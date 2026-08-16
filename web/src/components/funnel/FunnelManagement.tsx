@@ -30,7 +30,7 @@ import { format, subDays } from 'date-fns'
 import { BarChart3, Calendar as CalendarIcon, Plus } from 'lucide-react'
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { FunnelCard } from './FunnelCard'
 
 interface FunnelManagementProps {
@@ -157,7 +157,7 @@ export function FunnelManagement({ project }: FunnelManagementProps) {
             </PopoverTrigger>
             <PopoverContent className="w-auto p-0" align="end">
               <Calendar
-                initialFocus
+                autoFocus
                 mode="range"
                 defaultMonth={dateRange?.from}
                 selected={dateRange}

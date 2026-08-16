@@ -43,6 +43,27 @@ pub enum DataError {
     #[error("Serialization error: {0}")]
     SerializationError(String),
 
+    /// A backend result exceeded a server-defined memory/shape budget.
+    #[error(
+        "Query result for entity '{entity}' exceeded {limit_kind} limit {limit} \
+         (observed at least {observed})"
+    )]
+    ResultLimitExceeded {
+        entity: String,
+        limit_kind: &'static str,
+        limit: usize,
+        observed: usize,
+    },
+
+    /// A backend query failed. The source error is logged separately and is
+    /// intentionally absent here because database diagnostics may echo filter
+    /// literals or raw SQL.
+    #[error("{backend} query failed for entity '{entity}'")]
+    BackendQueryFailed {
+        backend: &'static str,
+        entity: String,
+    },
+
     /// Permission denied
     #[error("Permission denied: {0}")]
     PermissionDenied(String),

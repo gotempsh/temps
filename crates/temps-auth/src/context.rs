@@ -26,6 +26,11 @@ pub struct UserSchema {
 pub enum AuthSource {
     Session {
         user: users::Model,
+        /// Database identity of the authenticated browser session. Kept out
+        /// of serialized contexts because it is an internal authorization
+        /// handle, not API response data.
+        #[serde(skip)]
+        session_id: Option<i32>,
     },
     CliToken {
         user: users::Model,
@@ -100,7 +105,27 @@ impl AuthContext {
     pub fn new_session(user: users::Model, role: Role) -> Self {
         Self {
             user: Some(user.clone()),
-            source: AuthSource::Session { user },
+            source: AuthSource::Session {
+                user,
+                session_id: None,
+            },
+            effective_role: role,
+            custom_permissions: None,
+            deployment_token_permissions: None,
+        }
+    }
+
+    /// Construct a browser-session context backed by a persisted session row.
+    /// Production middleware uses this constructor so sensitive-action checks
+    /// can scope elevation to this device. `new_session` remains convenient for
+    /// unit tests that do not exercise session-bound policy.
+    pub fn new_persisted_session(user: users::Model, role: Role, session_id: i32) -> Self {
+        Self {
+            user: Some(user.clone()),
+            source: AuthSource::Session {
+                user,
+                session_id: Some(session_id),
+            },
             effective_role: role,
             custom_permissions: None,
             deployment_token_permissions: None,
@@ -181,13 +206,15 @@ impl AuthContext {
             let required_dt_perm = match permission {
                 Permission::AnalyticsRead => DeploymentTokenPermission::AnalyticsRead,
                 Permission::AnalyticsWrite => DeploymentTokenPermission::VisitorsEnrich,
-                // Deployed apps inject their deployment token as TEMPS_API_TOKEN
-                // and use it to call POST /emails (guarded by EmailsSend). This
-                // is documented, project-scoped machine access, so map it to the
-                // matching deployment-token permission.
                 Permission::EmailsSend => DeploymentTokenPermission::EmailsSend,
-                // No implicit bridge from deployment-token permissions to
-                // general control-plane permissions.
+                Permission::AiGatewayExecute => DeploymentTokenPermission::AiGatewayExecute,
+                Permission::FlagsRead => DeploymentTokenPermission::FlagsRead,
+                Permission::BlobRead => DeploymentTokenPermission::BlobRead,
+                Permission::BlobWrite => DeploymentTokenPermission::BlobWrite,
+                Permission::BlobDelete => DeploymentTokenPermission::BlobDelete,
+                Permission::KvRead => DeploymentTokenPermission::KvRead,
+                Permission::KvWrite => DeploymentTokenPermission::KvWrite,
+                Permission::KvDelete => DeploymentTokenPermission::KvDelete,
                 _ => return false,
             };
 
@@ -250,6 +277,47 @@ impl AuthContext {
 
     pub fn is_deployment_token(&self) -> bool {
         matches!(self.source, AuthSource::DeploymentToken { .. })
+    }
+
+    /// Convert the authentication context into the stable principal shape used
+    /// by sensitive-action policy implementations.
+    pub fn sensitive_action_principal(&self) -> Option<temps_core::SensitiveActionPrincipal> {
+        match &self.source {
+            AuthSource::Session {
+                user,
+                session_id: Some(session_id),
+            } => Some(temps_core::SensitiveActionPrincipal::UserSession {
+                user_id: user.id,
+                session_id: *session_id,
+                mfa_enabled: user.mfa_enabled,
+            }),
+            AuthSource::Session {
+                session_id: None, ..
+            } => None,
+            AuthSource::ApiKey { user, key_id, .. } => {
+                Some(temps_core::SensitiveActionPrincipal::ApiKey {
+                    user_id: user.id,
+                    key_id: *key_id,
+                })
+            }
+            AuthSource::CliToken { user } => {
+                Some(temps_core::SensitiveActionPrincipal::CliToken { user_id: user.id })
+            }
+            AuthSource::DeploymentToken { token_id, .. } => {
+                Some(temps_core::SensitiveActionPrincipal::DeploymentToken {
+                    token_id: *token_id,
+                })
+            }
+        }
+    }
+
+    pub fn session_id(&self) -> Option<i32> {
+        match &self.source {
+            AuthSource::Session { session_id, .. } => *session_id,
+            AuthSource::CliToken { .. }
+            | AuthSource::ApiKey { .. }
+            | AuthSource::DeploymentToken { .. } => None,
+        }
     }
 
     pub fn api_key_info(&self) -> Option<(String, i32)> {
@@ -350,6 +418,17 @@ mod tests {
     }
 
     #[test]
+    fn deployment_token_storage_permissions_map_to_standard_permissions() {
+        let blob_read = deployment_token_ctx(7, vec![DeploymentTokenPermission::BlobRead]);
+        assert!(blob_read.has_permission(&Permission::BlobRead));
+        assert!(!blob_read.has_permission(&Permission::BlobWrite));
+
+        let kv_write = deployment_token_ctx(7, vec![DeploymentTokenPermission::KvWrite]);
+        assert!(kv_write.has_permission(&Permission::KvWrite));
+        assert!(!kv_write.has_permission(&Permission::KvDelete));
+    }
+
+    #[test]
     fn deployment_token_is_scoped_to_its_own_project() {
         let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
         assert!(ctx.is_scoped_to_project(7));
@@ -402,6 +481,35 @@ mod tests {
     fn deployment_token_without_emails_send_is_denied_emails_send() {
         let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AnalyticsRead]);
         assert!(!ctx.has_permission(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn deployment_token_full_access_grants_ai_gateway_execute() {
+        // Deployed apps use their injected deployment token to call the AI
+        // gateway; the default auto-minted token carries FullAccess, so it
+        // must satisfy AiGatewayExecute — same contract as EmailsSend.
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+        assert!(ctx.has_permission(&Permission::AiGatewayExecute));
+    }
+
+    #[test]
+    fn deployment_token_ai_gateway_permission_grants_only_ai_gateway() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AiGatewayExecute]);
+        assert!(ctx.has_permission(&Permission::AiGatewayExecute));
+        // ...but a narrow ai_gateway:execute token must not gain other access.
+        assert!(!ctx.has_permission(&Permission::EmailsSend));
+        assert!(!ctx.has_permission(&Permission::AnalyticsRead));
+    }
+
+    #[test]
+    fn deployment_token_without_ai_gateway_is_denied_ai_gateway_execute() {
+        let ctx = deployment_token_ctx(7, vec![DeploymentTokenPermission::AnalyticsRead]);
+        assert!(!ctx.has_permission(&Permission::AiGatewayExecute));
+        // AI gateway read/write management APIs stay control-plane only,
+        // even for FullAccess tokens.
+        let full = deployment_token_ctx(7, vec![DeploymentTokenPermission::FullAccess]);
+        assert!(!full.has_permission(&Permission::AiGatewayRead));
+        assert!(!full.has_permission(&Permission::AiGatewayWrite));
     }
 
     #[test]

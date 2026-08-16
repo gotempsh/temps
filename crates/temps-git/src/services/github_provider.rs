@@ -3,13 +3,256 @@ use super::git_provider::{
     GitProviderType, PullRequest, RepoDirEntry, Repository, ScopedTokenGrant, ScopedTokenOp, User,
     WebhookConfig,
 };
+use super::github::create_github_app_jwt;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use octocrab::{Octocrab, OctocrabBuilder};
 use reqwest;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use tracing::{debug, error, info};
+
+const MAX_GITHUB_TAGS: usize = 1_000;
+const MAX_GITHUB_TAG_PAGES: usize = 10;
+const MAX_GITHUB_BRANCHES: usize = 1_000;
+const MAX_GITHUB_BRANCH_PAGES: usize = 10;
+
+fn github_status_error(
+    status: reqwest::StatusCode,
+    rate_limit_remaining: Option<u64>,
+    provider_message: String,
+    operation: impl Into<String>,
+    required_permission: impl Into<String>,
+) -> GitProviderError {
+    let is_rate_limit_message = provider_message.to_ascii_lowercase().contains("rate limit");
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        GitProviderError::AuthenticationFailed(format!(
+            "GitHub rejected the credential as invalid or expired while trying to {}. GitHub said: {}",
+            operation.into(), provider_message
+        ))
+    } else if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || (status == reqwest::StatusCode::FORBIDDEN
+            && (rate_limit_remaining == Some(0) || is_rate_limit_message))
+    {
+        GitProviderError::RateLimitExceeded
+    } else if status == reqwest::StatusCode::FORBIDDEN {
+        GitProviderError::PermissionDenied {
+            operation: operation.into(),
+            required_permission: required_permission.into(),
+            provider_message,
+        }
+    } else {
+        GitProviderError::ApiError(format!(
+            "GitHub failed the '{}' operation with HTTP {}: {}",
+            operation.into(),
+            status,
+            provider_message
+        ))
+    }
+}
+
+async fn github_response_error(
+    response: reqwest::Response,
+    operation: impl Into<String>,
+    required_permission: impl Into<String>,
+) -> GitProviderError {
+    let status = response.status();
+    let rate_limit_remaining = response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let provider_message = response
+        .json::<serde_json::Value>()
+        .await
+        .ok()
+        .and_then(|body| {
+            body.get("message")
+                .and_then(|message| message.as_str())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| format!("HTTP {status}"));
+
+    github_status_error(
+        status,
+        rate_limit_remaining,
+        provider_message,
+        operation,
+        required_permission,
+    )
+}
+
+fn github_octocrab_error(
+    error: octocrab::Error,
+    operation: impl Into<String>,
+    required_permission: impl Into<String>,
+) -> GitProviderError {
+    let operation = operation.into();
+    let required_permission = required_permission.into();
+    match error {
+        octocrab::Error::GitHub { source, .. }
+            if source.status_code == reqwest::StatusCode::UNAUTHORIZED =>
+        {
+            GitProviderError::AuthenticationFailed(format!(
+                "GitHub rejected the credential as invalid or expired while trying to {}. GitHub said: {}",
+                operation, source.message
+            ))
+        }
+        octocrab::Error::GitHub { source, .. }
+            if source.status_code == reqwest::StatusCode::FORBIDDEN
+                && source.message.to_ascii_lowercase().contains("rate limit") =>
+        {
+            GitProviderError::RateLimitExceeded
+        }
+        octocrab::Error::GitHub { source, .. }
+            if source.status_code == reqwest::StatusCode::FORBIDDEN =>
+        {
+            GitProviderError::PermissionDenied {
+                operation,
+                required_permission,
+                provider_message: source.message.clone(),
+            }
+        }
+        octocrab::Error::GitHub { source, .. }
+            if source.status_code == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+        {
+            GitProviderError::RateLimitExceeded
+        }
+        error => GitProviderError::ApiError(format!(
+            "GitHub failed the '{}' operation: {}",
+            operation, error
+        )),
+    }
+}
+
+fn append_github_tags(
+    tags: &mut Vec<GitProviderTag>,
+    page_items: Vec<octocrab::models::repos::Tag>,
+) {
+    let remaining = MAX_GITHUB_TAGS.saturating_sub(tags.len());
+    tags.extend(
+        page_items
+            .into_iter()
+            .take(remaining)
+            .map(|tag| GitProviderTag {
+                name: tag.name,
+                commit_sha: tag.commit.sha,
+            }),
+    );
+}
+
+/// Validate a provider-supplied pagination link before issuing another request.
+///
+/// GitHub Enterprise may use a path prefix such as `/api/v3`. Returning only
+/// the validated path and query keeps Octocrab's authentication and base-URI
+/// middleware in control of the final destination.
+fn github_pagination_route(api_url: &str, next_url: &str) -> Result<String, GitProviderError> {
+    let base_url = url::Url::parse(api_url).map_err(|error| {
+        GitProviderError::ApiError(format!("Invalid configured GitHub API URL: {error}"))
+    })?;
+    let next_url = match url::Url::parse(next_url) {
+        Ok(url) => url,
+        Err(url::ParseError::RelativeUrlWithoutBase) => {
+            base_url.join(next_url).map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "Invalid relative GitHub pagination URL: {error}"
+                ))
+            })?
+        }
+        Err(error) => {
+            return Err(GitProviderError::ApiError(format!(
+                "Invalid GitHub pagination URL: {error}"
+            )))
+        }
+    };
+
+    let same_origin = next_url.scheme() == base_url.scheme()
+        && next_url.host_str().map(str::to_ascii_lowercase)
+            == base_url.host_str().map(str::to_ascii_lowercase)
+        && next_url.port_or_known_default() == base_url.port_or_known_default();
+    if !same_origin
+        || !next_url.username().is_empty()
+        || next_url.password().is_some()
+        || next_url.fragment().is_some()
+    {
+        return Err(GitProviderError::ApiError(
+            "GitHub pagination URL must use the configured API origin without credentials or fragments"
+                .to_string(),
+        ));
+    }
+
+    let base_path = base_url.path().trim_end_matches('/');
+    if !base_path.is_empty()
+        && next_url.path() != base_path
+        && !next_url
+            .path()
+            .strip_prefix(base_path)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+    {
+        return Err(GitProviderError::ApiError(
+            "GitHub pagination URL escaped the configured API path".to_string(),
+        ));
+    }
+
+    let mut route = next_url.path().to_string();
+    if let Some(query) = next_url.query() {
+        route.push('?');
+        route.push_str(query);
+    }
+    Ok(route)
+}
+
+async fn collect_guarded_github_pages<T: serde::de::DeserializeOwned>(
+    octocrab: &Octocrab,
+    api_url: &str,
+    mut page: octocrab::Page<T>,
+    max_items: usize,
+    max_pages: usize,
+    resource: &str,
+    repository: (&str, &str),
+) -> Result<Vec<T>, GitProviderError> {
+    let (owner, repo) = repository;
+    let mut items = Vec::new();
+    let mut pages_fetched = 1usize;
+    let mut visited_next_routes = HashSet::new();
+
+    loop {
+        let remaining = max_items.saturating_sub(items.len());
+        items.extend(page.take_items().into_iter().take(remaining));
+        if items.len() >= max_items {
+            break;
+        }
+
+        let Some(next_url) = page.next.as_ref() else {
+            break;
+        };
+        if pages_fetched >= max_pages {
+            return Err(GitProviderError::ApiError(format!(
+                "GitHub {resource} pagination for {owner}/{repo} exceeded the {max_pages}-page safety limit"
+            )));
+        }
+        let next_route = github_pagination_route(api_url, &next_url.to_string())?;
+        if !visited_next_routes.insert(next_route.clone()) {
+            return Err(GitProviderError::ApiError(format!(
+                "GitHub {resource} pagination for {owner}/{repo} repeated page URL"
+            )));
+        }
+
+        page = octocrab
+            .get::<octocrab::Page<T>, _, _>(&next_route, None::<&()>)
+            .await
+            .map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "Failed to paginate {resource} for {owner}/{repo} (page {}): {error}",
+                    pages_fetched + 1
+                ))
+            })?;
+        pages_fetched += 1;
+    }
+
+    Ok(items)
+}
 
 // Response structs for API calls
 
@@ -154,21 +397,19 @@ impl GitHubProvider {
 
     /// Create an Octocrab client with the given access token
     async fn get_octocrab_client(&self, access_token: &str) -> Result<Octocrab, GitProviderError> {
-        // Note: Octocrab doesn't support custom base URLs through the builder
-        // For GitHub Enterprise support, we'd need to use the underlying reqwest client
-        // For now, we'll only support the default GitHub API with Octocrab
+        let mut builder = OctocrabBuilder::new().personal_token(access_token.to_string());
         if self.api_url != "https://api.github.com" {
-            return Err(GitProviderError::Other(
-                "Custom API URLs are not supported with Octocrab integration yet".to_string(),
-            ));
+            builder = builder.base_uri(self.api_url.clone()).map_err(|error| {
+                GitProviderError::Other(format!(
+                    "Failed to configure GitHub API URL '{}': {}",
+                    self.api_url, error
+                ))
+            })?;
         }
 
-        let octocrab = OctocrabBuilder::new()
-            .personal_token(access_token.to_string())
-            .build()
-            .map_err(|e| {
-                GitProviderError::Other(format!("Failed to build Octocrab client: {}", e))
-            })?;
+        let octocrab = builder.build().map_err(|e| {
+            GitProviderError::Other(format!("Failed to build Octocrab client: {}", e))
+        })?;
 
         Ok(octocrab)
     }
@@ -440,7 +681,7 @@ impl GitHubProvider {
                     },
                 )?;
 
-                let jwt = octocrab::auth::create_jwt(app_id_param, &key).map_err(|e| {
+                let jwt = create_github_app_jwt(app_id_param.0, &key).map_err(|e| {
                     error!(
                         installation_id,
                         app_id = *app_id,
@@ -554,11 +795,13 @@ impl GitHubProvider {
         let client = self.get_client();
         let headers = self.get_headers(access_token);
 
-        // Use the /user endpoint to validate the token (for OAuth/PAT)
-        // For GitHub Apps, we use /app endpoint
+        // `/rate_limit` authenticates OAuth, PAT, Actions, and installation
+        // credentials without requiring user-profile access. GitHub Apps use
+        // their installation repository endpoint because it also confirms the
+        // installation can access at least one selected repository.
         let endpoint = match &self.auth_method {
             AuthMethod::GitHubApp { .. } => format!("{}/installation/repositories", self.api_url),
-            _ => format!("{}/user", self.api_url),
+            _ => format!("{}/rate_limit", self.api_url),
         };
 
         let response = self
@@ -582,7 +825,17 @@ impl GitHubProvider {
                 {
                     Err(GitProviderError::RateLimitExceeded)
                 } else {
-                    Ok(false) // Token might be invalid or lack permissions
+                    Err(github_response_error(
+                        response,
+                        "validate the GitHub connection",
+                        match &self.auth_method {
+                            AuthMethod::GitHubApp { .. } => {
+                                "Metadata: read and access to at least one selected repository"
+                            }
+                            _ => "Metadata: read",
+                        },
+                    )
+                    .await)
                 }
             }
             status => {
@@ -666,7 +919,7 @@ impl GitProviderService for GitHubProvider {
                 ..
             } => {
                 let auth_url = format!(
-                    "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&scope=repo,user",
+                    "https://github.com/login/oauth/authorize?client_id={}&redirect_uri={}&state={}&scope=repo",
                     client_id, redirect_uri, state
                 );
                 Ok(auth_url)
@@ -684,56 +937,15 @@ impl GitProviderService for GitHubProvider {
         match self.validate_token(access_token).await {
             Ok(true) => false, // Token is valid, no refresh needed
             Ok(false) => true, // Token is invalid, needs refresh
-            Err(_) => true,    // Error validating, assume it needs refresh
+            // Permission, rate-limit, network, and provider failures do not
+            // prove expiry. Let the requested operation return its typed error
+            // instead of persistently marking a usable token as expired.
+            Err(_) => false,
         }
     }
 
     async fn validate_token(&self, access_token: &str) -> Result<bool, GitProviderError> {
-        let client = self.get_client();
-        let headers = self.get_headers(access_token);
-
-        // Use the /user endpoint to validate the token (for OAuth/PAT)
-        // For GitHub Apps, we use /app endpoint
-        let endpoint = match &self.auth_method {
-            AuthMethod::GitHubApp { .. } => format!("{}/installation/repositories", self.api_url),
-            _ => format!("{}/user", self.api_url),
-        };
-
-        let response = self
-            .send_with_retry(|| client.get(&endpoint).headers(headers.clone()))
-            .await?;
-
-        // Token is valid if we get a 200 OK
-        // 401 means unauthorized (invalid token)
-        // 403 could mean rate limited or token lacks scopes
-        match response.status() {
-            status if status.is_success() => Ok(true),
-            status if status.as_u16() == 401 => Ok(false),
-            status if status.as_u16() == 403 => {
-                // Check if it's rate limiting
-                if response
-                    .headers()
-                    .get("X-RateLimit-Remaining")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<i32>().ok())
-                    == Some(0)
-                {
-                    Err(GitProviderError::RateLimitExceeded)
-                } else {
-                    Ok(false) // Token might be invalid or lack permissions
-                }
-            }
-            status => {
-                let error_text = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
-                Err(GitProviderError::ApiError(format!(
-                    "Unexpected response validating token: {} - {}",
-                    status, error_text
-                )))
-            }
-        }
+        GitHubProvider::validate_token(self, access_token).await
     }
 
     async fn validate_and_refresh_token(
@@ -924,13 +1136,12 @@ impl GitProviderService for GitHubProvider {
                 .await?;
 
             if !response.status().is_success() {
-                let status = response.status();
-                let error_text = response.text().await.unwrap_or_default();
-                error!("Failed to list repositories: {} - {}", status, error_text);
-                return Err(GitProviderError::ApiError(format!(
-                    "Failed to list repositories: {} - {}",
-                    status, error_text
-                )));
+                return Err(github_response_error(
+                    response,
+                    "list repositories available to this connection",
+                    "Metadata: read, Contents: read, and access to the selected repositories",
+                )
+                .await);
             }
 
             // GitHub App installation endpoint returns a different structure
@@ -1020,10 +1231,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to get repository: {}",
-                response.status()
-            )));
+            return Err(github_response_error(
+                response,
+                format!("read repository {owner}/{repo}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
         }
 
         #[derive(Deserialize)]
@@ -1094,22 +1307,33 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<Vec<Branch>, GitProviderError> {
         let octocrab = self.get_octocrab_client(access_token).await?;
 
-        // Fetch the first page with the maximum page size, then walk every
-        // remaining page so callers always see the complete branch list.
-        // GitHub paginates branches at 30 items per page by default; without
-        // `all_pages` we'd silently truncate repos like ours where `main`
-        // sorts past page 1.
+        // Fetch the first page with the maximum page size, then walk bounded,
+        // same-origin pages so callers see large branch lists without trusting
+        // provider-controlled Link targets.
         let first_page = octocrab
             .repos(owner, repo)
             .list_branches()
             .per_page(100)
             .send()
             .await
-            .map_err(|e| GitProviderError::ApiError(format!("Failed to list branches: {}", e)))?;
+            .map_err(|error| {
+                github_octocrab_error(
+                    error,
+                    format!("list branches for {owner}/{repo}"),
+                    "Contents: read and access to the target repository",
+                )
+            })?;
 
-        let all = octocrab.all_pages(first_page).await.map_err(|e| {
-            GitProviderError::ApiError(format!("Failed to paginate branches: {}", e))
-        })?;
+        let all = collect_guarded_github_pages(
+            &octocrab,
+            &self.api_url,
+            first_page,
+            MAX_GITHUB_BRANCHES,
+            MAX_GITHUB_BRANCH_PAGES,
+            "branch",
+            (owner, repo),
+        )
+        .await?;
 
         let branches = all
             .into_iter()
@@ -1131,23 +1355,35 @@ impl GitProviderService for GitHubProvider {
     ) -> Result<Vec<GitProviderTag>, GitProviderError> {
         let octocrab = self.get_octocrab_client(access_token).await?;
 
-        // Get all tags using Octocrab
-        let tags = octocrab
+        let page = octocrab
             .repos(owner, repo)
             .list_tags()
+            .per_page(100u8)
             .send()
             .await
-            .map_err(|e| GitProviderError::ApiError(format!("Failed to list tags: {}", e)))?;
+            .map_err(|error| {
+                github_octocrab_error(
+                    error,
+                    format!("list tags for {owner}/{repo}"),
+                    "Contents: read and access to the target repository",
+                )
+            })?;
 
-        // Convert Octocrab tags to our GitProviderTag type
-        let tags = tags
-            .items
-            .into_iter()
-            .map(|t| GitProviderTag {
-                name: t.name,
-                commit_sha: t.commit.sha,
-            })
-            .collect();
+        // GitHub defaults to 30 tags and the previous implementation silently
+        // ignored every later page. Follow pagination while retaining the same
+        // 1,000-tag memory bound used by the other providers.
+        let raw_tags = collect_guarded_github_pages(
+            &octocrab,
+            &self.api_url,
+            page,
+            MAX_GITHUB_TAGS,
+            MAX_GITHUB_TAG_PAGES,
+            "tag",
+            (owner, repo),
+        )
+        .await?;
+        let mut tags = Vec::with_capacity(raw_tags.len());
+        append_github_tags(&mut tags, raw_tags);
 
         Ok(tags)
     }
@@ -1184,10 +1420,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to get file content: {}",
-                response.status()
-            )));
+            return Err(github_response_error(
+                response,
+                format!("read file '{path}' from {owner}/{repo}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
         }
 
         #[derive(Deserialize)]
@@ -1242,10 +1480,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to list directory '{path}' in {owner}/{repo}: {}",
-                response.status()
-            )));
+            return Err(github_response_error(
+                response,
+                format!("list directory '{path}' in {owner}/{repo}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
         }
 
         // The Contents API returns either a JSON array (directory) or a single
@@ -1327,10 +1567,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to get latest commit: {}",
-                response.status()
-            )));
+            return Err(github_response_error(
+                response,
+                format!("read the latest commit from {owner}/{repo}@{branch}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
         }
 
         #[derive(Deserialize)]
@@ -1411,10 +1653,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to create webhook: {}",
-                response.status()
-            )));
+            return Err(github_response_error(
+                response,
+                format!("create a webhook for {owner}/{repo}"),
+                "Webhooks: write (or classic PAT repo scope) and access to the target repository",
+            )
+            .await);
         }
 
         let hook: HookResponse = response
@@ -1445,10 +1689,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to delete webhook: {}",
-                response.status()
-            )));
+            return Err(github_response_error(
+                response,
+                format!("delete webhook {webhook_id} from {owner}/{repo}"),
+                "Webhooks: write (or classic PAT repo scope) and access to the target repository",
+            )
+            .await);
         }
 
         Ok(())
@@ -1460,17 +1706,8 @@ impl GitProviderService for GitHubProvider {
         signature: &str,
         secret: &str,
     ) -> Result<bool, GitProviderError> {
-        use hmac::{Hmac, KeyInit, Mac};
-        use sha2::Sha256;
-
-        // GitHub uses HMAC-SHA256 for webhook signatures
-        let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
-            .map_err(|e| GitProviderError::Other(format!("Invalid secret key: {}", e)))?;
-
-        mac.update(payload);
-
-        let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
-        Ok(signature == expected)
+        github_webhook_signature_matches(payload, signature, secret)
+            .map_err(GitProviderError::Other)
     }
 
     async fn get_user(&self, access_token: &str) -> Result<User, GitProviderError> {
@@ -1484,10 +1721,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to get user: {}",
-                response.status()
-            )));
+            return Err(github_response_error(
+                response,
+                "read the GitHub account identity",
+                "Metadata: read",
+            )
+            .await);
         }
 
         #[derive(Deserialize)]
@@ -1582,7 +1821,10 @@ impl GitProviderService for GitHubProvider {
         // GitHub API endpoint for getting a commit
         let url = format!(
             "{}/repos/{}/{}/commits/{}",
-            self.api_url, owner, repo, reference
+            self.api_url,
+            owner,
+            repo,
+            urlencoding::encode(reference)
         );
 
         let response = self
@@ -1591,14 +1833,18 @@ impl GitProviderService for GitHubProvider {
 
         if !response.status().is_success() {
             let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to get commit: {} - {}",
-                status, error_text
-            )));
+            if status == reqwest::StatusCode::NOT_FOUND {
+                return Err(GitProviderError::CommitNotFound {
+                    repository: format!("{}/{}", owner, repo),
+                    commit_sha: reference.to_string(),
+                });
+            }
+            return Err(github_response_error(
+                response,
+                format!("read commit {reference} from {owner}/{repo}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
         }
 
         #[derive(Deserialize)]
@@ -1665,16 +1911,12 @@ impl GitProviderService for GitHubProvider {
         match response.status() {
             status if status.is_success() => Ok(true),
             status if status == 404 => Ok(false),
-            _ => {
-                let error_text = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
-                Err(GitProviderError::ApiError(format!(
-                    "Failed to check commit: {}",
-                    error_text
-                )))
-            }
+            _ => Err(github_response_error(
+                response,
+                format!("check commit {commit_sha} in {owner}/{repo}"),
+                "Contents: read and access to the target repository",
+            )
+            .await),
         }
     }
 
@@ -1699,10 +1941,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !response.status().is_success() {
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to list commits: {}",
-                response.status()
-            )));
+            return Err(github_response_error(
+                response,
+                format!("list commits for {owner}/{repo}@{branch}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
         }
 
         #[derive(Deserialize)]
@@ -1832,15 +2076,12 @@ impl GitProviderService for GitHubProvider {
         };
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to download archive: {} - {}",
-                status, error_text
-            )));
+            return Err(github_response_error(
+                response,
+                format!("download source archive for {owner}/{repo}@{ref_spec}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
         }
 
         // Cap the total bytes written: the client `.timeout()` bounds idle/stall
@@ -1968,6 +2209,11 @@ impl GitProviderService for GitHubProvider {
 
         if !response.status().is_success() {
             let status = response.status();
+            let rate_limit_remaining = response
+                .headers()
+                .get("x-ratelimit-remaining")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok());
             let error_text = response
                 .text()
                 .await
@@ -2002,10 +2248,17 @@ impl GitProviderService for GitHubProvider {
                 }
             }
 
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to create repository: {} - {}",
-                status, error_text
-            )));
+            return Err(github_status_error(
+                status,
+                rate_limit_remaining,
+                error_text,
+                format!("create repository '{name}'"),
+                if owner.is_some() {
+                    "Administration: write for the target organization"
+                } else {
+                    "permission to create repositories for the authenticated user"
+                },
+            ));
         }
 
         let github_repo: GitHubRepo = response
@@ -2095,7 +2348,7 @@ impl GitProviderService for GitHubProvider {
                     GitProviderError::ApiError(format!("Failed to parse ref: {}", e))
                 })?;
                 git_ref.object.sha
-            } else {
+            } else if ref_response.status() == reqwest::StatusCode::NOT_FOUND {
                 // Branch doesn't exist — get the default branch SHA and create the new branch
                 // Try "main" first, then "master"
                 let mut base_sha = None;
@@ -2113,6 +2366,13 @@ impl GitProviderService for GitHubProvider {
                         })?;
                         base_sha = Some(git_ref.object.sha);
                         break;
+                    } else if base_response.status() != reqwest::StatusCode::NOT_FOUND {
+                        return Err(github_response_error(
+                            base_response,
+                            format!("read base branch '{}' for {}/{}", base_branch, owner, repo),
+                            "Contents: read",
+                        )
+                        .await);
                     }
                 }
 
@@ -2136,16 +2396,23 @@ impl GitProviderService for GitHubProvider {
                     .await?;
 
                 if !create_response.status().is_success() {
-                    let status = create_response.status();
-                    let error_text = create_response.text().await.unwrap_or_default();
-                    return Err(GitProviderError::ApiError(format!(
-                        "Failed to create branch '{}': {} - {}",
-                        branch, status, error_text
-                    )));
+                    return Err(github_response_error(
+                        create_response,
+                        format!("create branch '{}' in {}/{}", branch, owner, repo),
+                        "Contents: write",
+                    )
+                    .await);
                 }
 
                 info!("Created new branch '{}' from SHA {}", branch, &sha);
                 sha
+            } else {
+                return Err(github_response_error(
+                    ref_response,
+                    format!("read branch '{}' for {}/{}", branch, owner, repo),
+                    "Contents: read",
+                )
+                .await);
             };
         debug!("Base commit SHA: {}", base_commit_sha);
 
@@ -2158,6 +2425,15 @@ impl GitProviderService for GitHubProvider {
         let commit_response = self
             .send_with_retry(|| client.get(&commit_url).headers(headers.clone()))
             .await?;
+
+        if !commit_response.status().is_success() {
+            return Err(github_response_error(
+                commit_response,
+                format!("read base commit for {}/{}", owner, repo),
+                "Contents: read",
+            )
+            .await);
+        }
 
         #[derive(Deserialize)]
         struct GitCommitResponse {
@@ -2204,15 +2480,12 @@ impl GitProviderService for GitHubProvider {
                 .await?;
 
             if !blob_response.status().is_success() {
-                let status = blob_response.status();
-                let error_text = blob_response
-                    .text()
-                    .await
-                    .unwrap_or_else(|_| "Unknown error".to_string());
-                return Err(GitProviderError::ApiError(format!(
-                    "Failed to create blob for {}: {} - {}",
-                    path, status, error_text
-                )));
+                return Err(github_response_error(
+                    blob_response,
+                    format!("create blob '{}' in {}/{}", path, owner, repo),
+                    "Contents: write",
+                )
+                .await);
             }
 
             #[derive(Deserialize)]
@@ -2253,15 +2526,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !tree_response.status().is_success() {
-            let status = tree_response.status();
-            let error_text = tree_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to create tree: {} - {}",
-                status, error_text
-            )));
+            return Err(github_response_error(
+                tree_response,
+                format!("create tree in {}/{}", owner, repo),
+                "Contents: write",
+            )
+            .await);
         }
 
         #[derive(Deserialize)]
@@ -2295,15 +2565,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !new_commit_response.status().is_success() {
-            let status = new_commit_response.status();
-            let error_text = new_commit_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to create commit: {} - {}",
-                status, error_text
-            )));
+            return Err(github_response_error(
+                new_commit_response,
+                format!("create commit in {}/{}", owner, repo),
+                "Contents: write",
+            )
+            .await);
         }
 
         #[derive(Deserialize)]
@@ -2348,15 +2615,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !update_ref_response.status().is_success() {
-            let status = update_ref_response.status();
-            let error_text = update_ref_response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to update branch reference: {} - {}",
-                status, error_text
-            )));
+            return Err(github_response_error(
+                update_ref_response,
+                format!("update branch '{}' in {}/{}", branch, owner, repo),
+                "Contents: write",
+            )
+            .await);
         }
 
         info!(
@@ -2423,19 +2687,12 @@ impl GitProviderService for GitHubProvider {
             .await?;
 
         if !response.status().is_success() {
-            let status = response.status();
-            let error_text = response
-                .text()
-                .await
-                .unwrap_or_else(|_| "Unknown error".to_string());
-            error!(
-                "Failed to create pull request in {}/{}: {} - {}",
-                owner, repo, status, error_text
-            );
-            return Err(GitProviderError::ApiError(format!(
-                "Failed to create pull request in {}/{}: {} - {}",
-                owner, repo, status, error_text
-            )));
+            return Err(github_response_error(
+                response,
+                format!("create a pull request in {owner}/{repo}"),
+                "Pull requests: write and access to the target repository",
+            )
+            .await);
         }
 
         #[derive(Deserialize)]
@@ -2637,6 +2894,346 @@ mod archive_redirect_tests {
 }
 
 #[cfg(test)]
+mod tag_pagination_tests {
+    use super::*;
+
+    fn install_test_crypto_provider() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+    }
+
+    fn provider(api_url: String) -> GitHubProvider {
+        GitHubProvider::new(
+            Some(api_url),
+            AuthMethod::PersonalAccessToken {
+                token: "test-token".to_string(),
+            },
+        )
+    }
+
+    fn github_tag_json(index: usize) -> serde_json::Value {
+        serde_json::json!({
+            "name": format!("v1.0.{index}"),
+            "commit": {
+                "sha": format!("{index:040x}"),
+                "url": format!("https://api.github.com/repos/temps/example/commits/{index}")
+            },
+            "zipball_url": format!("https://api.github.com/repos/temps/example/zipball/v1.0.{index}"),
+            "tarball_url": format!("https://api.github.com/repos/temps/example/tarball/v1.0.{index}"),
+            "node_id": format!("tag-{index}")
+        })
+    }
+
+    fn github_tag(index: usize) -> octocrab::models::repos::Tag {
+        serde_json::from_value(github_tag_json(index)).unwrap()
+    }
+
+    fn github_branch_json(index: usize) -> serde_json::Value {
+        serde_json::json!({
+            "name": format!("branch-{index}"),
+            "commit": {
+                "sha": format!("{index:040x}"),
+                "url": format!("https://api.github.com/repos/temps/example/commits/{index}")
+            },
+            "protected": false
+        })
+    }
+
+    #[test]
+    fn appending_github_tag_pages_maps_commit_shas_and_enforces_the_cap() {
+        let mut tags = Vec::new();
+        let page = (0..=MAX_GITHUB_TAGS).map(github_tag).collect();
+
+        append_github_tags(&mut tags, page);
+
+        assert_eq!(tags.len(), MAX_GITHUB_TAGS);
+        assert_eq!(tags[0].name, "v1.0.0");
+        assert_eq!(tags[0].commit_sha, format!("{:040x}", 0));
+        assert_eq!(tags[MAX_GITHUB_TAGS - 1].name, "v1.0.999");
+    }
+
+    #[test]
+    fn pagination_route_allows_only_the_configured_api_origin_and_path() {
+        let base = "https://ghe.example.com/api/v3";
+
+        assert_eq!(
+            github_pagination_route(
+                base,
+                "https://ghe.example.com/api/v3/repos/temps/example/tags?page=2"
+            )
+            .unwrap(),
+            "/api/v3/repos/temps/example/tags?page=2"
+        );
+        assert_eq!(
+            github_pagination_route(base, "/api/v3/repos/temps/example/tags?page=2").unwrap(),
+            "/api/v3/repos/temps/example/tags?page=2"
+        );
+        assert!(github_pagination_route(
+            base,
+            "https://evil.example/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(github_pagination_route(
+            base,
+            "https://127.0.0.1/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(
+            github_pagination_route(base, "https://169.254.169.254/latest/meta-data/iam").is_err()
+        );
+        assert!(github_pagination_route(
+            base,
+            "https://ghe.example.com@evil.example/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(github_pagination_route(
+            base,
+            "http://ghe.example.com/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(github_pagination_route(
+            base,
+            "https://ghe.example.com:444/api/v3/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+        assert!(github_pagination_route(
+            base,
+            "https://ghe.example.com/repos/temps/example/tags?page=2"
+        )
+        .is_err());
+    }
+
+    #[tokio::test]
+    async fn list_branches_rejects_cross_origin_and_path_escape_links() {
+        install_test_crypto_provider();
+
+        for path_escape in [false, true] {
+            let mut server = mockito::Server::new_async().await;
+            let next_url = if path_escape {
+                format!("{}/outside/branches?page=2", server.url())
+            } else {
+                "http://169.254.169.254/latest/meta-data/iam".to_string()
+            };
+            let first_page = server
+                .mock("GET", "/api/v3/repos/temps/example/branches")
+                .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+                .with_status(200)
+                .with_header("content-type", "application/json")
+                .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+                .with_body(serde_json::json!([github_branch_json(1)]).to_string())
+                .create_async()
+                .await;
+
+            let error = provider(format!("{}/api/v3", server.url()))
+                .list_branches("test-token", "temps", "example")
+                .await
+                .expect_err("unsafe branch pagination URL must fail closed");
+
+            assert!(error.to_string().contains("GitHub pagination URL"));
+            first_page.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn list_branches_rejects_a_repeated_next_page_url() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!(
+            "{}/repos/temps/example/branches?per_page=100&page=2",
+            server.url()
+        );
+        let link = format!("<{next_url}>; rel=\"next\"");
+        let first_page = server
+            .mock("GET", "/repos/temps/example/branches")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &link)
+            .with_body(serde_json::json!([github_branch_json(1)]).to_string())
+            .create_async()
+            .await;
+        let repeated_page = server
+            .mock("GET", "/repos/temps/example/branches")
+            .match_query(mockito::Matcher::Exact("per_page=100&page=2".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &link)
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        let error = provider(server.url())
+            .list_branches("test-token", "temps", "example")
+            .await
+            .expect_err("repeated branch pagination URL must fail closed");
+
+        assert!(error.to_string().contains("repeated page URL"));
+        first_page.assert_async().await;
+        repeated_page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_branches_enforces_the_page_limit() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let first_next_url = format!(
+            "{}/repos/temps/example/branches?per_page=100&page=2",
+            server.url()
+        );
+        let first_page = server
+            .mock("GET", "/repos/temps/example/branches")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &format!("<{first_next_url}>; rel=\"next\""))
+            .with_body(serde_json::json!([github_branch_json(1)]).to_string())
+            .create_async()
+            .await;
+        let mut later_pages = Vec::new();
+        for page in 2..=MAX_GITHUB_BRANCH_PAGES {
+            let next_url = format!(
+                "{}/repos/temps/example/branches?per_page=100&page={}",
+                server.url(),
+                page + 1
+            );
+            later_pages.push(
+                server
+                    .mock("GET", "/repos/temps/example/branches")
+                    .match_query(mockito::Matcher::Exact(format!("per_page=100&page={page}")))
+                    .with_status(200)
+                    .with_header("content-type", "application/json")
+                    .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+                    .with_body(serde_json::json!([github_branch_json(page)]).to_string())
+                    .create_async()
+                    .await,
+            );
+        }
+
+        let error = provider(server.url())
+            .list_branches("test-token", "temps", "example")
+            .await
+            .expect_err("branch pagination must stop at its page limit");
+
+        assert!(error.to_string().contains("10-page safety limit"));
+        first_page.assert_async().await;
+        for page in later_pages {
+            page.assert_async().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn list_tags_follows_github_link_pagination() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!(
+            "{}/repos/temps/example/tags?per_page=100&page=2",
+            server.url()
+        );
+        let first_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+            .with_body(serde_json::json!([github_tag_json(1)]).to_string())
+            .create_async()
+            .await;
+        let second_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100&page=2".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(serde_json::json!([github_tag_json(2)]).to_string())
+            .create_async()
+            .await;
+
+        let tags = provider(server.url())
+            .list_tags("test-token", "temps", "example")
+            .await
+            .expect("two-page tag listing should succeed");
+
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].name, "v1.0.1");
+        assert_eq!(tags[1].name, "v1.0.2");
+        first_page.assert_async().await;
+        second_page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_tags_rejects_a_repeated_next_page_url() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!(
+            "{}/repos/temps/example/tags?per_page=100&page=2",
+            server.url()
+        );
+        let link = format!("<{next_url}>; rel=\"next\"");
+        let first_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &link)
+            .with_body(serde_json::json!([github_tag_json(1)]).to_string())
+            .create_async()
+            .await;
+        let repeated_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100&page=2".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &link)
+            .with_body("[]")
+            .create_async()
+            .await;
+
+        let error = provider(server.url())
+            .list_tags("test-token", "temps", "example")
+            .await
+            .expect_err("repeated pagination URL must fail closed");
+
+        assert!(error.to_string().contains("repeated page URL"));
+        first_page.assert_async().await;
+        repeated_page.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_tags_reports_the_failing_later_page() {
+        install_test_crypto_provider();
+        let mut server = mockito::Server::new_async().await;
+        let next_url = format!(
+            "{}/repos/temps/example/tags?per_page=100&page=2",
+            server.url()
+        );
+        let first_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100".to_string()))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("link", &format!("<{next_url}>; rel=\"next\""))
+            .with_body(serde_json::json!([github_tag_json(1)]).to_string())
+            .create_async()
+            .await;
+        let failing_page = server
+            .mock("GET", "/repos/temps/example/tags")
+            .match_query(mockito::Matcher::Exact("per_page=100&page=2".to_string()))
+            .with_status(502)
+            .with_body("upstream unavailable")
+            .expect(4)
+            .create_async()
+            .await;
+
+        let error = provider(server.url())
+            .list_tags("test-token", "temps", "example")
+            .await
+            .expect_err("later-page provider failure must be returned");
+
+        assert!(error.to_string().contains("page 2"));
+        first_page.assert_async().await;
+        failing_page.assert_async().await;
+    }
+}
+
+#[cfg(test)]
 mod list_directory_tests {
     use super::*;
 
@@ -2719,5 +3316,110 @@ mod list_directory_tests {
         assert_eq!(entries[0].name, "Cargo.toml");
         assert!(!entries[0].is_dir);
         assert_eq!(entries[0].size, Some(1024));
+    }
+}
+
+/// Verify a GitHub `X-Hub-Signature-256` HMAC-SHA256 webhook signature.
+///
+/// The comparison is **constant-time** (`subtle::ConstantTimeEq`) to avoid a
+/// timing side-channel that could leak the expected signature byte-by-byte
+/// (security review finding #14). Factored out as a free function so the
+/// verification logic can be unit-tested with a known vector.
+fn github_webhook_signature_matches(
+    payload: &[u8],
+    signature: &str,
+    secret: &str,
+) -> Result<bool, String> {
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::Sha256;
+    use subtle::ConstantTimeEq;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())
+        .map_err(|e| format!("Invalid secret key: {}", e))?;
+    mac.update(payload);
+    let expected = format!("sha256={}", hex::encode(mac.finalize().into_bytes()));
+    Ok(signature.as_bytes().ct_eq(expected.as_bytes()).into())
+}
+
+#[cfg(test)]
+mod signature_tests {
+    use super::github_webhook_signature_matches;
+
+    // Known HMAC-SHA256 vector (GitHub's documented example):
+    // secret "It's a Secret to Everybody", payload "Hello, World!".
+    const SECRET: &str = "It's a Secret to Everybody";
+    const PAYLOAD: &[u8] = b"Hello, World!";
+    const VALID: &str = "sha256=757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17";
+
+    #[test]
+    fn valid_signature_matches() {
+        assert!(github_webhook_signature_matches(PAYLOAD, VALID, SECRET).unwrap());
+    }
+
+    #[test]
+    fn tampered_signature_is_rejected() {
+        let mut bad = VALID.to_string();
+        bad.pop();
+        bad.push('0');
+        assert!(!github_webhook_signature_matches(PAYLOAD, &bad, SECRET).unwrap());
+    }
+
+    #[test]
+    fn wrong_length_signature_is_rejected() {
+        // ct_eq handles unequal lengths without panicking and returns false.
+        assert!(!github_webhook_signature_matches(PAYLOAD, "sha256=deadbeef", SECRET).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod token_permission_tests {
+    use super::*;
+
+    fn provider(api_url: String) -> GitHubProvider {
+        GitHubProvider::new(
+            Some(api_url),
+            AuthMethod::PersonalAccessToken {
+                token: "test-token".to_string(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn validate_token_accepts_repository_scoped_credentials_without_user_access() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/rate_limit")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_header("x-ratelimit-remaining", "4999")
+            .with_body(r#"{"resources":{"core":{"remaining":4999}}}"#)
+            .create_async()
+            .await;
+
+        let valid = GitProviderService::validate_token(&provider(server.url()), "token")
+            .await
+            .expect("a repository-scoped credential should validate without /user access");
+
+        mock.assert_async().await;
+        assert!(valid);
+    }
+
+    #[tokio::test]
+    async fn validate_token_keeps_invalid_credentials_distinct_from_permissions() {
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("GET", "/rate_limit")
+            .with_status(401)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"Bad credentials"}"#)
+            .create_async()
+            .await;
+
+        let valid = GitProviderService::validate_token(&provider(server.url()), "token")
+            .await
+            .expect("401 is represented by false for the existing validation contract");
+
+        mock.assert_async().await;
+        assert!(!valid);
     }
 }

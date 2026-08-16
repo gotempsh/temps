@@ -42,7 +42,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 interface WebhooksSettingsProps {

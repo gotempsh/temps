@@ -65,6 +65,8 @@ impl TempsPlugin for EnvironmentsPlugin {
         let env_var_service = context.require_service::<EnvVarService>();
         let secret_service = context.require_service::<SecretService>();
         let deployment_service = context.require_service::<dyn temps_core::DeploymentCanceller>();
+        let deployment_container_cleaner =
+            context.require_service::<dyn temps_core::DeploymentContainerCleaner>();
         let on_demand_waker = context.get_service::<dyn temps_core::OnDemandWaker>();
         let integration_env_provider =
             context.get_service::<dyn temps_core::ProjectEnvVarsProvider>();
@@ -72,6 +74,8 @@ impl TempsPlugin for EnvironmentsPlugin {
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter));
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let sensitive_action_authorizer =
+            context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
 
         let app_state = crate::handlers::create_environment_app_state(
             environment_service,
@@ -79,10 +83,12 @@ impl TempsPlugin for EnvironmentsPlugin {
             secret_service,
             audit_service,
             deployment_service,
+            deployment_container_cleaner,
             on_demand_waker,
             integration_env_provider,
             telemetry,
             project_access_checker,
+            sensitive_action_authorizer,
         );
 
         let routes = crate::handlers::configure_routes().with_state(app_state);

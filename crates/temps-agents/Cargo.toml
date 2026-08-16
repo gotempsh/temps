@@ -9,6 +9,8 @@ homepage.workspace = true
 
 [dependencies]
 temps-core = { path = "../temps-core" }
+temps-ai = { path = "../temps-ai" }
+temps-vm-agent = { path = "../temps-vm-agent" }
 temps-entities = { path = "../temps-entities" }
 temps-database = { path = "../temps-database" }
 temps-git = { path = "../temps-git" }
@@ -31,7 +33,7 @@ chrono = { workspace = true }
 axum = { workspace = true }
 axum-macros = { workspace = true }
 http = { workspace = true }
-cron = "0.12"
+cron = "0.17"
 temps-error-tracking = { path = "../temps-error-tracking" }
 temps-agents-mcp-proxy = { path = "../temps-agents-mcp-proxy" }
 anyhow = { workspace = true }
@@ -45,6 +47,7 @@ pulldown-cmark = "0.12"
 libc = { workspace = true }
 rand = { workspace = true }
 hex = "0.4"
+sha2 = { workspace = true }
 
 tempfile = { workspace = true }
 

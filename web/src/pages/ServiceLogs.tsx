@@ -2,10 +2,18 @@ import { getServiceOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { DateRangePicker } from '@/components/ui/date-range-picker'
 import { ServiceHealthBadge } from '@/components/storage/ServiceHealthCard'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select'
 import {
   type LogLevel,
   type LogSearchLine,
@@ -20,6 +28,7 @@ import {
   ScrollText,
   Server,
 } from 'lucide-react'
+import type { DateRange } from 'react-day-picker'
 import {
   useCallback,
   useLayoutEffect,
@@ -27,7 +36,7 @@ import {
   useRef,
   useState,
 } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 
 /** Tailwind classes per normalized level — mirrors the deployment log viewer. */
 const LEVEL_CLASS: Record<LogLevel, string> = {
@@ -46,6 +55,29 @@ const PAGE_SIZE = 200
 
 /** Distance (px) from the top that triggers loading the next-older page. */
 const LOAD_OLDER_THRESHOLD = 48
+
+// ── Time range ─────────────────────────────────────────────────────────────
+
+type TimePreset = '15m' | '1h' | '24h' | '7d' | 'custom'
+
+const PRESETS: { value: TimePreset; label: string }[] = [
+  { value: '15m', label: 'Last 15 minutes' },
+  { value: '1h', label: 'Last hour' },
+  { value: '24h', label: 'Last 24 hours' },
+  { value: '7d', label: 'Last 7 days' },
+  { value: 'custom', label: 'Custom range…' },
+]
+
+const PRESET_MS: Record<Exclude<TimePreset, 'custom'>, number> = {
+  '15m': 15 * 60 * 1000,
+  '1h': 60 * 60 * 1000,
+  '24h': 24 * 60 * 60 * 1000,
+  '7d': 7 * 24 * 60 * 60 * 1000,
+}
+
+function presetLabel(preset: TimePreset): string {
+  return PRESETS.find((p) => p.value === preset)?.label ?? preset
+}
 
 function formatTs(ts: string): string {
   const d = new Date(ts)
@@ -78,13 +110,37 @@ export function ServiceLogs() {
   // Bumped by Refresh to collapse back to a single newest page and re-tail.
   const [refreshKey, setRefreshKey] = useState(0)
 
-  // Look back 24h by default — matches the service history window operators
-  // expect. Memoized so it stays stable across renders (the pagination window
-  // must not shift under the cursor).
-  const startTime = useMemo(
-    () => new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
-    []
+  // ── Date/time range filter ───────────────────────────────────────────
+  const [preset, setPreset] = useState<TimePreset>('24h')
+  const [customRange, setCustomRange] = useState<DateRange | undefined>(
+    undefined
   )
+
+  // Derive startTime / endTime from the active preset or custom range.
+  // Memoized so the values are stable across renders (page identity must not
+  // shift while the user is reading; only a filter change resets it).
+  const { startTime, endTime } = useMemo(() => {
+    if (preset !== 'custom') {
+      const ms = PRESET_MS[preset]
+      return {
+        startTime: new Date(Date.now() - ms).toISOString(),
+        endTime: undefined,
+      }
+    }
+    return {
+      startTime: customRange?.from?.toISOString(),
+      endTime: customRange?.to?.toISOString(),
+    }
+  }, [preset, customRange])
+
+  // When switching away from custom, reset the custom range so the DateRangePicker
+  // comes up clean if the user switches back.
+  function handlePresetChange(next: TimePreset) {
+    if (next !== 'custom') setCustomRange(undefined)
+    setPreset(next)
+    // A time-range change should re-tail to the newest lines.
+    setRefreshKey((k) => k + 1)
+  }
 
   const levels = activeLevels.length ? activeLevels : undefined
   const trimmedText = text.trim() || undefined
@@ -103,12 +159,13 @@ export function ServiceLogs() {
       projectId: 0,
       externalServiceId: serviceId,
       startTime,
+      endTime,
       levels,
       text: trimmedText,
       pageSize: PAGE_SIZE,
       refreshKey,
     },
-    !Number.isNaN(serviceId)
+    !Number.isNaN(serviceId) && startTime !== undefined
   )
 
   // Pages come newest-first (page 0 = newest). Reverse so the oldest loaded
@@ -186,6 +243,16 @@ export function ServiceLogs() {
 
   // Refresh spins only for a full reload, not for background older-page loads.
   const refreshing = isFetching && !isFetchingNextPage
+
+  // Human-readable summary of the active time window.
+  const rangeLabel =
+    preset !== 'custom'
+      ? presetLabel(preset)
+      : customRange?.from && customRange?.to
+        ? `${customRange.from.toLocaleDateString()} – ${customRange.to.toLocaleDateString()}`
+        : customRange?.from
+          ? `From ${customRange.from.toLocaleDateString()}`
+          : 'Custom range'
 
   return (
     <div className="flex-1 overflow-auto">
@@ -287,6 +354,40 @@ export function ServiceLogs() {
             onChange={(e) => setText(e.target.value)}
             className="w-full sm:w-[320px]"
           />
+
+          {/* Time range preset selector */}
+          <Select
+            value={preset}
+            onValueChange={(v) => handlePresetChange(v as TimePreset)}
+          >
+            <SelectTrigger className="w-full sm:w-[180px]">
+              <SelectValue placeholder="Time range" />
+            </SelectTrigger>
+            <SelectContent>
+              {PRESETS.map((p) => (
+                <SelectItem key={p.value} value={p.value}>
+                  {p.label}
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+
+          {/* Custom date/time picker — only shown when "Custom range…" is selected */}
+          {preset === 'custom' ? (
+            <DateRangePicker
+              date={customRange}
+              onDateChange={(range) => {
+                setCustomRange(range)
+                // Re-tail when a complete custom range is applied.
+                if (range?.from && range?.to) {
+                  setRefreshKey((k) => k + 1)
+                }
+              }}
+              showTime
+              className="w-full sm:w-auto"
+            />
+          ) : null}
+
           <div className="flex flex-wrap gap-1">
             {LEVELS.map((level) => (
               <Badge
@@ -300,14 +401,18 @@ export function ServiceLogs() {
             ))}
           </div>
           <span className="text-xs text-muted-foreground sm:ml-auto">
-            Last 24h · {lines.length} line{lines.length === 1 ? '' : 's'}
+            {rangeLabel} · {lines.length} line{lines.length === 1 ? '' : 's'}
             {hasNextPage ? '+' : ''}
           </span>
         </div>
 
         {/* Log panel — bounded height + its own scrollbar. Tails to the newest
             line on load; scrolling to the top lazily pages in older lines. */}
-        {error ? (
+        {preset === 'custom' && !customRange?.from ? (
+          <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
+            Select a start date above to load logs for a custom time range.
+          </div>
+        ) : error ? (
           <div className="rounded-md border border-destructive/40 bg-destructive/5 p-4 text-sm text-destructive">
             Failed to load logs: {(error as Error).message}
           </div>
@@ -319,8 +424,8 @@ export function ServiceLogs() {
           </div>
         ) : lines.length === 0 ? (
           <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-            No logs found in the last 24 hours. Logs appear here once the
-            service container emits output.
+            No logs found for {rangeLabel.toLowerCase()}. Logs appear here once
+            the service container emits output.
           </div>
         ) : (
           <div className="rounded-md border bg-muted/30">
@@ -341,7 +446,7 @@ export function ServiceLogs() {
                 </div>
               ) : (
                 <div className="py-1.5 text-center text-xs text-muted-foreground/50">
-                  Beginning of the last 24 hours
+                  Beginning of {rangeLabel.toLowerCase()}
                 </div>
               )}
               <pre className="min-w-full px-3 pb-3 font-mono text-xs leading-relaxed">

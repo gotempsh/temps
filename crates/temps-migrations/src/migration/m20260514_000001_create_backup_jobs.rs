@@ -286,29 +286,38 @@ impl MigrationTrait for Migration {
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
         let db = manager.get_connection();
 
-        // Remove the FK + column added to backup_schedules first.
+        // Everything here is IF EXISTS-tolerant: m20260517_000002 drops
+        // backup_jobs/backup_job_steps (and the last_job_id column) with a
+        // no-op down(), so a full rollback reaches this migration with
+        // those objects already gone.
         db.execute_unprepared(
-            "ALTER TABLE backup_schedules \
+            "ALTER TABLE IF EXISTS backup_schedules \
              DROP CONSTRAINT IF EXISTS fk_backup_schedules_last_job_id",
         )
         .await?;
 
+        db.execute_unprepared(
+            "ALTER TABLE IF EXISTS backup_schedules DROP COLUMN IF EXISTS last_job_id",
+        )
+        .await?;
+
+        // Drop backup_job_steps before backup_jobs (FK dependency).
         manager
-            .alter_table(
-                Table::alter()
-                    .table(BackupSchedules::Table)
-                    .drop_column(BackupSchedules::LastJobId)
+            .drop_table(
+                Table::drop()
+                    .table(BackupJobSteps::Table)
+                    .if_exists()
                     .to_owned(),
             )
             .await?;
 
-        // Drop backup_job_steps before backup_jobs (FK dependency).
         manager
-            .drop_table(Table::drop().table(BackupJobSteps::Table).to_owned())
-            .await?;
-
-        manager
-            .drop_table(Table::drop().table(BackupJobs::Table).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(BackupJobs::Table)
+                    .if_exists()
+                    .to_owned(),
+            )
             .await?;
 
         Ok(())

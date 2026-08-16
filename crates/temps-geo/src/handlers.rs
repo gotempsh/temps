@@ -154,6 +154,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -209,6 +210,8 @@ mod tests {
             region: Some("New York".to_string()),
             timezone: Some("America/New_York".to_string()),
             is_eu: false,
+            asn_org: None,
+            is_hosting_provider: None,
         };
 
         let response = GeoLocationResponse::from(("8.8.8.8".to_string(), location));

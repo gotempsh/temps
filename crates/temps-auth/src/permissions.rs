@@ -37,10 +37,19 @@ pub enum Permission {
     UsersWrite,
     UsersDelete,
     UsersCreate,
+    /// Elevated user administration: create/update/delete/restore users and
+    /// assign or remove their roles. Held only by `Role::Admin` so that a
+    /// weaker role such as `PlatformAdmin` (which still has UsersWrite) cannot
+    /// mint or promote an `admin` account. Can also be granted directly to an
+    /// API key that needs to manage users without being a full admin.
+    UsersManage,
 
     // System admin permissions
     SystemAdmin,
     SystemRead,
+
+    // Plaintext credential access
+    SecretsRead,
 
     // API Key management
     ApiKeysRead,
@@ -72,6 +81,17 @@ pub enum Permission {
     // Settings permissions
     SettingsRead,
     SettingsWrite,
+
+    // DNS provider and unattended automation permissions
+    DnsProvidersRead,
+    DnsProvidersWrite,
+    DnsAutomationWrite,
+    /// Apply a release update to the server binary and restart the process.
+    /// Deliberately separate from `SettingsWrite`: replacing the running binary
+    /// and dropping every in-flight request is a different class of action from
+    /// editing a config value, so a custom role scoped to settings must not
+    /// acquire it implicitly.
+    PlatformUpdate,
 
     // Files permissions
     FilesRead,
@@ -194,6 +214,11 @@ pub enum Permission {
     KvWrite,
     KvDelete,
 
+    // Feature flag permissions
+    FlagsRead,
+    FlagsWrite,
+    FlagsDelete,
+
     // Status Page permissions
     StatusPageRead,
     StatusPageWrite,
@@ -251,8 +276,10 @@ impl fmt::Display for Permission {
             Permission::UsersWrite => "users:write",
             Permission::UsersDelete => "users:delete",
             Permission::UsersCreate => "users:create",
+            Permission::UsersManage => "users:manage",
             Permission::SystemAdmin => "system:admin",
             Permission::SystemRead => "system:read",
+            Permission::SecretsRead => "secrets:read",
             Permission::ApiKeysRead => "api_keys:read",
             Permission::ApiKeysWrite => "api_keys:write",
             Permission::ApiKeysDelete => "api_keys:delete",
@@ -307,6 +334,10 @@ impl fmt::Display for Permission {
             Permission::WebSocketProxyConnect => "websocket_proxy:connect",
             Permission::SettingsRead => "settings:read",
             Permission::SettingsWrite => "settings:write",
+            Permission::DnsProvidersRead => "dns_providers:read",
+            Permission::DnsProvidersWrite => "dns_providers:write",
+            Permission::DnsAutomationWrite => "dns_automation:write",
+            Permission::PlatformUpdate => "platform:update",
             Permission::ErrorTrackingRead => "error_tracking:read",
             Permission::ErrorTrackingWrite => "error_tracking:write",
             Permission::ErrorTrackingCreate => "error_tracking:create",
@@ -347,6 +378,9 @@ impl fmt::Display for Permission {
             Permission::KvRead => "kv:read",
             Permission::KvWrite => "kv:write",
             Permission::KvDelete => "kv:delete",
+            Permission::FlagsRead => "flags:read",
+            Permission::FlagsWrite => "flags:write",
+            Permission::FlagsDelete => "flags:delete",
             Permission::StatusPageRead => "status_page:read",
             Permission::StatusPageWrite => "status_page:write",
             Permission::StatusPageCreate => "status_page:create",
@@ -395,8 +429,10 @@ impl Permission {
             "users:write" => Some(Permission::UsersWrite),
             "users:delete" => Some(Permission::UsersDelete),
             "users:create" => Some(Permission::UsersCreate),
+            "users:manage" => Some(Permission::UsersManage),
             "system:admin" => Some(Permission::SystemAdmin),
             "system:read" => Some(Permission::SystemRead),
+            "secrets:read" => Some(Permission::SecretsRead),
             "api_keys:read" => Some(Permission::ApiKeysRead),
             "api_keys:write" => Some(Permission::ApiKeysWrite),
             "api_keys:delete" => Some(Permission::ApiKeysDelete),
@@ -416,6 +452,10 @@ impl Permission {
             "external_services:create" => Some(Permission::ExternalServicesCreate),
             "settings:read" => Some(Permission::SettingsRead),
             "settings:write" => Some(Permission::SettingsWrite),
+            "dns_providers:read" => Some(Permission::DnsProvidersRead),
+            "dns_providers:write" => Some(Permission::DnsProvidersWrite),
+            "dns_automation:write" => Some(Permission::DnsAutomationWrite),
+            "platform:update" => Some(Permission::PlatformUpdate),
             "files:read" => Some(Permission::FilesRead),
             "files:write" => Some(Permission::FilesWrite),
             "files:delete" => Some(Permission::FilesDelete),
@@ -491,6 +531,9 @@ impl Permission {
             "kv:read" => Some(Permission::KvRead),
             "kv:write" => Some(Permission::KvWrite),
             "kv:delete" => Some(Permission::KvDelete),
+            "flags:read" => Some(Permission::FlagsRead),
+            "flags:write" => Some(Permission::FlagsWrite),
+            "flags:delete" => Some(Permission::FlagsDelete),
             "status_page:read" => Some(Permission::StatusPageRead),
             "status_page:write" => Some(Permission::StatusPageWrite),
             "status_page:create" => Some(Permission::StatusPageCreate),
@@ -536,8 +579,10 @@ impl Permission {
             Permission::UsersWrite,
             Permission::UsersDelete,
             Permission::UsersCreate,
+            Permission::UsersManage,
             Permission::SystemAdmin,
             Permission::SystemRead,
+            Permission::SecretsRead,
             Permission::ApiKeysRead,
             Permission::ApiKeysWrite,
             Permission::ApiKeysDelete,
@@ -557,6 +602,10 @@ impl Permission {
             Permission::ExternalServicesCreate,
             Permission::SettingsRead,
             Permission::SettingsWrite,
+            Permission::DnsProvidersRead,
+            Permission::DnsProvidersWrite,
+            Permission::DnsAutomationWrite,
+            Permission::PlatformUpdate,
             Permission::FilesRead,
             Permission::FilesWrite,
             Permission::FilesDelete,
@@ -632,6 +681,9 @@ impl Permission {
             Permission::KvRead,
             Permission::KvWrite,
             Permission::KvDelete,
+            Permission::FlagsRead,
+            Permission::FlagsWrite,
+            Permission::FlagsDelete,
             Permission::StatusPageRead,
             Permission::StatusPageWrite,
             Permission::StatusPageCreate,
@@ -771,14 +823,18 @@ impl Role {
                 Permission::PipelinesRead,
                 Permission::PipelinesWrite,
                 Permission::PlatformInfoRead,
+                Permission::PlatformUpdate,
                 Permission::ProjectsCreate,
-                Permission::ProjectsDelete,
                 Permission::ProjectsDelete,
                 Permission::ProjectsRead,
                 Permission::ProjectsWrite,
                 Permission::SessionMetricsRead,
                 Permission::SettingsRead,
                 Permission::SettingsWrite,
+                Permission::DnsProvidersRead,
+                Permission::DnsProvidersWrite,
+                Permission::DnsAutomationWrite,
+                Permission::SecretsRead,
                 Permission::SpeedInsightsRead,
                 Permission::SystemAdmin,
                 Permission::SystemRead,
@@ -786,6 +842,7 @@ impl Role {
                 Permission::UsersDelete,
                 Permission::UsersRead,
                 Permission::UsersWrite,
+                Permission::UsersManage,
                 Permission::WebSocketProxyConnect,
                 Permission::WebhooksCreate,
                 Permission::WebhooksDelete,
@@ -831,6 +888,9 @@ impl Role {
                 Permission::KvRead,
                 Permission::KvWrite,
                 Permission::KvDelete,
+                Permission::FlagsRead,
+                Permission::FlagsWrite,
+                Permission::FlagsDelete,
                 Permission::StatusPageRead,
                 Permission::StatusPageWrite,
                 Permission::StatusPageCreate,
@@ -906,14 +966,17 @@ impl Role {
                 Permission::NotificationProvidersWrite,
                 Permission::PipelinesCreate,
                 Permission::PipelinesDelete,
-                Permission::PipelinesExecute,
                 Permission::PipelinesRead,
                 Permission::PipelinesWrite,
                 Permission::PlatformInfoRead,
+                Permission::PlatformUpdate,
                 Permission::ProjectsRead,
                 Permission::SessionMetricsRead,
                 Permission::SettingsRead,
                 Permission::SettingsWrite,
+                Permission::DnsProvidersRead,
+                Permission::DnsProvidersWrite,
+                Permission::DnsAutomationWrite,
                 Permission::SpeedInsightsRead,
                 Permission::SystemAdmin,
                 Permission::SystemRead,
@@ -966,6 +1029,9 @@ impl Role {
                 Permission::KvRead,
                 Permission::KvWrite,
                 Permission::KvDelete,
+                Permission::FlagsRead,
+                Permission::FlagsWrite,
+                Permission::FlagsDelete,
                 Permission::StatusPageRead,
                 Permission::StatusPageWrite,
                 Permission::StatusPageCreate,
@@ -975,14 +1041,11 @@ impl Role {
                 Permission::AiGatewayRead,
                 Permission::AiGatewayWrite,
                 Permission::AiGatewayExecute,
-                Permission::ContainersExec,
                 Permission::StacksRead,
                 Permission::StacksWrite,
                 Permission::StacksDelete,
                 Permission::StacksCreate,
                 Permission::SandboxesRead,
-                Permission::SandboxesWrite,
-                Permission::SandboxesExec,
             ],
             Role::User => &[
                 Permission::ProjectsRead,
@@ -1001,7 +1064,6 @@ impl Role {
                 Permission::ApiKeysRead,
                 Permission::ApiKeysWrite,
                 Permission::ApiKeysCreate,
-                Permission::AuditRead,
                 Permission::BackupsRead,
                 Permission::BackupsWrite,
                 Permission::BackupsCreate,
@@ -1074,6 +1136,8 @@ impl Role {
                 Permission::BlobWrite,
                 Permission::KvRead,
                 Permission::KvWrite,
+                Permission::FlagsRead,
+                Permission::FlagsWrite,
                 Permission::StatusPageRead,
                 Permission::StatusPageWrite,
                 Permission::StatusPageCreate,
@@ -1094,7 +1158,6 @@ impl Role {
                 Permission::DomainsRead,
                 Permission::EnvironmentsRead,
                 Permission::AnalyticsRead,
-                Permission::AuditRead,
                 Permission::BackupsRead,
                 Permission::CronsRead,
                 Permission::ExternalServicesRead,
@@ -1123,6 +1186,7 @@ impl Role {
                 Permission::VulnerabilityScansRead,
                 Permission::BlobRead,
                 Permission::KvRead,
+                Permission::FlagsRead,
                 Permission::StatusPageRead,
                 Permission::OtelRead,
                 Permission::AiGatewayRead,
@@ -1274,6 +1338,23 @@ mod tests {
     }
 
     #[test]
+    fn dns_governance_permissions_round_trip_and_stay_admin_only() {
+        for (permission, serialized) in [
+            (Permission::DnsProvidersRead, "dns_providers:read"),
+            (Permission::DnsProvidersWrite, "dns_providers:write"),
+            (Permission::DnsAutomationWrite, "dns_automation:write"),
+        ] {
+            assert_eq!(permission.to_string(), serialized);
+            assert_eq!(Permission::from_str(serialized), Some(permission));
+            assert!(Permission::all().contains(&permission));
+            assert!(Role::Admin.has_permission(&permission));
+            assert!(Role::PlatformAdmin.has_permission(&permission));
+            assert!(!Role::User.has_permission(&permission));
+            assert!(!Role::Reader.has_permission(&permission));
+        }
+    }
+
+    #[test]
     fn test_user_has_email_permissions() {
         let user_permissions = Role::User.permissions();
 
@@ -1315,6 +1396,46 @@ mod tests {
         assert!(Role::User.has_permission(&Permission::EmailsSend));
         // Reader does NOT have email send permission
         assert!(!Role::Reader.has_permission(&Permission::EmailsSend));
+    }
+
+    #[test]
+    fn plaintext_secret_access_is_admin_only_by_default() {
+        assert!(Role::Admin.has_permission(&Permission::SecretsRead));
+        assert!(!Role::PlatformAdmin.has_permission(&Permission::SecretsRead));
+        assert!(!Role::User.has_permission(&Permission::SecretsRead));
+        assert!(!Role::Reader.has_permission(&Permission::SecretsRead));
+        assert!(!Role::ApiReader.has_permission(&Permission::SecretsRead));
+    }
+
+    #[test]
+    fn secrets_read_permission_round_trips() {
+        assert_eq!(Permission::SecretsRead.to_string(), "secrets:read");
+        assert_eq!(
+            Permission::from_str("secrets:read"),
+            Some(Permission::SecretsRead)
+        );
+        assert!(Permission::all().contains(&Permission::SecretsRead));
+    }
+
+    #[test]
+    fn test_only_admin_holds_users_manage() {
+        // `users:manage` is the elevated gate for user administration. It must be
+        // held by `Admin` alone; if any weaker role (notably `PlatformAdmin`,
+        // which still holds `UsersWrite`) gains it, the privilege-escalation hole
+        // it was created to close reopens.
+        assert!(Role::Admin.has_permission(&Permission::UsersManage));
+        for role in [
+            Role::PlatformAdmin,
+            Role::User,
+            Role::Reader,
+            Role::ApiReader,
+            Role::MetricsIngest,
+        ] {
+            assert!(
+                !role.has_permission(&Permission::UsersManage),
+                "role {role:?} must not hold users:manage"
+            );
+        }
     }
 
     // Deployment token permission tests
@@ -1398,6 +1519,27 @@ mod tests {
     }
 
     #[test]
+    fn test_audit_read_is_restricted_to_administration_roles() {
+        // The audit log is a platform-wide, security-sensitive view (every
+        // user's and admin's actions, IP addresses, emails). Only the
+        // administration roles may read it; lower-privilege roles must not (an
+        // operator can still grant `audit:read` to a specific API key).
+        assert!(Role::Admin.has_permission(&Permission::AuditRead));
+        assert!(Role::PlatformAdmin.has_permission(&Permission::AuditRead));
+        for role in [
+            Role::User,
+            Role::Reader,
+            Role::ApiReader,
+            Role::MetricsIngest,
+        ] {
+            assert!(
+                !role.has_permission(&Permission::AuditRead),
+                "role {role:?} must not hold audit:read"
+            );
+        }
+    }
+
+    #[test]
     fn test_reader_has_read_only_deployment_token_permissions() {
         let reader_permissions = Role::Reader.permissions();
 
@@ -1408,5 +1550,31 @@ mod tests {
         assert!(!reader_permissions.contains(&Permission::DeploymentTokensWrite));
         assert!(!reader_permissions.contains(&Permission::DeploymentTokensCreate));
         assert!(!reader_permissions.contains(&Permission::DeploymentTokensDelete));
+    }
+
+    #[test]
+    fn test_platform_admin_cannot_execute_in_customer_workloads() {
+        // PlatformAdmin is documented as read-only on deployable resources, so
+        // it must not hold permissions that run code inside customer workloads
+        // (a container/sandbox shell or a pipeline run would bypass that intent).
+        // An operator who wants that capability can grant these to an API key.
+        let platform_admin = Role::PlatformAdmin.permissions();
+        assert!(!platform_admin.contains(&Permission::ContainersExec));
+        assert!(!platform_admin.contains(&Permission::SandboxesWrite));
+        assert!(!platform_admin.contains(&Permission::SandboxesExec));
+        assert!(!platform_admin.contains(&Permission::PipelinesExecute));
+
+        // The Admin role still holds them (unchanged), and User keeps the two it
+        // legitimately needs for its own deployable resources.
+        let admin = Role::Admin.permissions();
+        assert!(admin.contains(&Permission::ContainersExec));
+        assert!(admin.contains(&Permission::SandboxesWrite));
+        assert!(admin.contains(&Permission::SandboxesExec));
+        assert!(admin.contains(&Permission::PipelinesExecute));
+        let user = Role::User.permissions();
+        assert!(user.contains(&Permission::SandboxesWrite));
+        assert!(user.contains(&Permission::SandboxesExec));
+        assert!(user.contains(&Permission::PipelinesExecute));
+        assert!(!user.contains(&Permission::ContainersExec));
     }
 }

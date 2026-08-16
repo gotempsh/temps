@@ -3,6 +3,8 @@ use axum::http::StatusCode;
 use serde::Serialize;
 use std::collections::HashMap;
 
+use crate::problemdetails::PermissionDenialKind;
+
 pub struct ErrorBuilder {
     status: StatusCode,
     type_: String,
@@ -10,6 +12,7 @@ pub struct ErrorBuilder {
     detail: String,
     instance: String,
     values: HashMap<String, serde_json::Value>,
+    permission_denial: Option<(PermissionDenialKind, Option<String>)>,
 }
 
 impl ErrorBuilder {
@@ -21,6 +24,7 @@ impl ErrorBuilder {
             detail: String::new(),
             instance: String::new(),
             values: HashMap::new(),
+            permission_denial: None,
         }
     }
 
@@ -51,6 +55,18 @@ impl ErrorBuilder {
         self
     }
 
+    /// Attach internal authorization-denial metadata for response middleware.
+    /// This metadata is never serialized into the problem body.
+    #[doc(hidden)]
+    pub fn permission_denial(
+        mut self,
+        kind: PermissionDenialKind,
+        required_permission: Option<String>,
+    ) -> Self {
+        self.permission_denial = Some((kind, required_permission));
+        self
+    }
+
     pub fn build(self) -> problemdetails::Problem {
         let mut problem = problemdetails::new(self.status)
             .with_type(self.type_)
@@ -61,6 +77,10 @@ impl ErrorBuilder {
 
         for (key, value) in self.values {
             problem = problem.with_value(&key, value);
+        }
+
+        if let Some((kind, required_permission)) = self.permission_denial {
+            problem = problem.with_permission_denial(kind, required_permission);
         }
 
         problem

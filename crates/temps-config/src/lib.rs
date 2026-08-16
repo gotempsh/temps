@@ -11,4 +11,4 @@ pub use disk_status::{
 pub use enrollment_tokens::{EnrollmentError, EnrollmentTokenService, MintParams};
 pub use handler::{configure_routes, SettingsApiDoc, SettingsState};
 pub use plugin::ConfigPlugin;
-pub use service::{ConfigService, ConfigServiceError, ServerConfig};
+pub use service::{ConfigService, ConfigServiceError, EffectiveTelemetryPolicies, ServerConfig};

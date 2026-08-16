@@ -328,6 +328,99 @@ async fn test_openai_streaming_chat_completion() {
 }
 
 #[tokio::test]
+async fn test_openai_responses_supports_reasoning_with_tools() {
+    let server = MockOpenAiServer::start().await;
+    let provider = OpenAiCompatProvider::openai();
+    let mut request = simple_chat_request("gpt-5.6-luna");
+    request.tools = Some(vec![serde_json::json!({
+        "type": "function",
+        "function": {
+            "name": "lookup",
+            "description": "Look up project data",
+            "parameters": {"type": "object", "properties": {}}
+        }
+    })]);
+    request.extra = Some(serde_json::Map::from_iter([(
+        "reasoning_effort".to_string(),
+        serde_json::json!("medium"),
+    )]));
+
+    let response = provider
+        .chat_completion("sk-test-key", Some(&server.base_url), &request)
+        .await
+        .expect("modern OpenAI model should use Responses transport");
+
+    assert_eq!(response.id, "resp_mock");
+    assert_eq!(
+        response.choices[0].finish_reason.as_deref(),
+        Some("tool_calls")
+    );
+    let gateway_call_id = response.choices[0].message.tool_calls.as_ref().unwrap()[0]["id"]
+        .as_str()
+        .expect("gateway call id")
+        .to_string();
+    assert_ne!(gateway_call_id, "call_mock");
+
+    let mut follow_up = simple_chat_request("gpt-5.6-luna");
+    follow_up.messages = vec![
+        ChatMessage {
+            role: "assistant".to_string(),
+            content: None,
+            name: None,
+            tool_calls: Some(vec![serde_json::json!({
+                "id": gateway_call_id.clone(),
+                "type": "function",
+                "function": {"name": "lookup", "arguments": "{}"}
+            })]),
+            tool_call_id: None,
+        },
+        ChatMessage {
+            role: "tool".to_string(),
+            content: Some(MessageContent::Text("4".to_string())),
+            name: None,
+            tool_calls: None,
+            tool_call_id: Some(gateway_call_id),
+        },
+    ];
+    let follow_up_response = provider
+        .chat_completion("sk-test-key", Some(&server.base_url), &follow_up)
+        .await
+        .expect("gateway should restore upstream call id and reasoning context");
+    assert_eq!(
+        follow_up_response.choices[0]
+            .message
+            .content
+            .as_ref()
+            .and_then(MessageContent::as_text),
+        Some("Tool result accepted")
+    );
+}
+
+#[tokio::test]
+async fn test_openai_responses_stream_translates_partial_text() {
+    let server = MockOpenAiServer::start().await;
+    let provider = OpenAiCompatProvider::openai();
+    let request = streaming_chat_request("gpt-5.6-luna");
+
+    let stream = provider
+        .chat_completion_stream("sk-test-key", Some(&server.base_url), &request)
+        .await
+        .expect("Responses stream should start");
+    let raw_chunks = collect_sse_chunks(stream).await;
+    let full_stream = raw_chunks.join("");
+    assert!(full_stream.contains("[DONE]"));
+    let chunks = parse_sse_chunks(&raw_chunks);
+    let content = chunks
+        .iter()
+        .filter_map(|chunk| chunk.choices[0].delta.content.as_deref())
+        .collect::<String>();
+    assert_eq!(content, "Hello from Responses");
+    assert!(chunks
+        .iter()
+        .any(|chunk| chunk.choices[0].finish_reason.as_deref() == Some("stop")));
+}
+
+#[tokio::test]
 async fn test_openai_embeddings() {
     let server = MockOpenAiServer::start().await;
     let provider = OpenAiCompatProvider::openai();

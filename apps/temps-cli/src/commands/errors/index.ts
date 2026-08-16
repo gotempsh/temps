@@ -15,9 +15,9 @@ import type { ErrorGroupResponse, ErrorEventResponse, ErrorTimeSeriesDataRespons
 import { withSpinner, startSpinner, succeedSpinner, failSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue, formatRelativeTime } from '../../ui/output.js'
-import { readFile } from 'node:fs/promises'
-import { existsSync } from 'node:fs'
-import { resolve, basename } from 'node:path'
+import { readFile, readdir } from 'node:fs/promises'
+import { existsSync, statSync } from 'node:fs'
+import { resolve, basename, join } from 'node:path'
 
 interface ListOptions {
   projectId: string
@@ -131,6 +131,54 @@ interface SourceMapListResponse {
 interface ReleaseListResponse {
   releases: string[]
 }
+
+interface SourceFileUploadOptions {
+  projectId: string
+  release: string
+  file?: string
+  filePath?: string
+  dir?: string
+  ext?: string
+}
+
+interface SourceFileListOptions {
+  projectId: string
+  release: string
+  json?: boolean
+}
+
+interface SourceFileDeleteOptions {
+  projectId: string
+  release: string
+}
+
+// Source file API response shapes
+interface SourceFileResponse {
+  id: number
+  project_id: number
+  release: string
+  file_path: string
+  size_bytes: number
+  checksum?: string
+  created_at: string
+}
+
+interface SourceFileListResponse {
+  source_files: SourceFileResponse[]
+  total: number
+}
+
+/// Default source extensions uploaded by `source-files upload --dir`.
+const DEFAULT_SOURCE_EXTS = [
+  'go', 'rs', 'py', 'rb', 'js', 'jsx', 'ts', 'tsx', 'java', 'kt',
+  'c', 'h', 'cpp', 'cc', 'hpp', 'cs', 'php', 'swift', 'scala', 'ex', 'exs',
+]
+
+/// Directory names never walked by `--dir` (deps, build output, VCS metadata).
+const SKIP_DIRS = new Set([
+  '.git', 'node_modules', 'vendor', 'target', 'dist', 'build',
+  '.next', '.nuxt', '.venv', 'venv', '__pycache__', '.temps',
+])
 
 interface DeleteResponse {
   deleted: number
@@ -264,6 +312,47 @@ export function registerErrorsCommands(program: Command): void {
     .requiredOption('--project-id <id>', 'Project ID')
     .requiredOption('--source-map-id <id>', 'Source map ID')
     .action(deleteSourceMap)
+
+  const sourceFiles = errors
+    .command('source-files')
+    .alias('sf')
+    .description('Manage raw source files for native (Go/Rust/…) symbolication')
+
+  sourceFiles
+    .command('upload')
+    .description('Upload source file(s) for a release (single --file or a --dir tree)')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption(
+      '--release <version>',
+      'Release version (must match the app\'s SENTRY_RELEASE, e.g. the deployed commit SHA)'
+    )
+    .option('--file <path>', 'Path to a single source file')
+    .option(
+      '--file-path <path>',
+      'Path as it appears in stack frames (e.g. internal/gateway/main.go); defaults to the file name'
+    )
+    .option('--dir <root>', 'Upload every source file under this directory, recursively')
+    .option(
+      '--ext <csv>',
+      `Comma-separated extensions to include with --dir (default: ${DEFAULT_SOURCE_EXTS.join(',')})`
+    )
+    .action(uploadSourceFileAction)
+
+  sourceFiles
+    .command('list')
+    .alias('ls')
+    .description('List uploaded source files for a release')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--release <version>', 'Release version')
+    .option('--json', 'Output in JSON format')
+    .action(listSourceFilesAction)
+
+  sourceFiles
+    .command('delete')
+    .description('Delete all source files for a release')
+    .requiredOption('--project-id <id>', 'Project ID')
+    .requiredOption('--release <version>', 'Release version')
+    .action(deleteSourceFilesAction)
 }
 
 async function listErrorGroupsAction(options: ListOptions): Promise<void> {
@@ -692,6 +781,231 @@ async function uploadSourceMap(options: SourceMapUploadOptions): Promise<void> {
   }
 }
 
+/** POST a single raw source file to the native source-files endpoint. */
+async function postSourceFile(
+  apiUrl: string,
+  apiKey: string,
+  projectId: number,
+  release: string,
+  content: Uint8Array,
+  filePath: string
+): Promise<
+  { ok: true; result: SourceFileResponse } | { ok: false; status: number; text: string }
+> {
+  const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(release)}/source-files`
+  const formData = new FormData()
+  // Copy into a fresh ArrayBuffer-backed view so it satisfies BlobPart.
+  formData.append('file', new Blob([new Uint8Array(content)], { type: 'text/plain' }), basename(filePath))
+  formData.append('file_path', filePath)
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: formData,
+  })
+  if (!response.ok) {
+    return { ok: false, status: response.status, text: await response.text() }
+  }
+  return { ok: true, result: (await response.json()) as SourceFileResponse }
+}
+
+async function uploadSourceFileAction(options: SourceFileUploadOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  if (isNaN(projectId)) {
+    warning('Invalid project ID')
+    return
+  }
+  if (!options.file && !options.dir) {
+    warning('Provide --file <path> for a single file, or --dir <root> to upload a tree')
+    return
+  }
+  if (options.file && options.dir) {
+    warning('Use either --file or --dir, not both')
+    return
+  }
+
+  const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+  const apiKey = await credentials.getApiKey()
+  if (!apiKey) {
+    warning('Not authenticated — run `temps auth login` first')
+    return
+  }
+
+  // Single-file mode.
+  if (options.file) {
+    const resolvedPath = resolve(options.file)
+    if (!existsSync(resolvedPath)) {
+      warning(`File does not exist: ${resolvedPath}`)
+      return
+    }
+    const filePath = options.filePath ?? basename(resolvedPath)
+    startSpinner(`Uploading source file: ${filePath}...`)
+    try {
+      const data = await readFile(resolvedPath)
+      const res = await postSourceFile(
+        apiUrl,
+        apiKey,
+        projectId,
+        options.release,
+        new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+        filePath
+      )
+      if (!res.ok) {
+        failSpinner(`Upload failed: ${res.status}`)
+        warning(res.text)
+        return
+      }
+      succeedSpinner(`Source file uploaded (id=${res.result.id})`)
+      newline()
+      keyValue('Release', res.result.release)
+      keyValue('File Path', res.result.file_path)
+      keyValue('Size', formatBytes(res.result.size_bytes))
+      newline()
+    } catch (err) {
+      failSpinner('Upload failed')
+      throw err
+    }
+    return
+  }
+
+  // Directory mode: upload every matching file, keyed by its path relative to
+  // the root — which is exactly how a `-trimpath` Go binary (and most native
+  // SDKs) report frame filenames.
+  const root = resolve(options.dir as string)
+  if (!existsSync(root) || !statSync(root).isDirectory()) {
+    warning(`Directory does not exist: ${root}`)
+    return
+  }
+  const exts = parseSourceFileExtensions(options.ext)
+
+  const entries = (await readdir(root, { recursive: true })) as string[]
+  const relPaths = entries.filter((rel) => {
+    if (!matchesSourceFileFilter(rel, exts)) return false
+    // Recursive readdir returns directories too; keep only real files.
+    try {
+      return statSync(join(root, rel)).isFile()
+    } catch {
+      return false
+    }
+  })
+
+  if (relPaths.length === 0) {
+    warning(`No matching source files under ${root} (extensions: ${[...exts].join(', ')})`)
+    return
+  }
+
+  startSpinner(`Uploading ${relPaths.length} source file(s) for release "${options.release}"...`)
+  let uploaded = 0
+  const failures: string[] = []
+  for (const rel of relPaths) {
+    try {
+      const data = await readFile(join(root, rel))
+      const res = await postSourceFile(
+        apiUrl,
+        apiKey,
+        projectId,
+        options.release,
+        new Uint8Array(data.buffer, data.byteOffset, data.byteLength),
+        rel
+      )
+      if (res.ok) uploaded++
+      else failures.push(`${rel}: ${res.status} ${res.text}`)
+    } catch (err) {
+      failures.push(`${rel}: ${getErrorMessage(err)}`)
+    }
+  }
+
+  if (failures.length > 0) {
+    failSpinner(`Uploaded ${uploaded}/${relPaths.length}; ${failures.length} failed`)
+    for (const f of failures.slice(0, 10)) warning(f)
+  } else {
+    succeedSpinner(`Uploaded ${uploaded} source file(s) for release "${options.release}"`)
+  }
+  newline()
+}
+
+async function listSourceFilesAction(options: SourceFileListOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  if (isNaN(projectId)) {
+    warning('Invalid project ID')
+    return
+  }
+
+  const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+  const apiKey = await credentials.getApiKey()
+  const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(options.release)}/source-files`
+
+  const result = await withSpinner('Fetching source files...', async () => {
+    const response = await fetch(url, {
+      headers: { Authorization: `Bearer ${apiKey}` },
+    })
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Request failed (${response.status}): ${errorText}`)
+    }
+    return response.json() as Promise<SourceFileListResponse>
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Source Files for Release "${options.release}" (${result.total})`)
+
+  if (result.source_files.length === 0) {
+    info('No source files found for this release')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<SourceFileResponse>[] = [
+    { header: 'ID', key: 'id', width: 6 },
+    { header: 'File Path', key: 'file_path' },
+    { header: 'Size', accessor: (m) => formatBytes(m.size_bytes) },
+    { header: 'Uploaded', accessor: (m) => formatRelativeTime(m.created_at) },
+  ]
+  printTable(result.source_files, columns, { style: 'minimal' })
+  newline()
+}
+
+async function deleteSourceFilesAction(options: SourceFileDeleteOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projectId = parseInt(options.projectId, 10)
+  if (isNaN(projectId)) {
+    warning('Invalid project ID')
+    return
+  }
+
+  const apiUrl = normalizeApiUrl(config.get('apiUrl'))
+  const apiKey = await credentials.getApiKey()
+  const url = `${apiUrl}/projects/${projectId}/releases/${encodeURIComponent(options.release)}/source-files`
+
+  const result = await withSpinner('Deleting source files...', async () => {
+    const response = await fetch(url, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${apiKey}` },
+    })
+    if (!response.ok) {
+      const errorText = await response.text()
+      throw new Error(`Request failed (${response.status}): ${errorText}`)
+    }
+    return response.json() as Promise<{ deleted: number }>
+  })
+
+  success(`Deleted ${result.deleted} source file(s) for release "${options.release}"`)
+  newline()
+}
+
 async function listSourceMaps(options: SourceMapListOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -846,10 +1160,26 @@ async function deleteSourceMap(options: SourceMapDeleteOneOptions): Promise<void
   success(`Source map #${sourceMapId} deleted`)
 }
 
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+}
+
+/** Normalize a `--ext` CSV (or fall back to defaults) into a lookup set of bare, lowercased extensions. */
+export function parseSourceFileExtensions(extCsv: string | undefined): Set<string> {
+  return new Set(
+    (extCsv ? extCsv.split(',') : DEFAULT_SOURCE_EXTS)
+      .map((e) => e.trim().replace(/^\./, '').toLowerCase())
+      .filter(Boolean)
+  )
+}
+
+/** Whether a `--dir`-relative path should be uploaded: right extension, and not under a skipped directory at any depth. */
+export function matchesSourceFileFilter(rel: string, exts: Set<string>): boolean {
+  if (rel.split(/[/\\]/).some((seg) => SKIP_DIRS.has(seg))) return false
+  const ext = rel.split('.').pop()?.toLowerCase() ?? ''
+  return exts.has(ext)
 }
 
 async function getErrorDashboardAction(options: DashboardOptions): Promise<void> {

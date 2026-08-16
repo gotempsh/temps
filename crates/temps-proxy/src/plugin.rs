@@ -16,7 +16,18 @@ use crate::{
     },
 };
 
-pub struct ProxyPlugin;
+pub struct ProxyPlugin {
+    /// Handle to the ClickHouse proxy-log storage's `RetentionResolver` slot,
+    /// captured in `register_services` (before the storage is moved into
+    /// `Arc<dyn ProxyLogStorage>`) and written into from
+    /// `initialize_plugin_services`, which runs only after every plugin has
+    /// registered its services. `register_services` runs in
+    /// plugin-registration order and this plugin registers before any
+    /// later-registered plugin (e.g. one implementing per-project retention)
+    /// gets a chance to provide a resolver — same two-phase handoff
+    /// `DeploymentsPlugin` uses for `DeploymentGate`.
+    retention_resolver_slot: tokio::sync::OnceCell<Arc<temps_core::RetentionResolverSlot>>,
+}
 
 impl TempsPlugin for ProxyPlugin {
     fn name(&self) -> &'static str {
@@ -48,6 +59,18 @@ impl TempsPlugin for ProxyPlugin {
                 .get_service::<temps_config::ConfigService>()
                 .map(|cs| cs.get_server_config());
 
+            // Pre-registered by the top-level `temps serve` orchestrator
+            // (commands/serve/mod.rs) BEFORE any plugin's `register_services`
+            // runs, specifically so this exact slot instance can also be
+            // handed directly to `start_proxy_server` — the live Pingora
+            // proxy builds its own isolated plugin context that can never see
+            // anything registered here. A plugin (e.g. one implementing
+            // per-project data retention policies) is wired in later from
+            // `initialize_plugin_services`, once every plugin (including a
+            // later-registered plugin) has finished registering.
+            let retention_slot = context.require_service::<temps_core::RetentionResolverSlot>();
+            let _ = self.retention_resolver_slot.set(retention_slot.clone());
+
             // Create LB service
             let lb_service = Arc::new(LbService::new(db.clone()));
 
@@ -56,9 +79,12 @@ impl TempsPlugin for ProxyPlugin {
             // When ClickHouse is NOT configured this resolves to the default
             // TimescaleDB path with no behaviour change.
             let proxy_log_storage = match server_config {
-                Some(config) => {
-                    crate::storage::build_proxy_log_storage(&config, db.clone(), ip_service.clone())
-                }
+                Some(config) => crate::storage::build_proxy_log_storage(
+                    &config,
+                    db.clone(),
+                    ip_service.clone(),
+                    retention_slot as Arc<dyn temps_core::RetentionResolver>,
+                ),
                 None => {
                     tracing::debug!(
                         "Proxy plugin: ConfigService unavailable; proxy logs use the \
@@ -79,6 +105,9 @@ impl TempsPlugin for ProxyPlugin {
                 ip_service,
                 proxy_log_storage,
             ));
+            let api_traffic_data_source: Arc<
+                dyn temps_analytics::api_traffic::ApiTrafficDataSource,
+            > = proxy_log_service.clone();
 
             // Create IP Access Control service
             let ip_access_control_service = Arc::new(IpAccessControlService::new(db.clone()));
@@ -89,6 +118,7 @@ impl TempsPlugin for ProxyPlugin {
             // Register the services for other plugins to use
             context.register_service(lb_service);
             context.register_service(proxy_log_service);
+            context.register_service(api_traffic_data_source);
             context.register_service(ip_access_control_service);
             context.register_service(challenge_service);
 
@@ -97,10 +127,39 @@ impl TempsPlugin for ProxyPlugin {
         })
     }
 
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Runs after every plugin has registered its services, so this is
+            // the first point at which an optional plugin-provided
+            // RetentionResolver (e.g. from a plugin implementing per-project
+            // retention) can actually be found.
+            if let Some(slot) = self.retention_resolver_slot.get() {
+                if let Some(resolver) = context.get_service::<dyn temps_core::RetentionResolver>() {
+                    if slot.set(resolver) {
+                        tracing::debug!(
+                            "proxy: RetentionResolver wired in from a registered plugin"
+                        );
+                    } else {
+                        tracing::warn!(
+                            "proxy: RetentionResolver slot was already claimed; \
+                             this plugin's resolver was NOT installed. \
+                             Check plugin registration order."
+                        );
+                    }
+                }
+            }
+            Ok(())
+        })
+    }
+
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // Get the required services from the service registry
         let lb_service = context.require_service::<LbService>();
         let proxy_log_service = context.require_service::<ProxyLogService>();
+        let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let ip_access_control_service = context.require_service::<IpAccessControlService>();
         let challenge_service = context.require_service::<ChallengeService>();
         let db = context.require_service::<DbConnection>();
@@ -114,10 +173,15 @@ impl TempsPlugin for ProxyPlugin {
             challenge_service: challenge_service.clone(),
         });
 
+        let proxy_logs_state = Arc::new(crate::handler::proxy_logs::ProxyLogsState {
+            service: proxy_log_service,
+            project_access_checker,
+        });
+
         // Configure routes with the app state
         let router = crate::handler::handler::configure_routes()
             .with_state(app_state)
-            .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_log_service))
+            .merge(crate::handler::proxy_logs::create_routes().with_state(proxy_logs_state))
             .merge(
                 crate::handler::ip_access_control::create_routes()
                     .with_state(ip_access_control_service),
@@ -144,7 +208,9 @@ impl TempsPlugin for ProxyPlugin {
 
 impl ProxyPlugin {
     pub fn new() -> Self {
-        Self
+        Self {
+            retention_resolver_slot: tokio::sync::OnceCell::new(),
+        }
     }
 }
 
@@ -177,6 +243,11 @@ mod tests {
             geo_ip_service,
         ));
         context.register_service(ip_service);
+
+        // Pre-registered by the top-level `temps serve` orchestrator in real
+        // boot (commands/serve/mod.rs), before any plugin's register_services
+        // runs — see the `retention_resolver_slot` field doc.
+        context.register_service(Arc::new(temps_core::RetentionResolverSlot::new_default()));
 
         // No ConfigService is registered here: the plugin reads it via
         // `get_service` and, when absent, selects the default TimescaleDB

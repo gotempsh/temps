@@ -1,0 +1,48 @@
+---
+title: Feature maturity
+description: What Stable, Beta, and Experimental mean in Temps.
+---
+
+# Feature maturity
+
+Temps labels features by the compatibility promise attached to them. The label
+describes how much a feature may change between releases; it is not a claim
+that a feature can never have a bug.
+
+Stable features do not carry a badge in the console. Beta and Experimental
+features remain fully visible and usable, with a badge beside their navigation
+item and page title.
+
+## Stable
+
+This works, it is verified end to end in CI on every commit, and we will not
+break it in a `0.1.x` release.
+
+- HTTP API shapes, CLI flags, and configuration keys remain compatible within
+  `0.1.x`.
+- Database migrations preserve your data across upgrades.
+- Regressions are treated as release-blocking.
+
+## Beta
+
+This works and we test it, but the data model or API may still change between
+releases.
+
+- The feature is functional and covered by tests.
+- Upgrades preserve platform data, while feature-specific schemas may be
+  reshaped or migrated lossily.
+- Breaking changes are documented in the changelog.
+
+## Experimental
+
+This is under active development. It may change substantially or be removed,
+so do not build critical workflows on it yet.
+
+Experimental features are not hidden or disabled. The badge exists so you can
+make an informed decision while still trying the feature and giving feedback.
+
+## Where the label comes from
+
+Every release ships a build-time feature maturity registry. The console, the
+OpenAPI description, and the Temps CLI read the same registry so the promise is
+consistent across interfaces.

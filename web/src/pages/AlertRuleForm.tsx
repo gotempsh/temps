@@ -36,7 +36,8 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useMemo } from 'react'
 import { useForm } from 'react-hook-form'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useParams } from 'react-router'
+import { useGoBack } from '@/hooks/useGoBack'
 import { toast } from 'sonner'
 import { z } from 'zod'
 
@@ -82,9 +83,9 @@ interface AlertRuleFormProps {
 }
 
 export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
-  const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { ruleId } = useParams()
+  const { ruleId, slug } = useParams()
+  const goBack = useGoBack(`/projects/${slug}/errors/alert-rules`)
   const isEditing = !!ruleId
 
   const { data: existingRule, isLoading: ruleLoading } = useQuery({
@@ -137,7 +138,7 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
     onSuccess: () => {
       toast.success('Alert rule created')
       queryClient.invalidateQueries({ predicate: (query) => (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlertRules' })
-      navigate(-1)
+      goBack()
     },
   })
 
@@ -147,7 +148,7 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
     onSuccess: () => {
       toast.success('Alert rule updated')
       queryClient.invalidateQueries({ predicate: (query) => (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlertRules' })
-      navigate(-1)
+      goBack()
     },
   })
 
@@ -202,7 +203,7 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
   return (
     <div className="space-y-6 max-w-2xl mx-auto">
       <div className="flex items-center gap-4">
-        <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+        <Button variant="ghost" size="icon" onClick={() => goBack()}>
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div>
@@ -455,7 +456,7 @@ export function AlertRuleForm({ projectId }: AlertRuleFormProps) {
                       ? 'Update Rule'
                       : 'Create Rule'}
                 </Button>
-                <Button type="button" variant="outline" onClick={() => navigate(-1)}>
+                <Button type="button" variant="outline" onClick={() => goBack()}>
                   Cancel
                 </Button>
               </div>

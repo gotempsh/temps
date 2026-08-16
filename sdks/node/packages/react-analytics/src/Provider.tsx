@@ -45,6 +45,7 @@ export function TempsAnalyticsProvider({
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: domain || window.location.hostname,
+        language: navigator.language,
         event_data: data,
       }, "POST", basePath);
     },
@@ -59,6 +60,7 @@ export function TempsAnalyticsProvider({
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: domain || window.location.hostname,
+        language: navigator.language,
         event_data: {
           referrer: document.referrer,
           userAgent: navigator.userAgent,
@@ -190,6 +192,7 @@ export function TempsAnalyticsProvider({
           request_query: window.location.search,
           request_path: window.location.pathname,
           domain: domain || window.location.hostname,
+          language: navigator.language,
           event_data: {
             time_on_page_ms: timeOnPage,
             timestamp: new Date().toISOString(),

@@ -52,6 +52,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: resolveDomain(),
+        language: navigator.language,
         event_data: data as Record<string, JsonValue>,
       },
       "POST",
@@ -68,6 +69,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: resolveDomain(),
+        language: navigator.language,
         event_data: {
           referrer: document.referrer,
           userAgent: navigator.userAgent,
@@ -264,6 +266,7 @@ function setupLegacyPageLeave(
         request_query: window.location.search,
         request_path: window.location.pathname,
         domain: resolveDomain(),
+        language: navigator.language,
         event_data: {
           time_on_page_ms: timeOnPage,
           timestamp: new Date().toISOString(),

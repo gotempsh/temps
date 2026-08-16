@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated on: 2026-01-02
+> Generated on: 2026-08-14
 
 ## Installation
 
@@ -33,94 +33,85 @@ bunx @temps-sdk/cli configure
 
 ## Commands
 
-## `login`
-
-Authenticate with Temps using an API key
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `-k, --api-key <key>` | API key (will prompt if not provided) | - | Yes |
-
-## `logout`
-
-Log out and clear credentials
-
-## `whoami`
-
-Display current authenticated user
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--json` | Output as JSON | - | No |
-
-## `configure`
-
-Configure CLI settings (AWS-style wizard)
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--api-url <url>` | API URL | - | Yes |
-| `--api-token <token>` | API token for authentication | - | Yes |
-| `--output-format <format>` | Output format (table, json, minimal) | - | Yes |
-| `--enable-colors` | Enable colored output in config | - | No |
-| `--disable-colors` | Disable colored output in config | - | No |
-| `-i, --interactive` | Force interactive mode even in non-TTY | - | No |
-| `-y, --no-interactive` | Non-interactive mode (uses defaults for unspecified options) | - | No |
-
-**Subcommands:**
-
-- `get` - Get a configuration value
-- `set` - Set a configuration value
-- `list` - List all configuration values
-- `show` - Show current configuration and authentication status
-- `reset` - Reset configuration to defaults
-
-### `configure get`
-
-Get a configuration value
-
-### `configure set`
-
-Set a configuration value
-
-### `configure list`
-
-List all configuration values
-
-### `configure show`
-
-Show current configuration and authentication status
-
-**Options:**
-
-| Flag | Description | Default | Required |
-|------|-------------|---------|----------|
-| `--json` | Output in JSON format | - | No |
-
-### `configure reset`
-
-Reset configuration to defaults
-
 ## `projects` (alias: `project`, `p`)
 
 Manage projects
 
 **Subcommands:**
 
+- `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY> (mode 0400), not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 - `list` (`ls`) - List all projects
-- `create` (`new`) - Create a new project
+- `create` (`new`) - Create a new project (git-based or manual deployment)
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
 - `settings` - Update project settings (slug, attack mode, preview environments)
 - `git` - Update git repository settings
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a project
+
+### `projects secrets`
+
+Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY> (mode 0400), not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
+
+**Subcommands:**
+
+- `list` (`ls`) - List secrets for a project (values are never returned)
+- `create` (`add`) - Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
+- `update` - Update a project secret (a redeploy is required for running containers to pick it up)
+- `delete` (`rm`) - Delete a project secret
+
+#### `projects secrets list` (alias: `ls`)
+
+List secrets for a project (values are never returned)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <name>` | Filter to one environment | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `projects secrets create` (alias: `add`)
+
+Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-k, --key <key>` | Secret key — becomes the filename at /run/secrets/<KEY>. Letters, digits, underscore; must start with a letter or underscore. | - | Yes |
+| `-v, --value <value>` | Secret value (<=1 MiB). Prefix with @ to read from a local file, e.g. @./auth.json — never touches shell history. | - | Yes |
+| `-e, --environment <name>` | Scope to one environment (repeatable; default: all) | `` | Yes |
+| `--include-in-preview` | Also mount this secret in preview environments | - | No |
+
+#### `projects secrets update`
+
+Update a project secret (a redeploy is required for running containers to pick it up)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-k, --key <key>` | Key of the secret to update | - | Yes |
+| `-v, --value <value>` | New value (<=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value. | - | Yes |
+| `-e, --environment <name>` | Replace environment scoping (repeatable) | `` | Yes |
+| `--include-in-preview` | Include in preview environments | - | No |
+| `--no-include-in-preview` | Exclude from preview environments | - | No |
+
+#### `projects secrets delete` (alias: `rm`)
+
+Delete a project secret
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ### `projects list` (alias: `ls`)
 
@@ -131,10 +122,12 @@ List all projects
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
+| `--page <n>` | Page number | - | Yes |
+| `--per-page <n>` | Items per page | - | Yes |
 
 ### `projects create` (alias: `new`)
 
-Create a new project
+Create a new project (git-based or manual deployment)
 
 **Options:**
 
@@ -142,7 +135,16 @@ Create a new project
 |------|-------------|---------|----------|
 | `-n, --name <name>` | Project name | - | Yes |
 | `-d, --description <description>` | Project description | - | Yes |
-| `--repo <repository>` | Git repository URL | - | Yes |
+| `--repo <repository>` | Repository in owner/name format (nested groups supported: group/subgroup/name) | - | Yes |
+| `--branch <branch>` | Git branch | - | Yes |
+| `--directory <directory>` | Root directory (relative to repo) | - | Yes |
+| `--preset <preset>` | Build preset (e.g., nextjs, nodejs, static, docker) | - | Yes |
+| `--connection <id>` | Git connection ID | - | Yes |
+| `--manual` | Create a manual (non-git) project - deploy via Docker image or static files | - | No |
+| `--source-type <type>` | Manual deployment method: manual (flexible), docker_image, or static_files | - | Yes |
+| `--image <image>` | Docker image for the first deployment (manual mode) | - | Yes |
+| `--port <port>` | Application/container port (manual mode, default: 3000) | - | Yes |
+| `-y, --yes` | Skip optional prompts (services, env vars, set-default) | - | No |
 
 ### `projects show` (alias: `get`)
 
@@ -200,6 +202,7 @@ Update git repository settings
 | `--branch <branch>` | Main branch | - | Yes |
 | `--directory <directory>` | App directory path | - | Yes |
 | `--preset <preset>` | Build preset (auto, nextjs, nodejs, static, docker, rust, go, python) | - | Yes |
+| `--connection <id>` | Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided/existing values (for automation) | - | No |
 
@@ -217,6 +220,9 @@ Update deployment configuration (resources, replicas)
 | `--memory-limit <limit>` | Memory limit in MB | - | Yes |
 | `--auto-deploy` | Enable automatic deployments | - | No |
 | `--no-auto-deploy` | Disable automatic deployments | - | No |
+| `--request-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | Yes |
+| `--sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | Yes |
+| `--websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | Yes |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
 
@@ -232,9 +238,23 @@ Delete a project
 | `-f, --force` | Skip confirmation | - | No |
 | `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
+## `drop`
+
+Detect and deploy a local source directory or ZIP without Git
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--name <name>` | Project name (slugified automatically) | - | Yes |
+| `--preset <preset>` | Select a detected preset | - | Yes |
+| `--directory <directory>` | Select a detected project root | - | Yes |
+| `--no-wait` | Do not wait for deployment to complete | - | No |
+| `--timeout <seconds>` | Deployment timeout | `600` | Yes |
+
 ## `deploy`
 
-Deploy a project
+Deploy a project from git
 
 **Options:**
 
@@ -244,8 +264,68 @@ Deploy a project
 | `-e, --environment <env>` | Target environment name | - | Yes |
 | `--environment-id <id>` | Target environment ID | - | Yes |
 | `-b, --branch <branch>` | Git branch to deploy | - | Yes |
+| `-c, --commit <sha>` | Specific commit SHA to deploy | - | Yes |
 | `--no-wait` | Do not wait for deployment to complete | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+## `deploy:static` (alias: `deploy-static`)
+
+Deploy static files (tar.gz, zip, or directory)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <path>` | Path to static files archive or directory | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <env>` | Target environment name | `production` | Yes |
+| `--environment-id <id>` | Target environment ID | - | Yes |
+| `--no-wait` | Do not wait for deployment to complete | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--metadata <json>` | Additional metadata (JSON format) | - | Yes |
+| `--health-check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor. | - | Yes |
+| `--timeout <seconds>` | Timeout in seconds for --wait | `300` | Yes |
+
+## `deploy:image` (alias: `deploy-image`)
+
+Deploy a pre-built Docker image
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <image>` | Docker image reference (e.g., ghcr.io/org/app:v1.0) | - | Yes |
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <env>` | Target environment name | `production` | Yes |
+| `--environment-id <id>` | Target environment ID | - | Yes |
+| `--no-wait` | Do not wait for deployment to complete | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--metadata <json>` | Additional metadata (JSON format) | - | Yes |
+| `--health-check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor. | - | Yes |
+| `--timeout <seconds>` | Timeout in seconds for --wait | `300` | Yes |
+
+## `deploy:local-image` (alias: `deploy-local-image`)
+
+Build and deploy a local Docker image (or deploy existing image with --image)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--image <image>` | Use existing local image instead of building (skips build) | - | Yes |
+| `-f, --dockerfile <path>` | Path to Dockerfile | `Dockerfile` | Yes |
+| `-c, --context <path>` | Build context directory | `.` | Yes |
+| `--build-arg <arg...>` | Build arguments (can be specified multiple times) | - | Yes |
+| `--no-build` | Skip building, requires --image | - | No |
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <env>` | Target environment name | `production` | Yes |
+| `--environment-id <id>` | Target environment ID | - | Yes |
+| `-t, --tag <tag>` | Tag for the built/uploaded image | - | Yes |
+| `--no-wait` | Do not wait for deployment to complete | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--metadata <json>` | Additional metadata (JSON format) | - | Yes |
+| `--health-check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Overrides .temps.yaml; also updates the uptime monitor. | - | Yes |
+| `--timeout <seconds>` | Timeout in seconds for --wait | `600` | Yes |
 
 ## `deployments` (alias: `deploys`)
 
@@ -260,6 +340,8 @@ Manage deployments
 - `pause` - Pause a deployment
 - `resume` - Resume a paused deployment
 - `teardown` - Teardown a deployment and remove all resources
+- `logs` - Show deployment build logs
+- `failure-report` - Preview or send a redacted deploy-failure trace
 
 ### `deployments list` (alias: `ls`)
 
@@ -270,8 +352,11 @@ List deployments
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | Yes |
-| `-e, --environment <env>` | Filter by environment | - | Yes |
+| `-e, --environment <env>` | Filter by environment name (client-side) | - | Yes |
+| `--environment-id <id>` | Filter by environment ID (server-side) | - | Yes |
 | `-n, --limit <number>` | Limit results | `10` | Yes |
+| `--page <n>` | Page number | - | Yes |
+| `--per-page <n>` | Items per page | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `deployments status`
@@ -344,9 +429,9 @@ Teardown a deployment and remove all resources
 | `-d, --deployment-id <id>` | Deployment ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
 
-## `logs`
+### `deployments logs`
 
-Stream deployment logs
+Show deployment build logs
 
 **Options:**
 
@@ -357,6 +442,40 @@ Stream deployment logs
 | `-f, --follow` | Follow log output | - | No |
 | `-n, --lines <number>` | Number of lines to show | `100` | Yes |
 | `-d, --deployment <id>` | Specific deployment ID | - | Yes |
+
+### `deployments failure-report`
+
+Preview or send a redacted deploy-failure trace
+
+**Subcommands:**
+
+- `preview` - Preview the redacted, editable failure-report text for a failed job
+- `send` - Send a failure report to the Temps team. Reads report text from --text-file, or stdin if piped, or defaults to the redacted preview.
+
+#### `deployments failure-report preview`
+
+Preview the redacted, editable failure-report text for a failed job
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
+| `-j, --job-id <id>` | Failed job ID (see "deployments logs") | - | Yes |
+
+#### `deployments failure-report send`
+
+Send a failure report to the Temps team. Reads report text from --text-file, or stdin if piped, or defaults to the redacted preview.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-d, --deployment-id <id>` | Deployment ID | - | Yes |
+| `-j, --job-id <id>` | Failed job ID (see "deployments logs") | - | Yes |
+| `--text-file <path>` | Read the (already-reviewed) report text from a file | - | Yes |
 
 ## `domains` (alias: `domain`)
 
@@ -370,6 +489,10 @@ Manage custom domains
 - `remove` (`rm`) - Remove a domain
 - `ssl` - Manage SSL certificate
 - `status` - Check domain status
+- `renewal-attempts` - Show the certificate renewal-attempt history for a domain
+- `orders` (`order`) - Manage ACME orders for SSL certificate provisioning
+- `dns-challenge` - Setup DNS challenge records automatically using a DNS provider
+- `http-debug` - Debug HTTP-01 challenge for a domain
 
 ### `domains list` (alias: `ls`)
 
@@ -389,11 +512,19 @@ Add a custom domain
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name | - | Yes |
 | `-c, --challenge <type>` | Challenge type (http-01 or dns-01) | `http-01` | Yes |
+| `-y, --yes` | Skip confirmation prompts | - | No |
 
 ### `domains verify`
 
 Verify domain and provision SSL certificate
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name | - | Yes |
 
 ### `domains remove` (alias: `rm`)
 
@@ -403,7 +534,9 @@ Remove a domain
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `domains ssl`
 
@@ -413,11 +546,118 @@ Manage SSL certificate
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name | - | Yes |
 | `--renew` | Force certificate renewal | - | No |
 
 ### `domains status`
 
 Check domain status
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name | - | Yes |
+
+### `domains renewal-attempts`
+
+Show the certificate renewal-attempt history for a domain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name | - | Yes |
+| `--page <page>` | Page number (1-indexed) | `1` | Yes |
+| `--page-size <pageSize>` | Items per page (max 100) | `20` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `domains orders` (alias: `order`)
+
+Manage ACME orders for SSL certificate provisioning
+
+**Subcommands:**
+
+- `list` (`ls`) - List all ACME orders
+- `show` - Show ACME order for a domain
+- `create` - Create or recreate an ACME order for a domain
+- `finalize` - Finalize an ACME order (complete challenge validation)
+- `cancel` - Cancel an ACME order for a domain
+
+#### `domains orders list` (alias: `ls`)
+
+List all ACME orders
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `domains orders show`
+
+Show ACME order for a domain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--domain-id <id>` | Domain ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `domains orders create`
+
+Create or recreate an ACME order for a domain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--domain-id <id>` | Domain ID | - | Yes |
+
+#### `domains orders finalize`
+
+Finalize an ACME order (complete challenge validation)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--domain-id <id>` | Domain ID | - | Yes |
+
+#### `domains orders cancel`
+
+Cancel an ACME order for a domain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--domain-id <id>` | Domain ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `domains dns-challenge`
+
+Setup DNS challenge records automatically using a DNS provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--domain-id <id>` | Domain ID | - | Yes |
+| `--provider-id <id>` | DNS provider ID | - | Yes |
+
+### `domains http-debug`
+
+Debug HTTP-01 challenge for a domain
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-d, --domain <domain>` | Domain name | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 ## `environments` (alias: `envs`, `env`)
 
@@ -430,7 +670,10 @@ Manage environments and environment variables
 - `delete` (`rm`) - Delete an environment
 - `vars` - Manage environment variables
 - `resources` - View or set CPU/memory resources for an environment
+- `timeouts` - View or set upstream request/idle timeouts for an environment
+- `force-https` - View or set the HTTP to HTTPS redirect override for an environment
 - `scale` - View or set the number of replicas for an environment
+- `crons` - Manage cron jobs
 
 ### `environments list` (alias: `ls`)
 
@@ -440,6 +683,7 @@ List environments for a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments create`
@@ -450,6 +694,7 @@ Create a new environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
 | `-n, --name <name>` | Environment name | - | Yes |
 | `-b, --branch <branch>` | Git branch | - | Yes |
 | `--preview` | Set as preview environment | - | No |
@@ -462,11 +707,18 @@ Delete an environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
 
 ### `environments vars`
 
 Manage environment variables
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
 
 **Subcommands:**
 
@@ -510,6 +762,7 @@ Set an environment variable
 | `-e, --environments <names>` | Comma-separated environment names (interactive if not provided) | - | Yes |
 | `--no-preview` | Exclude from preview environments | - | No |
 | `--update` | Update existing variable instead of creating new | - | No |
+| `--secret` | Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew | - | No |
 
 #### `environments vars delete` (alias: `rm`, `unset`)
 
@@ -552,10 +805,40 @@ View or set CPU/memory resources for an environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
 | `--cpu <millicores>` | CPU limit in millicores (e.g., 500 = 0.5 CPU) | - | Yes |
 | `--memory <mb>` | Memory limit in MB (e.g., 512) | - | Yes |
 | `--cpu-request <millicores>` | CPU request in millicores (guaranteed minimum) | - | Yes |
 | `--memory-request <mb>` | Memory request in MB (guaranteed minimum) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `environments timeouts`
+
+View or set upstream request/idle timeouts for an environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--request <seconds>` | Timeout for regular (non-streaming) HTTP requests, in seconds | - | Yes |
+| `--sse-idle <seconds>` | Idle timeout for Server-Sent Events streams, in seconds | - | Yes |
+| `--websocket-idle <seconds>` | Idle timeout for WebSocket connections, in seconds | - | Yes |
+| `--inherit` | Clear all three overrides (inherit the project/global defaults) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `environments force-https`
+
+View or set the HTTP to HTTPS redirect override for an environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--enable` | Always redirect plain HTTP to HTTPS, even without a local certificate | - | No |
+| `--disable` | Never redirect: keep serving this environment over plain HTTP | - | No |
+| `--inherit` | Clear the override and follow the proxy default | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `environments scale`
@@ -566,6 +849,60 @@ View or set the number of replicas for an environment
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <env>` | Environment name or slug | `production` | Yes |
+| `-r, --replicas <count>` | Number of replicas to set | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `environments crons`
+
+Manage cron jobs
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <env>` | Environment name or slug | - | Yes |
+
+**Subcommands:**
+
+- `list` (`ls`) - List cron jobs for an environment
+- `show` - Show cron job details
+- `executions` (`execs`) - Show cron job execution history
+
+#### `environments crons list` (alias: `ls`)
+
+List cron jobs for an environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `environments crons show`
+
+Show cron job details
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Cron job ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `environments crons executions` (alias: `execs`)
+
+Show cron job execution history
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Cron job ID | - | Yes |
+| `--page <page>` | Page number | `1` | Yes |
+| `--per-page <count>` | Items per page | `20` | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ## `providers` (alias: `provider`)
@@ -575,10 +912,15 @@ Manage Git providers
 **Subcommands:**
 
 - `list` (`ls`) - List configured Git providers
-- `add` - Add a new Git provider (interactive)
+- `add` - Add a new Git provider
 - `remove` (`rm`) - Remove a Git provider
 - `show` - Show Git provider details
+- `activate` - Activate a Git provider
+- `deactivate` - Deactivate a Git provider
+- `safe-delete` - Safely delete a Git provider (checks dependencies first)
+- `deletion-check` - Check if a Git provider can be safely deleted
 - `git` - Manage Git providers
+- `connections` (`conn`) - Manage Git provider connections
 
 ### `providers list` (alias: `ls`)
 
@@ -592,7 +934,21 @@ List configured Git providers
 
 ### `providers add`
 
-Add a new Git provider (interactive)
+Add a new Git provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --provider <provider>` | Provider type (github, gitlab, bitbucket, gitea, generic) | - | Yes |
+| `-n, --name <name>` | Provider name | - | Yes |
+| `-t, --token <token>` | Personal access token (or Bitbucket access token / app password) | - | Yes |
+| `--base-url <url>` | Instance base URL (GitLab/Gitea self-hosted; required for gitea) | - | Yes |
+| `--username <username>` | Bitbucket username (selects app-password auth) | - | Yes |
+| `--password <password>` | Bitbucket app password (used with --username) | - | Yes |
+| `--clone-url <url>` | HTTPS clone URL (generic provider) | - | Yes |
+| `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `providers remove` (alias: `rm`)
 
@@ -602,7 +958,9 @@ Remove a Git provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `providers show`
 
@@ -612,6 +970,50 @@ Show Git provider details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `providers activate`
+
+Activate a Git provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+
+### `providers deactivate`
+
+Deactivate a Git provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+
+### `providers safe-delete`
+
+Safely delete a Git provider (checks dependencies first)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `providers deletion-check`
+
+Check if a Git provider can be safely deleted
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `providers git`
@@ -620,12 +1022,26 @@ Manage Git providers
 
 **Subcommands:**
 
-- `connect` - Connect a Git provider (github, gitlab)
+- `connect` - Connect a Git provider (github, gitlab, bitbucket, gitea, generic)
 - `repos` - List available repositories
 
 #### `providers git connect`
 
-Connect a Git provider (github, gitlab)
+Connect a Git provider (github, gitlab, bitbucket, gitea, generic)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --provider <provider>` | Provider type (github, gitlab, bitbucket, gitea, generic) | - | Yes |
+| `-n, --name <name>` | Provider name | - | Yes |
+| `-t, --token <token>` | Personal access token (or Bitbucket access token / app password) | - | Yes |
+| `--base-url <url>` | Instance base URL (GitLab/Gitea self-hosted; required for gitea) | - | Yes |
+| `--username <username>` | Bitbucket username (selects app-password auth) | - | Yes |
+| `--password <password>` | Bitbucket app password (used with --username) | - | Yes |
+| `--clone-url <url>` | HTTPS clone URL (generic provider) | - | Yes |
+| `--token-username <username>` | HTTP Basic username for the token (generic; default x-access-token) | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 #### `providers git repos`
 
@@ -635,6 +1051,118 @@ List available repositories
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Provider ID (optional, lists all if not provided) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `--search <term>` | Search repositories by name | - | Yes |
+| `--page <n>` | Page number | - | Yes |
+| `--per-page <n>` | Items per page (max: 100) | - | Yes |
+| `--sort <field>` | Sort by field (name, created_at, updated_at, stars) | - | Yes |
+| `--direction <dir>` | Sort direction: asc or desc | - | Yes |
+| `--language <lang>` | Filter by programming language | - | Yes |
+| `--owner <owner>` | Filter by repository owner | - | Yes |
+
+### `providers connections` (alias: `conn`)
+
+Manage Git provider connections
+
+**Subcommands:**
+
+- `list` (`ls`) - List all Git connections
+- `show` - Show connection details for a provider
+- `delete` (`rm`) - Delete a Git connection
+- `activate` - Activate a Git connection
+- `deactivate` - Deactivate a Git connection
+- `sync` - Sync repositories for a Git connection
+- `update-token` - Update access token for a Git connection
+- `validate` - Validate a Git connection
+
+#### `providers connections list` (alias: `ls`)
+
+List all Git connections
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+| `--page <n>` | Page number | - | Yes |
+| `--per-page <n>` | Items per page (default: 30, max: 100) | - | Yes |
+| `--sort <field>` | Sort by field (created_at, updated_at, account_name) | - | Yes |
+| `--direction <dir>` | Sort direction: asc or desc (default: desc) | - | Yes |
+
+#### `providers connections show`
+
+Show connection details for a provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `providers connections delete` (alias: `rm`)
+
+Delete a Git connection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+#### `providers connections activate`
+
+Activate a Git connection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
+
+#### `providers connections deactivate`
+
+Deactivate a Git connection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
+
+#### `providers connections sync`
+
+Sync repositories for a Git connection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
+
+#### `providers connections update-token`
+
+Update access token for a Git connection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
+| `-t, --token <token>` | New access token | - | Yes |
+
+#### `providers connections validate`
+
+Validate a Git connection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Connection ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ## `backups` (alias: `backup`)
@@ -644,8 +1172,12 @@ Manage backup schedules and backups
 **Subcommands:**
 
 - `schedules` (`schedule`) - Manage backup schedules
+- `sources` (`source`) - Manage S3 backup sources
 - `list` (`ls`) - List backups for a schedule
 - `show` - Show backup details
+- `delete` (`rm`) - Permanently delete one terminal backup
+- `cleanup` - Delete backups expired by their schedule retention policy
+- `run-service` - Run a backup for an external service
 
 ### `backups schedules` (alias: `schedule`)
 
@@ -674,6 +1206,18 @@ List backup schedules
 
 Create a backup schedule
 
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Schedule name | - | Yes |
+| `-t, --type <type>` | Backup type (full, incremental) | - | Yes |
+| `-s, --schedule <cron>` | Schedule expression (cron format) | - | Yes |
+| `-r, --retention <days>` | Retention period in days | - | Yes |
+| `-d, --description <desc>` | Description | - | Yes |
+| `--s3-source-id <id>` | S3 Source ID | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
 #### `backups schedules show`
 
 Show backup schedule details
@@ -682,15 +1226,28 @@ Show backup schedule details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Schedule ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 #### `backups schedules enable`
 
 Enable a backup schedule
 
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Schedule ID | - | Yes |
+
 #### `backups schedules disable`
 
 Disable a backup schedule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Schedule ID | - | Yes |
 
 #### `backups schedules delete` (alias: `rm`)
 
@@ -700,7 +1257,111 @@ Delete a backup schedule
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Schedule ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `backups sources` (alias: `source`)
+
+Manage S3 backup sources
+
+**Subcommands:**
+
+- `list` (`ls`) - List S3 sources
+- `create` - Create an S3 source
+- `show` - Show S3 source details
+- `update` - Update an S3 source
+- `remove` (`rm`) - Delete an S3 source
+- `backups` - List backups for an S3 source
+- `run` - Trigger a backup for an S3 source
+
+#### `backups sources list` (alias: `ls`)
+
+List S3 sources
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `backups sources create`
+
+Create an S3 source
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Source name | - | Yes |
+| `--bucket <bucket>` | S3 bucket name | - | Yes |
+| `--region <region>` | S3 region | - | Yes |
+| `--endpoint <endpoint>` | S3 endpoint (for S3-compatible services) | - | Yes |
+| `--access-key <key>` | Access key ID | - | Yes |
+| `--secret-key <key>` | Secret access key | - | Yes |
+| `--prefix <prefix>` | Bucket path/prefix | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+#### `backups sources show`
+
+Show S3 source details
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | S3 source ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `backups sources update`
+
+Update an S3 source
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | S3 source ID | - | Yes |
+| `-n, --name <name>` | New source name | - | Yes |
+| `--bucket <bucket>` | New S3 bucket name | - | Yes |
+| `--region <region>` | New S3 region | - | Yes |
+| `--endpoint <endpoint>` | New S3 endpoint | - | Yes |
+| `--access-key <key>` | New access key ID | - | Yes |
+| `--secret-key <key>` | New secret access key | - | Yes |
+| `--prefix <prefix>` | New bucket path/prefix | - | Yes |
+
+#### `backups sources remove` (alias: `rm`)
+
+Delete an S3 source
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | S3 source ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+#### `backups sources backups`
+
+List backups for an S3 source
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | S3 source ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `backups sources run`
+
+Trigger a backup for an S3 source
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | S3 source ID | - | Yes |
 
 ### `backups list` (alias: `ls`)
 
@@ -710,6 +1371,7 @@ List backups for a schedule
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--schedule-id <id>` | Schedule ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `backups show`
@@ -720,11 +1382,49 @@ Show backup details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Backup ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+
+### `backups delete` (alias: `rm`)
+
+Permanently delete one terminal backup
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Backup UUID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `backups cleanup`
+
+Delete backups expired by their schedule retention policy
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--dry-run` | Preview expired backups without deleting them | - | No |
+| `--schedule-id <id>` | Limit cleanup to one schedule | - | Yes |
+| `-y, --yes` | Skip confirmation prompt | - | No |
+| `--json` | Output the cleanup report as JSON | - | No |
+
+### `backups run-service`
+
+Run a backup for an external service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | External service ID | - | Yes |
+| `--s3-source-id <id>` | S3 source ID to store the backup | - | Yes |
+| `-t, --type <type>` | Backup type (e.g., full, incremental) | - | Yes |
 
 ## `runtime-logs` (alias: `rlogs`)
 
-Stream runtime container logs (not build logs)
+View runtime container logs (use -f to follow in real-time)
 
 **Options:**
 
@@ -735,15 +1435,19 @@ Stream runtime container logs (not build logs)
 | `-c, --container <id>` | Container ID (partial match supported) | - | Yes |
 | `-n, --tail <lines>` | Number of lines to tail | `1000` | Yes |
 | `-t, --timestamps` | Show timestamps | - | No |
+| `-f, --follow` | Follow log output (stream in real-time) | - | No |
 
 ## `notifications` (alias: `notify`)
 
-Manage notification providers (Slack, Email, etc.)
+Manage notification providers (Slack, Email, Webhook, etc.)
 
 **Subcommands:**
 
 - `list` (`ls`) - List configured notification providers
-- `add` - Add a new notification provider (interactive)
+- `add` - Add a new notification provider
+- `update` - Update a notification provider
+- `enable` - Enable a notification provider
+- `disable` - Disable a notification provider
 - `show` - Show notification provider details
 - `remove` (`rm`) - Remove a notification provider
 - `test` - Send a test notification
@@ -760,7 +1464,73 @@ List configured notification providers
 
 ### `notifications add`
 
-Add a new notification provider (interactive)
+Add a new notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-t, --type <type>` | Provider type (slack, email, webhook) | - | Yes |
+| `-n, --name <name>` | Provider name | - | Yes |
+| `-w, --webhook-url <url>` | Webhook URL (for slack) | - | Yes |
+| `-c, --channel <channel>` | Channel name (for slack, optional) | - | Yes |
+| `--smtp-host <host>` | SMTP host (for email) | - | Yes |
+| `--smtp-port <port>` | SMTP port (for email) | - | Yes |
+| `--username <username>` | SMTP username (for email) | - | Yes |
+| `--password <password>` | SMTP password (for email) | - | Yes |
+| `--from-address <address>` | From email address (for email) | - | Yes |
+| `--from-name <name>` | From display name (for email, optional) | - | Yes |
+| `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | Yes |
+| `--url <url>` | Webhook URL (for webhook) | - | Yes |
+| `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook, default: POST) | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+### `notifications update`
+
+Update a notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+| `-n, --name <name>` | New provider name | - | Yes |
+| `--enabled <enabled>` | Enable or disable (true/false) | - | Yes |
+| `-w, --webhook-url <url>` | Webhook URL (for slack) | - | Yes |
+| `-c, --channel <channel>` | Channel name (for slack) | - | Yes |
+| `--smtp-host <host>` | SMTP host (for email) | - | Yes |
+| `--smtp-port <port>` | SMTP port (for email) | - | Yes |
+| `--username <username>` | SMTP username (for email) | - | Yes |
+| `--password <password>` | SMTP password (for email) | - | Yes |
+| `--from-address <address>` | From email address (for email) | - | Yes |
+| `--from-name <name>` | From display name (for email) | - | Yes |
+| `--to-addresses <addresses>` | Comma-separated recipient addresses (for email) | - | Yes |
+| `--url <url>` | Webhook URL (for webhook) | - | Yes |
+| `--method <method>` | HTTP method: POST, PUT, PATCH (for webhook) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompts | - | No |
+
+### `notifications enable`
+
+Enable a notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `notifications disable`
+
+Disable a notification provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 ### `notifications show`
 
@@ -770,6 +1540,7 @@ Show notification provider details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `notifications remove` (alias: `rm`)
@@ -780,20 +1551,28 @@ Remove a notification provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `notifications test`
 
 Send a test notification
 
-## `dns` (alias: `dns-providers`)
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
+
+## `dns`
 
 Manage DNS providers for automated domain verification
 
 **Subcommands:**
 
 - `list` (`ls`) - List configured DNS providers
-- `add` - Add a new DNS provider (interactive)
+- `add` - Add a new DNS provider
 - `show` - Show DNS provider details
 - `remove` (`rm`) - Remove a DNS provider
 - `test` - Test DNS provider connection
@@ -811,7 +1590,34 @@ List configured DNS providers
 
 ### `dns add`
 
-Add a new DNS provider (interactive)
+Add a new DNS provider
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-t, --type <type>` | Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual) | - | Yes |
+| `-n, --name <name>` | Provider name | - | Yes |
+| `-d, --description <description>` | Provider description | - | Yes |
+| `--api-token <token>` | Cloudflare API token | - | Yes |
+| `--account-id <id>` | Cloudflare account ID (optional) | - | Yes |
+| `--access-key-id <key>` | AWS access key ID | - | Yes |
+| `--secret-access-key <secret>` | AWS secret access key | - | Yes |
+| `--region <region>` | AWS region | - | Yes |
+| `--api-user <user>` | Namecheap API user | - | Yes |
+| `--api-key <key>` | Namecheap API key | - | Yes |
+| `--username <username>` | Namecheap username | - | Yes |
+| `--client-ip <ip>` | Namecheap whitelisted client IP | - | Yes |
+| `--project-id <id>` | GCP project ID | - | Yes |
+| `--service-account-email <email>` | GCP service account email | - | Yes |
+| `--private-key-id <id>` | GCP private key ID | - | Yes |
+| `--private-key <key>` | GCP private key | - | Yes |
+| `--tenant-id <id>` | Azure tenant ID | - | Yes |
+| `--client-id <id>` | Azure client ID | - | Yes |
+| `--client-secret <secret>` | Azure client secret | - | Yes |
+| `--subscription-id <id>` | Azure subscription ID | - | Yes |
+| `--resource-group <name>` | Azure resource group | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `dns show`
 
@@ -821,6 +1627,7 @@ Show DNS provider details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `dns remove` (alias: `rm`)
@@ -831,11 +1638,19 @@ Remove a DNS provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ### `dns test`
 
 Test DNS provider connection
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
 
 ### `dns zones`
 
@@ -845,6 +1660,7 @@ List available zones in a DNS provider
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Provider ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ## `services` (alias: `svc`)
@@ -854,13 +1670,29 @@ Manage external services (databases, caches, storage)
 **Subcommands:**
 
 - `list` (`ls`) - List all external services
-- `create` (`add`) - Create a new external service (interactive)
+- `create` (`add`) - Create a new external service
 - `show` - Show service details
 - `remove` (`rm`) - Remove a service
 - `start` - Start a stopped service
 - `stop` - Stop a running service
 - `types` - List available service types
 - `projects` - List projects linked to a service
+- `update` - Update a service
+- `upgrade` - Upgrade a service to a newer version
+- `import` - Import an existing external service
+- `link` - Link a service to a project
+- `unlink` - Unlink a service from a project
+- `connect` - Get connection info for a service by name or slug
+- `env` - Show environment variables for a linked service
+- `env-var` - Get a specific environment variable
+- `logs` - View persisted logs for an external service
+- `slow-queries` - Show slowest PostgreSQL queries from pg_stat_statements
+- `enable-pg-stat-statements` - Enable pg_stat_statements on a standalone Postgres service by restarting its container (drops active connections briefly)
+- `restore-capabilities` - Show what restore modes a service supports (in-place / new service / PITR)
+- `list-backups` - List backups stored on an S3 source
+- `restore` - Restore a service from a backup (in-place, new service, or PITR)
+- `restore-runs` - List recent restore runs for a service
+- `restore-run` - Show a single restore run
 
 ### `services list` (alias: `ls`)
 
@@ -874,7 +1706,16 @@ List all external services
 
 ### `services create` (alias: `add`)
 
-Create a new external service (interactive)
+Create a new external service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-t, --type <type>` | Service type (postgres, mongodb, redis, s3) | - | Yes |
+| `-n, --name <name>` | Service name | - | Yes |
+| `-s, --set <key=value>` | Set a parameter (repeatable) | `` | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `services show`
 
@@ -884,6 +1725,7 @@ Show service details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `services remove` (alias: `rm`)
@@ -894,15 +1736,29 @@ Remove a service
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `services start`
 
 Start a stopped service
 
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
 ### `services stop`
 
 Stop a running service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
 
 ### `services types`
 
@@ -914,6 +1770,20 @@ List available service types
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
+**Subcommands:**
+
+- `info` - Show parameters schema for a service type (useful for automation)
+
+#### `services types info`
+
+Show parameters schema for a service type (useful for automation)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output as raw JSON schema (default) | - | No |
+
 ### `services projects`
 
 List projects linked to a service
@@ -922,6 +1792,207 @@ List projects linked to a service
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services update`
+
+Update a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-n, --name <name>` | Docker image name (e.g., postgres:18-alpine) | - | Yes |
+| `-s, --set <key=value>` | Set a parameter (repeatable) | `` | Yes |
+
+### `services upgrade`
+
+Upgrade a service to a newer version
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-v, --version <version>` | Docker image to upgrade to (e.g., postgres:18-alpine) | - | Yes |
+
+### `services import`
+
+Import an existing external service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-t, --type <type>` | Service type (postgres, mongodb, redis, s3) | - | Yes |
+| `-n, --name <name>` | Service name | - | Yes |
+| `--container-id <id>` | Container ID or name to import | - | Yes |
+| `-s, --set <key=value>` | Set a parameter (repeatable) | `` | Yes |
+| `--version <version>` | Optional version override | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+### `services link`
+
+Link a service to a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+
+### `services unlink`
+
+Unlink a service from a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `services connect`
+
+Get connection info for a service by name or slug
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services env`
+
+Show environment variables for a linked service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services env-var`
+
+Get a specific environment variable
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json) | - | Yes |
+| `--var <name>` | Environment variable name | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services logs`
+
+View persisted logs for an external service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--from <datetime>` | Start of time range. ISO 8601 timestamp or a relative duration like "1h", "24h", "7d" (default: 24h ago) | - | Yes |
+| `--to <datetime>` | End of time range. ISO 8601 timestamp (default: now) | - | Yes |
+| `-l, --level <levels>` | Comma-separated log levels to include: ERROR,WARN,INFO,DEBUG,TRACE | - | Yes |
+| `-n, --tail <lines>` | Maximum number of log lines to fetch (default: 200, max: 1000) | `200` | Yes |
+| `-t, --text <query>` | Filter log lines by text (case-insensitive) | - | Yes |
+| `--json` | Output raw JSON instead of formatted lines | - | No |
+
+### `services slow-queries`
+
+Show slowest PostgreSQL queries from pg_stat_statements
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--page <n>` | Page number (1-based, default: 1) | `1` | Yes |
+| `--page-size <n>` | Rows per page (1–100, default: 20) | `20` | Yes |
+| `--sort-by <column>` | Sort column: calls, total_exec_time_ms, mean_exec_time_ms, rows, cache_hit_ratio (default: mean_exec_time_ms) | - | Yes |
+| `--sort-order <order>` | Sort direction: asc or desc (default: desc) | - | Yes |
+| `--json` | Output raw JSON instead of a formatted table | - | No |
+
+### `services enable-pg-stat-statements`
+
+Enable pg_stat_statements on a standalone Postgres service by restarting its container (drops active connections briefly)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-y, --yes` | Skip the restart confirmation prompt (for automation) | - | No |
+
+### `services restore-capabilities`
+
+Show what restore modes a service supports (in-place / new service / PITR)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services list-backups`
+
+List backups stored on an S3 source
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--s3-source-id <id>` | S3 source ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services restore`
+
+Restore a service from a backup (in-place, new service, or PITR)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Source service ID (the service the backup came from) | - | Yes |
+| `--backup-id <id>` | Backup ID to restore from (see `list-backups`) | - | Yes |
+| `--new-service [name]` | Clone into a new service. Omit the value or pass "auto" to accept the auto-suggested name. | - | No |
+| `--pitr <iso>` | Point-in-time recovery target, ISO 8601 timestamp (requires WAL-G backup). Combine with --new-service to route PITR into a new service. | - | Yes |
+| `-y, --yes` | Skip confirmation | - | No |
+| `--no-wait` | Return immediately without polling run status | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `services restore-runs`
+
+List recent restore runs for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `services restore-run`
+
+Show a single restore run
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Restore run ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ## `settings`
@@ -931,7 +2002,7 @@ Manage platform settings
 **Subcommands:**
 
 - `show` (`get`) - Show current platform settings
-- `update` (`set`) - Update platform settings (interactive)
+- `update` (`set`) - Update platform settings
 - `set-external-url` - Set the external URL for the platform
 - `set-preview-domain` - Set the preview domain pattern
 
@@ -947,15 +2018,139 @@ Show current platform settings
 
 ### `settings update` (alias: `set`)
 
-Update platform settings (interactive)
+Update platform settings
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-s, --setting <setting>` | Setting to update (external_url, preview_domain, letsencrypt, rate_limiting, security_headers, screenshots) | - | Yes |
+| `-v, --value <value>` | Value for the setting | - | Yes |
+| `--external-url <url>` | External URL for the platform | - | Yes |
+| `--preview-domain <domain>` | Preview domain pattern | - | Yes |
+| `--letsencrypt-email <email>` | Let's Encrypt email | - | Yes |
+| `--letsencrypt-mode <mode>` | Let's Encrypt mode (staging, production) | - | Yes |
+| `--rate-limiting-enabled <enabled>` | Enable rate limiting (true/false) | - | Yes |
+| `--rate-limiting-rpm <rpm>` | Requests per minute | - | Yes |
+| `--screenshots-enabled <enabled>` | Enable screenshots (true/false) | - | Yes |
+| `--max-request-timeout <seconds>` | Hard ceiling for all upstream request/idle timeouts, in seconds | - | Yes |
+| `--default-http-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | Yes |
+| `--default-sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | Yes |
+| `--default-websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `settings set-external-url`
 
 Set the external URL for the platform
 
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--url <url>` | External URL | - | Yes |
+
 ### `settings set-preview-domain`
 
 Set the preview domain pattern
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--domain <domain>` | Preview domain pattern | - | Yes |
+
+## `platform` (alias: `plat`)
+
+View platform and server information
+
+**Subcommands:**
+
+- `info` - Get platform information
+- `access` - Get access and networking information
+- `private-ip` - Get the server private IP address
+- `public-ip` - Get the server public IP address
+- `update` - Check for and apply temps releases on the server
+
+### `platform info`
+
+Get platform information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform access`
+
+Get access and networking information
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `platform private-ip`
+
+Get the server private IP address
+
+### `platform public-ip`
+
+Get the server public IP address
+
+### `platform update`
+
+Check for and apply temps releases on the server
+
+**Subcommands:**
+
+- `status` - Show the available release and whether it can be applied from here
+- `check` - Ask the release API for the newest version on this channel now
+- `channel` - Show or set the release channel: stable, beta, nightly, or "auto" to follow the installed version
+- `apply` - Install a release on the server and restart it
+
+#### `platform update status`
+
+Show the available release and whether it can be applied from here
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `platform update check`
+
+Ask the release API for the newest version on this channel now
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `platform update channel`
+
+Show or set the release channel: stable, beta, nightly, or "auto" to follow the installed version
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `platform update apply`
+
+Install a release on the server and restart it
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--version <version>` | Release tag to install (default: newest on this channel) | - | Yes |
+| `-y, --yes` | Skip the confirmation prompt | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `users`
 
@@ -984,6 +2179,16 @@ List all users
 
 Create a new user
 
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-u, --username <username>` | Username | - | Yes |
+| `-e, --email <email>` | Email address | - | Yes |
+| `-p, --password <password>` | Password (if not provided, invite email will be sent) | - | Yes |
+| `-r, --roles <roles>` | Comma-separated roles (admin, user) | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
 ### `users me`
 
 Show current user info
@@ -1002,11 +2207,19 @@ Remove a user
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `users restore`
 
 Restore a deleted user
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
 
 ### `users role`
 
@@ -1016,6 +2229,7 @@ Manage user roles
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | User ID | - | Yes |
 | `--add <role>` | Add a role to user | - | Yes |
 | `--remove <role>` | Remove a role from user | - | Yes |
 
@@ -1047,6 +2261,16 @@ List all API keys
 
 Create a new API key
 
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | API key name | - | Yes |
+| `-r, --role <role>` | Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest) | - | Yes |
+| `-e, --expires-in <days>` | Expires in N days (7, 30, 90, 365) | - | Yes |
+| `-p, --permissions <permissions>` | Comma-separated list of permissions | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
 ### `apikeys show`
 
 Show API key details
@@ -1055,6 +2279,7 @@ Show API key details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | API key ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `apikeys remove` (alias: `rm`)
@@ -1065,15 +2290,29 @@ Delete an API key
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | API key ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `apikeys activate`
 
 Activate a deactivated API key
 
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | API key ID | - | Yes |
+
 ### `apikeys deactivate`
 
 Deactivate an API key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | API key ID | - | Yes |
 
 ### `apikeys permissions`
 
@@ -1085,7 +2324,7 @@ List available API key permissions
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
-## `monitors`
+## `monitors` (alias: `monitoring`)
 
 Manage uptime monitors for status pages
 
@@ -1095,7 +2334,7 @@ Manage uptime monitors for status pages
 - `create` (`add`) - Create a new monitor for a project
 - `show` - Show monitor details and current status
 - `remove` (`rm`) - Delete a monitor
-- `status` - Get current monitor status
+- `status` - Get current status — all monitors for a project, or a single monitor by ID
 - `history` - Get monitor uptime history
 
 ### `monitors list` (alias: `ls`)
@@ -1106,11 +2345,24 @@ List all monitors for a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `monitors create` (alias: `add`)
 
 Create a new monitor for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `-n, --name <name>` | Monitor name | - | Yes |
+| `-t, --type <type>` | Monitor type (http, tcp, ping) | - | Yes |
+| `-i, --interval <seconds>` | Check interval in seconds (60, 300, 600, 900, 1800) | - | Yes |
+| `--check-path <path>` | HTTP health-check path (must start with "/", e.g. /api/healthz). Defaults to "/" for HTTP monitors. | - | Yes |
+| `--environment-id <id>` | Environment ID (default: 0 for production) | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `monitors show`
 
@@ -1120,6 +2372,7 @@ Show monitor details and current status
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Monitor ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `monitors remove` (alias: `rm`)
@@ -1130,16 +2383,20 @@ Delete a monitor
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Monitor ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `monitors status`
 
-Get current monitor status
+Get current status — all monitors for a project, or a single monitor by ID
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Monitor ID (omit to show all monitors for the project) | - | Yes |
+| `-p, --project <slug>` | Project slug (auto-detected from .temps/config.json or TEMPS_PROJECT) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `monitors history`
@@ -1150,6 +2407,7 @@ Get monitor uptime history
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--id <id>` | Monitor ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 | `--days <days>` | Number of days to show | `7` | Yes |
 
@@ -1162,10 +2420,12 @@ Manage webhooks for project events
 - `list` (`ls`) - List all webhooks for a project
 - `create` (`add`) - Create a new webhook for a project
 - `show` - Show webhook details
+- `update` - Update a webhook
 - `remove` (`rm`) - Delete a webhook
 - `enable` - Enable a webhook
 - `disable` - Disable a webhook
 - `events` - List available webhook event types
+- `deliveries` - Manage webhook deliveries
 
 ### `webhooks list` (alias: `ls`)
 
@@ -1175,11 +2435,22 @@ List all webhooks for a project
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `webhooks create` (alias: `add`)
 
 Create a new webhook for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `-u, --url <url>` | Webhook URL | - | Yes |
+| `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | Yes |
+| `-s, --secret <secret>` | Webhook secret for signature verification | - | Yes |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `webhooks show`
 
@@ -1189,7 +2460,23 @@ Show webhook details
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID | - | Yes |
 | `--json` | Output in JSON format | - | No |
+
+### `webhooks update`
+
+Update a webhook
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID | - | Yes |
+| `-u, --url <url>` | New webhook URL | - | Yes |
+| `-e, --events <events>` | Comma-separated event types (or "all" for all events) | - | Yes |
+| `-s, --secret <secret>` | New webhook secret for signature verification | - | Yes |
 
 ### `webhooks remove` (alias: `rm`)
 
@@ -1199,15 +2486,32 @@ Delete a webhook
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID | - | Yes |
 | `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `webhooks enable`
 
 Enable a webhook
 
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID | - | Yes |
+
 ### `webhooks disable`
 
 Disable a webhook
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID | - | Yes |
 
 ### `webhooks events`
 
@@ -1219,29 +2523,77 @@ List available webhook event types
 |------|-------------|---------|----------|
 | `--json` | Output in JSON format | - | No |
 
+### `webhooks deliveries`
+
+Manage webhook deliveries
+
+**Subcommands:**
+
+- `list` (`ls`) - List deliveries for a webhook
+- `show` - Show delivery details
+- `retry` - Retry a failed delivery
+
+#### `webhooks deliveries list` (alias: `ls`)
+
+List deliveries for a webhook
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID | - | Yes |
+| `--limit <n>` | Number of deliveries to return (default: 50) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `webhooks deliveries show`
+
+Show delivery details
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID | - | Yes |
+| `--delivery-id <id>` | Delivery ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `webhooks deliveries retry`
+
+Retry a failed delivery
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--project-id <id>` | Project ID | - | Yes |
+| `--webhook-id <id>` | Webhook ID | - | Yes |
+| `--delivery-id <id>` | Delivery ID | - | Yes |
+
 ## `containers` (alias: `cts`)
 
 Manage project containers in environments
 
 **Subcommands:**
 
-- `list` (`ls`) - List all containers in an environment
+- `list` (`ls`) - List containers in an environment, or across all environments if -e omitted
 - `show` - Show container details
 - `start` - Start a stopped container
 - `stop` - Stop a running container
 - `restart` - Restart a container
-- `metrics` - Get container resource metrics
+- `metrics` - Get container resource metrics (all containers if no container ID specified)
 
 ### `containers list` (alias: `ls`)
 
-List all containers in an environment
+List containers in an environment, or across all environments if -e omitted
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project-id <id>` | Project ID | - | Yes |
-| `-e, --environment-id <id>` | Environment ID | - | Yes |
+| `-e, --environment-id <id>` | Environment ID (optional - lists all environments if omitted) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
 ### `containers show`
@@ -1296,7 +2648,7 @@ Restart a container
 
 ### `containers metrics`
 
-Get container resource metrics
+Get container resource metrics (all containers if no container ID specified)
 
 **Options:**
 
@@ -1304,53 +2656,388 @@ Get container resource metrics
 |------|-------------|---------|----------|
 | `-p, --project-id <id>` | Project ID | - | Yes |
 | `-e, --environment-id <id>` | Environment ID | - | Yes |
-| `-c, --container-id <id>` | Container ID | - | Yes |
+| `-c, --container-id <id>` | Container ID (optional - shows all if not specified) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+| `-w, --watch` | Watch mode - continuously update metrics | - | No |
+| `-i, --interval <seconds>` | Refresh interval in seconds (default: 2) | `2` | Yes |
+
+## `flags` (alias: `flag`)
+
+Manage feature flags (runtime config that changes without a redeploy)
+
+**Subcommands:**
+
+- `list` (`ls`) - List feature flags
+- `get` - Show a feature flag and its per-environment values
+- `create` - Create a feature flag
+- `update` - Update a flag definition (default value, description, visibility)
+- `set` - Set a flag value in one environment
+- `clear` - Clear a flag override so the environment inherits the default
+- `disable` - Kill switch: serve the default in this environment, ignoring any override
+- `enable` - Re-enable a flag in this environment after a kill switch
+- `restore` - Restore an archived flag
+- `archive` - Archive a flag (callers fall back to their own default)
+
+### `flags list` (alias: `ls`)
+
+List feature flags
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <name>` | Show values for this environment | - | Yes |
+| `--include-archived` | Include archived flags | - | No |
+| `--page <n>` | Page number (default: 1) | - | Yes |
+| `--page-size <n>` | Items per page (default: 20, max: 100) | - | Yes |
 | `--json` | Output in JSON format | - | No |
 
+### `flags get`
 
----
+Show a feature flag and its per-environment values
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `flags create`
+
+Create a feature flag
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-t, --type <type>` | Value type: bool, string, number, or json | - | Yes |
+| `-d, --default <value>` | Default value, served when nothing more specific applies | - | Yes |
+| `--description <text>` | What this flag controls | - | Yes |
+| `--client-visible` | Allow this flag to be exposed to browsers (default: server-only) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags update`
+
+Update a flag definition (default value, description, visibility)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-d, --default <value>` | New default value | - | Yes |
+| `--description <text>` | New description | - | Yes |
+| `--client-visible` | Expose this flag to browsers | - | No |
+| `--no-client-visible` | Make this flag server-only | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `flags set`
+
+Set a flag value in one environment
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `flags clear`
+
+Clear a flag override so the environment inherits the default
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+
+### `flags disable`
+
+Kill switch: serve the default in this environment, ignoring any override
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+
+### `flags enable`
+
+Re-enable a flag in this environment after a kill switch
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `-e, --environment <name>` | Environment name or slug | - | Yes |
+
+### `flags restore`
+
+Restore an archived flag
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+
+### `flags archive`
+
+Archive a flag (callers fall back to their own default)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+
+## `data`
+
+Browse the data inside a service (tables, collections, keys, objects) — read-only
+
+**Subcommands:**
+
+- `info` - Show what a service supports and how its containers nest
+- `containers` (`databases`) - List top-level containers (databases, or buckets for S3)
+- `tables` (`entities`) - List tables, collections, keys or objects in a container
+- `schema` (`columns`) - Show an entity's columns, types and row count
+- `rows` (`select`) - Read rows from an entity
+- `ai-access` - Show or set whether the built-in AI assistant may read this service's rows
+
+### `data info`
+
+Show what a service supports and how its containers nest
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `data containers` (alias: `databases`)
+
+List top-level containers (databases, or buckets for S3)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <path>` | List containers nested under this path instead of the root | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `data tables` (alias: `entities`)
+
+List tables, collections, keys or objects in a container
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <path>` | Container path, slash-separated (e.g. mydb/public) | - | Yes |
+| `--limit <n>` | Maximum entities to return (default: 100) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `data schema` (alias: `columns`)
+
+Show an entity's columns, types and row count
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <path>` | Container path, slash-separated (e.g. mydb/public) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `data rows` (alias: `select`)
+
+Read rows from an entity
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--path <path>` | Container path, slash-separated (e.g. mydb/public) | - | Yes |
+| `--filter <json>` | Backend-specific filter as JSON (SQL: '{"where":"id > 5"}'). See: temps data info <service> | - | Yes |
+| `--limit <n>` | Maximum rows to return (default: 20) | - | Yes |
+| `--offset <n>` | Rows to skip (default: 0) | - | Yes |
+| `--sort-by <field>` | Field to sort by | - | Yes |
+| `--sort-order <order>` | asc or desc (default: asc) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `data ai-access`
+
+Show or set whether the built-in AI assistant may read this service's rows
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--enable` | Allow the built-in assistant to read row data | - | No |
+| `--disable` | Stop the built-in assistant reading row data | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ## `analytics` (alias: `stats`)
 
-View project analytics from the terminal.
+View project analytics
 
 **Subcommands:**
 
 - `overview` (`o`) - Show analytics dashboard overview
-- `top <dimension>` - Show breakdown by dimension
+- `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
+- `funnels` - Show funnel conversion metrics for all funnels
+- `ai-agents` - Show AI crawler / provider breakdown (web /analytics/ai-agents)
+- `ai-pages` - Show pages crawled by AI agents, with distinct-agent counts
+- `ai-page` - Show which agents/providers crawled a single page (e.g. /docs)
+- `api-overview` - Show API traffic timeseries (requests, errors, latency) from /api-analytics/timeseries
+- `api-routes` - Show top API routes by request count from /api-analytics/routes
+- `api-callers` - Show top API callers by client IP from /api-analytics/callers
+- `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
 
 ### `analytics overview` (alias: `o`)
 
-Show analytics dashboard overview with key metrics, hourly sparkline, top pages, events, and locations.
+Show analytics dashboard overview
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-p, --project <project>` | Project slug or ID | - |
-| `--period <period>` | Time period: today, 24h, 7d, 30d, 90d | `24h` |
-| `--json` | Output in JSON format | - |
+**Options:**
 
-```bash
-temps analytics overview -p my-app --period 7d
-temps stats -p my-app
-```
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--json` | Output in JSON format | - | No |
 
-### `analytics top <dimension>`
+### `analytics top`
 
-Show breakdown by dimension: `pages`, `referrers`, `browsers`, `os`, `devices`, `countries`, `channels`, `events`, `languages`, `utm_source`, `utm_medium`, `utm_campaign`
+Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 
-| Flag | Description | Default |
-|------|-------------|---------|
-| `-p, --project <project>` | Project slug or ID | - |
-| `--period <period>` | Time period: today, 24h, 7d, 30d, 90d | `24h` |
-| `--limit <n>` | Number of results | `20` |
-| `--json` | Output in JSON format | - |
+**Options:**
 
-```bash
-temps analytics top pages -p my-app --period 30d
-temps analytics top referrers --period 7d
-temps analytics top browsers --json
-temps analytics top countries --limit 50
-```
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--limit <n>` | Number of results (default: 20, max: 100) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics funnels`
+
+Show funnel conversion metrics for all funnels
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `7d` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics ai-agents`
+
+Show AI crawler / provider breakdown (web /analytics/ai-agents)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | Yes |
+| `--limit <n>` | Number of rows to fetch (default: 20, max: 100) | - | Yes |
+| `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | Yes |
+| `--path <path>` | Restrict to one URL path (e.g. /docs) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics ai-pages`
+
+Show pages crawled by AI agents, with distinct-agent counts
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | Yes |
+| `--limit <n>` | Number of pages to fetch (default: 20, max: 100) | - | Yes |
+| `--path <path>` | Restrict to one URL path (returns just that row) | - | Yes |
+| `--with-agents` | Also fetch and render the per-agent split for each page (slower) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics ai-page`
+
+Show which agents/providers crawled a single page (e.g. /docs)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 24h, 7d, 30d) | `24h` | Yes |
+| `--limit <n>` | Number of rows to fetch (default: 50, max: 100) | - | Yes |
+| `--group-by <mode>` | Group rows by "agent" (default) or "provider" | `agent` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-overview`
+
+Show API traffic timeseries (requests, errors, latency) from /api-analytics/timeseries
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-routes`
+
+Show top API routes by request count from /api-analytics/routes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--limit <n>` | Number of routes to return (default: 20, max: 100) | - | Yes |
+| `--offset <n>` | Number of ranked routes to skip (default: 0) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-callers`
+
+Show top API callers by client IP from /api-analytics/callers
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--limit <n>` | Number of callers to return (default: 20, max: 100) | - | Yes |
+| `--offset <n>` | Number of ranked callers to skip (default: 0) | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-summary`
+
+Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | Yes |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | Yes |
+| `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | Yes |
+| `--json` | Output in JSON format | - | No |
+
 
 ---
 
@@ -1419,9 +3106,9 @@ The CLI respects the following environment variables:
 
 Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
-- **Credentials**: `~/.temps/.secrets`
+- **Credentials**: Stored securely in `~/.temps/` with restricted file permissions
 
-Use `temps configure show` to view current configuration.
+Use `bunx @temps-sdk/cli configure show` to view current configuration.
 
 ## Support
 

@@ -1,15 +1,33 @@
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DbErr, EntityTrait, QueryFilter, QueryOrder,
-    Set, Statement, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseTransaction, DbErr, EntityTrait,
+    QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::Serialize;
 use slug::slugify;
 use std::sync::Arc;
 use temps_core::problemdetails::Problem;
-use temps_core::{EnvironmentCreatedJob, EnvironmentDeletedJob, Job, JobQueue};
+use temps_core::{
+    EnvironmentCreatedJob, EnvironmentDeletedJob, Job, JobQueue, PublicHostnameStrategy,
+};
 use temps_entities::{environment_domains, environments, projects};
 use thiserror::Error;
 use tracing::{info, warn};
+
+/// An empty target-node list means "remove this environment override".
+/// Persisting `Some([])` would instead create an explicit placement constraint
+/// that no node can satisfy, leaving workloads impossible to redeploy or drain.
+fn normalize_target_nodes(target_nodes: Vec<i32>) -> Option<Vec<i32>> {
+    (!target_nodes.is_empty()).then_some(target_nodes)
+}
+
+/// An empty target-label object means "remove this environment override" so
+/// the environment inherits any project-level placement constraint.
+fn normalize_target_labels(target_labels: serde_json::Value) -> Option<serde_json::Value> {
+    (!target_labels
+        .as_object()
+        .is_some_and(serde_json::Map::is_empty))
+    .then_some(target_labels)
+}
 
 #[derive(Error, Debug)]
 pub enum EnvironmentError {
@@ -92,6 +110,35 @@ pub struct DomainEnvironment {
     pub slug: String,
 }
 
+/// Build a browser-reachable URL for a preview-domain hostname.
+///
+/// `external_url` is the public origin of the Temps instance, so its scheme
+/// and explicit port are authoritative. The hostname itself remains the
+/// environment/custom-domain hostname supplied by the caller.
+fn format_public_url(host: &str, external_url: Option<&str>, proxy_port: u16) -> String {
+    let (protocol, port) = match external_url {
+        Some(origin) => match origin.parse::<http::Uri>() {
+            Ok(uri) => (
+                uri.scheme_str().unwrap_or("https").to_owned(),
+                uri.authority().and_then(http::uri::Authority::port_u16),
+            ),
+            Err(_) if origin.starts_with("http://") => ("http".to_owned(), None),
+            Err(_) => ("https".to_owned(), None),
+        },
+        None => ("http".to_owned(), Some(proxy_port)),
+    };
+    let is_default_port = matches!(
+        (protocol.as_str(), port),
+        ("http", Some(80)) | ("https", Some(443))
+    );
+    let port_suffix = match port {
+        Some(_) if is_default_port => String::new(),
+        Some(port) => format!(":{port}"),
+        None => String::new(),
+    };
+    format!("{protocol}://{host}{port_suffix}")
+}
+
 #[derive(Clone)]
 pub struct EnvironmentService {
     db: Arc<temps_database::DbConnection>,
@@ -128,58 +175,23 @@ impl EnvironmentService {
             }
         };
 
-        // Use external_url if configured, otherwise fall back to preview_domain
-        let base_domain = settings.preview_domain.clone();
+        // Environment hostnames are identical across strategies, so no per-domain
+        // resolution is needed here.
+        let domain = PublicHostnameStrategy::Standard
+            .environment_hostname(&settings.preview_domain, environment_slug);
 
-        // Determine protocol - use https if external_url is configured, otherwise http
-        let protocol = if settings.external_url.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-
-        // Append the proxy port when it isn't the protocol's default — the
-        // proxy listens on `ServerConfig.address` (e.g. `:8080`), so without
-        // this the URL points at :80/:443 and is unreachable on a local /
-        // non-standard-port instance. Only applies to the preview-domain path:
-        // when `external_url` is set, that URL already encodes the real public
-        // host/port (typically 443) and the internal proxy port is irrelevant.
-        let port_suffix = self.port_suffix(protocol, settings.external_url.is_some());
-
-        // <scheme>://<slug>.<preview_domain>[:port]
-        format!(
-            "{}://{}.{}{}",
-            protocol, environment_slug, base_domain, port_suffix
+        format_public_url(
+            &domain,
+            settings.external_url.as_deref(),
+            self.config_service.proxy_port(),
         )
-    }
-
-    /// Returns `:<port>` when the proxy listens on a non-default port for the
-    /// given scheme (i.e. not 80 for http, not 443 for https), otherwise an
-    /// empty string. The port comes from the Rust proxy listener address via
-    /// [`ConfigService::proxy_port`] — the single source of truth — rather than
-    /// being parsed out of `preview_domain`.
-    ///
-    /// `external_url_set` short-circuits to no suffix: behind a reverse proxy /
-    /// public domain the externally-visible port is whatever `external_url`
-    /// uses, not the internal proxy listener port.
-    fn port_suffix(&self, protocol: &str, external_url_set: bool) -> String {
-        if external_url_set {
-            return String::new();
-        }
-        let port = self.config_service.proxy_port();
-        let is_default = (protocol == "http" && port == 80) || (protocol == "https" && port == 443);
-        if is_default {
-            String::new()
-        } else {
-            format!(":{}", port)
-        }
     }
 
     /// Compute the full FQDN for an environment (without protocol)
     pub async fn compute_environment_fqdn(&self, environment_slug: &str) -> String {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
-        let base_domain = settings.preview_domain.clone();
-        format!("{}.{}", environment_slug, base_domain)
+        PublicHostnameStrategy::Standard
+            .environment_hostname(&settings.preview_domain, environment_slug)
     }
 
     /// Compute the URL for a user-supplied custom domain (verbatim host).
@@ -187,13 +199,33 @@ impl EnvironmentService {
     /// the input is expected to already be a fully-qualified hostname.
     pub async fn compute_custom_domain_url(&self, domain: &str) -> String {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
-        let protocol = if settings.external_url.is_some() {
-            "https"
-        } else {
-            "http"
-        };
-        let port_suffix = self.port_suffix(protocol, settings.external_url.is_some());
-        format!("{}://{}{}", protocol, domain, port_suffix)
+        format_public_url(
+            domain,
+            settings.external_url.as_deref(),
+            self.config_service.proxy_port(),
+        )
+    }
+
+    /// Serialize every activation of a preview hostname and reject an active
+    /// owner. This must be called inside the transaction that creates,
+    /// restores, or renames the environment.
+    async fn claim_environment_subdomain(
+        &self,
+        txn: &DatabaseTransaction,
+        subdomain: &str,
+        excluding_environment_id: Option<i32>,
+    ) -> Result<(), EnvironmentError> {
+        let excluded = excluding_environment_id.into_iter().collect::<Vec<_>>();
+        if environments::claim_subdomain(txn, subdomain, &excluded)
+            .await?
+            .is_some()
+        {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Subdomain '{}' is already in use",
+                subdomain
+            )));
+        }
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -225,11 +257,17 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} for branch '{}' in project {}",
                 deleted_env.id, branch, project_id
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self.db.begin().await?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             active_env.current_deployment_id = Set(None);
-            let restored = active_env.update(self.db.as_ref()).await?;
+            let restored = active_env.update(&txn).await?;
+            txn.commit().await?;
             return Ok(restored);
         }
 
@@ -237,10 +275,12 @@ impl EnvironmentService {
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
-        let main_url = format!("{}-{}", project.slug, env_slug);
+        let main_url = format!("{}-{}", project.slug, env_slug).to_ascii_lowercase();
 
         // Start a transaction for insert + domain creation
         let txn = self.db.begin().await?;
+        self.claim_environment_subdomain(&txn, &main_url, None)
+            .await?;
 
         // Create the new environment
         let new_environment = environments::ActiveModel {
@@ -348,6 +388,26 @@ impl EnvironmentService {
         )))
     }
 
+    /// Load an environment for an idempotent deletion retry, including rows
+    /// whose deletion fence (`deleted_at`) is already set.
+    pub async fn get_environment_for_deletion(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<environments::Model, EnvironmentError> {
+        environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .filter(environments::Column::Id.eq(environment_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!(
+                    "Environment {} not found in project {}",
+                    environment_id, project_id
+                ))
+            })
+    }
+
     pub async fn get_default_environment(
         &self,
         project_id_p: i32,
@@ -418,13 +478,25 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} for branch '{}'",
                 deleted_env.id, branch
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self
+                .db
+                .begin()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             let restored = active_env
-                .update(self.db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            txn.commit()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
             return Ok(restored);
         }
 
@@ -492,6 +564,15 @@ impl EnvironmentService {
                 "Restoring soft-deleted environment {} ('{}') in project {}",
                 deleted_env.id, name, project_id
             );
+            let deleted_env_id = deleted_env.id;
+            let subdomain = deleted_env.subdomain.clone();
+            let txn = self
+                .db
+                .begin()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
+            self.claim_environment_subdomain(&txn, &subdomain, Some(deleted_env_id))
+                .await?;
             let mut active_env: environments::ActiveModel = deleted_env.into();
             active_env.deleted_at = Set(None);
             active_env.branch = Set(Some(branch));
@@ -505,9 +586,12 @@ impl EnvironmentService {
                     }));
             }
             let restored = active_env
-                .update(self.db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+            txn.commit()
+                .await
+                .map_err(|error| EnvironmentError::Other(error.to_string()))?;
             return Ok(restored);
         }
 
@@ -516,7 +600,7 @@ impl EnvironmentService {
         let env_slug = slugify(&name);
 
         // Create main_url using project_slug-env_slug format
-        let main_url = format!("{}-{}", project.slug, env_slug);
+        let main_url = format!("{}-{}", project.slug, env_slug).to_ascii_lowercase();
 
         // Create the new environment
         let new_environment = environments::ActiveModel {
@@ -544,6 +628,8 @@ impl EnvironmentService {
             .begin()
             .await
             .map_err(|e| EnvironmentError::Other(e.to_string()))?;
+        self.claim_environment_subdomain(&txn, &main_url, None)
+            .await?;
 
         // Insert the environment
         let environment = new_environment
@@ -655,14 +741,19 @@ impl EnvironmentService {
             }
             deployment_config.security = Some(security);
         }
-        if settings.target_nodes.is_some() {
-            deployment_config.target_nodes = settings.target_nodes;
+        if let Some(target_nodes) = settings.target_nodes {
+            deployment_config.target_nodes = normalize_target_nodes(target_nodes);
         }
-        if settings.target_labels.is_some() {
-            deployment_config.target_labels = settings.target_labels;
+        if let Some(target_labels) = settings.target_labels {
+            deployment_config.target_labels = normalize_target_labels(target_labels);
         }
         if let Some(anti_affinity) = settings.anti_affinity {
             deployment_config.anti_affinity = anti_affinity;
+        }
+        // Absent leaves the environment inheriting the project's setting; an
+        // explicit value (including `false`) pins it for this environment.
+        if let Some(cross_architecture_builds) = settings.cross_architecture_builds {
+            deployment_config.cross_architecture_builds = Some(cross_architecture_builds);
         }
         if let Some(on_demand) = settings.on_demand {
             deployment_config.on_demand = on_demand;
@@ -672,6 +763,22 @@ impl EnvironmentService {
         }
         if let Some(wake_timeout_seconds) = settings.wake_timeout_seconds {
             deployment_config.wake_timeout_seconds = wake_timeout_seconds;
+        }
+        // Double-Option semantics, like cpu_request/cpu_limit above: outer
+        // `Some` applies the change (inner `None` clears the override so the
+        // environment inherits the project/global value again, inner
+        // `Some(n)` sets it); outer `None` leaves the current value unchanged.
+        if let Some(request_timeout_seconds) = settings.request_timeout_seconds {
+            deployment_config.request_timeout_seconds = request_timeout_seconds;
+        }
+        if let Some(sse_idle_timeout_seconds) = settings.sse_idle_timeout_seconds {
+            deployment_config.sse_idle_timeout_seconds = sse_idle_timeout_seconds;
+        }
+        if let Some(websocket_idle_timeout_seconds) = settings.websocket_idle_timeout_seconds {
+            deployment_config.websocket_idle_timeout_seconds = websocket_idle_timeout_seconds;
+        }
+        if let Some(max_concurrent_connections) = settings.max_concurrent_connections {
+            deployment_config.max_concurrent_connections = max_concurrent_connections;
         }
 
         // Validate the deployment config
@@ -693,6 +800,10 @@ impl EnvironmentService {
         if let Some(attack_mode) = settings.attack_mode {
             active_model.attack_mode = Set(attack_mode);
         }
+        // force_https follows the same tri-state contract as attack_mode.
+        if let Some(force_https) = settings.force_https {
+            active_model.force_https = Set(force_https);
+        }
         active_model.updated_at = Set(chrono::Utc::now());
 
         let updated_environment = active_model
@@ -700,12 +811,27 @@ impl EnvironmentService {
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
 
-        // When on-demand settings change, notify the proxy to reload routes so it
-        // picks up sleeping-domain registrations and on-demand configs immediately.
-        let on_demand_changed = settings.on_demand.is_some()
+        // Notify the proxy to reload routes so it picks up the change immediately.
+        //
+        // This is NOT optional for the fields below. The proxy answers requests
+        // from `CachedPeerTable`, which holds a cloned `environments::Model` and
+        // reloads *only* on PG NOTIFY — there is no periodic timer ("a quiet
+        // system stays quiet"). The `environments_route_change_trigger` covers
+        // just `current_deployment_id` and `deployment_config`, so a change to a
+        // top-level column like `force_https` or `attack_mode` reaches Postgres
+        // and then stops: the proxy keeps serving the stale model until some
+        // unrelated event (a deploy, a subdomain rename) happens to fire a
+        // NOTIFY. The setting looks silently broken, which is the worst possible
+        // outcome for a self-hosted operator with no support channel to ask.
+        //
+        // `attack_mode` is included for the same reason — it is read off the same
+        // cached model on the request path and has the same staleness window.
+        let routing_relevant_changed = settings.on_demand.is_some()
             || settings.idle_timeout_seconds.is_some()
-            || settings.wake_timeout_seconds.is_some();
-        if on_demand_changed {
+            || settings.wake_timeout_seconds.is_some()
+            || settings.force_https.is_some()
+            || settings.attack_mode.is_some();
+        if routing_relevant_changed {
             // "NOTIFY route_table_changes" is a fully hardcoded string — no
             // user-controlled data is interpolated. Statement::from_string is
             // safe here; PostgreSQL does not support parameterised NOTIFY.
@@ -720,7 +846,7 @@ impl EnvironmentService {
                 tracing::error!(
                     error = %e,
                     environment_id = env_id,
-                    "Failed to send route_table_changes NOTIFY after on-demand settings update"
+                    "Failed to send route_table_changes NOTIFY after environment settings update - the proxy will keep serving the previous settings until the next reload"
                 );
             }
         }
@@ -736,8 +862,8 @@ impl EnvironmentService {
     /// the proxy reloads its route table.
     ///
     /// Returns `InvalidInput` if the slugified value is empty, exceeds the
-    /// DNS label length limit, or collides with another environment in the
-    /// same project.
+    /// DNS label length limit, or collides with another active environment
+    /// globally because preview hostnames are keyed by subdomain.
     pub async fn update_environment_subdomain(
         &self,
         project_id: i32,
@@ -765,28 +891,18 @@ impl EnvironmentService {
             return Ok(environment);
         }
 
-        // Reject collisions with any other environment in the same project.
-        let conflict = environments::Entity::find()
-            .filter(environments::Column::ProjectId.eq(project_id))
-            .filter(environments::Column::Subdomain.eq(&normalized))
-            .filter(environments::Column::Id.ne(env_id))
-            .filter(environments::Column::DeletedAt.is_null())
-            .one(self.db.as_ref())
-            .await?;
-        if let Some(other) = conflict {
-            return Err(EnvironmentError::InvalidInput(format!(
-                "Subdomain '{}' is already used by environment '{}' in this project",
-                normalized, other.name
-            )));
-        }
-
-        let previous_subdomain = environment.subdomain.clone();
-
         let txn = self
             .db
             .begin()
             .await
             .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
+
+        // A row lock cannot protect the "no conflict exists" case, and a new
+        // unique index would fail upgrades that already contain duplicates.
+        self.claim_environment_subdomain(&txn, &normalized, Some(env_id))
+            .await?;
+
+        let previous_subdomain = environment.subdomain.clone();
 
         let mut active_model: environments::ActiveModel = environment.clone().into();
         active_model.subdomain = Set(normalized.clone());
@@ -1008,11 +1124,10 @@ impl EnvironmentService {
         project_id: i32,
         env_id: i32,
     ) -> Result<(), EnvironmentError> {
-        // Get the environment (only non-deleted ones)
+        // Include an already-fenced row so deletion retries are idempotent.
         let environment = environments::Entity::find()
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::Id.eq(env_id))
-            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
@@ -1024,6 +1139,10 @@ impl EnvironmentService {
             return Err(EnvironmentError::InvalidInput(
                 "Cannot delete production environment".to_string(),
             ));
+        }
+
+        if environment.deleted_at.is_some() {
+            return Ok(());
         }
 
         // Emit EnvironmentDeleted job so subscribers can clean up
@@ -1062,6 +1181,53 @@ mod tests {
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
 
+    #[test]
+    fn empty_target_nodes_clears_environment_placement_override() {
+        assert_eq!(normalize_target_nodes(Vec::new()), None);
+        assert_eq!(normalize_target_nodes(vec![1, 3]), Some(vec![1, 3]));
+    }
+
+    #[test]
+    fn empty_target_labels_clear_environment_placement_override() {
+        assert_eq!(normalize_target_labels(serde_json::json!({})), None);
+        assert_eq!(
+            normalize_target_labels(serde_json::json!({"region": "eu"})),
+            Some(serde_json::json!({"region": "eu"}))
+        );
+    }
+
+    #[test]
+    fn public_url_preserves_external_http_scheme_and_non_default_port() {
+        assert_eq!(
+            format_public_url(
+                "app-production.example.test",
+                Some("http://example.test:8240"),
+                8240,
+            ),
+            "http://app-production.example.test:8240"
+        );
+    }
+
+    #[test]
+    fn public_url_preserves_external_https_custom_port() {
+        assert_eq!(
+            format_public_url(
+                "app-production.example.test",
+                Some("https://temps.example.test:8443"),
+                8080,
+            ),
+            "https://app-production.example.test:8443"
+        );
+    }
+
+    #[test]
+    fn public_url_uses_proxy_port_without_external_origin() {
+        assert_eq!(
+            format_public_url("app-production.localho.st", None, 8240),
+            "http://app-production.localho.st:8240"
+        );
+    }
+
     fn make_service(db: sea_orm::DatabaseConnection) -> EnvironmentService {
         let server_config = temps_config::ServerConfig::new(
             "127.0.0.1:3000".to_string(),
@@ -1075,6 +1241,44 @@ mod tests {
             Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
         ));
         EnvironmentService::new(Arc::new(db), config_service)
+    }
+
+    #[tokio::test]
+    async fn delete_environment_persists_idempotent_deployment_fence() {
+        let environment = environments::Model {
+            id: 7,
+            project_id: 3,
+            name: "Preview".to_string(),
+            slug: "preview".to_string(),
+            subdomain: "project-preview".to_string(),
+            branch: Some("feature".to_string()),
+            host: String::new(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: Some(11),
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: true,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
+        };
+        let mut fenced = environment.clone();
+        fenced.deleted_at = Some(chrono::Utc::now());
+        fenced.current_deployment_id = None;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![environment]])
+            .append_query_results(vec![vec![fenced.clone()]])
+            .append_query_results(vec![vec![fenced]])
+            .into_connection();
+        let service = make_service(db);
+
+        service.delete_environment(3, 7).await.unwrap();
+        service.delete_environment(3, 7).await.unwrap();
     }
 
     #[test]
@@ -1176,6 +1380,7 @@ mod tests {
             protected: false,
             sleeping: false,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         };
 
@@ -1219,11 +1424,17 @@ mod tests {
                     target_nodes: None,
                     target_labels: None,
                     anti_affinity: None,
+                    cross_architecture_builds: None,
                     protected: None,
                     attack_mode: None,
+                    force_https: None,
                     on_demand: None,
                     idle_timeout_seconds: None,
                     wake_timeout_seconds: None,
+                    request_timeout_seconds: None,
+                    sse_idle_timeout_seconds: None,
+                    websocket_idle_timeout_seconds: None,
+                    max_concurrent_connections: None,
                     password: None,
                 },
             )
@@ -1233,6 +1444,121 @@ mod tests {
             result.is_ok(),
             "Should allow keeping the same branch: {:?}",
             result.err()
+        );
+    }
+
+    /// Double-Option clearing (`Some(None)`) must actually remove the override
+    /// from the persisted `deployment_config`, not just leave it unchanged —
+    /// this project has shipped a bug before where a double-Option "clear"
+    /// silently no-opped instead of nulling the column.
+    #[tokio::test]
+    async fn test_update_settings_clears_request_timeout_override() {
+        let current_env = environments::Model {
+            id: 1,
+            name: "production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "my-project-production".to_string(),
+            branch: Some("main".to_string()),
+            project_id: 10,
+            host: "".to_string(),
+            upstreams: temps_entities::upstream_config::UpstreamList::new(),
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_deployment: None,
+            current_deployment_id: None,
+            deleted_at: None,
+            deployment_config: Some(temps_entities::deployment_config::DeploymentConfig {
+                request_timeout_seconds: Some(120),
+                ..Default::default()
+            }),
+            is_preview: false,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
+        };
+        let updated_env = environments::Model {
+            deployment_config: Some(temps_entities::deployment_config::DeploymentConfig {
+                request_timeout_seconds: None,
+                ..Default::default()
+            }),
+            ..current_env.clone()
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![current_env]])
+            .append_query_results(vec![vec![updated_env]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let db = Arc::new(db);
+        let server_config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            "postgres://localhost/test".to_string(),
+            None,
+            None,
+        )
+        .unwrap();
+        let config_service = Arc::new(temps_config::ConfigService::new(
+            Arc::new(server_config),
+            Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        ));
+        let svc = EnvironmentService::new(db.clone(), config_service);
+
+        let result = svc
+            .update_environment_settings(
+                10,
+                1,
+                crate::handlers::UpdateEnvironmentSettingsRequest {
+                    branch: None,
+                    cpu_request: None,
+                    cpu_limit: None,
+                    memory_request: None,
+                    memory_limit: None,
+                    replicas: None,
+                    exposed_port: None,
+                    automatic_deploy: None,
+                    performance_metrics_enabled: None,
+                    session_recording_enabled: None,
+                    security: None,
+                    target_nodes: None,
+                    target_labels: None,
+                    anti_affinity: None,
+                    cross_architecture_builds: None,
+                    protected: None,
+                    attack_mode: None,
+                    force_https: None,
+                    on_demand: None,
+                    idle_timeout_seconds: None,
+                    wake_timeout_seconds: None,
+                    // Outer Some, inner None: explicitly clear the override
+                    // so the environment reverts to inheriting the
+                    // project/global request timeout.
+                    request_timeout_seconds: Some(None),
+                    sse_idle_timeout_seconds: None,
+                    websocket_idle_timeout_seconds: None,
+                    max_concurrent_connections: None,
+                    password: None,
+                },
+            )
+            .await;
+        assert!(
+            result.is_ok(),
+            "clearing an override should succeed: {:?}",
+            result.err()
+        );
+
+        // Inspect the actual UPDATE statement rather than trusting the mock's
+        // canned response — it must not still carry the cleared field.
+        drop(svc);
+        let db = Arc::try_unwrap(db).expect("service dropped, so this is the only handle");
+        let log = format!("{:?}", db.into_transaction_log());
+        assert!(
+            !log.contains("requestTimeoutSeconds"),
+            "cleared field must be omitted from the persisted deployment_config JSON, got: {log}"
         );
     }
 
@@ -1261,6 +1587,7 @@ mod tests {
             protected: false,
             sleeping,
             attack_mode: None,
+            force_https: None,
             last_activity_at: None,
         }
     }
@@ -1415,6 +1742,10 @@ mod tests {
             .append_query_results(vec![vec![env]])
             // 2. conflict check returns the sibling env
             .append_query_results(vec![vec![conflict]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
             .into_connection();
         let svc = make_service(db);
 
@@ -1425,17 +1756,53 @@ mod tests {
         match result {
             Err(EnvironmentError::InvalidInput(msg)) => {
                 assert!(
-                    msg.contains("already used"),
+                    msg.contains("already in use"),
                     "Error should describe conflict: {}",
                     msg
                 );
                 assert!(
-                    msg.contains("production"),
-                    "Error should name the conflicting env: {}",
+                    !msg.contains("production"),
+                    "Error must not disclose the conflicting environment: {}",
                     msg
                 );
             }
             other => panic!("Expected InvalidInput, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_update_subdomain_rejects_conflict_across_projects() {
+        let env = make_env_model(false, false);
+        let conflict = environments::Model {
+            id: 2,
+            name: "victim-production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "victim".to_string(),
+            project_id: 99,
+            ..make_env_model(false, false)
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![env]])
+            .append_query_results(vec![vec![conflict]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 1,
+            }])
+            .into_connection();
+        let svc = make_service(db);
+
+        let result = svc
+            .update_environment_subdomain(10, 1, "victim".to_string())
+            .await;
+
+        match result {
+            Err(EnvironmentError::InvalidInput(msg)) => {
+                assert!(msg.contains("already in use"), "got: {msg}");
+                assert!(!msg.contains("victim-production"), "got: {msg}");
+                assert!(!msg.contains("project 99"), "got: {msg}");
+            }
+            other => panic!("Expected InvalidInput, got {other:?}"),
         }
     }
 

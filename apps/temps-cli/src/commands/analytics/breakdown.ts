@@ -7,7 +7,7 @@ import { withSpinner } from '../../ui/spinner.js'
 import { newline, json as jsonOut, colors, info } from '../../ui/output.js'
 import { parsePeriod } from './period.js'
 
-const DIMENSION_MAP: Record<string, { groupBy: string; label: string }> = {
+export const DIMENSION_MAP: Record<string, { groupBy: string; label: string }> = {
   pages: { groupBy: 'page_path', label: 'Top Pages' },
   referrers: { groupBy: 'referrer_hostname', label: 'Top Referrers' },
   browsers: { groupBy: 'browser', label: 'Browsers' },
@@ -36,12 +36,18 @@ function formatNumber(n: number): string {
   return n.toLocaleString('en-US')
 }
 
-export async function breakdown(dimension: string, options: BreakdownOptions): Promise<void> {
+/** Look up a `temps analytics top <dimension>` argument, rejecting anything not in DIMENSION_MAP. */
+export function resolveDimension(dimension: string): { groupBy: string; label: string } {
   const dim = DIMENSION_MAP[dimension]
   if (!dim) {
     const valid = Object.keys(DIMENSION_MAP).join(', ')
     throw new Error(`Unknown dimension "${dimension}". Available: ${valid}`)
   }
+  return dim
+}
+
+export async function breakdown(dimension: string, options: BreakdownOptions): Promise<void> {
+  const dim = resolveDimension(dimension)
 
   await requireAuth()
   await setupClient()

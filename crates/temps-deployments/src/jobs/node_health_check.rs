@@ -339,21 +339,20 @@ pub fn latest_control_plane_metrics() -> Option<CpSample> {
 /// the same shape worker heartbeats use. Cheap; called from the 60s health loop
 /// so the control-plane node shows live metrics like any worker.
 pub fn refresh_control_plane_metrics() {
-    use sysinfo::{CpuExt, DiskExt, SystemExt};
+    use sysinfo::{Disks, System};
 
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu();
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
     sys.refresh_memory();
-    sys.refresh_disks_list();
-    sys.refresh_disks();
+    let disks = Disks::new_with_refreshed_list();
 
-    let cpu_percent = sys.global_cpu_info().cpu_usage() as f64;
+    let cpu_percent = sys.global_cpu_usage() as f64;
     let memory_used_bytes = sys.used_memory();
     let memory_total_bytes = sys.total_memory();
     // Root mount only, to avoid double-counting overlapping mounts (matches the
     // agent's collect_system_metrics).
-    let (disk_used, disk_total) = sys
-        .disks()
+    let (disk_used, disk_total) = disks
+        .list()
         .iter()
         .find(|d| d.mount_point() == std::path::Path::new("/"))
         .map(|d| (d.total_space() - d.available_space(), d.total_space()))
@@ -471,7 +470,7 @@ pub async fn failover_offline_nodes(
             if dep.needs_redeploy() {
                 // All replicas were on this node — must redeploy
                 match deployment_service
-                    .redeploy_environment(dep.project_id, dep.environment_id)
+                    .redeploy_environment(dep.project_id, dep.environment_id, dep.deployment_id)
                     .await
                 {
                     Ok(_) => {
@@ -528,6 +527,7 @@ mod tests {
 
     fn make_node(id: i32, name: &str, status: &str, heartbeat_age_secs: i64) -> nodes::Model {
         nodes::Model {
+            architecture: None,
             id,
             name: name.to_string(),
             token_hash: "hash".to_string(),

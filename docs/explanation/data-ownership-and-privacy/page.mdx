@@ -18,13 +18,13 @@ export const sections = [
 
 # Data Ownership & Privacy
 
-When you self-host Temps, every byte of data — analytics events, error reports, session recordings, database backups, application logs — stays on your infrastructure. Nothing is sent to Temps (the company), third-party analytics services, or any external server. {{ className: 'lead' }}
+When you self-host Temps, every byte of your data — analytics events, error reports, session recordings, database backups, application logs — stays on your infrastructure. None of it is sent to Temps (the company), third-party analytics services, or any external server. The only thing the binary reports is [anonymous product telemetry](#anonymous-telemetry) — event names, counts, and coarse internal labels (Temps module names, route templates) under a random instance ID. Set `TEMPS_TELEMETRY=0` and nothing is sent. {{ className: 'lead' }}
 
 ---
 
 ## Your server, your data {{ anchor: true, id: 'your-server-your-data' }}
 
-Temps is a binary you run on your own server. It stores data in a PostgreSQL database (with TimescaleDB extension) running on that same server. There is no cloud backend, no telemetry endpoint, and no "call home" mechanism.
+Temps is a binary you run on your own server. It stores data in a PostgreSQL database (with TimescaleDB extension) running on that same server. There is no cloud backend, and none of your data — analytics, recordings, errors, logs, backups, credentials — ever leaves your infrastructure. The binary does send [anonymous product telemetry](#anonymous-telemetry) (event names and counts under a random instance ID, disable with `TEMPS_TELEMETRY=0`), described in full below.
 
 This means:
 
@@ -55,11 +55,37 @@ All data lives in one PostgreSQL database:
 
 ### Where data does NOT go
 
-- No data is sent to `temps.sh` or any Temps-operated server
+- None of **your** data (analytics events, recordings, error reports, logs, backups, user accounts, credentials) is ever sent to `temps.sh` or any Temps-operated server
 - No data is sent to Google, Facebook, or any advertising network
 - No data is shared with analytics aggregators
-- The Temps binary does not contain tracking code or telemetry
-- The `temps upgrade` command checks GitHub for new releases (a public API call) — this is the only external request, and it contains no user data
+- The `temps upgrade` command checks GitHub for new releases (a public API call with no user data)
+- The binary sends anonymous product telemetry to `telemetry.temps.sh` — event names, counts, and coarse labels only, detailed in the next section. Set `TEMPS_TELEMETRY=0` and nothing is sent.
+
+---
+
+## Anonymous product telemetry {{ anchor: true, id: 'anonymous-telemetry' }}
+
+Temps reports anonymous usage events so the maintainers can tell whether the product actually works for self-hosters (e.g. "how many instances attempted a deploy vs. succeeded"). Every event carries only:
+
+- A **random instance ID** generated on your server (`~/.temps/anonymous_id`) — not derived from your hardware, domain, or account
+- The **event name** (e.g. `deploy_succeeded`, `instance_heartbeat`) and the Temps version
+- A small bag of **non-identifying properties**: counts, enum labels (build preset, source type), and coarse buckets (RAM tier — never exact specs)
+
+What is **never** sent: emails, IPs, repo names, domains, URLs, environment variables, error messages, stack traces, file paths from your projects, or any free-form user text.
+
+### Error summary
+
+To find and fix bugs that only appear on self-hosted instances, Temps periodically (every 6 hours, only if something went wrong) sends one aggregated `error_summary` event containing **counts** of:
+
+- ERROR-level log events, keyed by the Temps source module that logged them
+- Console-API 5xx responses, keyed by route *template* (`/api/projects/{id}` — never the actual URL you requested)
+- Panics, keyed by source file and line in the Temps codebase
+
+Every key is a compile-time identifier of Temps's own code. The error messages themselves — which can contain your project names, paths, and IDs — are never transmitted.
+
+### Opting out
+
+Set `TEMPS_TELEMETRY=0` (also accepts `false`, `off`, `no`, `disabled`) in the server's environment and restart. Nothing is sent while opted out — no events, no error summaries. Two things still happen locally: the instance ID file is created (so re-enabling later doesn't churn identity), and error counts are tallied in a small fixed-size in-process buffer that is never read or transmitted while opted out.
 
 ---
 

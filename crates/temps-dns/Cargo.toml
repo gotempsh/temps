@@ -42,7 +42,7 @@ hex = "0.4"
 
 # GCP service account authentication
 rsa = "0.9"
-base64 = "0.22"
+base64 = "0.23"
 
 # XML parsing for Route53
 quick-xml = { version = "0.41", features = ["serialize"] }
@@ -71,8 +71,9 @@ tokio-test = "0.4"
 testcontainers = { workspace = true }
 temps-migrations = { path = "../temps-migrations" }
 wiremock = "0.6"
-serial_test = "3.2"
-mockall = "0.13"
+serial_test = "4.0"
+mockall = "0.15"
+tower.workspace = true
 # ADR-024 integration test: in-process DNS client to query the real
 # control-plane resolver over a UDP socket (mirrors temps-dns-resolver's
 # own end_to_end.rs client).

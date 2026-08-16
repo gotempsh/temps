@@ -7,6 +7,8 @@ import {
 import {
   getEnvironmentsOptions,
   getProjectDeploymentsOptions,
+  hasTracesOptions,
+  listFacetsOptions,
   queryTraceSummariesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
@@ -22,6 +24,11 @@ import { CodeBlock } from '@/components/ui/code-block'
 import { EmptyState } from '@/components/ui/empty-state'
 import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
+import {
+  computeTracesTimeWindow,
+  tracesListTimeBounds,
+  type TracesTimeRange,
+} from '@/lib/traces-time-window'
 import {
   Select,
   SelectContent,
@@ -55,9 +62,11 @@ import {
   Clock,
   Code2,
   FileCode,
+  Gauge,
   RefreshCw,
   Search,
   Settings2,
+  Tag,
   Terminal,
   Workflow,
 } from 'lucide-react'
@@ -68,13 +77,11 @@ import {
   useMemo,
   useState,
 } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 
 interface TracesListProps {
   project: ProjectResponse
 }
-
-type TimeRange = '1h' | '6h' | '24h' | '7d' | '30d'
 
 function statusBadge(status: SpanStatusCode) {
   switch (status) {
@@ -615,8 +622,8 @@ export default function TracesList({ project }: TracesListProps) {
   usePageTitle(`Traces - ${project.name}`)
 
   // State from URL params
-  const [timeRange, setTimeRange] = useState<TimeRange>(
-    () => (searchParams.get('range') as TimeRange) || '24h'
+  const [timeRange, setTimeRange] = useState<TracesTimeRange>(
+    () => (searchParams.get('range') as TracesTimeRange) || '24h'
   )
   const [serviceName, setServiceName] = useState(
     () => searchParams.get('service') || ''
@@ -639,6 +646,17 @@ export default function TracesList({ project }: TracesListProps) {
   const [deploymentId, setDeploymentId] = useState(
     () => searchParams.get('deploy') || 'all'
   )
+  // Attribute filter: restricted to registered facets only (see ADR-039 /
+  // the FacetToggle in TraceDetail) — an unfaceted attribute would force a
+  // JSON scan over every span in the project's whole retention window, which
+  // is exactly the query this platform can't afford at 500M+ rows.
+  const [attrKey, setAttrKey] = useState(
+    () => searchParams.get('attr_key') || ''
+  )
+  const [attrValue, setAttrValue] = useState(
+    () => searchParams.get('attr_value') || ''
+  )
+  const debouncedAttrValue = useDebounce(attrValue, 300)
   const [page, setPage] = useState(() => {
     const p = searchParams.get('page')
     return p ? parseInt(p, 10) : 1
@@ -653,30 +671,17 @@ export default function TracesList({ project }: TracesListProps) {
     searchParams.get('dir') === 'asc' ? 'asc' : 'desc',
   )
   const [showSetup, setShowSetup] = useState(false)
+  // Bumped by Refresh so relative ranges recompute against "now". Without
+  // this, start/end freeze at mount (or last range change) and newly ingested
+  // traces that land after that frozen end_time stay invisible until a full
+  // page reload — including exact trace-id searches that still AND the window.
+  const [refreshKey, setRefreshKey] = useState(0)
 
-  // Compute time window
-  const { startTime, endTime } = useMemo(() => {
-    const now = new Date()
-    const start = new Date()
-    switch (timeRange) {
-      case '1h':
-        start.setHours(start.getHours() - 1)
-        break
-      case '6h':
-        start.setHours(start.getHours() - 6)
-        break
-      case '24h':
-        start.setDate(start.getDate() - 1)
-        break
-      case '7d':
-        start.setDate(start.getDate() - 7)
-        break
-      case '30d':
-        start.setDate(start.getDate() - 30)
-        break
-    }
-    return { startTime: start.toISOString(), endTime: now.toISOString() }
-  }, [timeRange])
+  // Compute time window (refreshKey forces a fresh "now" on Refresh)
+  const { startTime, endTime } = useMemo(
+    () => computeTracesTimeWindow(timeRange),
+    [timeRange, refreshKey],
+  )
 
   // Fetch environments for the filter dropdown
   const { data: environments } = useQuery({
@@ -685,6 +690,30 @@ export default function TracesList({ project }: TracesListProps) {
     }),
     enabled: !!project.id,
   })
+
+  // Registered facets — platform-global, so no project scoping. Backs the
+  // attribute-key dropdown below; only faceted keys are offered since only
+  // those are fast to filter on.
+  const { data: facetsData } = useQuery({
+    ...listFacetsOptions(),
+    staleTime: 30_000,
+  })
+  const facets = facetsData?.data ?? []
+
+  // If the URL names an attribute key (e.g. from a shared link, or one whose
+  // facet was since removed) that isn't a currently registered facet, drop
+  // it once the facet list has loaded. Otherwise the dropdown — which only
+  // lists registered facets — has no matching option to show, renders blank,
+  // and looks like "the selection disappeared" even though the filter is
+  // still silently applied underneath via the slow JSON-scan fallback.
+  useEffect(() => {
+    if (!facetsData || !attrKey) return
+    if (!facets.some((f) => f.attribute_key === attrKey)) {
+      setAttrKey('')
+      setAttrValue('')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [facetsData])
 
   // Fetch deployments for the selected environment (or all)
   const { data: deploymentsData } = useQuery({
@@ -711,12 +740,14 @@ export default function TracesList({ project }: TracesListProps) {
     if (debouncedNamePattern) params.set('name', debouncedNamePattern)
     if (environmentId !== 'all') params.set('env', environmentId)
     if (deploymentId !== 'all') params.set('deploy', deploymentId)
+    if (attrKey) params.set('attr_key', attrKey)
+    if (attrKey && debouncedAttrValue) params.set('attr_value', debouncedAttrValue)
     if (page > 1) params.set('page', page.toString())
     if (sortBy === null) params.set('sort', 'none')
     else if (sortBy !== 'start_time') params.set('sort', sortBy)
     if (sortBy !== null && sortOrder !== 'desc') params.set('dir', sortOrder)
     setSearchParams(params, { replace: true })
-  }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, page, sortBy, sortOrder, setSearchParams])
+  }, [timeRange, serviceName, status, debouncedSearch, debouncedNamePattern, environmentId, deploymentId, attrKey, debouncedAttrValue, page, sortBy, sortOrder, setSearchParams])
 
   // Cycle sort on a column header through three states: clicking a new column
   // selects it descending; clicking the active column goes desc → asc → unsorted
@@ -748,13 +779,18 @@ export default function TracesList({ project }: TracesListProps) {
     ])
   }, [project.name, project.slug, setBreadcrumbs])
 
+  const timeBounds = tracesListTimeBounds(debouncedSearch || undefined, {
+    startTime,
+    endTime,
+  })
+
   // Fetch trace summaries (one row per trace, server-side aggregation)
   const { data, isLoading, isFetching, refetch } = useQuery({
     ...queryTraceSummariesOptions({
       query: {
         project_id: project.id,
-        start_time: startTime,
-        end_time: endTime,
+        start_time: timeBounds.start_time,
+        end_time: timeBounds.end_time,
         service_name: serviceName || undefined,
         status: status !== 'all' ? status : undefined,
         trace_id: debouncedSearch || undefined,
@@ -763,8 +799,16 @@ export default function TracesList({ project }: TracesListProps) {
           environmentId !== 'all' ? Number(environmentId) : undefined,
         deployment_id:
           deploymentId !== 'all' ? Number(deploymentId) : undefined,
+        attributes:
+          attrKey && debouncedAttrValue
+            ? `${attrKey}=${debouncedAttrValue}`
+            : undefined,
         sort_by: sortBy ?? undefined,
         sort_order: sortBy ? sortOrder : undefined,
+        // Explicit: this list renders "Showing X–Y of Z" and a page count, so
+        // it genuinely needs the total. Stating it makes the `?? 0` below safe
+        // by construction rather than by relying on the server default.
+        include_total: true,
         limit: PAGE_SIZE,
         offset: (page - 1) * PAGE_SIZE,
       },
@@ -776,26 +820,37 @@ export default function TracesList({ project }: TracesListProps) {
   const totalPages = Math.max(1, Math.ceil(totalCount / PAGE_SIZE))
 
   // "Has this project EVER received a trace?" — a window/filter-independent
-  // probe (project_id only, limit 1). The main query above is scoped to the
-  // selected time range and filters, so its `total` goes to 0 whenever the
-  // window happens to be empty. Gating the setup onboarding on that would show
-  // "set up OpenTelemetry" to a project with millions of historical traces just
+  // probe. The main query above is scoped to the selected time range and
+  // filters, so its `total` goes to 0 whenever the window happens to be
+  // empty. Gating the setup onboarding on that would show "set up
+  // OpenTelemetry" to a project with millions of historical traces just
   // because nothing landed in the last 24h. This probe answers the real
   // question the onboarding screen is for.
-  const { data: anyTraceData, isLoading: isProbeLoading } = useQuery({
-    ...queryTraceSummariesOptions({
-      query: { project_id: project.id, limit: 1 },
+  //
+  // Uses the dedicated has-traces existence endpoint rather than
+  // trace-summaries with limit=1: without a time bound, trace-summaries
+  // GROUPs BY trace_id over the project's entire retention window — this was
+  // the single most expensive query on this page (measured at ~10s on an
+  // 860M-span project) before has-traces made it an O(1) index lookup.
+  const {
+    data: hasTracesData,
+    isLoading: isProbeLoading,
+    refetch: refetchProbe,
+  } = useQuery({
+    ...hasTracesOptions({
+      path: { project_id: project.id },
     }),
     enabled: !!project.id,
   })
-  const hasEverReceivedTraces = (anyTraceData?.total ?? 0) > 0
+  const hasEverReceivedTraces = !!hasTracesData?.has_traces
 
   const hasActiveFilters =
     !!search ||
     !!serviceName ||
     status !== 'all' ||
     environmentId !== 'all' ||
-    deploymentId !== 'all'
+    deploymentId !== 'all' ||
+    !!attrKey
 
   // Copy for the in-window empty state, in priority order:
   //  1. filters/window active → suggest adjusting them
@@ -821,7 +876,7 @@ export default function TracesList({ project }: TracesListProps) {
 
   const handleTimeRangeChange = useCallback(
     (v: string) => {
-      setTimeRange(v as TimeRange)
+      setTimeRange(v as TracesTimeRange)
       setPage(1)
     },
     []
@@ -855,6 +910,11 @@ export default function TracesList({ project }: TracesListProps) {
     },
     []
   )
+  const handleAttrKeyChange = useCallback((v: string) => {
+    setAttrKey(v === '__none__' ? '' : v)
+    setAttrValue('')
+    setPage(1)
+  }, [])
 
   return (
     <div className="space-y-4">
@@ -870,10 +930,29 @@ export default function TracesList({ project }: TracesListProps) {
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => refetch()}
+            onClick={() => {
+              // Advance the relative window so list queries recompute against
+              // "now". Trace-id searches omit the window, so their query key
+              // does not change — refetch those explicitly. Also re-check the
+              // unwindowed "ever received a trace" probe.
+              setRefreshKey((k) => k + 1)
+              if (debouncedSearch) void refetch()
+              void refetchProbe()
+            }}
             disabled={isFetching}
           >
             <RefreshCw className={`h-4 w-4 ${isFetching ? 'animate-spin' : ''}`} />
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="gap-2"
+            onClick={() =>
+              navigate(`/projects/${project.slug}/traces/operations`)
+            }
+          >
+            <Gauge className="h-3.5 w-3.5" />
+            <span className="hidden sm:inline">Operations</span>
           </Button>
           <Button
             variant="outline"
@@ -1030,6 +1109,42 @@ export default function TracesList({ project }: TracesListProps) {
                 className="h-9"
               />
             </div>
+
+            {facets.length > 0 && (
+              <>
+                <Select
+                  value={attrKey || '__none__'}
+                  onValueChange={handleAttrKeyChange}
+                >
+                  <SelectTrigger className="h-9 w-full sm:w-[200px]">
+                    <Tag className="mr-2 h-3.5 w-3.5" />
+                    <SelectValue placeholder="Attribute" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    <SelectItem value="__none__">No attribute filter</SelectItem>
+                    {facets.map((f) => (
+                      <SelectItem key={f.attribute_key} value={f.attribute_key}>
+                        {f.attribute_key}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+
+                {attrKey && (
+                  <div className="relative flex-1 min-w-0 sm:min-w-[160px]">
+                    <Input
+                      placeholder={`Value for ${attrKey}…`}
+                      value={attrValue}
+                      onChange={(e) => {
+                        setAttrValue(e.target.value)
+                        setPage(1)
+                      }}
+                      className="h-9"
+                    />
+                  </div>
+                )}
+              </>
+            )}
           </div>
         </CardContent>
       </Card>

@@ -78,7 +78,7 @@ interface VpsCredentials {
 
 // --- Helpers ---
 
-function vpsStatusBadge(status: string): string {
+export function vpsStatusBadge(status: string): string {
   const statusMap: Record<string, (s: string) => string> = {
     provisioning: chalk.yellow,
     installing: chalk.yellow,
@@ -92,7 +92,7 @@ function vpsStatusBadge(status: string): string {
   return colorFn(`● ${status}`)
 }
 
-function formatPrice(cents: number): string {
+export function formatPrice(cents: number): string {
   if (cents === 0) return colors.success('free')
   return `€${(cents / 100).toFixed(2)}/mo`
 }

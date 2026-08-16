@@ -34,7 +34,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useNavigate, useParams } from 'react-router-dom'
+import { useNavigate, useParams } from 'react-router'
 import { DeliveryDetailDialog } from './DeliveryDetailDialog'
 
 interface WebhookDetailProps {

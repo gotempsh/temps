@@ -4922,6 +4922,23 @@ impl MigrationTrait for Migration {
     }
 
     async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
+        // Drop every continuous aggregate this migration creates BEFORE any
+        // base hypertable. A TimescaleDB CAGG blocks DROP TABLE on its
+        // hypertable, and a single missing view aborts this whole down()
+        // transaction (which also rolls back the later per-table view
+        // drops, making the failure look like the base table itself).
+        manager
+            .get_connection()
+            .execute_unprepared(
+                "DROP MATERIALIZED VIEW IF EXISTS status_checks_daily CASCADE; \
+                 DROP MATERIALIZED VIEW IF EXISTS status_checks_hourly CASCADE; \
+                 DROP MATERIALIZED VIEW IF EXISTS status_checks_5min CASCADE; \
+                 DROP MATERIALIZED VIEW IF EXISTS error_events_daily CASCADE; \
+                 DROP MATERIALIZED VIEW IF EXISTS error_events_hourly CASCADE; \
+                 DROP MATERIALIZED VIEW IF EXISTS events_hourly CASCADE;",
+            )
+            .await?;
+
         // Drop tables in reverse order to handle foreign key constraints
 
         // Drop status page tables first (due to foreign key dependencies)
@@ -4929,6 +4946,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("status_incident_updates"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -4937,6 +4956,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("status_incidents"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -4951,48 +4972,94 @@ impl MigrationTrait for Migration {
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("status_checks")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("status_checks"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
             .drop_table(
                 Table::drop()
                     .table(Alias::new("status_monitors"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
 
         // Drop new error tracking and DSN tables first
         manager
-            .drop_table(Table::drop().table(Alias::new("project_dsns")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("project_dsns"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("error_events")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("error_events"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("error_groups")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("error_groups"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         // Drop funnel tables (due to foreign key dependencies)
         manager
-            .drop_table(Table::drop().table(Alias::new("funnel_steps")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("funnel_steps"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
         manager
-            .drop_table(Table::drop().table(Alias::new("funnels")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("funnels"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
             .drop_table(
                 Table::drop()
                     .table(Alias::new("magic_link_tokens"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("dev_projects")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("dev_projects"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         // Drop session replay tables first (they depend on visitor)
@@ -5000,6 +5067,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("session_replay_events"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5008,22 +5077,38 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("session_replay_sessions"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("visitor")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("visitor"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("api_keys")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("api_keys"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
             .drop_table(
                 Table::drop()
                     .table(Alias::new("project_services"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5032,6 +5117,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("env_var_environments"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5040,6 +5127,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("backup_schedules"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5048,6 +5137,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("external_service_backups"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5056,6 +5147,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("cron_executions"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5064,6 +5157,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("deployment_containers"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5072,30 +5167,58 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("deployment_domains"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("repositories")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("repositories"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("user_roles")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("user_roles"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("audit_logs")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("audit_logs"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("request_logs")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("request_logs"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
             .drop_table(
                 Table::drop()
                     .table(Alias::new("performance_metrics"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5104,6 +5227,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("project_custom_domains"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5112,40 +5237,80 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("deployment_metrics"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("crons")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("crons"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("env_vars")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("env_vars"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
             .drop_table(
                 Table::drop()
                     .table(Alias::new("environment_domains"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("custom_routes")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("custom_routes"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("domains")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("domains"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("acme_accounts")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("acme_accounts"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("backups")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("backups"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
@@ -5156,6 +5321,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("request_sessions"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5164,6 +5331,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("tls_acme_certificates"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5172,6 +5341,8 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("external_services"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5180,47 +5351,99 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("git_provider_connections"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("git_providers")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("git_providers"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         // Drop original tables
         manager
-            .drop_table(Table::drop().table(Alias::new("sessions")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("sessions"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("deployments")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("deployments"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("environments")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("environments"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("projects")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("projects"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("users")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("users"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("roles")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("roles"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("events")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("events"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
             .drop_table(
                 Table::drop()
                     .table(Alias::new("ip_geolocations"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
@@ -5229,24 +5452,40 @@ impl MigrationTrait for Migration {
             .drop_table(
                 Table::drop()
                     .table(Alias::new("notification_preferences"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("notifications")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("notifications"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         manager
             .drop_table(
                 Table::drop()
                     .table(Alias::new("notification_providers"))
+                    .if_exists()
+                    .cascade()
                     .to_owned(),
             )
             .await?;
 
         manager
-            .drop_table(Table::drop().table(Alias::new("settings")).to_owned())
+            .drop_table(
+                Table::drop()
+                    .table(Alias::new("settings"))
+                    .if_exists()
+                    .cascade()
+                    .to_owned(),
+            )
             .await?;
 
         Ok(())

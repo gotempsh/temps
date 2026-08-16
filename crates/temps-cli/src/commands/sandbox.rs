@@ -70,6 +70,10 @@ pub struct SandboxCreateCommand {
     /// Extra env vars as KEY=VALUE. Repeatable.
     #[arg(long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
+    /// Isolation backend: "docker" (default) or "firecracker" (ADR-029;
+    /// requires a host provisioned via `temps firecracker setup`).
+    #[arg(long)]
+    pub backend: Option<String>,
     /// Output the server response as JSON instead of a table.
     #[arg(long)]
     pub json: bool,
@@ -142,6 +146,8 @@ struct CreateSandboxBody {
     timeout_secs: Option<u64>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     env: HashMap<String, String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,24 +160,48 @@ struct ExecBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct SandboxEnvelope {
+    sandbox: SandboxResponse,
+}
+
+/// `SandboxInner` on the server (`@vercel/sandbox`-shaped): `cwd` for the
+/// work dir, epoch-ms `createdAt`, idle `timeout` in ms.
+#[derive(Debug, Deserialize)]
 struct SandboxResponse {
     id: String,
     name: String,
     status: String,
     #[allow(dead_code)]
     image: Option<String>,
-    #[allow(dead_code)]
-    work_dir: String,
-    created_at: String,
-    expires_at: String,
+    cwd: String,
+    #[serde(rename = "createdAt")]
+    created_at_ms: i64,
+    timeout: i64,
+}
+
+impl SandboxResponse {
+    fn created_at(&self) -> String {
+        chrono::DateTime::from_timestamp_millis(self.created_at_ms)
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default()
+    }
+
+    fn expires_at(&self) -> String {
+        chrono::DateTime::from_timestamp_millis(self.created_at_ms + self.timeout)
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_default()
+    }
 }
 
 #[derive(Debug, Deserialize)]
 struct ListSandboxesResponse {
-    items: Vec<SandboxResponse>,
-    total: u64,
-    page: u64,
-    page_size: u64,
+    sandboxes: Vec<SandboxResponse>,
+    pagination: Pagination,
+}
+
+#[derive(Debug, Deserialize)]
+struct Pagination {
+    count: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -193,7 +223,10 @@ struct ProblemDetail {
 /// slashes in `TEMPS_API_URL`.
 fn sandbox_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
-    format!("{}/v1/sandbox{}", base, path)
+    // Plural is the canonical route (`/v1/sandboxes`, pinned by
+    // tests/vercel_compat.rs) — the singular form predates the rename and
+    // matches nothing on current servers.
+    format!("{}/v1/sandboxes{}", base, path)
 }
 
 fn make_client() -> reqwest::Client {
@@ -263,6 +296,7 @@ async fn execute_create(cmd: SandboxCreateCommand) -> anyhow::Result<()> {
         name: cmd.name,
         timeout_secs: cmd.timeout_secs,
         env,
+        backend: cmd.backend,
     };
 
     let client = make_client();
@@ -279,7 +313,7 @@ async fn execute_create(cmd: SandboxCreateCommand) -> anyhow::Result<()> {
         return Err(api_error(response).await);
     }
 
-    let sandbox: SandboxResponse = response.json().await?;
+    let sandbox = response.json::<SandboxEnvelope>().await?.sandbox;
 
     if cmd.json {
         println!(
@@ -288,8 +322,8 @@ async fn execute_create(cmd: SandboxCreateCommand) -> anyhow::Result<()> {
                 "id": sandbox.id,
                 "name": sandbox.name,
                 "status": sandbox.status,
-                "created_at": sandbox.created_at,
-                "expires_at": sandbox.expires_at,
+                "created_at": sandbox.created_at(),
+                "expires_at": sandbox.expires_at(),
             }))?
         );
         return Ok(());
@@ -306,7 +340,7 @@ async fn execute_create(cmd: SandboxCreateCommand) -> anyhow::Result<()> {
     println!(
         "  {} {}",
         "Expires:".bright_white().bold(),
-        sandbox.expires_at
+        sandbox.expires_at()
     );
     println!();
     Ok(())
@@ -334,22 +368,22 @@ async fn execute_list(cmd: SandboxListCommand) -> anyhow::Result<()> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "total": data.total,
-                "page": data.page,
-                "page_size": data.page_size,
-                "items": data.items.iter().map(|s| serde_json::json!({
+                "total": data.pagination.count,
+                "page": cmd.page,
+                "page_size": cmd.page_size,
+                "items": data.sandboxes.iter().map(|s| serde_json::json!({
                     "id": s.id,
                     "name": s.name,
                     "status": s.status,
-                    "created_at": s.created_at,
-                    "expires_at": s.expires_at,
+                    "created_at": s.created_at(),
+                    "expires_at": s.expires_at(),
                 })).collect::<Vec<_>>(),
             }))?
         );
         return Ok(());
     }
 
-    if data.items.is_empty() {
+    if data.sandboxes.is_empty() {
         println!("No sandboxes.");
         println!(
             "Run {} to create one.",
@@ -367,7 +401,7 @@ async fn execute_list(cmd: SandboxListCommand) -> anyhow::Result<()> {
         "EXPIRES".bright_white().bold(),
     );
     println!("  {}", "─".repeat(74).bright_black());
-    for s in &data.items {
+    for s in &data.sandboxes {
         let status_colored = match s.status.as_str() {
             "running" => s.status.bright_green(),
             "stopped" => s.status.bright_red(),
@@ -378,16 +412,16 @@ async fn execute_list(cmd: SandboxListCommand) -> anyhow::Result<()> {
             s.id.bright_cyan(),
             truncate(&s.name, 20),
             status_colored,
-            s.expires_at,
+            s.expires_at(),
         );
     }
     println!();
     println!(
         "  {} page {} of {} ({} total)",
         "→".bright_black(),
-        data.page,
-        ((data.total + data.page_size - 1) / data.page_size.max(1)).max(1),
-        data.total,
+        cmd.page,
+        (data.pagination.count.div_ceil(cmd.page_size.max(1))).max(1),
+        data.pagination.count,
     );
     println!();
     Ok(())
@@ -408,7 +442,7 @@ async fn execute_show(cmd: SandboxShowCommand) -> anyhow::Result<()> {
         return Err(api_error(response).await);
     }
 
-    let sandbox: SandboxResponse = response.json().await?;
+    let sandbox = response.json::<SandboxEnvelope>().await?.sandbox;
 
     if cmd.json {
         println!(
@@ -418,9 +452,9 @@ async fn execute_show(cmd: SandboxShowCommand) -> anyhow::Result<()> {
                 "name": sandbox.name,
                 "status": sandbox.status,
                 "image": sandbox.image,
-                "work_dir": sandbox.work_dir,
-                "created_at": sandbox.created_at,
-                "expires_at": sandbox.expires_at,
+                "work_dir": sandbox.cwd,
+                "created_at": sandbox.created_at(),
+                "expires_at": sandbox.expires_at(),
             }))?
         );
         return Ok(());
@@ -437,22 +471,18 @@ async fn execute_show(cmd: SandboxShowCommand) -> anyhow::Result<()> {
     println!(
         "  {} {}",
         "Image:".bright_white().bold(),
-        sandbox.image.unwrap_or_else(|| "<default>".into())
+        sandbox.image.as_deref().unwrap_or("<default>")
     );
-    println!(
-        "  {} {}",
-        "Work dir:".bright_white().bold(),
-        sandbox.work_dir
-    );
+    println!("  {} {}", "Work dir:".bright_white().bold(), sandbox.cwd);
     println!(
         "  {} {}",
         "Created:".bright_white().bold(),
-        sandbox.created_at
+        sandbox.created_at()
     );
     println!(
         "  {} {}",
         "Expires:".bright_white().bold(),
-        sandbox.expires_at
+        sandbox.expires_at()
     );
     println!();
     Ok(())
@@ -564,11 +594,11 @@ mod tests {
     fn sandbox_url_trims_trailing_slash() {
         assert_eq!(
             sandbox_url("http://localhost:3001/", ""),
-            "http://localhost:3001/v1/sandbox"
+            "http://localhost:3001/v1/sandboxes"
         );
         assert_eq!(
             sandbox_url("http://localhost:3001", "/sbx_a"),
-            "http://localhost:3001/v1/sandbox/sbx_a"
+            "http://localhost:3001/v1/sandboxes/sbx_a"
         );
     }
 
@@ -576,7 +606,7 @@ mod tests {
     fn sandbox_url_passes_subpath_untouched() {
         assert_eq!(
             sandbox_url("https://api.example/", "/sbx_a/exec"),
-            "https://api.example/v1/sandbox/sbx_a/exec"
+            "https://api.example/v1/sandboxes/sbx_a/exec"
         );
     }
 
@@ -625,6 +655,7 @@ mod tests {
             name: None,
             timeout_secs: None,
             env: HashMap::new(),
+            backend: None,
         };
         let j = serde_json::to_string(&body).expect("serializes");
         // All fields have `skip_serializing_if`, so nothing is emitted.
@@ -641,6 +672,7 @@ mod tests {
             name: Some("demo".into()),
             timeout_secs: Some(300),
             env,
+            backend: None,
         };
         let j = serde_json::to_value(&body).expect("serializes");
         assert_eq!(j["image"], "node:20");

@@ -88,6 +88,20 @@ impl WorkflowExecutor {
         )
     }
 
+    async fn cleanup_terminal_resources(&self, jobs: &[JobConfig], context: &WorkflowContext) {
+        for config in jobs {
+            if config.job.cleanup_after_workflow() {
+                if let Err(error) = config.job.cleanup(context).await {
+                    error!(
+                        job_id = config.job.job_id(),
+                        %error,
+                        "Failed to clean up workflow-scoped resources"
+                    );
+                }
+            }
+        }
+    }
+
     /// Execute a workflow with proper dependency resolution and parallel execution
     pub async fn execute_workflow(
         &self,
@@ -124,34 +138,39 @@ impl WorkflowExecutor {
         // Execute jobs in dependency order
         for batch in execution_order {
             // Check for cancellation
-            if cancellation_provider
+            let cancelled = match cancellation_provider
                 .is_cancelled(&config.workflow_run_id)
-                .await?
+                .await
             {
+                Ok(cancelled) => cancelled,
+                Err(error) => {
+                    self.cancel_remaining_pending(
+                        &config.workflow_run_id,
+                        format!("Cancellation status check failed: {error}"),
+                    )
+                    .await;
+                    self.cleanup_terminal_resources(&config.jobs, &context)
+                        .await;
+                    return Err(error);
+                }
+            };
+            if cancelled {
                 warn!("🚫 Workflow {} was cancelled", config.workflow_run_id);
 
-                // Cancel all pending jobs via job tracker
-                if let Some(ref tracker) = self.job_tracker {
-                    warn!(
-                        "🧹 Cancelling all pending jobs in workflow {}",
-                        config.workflow_run_id
-                    );
-                    if let Err(e) = tracker
-                        .cancel_pending_jobs(
-                            &config.workflow_run_id,
-                            "Workflow cancelled by user".to_string(),
-                        )
-                        .await
-                    {
-                        error!("Failed to cancel pending jobs: {}", e);
-                    }
-                }
+                self.cancel_remaining_pending(
+                    &config.workflow_run_id,
+                    "Workflow cancelled by user".to_string(),
+                )
+                .await;
+
+                self.cleanup_terminal_resources(&config.jobs, &context)
+                    .await;
 
                 return Err(WorkflowError::WorkflowCancelled);
             }
 
             // Execute all jobs in this batch in parallel
-            let batch_results = self
+            let batch_results = match self
                 .execute_job_batch(
                     batch,
                     &mut job_states,
@@ -160,7 +179,24 @@ impl WorkflowExecutor {
                     cancellation_provider.clone(),
                     config.continue_on_failure,
                 )
-                .await?;
+                .await
+            {
+                Ok(results) => results,
+                Err(e) => {
+                    // Aborting mid-batch skips the per-result handling below, which is
+                    // what would normally cancel the rest of the workflow. Without this,
+                    // every job that never got to run keeps the planner's `Pending`
+                    // status forever and the UI polls it as still in progress.
+                    self.cancel_remaining_pending(
+                        &config.workflow_run_id,
+                        format!("Workflow aborted: {}", e),
+                    )
+                    .await;
+                    self.cleanup_terminal_resources(&config.jobs, &context)
+                        .await;
+                    return Err(e);
+                }
+            };
 
             // Check if any required jobs failed
             for (job_id, result) in batch_results {
@@ -186,6 +222,9 @@ impl WorkflowExecutor {
                     }
                     for (key, value) in result.context.vars {
                         context.vars.insert(key, value);
+                    }
+                    if result.context.work_dir.is_some() {
+                        context.work_dir = result.context.work_dir;
                     }
 
                     // Update job tracker with completion status
@@ -277,6 +316,9 @@ impl WorkflowExecutor {
                                 }
                             }
 
+                            self.cleanup_terminal_resources(&config.jobs, &context)
+                                .await;
+
                             return Err(WorkflowError::JobExecutionFailed(format!(
                                 "Required job '{}' failed: {:?}",
                                 job_id, result.message
@@ -293,6 +335,8 @@ impl WorkflowExecutor {
             "🎉 Workflow {} completed successfully",
             config.workflow_run_id
         );
+        self.cleanup_terminal_resources(&config.jobs, &context)
+            .await;
         Ok(context)
     }
 
@@ -443,6 +487,75 @@ impl WorkflowExecutor {
         Ok(order)
     }
 
+    /// Move every still-`Pending` job in this workflow to `Cancelled`.
+    ///
+    /// Any path that leaves `execute_workflow` early must call this: jobs that
+    /// never ran keep the status the planner created them with, and a row left at
+    /// `Pending` reads as "still running" forever in the UI. Tracker failures are
+    /// logged and swallowed — cancellation bookkeeping must not mask the original
+    /// error that caused the abort.
+    async fn cancel_remaining_pending(&self, workflow_run_id: &str, reason: String) {
+        let Some(ref tracker) = self.job_tracker else {
+            return;
+        };
+
+        warn!(
+            "🧹 Cancelling all pending jobs in workflow {}",
+            workflow_run_id
+        );
+        if let Err(e) = tracker.cancel_pending_jobs(workflow_run_id, reason).await {
+            error!("Failed to cancel pending jobs: {}", e);
+        }
+    }
+
+    /// Record a terminal status for a job that never entered execution.
+    ///
+    /// Jobs that are skipped or fail prerequisite validation never reach the
+    /// batch-result handling in [`execute_workflow`](Self::execute_workflow), so
+    /// without this their tracker row keeps whatever status the planner created it
+    /// with (`Pending`) indefinitely. Tracker failures are logged and swallowed —
+    /// they must not take down the surrounding workflow.
+    async fn persist_terminal_status(
+        &self,
+        context: &WorkflowContext,
+        job_id: &str,
+        status: JobStatus,
+        message: Option<String>,
+    ) {
+        let Some(ref tracker) = self.job_tracker else {
+            return;
+        };
+
+        let execution_id = match tracker
+            .create_job_execution(&context.workflow_run_id, job_id, status.clone())
+            .await
+        {
+            Ok(id) => id,
+            Err(e) => {
+                error!(
+                    "Failed to record terminal status {:?} for job '{}': {}",
+                    status, job_id, e
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = tracker
+            .update_job_status(execution_id, status.clone(), message)
+            .await
+        {
+            error!(
+                "Failed to update job '{}' (execution {}) to {:?}: {}",
+                job_id, execution_id, status, e
+            );
+        } else {
+            debug!(
+                "✅ Recorded terminal status {:?} for job '{}'",
+                status, job_id
+            );
+        }
+    }
+
     /// Execute a batch of jobs in parallel
     async fn execute_job_batch(
         &self,
@@ -463,6 +576,16 @@ impl WorkflowExecutor {
                 if job_state.job_config.job.should_skip(context).await? {
                     info!("⏭️ Skipping job: {}", job_id);
                     job_state.status = JobStatus::Skipped;
+                    // A job that never enters the batch results below must still reach a
+                    // terminal state in the tracker, or its pre-created row stays Pending
+                    // forever and the UI shows the step as still running.
+                    //
+                    // No message: `should_skip` is a deliberate opt-out (feature disabled,
+                    // nothing to do), not a failure, and the executor doesn't know the
+                    // job-specific reason — inventing one would put a fabricated string in
+                    // the `error_message` column for a job that never errored.
+                    self.persist_terminal_status(context, &job_id, JobStatus::Skipped, None)
+                        .await;
                     continue;
                 }
 
@@ -476,11 +599,33 @@ impl WorkflowExecutor {
                     let error_msg = format!("Prerequisites not met for job '{}': {}", job_id, e);
                     error!("{}", error_msg);
 
+                    // Failed prerequisites are a real failure, not a silent skip — record
+                    // them as Failure with the reason so the operator can act on it. This
+                    // applies to optional jobs too: they are optional for *deployment
+                    // completion*, not exempt from reporting why they didn't run.
+                    job_state.status = JobStatus::Failure;
+                    self.persist_terminal_status(
+                        context,
+                        &job_id,
+                        JobStatus::Failure,
+                        Some(error_msg.clone()),
+                    )
+                    .await;
+
+                    if let Err(log_err) = context.log(&error_msg).await {
+                        error!(
+                            "Failed to log prerequisite failure for '{}': {}",
+                            job_id, log_err
+                        );
+                    }
+
                     if job_state.job_config.required && !continue_on_failure {
                         return Err(e);
                     } else {
-                        warn!("Skipping job '{}' due to failed prerequisites", job_id);
-                        job_state.status = JobStatus::Skipped;
+                        warn!(
+                            "Not running job '{}' due to failed prerequisites: {}",
+                            job_id, e
+                        );
                         continue;
                     }
                 }
@@ -699,6 +844,11 @@ mod tests {
         cancelled: bool,
     }
 
+    struct FailingCancellationProvider {
+        calls: AtomicUsize,
+        fail_on: usize,
+    }
+
     #[test]
     fn test_cancellation_errors_are_not_failures() {
         assert!(WorkflowExecutor::is_cancellation_error(
@@ -715,6 +865,20 @@ mod tests {
     impl WorkflowCancellationProvider for TestCancellationProvider {
         async fn is_cancelled(&self, _workflow_run_id: &str) -> Result<bool, WorkflowError> {
             Ok(self.cancelled)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowCancellationProvider for FailingCancellationProvider {
+        async fn is_cancelled(&self, _workflow_run_id: &str) -> Result<bool, WorkflowError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+            if call == self.fail_on {
+                Err(WorkflowError::JobExecutionFailed(
+                    "cancellation backend unavailable".to_string(),
+                ))
+            } else {
+                Ok(false)
+            }
         }
     }
 
@@ -844,5 +1008,463 @@ mod tests {
         } else {
             panic!("Expected DependencyCycleDetected error");
         }
+    }
+
+    /// A job that never runs: either its prerequisites fail or it opts out via
+    /// `should_skip`. Mirrors `TakeScreenshotJob` when Chrome is missing.
+    #[derive(Debug)]
+    struct NonRunningJob {
+        id: String,
+        skip: bool,
+        prerequisite_error: Option<String>,
+        executed: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for NonRunningJob {
+        fn job_id(&self) -> &str {
+            &self.id
+        }
+
+        fn name(&self) -> &str {
+            "Non-running job"
+        }
+
+        fn description(&self) -> &str {
+            "A job that is skipped or fails prerequisite validation"
+        }
+
+        async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            self.executed.fetch_add(1, Ordering::SeqCst);
+            Ok(JobResult::success(context))
+        }
+
+        async fn should_skip(&self, _context: &WorkflowContext) -> Result<bool, WorkflowError> {
+            Ok(self.skip)
+        }
+
+        async fn validate_prerequisites(
+            &self,
+            _context: &WorkflowContext,
+        ) -> Result<(), WorkflowError> {
+            match &self.prerequisite_error {
+                Some(msg) => Err(WorkflowError::JobValidationFailed(msg.clone())),
+                None => Ok(()),
+            }
+        }
+
+        fn depends_on(&self) -> Vec<String> {
+            Vec::new()
+        }
+    }
+
+    /// Records every status the executor persists, keyed by job id.
+    #[derive(Default)]
+    struct RecordingJobTracker {
+        statuses: std::sync::Mutex<Vec<(String, JobStatus, Option<String>)>>,
+        ids: std::sync::Mutex<HashMap<i32, String>>,
+        cancellations: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl RecordingJobTracker {
+        /// Reasons passed to `cancel_pending_jobs` — i.e. the sweeps that would
+        /// move leftover Pending rows to Cancelled.
+        fn cancellations(&self) -> Vec<String> {
+            self.cancellations
+                .lock()
+                .expect("cancellations lock poisoned")
+                .clone()
+        }
+
+        fn statuses_for(&self, job_id: &str) -> Vec<(JobStatus, Option<String>)> {
+            self.statuses
+                .lock()
+                .expect("statuses lock poisoned")
+                .iter()
+                .filter(|(id, _, _)| id == job_id)
+                .map(|(_, status, msg)| (status.clone(), msg.clone()))
+                .collect()
+        }
+
+        /// The status the deployment_jobs row would be left with.
+        fn final_status(&self, job_id: &str) -> Option<(JobStatus, Option<String>)> {
+            self.statuses_for(job_id).last().cloned()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl JobTracker for RecordingJobTracker {
+        async fn create_job_execution(
+            &self,
+            _workflow_run_id: &str,
+            job_id: &str,
+            status: JobStatus,
+        ) -> Result<i32, WorkflowError> {
+            let mut ids = self.ids.lock().expect("ids lock poisoned");
+            let execution_id = ids.len() as i32 + 1;
+            ids.insert(execution_id, job_id.to_string());
+            self.statuses.lock().expect("statuses lock poisoned").push((
+                job_id.to_string(),
+                status,
+                None,
+            ));
+            Ok(execution_id)
+        }
+
+        async fn update_job_status(
+            &self,
+            job_execution_id: i32,
+            status: JobStatus,
+            message: Option<String>,
+        ) -> Result<(), WorkflowError> {
+            let job_id = self
+                .ids
+                .lock()
+                .expect("ids lock poisoned")
+                .get(&job_execution_id)
+                .cloned()
+                .ok_or_else(|| {
+                    WorkflowError::Other(format!("Unknown execution id {}", job_execution_id))
+                })?;
+            self.statuses
+                .lock()
+                .expect("statuses lock poisoned")
+                .push((job_id, status, message));
+            Ok(())
+        }
+
+        async fn add_job_logs(&self, _id: i32, _logs: Vec<String>) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        async fn mark_job_started(&self, _id: i32) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        async fn mark_job_finished(&self, _id: i32) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        async fn save_job_outputs(
+            &self,
+            _id: i32,
+            _outputs: serde_json::Value,
+        ) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        async fn cancel_pending_jobs(
+            &self,
+            _workflow_run_id: &str,
+            reason: String,
+        ) -> Result<(), WorkflowError> {
+            self.cancellations
+                .lock()
+                .expect("cancellations lock poisoned")
+                .push(reason);
+            Ok(())
+        }
+    }
+
+    async fn run_with_tracker(
+        job: Arc<dyn WorkflowTask>,
+        required: bool,
+        continue_on_failure: bool,
+    ) -> (
+        Arc<RecordingJobTracker>,
+        Result<WorkflowContext, WorkflowError>,
+    ) {
+        let tracker = Arc::new(RecordingJobTracker::default());
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("test-workflow".to_string())
+            .with_deployment_context(1, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job_config(job, vec![], required)
+            .continue_on_failure(continue_on_failure)
+            .build()
+            .expect("workflow config should build");
+
+        let executor = WorkflowExecutor::new(Some(tracker.clone()));
+        let result = executor
+            .execute_workflow(
+                config,
+                Arc::new(TestCancellationProvider { cancelled: false }),
+            )
+            .await;
+
+        (tracker, result)
+    }
+
+    /// Regression test for #477: an optional job whose prerequisites fail (e.g.
+    /// `take_screenshot` on a server with no working Chrome) must be persisted as
+    /// Failure with the reason — previously only an in-memory status was set, so
+    /// the deployment_jobs row stayed Pending forever and the UI showed the step
+    /// as perpetually "generating".
+    #[tokio::test]
+    async fn test_optional_job_failing_prerequisites_is_persisted_as_failure() {
+        let executed = Arc::new(AtomicUsize::new(0));
+        let job = Arc::new(NonRunningJob {
+            id: "take_screenshot".to_string(),
+            skip: false,
+            prerequisite_error: Some(
+                "Screenshot provider 'local-headless-chrome' is not available: \
+                 Chrome browser error: Failed to launch Chrome browser"
+                    .to_string(),
+            ),
+            executed: executed.clone(),
+        });
+
+        let (tracker, result) = run_with_tracker(job, false, true).await;
+
+        // The optional job must not fail the workflow...
+        assert!(
+            result.is_ok(),
+            "optional job should not fail the workflow: {:?}",
+            result.err()
+        );
+        assert_eq!(executed.load(Ordering::SeqCst), 0, "job must not execute");
+
+        // ...but it must reach a terminal, non-Pending state in the tracker.
+        let (status, message) = tracker
+            .final_status("take_screenshot")
+            .expect("prerequisite failure must be persisted, not left Pending");
+        assert_eq!(status, JobStatus::Failure);
+
+        let message = message.expect("failure must carry a reason");
+        assert!(
+            message.contains("Failed to launch Chrome browser"),
+            "reason must reach the user, got: {}",
+            message
+        );
+    }
+
+    /// A required job that fails prerequisites still fails the workflow, but must
+    /// also leave a Failure row behind rather than a Pending one.
+    #[tokio::test]
+    async fn test_required_job_failing_prerequisites_is_persisted_before_erroring() {
+        let job = Arc::new(NonRunningJob {
+            id: "deploy".to_string(),
+            skip: false,
+            prerequisite_error: Some("docker daemon unreachable".to_string()),
+            executed: Arc::new(AtomicUsize::new(0)),
+        });
+
+        let (tracker, result) = run_with_tracker(job, true, false).await;
+
+        assert!(matches!(result, Err(WorkflowError::JobValidationFailed(_))));
+
+        let (status, message) = tracker
+            .final_status("deploy")
+            .expect("prerequisite failure must be persisted, not left Pending");
+        assert_eq!(status, JobStatus::Failure);
+        assert!(message
+            .unwrap_or_default()
+            .contains("docker daemon unreachable"));
+    }
+
+    /// Aborting out of a batch must sweep the jobs that never got to run.
+    ///
+    /// The early `return Err` on a required job's failed prerequisites bypasses the
+    /// per-result handling that normally cancels the rest of the workflow, so every
+    /// downstream job kept the planner's `Pending` status forever — the same stuck
+    /// state as #477, one branch over.
+    #[tokio::test]
+    async fn test_aborting_batch_cancels_jobs_that_never_ran() {
+        let downstream_executed = Arc::new(AtomicUsize::new(0));
+
+        let failing = Arc::new(NonRunningJob {
+            id: "deploy".to_string(),
+            skip: false,
+            prerequisite_error: Some("docker daemon unreachable".to_string()),
+            executed: Arc::new(AtomicUsize::new(0)),
+        });
+        let downstream = Arc::new(NonRunningJob {
+            id: "take_screenshot".to_string(),
+            skip: false,
+            prerequisite_error: None,
+            executed: downstream_executed.clone(),
+        });
+
+        let tracker = Arc::new(RecordingJobTracker::default());
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("test-workflow".to_string())
+            .with_deployment_context(1, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job_config(failing, vec![], true)
+            .with_job_config(downstream, vec!["deploy".to_string()], false)
+            .continue_on_failure(false)
+            .build()
+            .expect("workflow config should build");
+
+        let executor = WorkflowExecutor::new(Some(tracker.clone()));
+        let result = executor
+            .execute_workflow(
+                config,
+                Arc::new(TestCancellationProvider { cancelled: false }),
+            )
+            .await;
+
+        assert!(
+            result.is_err(),
+            "required job failure must abort the workflow"
+        );
+        assert_eq!(
+            downstream_executed.load(Ordering::SeqCst),
+            0,
+            "downstream job must not run"
+        );
+
+        // take_screenshot never reached the executor, so only the sweep can move it
+        // off Pending.
+        assert!(
+            tracker.final_status("take_screenshot").is_none(),
+            "sanity: the downstream job should have no status of its own"
+        );
+        let cancellations = tracker.cancellations();
+        assert_eq!(
+            cancellations.len(),
+            1,
+            "aborting the workflow must cancel jobs left Pending, got: {:?}",
+            cancellations
+        );
+        assert!(
+            cancellations[0].contains("docker daemon unreachable"),
+            "cancellation reason should explain the abort, got: {}",
+            cancellations[0]
+        );
+    }
+
+    /// A job that opts out via `should_skip` must be persisted as Skipped.
+    #[tokio::test]
+    async fn test_skipped_job_is_persisted_as_skipped() {
+        let executed = Arc::new(AtomicUsize::new(0));
+        let job = Arc::new(NonRunningJob {
+            id: "configure_crons".to_string(),
+            skip: true,
+            prerequisite_error: None,
+            executed: executed.clone(),
+        });
+
+        let (tracker, result) = run_with_tracker(job, false, true).await;
+
+        assert!(result.is_ok());
+        assert_eq!(executed.load(Ordering::SeqCst), 0, "job must not execute");
+
+        let (status, message) = tracker
+            .final_status("configure_crons")
+            .expect("skipped job must be persisted, not left Pending");
+        assert_eq!(status, JobStatus::Skipped);
+        assert!(
+            message.is_none(),
+            "an intentional skip is not an error and the executor doesn't know the \
+             job's reason — it must not fabricate one, got: {:?}",
+            message
+        );
+    }
+
+    #[derive(Debug)]
+    struct TerminalCleanupJob {
+        cleaned: Arc<AtomicUsize>,
+    }
+
+    #[derive(Debug)]
+    struct AfterTemporarySourceJob;
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for AfterTemporarySourceJob {
+        fn job_id(&self) -> &str {
+            "after_temporary_source"
+        }
+        fn name(&self) -> &str {
+            "After temporary source"
+        }
+        fn description(&self) -> &str {
+            "Creates a second workflow batch"
+        }
+        fn depends_on(&self) -> Vec<String> {
+            vec!["temporary_source".to_string()]
+        }
+        async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            Ok(JobResult::success(context))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WorkflowTask for TerminalCleanupJob {
+        fn job_id(&self) -> &str {
+            "temporary_source"
+        }
+
+        fn name(&self) -> &str {
+            "Temporary source"
+        }
+
+        fn description(&self) -> &str {
+            "Creates a workflow-scoped temporary input"
+        }
+
+        async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+            Ok(JobResult::success(context))
+        }
+
+        async fn cleanup(&self, _context: &WorkflowContext) -> Result<(), WorkflowError> {
+            self.cleaned.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn cleanup_after_workflow(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn workflow_scoped_resources_are_cleaned_after_success() {
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("cleanup-workflow".to_string())
+            .with_deployment_context(1, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job(Arc::new(TerminalCleanupJob {
+                cleaned: cleaned.clone(),
+            }))
+            .build()
+            .expect("workflow config should build");
+
+        WorkflowExecutor::new(None)
+            .execute_workflow(
+                config,
+                Arc::new(TestCancellationProvider { cancelled: false }),
+            )
+            .await
+            .expect("workflow should succeed");
+
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cancellation_provider_error_still_runs_terminal_cleanup() {
+        let cleaned = Arc::new(AtomicUsize::new(0));
+        let config = WorkflowBuilder::new()
+            .with_workflow_run_id("cleanup-provider-error".to_string())
+            .with_deployment_context(1, 1, 1)
+            .with_log_writer(Arc::new(MockLogWriter))
+            .with_job(Arc::new(TerminalCleanupJob {
+                cleaned: cleaned.clone(),
+            }))
+            .with_job(Arc::new(AfterTemporarySourceJob))
+            .build()
+            .expect("workflow config should build");
+
+        let result = WorkflowExecutor::new(None)
+            .execute_workflow(
+                config,
+                Arc::new(FailingCancellationProvider {
+                    calls: AtomicUsize::new(0),
+                    fail_on: 1,
+                }),
+            )
+            .await;
+        assert!(result.is_err());
+        assert_eq!(cleaned.load(Ordering::SeqCst), 1);
     }
 }

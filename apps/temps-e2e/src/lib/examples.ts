@@ -48,7 +48,7 @@ export const EXAMPLES: ExampleProject[] = [
     port: 3000,
     healthPath: '/health',
     weight: 'light',
-    dockerfile: `FROM golang:1.24-alpine AS build
+    dockerfile: `FROM golang:1.25-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
@@ -229,6 +229,7 @@ async function runDocker(
   what: string,
 ): Promise<void> {
   const proc = Bun.spawn(['docker', ...args], { stdout: 'pipe', stderr: 'pipe' })
+  const outputTail: string[] = []
   const pump = async (stream: ReadableStream<Uint8Array>) => {
     const reader = stream.getReader()
     const decoder = new TextDecoder()
@@ -239,13 +240,23 @@ async function runDocker(
       buf += decoder.decode(value, { stream: true })
       const lines = buf.split('\n')
       buf = lines.pop() ?? ''
-      for (const l of lines) if (l.trim()) onLog?.(l)
+      for (const l of lines) {
+        if (!l.trim()) continue
+        onLog?.(l)
+        outputTail.push(l)
+        if (outputTail.length > 40) outputTail.shift()
+      }
     }
-    if (buf.trim()) onLog?.(buf)
+    if (buf.trim()) {
+      onLog?.(buf)
+      outputTail.push(buf)
+      if (outputTail.length > 40) outputTail.shift()
+    }
   }
   await Promise.all([pump(proc.stdout), pump(proc.stderr)])
   const code = await proc.exited
   if (code !== 0) {
-    throw new Error(`${what} failed (exit ${code})`)
+    const detail = outputTail.length ? `\n${outputTail.join('\n')}` : ''
+    throw new Error(`${what} failed (exit ${code})${detail}`)
   }
 }

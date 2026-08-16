@@ -83,4 +83,105 @@ pub trait ProjectAccessChecker: Send + Sync {
     ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(None)
     }
+
+    /// Returns the project ids `user_id` must **not** see in listings —
+    /// projects that are access-gated and that this user has not been
+    /// granted.
+    ///
+    /// Per-resource guards alone are not enough for a multi-tenant
+    /// instance: without list filtering, every user still sees every
+    /// project's *name* in `GET /projects` and only discovers the denial
+    /// on click. On an instance where different clients or teams are meant
+    /// to be isolated, the list of project names is itself something worth
+    /// keeping separate.
+    ///
+    /// The "hidden" (rather than "visible") direction is deliberate: the
+    /// returned set is bounded by the number of *gated* projects, which is
+    /// zero on an instance that hasn't configured any access grants, so
+    /// the default posture costs nothing and cannot accidentally hide a
+    /// project that no rule was written for.
+    ///
+    /// # Semantics
+    ///
+    /// - `Ok(None)` — no opinion; callers list everything, unchanged.
+    /// - `Ok(Some(ids))` — exclude these ids. An empty vec means "nothing
+    ///   is hidden from this user".
+    /// - `Err(_)` — infrastructure failure. Callers must fail the request
+    ///   rather than fall back to an unfiltered list, which would leak
+    ///   exactly what this method exists to hide.
+    ///
+    /// Callers are responsible for skipping this for instance
+    /// administrators, matching the admin bypass in
+    /// [`project_access_guard!`](temps_auth::project_access_guard).
+    async fn hidden_project_ids(
+        &self,
+        _user_id: i32,
+    ) -> Result<Option<Vec<i32>>, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(None)
+    }
+
+    /// Flushes any cache this checker keeps for `effective_project_permissions`
+    /// (and, transitively, for whatever a registered
+    /// [`MembershipPermissionResolver`] answers).
+    ///
+    /// A checker that caches per-`(user, project)` permission sets — as the
+    /// recommended implementation does, since `effective_project_permissions`
+    /// is on the hot path of every `project_permission_guard!` call — becomes
+    /// a second cache layer sitting in front of a
+    /// [`MembershipPermissionResolver`] plugin's own cache. When that plugin's
+    /// answer for a membership changes (a role definition is edited, a
+    /// membership's role assignment is created/updated/deleted), the plugin
+    /// can invalidate its own cache, but it holds only `Arc<dyn
+    /// ProjectAccessChecker>` — the trait, not this checker's concrete type —
+    /// so it has no way to reach this cache without this method.
+    ///
+    /// Defaults to a no-op so existing implementations of this trait
+    /// (compiled against an older version of it, or a checker that caches
+    /// nothing) keep behaving exactly as they do today.
+    ///
+    /// Deliberately synchronous and coarse (whole-cache flush, no
+    /// per-project or per-user granularity): the moka-backed reference
+    /// implementation's own `invalidate_all` is lazy and cheap to call from a
+    /// resolver plugin's write path without needing `.await` there, and a
+    /// resolver plugin has no way to know which `(user, project)` pairs are
+    /// affected by e.g. a role permission-set edit — that set is unbounded
+    /// from the resolver's point of view, so a full flush is the only
+    /// correct granularity available to it.
+    fn invalidate_permissions_cache(&self) {}
+}
+
+/// Optional extension point for overriding what a single team membership
+/// resolves to, in place of the fixed role stored on the membership row.
+///
+/// Core knows four fixed roles (`owner`/`admin`/`deployer`/`viewer`) and
+/// resolves a member's permissions inside a project from those. A plugin
+/// (e.g. one implementing admin-defined named permission sets) registers
+/// an implementation via `context.register_service(resolver)` to answer
+/// differently for memberships it knows about. Retrieved with
+/// `context.get_service::<dyn MembershipPermissionResolver>()` — never
+/// `require_service` — so a binary with nothing registered resolves purely
+/// from the fixed roles, identical in spirit to [`crate::DeploymentGate`].
+///
+/// # The answer is a ceiling, not a grant
+///
+/// Whatever this returns is **intersected** with the permission set the
+/// team's own grant on the project allows. It can therefore only ever
+/// narrow a member below their team's access, never widen them past it.
+/// That invariant belongs to core, not to the implementation: a team
+/// granted `viewer` on a project must not end up with a member who can
+/// deploy to it, no matter what a plugin says.
+#[async_trait]
+pub trait MembershipPermissionResolver: Send + Sync {
+    /// Returns `Ok(Some(perms))` — permission strings (matching
+    /// `Permission::to_string()`, e.g. `"deployments:create"`) to use for
+    /// this membership instead of its fixed role — or `Ok(None)` to fall
+    /// through to the fixed role.
+    ///
+    /// `Err(_)` is an infrastructure failure and is propagated: the caller
+    /// fails the check rather than silently falling back, since falling
+    /// back could widen a member the plugin meant to narrow.
+    async fn membership_permissions(
+        &self,
+        team_member_id: i32,
+    ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>>;
 }

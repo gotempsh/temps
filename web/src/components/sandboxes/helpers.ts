@@ -9,11 +9,26 @@ export type SandboxView = {
   name: string
   status: string
   image: string | null
+  backend?: string | null
+  disk_size_mb?: number | null
   work_dir: string
   created_at: string
   expires_at: string
   preview_url_template: string
   preview_password_hint?: string | null
+  /**
+   * `'ephemeral'` or `'workspace'` (ADR-036). A workspace suspends on idle
+   * like an ephemeral sandbox but wakes on the next access instead of
+   * erroring, so `expires_at` means "suspends at" rather than "dies at".
+   */
+  lifecycle?: string
+  project_id?: number | null
+  source_repo_url?: string | null
+}
+
+/** Is this sandbox a persistent workspace? Absent lifecycle = ephemeral. */
+export function isWorkspace(s: Pick<SandboxView, 'lifecycle'>): boolean {
+  return s.lifecycle === 'workspace'
 }
 
 export type JobSummary = JobSummaryResponse
@@ -30,11 +45,16 @@ export function toSandboxView(inner: SandboxInner): SandboxView {
     name: inner.name,
     status: inner.status,
     image: inner.image ?? null,
+    backend: inner.backend ?? null,
+    disk_size_mb: inner.disk_size_mb ?? null,
     work_dir: inner.cwd,
     created_at: new Date(createdMs).toISOString(),
     expires_at: new Date(expiresMs).toISOString(),
     preview_url_template: inner.preview_url_template,
     preview_password_hint: inner.preview_password_hint ?? undefined,
+    lifecycle: inner.lifecycle,
+    project_id: inner.project_id ?? null,
+    source_repo_url: inner.source_repo_url ?? null,
   }
 }
 

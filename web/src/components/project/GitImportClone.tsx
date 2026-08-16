@@ -1,5 +1,5 @@
 import { useEffect, useState, useCallback } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   listConnectionsOptions,
@@ -11,7 +11,8 @@ import {
   listProjectTemplatesOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
-import { Card, CardHeader, CardTitle, CardContent } from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Select,
   SelectTrigger,
@@ -31,22 +32,30 @@ import type {
   TemplateResponse,
 } from '@/api/client/types.gen'
 import {
-  GitBranch,
   ChevronLeft,
   Link as LinkIcon,
   Loader2,
-  Gitlab,
-  LayoutTemplate,
-  Container,
   FolderGit2,
+  Plus,
 } from 'lucide-react'
 import Github from '@/icons/Github'
+import Gitlab from '@/icons/Gitlab'
+import { ProviderLogo } from '@/components/git/ProviderLogo'
+import {
+  NewProjectShell,
+  type ProjectSource,
+} from '@/components/project/NewProjectShell'
+import { Drop } from '@/pages/Drop'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 
-type ProjectSource = 'templates' | 'browse' | 'git-url' | 'manual'
-
-const SOURCE_VALUES: ProjectSource[] = ['templates', 'browse', 'git-url', 'manual']
+const SOURCE_VALUES: ProjectSource[] = [
+  'templates',
+  'browse',
+  'git-url',
+  'manual',
+  'drop',
+]
 
 function isProjectSource(value: string | null): value is ProjectSource {
   return value !== null && (SOURCE_VALUES as string[]).includes(value)
@@ -180,26 +189,32 @@ export function GitImportClone({
   // correct sub-screen instead of leaving stale configurators visible.
   useEffect(() => {
     if (mode !== 'navigation') return
-    if (selectedSource !== 'templates' && selectedTemplate) {
-      setSelectedTemplate(null)
-    }
-    if (selectedSource !== 'browse' && selectedSource !== 'git-url') {
-      if (selectedRepository) setSelectedRepository(null)
-      if (useGitUrl) setUseGitUrl(false)
-      if (parsedPublicRepo) setParsedPublicRepo(null)
-    }
+    queueMicrotask(() => {
+      if (selectedSource !== 'templates' && selectedTemplate) {
+        setSelectedTemplate(null)
+      }
+      if (selectedSource !== 'browse' && selectedSource !== 'git-url') {
+        if (selectedRepository) setSelectedRepository(null)
+        if (useGitUrl) setUseGitUrl(false)
+        if (parsedPublicRepo) setParsedPublicRepo(null)
+      }
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSource, mode])
 
   // Templates fetched at this level so we can resolve `?template=<slug>` from
   // the URL into a `TemplateResponse` (used to hydrate the configurator on
-  // page load / browser back-forward / shared link).
+  // page load / browser back-forward / shared link). Also fetched on the
+  // entry screen (selectedSource === null) to show a real template count.
   const { data: templatesData } = useQuery({
     ...listProjectTemplatesOptions(),
-    enabled: mode === 'navigation' && selectedSource === 'templates',
+    enabled:
+      mode === 'navigation' &&
+      (selectedSource === 'templates' || selectedSource === null),
   })
 
-  const templateSlugFromUrl = mode === 'navigation' ? searchParams.get('template') : null
+  const templateSlugFromUrl =
+    mode === 'navigation' ? searchParams.get('template') : null
   const repoUrlFromUrl = mode === 'navigation' ? searchParams.get('repo') : null
 
   // Hydrate `selectedTemplate` from the URL slug once templates load. Also
@@ -207,12 +222,14 @@ export function GitImportClone({
   useEffect(() => {
     if (mode !== 'navigation') return
     if (!templateSlugFromUrl) {
-      if (selectedTemplate) setSelectedTemplate(null)
+      if (selectedTemplate) queueMicrotask(() => setSelectedTemplate(null))
       return
     }
     if (selectedTemplate?.slug === templateSlugFromUrl) return
-    const match = templatesData?.templates?.find((t) => t.slug === templateSlugFromUrl)
-    if (match) setSelectedTemplate(match)
+    const match = templatesData?.templates?.find(
+      (t) => t.slug === templateSlugFromUrl
+    )
+    if (match) queueMicrotask(() => setSelectedTemplate(match))
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [templateSlugFromUrl, templatesData, mode])
 
@@ -259,18 +276,22 @@ export function GitImportClone({
     ...listGitProvidersOptions(),
   })
 
-  const providerTypeForConnectionId = (providerId: number): string | undefined =>
+  const providerTypeForConnectionId = (
+    providerId: number
+  ): string | undefined =>
     gitProviders?.find((p) => p.id === providerId)?.provider_type
 
   const renderProviderIcon = (
     providerId: number | undefined | null,
     className = 'h-4 w-4'
-  ) => {
-    const type = providerId != null ? providerTypeForConnectionId(providerId) : undefined
-    if (type === 'github' || type === 'github_app') return <Github className={className} />
-    if (type === 'gitlab') return <Gitlab className={className} />
-    return <GitBranch className={className} />
-  }
+  ) => (
+    <ProviderLogo
+      providerType={
+        providerId != null ? providerTypeForConnectionId(providerId) : undefined
+      }
+      className={className}
+    />
+  )
 
   // Optional `?connection=<id>` param lets callers deep-link straight to a
   // specific connection's repository list — used by the first-run "connect a
@@ -278,6 +299,30 @@ export function GitImportClone({
   // PAT connection so they continue to repo selection without a detour.
   const connectionIdFromUrl =
     mode === 'navigation' ? searchParams.get('connection') : null
+
+  // Land directly on something deployable — the method chooser is not a
+  // destination. With a Git connection, that's the provider's repository
+  // list; without one, the template gallery (one-click deploys that need no
+  // connection). The Repositories pill keeps the connect path reachable.
+  useEffect(() => {
+    if (selectedSource !== null) return
+    if (!connections) return
+    const landing = connections.connections.length > 0 ? 'browse' : 'templates'
+    if (mode === 'navigation') {
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev)
+          params.set('source', landing)
+          return params
+        },
+        // replace, not push: Back should leave the page, not bounce through
+        // the redirect.
+        { replace: true }
+      )
+    } else {
+      queueMicrotask(() => setLocalSource(landing))
+    }
+  }, [connections, selectedSource, mode, setSearchParams])
 
   useEffect(() => {
     if (!connections || connections.connections.length === 0) return
@@ -307,6 +352,15 @@ export function GitImportClone({
       })
     }
   }, [connections, selectedConnection, isInitialLoad, connectionIdFromUrl])
+
+  const selectedConnectionDetails = connections?.connections.find(
+    (connection) => connection.id.toString() === selectedConnection
+  )
+  const selectedConnectionProviderType = selectedConnectionDetails
+    ? providerTypeForConnectionId(selectedConnectionDetails.provider_id)
+    : undefined
+  const parsedGitUrlPreview =
+    gitUrl && !isValidatingUrl ? parseGitUrl(gitUrl) : null
 
   // Parse owner/repo from full_name
   const [owner, repo] = (selectedRepository?.full_name || '/').split('/')
@@ -349,7 +403,10 @@ export function GitImportClone({
   const branches = useGitUrl ? publicBranches : authenticatedBranches
 
   // Query for presets from authenticated connection
-  const { data: authenticatedPresetData } = useQuery({
+  const {
+    data: authenticatedPresetData,
+    refetch: refetchAuthenticatedPresetData,
+  } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: {
         repository_id: selectedRepository?.id || 0,
@@ -359,19 +416,21 @@ export function GitImportClone({
   })
 
   // Query for presets from public repository
-  const { data: publicPresetData } = useQuery({
-    ...detectPublicPresetsOptions({
-      path: {
-        provider: parsedPublicRepo?.provider || 'github',
-        owner: parsedPublicRepo?.owner || '',
-        repo: parsedPublicRepo?.repo || '',
-      },
-      query: {
-        branch: selectedRepository?.default_branch,
-      },
-    }),
-    enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
-  })
+  const { data: publicPresetData, refetch: refetchPublicPresetData } = useQuery(
+    {
+      ...detectPublicPresetsOptions({
+        path: {
+          provider: parsedPublicRepo?.provider || 'github',
+          owner: parsedPublicRepo?.owner || '',
+          repo: parsedPublicRepo?.repo || '',
+        },
+        query: {
+          branch: selectedRepository?.default_branch,
+        },
+      }),
+      enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
+    }
+  )
 
   // Transform public preset data to match ProjectPresetResponse format (camelCase)
   const presetData = useGitUrl
@@ -477,7 +536,7 @@ export function GitImportClone({
         if (options.pushToUrl && mode === 'navigation') {
           updateSearchParams({ repo: url })
         }
-      } catch (error) {
+      } catch {
         toast.error('Failed to validate repository URL')
         setParsedPublicRepo(null)
       } finally {
@@ -494,7 +553,9 @@ export function GitImportClone({
     if (selectedSource !== 'git-url') return
     if (!repoUrlFromUrl) return
     if (selectedRepository && useGitUrl && gitUrl === repoUrlFromUrl) return
-    void validateAndSelectGitUrl(repoUrlFromUrl, { silent: true })
+    queueMicrotask(() => {
+      void validateAndSelectGitUrl(repoUrlFromUrl, { silent: true })
+    })
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [repoUrlFromUrl, selectedSource, mode])
 
@@ -512,27 +573,34 @@ export function GitImportClone({
     }
   }
 
-  // Show TemplateConfigurator when a template is selected
+  // Show TemplateConfigurator when a template is selected — inside the same
+  // shell (header + pills) as the picker, so configuring never swaps the
+  // page frame.
   if (selectedTemplate) {
     return (
-      <div className="space-y-6">
-        <div className="flex items-center gap-4">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => selectTemplate(null)}
-          >
-            <ChevronLeft className="h-4 w-4 mr-2" />
-            Back to Templates
-          </Button>
-        </div>
+      <NewProjectShell
+        activeSource="templates"
+        onSelectSource={setSelectedSource}
+      >
+        <div className="space-y-6">
+          <div className="flex items-center gap-4">
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => selectTemplate(null)}
+            >
+              <ChevronLeft className="h-4 w-4 mr-2" />
+              Back to Templates
+            </Button>
+          </div>
 
-        <TemplateConfigurator
-          template={selectedTemplate}
-          onCancel={() => selectTemplate(null)}
-          onSuccess={onProjectCreated}
-        />
-      </div>
+          <TemplateConfigurator
+            template={selectedTemplate}
+            onCancel={() => selectTemplate(null)}
+            onSuccess={onProjectCreated}
+          />
+        </div>
+      </NewProjectShell>
     )
   }
 
@@ -556,84 +624,117 @@ export function GitImportClone({
       }
     }
     return (
-      <div className="space-y-6">
-        <div className="flex items-center gap-4">
-          <Button variant="ghost" size="sm" onClick={goBackFromRepo}>
-            <ChevronLeft className="h-4 w-4 mr-2" />
-            {useGitUrl ? 'Back to Git URL' : 'Back to Create Project'}
-          </Button>
-        </div>
+      <NewProjectShell
+        activeSource={useGitUrl ? 'git-url' : 'browse'}
+        onSelectSource={setSelectedSource}
+      >
+        <div className="space-y-6">
+          <div className="flex items-center gap-4">
+            <Button variant="ghost" size="sm" onClick={goBackFromRepo}>
+              <ChevronLeft className="h-4 w-4 mr-2" />
+              {useGitUrl ? 'Back to Git URL' : 'Back to Create Project'}
+            </Button>
+          </div>
 
-        <ProjectConfigurator
-          repository={{
-            id: selectedRepository.id,
-            name: selectedRepository.name,
-            owner: selectedRepository.owner || owner,
-            full_name: selectedRepository.full_name,
-            private: selectedRepository.private || false,
-            default_branch:
-              branches?.branches?.find((b: any) => b.is_default)?.name ||
-              selectedRepository.default_branch ||
-              'main',
-            created_at:
-              selectedRepository.created_at || new Date().toISOString(),
-            pushed_at: selectedRepository.pushed_at || new Date().toISOString(),
-            updated_at:
-              selectedRepository.updated_at || new Date().toISOString(),
-            git_provider_connection_id:
-              selectedRepository.git_provider_connection_id ??
-              Number(selectedConnection) ??
-              0,
-          }}
-          connectionId={useGitUrl ? undefined : Number(selectedConnection)}
-          presetData={presetData}
-          branches={branches?.branches}
-          mode="wizard"
-          onSubmit={async (data) => {
-            try {
-              await createProjectMutationM.mutateAsync({
-                body: {
-                  name: data.name,
-                  preset: data.preset,
-                  directory: data.rootDirectory,
-                  main_branch: data.branch,
-                  repo_name: selectedRepository.name || '',
-                  repo_owner: selectedRepository.owner || owner || '',
-                  git_url: useGitUrl ? gitUrl : undefined,
-                  git_provider_connection_id: useGitUrl
-                    ? undefined
-                    : Number(selectedConnection),
-                  is_public_repo: useGitUrl ? true : undefined,
-                  project_type: data.preset === 'custom' ? 'static' : undefined,
-                  automatic_deploy: data.autoDeploy,
-                  storage_service_ids: data.storageServices || [],
-                  environment_variables: data.environmentVariables?.map(
-                    (env) => [env.key, env.value] as [string, string]
-                  ),
-                  preset_config:
-                    data.preset === 'dockerfile' && data.dockerfilePath
-                      ? {
-                          preset: 'dockerfile',
-                          dockerfilePath: data.dockerfilePath,
-                        }
-                      : data.preset === 'docker-compose'
-                        ? {
-                            preset: 'docker-compose',
-                            composePath:
-                              (data as any).composePath || 'docker-compose.yml',
-                          }
-                        : undefined,
-                  exposed_port:
-                    data.preset === 'docker-compose' ? undefined : data.port,
-                },
-              })
-            } catch (error) {
-              console.error('Project creation error:', error)
+          <ProjectConfigurator
+            repository={{
+              id: selectedRepository.id,
+              name: selectedRepository.name,
+              owner: selectedRepository.owner || owner,
+              full_name: selectedRepository.full_name,
+              private: selectedRepository.private || false,
+              default_branch:
+                branches?.branches?.find((b: any) => b.is_default)?.name ||
+                selectedRepository.default_branch ||
+                'main',
+              created_at:
+                selectedRepository.created_at || new Date().toISOString(),
+              pushed_at:
+                selectedRepository.pushed_at || new Date().toISOString(),
+              updated_at:
+                selectedRepository.updated_at || new Date().toISOString(),
+              git_provider_connection_id:
+                selectedRepository.git_provider_connection_id ??
+                (Number(selectedConnection) || 0),
+              clone_url: selectedRepository.clone_url,
+              ssh_url: selectedRepository.ssh_url,
+            }}
+            connectionId={useGitUrl ? undefined : Number(selectedConnection)}
+            publicRepo={
+              useGitUrl && parsedPublicRepo
+                ? {
+                    provider: parsedPublicRepo.provider || 'github',
+                    owner: parsedPublicRepo.owner,
+                    repo: parsedPublicRepo.repo,
+                  }
+                : null
             }
-          }}
-          onCancel={goBackFromRepo}
-        />
-      </div>
+            presetData={presetData}
+            onRefreshPresets={() =>
+              useGitUrl
+                ? refetchPublicPresetData()
+                : refetchAuthenticatedPresetData()
+            }
+            branches={branches?.branches}
+            mode="wizard"
+            onSubmit={async (data) => {
+              try {
+                await createProjectMutationM.mutateAsync({
+                  body: {
+                    name: data.name,
+                    preset: data.preset,
+                    directory: data.rootDirectory,
+                    main_branch: data.branch,
+                    repo_name: selectedRepository.name || '',
+                    repo_owner: selectedRepository.owner || owner || '',
+                    git_url: useGitUrl ? gitUrl : undefined,
+                    git_provider_connection_id: useGitUrl
+                      ? undefined
+                      : Number(selectedConnection),
+                    is_public_repo: useGitUrl ? true : undefined,
+                    project_type:
+                      data.preset === 'custom' ? 'static' : undefined,
+                    automatic_deploy: data.autoDeploy,
+                    storage_service_ids: data.storageServices || [],
+                    environment_variables: data.environmentVariables?.map(
+                      (env) => ({
+                        key: env.key,
+                        value: env.value,
+                        is_secret: env.isSecret,
+                      })
+                    ),
+                    preset_config:
+                      data.preset === 'dockerfile' && data.dockerfilePath
+                        ? {
+                            dockerfilePath: data.dockerfilePath,
+                          }
+                        : data.preset === 'docker-compose'
+                          ? {
+                              composePath:
+                                (data as any).composePath ||
+                                'docker-compose.yml',
+                              ...(data.excludedServices &&
+                              data.excludedServices.length > 0
+                                ? { excludedServices: data.excludedServices }
+                                : {}),
+                              ...(data.composeServices &&
+                              data.composeServices.length > 0
+                                ? { composeServices: data.composeServices }
+                                : {}),
+                            }
+                          : undefined,
+                    exposed_port:
+                      data.preset === 'docker-compose' ? undefined : data.port,
+                  },
+                })
+              } catch (error) {
+                console.error('Project creation error:', error)
+              }
+            }}
+            onCancel={goBackFromRepo}
+          />
+        </div>
+      </NewProjectShell>
     )
   }
 
@@ -642,147 +743,73 @@ export function GitImportClone({
   }
 
   // Source selection step
-  if (!selectedSource) {
-    const sources: Array<{
-      key: ProjectSource
-      icon: typeof FolderGit2
-      title: string
-      tagline: string
-      detail: string
-    }> = [
-      {
-        key: 'browse',
-        icon: FolderGit2,
-        title: 'Import Repository',
-        tagline: 'Browse your private and public repos',
-        detail:
-          'Select a repository from your connected Git accounts. Auto-detects framework, build settings, and sets up webhooks for automatic deploys on push.',
-      },
-      {
-        key: 'templates',
-        icon: LayoutTemplate,
-        title: 'Template',
-        tagline: 'Start from a pre-configured starter kit',
-        detail:
-          'Pick from curated templates like Next.js, SaaS starters, and documentation sites. Includes build settings, environment variables, and recommended services.',
-      },
-      {
-        key: 'git-url',
-        icon: LinkIcon,
-        title: 'Git URL',
-        tagline: 'Clone from a public repository URL',
-        detail:
-          'Paste a public GitHub or GitLab URL to import any open-source repository. No account connection required — great for trying out open-source projects.',
-      },
-      {
-        key: 'manual',
-        icon: Container,
-        title: 'Manual Deploy',
-        tagline: 'No Git repository needed',
-        detail:
-          'Deploy a pre-built Docker image from any registry (DockerHub, GHCR, etc.) or upload a static files bundle. Ideal for CI/CD pipelines or pre-built artifacts.',
-      },
-    ]
+  // Entry screen: persistent tab bar + sidebar. Only the content area below
+  // the tabs swaps based on `selectedSource` — switching tabs must never
+  // navigate away from this shell (that was the bug in the old two-screen
+  // "pick a source -> full-width takeover" flow).
 
-    return (
-      <Card className="flex-1">
-        <CardHeader className="flex items-center gap-2 pb-3">
-          <GitBranch className="h-5 w-5 text-foreground" />
-          <CardTitle className="text-xl font-bold">
-            Create New Project
-          </CardTitle>
-        </CardHeader>
-        <CardContent>
-          <p className="text-sm text-muted-foreground mb-6">
-            Choose how you want to set up your project
-          </p>
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            {sources.map((s) => {
-              const Icon = s.icon
-              return (
-                <button
-                  key={s.key}
-                  onClick={() => setSelectedSource(s.key)}
-                  className="group flex flex-col gap-3 p-5 rounded-lg border bg-card hover:border-primary hover:bg-accent/50 transition-colors text-left"
-                >
-                  <div className="flex items-center gap-3">
-                    <div className="rounded-md bg-primary/10 p-2.5 group-hover:bg-primary/20 transition-colors">
-                      <Icon className="h-5 w-5 text-primary" />
-                    </div>
-                    <div>
-                      <p className="font-semibold">{s.title}</p>
-                      <p className="text-xs text-muted-foreground">
-                        {s.tagline}
-                      </p>
-                    </div>
-                  </div>
-                  <p className="text-xs text-muted-foreground leading-relaxed pl-[52px]">
-                    {s.detail}
-                  </p>
-                  {s.key === 'browse' &&
-                    connections &&
-                    connections.connections.length > 0 && (
-                      <div className="flex items-center gap-2 pl-[52px] flex-wrap">
-                        {connections.connections.map((conn) => (
-                          <div
-                            key={conn.id}
-                            className="flex items-center gap-1.5 text-xs text-muted-foreground bg-muted/60 rounded-full px-2.5 py-1"
-                          >
-                            {renderProviderIcon(conn.provider_id, 'h-3 w-3')}
-                            <span>{conn.account_name}</span>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  {s.key === 'browse' &&
-                    (!connections ||
-                      connections.connections.length === 0) && (
-                      <p className="text-xs text-amber-500 pl-[52px]">
-                        No Git connections yet — you can add one after
-                        selecting this option.
-                      </p>
-                    )}
-                </button>
-              )
-            })}
+  const connectionCount = connections?.connections?.length ?? 0
+
+  const sourceContentEl = (
+    <>
+      {!selectedSource && !connections && (
+        <div className="space-y-3">
+          <Skeleton className="h-10 w-full" />
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+            {Array.from({ length: 6 }).map((_, i) => (
+              <Skeleton key={i} className="h-32 w-full rounded-xl" />
+            ))}
           </div>
-        </CardContent>
-      </Card>
-    )
-  }
-
-  // Selected source content
-  return (
-    <Card className="flex-1">
-      <CardHeader className="flex items-center gap-2 pb-3">
-        <div className="flex items-center gap-2 w-full">
-          <Button
-            variant="ghost"
-            size="sm"
-            onClick={() => setSelectedSource(null)}
-          >
-            <ChevronLeft className="h-4 w-4 mr-1" />
-            Back
-          </Button>
-          <CardTitle className="text-xl font-bold">
-            {selectedSource === 'templates' && 'Choose a Template'}
-            {selectedSource === 'browse' && 'Import Repository'}
-            {selectedSource === 'git-url' && 'Import from Git URL'}
-            {selectedSource === 'manual' && 'Manual Deployment'}
-          </CardTitle>
         </div>
-      </CardHeader>
-      <CardContent className="space-y-3">
-        {selectedSource === 'templates' && (
-          <TemplateList
-            onTemplateSelect={selectTemplate}
-            selectedTemplate={selectedTemplate}
-            showFeaturedFirst={true}
-          />
-        )}
+      )}
 
-        {selectedSource === 'browse' && (
-          <div className="space-y-3">
+      {selectedSource === 'templates' && (
+        <Card>
+          <CardContent className="pt-6">
+            <TemplateList
+              onTemplateSelect={selectTemplate}
+              selectedTemplate={selectedTemplate}
+              showFeaturedFirst={true}
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      {selectedSource === 'browse' && connections && connectionCount === 0 && (
+        <Card>
+          <CardContent className="flex flex-col items-center text-center py-12 px-6">
+            <FolderGit2 className="size-8 text-muted-foreground mb-3" />
+            <p className="text-sm font-medium">No Git provider connected</p>
+            <p className="text-xs text-muted-foreground mt-1 mb-4 max-w-xs">
+              Connect GitHub or GitLab to browse your repositories, or paste a
+              public Git URL instead.
+            </p>
+            <div className="flex items-center gap-2">
+              {mode === 'navigation' && (
+                <Button
+                  size="sm"
+                  onClick={() => navigate('/git-providers/add')}
+                >
+                  <Plus className="h-4 w-4 mr-1.5" />
+                  Connect provider
+                </Button>
+              )}
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setSelectedSource('git-url')}
+              >
+                <LinkIcon className="h-4 w-4 mr-1.5" />
+                Use a Git URL
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
+      {selectedSource === 'browse' && connectionCount > 0 && (
+        <Card>
+          <CardContent className="pt-6 space-y-3">
             <Select
               value={selectedConnection}
               onValueChange={setSelectedConnection}
@@ -791,24 +818,21 @@ export function GitImportClone({
                 <SelectValue placeholder="Select Connection">
                   {selectedConnection &&
                     connections &&
-                    (() => {
-                      const selectedConn = connections.connections.find(
-                        (c) => c.id.toString() === selectedConnection
-                      )
-                      return selectedConn ? (
-                        <div className="flex items-center gap-2">
-                          {renderProviderIcon(selectedConn.provider_id)}
-                          <span className="font-medium">
-                            {selectedConn.account_name}
-                          </span>
-                          <span className="text-xs text-muted-foreground">
-                            ({selectedConn.account_type})
-                          </span>
-                        </div>
-                      ) : (
-                        'Select Connection'
-                      )
-                    })()}
+                    (selectedConnectionDetails ? (
+                      <div className="flex items-center gap-2">
+                        {renderProviderIcon(
+                          selectedConnectionDetails.provider_id
+                        )}
+                        <span className="font-medium">
+                          {selectedConnectionDetails.account_name}
+                        </span>
+                        <span className="text-xs text-muted-foreground">
+                          ({selectedConnectionDetails.account_type})
+                        </span>
+                      </div>
+                    ) : (
+                      'Select Connection'
+                    ))}
                 </SelectValue>
               </SelectTrigger>
               <SelectContent>
@@ -838,14 +862,17 @@ export function GitImportClone({
                 showSelection={false}
                 itemsPerPage={15}
                 showHeader={true}
-                compactMode={false}
+                compactMode
+                providerType={selectedConnectionProviderType}
               />
             )}
-          </div>
-        )}
+          </CardContent>
+        </Card>
+      )}
 
-        {selectedSource === 'git-url' && (
-          <div className="space-y-4">
+      {selectedSource === 'git-url' && (
+        <Card>
+          <CardContent className="pt-6 space-y-4">
             <div className="space-y-2">
               <Label htmlFor="git-url">Public Repository URL</Label>
               <Input
@@ -892,42 +919,47 @@ export function GitImportClone({
             </Button>
 
             {/* Show parsed URL preview */}
-            {gitUrl &&
-              !isValidatingUrl &&
-              (() => {
-                const parsed = parseGitUrl(gitUrl)
-                if (parsed) {
-                  return (
-                    <div className="p-3 bg-muted/50 rounded-md text-sm">
-                      <div className="flex items-center gap-2">
-                        {parsed.provider === 'github' ? (
-                          <Github className="h-4 w-4" />
-                        ) : (
-                          <Gitlab className="h-4 w-4" />
-                        )}
-                        <span className="font-medium">
-                          {parsed.owner}/{parsed.repo}
-                        </span>
-                        <Badge variant="secondary" className="text-xs">
-                          {parsed.provider}
-                        </Badge>
-                      </div>
-                    </div>
-                  )
-                }
-                return null
-              })()}
-          </div>
-        )}
+            {parsedGitUrlPreview && (
+              <div className="p-3 bg-muted/50 rounded-md text-sm">
+                <div className="flex items-center gap-2">
+                  {parsedGitUrlPreview.provider === 'github' ? (
+                    <Github className="h-4 w-4" />
+                  ) : (
+                    <Gitlab className="h-4 w-4" />
+                  )}
+                  <span className="font-medium">
+                    {parsedGitUrlPreview.owner}/{parsedGitUrlPreview.repo}
+                  </span>
+                  <Badge variant="secondary" className="text-xs">
+                    {parsedGitUrlPreview.provider}
+                  </Badge>
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
 
-        {selectedSource === 'manual' && (
-          <div className="space-y-4">
+      {selectedSource === 'manual' && (
+        <Card>
+          <CardContent className="pt-6">
             <ManualProjectConfigurator
               onCancel={() => setSelectedSource(null)}
             />
-          </div>
-        )}
-      </CardContent>
-    </Card>
+          </CardContent>
+        </Card>
+      )}
+
+      {selectedSource === 'drop' && <Drop embedded />}
+    </>
+  )
+
+  return (
+    <NewProjectShell
+      activeSource={selectedSource}
+      onSelectSource={setSelectedSource}
+    >
+      {sourceContentEl}
+    </NewProjectShell>
   )
 }

@@ -14,6 +14,10 @@ temps-auth = { path = "../temps-auth" }
 temps-agents = { path = "../temps-agents" }
 temps-config = { path = "../temps-config" }
 temps-git = { path = "../temps-git" }
+# Frame codec for the in-sandbox PTY agent (ADR-008). Library half only —
+# the binary is built into the sandbox image, not linked here.
+temps-pty-agent = { path = "../temps-pty-agent" }
+anyhow = { workspace = true }
 base64 = { workspace = true }
 sea-orm = { workspace = true }
 tokio = { workspace = true }
@@ -31,6 +35,7 @@ argon2 = { workspace = true }
 hex = "0.4"
 url = { workspace = true }
 tokio-stream = { version = "0.1.17", features = ["sync"] }
+tokio-util = { workspace = true, features = ["io"] }
 futures = { workspace = true }
 async-stream = { workspace = true }
 flate2 = { workspace = true }

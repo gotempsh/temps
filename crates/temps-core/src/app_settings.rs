@@ -17,6 +17,11 @@ pub struct AppSettings {
     /// `external_url`, which is the public-facing address.
     pub internal_url: Option<String>,
     pub preview_domain: String,
+    /// Public edge target that generated DNS records point at when a managed
+    /// domain opts into automatic record sync. An IPv4/IPv6 address produces an
+    /// `A`/`AAAA` record; anything else is treated as a `CNAME` target. `None`
+    /// disables DNS record sync regardless of per-domain opt-in.
+    pub edge_target: Option<String>,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -56,6 +61,25 @@ pub struct AppSettings {
     // AI configuration settings (global config repo for skills, MCP servers, etc.)
     pub ai_config: AiConfigSettings,
 
+    /// Limits on a single AI chat turn. Operator-tunable because the right
+    /// value depends on the model: a turn against a slow self-hosted model can
+    /// legitimately take ten minutes, while a hosted one finishes in seconds
+    /// and a shorter ceiling keeps costs predictable.
+    #[serde(default)]
+    pub ai_chat_limits: AiChatLimitsSettings,
+
+    /// Upstream request/connection timeouts applied by the proxy to customer
+    /// app traffic. Provides a global hard ceiling plus global defaults for
+    /// regular HTTP, SSE, and WebSocket traffic; projects and environments
+    /// may set a shorter value but never exceed the ceiling here.
+    #[serde(default)]
+    pub request_timeouts: RequestTimeoutSettings,
+
+    /// Per-upstream concurrent-connection cap applied by the proxy to
+    /// customer app traffic. `0` (the default) is unlimited. See issue #646.
+    #[serde(default)]
+    pub connection_limits: ConnectionLimitSettings,
+
     /// Skip TLS certificate verification on outbound HTTP clients built by the
     /// server (deployer, agent, remote service client). Strictly opt-in for
     /// operators running self-signed control plane / worker certs on a trusted
@@ -80,6 +104,14 @@ pub struct AppSettings {
     /// scrape interval, and tiered retention windows.
     pub monitoring: MonitoringSettings,
 
+    /// TimescaleDB compression delays for immutable observability data.
+    /// Changes are applied at runtime by the Settings API.
+    pub observability_compression: ObservabilityCompressionSettings,
+
+    /// Retention windows for raw proxy and OpenTelemetry telemetry.
+    /// TimescaleDB policies are updated at runtime by the Settings API.
+    pub observability_retention: ObservabilityRetentionSettings,
+
     /// Set to `true` by `temps setup` (all modes) once initial configuration
     /// has been applied. The web onboarding wizard reads this from the server
     /// and skips itself when true, preventing the "Configure Base Domain" wall
@@ -100,6 +132,23 @@ pub struct AppSettings {
     /// restarting the binary.
     #[serde(default)]
     pub require_mfa_for_admins: bool,
+
+    /// One-click "Update now" from the console. Enabled by default; an admin
+    /// can turn it off here to keep upgrades on the CLI/config-management path.
+    ///
+    /// This is the *soft* switch — it is stored in the database, so whoever can
+    /// write settings can also turn it back on. Operators who need an upgrade
+    /// path that no console session can re-open should start the server with
+    /// `--disable-self-update`, which wins over this field unconditionally.
+    /// `None` means the client did not express an opinion, NOT "reset to
+    /// default". Every other field on this struct is safe to re-default on a
+    /// partial write, but this one gates whether the server may replace its own
+    /// binary — silently flipping it back on because an older client PUT a
+    /// settings document without it would undo a deliberate security decision.
+    /// The update handler preserves the stored value when this is absent; read
+    /// it through `self_update()`.
+    #[serde(default)]
+    pub self_update: Option<SelfUpdateSettings>,
 
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
@@ -147,6 +196,169 @@ pub struct ClusterDnsSettings {
     /// `*.temps.local` FQDNs resolve inside containers.
     #[schema(example = false)]
     pub enabled: bool,
+}
+
+/// Bounds on one AI chat turn.
+///
+/// A turn is bounded by TIME rather than by a number of steps. A step count
+/// says nothing about cost or about how long someone has been watching a
+/// spinner, and it cuts short exactly the long, productive turns the chat
+/// exists for. The user can already see each tool call and press Stop; the
+/// deadline is what guarantees an *unattended* turn still ends.
+///
+/// The right value is a property of the model, which is why it is configurable
+/// rather than compiled in: a full alert-suggestion turn takes ~10 minutes
+/// against a slow local model and seconds against a hosted one.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct AiChatLimitsSettings {
+    /// How long one turn may run before it is stopped and the partial answer
+    /// returned, in seconds. The user is told the turn was cut short.
+    ///
+    /// Checked between steps, not mid-call: a model round already in flight
+    /// finishes, so a turn can overrun by up to one round. Against a slow
+    /// self-hosted model that is a minute or two. Aborting mid-stream would cut
+    /// the answer off in the middle of a sentence and throw away work already
+    /// paid for, which is worse than a late stop.
+    #[schema(minimum = 30, maximum = 3600, example = 900)]
+    pub turn_timeout_secs: u32,
+}
+
+impl Default for AiChatLimitsSettings {
+    fn default() -> Self {
+        Self {
+            // Generous against a full alert-suggestion turn on a slow local
+            // model (~10 min) while capping what a single message can cost.
+            turn_timeout_secs: 15 * 60,
+        }
+    }
+}
+
+impl AiChatLimitsSettings {
+    /// Lower bound: below this a turn cannot complete even simple tool work,
+    /// so accepting it would just look like the chat is broken.
+    pub const MIN_TURN_TIMEOUT_SECS: u32 = 30;
+    /// Upper bound: an hour of provider calls from one message is already far
+    /// past anything useful, and the value is a cost ceiling.
+    pub const MAX_TURN_TIMEOUT_SECS: u32 = 3600;
+
+    /// The configured timeout, clamped to the supported range.
+    ///
+    /// Clamped rather than trusted: the settings row is JSON that predates this
+    /// field and can be written by any admin, and a zero would otherwise mean
+    /// "every turn times out instantly".
+    pub fn turn_timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(
+            self.turn_timeout_secs
+                .clamp(Self::MIN_TURN_TIMEOUT_SECS, Self::MAX_TURN_TIMEOUT_SECS) as u64,
+        )
+    }
+}
+
+/// Upstream request/connection timeouts for customer app traffic.
+///
+/// By default, no timeout is applied to customer app traffic at all — an
+/// existing app that happens to have a slow endpoint, a long-polling
+/// request, or an unusually long response must keep working exactly as it
+/// did before this setting existed. Timeouts here are opt-in: an operator
+/// can set a global default, and/or a project/environment can set its own
+/// override (`DeploymentConfig::request_timeout_seconds` /
+/// `sse_idle_timeout_seconds` / `websocket_idle_timeout_seconds`), but until
+/// one of those is explicitly configured, the proxy holds the connection
+/// open indefinitely (bounded only by TCP/OS-level limits).
+///
+/// `default_*_timeout_seconds` of `0` means "no timeout" — this is the
+/// out-of-the-box value for all three. `max_request_timeout_seconds` is a
+/// hard ceiling that only comes into play once a timeout is actually
+/// configured (globally or per project/environment): whatever value is
+/// resolved is always clamped to it, so lowering the ceiling here takes
+/// effect immediately without needing every environment row re-saved. It
+/// never *creates* a timeout for traffic that has none.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct RequestTimeoutSettings {
+    /// Hard ceiling, in seconds, applied once a timeout is configured (via a
+    /// global default above or a project/environment override). Has no
+    /// effect on traffic with no timeout configured at all.
+    #[schema(minimum = 5, maximum = 86400, example = 600)]
+    pub max_request_timeout_seconds: u32,
+
+    /// Default timeout for regular (non-streaming) HTTP requests, in
+    /// seconds. Used when a project/environment hasn't set
+    /// `request_timeout_seconds`. `0` (the default) means no timeout.
+    #[schema(minimum = 0, example = 0)]
+    pub default_http_timeout_seconds: u32,
+
+    /// Default idle timeout for Server-Sent Events streams, in seconds. Used
+    /// when a project/environment hasn't set `sse_idle_timeout_seconds`. `0`
+    /// (the default) means no timeout.
+    #[schema(minimum = 0, example = 0)]
+    pub default_sse_idle_timeout_seconds: u32,
+
+    /// Default idle timeout for WebSocket connections, in seconds. Used when
+    /// a project/environment hasn't set `websocket_idle_timeout_seconds`.
+    /// `0` (the default) means no timeout.
+    #[schema(minimum = 0, example = 0)]
+    pub default_websocket_idle_timeout_seconds: u32,
+}
+
+impl RequestTimeoutSettings {
+    /// Lower bound for `max_request_timeout_seconds`: below this, ordinary
+    /// requests to a slow-starting app would routinely fail.
+    pub const MIN_CEILING_SECS: u32 = 5;
+    /// Upper bound for `max_request_timeout_seconds`: a day-long single
+    /// upstream connection is already far past anything a proxy should hold
+    /// open.
+    pub const MAX_CEILING_SECS: u32 = 86400;
+
+    /// The configured ceiling, clamped to the supported range. Clamped
+    /// rather than trusted for the same reason as `AiChatLimitsSettings`:
+    /// the settings row is JSON any admin can write, and an unclamped 0
+    /// would mean "every request times out instantly" for any traffic that
+    /// does have a timeout configured.
+    pub fn ceiling(&self) -> u32 {
+        self.max_request_timeout_seconds
+            .clamp(Self::MIN_CEILING_SECS, Self::MAX_CEILING_SECS)
+    }
+
+    /// Clamp a resolved, *already-nonzero* per-request timeout (merged from
+    /// project/environment overrides or one of the defaults above) down to
+    /// the hard ceiling. The ceiling always wins. Callers must treat `0`
+    /// (no timeout) as a distinct case and never pass it here — clamping
+    /// would turn "no timeout" into "the ceiling," which is exactly the
+    /// unwanted default-on behavior this type exists to avoid.
+    pub fn clamp_to_ceiling(&self, seconds: u32) -> u32 {
+        seconds.min(self.ceiling())
+    }
+}
+
+impl Default for RequestTimeoutSettings {
+    fn default() -> Self {
+        Self {
+            max_request_timeout_seconds: 600,
+            default_http_timeout_seconds: 0,
+            default_sse_idle_timeout_seconds: 0,
+            default_websocket_idle_timeout_seconds: 0,
+        }
+    }
+}
+
+/// Per-upstream concurrent-connection limiting. Protects the proxy's own
+/// connection/file-descriptor budget from a single slow or malicious
+/// customer upstream — independent of the request/idle timeouts in
+/// `RequestTimeoutSettings`, which bound how long a connection may stay
+/// open, not how many may exist at once. See issue #646.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, ToSchema, Deserialize)]
+#[serde(default)]
+pub struct ConnectionLimitSettings {
+    /// Default max concurrent in-flight requests to a single
+    /// project/environment's upstream, used when the project/environment
+    /// hasn't set its own `max_concurrent_connections` override. `0` (the
+    /// default) means unlimited — matches the "opt-in, never breaks an
+    /// existing app on upgrade" philosophy already established for
+    /// `RequestTimeoutSettings`.
+    #[schema(minimum = 0, example = 200)]
+    pub default_max_concurrent_connections: u32,
 }
 
 /// Control-plane build resource limits.
@@ -253,6 +465,20 @@ pub struct ProviderConfig {
     /// settings). Intentionally untyped so new providers don't require
     /// schema changes.
     pub extra: serde_json::Value,
+    /// Default max agent turns for the autofixer *analysis* phase when this
+    /// provider runs it. `None` = built-in default (10). Only enforced for
+    /// CLIs that support a turn cap (Claude Code's `--max-turns`); Codex and
+    /// OpenCode run to completion regardless.
+    #[serde(default)]
+    pub max_turns_analysis: Option<i32>,
+    /// Default max agent turns for the autofixer *fix* phase.
+    /// `None` = built-in default (20).
+    #[serde(default)]
+    pub max_turns_fix: Option<i32>,
+    /// Default max agent turns for autofixer *feedback/re-analyze* rounds.
+    /// `None` = built-in default (10).
+    #[serde(default)]
+    pub max_turns_feedback: Option<i32>,
 }
 
 /// Global agent sandbox settings. Controls whether agent runs are isolated
@@ -301,6 +527,13 @@ pub struct AgentSandboxSettings {
     /// Network access level: "full" (unrestricted), "restricted" (Temps network only), "none" (no network)
     #[schema(example = "full")]
     pub network_mode: String,
+    /// Default isolation backend for sandboxes: "docker" (default) or
+    /// "firecracker" (ADR-029; requires `temps firecracker setup`). Only
+    /// consulted when the Firecracker backend probes available — otherwise
+    /// Docker is used regardless.
+    #[serde(default)]
+    #[schema(example = "docker")]
+    pub sandbox_backend: Option<String>,
 }
 
 /// Global AI configuration settings. Controls the default config repo
@@ -348,6 +581,7 @@ impl Default for AgentSandboxSettings {
             cpu_limit: 4.0,
             memory_limit_mb: 8192,
             network_mode: "full".to_string(),
+            sandbox_backend: None,
         }
     }
 }
@@ -381,6 +615,9 @@ impl AgentSandboxSettings {
                 credentials_encrypted: self.api_key_encrypted.clone(),
                 default_model: None,
                 extra: serde_json::Value::Null,
+                max_turns_analysis: None,
+                max_turns_fix: None,
+                max_turns_feedback: None,
             };
         }
         ProviderConfig::default()
@@ -456,7 +693,9 @@ pub struct DiskSpaceAlertSettings {
     /// Interval in seconds between disk space checks
     #[schema(minimum = 60, example = 300)]
     pub check_interval_seconds: u64,
-    /// Path to monitor (defaults to data directory)
+    /// Restrict monitoring to the disk backing this path. When unset (the
+    /// default), every mounted writable volume is monitored — including
+    /// dedicated volumes such as `/var/lib/docker`.
     pub monitor_path: Option<String>,
 }
 
@@ -548,9 +787,11 @@ impl Default for MultiNodeSettings {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct PreviewGatewaySettings {
-    /// Docker image reference for the gateway. Pinned per Temps release.
+    /// Docker image reference for the gateway. Pinned by digest per Temps release.
     /// Operators can override this to test a custom build.
-    #[schema(example = "ghcr.io/gotempsh/temps-preview-gateway:latest")]
+    #[schema(
+        example = "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9"
+    )]
     pub image: String,
     /// Host port to publish the gateway on (always bound to 127.0.0.1).
     /// Pingora forwards `ws-*` traffic to this port after authenticating.
@@ -576,7 +817,7 @@ pub struct PreviewGatewaySettings {
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
-            image: "ghcr.io/gotempsh/temps-preview-gateway:latest".to_string(),
+            image: "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9".to_string(),
             host_port: 8090,
             auto_upgrade: true,
             shared_secret: String::new(),
@@ -651,7 +892,10 @@ impl Default for OnDemandTlsSettings {
 pub enum MetricsStoreKind {
     /// Default: TimescaleDB (same PostgreSQL instance used by the control plane).
     TimescaleDb,
-    /// Optional: ClickHouse cluster — requires `clickhouse_url` to be set.
+    /// Optional: ClickHouse cluster. The runtime store is built from the
+    /// `TEMPS_CLICKHOUSE_*` server env configuration; selecting this without
+    /// that configuration falls back to TimescaleDB (reported via
+    /// `effective_metrics_store`).
     ClickHouse,
 }
 
@@ -685,12 +929,73 @@ pub struct MonitoringSettings {
     pub retention_hourly_days: u32,
 
     /// How many years of daily-aggregate data to keep (converted to days internally).
-    #[schema(minimum = 1, example = 2)]
+    #[schema(minimum = 1, maximum = 10, example = 2)]
     pub retention_daily_years: u32,
 
-    /// ClickHouse DSN, required only when `store = "click_house"`.
+    /// ClickHouse DSN (legacy, optional). The runtime metrics store is built
+    /// from the `TEMPS_CLICKHOUSE_*` env vars, never from this field; it is
+    /// retained for compatibility and operator reference only.
     /// Example: `"http://localhost:8123"`.
     pub clickhouse_url: Option<String>,
+}
+
+/// TimescaleDB compression policy configuration for append-only observability
+/// tables. Values are expressed in hours so operators can choose sub-day
+/// windows while keeping the API representation unambiguous.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityCompressionSettings {
+    /// Compress proxy-log chunks after this many hours. Defaults to 24 hours.
+    #[schema(minimum = 1, maximum = 720, example = 24)]
+    pub proxy_logs_after_hours: u32,
+
+    /// Compress OpenTelemetry span chunks after this many hours. Defaults to
+    /// 24 hours.
+    #[schema(minimum = 1, maximum = 2160, example = 24)]
+    pub otel_spans_after_hours: u32,
+}
+
+impl Default for ObservabilityCompressionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_after_hours: 24,
+            otel_spans_after_hours: 24,
+        }
+    }
+}
+
+/// Retention policy configuration for raw observability tables. Values are in
+/// days. The Settings API applies them to TimescaleDB; ClickHouse-backed proxy
+/// logs and spans retain their storage-level per-row TTL behavior.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct ObservabilityRetentionSettings {
+    /// Retain proxy request logs for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 30)]
+    pub proxy_logs_days: u32,
+
+    /// Retain OpenTelemetry spans (traces) for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_spans_days: u32,
+
+    /// Retain OpenTelemetry log events for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_logs_days: u32,
+
+    /// Retain OpenTelemetry metric points for this many days.
+    #[schema(minimum = 1, maximum = 3650, example = 90)]
+    pub otel_metrics_days: u32,
+}
+
+impl Default for ObservabilityRetentionSettings {
+    fn default() -> Self {
+        Self {
+            proxy_logs_days: 30,
+            otel_spans_days: 90,
+            otel_logs_days: 90,
+            otel_metrics_days: 90,
+        }
+    }
 }
 
 impl Default for MonitoringSettings {
@@ -714,6 +1019,7 @@ impl Default for AppSettings {
             external_url: None,
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
+            edge_target: None,
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),
@@ -728,12 +1034,60 @@ impl Default for AppSettings {
             on_demand_tls: OnDemandTlsSettings::default(),
             ai_config: AiConfigSettings::default(),
             insecure_tls: false,
+            ai_chat_limits: AiChatLimitsSettings::default(),
+            request_timeouts: RequestTimeoutSettings::default(),
+            connection_limits: ConnectionLimitSettings::default(),
             build_limits: BuildLimitsSettings::default(),
             cluster_dns: ClusterDnsSettings::default(),
             monitoring: MonitoringSettings::default(),
+            observability_compression: ObservabilityCompressionSettings::default(),
+            observability_retention: ObservabilityRetentionSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
+            self_update: None,
             console_version: None,
+        }
+    }
+}
+
+impl AppSettings {
+    /// Effective self-update settings, treating "never configured" as the
+    /// default. Use this everywhere instead of touching the `Option` directly,
+    /// so absence and an explicit default behave identically at read time.
+    pub fn self_update(&self) -> SelfUpdateSettings {
+        self.self_update.clone().unwrap_or_default()
+    }
+}
+
+/// Controls the console's one-click "Update now" action.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+#[serde(default)]
+pub struct SelfUpdateSettings {
+    /// Allow admins to apply a release and restart the server from the console.
+    /// `true` by default: the action is permission-gated, audited, and only
+    /// ever installs an official release whose published SHA-256 matches.
+    ///
+    /// Turning this off hides nothing — the console still shows the update
+    /// banner and the manual command, it just refuses to run it for you.
+    #[schema(example = true)]
+    pub enabled: bool,
+
+    /// Release channel this install tracks: `stable`, `beta` or `nightly`.
+    ///
+    /// `None` (the default) means "infer from the running version tag", which
+    /// is what the CLI has always done — a `-nightly.` build tracks nightly, a
+    /// `-beta.N` build tracks beta, a plain tag tracks stable. Setting it
+    /// explicitly pins the channel, so an operator can move a nightly box back
+    /// onto stable without reinstalling.
+    #[schema(example = "stable")]
+    pub channel: Option<String>,
+}
+
+impl Default for SelfUpdateSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            channel: None,
         }
     }
 }
@@ -826,7 +1180,7 @@ impl Default for DiskSpaceAlertSettings {
             enabled: true,               // Enabled by default
             threshold_percent: 80,       // Alert at 80% usage
             check_interval_seconds: 300, // Check every 5 minutes
-            monitor_path: None,          // Use data directory by default
+            monitor_path: None,          // Monitor all mounted disks by default
         }
     }
 }
@@ -893,6 +1247,43 @@ impl AppSettings {
         serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
     }
 
+    /// Serialize into an EXISTING `settings.data` document, preserving
+    /// top-level keys this struct does not own.
+    ///
+    /// The singleton `settings` row is a shared JSON document. `AppSettings`
+    /// owns most of it, but other subsystems store their own sub-documents on
+    /// the same row under their own key — today `admin_gate` (written by
+    /// `AdminGateService`), and anything added later. Those keys are invisible
+    /// to serde here: `from_json` drops them and `to_json` never re-emits them,
+    /// so writing `to_json()` straight over `data` DELETES them.
+    ///
+    /// That is not theoretical — the console records `console_version` through
+    /// `update_setting_field` on every startup, which wiped the operator's
+    /// admin-gate allowlist (IPs + Host headers) before the gate had even been
+    /// loaded, silently reverting the management surface to "open to any host"
+    /// on each restart. Every settings write must go through this method so a
+    /// subsystem's sub-document survives an unrelated save.
+    ///
+    /// Keys this struct owns always win, so a field can still be updated back
+    /// to its default value.
+    pub fn to_json_merged(&self, existing: &serde_json::Value) -> serde_json::Value {
+        let incoming = self.to_json();
+        let (Some(existing_map), serde_json::Value::Object(incoming_map)) =
+            (existing.as_object(), incoming)
+        else {
+            // Existing blob isn't an object (fresh row, or corrupt), or we
+            // somehow didn't serialize to one: nothing to preserve, so the
+            // serialized settings are the whole document.
+            return self.to_json();
+        };
+
+        // `incoming_map` is owned, so move the values in rather than cloning
+        // every key and every serialized sub-document.
+        let mut merged = existing_map.clone();
+        merged.extend(incoming_map);
+        serde_json::Value::Object(merged)
+    }
+
     /// Resolve the URL that service containers use to reach the Temps API from
     /// inside the Docker network. Resolution order:
     ///   1. `internal_url` settings field (admin-editable, runtime)
@@ -914,11 +1305,112 @@ impl AppSettings {
             .unwrap_or_else(|| format!("http://host.docker.internal:{console_port}"));
         raw.trim_end_matches('/').to_string()
     }
+
+    /// Hostname the Temps console is served on, derived from `external_url`.
+    ///
+    /// Returns `None` when `external_url` is unset or unparsable (installs
+    /// reached by raw IP), in which case there is no console hostname to
+    /// protect.
+    pub fn console_hostname(&self) -> Option<String> {
+        let raw = self.external_url.as_ref()?.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        // Tolerate a bare host ("console.example.com") as well as a full URL.
+        let candidate = if raw.contains("://") {
+            raw.to_string()
+        } else {
+            format!("https://{raw}")
+        };
+        url::Url::parse(&candidate)
+            .ok()?
+            .host_str()
+            .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+    }
+
+    /// True when `host` is owned by the platform itself and must never be
+    /// claimed by a project domain.
+    ///
+    /// Reserved hosts are the console hostname (`external_url`) and the
+    /// preview domain apex — routing either of them at a project makes the
+    /// console or every generated preview URL unreachable, and recovering
+    /// requires shell/IP access to the box (issue #478).
+    pub fn is_reserved_hostname(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        if host.is_empty() {
+            return false;
+        }
+        if self.console_hostname().as_deref() == Some(host.as_str()) {
+            return true;
+        }
+        let preview = self
+            .preview_domain
+            .trim()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
+        !preview.is_empty() && preview == host
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Issue #478: a project domain must never be allowed to claim the
+    // console hostname — doing so locks the operator out of the console and
+    // recovery requires the raw public IP.
+    #[test]
+    fn console_hostname_parses_url_and_bare_host() {
+        let with_external_url = |raw: Option<&str>| AppSettings {
+            external_url: raw.map(str::to_string),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            with_external_url(Some("https://Console.Example.com:8443/"))
+                .console_hostname()
+                .as_deref(),
+            Some("console.example.com")
+        );
+        assert_eq!(
+            with_external_url(Some("console.example.com"))
+                .console_hostname()
+                .as_deref(),
+            Some("console.example.com")
+        );
+        assert_eq!(with_external_url(Some("   ")).console_hostname(), None);
+        assert_eq!(with_external_url(None).console_hostname(), None);
+    }
+
+    #[test]
+    fn reserved_hostname_covers_console_and_preview_apex() {
+        let s = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            preview_domain: "apps.example.com".to_string(),
+            ..Default::default()
+        };
+
+        assert!(s.is_reserved_hostname("console.example.com"));
+        // Case and trailing-dot variants are the same host.
+        assert!(s.is_reserved_hostname("CONSOLE.example.com."));
+        assert!(s.is_reserved_hostname("apps.example.com"));
+
+        // Ordinary project domains, including subdomains of the preview
+        // domain, stay assignable.
+        assert!(!s.is_reserved_hostname("shop.example.com"));
+        assert!(!s.is_reserved_hostname("my-app.apps.example.com"));
+        assert!(!s.is_reserved_hostname(""));
+    }
+
+    #[test]
+    fn reserved_hostname_is_inert_without_external_url() {
+        let s = AppSettings {
+            external_url: None,
+            preview_domain: String::new(),
+            ..Default::default()
+        };
+        assert!(!s.is_reserved_hostname("anything.example.com"));
+    }
 
     // ADR-024: cluster-DNS injection is experimental/beta and defaults OFF
     // to avoid the DNS-timeout-cascade failure mode (22-27 s TCP delays when
@@ -967,6 +1459,37 @@ mod tests {
         assert!(
             !parsed.cluster_dns.enabled,
             "cluster_dns must default to disabled when deserializing a legacy settings row"
+        );
+    }
+
+    #[test]
+    fn legacy_settings_json_uses_observability_retention_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+
+        assert_eq!(
+            parsed.observability_retention,
+            ObservabilityRetentionSettings::default()
+        );
+        assert_eq!(parsed.observability_retention.proxy_logs_days, 30);
+        assert_eq!(parsed.observability_retention.otel_spans_days, 90);
+    }
+
+    #[test]
+    fn observability_retention_round_trips_through_json() {
+        let mut settings = AppSettings::default();
+        settings.observability_retention.proxy_logs_days = 14;
+        settings.observability_retention.otel_spans_days = 60;
+        settings.observability_retention.otel_logs_days = 45;
+        settings.observability_retention.otel_metrics_days = 30;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+
+        assert_eq!(
+            parsed.observability_retention,
+            settings.observability_retention
         );
     }
 
@@ -1057,5 +1580,216 @@ mod tests {
         let json = s.to_json();
         let back = AppSettings::from_json(json);
         assert!(back.require_mfa_for_admins);
+    }
+
+    #[test]
+    fn observability_compression_defaults_to_24_hours() {
+        let compression = ObservabilityCompressionSettings::default();
+        assert_eq!(compression.proxy_logs_after_hours, 24);
+        assert_eq!(compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn legacy_settings_get_24_hour_observability_compression_defaults() {
+        let parsed = AppSettings::from_json(serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        }));
+
+        assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 24);
+        assert_eq!(parsed.observability_compression.otel_spans_after_hours, 24);
+    }
+
+    #[test]
+    fn observability_compression_round_trips_through_json() {
+        let mut settings = AppSettings::default();
+        settings.observability_compression.proxy_logs_after_hours = 12;
+        settings.observability_compression.otel_spans_after_hours = 48;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+        assert_eq!(parsed.observability_compression.proxy_logs_after_hours, 12);
+        assert_eq!(parsed.observability_compression.otel_spans_after_hours, 48);
+    }
+
+    #[test]
+    fn request_timeouts_default_is_no_timeout_opt_in_only() {
+        // No traffic-class default applies a timeout out of the box — an
+        // existing app with a slow endpoint or long-lived connection must
+        // keep working exactly as it did before this setting existed.
+        // Timeouts are opt-in: an operator sets a nonzero global default
+        // and/or a project/environment sets its own override. The ceiling
+        // stays at a sane value because it only ever constrains a timeout
+        // that's actually configured — it can't create one on its own.
+        let s = RequestTimeoutSettings::default();
+        assert_eq!(s.max_request_timeout_seconds, 600);
+        assert_eq!(s.default_http_timeout_seconds, 0);
+        assert_eq!(s.default_sse_idle_timeout_seconds, 0);
+        assert_eq!(s.default_websocket_idle_timeout_seconds, 0);
+    }
+
+    #[test]
+    fn request_timeouts_ceiling_clamps_out_of_range_values() {
+        let mut s = RequestTimeoutSettings {
+            max_request_timeout_seconds: 0,
+            ..RequestTimeoutSettings::default()
+        };
+        assert_eq!(s.ceiling(), RequestTimeoutSettings::MIN_CEILING_SECS);
+
+        s.max_request_timeout_seconds = u32::MAX;
+        assert_eq!(s.ceiling(), RequestTimeoutSettings::MAX_CEILING_SECS);
+    }
+
+    #[test]
+    fn request_timeouts_clamp_to_ceiling_never_exceeds_ceiling() {
+        let s = RequestTimeoutSettings {
+            max_request_timeout_seconds: 120,
+            ..RequestTimeoutSettings::default()
+        };
+        assert_eq!(s.clamp_to_ceiling(30), 30, "below ceiling: pass through");
+        assert_eq!(s.clamp_to_ceiling(120), 120, "at ceiling: pass through");
+        assert_eq!(s.clamp_to_ceiling(9000), 120, "above ceiling: clamped");
+    }
+
+    #[test]
+    fn legacy_settings_json_without_request_timeouts_deserializes() {
+        // An old `settings.data` row written before this feature shipped has
+        // no `request_timeouts` key. `#[serde(default)]` must fill it in
+        // with the no-timeout defaults so pre-migration rows keep loading
+        // with identical (i.e. unbounded) proxy behavior.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert_eq!(parsed.request_timeouts, RequestTimeoutSettings::default());
+    }
+
+    #[test]
+    fn request_timeouts_round_trip_through_json() {
+        let mut settings = AppSettings::default();
+        settings.request_timeouts.max_request_timeout_seconds = 120;
+        settings.request_timeouts.default_http_timeout_seconds = 30;
+        settings.request_timeouts.default_sse_idle_timeout_seconds = 90;
+        settings
+            .request_timeouts
+            .default_websocket_idle_timeout_seconds = 90;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+        assert_eq!(parsed.request_timeouts, settings.request_timeouts);
+    }
+
+    #[test]
+    fn connection_limits_default_is_unlimited_opt_in_only() {
+        // Out of the box, no cap is applied — an existing app with many
+        // concurrent requests must keep working without any operator action.
+        // The limit is opt-in: an operator sets a nonzero global default
+        // and/or a project/environment sets its own override.
+        let s = ConnectionLimitSettings::default();
+        assert_eq!(s.default_max_concurrent_connections, 0);
+    }
+
+    #[test]
+    fn connection_limits_round_trip_through_json() {
+        let mut settings = AppSettings::default();
+        settings
+            .connection_limits
+            .default_max_concurrent_connections = 200;
+
+        let parsed = AppSettings::from_json(settings.to_json());
+        assert_eq!(
+            parsed.connection_limits.default_max_concurrent_connections,
+            200
+        );
+    }
+
+    #[test]
+    fn legacy_settings_json_without_connection_limits_deserializes() {
+        // An old `settings.data` row written before this feature shipped has
+        // no `connection_limits` key. `#[serde(default)]` must fill it in
+        // with the unlimited default so pre-existing deployments aren't
+        // suddenly capped on upgrade.
+        let legacy = serde_json::json!({
+            "external_url": "https://paas.example.com",
+            "preview_domain": "localho.st"
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert_eq!(parsed.connection_limits, ConnectionLimitSettings::default());
+        assert_eq!(
+            parsed.connection_limits.default_max_concurrent_connections,
+            0
+        );
+    }
+
+    /// Regression: a settings save must not delete the `admin_gate`
+    /// sub-document. The console writes `console_version` through
+    /// `update_setting_field` on every startup; with a plain `to_json()`
+    /// overwrite that wiped the operator's admin allowlist and reopened the
+    /// management surface to every host on each restart.
+    #[test]
+    fn merge_preserves_foreign_admin_gate_subdocument() {
+        let existing = serde_json::json!({
+            "preview_domain": "temps.kfs.es",
+            "admin_gate": {
+                "allowed_ips": ["10.0.0.0/8"],
+                "allowed_hosts": ["app.temps.kfs.es"],
+                "trust_forwarded_for": false
+            }
+        });
+
+        let mut settings = AppSettings::from_json(existing.clone());
+        settings.console_version = Some("v0.1.0".to_string());
+
+        let merged = settings.to_json_merged(&existing);
+
+        assert_eq!(
+            merged.get("admin_gate"),
+            existing.get("admin_gate"),
+            "an unrelated settings write must not drop the admin_gate sub-document"
+        );
+        assert_eq!(
+            merged.get("console_version").and_then(|v| v.as_str()),
+            Some("v0.1.0"),
+        );
+        assert_eq!(
+            merged.get("preview_domain").and_then(|v| v.as_str()),
+            Some("temps.kfs.es"),
+        );
+    }
+
+    /// Keys `AppSettings` owns must still be updatable — including back to
+    /// their default value — so the merge cannot simply prefer the stored blob.
+    #[test]
+    fn merge_lets_owned_fields_win_over_stored_values() {
+        let existing = serde_json::json!({
+            "preview_domain": "old.example.com",
+            "insecure_tls": true,
+            "admin_gate": { "allowed_hosts": ["app.example.com"] }
+        });
+
+        let mut settings = AppSettings::from_json(existing.clone());
+        settings.preview_domain = "new.example.com".to_string();
+        settings.insecure_tls = false;
+
+        let merged = settings.to_json_merged(&existing);
+
+        assert_eq!(
+            merged.get("preview_domain").and_then(|v| v.as_str()),
+            Some("new.example.com"),
+        );
+        assert_eq!(
+            merged.get("insecure_tls").and_then(|v| v.as_bool()),
+            Some(false),
+            "a field must be settable back to its default value"
+        );
+        assert!(merged.get("admin_gate").is_some());
+    }
+
+    /// A fresh/corrupt row has nothing to preserve — the serialized settings
+    /// become the whole document.
+    #[test]
+    fn merge_falls_back_to_plain_serialization_for_non_object_blob() {
+        let settings = AppSettings::default();
+        let merged = settings.to_json_merged(&serde_json::Value::Null);
+        assert_eq!(merged, settings.to_json());
     }
 }

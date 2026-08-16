@@ -15,7 +15,7 @@ import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import { ArrowRight } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 
 /** How many rows the overview card shows before "View all". */
 const TOP_N = 5

@@ -39,6 +39,20 @@ pub const PREVIEW_SANDBOX_COOKIE_PREFIX: &str = "temps_preview_sbx_";
 /// immediately regardless of this TTL.
 pub const PREVIEW_COOKIE_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
+/// How close to expiry a valid preview cookie must be before it is renewed.
+/// Owner unlock bridges remain idempotent outside this window.
+pub const PREVIEW_COOKIE_REFRESH_WINDOW: Duration = Duration::from_secs(60 * 60);
+
+/// Preview session grants are defined in `temps-core` so the sandbox API can
+/// mint what this module verifies without either crate depending on the other.
+/// Re-exported here because callers have always reached for them via
+/// `preview_auth`.
+pub use temps_core::{
+    encode_preview_session_grant, sanitize_preview_next, validate_preview_session_grant_envelope,
+    verify_preview_session_grant, PreviewGrantError, PREVIEW_SESSION_GRANT_MAX_TTL,
+    PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
+};
+
 /// The local TCP address where the preview gateway listens. Pingora forwards
 /// authenticated preview requests to this peer.
 pub const PREVIEW_GATEWAY_PEER: &str = "127.0.0.1:8090";
@@ -174,39 +188,97 @@ pub fn verify_preview_cookie_subject(
     password_hash: &str,
     now: SystemTime,
 ) -> bool {
+    preview_cookie_remaining_ttl(crypto, cookie_value, subject, password_hash, now).is_some()
+}
+
+/// Return the remaining lifetime of a valid cookie for this sandbox and
+/// current password hash. Invalid, revoked, and expired cookies return `None`.
+pub fn preview_cookie_remaining_ttl(
+    crypto: &CookieCrypto,
+    cookie_value: &str,
+    subject: &str,
+    password_hash: &str,
+    now: SystemTime,
+) -> Option<Duration> {
     let Ok(plain) = crypto.decrypt(cookie_value) else {
-        return false;
+        return None;
     };
     let parts: Vec<&str> = plain.splitn(3, '|').collect();
     if parts.len() != 3 {
-        return false;
+        return None;
     }
     if parts[0] != subject {
-        return false;
+        return None;
     }
     if parts[1] != hash_fingerprint(password_hash) {
-        return false;
+        return None;
     }
     let Ok(exp) = parts[2].parse::<u64>() else {
-        return false;
+        return None;
     };
     let Ok(now_secs) = now.duration_since(UNIX_EPOCH) else {
-        return false;
+        return None;
     };
-    now_secs.as_secs() <= exp
+    exp.checked_sub(now_secs.as_secs()).map(Duration::from_secs)
+}
+
+/// Combine every HTTP Cookie header field into the equivalent cookie-pair
+/// sequence. HTTP/2 permits clients to split Cookie across multiple fields.
+pub fn combine_cookie_header_values<'a>(
+    headers: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let values = headers.into_iter().collect::<Vec<_>>();
+    if values.is_empty() {
+        None
+    } else {
+        Some(values.join("; "))
+    }
 }
 
 /// Pull a single cookie value out of a `Cookie:` header by name.
 pub fn extract_cookie<'a>(cookie_header: &'a str, name: &str) -> Option<&'a str> {
+    extract_cookie_values(cookie_header, name)
+        .into_iter()
+        .next()
+}
+
+/// Return every cookie value with `name`, preserving header order.
+///
+/// Browsers can legitimately send duplicate names when an older parent-domain
+/// preview cookie coexists with the newer host-only partitioned cookie. Cookie
+/// ordering is not a security boundary, so authentication must accept any
+/// value that validates instead of blindly trusting the first one.
+pub fn extract_cookie_values<'a>(cookie_header: &'a str, name: &str) -> Vec<&'a str> {
+    let mut values = Vec::new();
     for pair in cookie_header.split(';') {
         let pair = pair.trim();
         if let Some((k, v)) = pair.split_once('=') {
             if k == name {
-                return Some(v);
+                values.push(v);
             }
         }
     }
-    None
+    values
+}
+
+/// Return true when no cookie candidate is valid with more than the refresh
+/// window remaining. Duplicate names are all considered.
+pub fn preview_cookie_needs_refresh(
+    crypto: &CookieCrypto,
+    cookie_header: Option<&str>,
+    cookie_name: &str,
+    subject: &str,
+    password_hash: &str,
+    now: SystemTime,
+) -> bool {
+    !cookie_header.is_some_and(|header| {
+        extract_cookie_values(header, cookie_name)
+            .iter()
+            .any(|value| {
+                preview_cookie_remaining_ttl(crypto, value, subject, password_hash, now)
+                    .is_some_and(|remaining| remaining > PREVIEW_COOKIE_REFRESH_WINDOW)
+            })
+    })
 }
 
 /// Build the `Set-Cookie` header for a sandbox preview cookie.
@@ -220,11 +292,27 @@ pub fn build_set_cookie_sandbox(
     // silently drop `Secure` cookies sent over plain HTTP, which would
     // completely break preview auth for self-hosted setups running without
     // TLS (e.g. `http://host.docker.internal:8080`).
-    let domain = preview_domain.trim_start_matches("*.");
-    let secure_attr = if secure { "; Secure" } else { "" };
+    // An authenticated unlock bridge may run inside a cross-site iframe.
+    // HTTPS previews therefore need an explicitly partitioned cookie;
+    // `SameSite=Lax` is omitted from iframe redirects by modern browsers.
+    // Plain HTTP cannot use SameSite=None or Partitioned because both require
+    // Secure, so retain the local/self-hosted Lax behavior there.
+    let scope_and_security = if secure {
+        // Host-only is the most interoperable CHIPS scope and is sufficient:
+        // the login POST and every request it unlocks use this exact host.
+        "; Secure; SameSite=None; Partitioned"
+    } else {
+        // HTTP cannot use CHIPS; retain the parent-domain scope used by local
+        // multi-port preview hosts.
+        let domain = preview_domain.trim_start_matches("*.");
+        return format!(
+            "{PREVIEW_SANDBOX_COOKIE_PREFIX}{public_id_suffix}={cookie_value}; Domain=.{domain}; Path=/; HttpOnly; SameSite=Lax; Max-Age={}",
+            PREVIEW_COOKIE_TTL.as_secs()
+        );
+    };
     let ttl = PREVIEW_COOKIE_TTL.as_secs();
     format!(
-        "{PREVIEW_SANDBOX_COOKIE_PREFIX}{public_id_suffix}={cookie_value}; Domain=.{domain}; Path=/; HttpOnly{secure_attr}; SameSite=Lax; Max-Age={ttl}"
+        "{PREVIEW_SANDBOX_COOKIE_PREFIX}{public_id_suffix}={cookie_value}; Path=/; HttpOnly{scope_and_security}; Max-Age={ttl}"
     )
 }
 
@@ -460,6 +548,46 @@ impl SandboxLookupCache {
         self.cache.insert(key, result.clone()).await;
         result
     }
+
+    /// Bypass a possibly stale password-hash entry and replace it with the
+    /// current database value. Used only after a presented cookie fails the
+    /// cached fingerprint check, so the normal authenticated hot path remains
+    /// cache-only while freshly rotated/reconciled cookies work immediately.
+    pub async fn lookup_fresh(&self, hex: &str) -> PreviewSandboxLookup {
+        let result = lookup_sandbox(&self.db, hex).await;
+        self.cache.insert(hex.to_string(), result.clone()).await;
+        result
+    }
+
+    /// Validate a share-link grant and return the current password hash used
+    /// to mint the preview cookie.
+    ///
+    /// Random or malformed public input is rejected by authenticated envelope
+    /// validation before the uncached lookup. A cryptographically valid grant
+    /// then checks the fresh row so password rotation revokes it immediately.
+    pub async fn verify_session_grant(
+        &self,
+        crypto: &CookieCrypto,
+        grant: &str,
+        hex: &str,
+        now: SystemTime,
+    ) -> Option<String> {
+        if grant.is_empty() {
+            return None;
+        }
+        let subject = format!("sbx_{hex}");
+        if !validate_preview_session_grant_envelope(crypto, grant, &subject, now) {
+            return None;
+        }
+        match self.lookup_fresh(hex).await {
+            PreviewSandboxLookup::Protected { password_hash }
+                if verify_preview_session_grant(crypto, grant, &subject, &password_hash, now) =>
+            {
+                Some(password_hash)
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Run the preview auth check for a parsed preview host (cookie-only).
@@ -501,18 +629,53 @@ pub async fn check_preview_auth(
     let cookie_name = format!("{}{}", PREVIEW_SANDBOX_COOKIE_PREFIX, host.hex);
 
     if let Some(header) = cookie_header {
-        if let Some(value) = extract_cookie(header, &cookie_name) {
-            if verify_preview_cookie_subject(
-                crypto,
-                value,
-                &subject,
-                &stored_hash,
-                SystemTime::now(),
-            ) {
+        let values = extract_cookie_values(header, &cookie_name);
+        if !values.is_empty() {
+            let now = SystemTime::now();
+            if values.iter().any(|value| {
+                verify_preview_cookie_subject(crypto, value, &subject, &stored_hash, now)
+            }) {
                 limiter.record_success(client_ip, &host.hex);
                 return PreviewAuthOutcome::Allow { host };
             }
+
+            // Password reconciliation can mint a cookie against a new hash
+            // while another worker still holds the previous hash in its
+            // short-lived lookup cache. Refresh only on fingerprint failure;
+            // without this, a successful login can redirect straight back to
+            // the password wall until that cache expires.
+            if let PreviewSandboxLookup::Protected { password_hash } =
+                cache.lookup_fresh(&host.hex).await
+            {
+                if values.iter().any(|value| {
+                    verify_preview_cookie_subject(crypto, value, &subject, &password_hash, now)
+                }) {
+                    limiter.record_success(client_ip, &host.hex);
+                    return PreviewAuthOutcome::Allow { host };
+                }
+            }
+
+            debug!(
+                sandbox = %host.hex,
+                cookie_header_present = true,
+                named_cookie_present = true,
+                "preview-auth: presented cookie failed cached and fresh validation"
+            );
+        } else {
+            debug!(
+                sandbox = %host.hex,
+                cookie_header_present = true,
+                named_cookie_present = false,
+                "preview-auth: preview cookie missing from Cookie header"
+            );
         }
+    } else {
+        debug!(
+            sandbox = %host.hex,
+            cookie_header_present = false,
+            named_cookie_present = false,
+            "preview-auth: request has no Cookie header"
+        );
     }
 
     PreviewAuthOutcome::LoginRequired { host }
@@ -529,6 +692,126 @@ mod tests {
         assert_ne!(hash_fingerprint(hash_a), hash_fingerprint(hash_b));
         assert_eq!(hash_fingerprint(hash_a), hash_fingerprint(hash_a));
         assert_eq!(hash_fingerprint(hash_a).len(), 16);
+    }
+
+    #[test]
+    fn secure_preview_cookie_is_available_to_the_owner_iframe() {
+        let cookie = build_set_cookie_sandbox("abc", "opaque", "preview.example.com", true);
+        assert!(cookie.contains("; Secure; SameSite=None; Partitioned;"));
+        assert!(!cookie.contains("Domain="));
+    }
+
+    #[test]
+    fn http_preview_cookie_retains_local_lax_behavior() {
+        let cookie = build_set_cookie_sandbox("abc", "opaque", "localho.st", false);
+        assert!(cookie.contains("; SameSite=Lax;"));
+        assert!(cookie.contains("Domain=.localho.st"));
+        assert!(!cookie.contains("Secure"));
+        assert!(!cookie.contains("Partitioned"));
+    }
+
+    #[test]
+    fn duplicate_cookie_names_are_all_preserved_for_validation() {
+        let values = extract_cookie_values(
+            "other=1; temps_preview_sbx_abc=stale; temps_preview_sbx_abc=fresh",
+            "temps_preview_sbx_abc",
+        );
+        assert_eq!(values, vec!["stale", "fresh"]);
+    }
+
+    #[test]
+    fn split_cookie_header_fields_preserve_every_duplicate_candidate() {
+        let combined = combine_cookie_header_values([
+            "temps_preview_sbx_abc=stale",
+            "other=1; temps_preview_sbx_abc=fresh",
+        ])
+        .unwrap();
+        assert_eq!(
+            extract_cookie_values(&combined, "temps_preview_sbx_abc"),
+            vec!["stale", "fresh"]
+        );
+        assert!(combine_cookie_header_values(std::iter::empty()).is_none());
+    }
+
+    #[test]
+    fn preview_cookie_is_reused_until_it_enters_refresh_window() {
+        let crypto = CookieCrypto::new("default-32-byte-key-for-testing!").unwrap();
+        let issued_at = UNIX_EPOCH + Duration::from_secs(10_000);
+        let subject = "sbx_7702c56bfb804b49";
+        let password_hash = "current-password-hash";
+        let cookie =
+            encode_preview_cookie_subject(&crypto, subject, password_hash, issued_at).unwrap();
+        let cookie_name = "temps_preview_sbx_7702c56bfb804b49";
+        let header = format!("{cookie_name}={cookie}");
+
+        assert!(!preview_cookie_needs_refresh(
+            &crypto,
+            Some(&header),
+            cookie_name,
+            subject,
+            password_hash,
+            issued_at,
+        ));
+        assert!(preview_cookie_needs_refresh(
+            &crypto,
+            Some(&header),
+            cookie_name,
+            subject,
+            password_hash,
+            issued_at + PREVIEW_COOKIE_TTL - PREVIEW_COOKIE_REFRESH_WINDOW,
+        ));
+        assert!(preview_cookie_needs_refresh(
+            &crypto,
+            Some(&header),
+            cookie_name,
+            subject,
+            password_hash,
+            issued_at + PREVIEW_COOKIE_TTL + Duration::from_secs(1),
+        ));
+    }
+
+    #[test]
+    fn platform_session_grant_is_scoped_and_expires() {
+        let crypto = CookieCrypto::new("default-32-byte-key-for-testing!").unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let password_hash = "argon2-current";
+        let (grant, _) = encode_preview_session_grant(
+            &crypto,
+            "sbx_7702c56bfb804b49",
+            password_hash,
+            PREVIEW_SESSION_GRANT_TTL,
+            now,
+        )
+        .unwrap();
+
+        assert!(verify_preview_session_grant(
+            &crypto,
+            &grant,
+            "sbx_7702c56bfb804b49",
+            password_hash,
+            now
+        ));
+        assert!(!verify_preview_session_grant(
+            &crypto,
+            &grant,
+            "sbx_c5d8e38f791dbc40",
+            password_hash,
+            now
+        ));
+        assert!(!verify_preview_session_grant(
+            &crypto,
+            &grant,
+            "sbx_7702c56bfb804b49",
+            password_hash,
+            now + PREVIEW_SESSION_GRANT_TTL + Duration::from_secs(1)
+        ));
+        assert!(!verify_preview_session_grant(
+            &crypto,
+            &grant,
+            "sbx_7702c56bfb804b49",
+            "argon2-rotated",
+            now
+        ));
     }
 
     #[test]
@@ -701,23 +984,86 @@ mod tests {
         sandboxes::Model {
             id: 1,
             public_id: public_id.to_string(),
-            user_id: 1,
+            user_id: Some(1),
+            agent_run_id: None,
             name: "test-sandbox".to_string(),
             status: status.to_string(),
             image: Some("ubuntu:22.04".to_string()),
             work_dir: "/workspace".to_string(),
             timeout_secs: 3600,
             metadata: None,
+            backend: None,
             created_at: now,
             last_activity_at: now,
             expires_at: now,
             preview_password_hash: password_hash.map(|s| s.to_string()),
             preview_password_hint: None,
+            lifecycle: "ephemeral".to_string(),
+            project_id: None,
+            source_repo_url: None,
         }
     }
 
-    /// A protected sandbox is cached after the first lookup; the second call
-    /// returns the cached result without a second DB query.
+    /// Invalid public input must not amplify into an uncached database query.
+    #[tokio::test]
+    async fn random_grant_is_rejected_before_a_fresh_database_lookup() {
+        // No query result is queued. MockDatabase would fail the test if the
+        // invalid public input reached lookup_fresh.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let cache = SandboxLookupCache::new(Arc::new(db));
+        let crypto = CookieCrypto::new("default-32-byte-key-for-testing!").unwrap();
+
+        assert!(cache
+            .verify_session_grant(
+                &crypto,
+                "random-public-input",
+                "7702c56bfb804b49",
+                UNIX_EPOCH + Duration::from_secs(1_000),
+            )
+            .await
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn session_grant_uses_fresh_hash_and_rejects_a_rotated_password() {
+        let current_hash = "argon2-after-rotation";
+        let model = sandbox_model("sbx_7702c56bfb804b49", "running", Some(current_hash));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![model.clone()], vec![model]])
+            .into_connection();
+        let cache = SandboxLookupCache::new(Arc::new(db));
+        let crypto = CookieCrypto::new("default-32-byte-key-for-testing!").unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(1_000);
+        let (stale_grant, _) = encode_preview_session_grant(
+            &crypto,
+            "sbx_7702c56bfb804b49",
+            "argon2-before-rotation",
+            PREVIEW_SESSION_GRANT_TTL,
+            now,
+        )
+        .unwrap();
+        let (current_grant, _) = encode_preview_session_grant(
+            &crypto,
+            "sbx_7702c56bfb804b49",
+            current_hash,
+            PREVIEW_SESSION_GRANT_TTL,
+            now,
+        )
+        .unwrap();
+
+        assert!(cache
+            .verify_session_grant(&crypto, &stale_grant, "7702c56bfb804b49", now,)
+            .await
+            .is_none());
+        assert_eq!(
+            cache
+                .verify_session_grant(&crypto, &current_grant, "7702c56bfb804b49", now,)
+                .await
+                .as_deref(),
+            Some(current_hash)
+        );
+    }
+
     #[tokio::test]
     async fn sandbox_cache_hit_avoids_second_db_call() {
         let hash = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";

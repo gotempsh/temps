@@ -33,5 +33,5 @@ thiserror = { workspace = true }
 [dev-dependencies]
 tokio-test = "0.4"
 testcontainers = { workspace = true }
-tower = { version = "0.4", features = ["util"] }
+tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

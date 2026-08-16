@@ -53,12 +53,12 @@ function openBrowser(url: string): void {
   }
 }
 
-function formatPrice(cents: number): string {
+export function formatPrice(cents: number): string {
   if (cents === 0) return colors.success('free')
   return `€${(cents / 100).toFixed(2)}/mo`
 }
 
-function usageBar(used: number, limit: number): string {
+export function usageBar(used: number, limit: number): string {
   const pct = limit > 0 ? Math.min(used / limit, 1) : 0
   const width = 20
   const filled = Math.round(pct * width)

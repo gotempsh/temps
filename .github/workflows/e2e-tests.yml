@@ -1,11 +1,24 @@
 name: E2E Tests
 
+# Called by `rust-tests.yml`, not triggered directly.
+#
+# This job used to build its own `--release` binary — a second full compile of
+# the same workspace that `rust-tests.yml` was already building for Compose
+# Security, plus a second web-UI and WASM build in front of it. It now takes
+# the musl `fast` binary from the `build-binary` job as an artifact, which is
+# both faster and a better test: that is the binary that ships in the Docker
+# image, where `--release` glibc never was.
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  workflow_dispatch:
+  workflow_call:
+    inputs:
+      binary-artifact:
+        description: "Name of the artifact holding the prebuilt `temps` binary"
+        required: false
+        default: temps-binary-musl-fast
+        type: string
+
+permissions:
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -15,7 +28,6 @@ jobs:
   e2e-test:
     name: E2E Deployment Tests
     runs-on: ubuntu-latest
-    needs: []
     timeout-minutes: 60
 
     services:
@@ -46,6 +58,12 @@ jobs:
       # with phantom "tried N deploys, never shipped" instances. (Opt-out values:
       # 0/false/off/no/disabled — see temps-telemetry/src/service.rs.)
       TEMPS_TELEMETRY: "0"
+      TEMPS_BIN: ./ci-prebuilt/temps
+      # Main and PR builds exercise the beta binary channel. Point sandbox
+      # pulls at the matching published image set; the default stable tag is
+      # only published by a stable release and otherwise forces a multi-minute
+      # local image build that exceeds Playwright's request timeout.
+      TEMPS_SANDBOX_CHANNEL: beta
 
     steps:
       - name: Free up disk space
@@ -55,64 +73,51 @@ jobs:
           sudo apt-get autoremove -y && sudo apt-get clean
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7.0.1
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      # No Rust toolchain, no wasm-pack, no rsbuild production build — the
+      # binary arrives prebuilt with the web UI already embedded. Bun stays,
+      # but only to install web/node_modules for the Playwright console tests
+      # below; it no longer builds the UI.
+      - name: Download temps binary
+        uses: actions/download-artifact@v8
+        with:
+          name: ${{ inputs.binary-artifact }}
+          path: ci-prebuilt
+
+      - name: Verify prebuilt binary runs
+        run: |
+          chmod +x "$TEMPS_BIN"
+          file "$TEMPS_BIN"
+          "$TEMPS_BIN" --version
 
       - name: Install Bun
         uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      - name: Rust cache (release build)
-        uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: e2e-release
-          # Save from every ref, not just main — PRs used to depend entirely
-          # on main's copy surviving GitHub's cache eviction, which it
-          # routinely didn't (repo-wide cache churn from per-PR debug-build
-          # caches kept evicting this one). Now every PR keeps its own copy
-          # warm too.
-
-      - name: Cache Bun dependencies
-        uses: actions/cache@v6
+      # Restore always, save only from `main` — see the cache-scoping note in
+      # rust-tests.yml. Saving from every ref stored a byte-identical 161MB
+      # node_modules copy in each open PR's scope (5 copies, ~805MB) for a
+      # `bun install` that takes seconds to redo.
+      - name: Restore Bun dependencies
+        id: bun-cache
+        uses: actions/cache/restore@v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
           restore-keys: |
             ${{ runner.os }}-bun-
 
-      - name: Cache wasm-pack binary
-        id: wasm-pack-cache
-        uses: actions/cache@v6
+      - name: Install web dependencies (Playwright tests)
+        run: cd web && bun install
+
+      - name: Save Bun dependencies
+        if: github.ref == 'refs/heads/main' && steps.bun-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
         with:
-          path: ~/.cargo/bin/wasm-pack
-          key: ${{ runner.os }}-wasm-pack-0.13
-
-      - name: Install system dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-
-      - name: Install wasm-pack and build WASM
-        run: |
-          if [ ! -f ~/.cargo/bin/wasm-pack ]; then
-            cargo install wasm-pack
-          fi
-          cd crates/temps-captcha-wasm
-          bun install
-          bun run build
-
-      - name: Build Web UI
-        run: |
-          cd web
-          bun install
-          RSBUILD_OUTPUT_PATH=../crates/temps-cli/dist bun run build
-
-      - name: Build release binary
-        run: cargo build --release --bin temps
-        env:
-          FORCE_WEB_BUILD: 1
-          CARGO_INCREMENTAL: 0
+          path: web/node_modules
+          key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
 
       - name: Generate self-signed localho.st certificate
         run: |
@@ -128,18 +133,84 @@ jobs:
 
       - name: Prepare data directory
         run: |
-          mkdir -p $TEMPS_DATA_DIR
+          mkdir -p "$TEMPS_DATA_DIR"
           # GeoLite2 database is checked into the repo
-          cp crates/temps-cli/GeoLite2-City.mmdb $TEMPS_DATA_DIR/GeoLite2-City.mmdb
+          cp crates/temps-cli/GeoLite2-City.mmdb "$TEMPS_DATA_DIR/GeoLite2-City.mmdb"
 
       - name: Verify TimescaleDB is ready
         run: |
           timeout 60 bash -c 'until nc -z localhost 5432; do sleep 1; done'
           echo "TimescaleDB is ready"
 
+      # Pulled explicitly (rather than left to the first `docker run` that
+      # needs it) so a slow/rate-limited registry pull fails clearly here,
+      # under an obvious step name, instead of surfacing later as a mystery
+      # delay inside the pre-flight check below or the Playwright test itself.
+      - name: Pre-pull alpine:latest (used by the host.docker.internal pre-flight)
+        run: docker pull alpine:latest
+
+      # domain-tls-pebble.spec.ts and email-provider-mailpit.spec.ts (below)
+      # each document this requirement themselves ("Requires docker compose
+      # -f apps/temps-e2e/docker-compose.e2e.yml up -d") -- brought up here so
+      # it's ready before `temps serve` starts (it needs a live ACME
+      # directory to point ACME_DIRECTORY_URL at) and well before the
+      # Playwright run reaches those specs. minio isn't started: nothing in
+      # this job (console/API e2e, not apps/temps-e2e's own scenarios) needs it.
+      - name: Start Pebble + Mailpit test infra
+        run: |
+          set -o pipefail
+
+          docker compose -f apps/temps-e2e/docker-compose.e2e.yml up -d pebble pebble-challtestsrv mailpit
+          echo "Waiting for Pebble (ACME directory, :14000)..."
+          timeout 60 bash -c 'until nc -z localhost 14000; do sleep 1; done'
+          echo "Waiting for pebble-challtestsrv (management API, :8056)..."
+          timeout 60 bash -c 'until nc -z localhost 8056; do sleep 1; done'
+          echo "Waiting for Mailpit (SMTP :1025, API :8025)..."
+          timeout 60 bash -c 'until nc -z localhost 1025 && nc -z localhost 8025; do sleep 1; done'
+          echo "Pebble + Mailpit test infra ready"
+
+          # Pre-flight: reproduce domain-tls-pebble.spec.ts's
+          # resolveHostDockerInternal() exactly (same network, same image, same
+          # free-resolution-then---add-host fallback order), so a broken
+          # host.docker.internal resolution on this runner fails HERE, with a
+          # clear step name, instead of three minutes later as a Playwright
+          # retry timeout inside the TLS-via-Pebble test.
+          PEBBLE_NET="temps-e2e-pebble-net"
+          IPV4_RE='^[0-9]{1,3}(\.[0-9]{1,3}){3}$'
+          echo "Resolving host.docker.internal on $PEBBLE_NET (as domain-tls-pebble.spec.ts does)..."
+
+          HOST_IP=""
+          if GETENT_OUT=$(docker run --rm --network "$PEBBLE_NET" alpine:latest getent hosts host.docker.internal 2>&1); then
+            # A no-match here is a legitimate outcome (falls through to the
+            # --add-host retry below), not a script error -- hence `|| true`.
+            HOST_IP=$(awk '{print $1}' <<<"$GETENT_OUT" | grep -E "$IPV4_RE" | head -n1 || true)
+          fi
+
+          if [ -z "$HOST_IP" ]; then
+            echo "Free resolution found no IPv4 address; retrying with --add-host host.docker.internal:host-gateway..."
+            if GETENT_OUT=$(docker run --rm --network "$PEBBLE_NET" --add-host host.docker.internal:host-gateway alpine:latest getent hosts host.docker.internal 2>&1); then
+              HOST_IP=$(awk '{print $1}' <<<"$GETENT_OUT" | grep -E "$IPV4_RE" | head -n1 || true)
+            else
+              echo "$GETENT_OUT"
+            fi
+          fi
+
+          if [ -z "$HOST_IP" ]; then
+            echo "ERROR: could not resolve an IPv4 host.docker.internal on $PEBBLE_NET (needed by domain-tls-pebble.spec.ts)." >&2
+            echo "--- docker version ---"
+            docker version || true
+            echo "--- docker network ls ---"
+            docker network ls || true
+            echo "--- docker network inspect $PEBBLE_NET ---"
+            docker network inspect "$PEBBLE_NET" || true
+            exit 1
+          fi
+
+          echo "host.docker.internal -> $HOST_IP (pre-flight OK)"
+
       - name: Run temps setup
         run: |
-          ./target/release/temps setup --non-interactive \
+          "$TEMPS_BIN" setup --non-interactive \
             --database-url "$DATABASE_URL" \
             --data-dir "$TEMPS_DATA_DIR" \
             --admin-email "$ADMIN_EMAIL" \
@@ -160,11 +231,21 @@ jobs:
           ln -sf "$TEMPS_DATA_DIR/GeoLite2-City.mmdb" ./GeoLite2-City.mmdb 2>/dev/null || true
 
       - name: Start temps serve
+        env:
+          # domain-tls-pebble.spec.ts needs a real ACME exchange against
+          # Pebble instead of real Let's Encrypt -- see
+          # crates/temps-domains/src/tls/providers.rs's get_acme_url (reads
+          # ACME_DIRECTORY_URL) and crates/temps-dns/src/providers/pebble.rs
+          # (gated behind TEMPS_ALLOW_PEBBLE_PROVIDER). ACME_INSECURE trusts
+          # Pebble's self-signed directory cert.
+          ACME_DIRECTORY_URL: https://localhost:14000/dir
+          ACME_INSECURE: "1"
+          TEMPS_ALLOW_PEBBLE_PROVIDER: "1"
         run: |
-          ./target/release/temps serve \
+          "$TEMPS_BIN" serve \
             --database-url "$DATABASE_URL" \
             --data-dir "$TEMPS_DATA_DIR" \
-            --address 0.0.0.0:3000 \
+            --address 0.0.0.0:5002 \
             --tls-address 0.0.0.0:3443 \
             --console-address 0.0.0.0:8081 \
             --disable-https-redirect \
@@ -174,7 +255,7 @@ jobs:
           echo "Temps server started with PID $(cat /tmp/temps.pid)"
           # Give it a moment to either start or crash
           sleep 3
-          if ! kill -0 $(cat /tmp/temps.pid) 2>/dev/null; then
+          if ! kill -0 "$(cat /tmp/temps.pid)" 2>/dev/null; then
             echo "ERROR: Temps server died immediately. Logs:"
             cat /tmp/temps.log
             exit 1
@@ -185,38 +266,72 @@ jobs:
           echo "Waiting for Temps to become healthy..."
           timeout 120 bash -c 'until curl -sf http://localhost:8081/ > /dev/null 2>&1; do sleep 2; done'
           echo "Platform is healthy"
+          # NOTE: this only proves the shell is served. A console whose JS dies
+          # on boot still answers 200 here -- that is exactly how #504 shipped.
+          # The console UI tests below are what actually verify it works.
           curl -s -o /dev/null -w "Console HTTP %{http_code}" http://localhost:8081/
           echo ""
+
+      # Drives the real console in a real browser against the instance started
+      # above. Runs before the API-level deploys so a broken UI is reported as a
+      # UI failure rather than being buried behind a 20-minute deploy matrix.
+      - name: Install Playwright browser
+        run: cd web && bunx playwright install --with-deps chromium
+
+      - name: Console UI end-to-end tests
+        env:
+          E2E_BASE_URL: http://localhost:8081
+          E2E_EMAIL: ${{ env.ADMIN_EMAIL }}
+          E2E_PASSWORD: ${{ env.ADMIN_PASSWORD }}
+          E2E_REPO_URL: https://github.com/${{ github.repository }}.git
+        run: cd web && bun run e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: |
+            web/playwright-report/
+            web/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
 
       - name: Create API key via CLI
         id: auth
         run: |
-          API_OUTPUT=$(./target/release/temps api-key \
+          if ! API_OUTPUT=$("$TEMPS_BIN" api-key \
             --database-url "$DATABASE_URL" \
             --name "e2e-test" \
             --role admin \
-            --output-format json 2>&1)
-          echo "CLI output: $API_OUTPUT"
-
-          API_KEY=$(echo "$API_OUTPUT" | jq -r '.api_key // empty' 2>/dev/null)
-          if [ -z "$API_KEY" ]; then
-            echo "Failed to extract API key from CLI output"
+            --output-format json 2>/dev/null); then
+            echo "Failed to create the E2E API key (credential-bearing stdout/stderr suppressed)"
             exit 1
           fi
 
-          echo "API key created: ${API_KEY:0:12}..."
-          echo "api_key=$API_KEY" >> $GITHUB_OUTPUT
+          API_KEY=$(echo "$API_OUTPUT" | jq -r '.api_key // empty' 2>/dev/null)
+          if [ -z "$API_KEY" ]; then
+            echo "Failed to extract API key from credential-bearing CLI output (output suppressed)"
+            exit 1
+          fi
+
+          echo "::add-mask::$API_KEY"
+          KEY_ID=$(echo "$API_OUTPUT" | jq -r '.id // "unknown"')
+          KEY_PREFIX=$(echo "$API_OUTPUT" | jq -r '.key_prefix // "unknown"')
+          echo "API key created: id=$KEY_ID prefix=$KEY_PREFIX"
+          printf 'api_key=%s\n' "$API_KEY" >> "$GITHUB_OUTPUT"
 
       - name: Deploy example applications
         env:
           API_KEY: ${{ steps.auth.outputs.api_key }}
+          SOURCE_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           set -euo pipefail
 
           REPO_URL="https://github.com/${{ github.repository }}.git"
           REPO_OWNER="${{ github.repository_owner }}"
           REPO_NAME=$(echo "${{ github.repository }}" | cut -d'/' -f2)
-          BRANCH="${{ github.head_ref || github.ref_name }}"
+          BRANCH="$SOURCE_BRANCH"
 
           # Define example apps: name|directory|preset
           APPS=(
@@ -400,7 +515,7 @@ jobs:
           if [ -f /tmp/temps.pid ]; then
             PID=$(cat /tmp/temps.pid)
             echo "Temps PID: $PID"
-            ps aux | grep temps || true
+            pgrep -af temps || true
           fi
 
           echo ""
@@ -422,6 +537,6 @@ jobs:
         if: always()
         run: |
           if [ -f /tmp/temps.pid ]; then
-            kill $(cat /tmp/temps.pid) 2>/dev/null || true
+            kill "$(cat /tmp/temps.pid)" 2>/dev/null || true
           fi
           docker system prune -f 2>/dev/null || true

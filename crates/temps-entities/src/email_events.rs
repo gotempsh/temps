@@ -12,6 +12,9 @@ pub struct Model {
     pub email_id: Uuid,
     pub event_type: String,
     pub provider_message_id: Option<String>,
+    /// SHA-256 of the authorized SNS topic, SNS message ID and recipient.
+    /// Separate from provider_message_id so API semantics stay truthful.
+    pub idempotency_key: Option<String>,
     pub recipient: Option<String>,
     #[sea_orm(column_type = "JsonBinary", nullable)]
     pub metadata: Option<Json>,

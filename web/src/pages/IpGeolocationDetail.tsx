@@ -1,5 +1,6 @@
 import { useEffect } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams } from 'react-router'
+import { useGoBack } from '@/hooks/useGoBack'
 import { useQuery } from '@tanstack/react-query'
 import { getIpGeolocationOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
@@ -13,7 +14,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 
 export default function IpGeolocationDetail() {
   const { ip } = useParams<{ ip: string }>()
-  const navigate = useNavigate()
+  const goBack = useGoBack('/proxy-logs')
   const { setBreadcrumbs } = useBreadcrumbs()
 
   usePageTitle(`IP Geolocation - ${ip}`)
@@ -36,7 +37,7 @@ export default function IpGeolocationDetail() {
   }, [setBreadcrumbs])
 
   const handleBack = () => {
-    navigate(-1)
+    goBack()
   }
 
   if (error) {

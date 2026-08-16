@@ -149,6 +149,8 @@ async fn setup_e2e() -> Option<(
         is_deleted: Set(false),
         is_public_repo: Set(false),
         attack_mode: Set(false),
+        error_source_context_enabled: Set(false),
+        error_source_root: Set(None),
         enable_preview_environments: Set(false),
         ..Default::default()
     };
@@ -181,7 +183,12 @@ async fn setup_e2e() -> Option<(
     let storage = Arc::new(TimescaleDbStorage::new(db.clone(), None));
     let auth_service = Arc::new(OtelAuthService::new(db.clone()));
     let rate_limiter = Arc::new(RateLimiter::new(10000, Duration::from_secs(60)));
-    let otel_service = Arc::new(OtelService::new(storage, auth_service, rate_limiter));
+    let otel_service = Arc::new(OtelService::new(
+        storage,
+        auth_service,
+        rate_limiter,
+        temps_otel::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+    ));
     let dashboard_service = Arc::new(temps_otel::services::MetricDashboardService::new(
         db.clone(),
     ));
@@ -213,6 +220,14 @@ async fn setup_e2e() -> Option<(
         db.clone(),
         None,
     ));
+    let facet_cache: temps_otel::services::FacetCache = Arc::new(arc_swap::ArcSwap::from_pointee(
+        std::collections::HashMap::new(),
+    ));
+    let facet_service = Arc::new(temps_otel::services::FacetService::new(
+        db.clone(),
+        None,
+        facet_cache,
+    ));
     let app_state = OtelAppState {
         otel_service,
         metrics_store: None,
@@ -223,7 +238,9 @@ async fn setup_e2e() -> Option<(
         audit_service: Arc::new(NoOpAuditLogger),
         cross_project_service,
         trace_hint_tx: None,
+        otel_relay_tx: None,
         project_access_checker: None,
+        facet_service,
     };
 
     // Create auth middleware that injects AuthContext into request extensions.
@@ -718,6 +735,38 @@ async fn test_e2e_missing_api_key_returns_401() {
 }
 
 #[tokio::test]
+async fn test_e2e_ingest_body_over_limit_returns_413() {
+    let Some((_db, router, _project_id)) = setup_e2e().await else {
+        return;
+    };
+
+    // One byte over the router's `DefaultBodyLimit` (see `handlers::INGEST_BODY_LIMIT`).
+    // Axum rejects a body whose declared `Content-Length` exceeds the limit
+    // before dispatching to any handler/extractor, so this doesn't need a
+    // valid API key — the limit must fire ahead of auth.
+    let oversized_body = vec![0_u8; temps_otel::handlers::INGEST_BODY_LIMIT + 1];
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/otel/v1/traces")
+                .header("content-type", "application/x-protobuf")
+                .body(Body::from(oversized_body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "Body over the ingest route's DefaultBodyLimit should be rejected with 413, \
+         not reach the handler/auth layer"
+    );
+}
+
+#[tokio::test]
 async fn test_e2e_invalid_api_key_returns_401() {
     let Some((_db, router, project_id)) = setup_e2e().await else {
         return;
@@ -793,5 +842,72 @@ async fn test_e2e_pipeline_stats() {
     assert!(
         stats["stats"]["metrics_received"].as_u64().unwrap() > 0,
         "metrics_received should be > 0 after ingesting"
+    );
+}
+
+/// `include_total` is the opt-out that lets a caller skip the trace-summaries
+/// count query entirely. Its contract has two halves and both matter:
+///
+///   * default (absent) → `total` is computed and present
+///   * `include_total=false` → `total` is **omitted**, not zeroed
+///
+/// The second half is the one worth a test. `total` is `Option<u64>` with
+/// `skip_serializing_if`, and the whole point is that a client reading
+/// `total ?? 0` must not silently render "0 traces" over a full page. Because
+/// `None` is only ever produced by the branch that skips `count_traces`, an
+/// omitted key is also proof that the second query was not issued.
+#[tokio::test]
+async fn test_e2e_trace_summaries_include_total_contract() {
+    let Some((_test_db, router, project_id)) = setup_e2e().await else {
+        return;
+    };
+
+    // Default: the count is computed, so `total` is present and numeric.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!("/otel/trace-summaries?project_id={project_id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    assert!(body["data"].is_array(), "data should be an array");
+    assert!(
+        body.get("total").and_then(|t| t.as_u64()).is_some(),
+        "total must be present by default, got: {body}"
+    );
+
+    // Opted out: `total` must be ABSENT from the payload — not 0, not null.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri(format!(
+                    "/otel/trace-summaries?project_id={project_id}&include_total=false"
+                ))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+    let body: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+    assert!(
+        body["data"].is_array(),
+        "data must still be returned when the count is skipped, got: {body}"
+    );
+    assert!(
+        body.get("total").is_none(),
+        "include_total=false must omit `total` entirely (a 0 would be read as \
+         'no traces' by a client doing `total ?? 0`), got: {body}"
     );
 }

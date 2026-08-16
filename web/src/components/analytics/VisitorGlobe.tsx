@@ -31,7 +31,7 @@ import {
   FileText,
   Calendar as CalendarIcon,
 } from 'lucide-react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { format, subDays } from 'date-fns'
 import type { DateRange } from 'react-day-picker'
 import { cn } from '@/lib/utils'
@@ -664,14 +664,14 @@ export function VisitorGlobePage({ project }: VisitorGlobePageProps) {
           </PopoverTrigger>
           <PopoverContent className="w-auto p-0" align="start">
             <Calendar
-              initialFocus
+              autoFocus
               mode="range"
               defaultMonth={subDays(new Date(), 30)}
               selected={dateFilter.dateRange}
               onSelect={handleCustomDateRange}
               numberOfMonths={2}
               disabled={(date) => date > new Date()}
-              toDate={new Date()}
+              endMonth={new Date()}
             />
           </PopoverContent>
         </Popover>

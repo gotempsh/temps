@@ -43,6 +43,34 @@ impl TempsPlugin for GeoPlugin {
             // Get required dependencies from the service registry
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
+            // `temps serve`'s console-API startup path downloads
+            // GeoLite2-City.mmdb in the background (see
+            // `validate_geolite2_database` in temps-cli's serve/console.rs)
+            // concurrently with plugin registration. `GeoIpService::new()`
+            // itself only opens whatever's on disk right now -- it doesn't
+            // download -- so on a fresh instance with no pre-provisioned
+            // database, registration can race the download and fail even
+            // though the file appears moments later. Wait for it (bounded)
+            // before handing off to the sync constructor, unless mock mode
+            // is enabled (which never touches the filesystem).
+            let use_mock = std::env::var("TEMPS_GEO_MOCK")
+                .map(|v| v.to_lowercase() == "true")
+                .unwrap_or(false);
+            if !use_mock {
+                let city_db_path = crate::geoip_service::resolve_mmdb_path("GeoLite2-City.mmdb");
+                if !city_db_path.exists() {
+                    tracing::info!(
+                        path = %city_db_path.display(),
+                        "GeoLite2-City.mmdb not present yet -- waiting up to 30s for the \
+                         concurrent startup download to finish before registering the geo plugin",
+                    );
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while !city_db_path.exists() && tokio::time::Instant::now() < deadline {
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            }
+
             // Create GeoIpService
             let geo_ip_service = Arc::new(GeoIpService::new().map_err(|e| {
                 PluginError::PluginRegistrationFailed {

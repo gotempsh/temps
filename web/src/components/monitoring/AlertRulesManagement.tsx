@@ -6,6 +6,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { AlertRuleResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   Card,
   CardContent,
@@ -32,7 +33,7 @@ import { Badge } from '@/components/ui/badge'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, EllipsisVertical, Plus, ShieldAlert } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 const TRIGGER_TYPES = [
@@ -177,10 +178,11 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
               </SelectContent>
             </Select>
           )}
-          <Button onClick={() => navigate('new')} disabled={!projectId}>
-            <Plus className="h-4 w-4 mr-2" />
-            <span className="hidden sm:inline">Add Rule</span>
-          </Button>
+          <CreateActionButton
+            onClick={() => navigate('new')}
+            disabled={!projectId}
+            label="Add Rule"
+          />
         </div>
       </div>
 

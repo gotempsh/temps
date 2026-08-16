@@ -447,3 +447,43 @@ pub struct CertStatusResponse {
     /// The most recent on-demand issuance attempt for this hostname, if any.
     pub last_attempt: Option<OnDemandCertAttemptResponse>,
 }
+
+/// One row of the standard (non-on-demand) renewal-attempt audit log, backing
+/// the domain detail page's renewal timeline.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RenewalAttemptResponse {
+    pub id: i32,
+    /// `"request_challenge"` | `"complete_challenge"`.
+    pub stage: String,
+    /// `"http-01"` | `"dns-01"`.
+    pub verification_method: String,
+    /// `"success"` | `"failed"`.
+    pub outcome: String,
+    pub error: Option<String>,
+    pub error_type: Option<String>,
+    /// When the attempt was recorded (epoch millis).
+    pub created_at: i64,
+}
+
+impl From<temps_entities::renewal_attempts::Model> for RenewalAttemptResponse {
+    fn from(m: temps_entities::renewal_attempts::Model) -> Self {
+        Self {
+            id: m.id,
+            stage: m.stage,
+            verification_method: m.verification_method,
+            outcome: m.outcome,
+            error: m.error,
+            error_type: m.error_type,
+            created_at: m.created_at.timestamp_millis(),
+        }
+    }
+}
+
+/// Paginated renewal-attempt history for one domain, newest first.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ListRenewalAttemptsResponse {
+    pub attempts: Vec<RenewalAttemptResponse>,
+    pub total: u64,
+    pub page: u64,
+    pub page_size: u64,
+}

@@ -16,7 +16,36 @@ import { promptConfirm, promptSelect, promptText } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 
-const ROLE_TYPES = ['admin', 'developer', 'viewer', 'readonly']
+// Matches crates/temps-auth/src/permissions.rs's Role enum exactly -- the
+// backend's Role::from_str only ever accepts these strings and 400s
+// ("Invalid role type") on anything else, including the "developer"/"viewer"/
+// "readonly" values this list previously offered.
+const ROLE_TYPES = ['admin', 'platform_admin', 'user', 'reader', 'api_reader', 'custom', 'metrics_ingest']
+
+/** Days-from-now -> ISO expiry, or null if the input isn't a positive integer. */
+export function computeExpiryIso(daysInput: string, from: Date = new Date()): string | null {
+  const days = parseInt(daysInput, 10)
+  if (isNaN(days) || days <= 0) {
+    return null
+  }
+  const expiry = new Date(from)
+  expiry.setDate(expiry.getDate() + days)
+  return expiry.toISOString()
+}
+
+export function groupPermissionsByCategory<T extends { category?: string | null }>(
+  permissions: T[],
+): Map<string, T[]> {
+  const categories = new Map<string, T[]>()
+  for (const perm of permissions) {
+    const cat = perm.category || 'Other'
+    if (!categories.has(cat)) {
+      categories.set(cat, [])
+    }
+    categories.get(cat)!.push(perm)
+  }
+  return categories
+}
 
 interface CreateOptions {
   name?: string
@@ -59,7 +88,7 @@ export function registerApiKeysCommands(program: Command): void {
     .alias('add')
     .description('Create a new API key')
     .option('-n, --name <name>', 'API key name')
-    .option('-r, --role <role>', 'Role type (admin, developer, viewer, readonly)')
+    .option('-r, --role <role>', 'Role type (admin, platform_admin, user, reader, api_reader, custom, metrics_ingest)')
     .option('-e, --expires-in <days>', 'Expires in N days (7, 30, 90, 365)')
     .option('-p, --permissions <permissions>', 'Comma-separated list of permissions')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
@@ -124,7 +153,7 @@ async function listApiKeysAction(options: { json?: boolean }): Promise<void> {
 
   if (keys.length === 0) {
     info('No API keys found')
-    info('Run: temps apikeys create --name my-key --role developer -y')
+    info('Run: temps apikeys create --name my-key --role user -y')
     newline()
     return
   }
@@ -167,14 +196,12 @@ async function createApiKeyAction(options: CreateOptions): Promise<void> {
 
     // Handle expiration
     if (options.expiresIn) {
-      const days = parseInt(options.expiresIn, 10)
-      if (isNaN(days) || days <= 0) {
+      const iso = computeExpiryIso(options.expiresIn)
+      if (iso === null) {
         warning('Invalid expiration days')
         return
       }
-      const expiry = new Date()
-      expiry.setDate(expiry.getDate() + days)
-      expiresAt = expiry.toISOString()
+      expiresAt = iso
     }
 
     // Handle permissions
@@ -446,15 +473,7 @@ async function listPermissions(options: { json?: boolean }): Promise<void> {
     return
   }
 
-  // Group permissions by category
-  const categories = new Map<string, typeof permissions>()
-  for (const perm of permissions) {
-    const cat = perm.category || 'Other'
-    if (!categories.has(cat)) {
-      categories.set(cat, [])
-    }
-    categories.get(cat)!.push(perm)
-  }
+  const categories = groupPermissionsByCategory(permissions)
 
   for (const [category, perms] of categories) {
     console.log(`\n  ${colors.bold(category)}:`)

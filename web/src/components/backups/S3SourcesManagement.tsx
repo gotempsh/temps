@@ -19,6 +19,7 @@ import {
 } from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import {
   Dialog,
   DialogContent,
@@ -48,7 +49,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import {
   DropdownMenu,
@@ -344,12 +345,11 @@ export function S3SourcesManagement() {
             Configure S3 storage for backups
           </p>
         </div>
-        <Button asChild className="w-full sm:w-auto">
-          <Link to="/backups/s3-sources/new">
-            <Plus className="mr-2 h-4 w-4" />
-            Add S3 Source
-          </Link>
-        </Button>
+        <CreateActionButton
+          to="/backups/s3-sources/new"
+          label="Add S3 Source"
+          className="w-full sm:w-auto"
+        />
       </div>
 
       <Dialog open={isEditDialogOpen} onOpenChange={setIsEditDialogOpen}>

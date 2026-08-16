@@ -55,6 +55,15 @@ pub struct AppState {
     /// case. Resolved once in `configure_routes` via
     /// `context.get_service::<dyn temps_core::ProjectAccessChecker>()`.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Resolves the per-managed-domain public hostname strategy (Standard/Flat).
+    pub hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
+    /// Optional metrics store, present only when metrics collection is
+    /// enabled. Serves container CPU/memory history (written by the
+    /// container health monitor under `source_kind = container`).
+    pub metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>>,
+    /// Builds and sends deploy-failure reports (redacted trace, user-edited,
+    /// sent on request) -- see [`crate::services::failure_report_service`].
+    pub failure_report_service: Arc<crate::services::FailureReportService>,
 }
 
 use crate::services::types::Deployment;
@@ -613,10 +622,45 @@ pub struct DeploymentJobResponse {
     pub finished_at: Option<i64>,
     pub log_id: String,
     pub error_message: Option<String>,
+    /// Internal workflow configuration is intentionally redacted. It can
+    /// contain legacy plaintext secrets or encrypted secret envelopes.
     pub job_config: Option<serde_json::Value>,
     pub outputs: Option<serde_json::Value>,
     pub dependencies: Option<serde_json::Value>,
     pub execution_order: Option<i32>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct FailureReportPreviewResponse {
+    /// Redacted, editable draft of the failure trace. Shown in a textarea the
+    /// user can edit before sending — nothing is sent without their review.
+    pub redacted_log: String,
+    pub error_message: Option<String>,
+    /// Whether "send to Temps" should be offered. False when the operator
+    /// opted out via `TEMPS_TELEMETRY`. The GitHub-issue path is unaffected.
+    pub reporting_enabled: bool,
+    pub failed_job_type: String,
+    pub github_issue_title: String,
+    pub github_issue_body: String,
+}
+
+impl From<crate::services::FailureReportPreview> for FailureReportPreviewResponse {
+    fn from(preview: crate::services::FailureReportPreview) -> Self {
+        Self {
+            redacted_log: preview.redacted_log,
+            error_message: preview.error_message,
+            reporting_enabled: preview.reporting_enabled,
+            failed_job_type: preview.failed_job_type,
+            github_issue_title: preview.github_issue_title,
+            github_issue_body: preview.github_issue_body,
+        }
+    }
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct SendFailureReportRequest {
+    /// The report text as reviewed (and possibly edited) by the user.
+    pub report_text: String,
 }
 
 impl From<temps_entities::deployment_jobs::Model> for DeploymentJobResponse {
@@ -635,7 +679,10 @@ impl From<temps_entities::deployment_jobs::Model> for DeploymentJobResponse {
             finished_at: job.finished_at.map(|t| t.timestamp_millis()),
             log_id: job.log_id,
             error_message: job.error_message,
-            job_config: job.job_config,
+            // Job configuration is executor-internal. Returning it here would
+            // expose legacy plaintext secrets and encrypted envelopes to roles
+            // that only have deployment-read access.
+            job_config: None,
             outputs: job.outputs,
             dependencies: job.dependencies,
             execution_order: job.execution_order,
@@ -736,6 +783,11 @@ impl From<temps_deployer::ContainerInfo> for ContainerInfoResponse {
 pub struct ContainerListResponse {
     pub containers: Vec<ContainerInfoResponse>,
     pub total: usize,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ContainerEnvironmentVariableValueResponse {
+    pub value: String,
 }
 
 /// Detailed container information with environment variables and metrics
@@ -845,6 +897,31 @@ pub struct ContainerMetricsResponse {
     /// Timestamp of metrics collection
     #[schema(example = "2025-10-12T12:15:47.609192Z")]
     pub timestamp: String,
+}
+
+/// Query parameters for the container metrics history endpoint.
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct ContainerMetricsHistoryQuery {
+    /// Dotted metric name, e.g. `container.cpu_percent` or
+    /// `container.memory_used_bytes`.
+    pub metric: String,
+    /// Time window: `1h`, `6h`, `24h`, or `7d` (defaults to `1h`).
+    #[serde(default = "default_metrics_range")]
+    pub range: String,
+}
+
+fn default_metrics_range() -> String {
+    "1h".to_string()
+}
+
+/// One bucketed data point of a container resource metric time series.
+#[derive(Serialize, ToSchema)]
+pub struct ContainerMetricHistoryPoint {
+    /// Bucket timestamp (ISO 8601 with `Z` suffix).
+    #[schema(example = "2025-10-12T12:15:00+00:00")]
+    pub time: String,
+    /// Averaged metric value for the bucket.
+    pub value: f64,
 }
 
 /// Response indicating success of container state change

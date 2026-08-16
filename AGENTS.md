@@ -5,44 +5,26 @@ Codex, aider, etc.). The detailed engineering rules live in
 [`CLAUDE.md`](./CLAUDE.md); this file is the short list of process
 conventions that go *around* the code. Read both.
 
-## Always update `CHANGELOG.md`
+## Do not hand-edit `CHANGELOG.md`
 
-Every user-visible change in this repo lands with a `CHANGELOG.md`
-entry under `## [Unreleased]`, in the same commit as the code change.
-"User-visible" means anything an operator could notice: behaviour
-change, new flag, new endpoint, removed flag, UI change, performance
-characteristic, error-message format, dependency bump that changes
-the operator surface. Internal refactors with no observable impact
-don't need an entry, but when in doubt, write one.
+`CHANGELOG.md` is generated from Conventional Commits by
+[git-cliff](https://git-cliff.org) at release time. PRs must not edit it
+directly, because concurrent `[Unreleased]` edits caused constant merge
+conflicts.
 
-The file follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/):
-- Sections: `### Added`, `### Changed`, `### Removed`, `### Fixed`,
-  `### Tests` (last is project-specific).
-- Each bullet starts with a **bolded short headline**, then a colon,
-  then a self-contained explanation. Include *why* — not just *what*.
-- Reference migration filenames, endpoint paths, env vars, and crate
-  names by their exact identifiers so the entry is greppable later.
-- Test-only changes go under `### Tests`.
+The `Changelog` workflow validates every non-merge commit in a PR and
+posts a preview of the generated entry. A non-conventional commit is
+dropped from the changelog, so use a precise `type(scope): description`
+subject and make the user or operator impact clear there.
 
-If you're touching code without writing a CHANGELOG entry, you're
-either doing the wrong thing or you forgot. Stop and add the entry
-before staging the commit.
+Preview the generated entry locally with:
 
-**This is CI-enforced on every PR to `main`.** The `changelog-check`
-workflow fails the PR unless the diff touches `CHANGELOG.md` (with a
-valid `## [Unreleased]` category) **or** the PR carries the
-`skip-changelog` label. So for every PR you open, do one of:
+```bash
+scripts/changelog.sh --unreleased
+```
 
-- **Add a `CHANGELOG.md` entry** (the default — see above). This is
-  also required for changes to the `@temps-sdk/cli` npm package, even
-  though it versions separately; tag those bullets with `(\`@temps-sdk/cli\`, #PR)`.
-- **Apply the `skip-changelog` label** (`gh pr edit <n> --add-label
-  skip-changelog`) only when the change is genuinely changelog-exempt:
-  docs/typos, CI/build config, dependency bumps with no operator
-  impact, pure refactors, or test-only changes.
-
-Don't open a PR and leave the changelog check red — resolve it the
-same way you'd resolve a failing test.
+The release process regenerates `CHANGELOG.md`; the commit history is
+the source of truth.
 
 ## Use the generated OpenAPI SDK in `web/`
 
@@ -77,6 +59,82 @@ schemas, or routes, you must:
 The shortest way to spot a missing step: TypeScript compile errors
 in `web/src/` that say "Module ... has no exported member ...". That
 means the SDK is stale.
+
+## Never overwrite `apps/temps-cli/openapi.json` with the raw server response
+
+The CLI's SDK is generated from a **committed** copy of the spec at
+`apps/temps-cli/openapi.json`. That file is ~92,000 lines of formatted
+JSON; the server serves the same document minified on one line, with
+keys in whatever order serde produced.
+
+So `curl .../openapi.json > apps/temps-cli/openapi.json` turns a
+92,000-line file into a 1-line file, and the pull request reports
+**-92,000 deletions** — burying the actual change and making the diff
+unreviewable. Pretty-printing alone is not enough either: key order is
+not stable between builds, so an unsorted dump reorders huge blocks for
+no reason.
+
+Use the script, which fetches, sorts keys recursively, indents by two
+and keeps the trailing newline:
+
+```bash
+cd apps/temps-cli
+TEMPS_API_KEY=tk_... bun run spec:update --url http://localhost:8080/api/api-docs/openapi.json
+bun run generate:api        # regenerate the client from the file
+bun run scripts/generate-docs.ts --output docs/CLI.md
+bun run scripts/generate-docs.ts --format mdx --output docs/CLI.mdx
+```
+
+Sanity check before committing — a few new endpoints should be a few
+hundred changed lines, never tens of thousands:
+
+```bash
+git diff --numstat -- apps/temps-cli/openapi.json
+```
+
+You do not have to remember any of this. `bun run spec:check` verifies
+the committed file and runs automatically as a pre-commit hook and as the
+**OpenAPI Spec Format** CI job, so a minified or reordered spec fails
+before review rather than after. It reads only the file on disk — no
+server, no network, no `bun install`.
+
+If it fails and the API did *not* change, `bun run spec:check --fix`
+reformats in place. If the API *did* change, `bun run spec:update` is
+what you want, since `--fix` never fetches.
+
+`web/src/api/client/` has no committed spec; it is generated straight
+from the live server by `bun run openapi-ts` (see above), so it does not
+have this failure mode.
+
+## Resolving merge conflicts in generated clients
+
+Conflicts in `web/src/api/client/**`, `apps/temps-cli/src/api/**` or
+`apps/temps-cli/openapi.json` are conflicts in **build output**. Do not
+hand-merge them, and do not hand-pick hunks — the result is a client
+that matches neither side's spec.
+
+Take either side to clear the conflict, then regenerate from a server
+built off the merged source:
+
+```bash
+git checkout --ours -- web/src/api/client apps/temps-cli/src/api apps/temps-cli/openapi.json
+git add web/src/api/client apps/temps-cli/src/api apps/temps-cli/openapi.json
+# build + start the merged server, then:
+cd apps/temps-cli && bun run spec:update --url <server>/api/api-docs/openapi.json && bun run generate:api
+cd ../../web && bun run openapi-ts
+```
+
+Then `bun run typecheck` (or `npx tsc --noEmit`) in both `web/` and
+`apps/temps-cli/`. A clean typecheck is what proves the regenerated
+client still satisfies every caller on both sides of the merge.
+
+## Scope Docker usage on shared hosts
+
+This host may already be running a live Temps instance or other
+operator-owned Docker resources. Do not stop, remove, prune, rebuild,
+retag, or otherwise mutate existing containers, images, volumes, or
+networks. Docker-backed tests may create uniquely named temporary
+resources and must clean up only the resources created by that test run.
 
 ## Pre-commit hooks run cargo fmt and cargo clippy
 
@@ -145,9 +203,69 @@ the short version:
 - PRs touching the hot path or high-volume data flows must state
   expected load, memory bound, and behaviour at saturation.
 
+## Features must be discoverable, and unconfigured features must onboard
+
+A feature the user can't find is a feature that doesn't exist. Never
+ship a capability whose only entry point is a keyboard shortcut, a
+buried menu item, or knowledge the user is assumed to already have.
+Every new feature needs a visible surface in the UI where the user is
+already looking when they'd want it.
+
+**Optional dependencies do not justify hiding a feature.** When a
+feature needs configuration the operator may not have done yet — an AI
+provider, an S3 bucket, an SMTP server, a DNS token — the wrong move is
+to conditionally render nothing. A self-hosted user has no support
+channel: if the button isn't there, they will never learn the feature
+exists, and they'll conclude temps can't do it.
+
+Instead, always render the surface and switch it into an onboarding
+state:
+
+- **Show what it would do.** Name the capability and give a concrete
+  example of the outcome, not an abstract description.
+- **Say exactly what's missing.** "No AI provider is configured" — not
+  "unavailable" or a disabled control with no explanation.
+- **Link straight to the fix.** A direct link to the settings page that
+  configures it, deep-linked to the right section. Not "see the docs."
+- **Never silently no-op.** If the user triggers it anyway, explain the
+  gap; don't fail quietly or spin forever.
+
+Concretely, the shape to reach for:
+
+```tsx
+// BAD — the feature vanishes; the user never learns it exists
+{aiConfigured && <AiQueryBar />}
+
+// GOOD — always visible, onboards when unconfigured
+<AiQueryBar
+  configured={aiConfigured}
+  onboardingHref="/settings/ai"
+  example="show me the users created last week"
+/>
+```
+
+This applies to the API too: prefer a capability/status endpoint that
+reports `configured: false` with a reason and a setup URL over a 404
+that leaves the client unable to distinguish "not built" from
+"not set up".
+
 ## Don't sweep unrelated dirty files into your commits
 
 If you arrive at a working tree that's already dirty (because a
 previous session left files modified), confirm with the user whether
 to include those files before staging them. Sweeping unrelated work
 into a focused PR makes review slower and history harder to bisect.
+
+## Never commit secrets, including local dev-instance artifacts
+
+Never commit `.env` files, credentials, or secrets. This explicitly
+includes local dev-instance artifacts generated while running a local
+server for manual testing/verification — encryption keys, auth
+secrets, generated tokens, `temps_data`-style data directories. These
+are easy to sweep in by accident with a broad `git add` right after
+spinning up a local test instance to verify a change, which is exactly
+when review attention is focused elsewhere. Before staging, run `git
+status` and scrutinize every path outside the files you intentionally
+edited. If a secret does get committed, treat it as compromised: at
+minimum remove it from tracking going forward, and flag to the user
+whether history needs rewriting — don't force-push without asking.

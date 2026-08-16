@@ -5,16 +5,18 @@
 //! Return correct OTLP response envelopes.
 
 use std::collections::HashMap;
+use std::future::Future;
 
 use axum::body::Bytes;
-use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::extract::{FromRequestParts, Path, State};
+use axum::http::{request::Parts, HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use prost::Message;
+use tokio::sync::OwnedSemaphorePermit;
 use tracing::{debug, error, warn};
 
 use crate::error::OtelError;
-use crate::ingest::auth::{IngestAuth, ServiceAuth};
+use crate::ingest::auth::{IngestAuth, ProjectAuth, ServiceAuth};
 use crate::ingest::decode;
 use crate::proto;
 use crate::services::cross_project::{is_valid_trace_id, TraceHintMsg};
@@ -29,6 +31,15 @@ use temps_metrics::{
 impl From<OtelError> for Problem {
     fn from(error: OtelError) -> Self {
         match error {
+            OtelError::MissingAuthToken { .. } => {
+                // The slug is carried in the error message for diagnostics but
+                // deliberately not emitted as a structured project dimension:
+                // authentication has not established that the caller owns it.
+                warn!(error = %error, "OTel ingest auth failed");
+                problemdetails::new(StatusCode::UNAUTHORIZED)
+                    .with_title("Authentication Failed")
+                    .with_detail(error.to_string())
+            }
             OtelError::AuthFailed { .. } | OtelError::InvalidApiKey => {
                 warn!(error = %error, "OTel ingest auth failed");
                 problemdetails::new(StatusCode::UNAUTHORIZED)
@@ -39,6 +50,12 @@ impl From<OtelError> for Problem {
                 warn!(error = %error, "OTel ingest rate limited");
                 problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
                     .with_title("Rate Limit Exceeded")
+                    .with_detail(error.to_string())
+            }
+            OtelError::IngestSaturated { .. } => {
+                warn!(error = %error, "OTel ingest saturated");
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("OTel Ingest Saturated")
                     .with_detail(error.to_string())
             }
             OtelError::QuotaExceeded { .. } => {
@@ -83,10 +100,13 @@ impl From<OtelError> for Problem {
             | OtelError::Io(_)
             | OtelError::Serialization(_)
             | OtelError::Internal { .. } => {
+                // Log the real error server-side only — the detail string can
+                // contain DB/S3 error text (schema names, paths) that must not
+                // reach the caller.
                 error!(error = %error, "OTel ingest internal error");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(error.to_string())
+                    .with_detail("An internal error occurred")
             }
         }
     }
@@ -97,29 +117,46 @@ impl From<OtelError> for Problem {
 /// Checks `Authorization: Bearer <token>` and `X-Temps-Api-Key: <token>`.
 /// Works for `tk_`, `dt_`, and `si_` token prefixes. Handles both plain
 /// `Bearer <token>` and percent-encoded `Bearer%20<token>` from OTLP SDKs.
+fn authorization_scheme(value: &str) -> &'static str {
+    if value.starts_with("Bearer ") || value.starts_with("Bearer%20") {
+        "Bearer"
+    } else {
+        "other"
+    }
+}
+
 fn extract_token(headers: &HeaderMap) -> Option<String> {
     if let Some(auth) = headers.get("authorization") {
         if let Ok(value) = auth.to_str() {
             // SECURITY: never log the raw header — it carries a live, mostly
             // non-expiring credential (Bearer dt_/tk_/si_). Log only its shape.
             tracing::debug!(
-                scheme = value.split_whitespace().next().unwrap_or(""),
+                scheme = authorization_scheme(value),
                 len = value.len(),
                 "OTLP extract_token"
             );
             if let Some(key) = value.strip_prefix("Bearer ") {
-                return Some(key.trim().to_string());
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
             }
             // Some OTLP exporters send the literal string "Bearer%20<token>"
             if let Some(key) = value.strip_prefix("Bearer%20") {
-                return Some(key.trim().to_string());
+                let key = key.trim();
+                if !key.is_empty() {
+                    return Some(key.to_string());
+                }
             }
         }
     }
 
     if let Some(key) = headers.get("x-temps-api-key") {
         if let Ok(value) = key.to_str() {
-            return Some(value.trim().to_string());
+            let key = value.trim();
+            if !key.is_empty() {
+                return Some(key.to_string());
+            }
         }
     }
 
@@ -134,6 +171,47 @@ fn extract_project_id_header(headers: &HeaderMap) -> Option<i32> {
         .get("x-temps-project-id")
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<i32>().ok())
+}
+
+/// Extract a caller-claimed diagnostic project slug.
+///
+/// This header is not trusted for authentication. It only preserves project
+/// context when authentication cannot run because the credential is missing.
+/// Generated deployments use a hex transport header so persisted Unicode
+/// slugs remain valid HTTP metadata. The plain header remains accepted for
+/// manually configured exporters with canonical ASCII slugs.
+fn extract_claimed_project_slug(headers: &HeaderMap) -> Option<String> {
+    let is_valid_slug = |slug: &str| {
+        !slug.is_empty()
+            && slug.len() <= 64
+            && slug
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '-')
+    };
+
+    if let Some(encoded_slug) = headers
+        .get("x-temps-project-slug-hex")
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| value.len() <= 128)
+    {
+        let slug = hex::decode(encoded_slug)
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())?;
+        return is_valid_slug(&slug).then_some(slug);
+    }
+
+    headers
+        .get("x-temps-project-slug")
+        .and_then(|value| value.to_str().ok())
+        .filter(|slug| is_valid_slug(slug))
+        .map(str::to_string)
+}
+
+fn missing_auth_token_error(headers: &HeaderMap) -> OtelError {
+    OtelError::MissingAuthToken {
+        claimed_project_slug: extract_claimed_project_slug(headers)
+            .unwrap_or_else(|| "unknown".to_string()),
+    }
 }
 
 /// Extract Content-Encoding from headers.
@@ -283,6 +361,28 @@ struct IngestContext {
     deployment_id: Option<i32>,
 }
 
+/// Holds a process-wide ingest permit for the full handler lifetime. As a
+/// request-parts extractor it runs before Axum buffers the `Bytes` body.
+pub struct IngestPermit {
+    _permit: OwnedSemaphorePermit,
+}
+
+impl FromRequestParts<OtelAppState> for IngestPermit {
+    type Rejection = Problem;
+
+    fn from_request_parts(
+        _parts: &mut Parts,
+        state: &OtelAppState,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send {
+        let permit = state
+            .otel_service
+            .try_acquire_ingest_permit()
+            .map(|permit| Self { _permit: permit })
+            .map_err(Problem::from);
+        async move { permit }
+    }
+}
+
 /// Authenticate the request and resolve the ingest context.
 ///
 /// For header-only requests the IDs come from the `ProjectAuth` returned
@@ -306,6 +406,13 @@ async fn resolve_ingest_context(
         .authenticate(token, effective_project_id)
         .await?;
 
+    resolve_authenticated_ingest_context(auth, path_ids)
+}
+
+fn resolve_authenticated_ingest_context(
+    auth: ProjectAuth,
+    path_ids: Option<(i32, i32, i32)>,
+) -> Result<IngestContext, OtelError> {
     match path_ids {
         Some((path_project_id, path_environment_id, path_deployment_id)) => {
             // Validate: if the token already binds to a project (dt_ tokens),
@@ -471,22 +578,39 @@ async fn do_ingest_metrics(
         .authenticate_any(token, header_project_id)
         .await?;
 
-    match auth_result {
+    let project_auth = match auth_result {
         IngestAuth::Service(service_auth) => {
             return do_ingest_service_metrics(state, service_auth, headers, body).await;
         }
-        IngestAuth::Project(_) => {
-            // Fall through to the existing project auth path below.
-        }
-    }
+        IngestAuth::Project(auth) => auth,
+    };
 
-    let ctx = resolve_ingest_context(state, token, path_ids, headers).await?;
+    let ctx = resolve_authenticated_ingest_context(project_auth, path_ids)?;
     state.otel_service.check_rate_limit(ctx.project_id)?;
     state.otel_service.check_quota(ctx.project_id).await?;
 
     let data = decode::decompress(body, content_encoding(headers))?;
     let points = decode::decode_metrics_request(&data, ctx.project_id, ctx.deployment_id)?;
     let count = points.len();
+
+    // Fire decoded batch at the relay extension point (non-blocking).
+    // `data.clone()` is O(1) — bytes::Bytes is ref-counted. The relay channel
+    // is bounded; try_send drops silently on full rather than blocking.
+    if let Some(tx) = &state.otel_relay_tx {
+        let msg = crate::relay::OtelRelayMessage {
+            project_id: ctx.project_id,
+            environment_id: ctx.environment_id,
+            deployment_id: ctx.deployment_id,
+            signal: crate::relay::OtelSignal::Metrics,
+            payload: data.clone(),
+        };
+        if tx.try_send(msg).is_err() {
+            tracing::warn!(
+                project_id = ctx.project_id,
+                "otel relay channel full; metrics batch dropped (backpressure)"
+            );
+        }
+    }
 
     for point in &points {
         debug!(
@@ -570,6 +694,23 @@ async fn do_ingest_traces(
     let data = decode::decompress(body, content_encoding(headers))?;
     let spans = decode::decode_traces_request(&data, ctx.project_id, ctx.deployment_id)?;
     let count = spans.len();
+
+    // Fire decoded batch at the relay extension point (non-blocking).
+    if let Some(tx) = &state.otel_relay_tx {
+        let msg = crate::relay::OtelRelayMessage {
+            project_id: ctx.project_id,
+            environment_id: ctx.environment_id,
+            deployment_id: ctx.deployment_id,
+            signal: crate::relay::OtelSignal::Traces,
+            payload: data.clone(),
+        };
+        if tx.try_send(msg).is_err() {
+            tracing::warn!(
+                project_id = ctx.project_id,
+                "otel relay channel full; traces batch dropped (backpressure)"
+            );
+        }
+    }
 
     // Log each span at debug level so operators can see what arrived
     for span in &spans {
@@ -662,6 +803,23 @@ async fn do_ingest_logs(
     let records = decode::decode_logs_request(&data, ctx.project_id, ctx.deployment_id)?;
     let count = records.len();
 
+    // Fire decoded batch at the relay extension point (non-blocking).
+    if let Some(tx) = &state.otel_relay_tx {
+        let msg = crate::relay::OtelRelayMessage {
+            project_id: ctx.project_id,
+            environment_id: ctx.environment_id,
+            deployment_id: ctx.deployment_id,
+            signal: crate::relay::OtelSignal::Logs,
+            payload: data.clone(),
+        };
+        if tx.try_send(msg).is_err() {
+            tracing::warn!(
+                project_id = ctx.project_id,
+                "otel relay channel full; logs batch dropped (backpressure)"
+            );
+        }
+    }
+
     for record in &records {
         debug!(
             project_id = ctx.project_id,
@@ -716,12 +874,11 @@ async fn do_ingest_logs(
 )]
 pub async fn ingest_metrics(
     State(state): State<OtelAppState>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_metrics(&state, &token, None, &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest metrics (header auth)");
@@ -750,12 +907,11 @@ pub async fn ingest_metrics(
 )]
 pub async fn ingest_traces(
     State(state): State<OtelAppState>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_traces(&state, &token, None, &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest traces (header auth)");
@@ -785,12 +941,11 @@ pub async fn ingest_traces(
 )]
 pub async fn ingest_logs(
     State(state): State<OtelAppState>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_logs(&state, &token, None, &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest logs (header auth)");
@@ -835,12 +990,11 @@ type IngestPathParams = (i32, i32, i32);
 pub async fn ingest_metrics_by_path(
     State(state): State<OtelAppState>,
     Path(path_ids): Path<IngestPathParams>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_metrics(&state, &token, Some(path_ids), &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest metrics (path auth)");
@@ -872,12 +1026,11 @@ pub async fn ingest_metrics_by_path(
 pub async fn ingest_traces_by_path(
     State(state): State<OtelAppState>,
     Path(path_ids): Path<IngestPathParams>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_traces(&state, &token, Some(path_ids), &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest traces (path auth)");
@@ -909,12 +1062,11 @@ pub async fn ingest_traces_by_path(
 pub async fn ingest_logs_by_path(
     State(state): State<OtelAppState>,
     Path(path_ids): Path<IngestPathParams>,
+    _permit: IngestPermit,
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<impl IntoResponse, Problem> {
-    let token = extract_token(&headers).ok_or_else(|| OtelError::AuthFailed {
-        reason: "Missing token in Authorization or X-Temps-Api-Key header".into(),
-    })?;
+    let token = extract_token(&headers).ok_or_else(|| missing_auth_token_error(&headers))?;
     let result = do_ingest_logs(&state, &token, Some(path_ids), &headers, &body).await;
     if let Err(ref e) = result {
         error!(error = ?e, "Failed to ingest logs (path auth)");
@@ -951,9 +1103,40 @@ mod tests {
     }
 
     #[test]
+    fn test_authorization_scheme_never_contains_token_material() {
+        let token = "dt_live_credential_must_not_be_logged";
+
+        for value in [
+            format!("Bearer {token}"),
+            format!("Bearer%20{token}"),
+            format!("Custom {token}"),
+        ] {
+            let scheme = authorization_scheme(&value);
+            assert!(!scheme.contains(token));
+        }
+
+        assert_eq!(authorization_scheme(&format!("Bearer {token}")), "Bearer");
+        assert_eq!(authorization_scheme(&format!("Bearer%20{token}")), "Bearer");
+        assert_eq!(authorization_scheme(&format!("Custom {token}")), "other");
+    }
+
+    #[test]
     fn test_extract_token_missing() {
         let headers = HeaderMap::new();
         assert_eq!(extract_token(&headers), None);
+    }
+
+    #[test]
+    fn test_extract_token_treats_empty_credentials_as_missing() {
+        for (header, value) in [
+            ("authorization", "Bearer "),
+            ("authorization", "Bearer%20"),
+            ("x-temps-api-key", ""),
+        ] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header, value.parse().unwrap());
+            assert_eq!(extract_token(&headers), None, "header: {header}");
+        }
     }
 
     #[test]
@@ -1001,6 +1184,64 @@ mod tests {
         assert_eq!(extract_project_id_header(&headers), None);
     }
 
+    #[test]
+    fn test_missing_auth_token_error_includes_valid_project_slug() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-temps-project-slug-hex",
+            "6578616d706c652d70726f6a656374".parse().unwrap(),
+        );
+
+        let error = missing_auth_token_error(&headers);
+
+        assert!(matches!(
+            error,
+            OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "example-project"
+        ));
+    }
+
+    #[test]
+    fn test_missing_auth_token_error_decodes_unicode_project_slug() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-temps-project-slug-hex", "636166c3a9".parse().unwrap());
+
+        let error = missing_auth_token_error(&headers);
+
+        assert!(matches!(
+            error,
+            OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "café"
+        ));
+    }
+
+    #[test]
+    fn test_missing_auth_token_error_rejects_untrusted_project_slug() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-temps-project-slug", "invalid slug".parse().unwrap());
+
+        let error = missing_auth_token_error(&headers);
+
+        assert!(matches!(
+            error,
+            OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "unknown"
+        ));
+    }
+
+    #[test]
+    fn test_missing_auth_token_error_rejects_malformed_hex_slug() {
+        let oversized_slug = "61".repeat(65);
+        for encoded_slug in ["not-hex", "ff", oversized_slug.as_str()] {
+            let mut headers = HeaderMap::new();
+            headers.insert("x-temps-project-slug-hex", encoded_slug.parse().unwrap());
+
+            let error = missing_auth_token_error(&headers);
+
+            assert!(matches!(
+                error,
+                OtelError::MissingAuthToken { claimed_project_slug } if claimed_project_slug == "unknown"
+            ));
+        }
+    }
+
     // ── content_encoding tests ─────────────────────────────────────
 
     #[test]
@@ -1028,6 +1269,15 @@ mod tests {
     }
 
     #[test]
+    fn test_error_missing_auth_token_maps_to_401() {
+        let err = OtelError::MissingAuthToken {
+            claimed_project_slug: "example-project".into(),
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::UNAUTHORIZED);
+    }
+
+    #[test]
     fn test_error_invalid_api_key_maps_to_401() {
         let err = OtelError::InvalidApiKey;
         let problem: Problem = err.into();
@@ -1042,6 +1292,12 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[test]
+    fn test_error_ingest_saturated_maps_to_503() {
+        let problem: Problem = OtelError::IngestSaturated { limit: 64 }.into();
+        assert_eq!(problem.status_code, StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[test]
@@ -1099,6 +1355,23 @@ mod tests {
         assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
     }
 
+    /// Extracts the `detail` string from a converted `Problem`, for asserting
+    /// on response content (not just status code).
+    fn problem_detail(problem: &Problem) -> &str {
+        problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+    }
+
+    /// Internal-error variants must never echo their underlying message (DB
+    /// error text, file paths, S3 reasons) into the HTTP response — only the
+    /// generic detail, with the real error logged server-side instead. See
+    /// `From<OtelError> for Problem`'s `Storage | Database | S3 | Io |
+    /// Serialization | Internal` arm.
+    const SANITIZED_INTERNAL_ERROR_DETAIL: &str = "An internal error occurred";
+
     #[test]
     fn test_error_storage_maps_to_500() {
         let err = OtelError::Storage {
@@ -1106,13 +1379,21 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("disk full"), "detail leaked: {detail}");
     }
 
     #[test]
     fn test_error_database_maps_to_500() {
-        let err = OtelError::Database(sea_orm::DbErr::Custom("test".into()));
+        let err = OtelError::Database(sea_orm::DbErr::Custom(
+            "column \"key_hash\" not found in table \"api_keys\"".into(),
+        ));
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("api_keys"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1123,6 +1404,9 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("timeout"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1130,6 +1414,9 @@ mod tests {
         let err = OtelError::Io(std::io::Error::other("test"));
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("test"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1139,6 +1426,9 @@ mod tests {
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem_detail(&problem);
+        assert_eq!(detail, SANITIZED_INTERNAL_ERROR_DETAIL);
+        assert!(!detail.contains("unexpected"), "detail leaked: {detail}");
     }
 
     #[test]
@@ -1177,6 +1467,39 @@ mod tests {
         assert_eq!(params.0, 1);
         assert_eq!(params.1, 2);
         assert_eq!(params.2, 3);
+    }
+
+    #[test]
+    fn authenticated_context_uses_existing_auth_without_another_lookup() {
+        let auth = ProjectAuth {
+            project_id: 10,
+            environment_id: Some(20),
+            deployment_id: Some(30),
+            token_id: 40,
+            project_name: "project".into(),
+        };
+
+        let context = resolve_authenticated_ingest_context(auth, Some((10, 20, 30))).unwrap();
+
+        assert_eq!(context.project_id, 10);
+        assert_eq!(context.environment_id, Some(20));
+        assert_eq!(context.deployment_id, Some(30));
+    }
+
+    #[test]
+    fn authenticated_context_rejects_mismatched_project() {
+        let auth = ProjectAuth {
+            project_id: 10,
+            environment_id: None,
+            deployment_id: None,
+            token_id: 40,
+            project_name: "project".into(),
+        };
+
+        assert!(matches!(
+            resolve_authenticated_ingest_context(auth, Some((11, 20, 30))),
+            Err(OtelError::AuthFailed { .. })
+        ));
     }
 
     // ── otlp_to_store_point tests ────────────────────────────────────
@@ -1382,6 +1705,68 @@ mod tests {
         };
         // The service_id is what gets written as source_id in service_metrics
         assert_eq!(auth.service_id, 42);
+    }
+
+    // ── Relay channel backpressure ──────────────────────────────────────
+    //
+    // Verifies that a full or closed relay channel does NOT propagate as an
+    // ingest error. The do_ingest_* handlers only call try_send and warn on
+    // Err — the OTLP HTTP response must still succeed.
+    //
+    // A full HTTP-level test would require constructing a real OtelAppState
+    // (which needs OtelService, storage backends, a live DB, etc.). Instead,
+    // this focused unit test exercises the exact try_send-then-discard pattern
+    // used in the handlers, confirming the Err is not propagated.
+
+    #[test]
+    fn relay_channel_full_try_send_returns_err_not_panic() {
+        use crate::relay::{OtelRelayMessage, OtelSignal};
+
+        // Capacity-1 channel: fill it with the first send.
+        let (tx, _rx) = tokio::sync::mpsc::channel::<OtelRelayMessage>(1);
+
+        let make_msg = |project_id: i32| OtelRelayMessage {
+            project_id,
+            environment_id: None,
+            deployment_id: None,
+            signal: OtelSignal::Metrics,
+            payload: bytes::Bytes::new(),
+        };
+
+        // Fill the channel (capacity = 1).
+        assert!(tx.try_send(make_msg(1)).is_ok(), "first send must succeed");
+
+        // Second send: channel is full. Must return Err, must not panic.
+        let result = tx.try_send(make_msg(2));
+        assert!(
+            result.is_err(),
+            "try_send on a full channel must return Err; handlers discard this error (warn-only)"
+        );
+        // Reaching here confirms no panic — the backpressure path is safe.
+    }
+
+    #[test]
+    fn relay_channel_closed_try_send_returns_err_not_panic() {
+        use crate::relay::{OtelRelayMessage, OtelSignal};
+
+        // Drop the receiver immediately — channel is closed.
+        let (tx, rx) = tokio::sync::mpsc::channel::<OtelRelayMessage>(10);
+        drop(rx);
+
+        let msg = OtelRelayMessage {
+            project_id: 1,
+            environment_id: None,
+            deployment_id: None,
+            signal: OtelSignal::Traces,
+            payload: bytes::Bytes::new(),
+        };
+
+        let result = tx.try_send(msg);
+        assert!(
+            result.is_err(),
+            "try_send on a closed channel must return Err; handlers discard this error (warn-only)"
+        );
+        // Reaching here confirms no panic — the closed-channel path is safe.
     }
 
     #[test]

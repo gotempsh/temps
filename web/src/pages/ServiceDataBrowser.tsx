@@ -35,7 +35,23 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
+import {
+  Sheet,
+  SheetContent,
+  SheetDescription,
+  SheetHeader,
+  SheetTitle,
+} from '@/components/ui/sheet'
 import { Label } from '@/components/ui/label'
 import {
   Select,
@@ -71,12 +87,15 @@ import {
   ArrowLeft,
   ArrowUpDown,
   Bookmark,
+  AlertTriangle,
   Box,
   Calendar,
   Check,
   ChevronDown,
   ChevronRight,
+  Columns3,
   Command as CommandIcon,
+  Copy,
   Download,
   Eye,
   Database,
@@ -99,8 +118,15 @@ import {
   Type,
   X,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { useDefaultLayout } from 'react-resizable-panels'
+import { useIsMobile } from '@/components/hooks/use-mobile'
+import {
+  ResizableHandle,
+  ResizablePanel,
+  ResizablePanelGroup,
+} from '@/components/ui/resizable'
+import { useNavigate, useParams, useSearchParams } from 'react-router'
 
 interface TreeNode {
   name: string
@@ -115,6 +141,10 @@ interface TreeNode {
   canContainContainers?: boolean
   canContainEntities?: boolean
   entityCountHint?: 'small' | 'large' | null // Hint about entity count
+  /** Backend-supplied facts (size_bytes, owner, encoding, entity_count…). */
+  metadata?: Record<string, unknown>
+  /** On-disk size for an entity, when the backend reports one. */
+  sizeBytes?: number
 }
 
 export function ServiceDataBrowser() {
@@ -138,8 +168,20 @@ export function ServiceDataBrowser() {
   // Track the last expanded path to avoid re-expanding
   const lastExpandedPathRef = useRef<string>('')
 
+
+  // Live mirror of `treeNodes`. The URL-restore effect below walks the path
+  // one level at a time, loading each level's children as it goes; it must
+  // read the tree *after* each load, which the `treeNodes` captured in its
+  // closure can never reflect.
+  const treeNodesRef = useRef<TreeNode[]>([])
+  useEffect(() => {
+    treeNodesRef.current = treeNodes
+  }, [treeNodes])
+
   // Filter state (for sidebar tree only)
   const [filterText, setFilterText] = useState('')
+
+  const isMobile = useIsMobile()
 
   // Sidebar toggle state (mobile responsive) - default closed on mobile, open on desktop
   const [isSidebarOpen, setIsSidebarOpen] = useState(
@@ -148,6 +190,19 @@ export function ServiceDataBrowser() {
 
   // Pagination state
   const [page, setPage] = useState(1)
+  /**
+   * Row offset of the current page.
+   *
+   * Deliberately NOT derived as `(page - 1) * pageSize`. The server drops rows
+   * from a response to stay inside a byte budget when a table holds large
+   * values, so a page can return fewer rows than requested while more remain at
+   * that offset. Stepping by `pageSize` would then jump straight over them —
+   * silently, since the row count still looks like a normal short last page.
+   * Tracking the offset explicitly and advancing it by the rows actually
+   * received is what the CLI does, and it means a truncated page costs an extra
+   * click rather than losing data.
+   */
+  const [dataOffset, setDataOffset] = useState(0)
   const pageSize = 20
 
   // Data table filter and sort state
@@ -180,6 +235,73 @@ export function ServiceDataBrowser() {
     () => tabs[0]?.id ?? makeTabId()
   )
   const [copyLinkFeedback, setCopyLinkFeedback] = useState(false)
+
+  // Per-tab scroll position.
+  //
+  // Each tab is a separate place in the data — switching to another table and
+  // back used to dump you at the top, losing your position in a long result
+  // set. sessionStorage rather than localStorage: a scroll offset is only
+  // meaningful for the rows currently loaded, so it should die with the tab,
+  // not persist to a future session where the data may have changed.
+  const contentScrollRef = useRef<HTMLDivElement | null>(null)
+  const scrollStorageKey = (tabId: string) =>
+    `temps:data-browser:scroll:${id ?? 'unknown'}:${tabId}`
+
+  const handleContentScroll = () => {
+    const el = contentScrollRef.current
+    if (!el || typeof window === 'undefined') return
+    try {
+      window.sessionStorage.setItem(
+        scrollStorageKey(activeTabId),
+        String(el.scrollTop)
+      )
+    } catch {
+      /* private mode / quota — scroll memory is a nicety, never fail on it */
+    }
+  }
+
+  // Restore on tab switch and on navigation within a tab.
+  //
+  // A single requestAnimationFrame isn't enough: switching tabs swaps in
+  // content that may still be fetching, so the pane is empty when the frame
+  // fires and `scrollTop = 900` clamps to 0 against a scrollHeight of nothing.
+  // Retry across frames until the assignment actually sticks, then stop.
+  // Bounded so a genuinely short page (target beyond its end) can't spin.
+  useEffect(() => {
+    if (typeof window === 'undefined') return
+
+    let target = 0
+    try {
+      const saved = window.sessionStorage.getItem(scrollStorageKey(activeTabId))
+      target = saved ? Number(saved) : 0
+    } catch {
+      /* ignore */
+    }
+    if (!Number.isFinite(target)) target = 0
+
+    let raf = 0
+    let attempts = 0
+    const MAX_ATTEMPTS = 40 // ~650ms at 60fps
+
+    const attempt = () => {
+      const el = contentScrollRef.current
+      if (el) {
+        if (target === 0) {
+          el.scrollTop = 0
+          return
+        }
+        el.scrollTop = target
+        // Stuck the landing, or the content simply isn't that tall.
+        if (el.scrollTop === target || attempts >= MAX_ATTEMPTS) return
+      }
+      attempts += 1
+      if (attempts <= MAX_ATTEMPTS) raf = window.requestAnimationFrame(attempt)
+    }
+
+    raf = window.requestAnimationFrame(attempt)
+    return () => window.cancelAnimationFrame(raf)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeTabId, selectedPath, selectedEntity, id])
 
   // Track whether we've already warmed the tree so the command palette and
   // tree always show every table, not just the ones the user has expanded.
@@ -223,7 +345,72 @@ export function ServiceDataBrowser() {
     )
   }
 
+  // Persisted split between the tree and the table. Keyed per service so a
+  // wide-schema database can keep a wider tree than a simple one.
+  const { defaultLayout, onLayoutChanged } = useDefaultLayout({
+    id: `data-browser-split:${id ?? 'unknown'}`,
+    onlySaveAfterUserInteractions: true,
+  })
+
+  /**
+   * Desktop splits the tree and the table with a draggable separator; mobile
+   * keeps the overlay drawer, where a resize handle has nothing to drag
+   * against.
+   *
+   * Deliberately a function, not a component: a component declared during
+   * render is a new type every render, so React would unmount and remount the
+   * whole tree (losing expansion state and the filter input's focus) on every
+   * keystroke.
+   */
+  const renderShell = (
+    sidebar: ReactNode,
+    overlay: ReactNode,
+    content: ReactNode
+  ) => {
+    if (isMobile) {
+      return (
+        <div className="flex-1 flex min-h-0 relative overflow-hidden">
+          {sidebar}
+          {overlay}
+          {content}
+        </div>
+      )
+    }
+    return (
+      <ResizablePanelGroup
+        orientation="horizontal"
+        className="flex-1 min-h-0 px-6 pb-6 overflow-hidden"
+        defaultLayout={defaultLayout}
+        onLayoutChanged={onLayoutChanged}
+      >
+        {/* Numbers are pixels in v4; the string maxSize is a percentage, so
+            the tree can never crowd out the table it exists to navigate. */}
+        <ResizablePanel
+          id="tree"
+          defaultSize={320}
+          minSize={220}
+          maxSize="50"
+        >
+          {sidebar}
+        </ResizablePanel>
+        <ResizableHandle withHandle className="mx-3" />
+        <ResizablePanel id="content" minSize={320}>
+          {content}
+        </ResizablePanel>
+      </ResizablePanelGroup>
+    )
+  }
+
   // Apply filter handler
+  // Page 1 is always offset 0. Every other reset path in this file already
+  // calls `setPage(1)` (filter change, entity change, sort change, tab
+  // restore), so anchoring the offset to that here keeps the two in step
+  // without threading a second setter through nine call sites — and makes it
+  // impossible for a future reset to remember to reset one but not the other.
+  useEffect(() => {
+    if (page === 1) setDataOffset(0)
+  }, [page])
+
   const handleApplyFilter = () => {
     // If we have filter_schema, send the form data as JSON object
     const nextFilter = explorerSupport?.filter_schema
@@ -276,6 +463,14 @@ export function ServiceDataBrowser() {
     setDataSortField(nextSortField)
     setDataSortOrder(nextSortOrder)
     setPage(nextPage)
+    // Restoring a tab is the one path that sets a page other than 1, so the
+    // `page === 1` reset effect does not cover it. Without this, reopening a
+    // tab saved at page 5 kept whatever offset the previous tab left behind and
+    // the header labelled unrelated rows "Page 5 • Rows 1–20" — the same
+    // silently-wrong-data failure the paging fix exists to remove. Uniform
+    // pages are the right assumption *here*, because a restore has no earlier
+    // response to have been truncated.
+    setDataOffset((nextPage - 1) * pageSize)
 
     if (opts?.commitToActiveTab !== false) {
       commitActiveTab({
@@ -306,6 +501,13 @@ export function ServiceDataBrowser() {
   const handleCloseTab = (tabId: string) => {
     const idx = tabs.findIndex((t) => t.id === tabId)
     if (idx === -1) return
+    // Drop this tab's remembered scroll offset — a closed tab's position is
+    // meaningless, and without this the keys accumulate for the session.
+    try {
+      window.sessionStorage.removeItem(scrollStorageKey(tabId))
+    } catch {
+      /* ignore */
+    }
     const next = tabs.filter((t) => t.id !== tabId)
     if (next.length === 0) {
       const fresh: BrowserTab = { id: makeTabId(), path: '' }
@@ -580,6 +782,9 @@ export function ServiceDataBrowser() {
           container.can_contain_entities ?? hierarchyInfo.can_list_entities,
         entityCountHint:
           (container.entity_count_hint as 'small' | 'large' | null) || null,
+        metadata: (container.metadata ?? undefined) as
+          | Record<string, unknown>
+          | undefined,
       }))
       setTreeNodes(nodes)
     }
@@ -654,6 +859,8 @@ export function ServiceDataBrowser() {
 
     // Expand each level of the path sequentially
     const expandPath = async () => {
+      let resolvedEveryLevel = true
+
       for (let i = 0; i < pathSegments.length; i++) {
         const currentPath = pathSegments.slice(0, i + 1).join('/')
 
@@ -669,10 +876,23 @@ export function ServiceDataBrowser() {
           return null
         }
 
-        const node = findNode(treeNodes, currentPath)
+        // Read the LIVE tree, not the `treeNodes` captured when this effect
+        // ran. Each `loadNodeChildren` below appends the next level, and the
+        // closure copy predates every one of them — so from i=1 onward this
+        // lookup always returned null and the deeper segments were never
+        // expanded. That is why reloading on ?path=db/schema left the schema
+        // collapsed.
+        const node = findNode(treeNodesRef.current, currentPath)
+
+        if (!node) {
+          // The level isn't in the tree yet (still loading, or the path is
+          // stale). Leave the guard unset so a later run can finish the job.
+          resolvedEveryLevel = false
+          break
+        }
 
         // If node exists and can have children
-        if (node && node.type === 'container') {
+        if (node.type === 'container') {
           // If not already expanded and can contain children, expand it
           if (
             !node.isExpanded &&
@@ -693,18 +913,26 @@ export function ServiceDataBrowser() {
               return updateNodes(prevNodes)
             })
 
-            // Load children if not loaded - wait for it to complete before moving to next level
+            // Load children before descending — the next iteration looks the
+            // child up in the tree this call populates. Yield afterwards so
+            // React commits the state update and `treeNodesRef` reflects it;
+            // if it hasn't landed yet, the `!node` branch above leaves the
+            // guard unset and a later pass retries rather than giving up.
             if (!node.isLoaded) {
               await loadNodeChildren(currentPath)
-              // Wait a bit for state to update
-              await new Promise((resolve) => setTimeout(resolve, 100))
+              await new Promise((resolve) => setTimeout(resolve, 50))
             }
           }
         }
       }
 
-      // Mark this path as expanded
-      lastExpandedPathRef.current = selectedPath
+      // Only latch when the whole path actually opened. Setting this
+      // unconditionally was the second half of the reload bug: the first
+      // (failed) pass marked the path done, so the re-run triggered by the
+      // freshly-loaded children bailed out at the guard above.
+      if (resolvedEveryLevel) {
+        lastExpandedPathRef.current = selectedPath
+      }
     }
 
     expandPath()
@@ -728,19 +956,59 @@ export function ServiceDataBrowser() {
     ...queryDataMutation(),
   })
 
+  // Sort state outlives the entity it was created for. `navigateTo` clears it,
+  // but restoring a tab, opening a saved view, or landing on a deep link all
+  // reinstate a `sortField` captured against a *different* table — and the
+  // backend then emits `ORDER BY "channel"` on a table with no `channel`
+  // column, so the table simply fails to open:
+  //
+  //   Query failed: column "channel" does not exist
+  //   SELECT * FROM "public"."db_mutex" ORDER BY "channel" DESC …
+  //
+  // Rather than clearing sort at each of those call sites (and missing the
+  // next one), validate against the schema we already fetched: a sort field
+  // the current entity doesn't have is dropped. Falls back to trusting the
+  // field while `entityInfo` is still loading, so the first paint of a
+  // legitimately-sorted view isn't thrown away.
+  const entityFieldNames = useMemo(
+    () => new Set((entityInfo?.fields ?? []).map((f: FieldResponse) => f.name)),
+    [entityInfo]
+  )
+  const sortFieldIsValid =
+    !dataSortField || entityFieldNames.size === 0 || entityFieldNames.has(dataSortField)
+  const effectiveSortField = sortFieldIsValid ? dataSortField : ''
+
+  // Drop the stale field from state too, so the column header doesn't show a
+  // sort indicator for a column this table doesn't have.
+  useEffect(() => {
+    if (dataSortField && !sortFieldIsValid) {
+      setDataSortField('')
+      setDataSortOrder('asc')
+      commitActiveTab({ sortField: undefined, sortOrder: undefined })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dataSortField, sortFieldIsValid])
+
   // Load entity data when entity is selected or page changes
   // Skip for S3 objects as they should be downloaded, not queried
   useEffect(() => {
     if (selectedEntity && selectedPath && id) {
-      // Check if this is an S3 object (skip query for object stores)
-      const isS3Object = entityInfo?.entity_type === 'object' && isObjectStore()
-
-      if (!isS3Object) {
+      // Object stores don't implement Queryable at all — asking produces
+      // "Operation not supported: Service does not support querying".
+      //
+      // The old guard was `entityInfo?.entity_type === 'object' &&
+      // isObjectStore()`, which is undefined-vs-false on the first render:
+      // entityInfo hasn't loaded yet, so the guard passed, the query fired,
+      // and every S3 object showed an error toast before its metadata
+      // rendered. `isObjectStore()` comes from explorer-support, which is
+      // already resolved by the time an entity can be selected, so it alone
+      // is the correct and race-free test.
+      if (!isObjectStore()) {
         const queryRequest: QueryDataRequest = {
           limit: pageSize,
-          offset: (page - 1) * pageSize,
-          sort_by: dataSortField || undefined,
-          sort_order: dataSortField ? dataSortOrder : undefined,
+          offset: dataOffset,
+          sort_by: effectiveSortField || undefined,
+          sort_order: effectiveSortField ? dataSortOrder : undefined,
           filters: dataFilter || undefined,
         }
 
@@ -970,6 +1238,9 @@ export function ServiceDataBrowser() {
                 entityCountHint:
                   (container.entity_count_hint as 'small' | 'large' | null) ||
                   null,
+                metadata: (container.metadata ?? undefined) as
+                  | Record<string, unknown>
+                  | undefined,
               })
             })
 
@@ -982,6 +1253,7 @@ export function ServiceDataBrowser() {
                 type: 'entity', // ← Key change: entities are entities, not containers
                 entityType: entity.entity_type,
                 level: childLevel,
+                sizeBytes: entity.size_bytes ?? undefined,
               })
             })
 
@@ -1241,30 +1513,30 @@ export function ServiceDataBrowser() {
           serviceId={id || ''}
           containerPath={selectedPath}
           containerName={selectedPath.split('/').pop() || ''}
+          containerType={selectedNode?.containerType}
           getEntityIcon={getEntityIcon}
           isObjectStore={isObjectStore}
           formatFileSize={formatFileSize}
           formatDate={formatDate}
+          onOpenEntity={(entityName) => navigateTo(selectedPath, entityName)}
         />
       )
     }
 
-    // Regular container - show info message
+    // An intermediate container (a Postgres database holding schemas). This
+    // used to be a dead end — "select an entity from the sidebar" — which
+    // wasted the whole pane and hid facts the backend already returns.
     return (
-      <Card>
-        <CardHeader>
-          <CardTitle>Container: {selectedPath.split('/').pop()}</CardTitle>
-          <CardDescription>
-            Select an entity from the sidebar to view its data
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          <p className="text-sm text-muted-foreground">
-            Expand folders in the sidebar to navigate through your data
-            structure.
-          </p>
-        </CardContent>
-      </Card>
+      <ContainerOverview
+        containerPath={selectedPath}
+        containerType={selectedNode?.containerType}
+        metadata={selectedNode?.metadata}
+        childNodes={selectedNode?.children ?? []}
+        onOpenChild={(path) => navigateTo(path)}
+        getContainerIcon={getContainerIcon}
+        getEntityIcon={getEntityIcon}
+        formatFileSize={formatFileSize}
+      />
     )
   }
 
@@ -1332,7 +1604,6 @@ export function ServiceDataBrowser() {
           {/* Main content skeleton */}
           <div
             className="flex-1 flex flex-col min-w-0 px-4 md:px-0"
-            style={{ height: 'calc(100vh - 180px)' }}
           >
             <div className="flex-1 overflow-y-auto space-y-6 pt-2">
               {/* Entity info card */}
@@ -1574,7 +1845,7 @@ export function ServiceDataBrowser() {
   }
 
   return (
-    <div className="flex-1 overflow-hidden flex flex-col">
+    <div className="flex h-full flex-col overflow-hidden">
       {/* Header */}
       <div className="p-4 md:p-6 pb-0">
         <div className="flex items-center gap-3 mb-4">
@@ -1590,6 +1861,8 @@ export function ServiceDataBrowser() {
             variant="ghost"
             size="icon"
             className="md:hidden"
+            aria-label="Toggle containers sidebar"
+            aria-expanded={isSidebarOpen}
             onClick={() => setIsSidebarOpen(!isSidebarOpen)}
           >
             <Menu className="h-4 w-4" />
@@ -1653,56 +1926,54 @@ export function ServiceDataBrowser() {
       </div>
 
       {/* Main content area with sidebar */}
-      <div className="flex-1 flex gap-0 md:gap-6 px-0 md:px-6 pb-0 md:pb-6 min-h-0 relative overflow-hidden">
-        {/* Sidebar - Tree View */}
+      {renderShell(
+        /* Sidebar - Tree View. On desktop the width comes from the resizable
+           panel, so the drawer/translate classes only apply on mobile. */
         <div
-          className={`
+          key="sidebar"
+          className={
+            isMobile
+              ? `
             ${isSidebarOpen ? 'translate-x-0' : '-translate-x-full'}
-            md:translate-x-0
             transition-transform duration-300 ease-in-out
-            fixed md:relative
-            top-0 left-0 md:left-auto md:top-auto
-            z-40
-            w-full md:w-80
-            h-full
-            flex-shrink-0
-            px-4 md:px-0
-          `}
+            fixed top-0 left-0 z-40
+            w-full h-full flex-shrink-0 px-4
+          `
+              : 'h-full w-full min-w-0'
+          }
         >
-          <Card className="h-full flex flex-col">
-            <CardHeader className="pb-3">
-              <CardTitle className="text-base flex items-center gap-2">
-                <Database className="h-4 w-4" />
-                Containers
-              </CardTitle>
-              <CardDescription className="text-xs">
-                Navigate through your data
-              </CardDescription>
-            </CardHeader>
-
-            {/* Search Control */}
-            <div className="px-4 pb-3">
+          {/* Flush rail rather than a card: the tree is primary navigation,
+              not a standalone object, and a card here only added a border,
+              ~90px of chrome and a second scroll container. */}
+          <div className="h-full flex flex-col border-r bg-background">
+            {/* Search first — with dozens of tables per schema, filtering is
+                the fast path and expanding the tree is the slow one. */}
+            <div className="p-3">
               <div className="relative">
-                <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
+                <Search className="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
                 <input
                   type="text"
-                  placeholder="Filter..."
+                  name="container-filter"
+                  aria-label="Filter containers and entities"
+                  placeholder="Filter…"
                   value={filterText}
                   onChange={(e) => setFilterText(e.target.value)}
-                  className="w-full pl-8 pr-8 py-1.5 text-sm border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-ring"
+                  className="w-full rounded-md border bg-background py-1.5 pl-8 pr-8 text-base/6 focus:outline-none focus:ring-2 focus:ring-ring sm:text-sm/6"
                 />
                 {filterText && (
                   <button
+                    type="button"
+                    aria-label="Clear filter"
                     onClick={() => setFilterText('')}
                     className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
                   >
-                    <X className="h-4 w-4" />
+                    <X className="size-4" />
                   </button>
                 )}
               </div>
             </div>
 
-            <CardContent className="flex-1 p-0 overflow-hidden border-t min-h-0">
+            <div className="flex-1 min-h-0 overflow-hidden">
               {/* Show tree error if present */}
               {treeError && (
                 <div className="p-4 border-b">
@@ -1749,27 +2020,33 @@ export function ServiceDataBrowser() {
                     getEntityIcon={getEntityIcon}
                   />
                 ) : (
-                  <div className="text-center py-8 text-sm text-muted-foreground">
+                  <div className="py-8 text-center text-base/7 text-muted-foreground sm:text-sm/6">
                     {filterText ? 'No matches found' : 'No containers'}
                   </div>
                 )}
               </div>
-            </CardContent>
-          </Card>
-        </div>
-
-        {/* Overlay for mobile when sidebar is open */}
-        {isSidebarOpen && (
+            </div>
+          </div>
+        </div>,
+        /* Overlay for mobile when the drawer is open */
+        isSidebarOpen ? (
           <div
+            key="overlay"
             className="fixed inset-0 bg-black/50 z-30 md:hidden"
             onClick={() => setIsSidebarOpen(false)}
           />
-        )}
-
-        {/* Main content */}
+        ) : null,
+        /* Main content.
+            `min-h-0` rather than a hardcoded `calc(100vh - 180px)`: the magic
+            number assumed a fixed header height, so it drifted whenever the
+            header wrapped (long service name, mobile) and left the pane either
+            clipped or overflowing the viewport. With min-h-0 the flex child
+            can shrink below its content, which is what lets the inner
+            `overflow-y-auto` own the scroll — and lets the tree rail scroll
+            independently of it. */
         <div
-          className="flex-1 flex flex-col min-w-0 px-4 md:px-0"
-          style={{ height: 'calc(100vh - 180px)' }}
+          key="content"
+          className="flex min-h-0 flex-1 flex-col min-w-0 px-4 md:px-0"
         >
           <DataBrowserTabs
             tabs={tabs}
@@ -1778,7 +2055,14 @@ export function ServiceDataBrowser() {
             onClose={handleCloseTab}
             onNewTab={handleNewTab}
           />
-          <div className="flex-1 overflow-y-auto pt-2">
+          <div
+            ref={contentScrollRef}
+            onScroll={handleContentScroll}
+            // pr-3: now that this pane owns the scroll, its scrollbar sits on
+            // the pane edge — without padding the table's right border and the
+            // row values butt straight up against it.
+            className="min-h-0 flex-1 overflow-y-auto pt-2 pr-3"
+          >
           {selectedEntity ? (
             // Show entity data
             <EntityDataView
@@ -1789,7 +2073,23 @@ export function ServiceDataBrowser() {
               queryError={queryEntityData.error}
               page={page}
               pageSize={pageSize}
+              rowOffset={dataOffset}
               onPageChange={(p) => {
+                // Advance by the rows actually received, not by pageSize. A
+                // byte-truncated page returns fewer rows than requested while
+                // more remain at this offset; stepping by pageSize would skip
+                // them without a trace. Going back steps by pageSize, which can
+                // re-show a few rows after a truncated page — harmless, whereas
+                // the other direction loses data.
+                setDataOffset((prev) => {
+                  if (p <= 1) return 0
+                  if (p > page) {
+                    return (
+                      prev + (queryEntityData.data?.returned_count ?? pageSize)
+                    )
+                  }
+                  return Math.max(0, prev - pageSize)
+                })
                 setPage(p)
                 commitActiveTab({ page: p })
               }}
@@ -1800,12 +2100,12 @@ export function ServiceDataBrowser() {
               appliedFilter={dataFilter}
               onApplyFilter={handleApplyFilter}
               onClearFilter={handleClearFilter}
-              dataSortField={dataSortField}
+              dataSortField={effectiveSortField}
               dataSortOrder={dataSortOrder}
               explorerSupport={explorerSupport}
               onSort={(field: string) => {
                 let nextField = dataSortField
-                let nextOrder: 'asc' | 'desc' = dataSortOrder
+                let nextOrder: 'asc' | 'desc'
                 if (dataSortField === field) {
                   nextOrder = dataSortOrder === 'asc' ? 'desc' : 'asc'
                   setDataSortOrder(nextOrder)
@@ -1832,9 +2132,9 @@ export function ServiceDataBrowser() {
                     },
                     body: {
                       limit: pageSize,
-                      offset: (page - 1) * pageSize,
-                      sort_by: dataSortField || undefined,
-                      sort_order: dataSortField ? dataSortOrder : undefined,
+                      offset: dataOffset,
+                      sort_by: effectiveSortField || undefined,
+                      sort_order: effectiveSortField ? dataSortOrder : undefined,
                       filters: dataFilter || undefined,
                     },
                   })
@@ -1847,6 +2147,7 @@ export function ServiceDataBrowser() {
               serviceId={id || ''}
               containerPath={selectedPath}
               entityName={selectedEntity}
+              onNavigateToContainer={(path) => navigateTo(path)}
             />
           ) : selectedPath ? (
             renderContainerContent()
@@ -1869,7 +2170,7 @@ export function ServiceDataBrowser() {
           )}
           </div>
         </div>
-      </div>
+      )}
 
       <DataBrowserCommandBar
         open={commandOpen}
@@ -1941,6 +2242,24 @@ function TreeView({
   )
 }
 
+/**
+ * Compact size for the tree rail — "216 MB", not "216.09 MB".
+ *
+ * The rail is narrow and the number sits beside a name that may already be
+ * truncated, so precision costs more than it gives; the entity view shows the
+ * exact figure.
+ */
+function formatTreeSize(bytes: number): string {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let value = bytes
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  return `${value < 10 && unit > 0 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`
+}
+
 // Tree Node Component
 function TreeNodeComponent({
   node,
@@ -1998,31 +2317,48 @@ function TreeNodeComponent({
           // Prevent browser autoscroll on middle-click
           if (e.button === 1) e.preventDefault()
         }}
-        className={`min-w-full w-max flex items-center gap-2 px-2 py-1.5 text-sm rounded-md transition-colors hover:bg-accent whitespace-nowrap ${
+        className={`flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-sm transition-colors hover:bg-accent ${
           isSelected ? 'bg-accent text-accent-foreground' : ''
         }`}
-        style={{ paddingLeft: `${level * 16 + 8}px` }}
       >
-        {canExpand && (
-          <span className="flex-shrink-0">
-            {node.isExpanded ? (
-              <ChevronDown className="h-3.5 w-3.5" />
+        {/* Reserve the chevron column even when a node can't expand, so
+            names stay aligned instead of stepping in and out. */}
+        <span className="shrink-0">
+          {canExpand ? (
+            node.isExpanded ? (
+              <ChevronDown className="size-3.5" />
             ) : (
-              <ChevronRight className="h-3.5 w-3.5" />
-            )}
-          </span>
-        )}
+              <ChevronRight className="size-3.5" />
+            )
+          ) : (
+            <span className="block size-3.5" />
+          )}
+        </span>
         {node.type === 'container'
           ? getContainerIcon(node.containerType, node.isExpanded || false)
           : getEntityIcon(node.entityType)}
-        <span className="text-left">{node.name}</span>
-        {node.containerType && (
-          <Badge variant="outline" className="text-xs flex-shrink-0 ml-auto">
-            {node.containerType}
-          </Badge>
+        {/* min-w-0 + truncate: long table names ellipsize. The previous
+            `w-max` + type Badge forced the whole rail to scroll sideways,
+            and the badge was redundant — every sibling shares a type. */}
+        <span className="min-w-0 flex-1 truncate text-left">{node.name}</span>
+        {/* Size beside the name, when the backend reports one. Unlike the old
+            type badge this differs per row, so it's worth the space — you can
+            see which table is the heavy one without opening any of them. */}
+        {node.sizeBytes !== undefined && (
+          <span className="shrink-0 text-xs tabular-nums text-muted-foreground">
+            {formatTreeSize(node.sizeBytes)}
+          </span>
         )}
       </button>
+      {/* Indent guide. Nesting used to be flat `paddingLeft: level*16`, which
+          left a child's icon only ~16px right of its parent's with nothing
+          joining them — at a glance the schemas read as siblings of the
+          database, not children. A rule dropped from the parent's chevron
+          makes the relationship explicit and survives long, truncated names.
+          The line sits at the chevron's centre: px-2 (8px) + half of
+          size-3.5 (7px). */}
       {node.isExpanded && node.children && node.children.length > 0 && (
+        <div className="ml-[15px] border-l border-border pl-2">
         <TreeView
           nodes={node.children}
           level={level + 1}
@@ -2034,6 +2370,7 @@ function TreeNodeComponent({
           getContainerIcon={getContainerIcon}
           getEntityIcon={getEntityIcon}
         />
+        </div>
       )}
     </div>
   )
@@ -2225,24 +2562,217 @@ function DynamicFilterBuilder({
 }
 
 // Container Entities View Component - Shows entities in a leaf container (like S3 bucket)
+/**
+ * Overview of a container that holds other containers.
+ *
+ * Shows what the backend already knows about it — size, owner, encoding, entity
+ * counts — followed by its children, so a database is a place you can read
+ * rather than a prompt to go use the sidebar.
+ */
+function ContainerOverview({
+  containerPath,
+  containerType,
+  metadata,
+  childNodes,
+  onOpenChild,
+  getContainerIcon,
+  getEntityIcon,
+  formatFileSize,
+}: {
+  containerPath: string
+  containerType?: string
+  metadata?: Record<string, unknown>
+  childNodes: TreeNode[]
+  onOpenChild: (path: string) => void
+  getContainerIcon: (
+    containerType: string | undefined,
+    isExpanded: boolean
+  ) => React.ReactElement
+  getEntityIcon: (entityType: string | undefined) => React.ReactElement
+  formatFileSize: (bytes: number) => string
+}) {
+  const name = containerPath.split('/').pop() ?? containerPath
+
+  // Render only keys we can present meaningfully; anything else would be raw
+  // JSON masquerading as a fact.
+  const facts: Array<{ label: string; value: string }> = []
+  const num = (k: string) => {
+    const v = metadata?.[k]
+    return typeof v === 'number' ? v : undefined
+  }
+  const text = (k: string) => {
+    const v = metadata?.[k]
+    return typeof v === 'string' ? v : undefined
+  }
+  const size = num('size_bytes')
+  if (size !== undefined) facts.push({ label: 'Size', value: formatFileSize(size) })
+  const entityCount = num('entity_count')
+  if (entityCount !== undefined)
+    facts.push({ label: 'Tables', value: entityCount.toLocaleString() })
+  const keyCount = num('key_count')
+  if (keyCount !== undefined)
+    facts.push({ label: 'Keys', value: keyCount.toLocaleString() })
+  const owner = text('owner')
+  if (owner) facts.push({ label: 'Owner', value: owner })
+  const encoding = text('encoding')
+  if (encoding) facts.push({ label: 'Encoding', value: encoding })
+
+  return (
+    <div className="flex flex-col gap-6">
+      <div>
+        <p className="text-sm/6 text-muted-foreground">
+          {containerType ?? 'container'}
+        </p>
+        <h2 className="truncate text-lg/7 font-semibold sm:text-base/6">
+          {name}
+        </h2>
+      </div>
+
+      {facts.length > 0 && (
+        <dl className="grid grid-cols-2 gap-x-6 gap-y-3 sm:grid-cols-4">
+          {facts.map((fact) => (
+            <div key={fact.label}>
+              <dt className="text-sm/6 text-muted-foreground">{fact.label}</dt>
+              <dd className="font-mono text-sm/6 tabular-nums">{fact.value}</dd>
+            </div>
+          ))}
+        </dl>
+      )}
+
+      <div>
+        <h3 className="mb-2 text-base/6 font-medium sm:text-sm/6">
+          {childNodes.length > 0
+            ? `${childNodes.length} ${childNodes.length === 1 ? 'item' : 'items'}`
+            : 'Contents'}
+        </h3>
+        {childNodes.length === 0 ? (
+          <p className="py-6 text-center text-base/7 text-muted-foreground sm:text-sm/6">
+            Nothing here yet.
+          </p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b">
+                <th className="whitespace-nowrap p-3 text-left font-medium">
+                  Name
+                </th>
+                <th className="whitespace-nowrap p-3 text-left font-medium">
+                  Type
+                </th>
+                <th className="whitespace-nowrap p-3 text-right font-medium">
+                  Contents
+                </th>
+              </tr>
+            </thead>
+            <tbody>
+              {childNodes.map((child) => {
+                const childEntities =
+                  typeof child.metadata?.entity_count === 'number'
+                    ? (child.metadata.entity_count as number)
+                    : undefined
+                return (
+                  <tr
+                    key={child.path}
+                    className="border-b last:border-0 hover:bg-muted/30"
+                  >
+                    <td className="p-3">
+                      <button
+                        type="button"
+                        onClick={() => onOpenChild(child.path)}
+                        className="flex items-center gap-2 text-left hover:underline"
+                      >
+                        <span className="shrink-0 [&>svg]:size-4">
+                          {child.type === 'container'
+                            ? getContainerIcon(child.containerType, false)
+                            : getEntityIcon(child.entityType)}
+                        </span>
+                        <span className="font-mono text-xs">{child.name}</span>
+                      </button>
+                    </td>
+                    <td className="p-3 text-xs text-muted-foreground">
+                      {child.containerType ?? child.entityType ?? '—'}
+                    </td>
+                    <td className="p-3 text-right text-xs tabular-nums">
+                      {childEntities !== undefined ? (
+                        // "entities", not "tables": the count includes views.
+                        `${childEntities.toLocaleString()} ${childEntities === 1 ? 'entity' : 'entities'}`
+                      ) : child.sizeBytes !== undefined ? (
+                        formatFileSize(child.sizeBytes)
+                      ) : (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  )
+}
+
+/**
+ * Plural noun for a container's entities, taken from what the source calls
+ * them: PostgreSQL/MySQL "table", MongoDB "collection", Redis "key", S3
+ * "object". A schema holding both tables and views falls back to the generic
+ * "entities" rather than picking one and misdescribing the rest.
+ */
+function pluralEntityNoun(
+  entities: EntityResponse[],
+  objectStore: boolean
+): string {
+  if (objectStore) return 'objects'
+  if (entities.length === 0) return 'entities'
+
+  const kinds = new Set(
+    entities.map((e) => (e.entity_type ?? '').toUpperCase())
+  )
+  if (kinds.size !== 1) return 'entities'
+
+  switch (kinds.values().next().value) {
+    case 'BASE TABLE':
+    case 'TABLE':
+      return 'tables'
+    case 'VIEW':
+      return 'views'
+    case 'COLLECTION':
+      return 'collections'
+    case 'KEY':
+      return 'keys'
+    case 'OBJECT':
+      return 'objects'
+    default:
+      return 'entities'
+  }
+}
+
 function ContainerEntitiesView({
   serviceId,
   containerPath,
   containerName,
+  containerType,
   getEntityIcon,
   isObjectStore,
   formatFileSize,
   formatDate,
+  onOpenEntity,
 }: {
   serviceId: string
   containerPath: string
   containerName: string
+  /** e.g. "database", "schema", "bucket" — labels an otherwise bare name. */
+  containerType?: string
   getEntityIcon: (entityType: string | undefined) => React.ReactElement
   isObjectStore: () => boolean
   formatFileSize: (bytes: number) => string
   formatDate: (dateString: string | undefined) => string
+  /** Open an entity's rows in the main pane. */
+  onOpenEntity?: (entityName: string) => void
 }) {
   const [nextToken, setNextToken] = useState<string | null>(null)
+  const [entityFilter, setEntityFilter] = useState('')
   const [selectedEntityForInfo, setSelectedEntityForInfo] = useState<
     string | null
   >(null)
@@ -2299,7 +2829,8 @@ function ContainerEntitiesView({
     ...queryDataMutation(),
   })
 
-  // Handler to view key value
+  // Handler to view key value (Redis/KV: the "entity" IS the value, so the
+  // row opens a peek dialog rather than navigating to a rows table).
   const handleViewKeyValue = (entityName: string) => {
     setSelectedKeyForValue(entityName)
     queryKeyValue.mutate({
@@ -2313,6 +2844,16 @@ function ContainerEntitiesView({
         offset: 0,
       },
     })
+  }
+
+  // Object stores download; key-value stores peek at the value; everything
+  // else (tables, collections) opens its rows in the main pane.
+  const openEntity = (entityName: string) => {
+    if (onOpenEntity) {
+      onOpenEntity(entityName)
+    } else {
+      handleViewKeyValue(entityName)
+    }
   }
 
   if (isLoading) {
@@ -2392,35 +2933,93 @@ function ContainerEntitiesView({
   // Split path into segments for display
   const pathSegments = containerPath.split('/')
 
+  // Narrow the loaded page client-side. A schema like pg_catalog has 60+
+  // tables; without this the only way to find one is to read the whole list.
+  const visibleEntities = entityFilter.trim()
+    ? entitiesList.filter((e: EntityResponse) =>
+        e.name.toLowerCase().includes(entityFilter.trim().toLowerCase())
+      )
+    : entitiesList
+
+  // Name entities the way the backend does. `isObjectStore() ? objects :
+  // tables` is a binary that only covers two of the five engines, so Redis
+  // keys and Mongo collections were both being announced as "tables". The
+  // entity_type the source itself reports is the honest label.
+  const entityNoun = pluralEntityNoun(visibleEntities, isObjectStore())
+
+  // Only render a column that actually says something. Across the five
+  // backends most containers are homogeneous — every Redis entity is a `key`,
+  // every Mongo one a `collection`, every MySQL one a `table` — so a Type
+  // column repeats one word down the page. It earns its place only where
+  // types genuinely differ (a Postgres schema holding both tables and views).
+  // Same for Rows and Size: a backend that reports neither would otherwise get
+  // two columns of em dashes.
+  const showTypeColumn =
+    new Set(visibleEntities.map((e: EntityResponse) => e.entity_type)).size > 1
+  // A column of identical values carries no information. Redis reports
+  // row_count = 1 for every key (a key *is* one entity), which rendered as a
+  // column of 1s down the page; requiring at least two distinct values drops
+  // it there while keeping it wherever counts actually vary.
+  const distinctRowCounts = new Set(
+    visibleEntities
+      .map((e: EntityResponse) => e.row_count)
+      .filter((c) => c !== null && c !== undefined)
+  )
+  const showRowsColumn = distinctRowCounts.size > 1
+  const showSizeColumn = visibleEntities.some(
+    (e: EntityResponse) => e.size_bytes !== null && e.size_bytes !== undefined
+  )
+
   return (
-    <Card>
-      <CardHeader>
-        <div className="flex items-center justify-between">
-          <div className="flex-1">
-            <div className="flex items-center gap-2 text-sm text-muted-foreground mb-2">
-              {pathSegments.map((segment, index) => (
-                <div key={index} className="flex items-center gap-2">
-                  {index > 0 && <span>/</span>}
-                  <span
-                    className={
-                      index === pathSegments.length - 1
-                        ? 'font-medium text-foreground'
-                        : ''
-                    }
-                  >
-                    {segment}
-                  </span>
-                </div>
-              ))}
-            </div>
-            <CardTitle className="flex items-center gap-2">
-              <Database className="h-5 w-5" />
-              {containerName}
-            </CardTitle>
-            <CardDescription>
-              Showing {count} {isObjectStore() ? 'objects' : 'entities'}
-              {total !== null && total !== undefined && ` of ${total}`}
-            </CardDescription>
+    <div className="flex flex-col gap-4">
+      {/* Header — breadcrumb, count, filter. No card: the table is the
+          content, and wrapping it in one only adds a border and padding. */}
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-end sm:justify-between">
+        <div className="min-w-0">
+          <nav className="flex flex-wrap items-center gap-1 text-sm/6 text-muted-foreground">
+            {pathSegments.map((segment, index) => (
+              <span key={index} className="flex items-center gap-1">
+                {index > 0 && <span aria-hidden="true">/</span>}
+                <span
+                  className={
+                    index === pathSegments.length - 1
+                      ? 'font-medium text-foreground'
+                      : ''
+                  }
+                >
+                  {/* Label the leaf with its container type. A Redis database
+                      is named "0", which on its own reads as a stray digit
+                      rather than a location. */}
+                  {index === pathSegments.length - 1 && containerType
+                    ? `${containerType} ${segment}`
+                    : segment}
+                </span>
+              </span>
+            ))}
+          </nav>
+          <h2 className="mt-1 truncate text-lg/7 font-semibold sm:text-base/6">
+            {count} {entityNoun}
+            {total !== null && total !== undefined && total !== count
+              ? ` of ${total}`
+              : ''}
+            {entityFilter.trim() && visibleEntities.length !== count
+              ? ` · ${visibleEntities.length} matching`
+              : ''}
+          </h2>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="text"
+              name="entity-filter"
+              aria-label={`Filter ${entityNoun}`}
+              placeholder={`Filter ${entityNoun}…`}
+              value={entityFilter}
+              onChange={(e) => setEntityFilter(e.target.value)}
+              className="w-full rounded-md border bg-background py-1.5 pl-8 pr-2 text-base/6 focus:outline-none focus:ring-2 focus:ring-ring sm:w-56 sm:text-sm/6"
+            />
           </div>
           <Button
             variant="ghost"
@@ -2429,60 +3028,84 @@ function ContainerEntitiesView({
               setNextToken(null)
               refetch()
             }}
-            className="gap-2"
+            title="Refresh"
           >
-            <RefreshCcw className="h-4 w-4" />
-            Refresh
+            <RefreshCcw className="size-4" />
+            <span className="sr-only">Refresh</span>
           </Button>
         </div>
-      </CardHeader>
-      <CardContent>
-        {entitiesList.length > 0 ? (
+      </div>
+
+      <div>
+        {visibleEntities.length > 0 ? (
           <>
-            <div className="rounded-md border overflow-x-auto">
+            <div className="-my-2 overflow-x-auto">
+              <div className="inline-block min-w-full py-2 align-middle">
               <table className="w-full text-sm">
                 <thead>
-                  <tr className="border-b bg-muted/50">
-                    <th className="text-left p-3 font-medium whitespace-nowrap">
-                      Type
-                    </th>
-                    <th className="text-left p-3 font-medium whitespace-nowrap">
+                  <tr className="border-b">
+                    <th className="whitespace-nowrap p-3 text-left font-medium">
                       Name
                     </th>
                     {isObjectStore() ? (
                       <>
-                        <th className="text-left p-3 font-medium whitespace-nowrap">
-                          Content Type
+                        <th className="whitespace-nowrap p-3 text-left font-medium">
+                          Content type
                         </th>
-                        <th className="text-left p-3 font-medium whitespace-nowrap">
+                        <th className="whitespace-nowrap p-3 text-left font-medium">
                           Size
                         </th>
-                        <th className="text-left p-3 font-medium whitespace-nowrap">
-                          Last Modified
+                        <th className="whitespace-nowrap p-3 text-left font-medium">
+                          Last modified
                         </th>
-                        <th className="text-right p-3 font-medium whitespace-nowrap">
-                          Actions
+                        <th className="whitespace-nowrap p-3 text-right font-medium">
+                          <span className="sr-only">Actions</span>
                         </th>
                       </>
                     ) : (
-                      <th className="text-right p-3 font-medium whitespace-nowrap">
-                        Actions
-                      </th>
+                      <>
+                        {showTypeColumn && (
+                          <th className="whitespace-nowrap p-3 text-left font-medium">
+                            Type
+                          </th>
+                        )}
+                        {showRowsColumn && (
+                          <th className="whitespace-nowrap p-3 text-right font-medium">
+                            Rows
+                          </th>
+                        )}
+                        {showSizeColumn && (
+                          <th className="whitespace-nowrap p-3 text-right font-medium">
+                            Size
+                          </th>
+                        )}
+                      </>
                     )}
                   </tr>
                 </thead>
                 <tbody>
-                  {entitiesList.map((entity: EntityResponse, idx: number) => (
+                  {visibleEntities.map((entity: EntityResponse, idx: number) => (
                     <tr
                       key={`${entity.name}-${idx}`}
                       className="border-b last:border-0 hover:bg-muted/30"
                     >
                       <td className="p-3">
-                        <div className="[&>svg]:h-4 [&>svg]:w-4">
-                          {getEntityIcon(entity.entity_type)}
-                        </div>
+                        {/* The name is the link. A row whose only affordance
+                            is a button at the far right reads as inert —
+                            people click the thing they came for. */}
+                        <button
+                          type="button"
+                          onClick={() => openEntity(entity.name)}
+                          className="flex items-center gap-2 text-left hover:underline"
+                        >
+                          <span className="shrink-0 [&>svg]:size-4">
+                            {getEntityIcon(entity.entity_type)}
+                          </span>
+                          <span className="font-mono text-xs">
+                            {entity.name}
+                          </span>
+                        </button>
                       </td>
-                      <td className="p-3 font-mono text-xs">{entity.name}</td>
                       {isObjectStore() ? (
                         <>
                           <td className="p-3 text-xs">
@@ -2572,51 +3195,74 @@ function ContainerEntitiesView({
                           </td>
                         </>
                       ) : (
-                        <td className="p-3 text-right">
-                          <Button
-                            variant="ghost"
-                            size="sm"
-                            className="h-8 px-2"
-                            onClick={() => handleViewKeyValue(entity.name)}
-                            title="View Value"
-                          >
-                            <Eye className="h-4 w-4" />
-                          </Button>
-                        </td>
+                        <>
+                          {showTypeColumn && (
+                            <td className="p-3 text-xs text-muted-foreground">
+                              {entity.entity_type === 'BASE TABLE'
+                                ? 'table'
+                                : (entity.entity_type ?? '—').toLowerCase()}
+                            </td>
+                          )}
+                          {showRowsColumn && (
+                            <td className="p-3 text-right text-xs tabular-nums">
+                              {entity.row_count === null ||
+                              entity.row_count === undefined ? (
+                                <span className="text-muted-foreground">—</span>
+                              ) : (
+                                entity.row_count.toLocaleString()
+                              )}
+                            </td>
+                          )}
+                          {showSizeColumn && (
+                            <td className="p-3 text-right text-xs tabular-nums">
+                              {entity.size_bytes === null ||
+                              entity.size_bytes === undefined ? (
+                                <span className="text-muted-foreground">—</span>
+                              ) : (
+                                formatFileSize(entity.size_bytes)
+                              )}
+                            </td>
+                          )}
+                        </>
                       )}
                     </tr>
                   ))}
                 </tbody>
               </table>
+              </div>
             </div>
 
-            {/* Pagination Controls */}
-            <div className="flex items-center justify-between mt-4">
-              <div className="text-sm text-muted-foreground">
-                {count} {isObjectStore() ? 'objects' : 'entities'} shown
-                {total !== null && total !== undefined && ` of ${total} total`}
+            {/* Pagination — only shown when the backend actually pages
+                (S3/Redis token cursors). A 60-table schema arrives in one
+                response, and showing dead controls under it is noise. */}
+            {(hasMore || nextToken) && (
+              <div className="mt-4 flex items-center justify-between">
+                <div className="text-sm/6 text-muted-foreground">
+                  {count} {entityNoun} shown
+                  {total !== null && total !== undefined && ` of ${total} total`}
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!nextToken}
+                    onClick={() => setNextToken(null)}
+                  >
+                    First page
+                  </Button>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    disabled={!hasMore}
+                    onClick={() =>
+                      setNextToken(entitiesResponse?.next_token || null)
+                    }
+                  >
+                    Next page
+                  </Button>
+                </div>
               </div>
-              <div className="flex items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!nextToken}
-                  onClick={() => setNextToken(null)}
-                >
-                  First Page
-                </Button>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={!hasMore}
-                  onClick={() =>
-                    setNextToken(entitiesResponse?.next_token || null)
-                  }
-                >
-                  Next Page
-                </Button>
-              </div>
-            </div>
+            )}
 
             {/* Entity Info Modal */}
             <Dialog
@@ -2843,14 +3489,29 @@ function ContainerEntitiesView({
               </DialogContent>
             </Dialog>
           </>
+        ) : entityFilter.trim() ? (
+          <div className="py-10 text-center">
+            <p className="text-base/7 text-muted-foreground sm:text-sm/6">
+              No {entityNoun} match &ldquo;{entityFilter.trim()}&rdquo;.
+            </p>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="mt-2"
+              onClick={() => setEntityFilter('')}
+            >
+              Clear filter
+            </Button>
+          </div>
         ) : (
-          <div className="text-center py-8 text-sm text-muted-foreground">
-            No {isObjectStore() ? 'objects' : 'entities'} found in this
-            container
+          <div className="py-10 text-center">
+            <p className="text-base/7 text-muted-foreground sm:text-sm/6">
+              This container has no {entityNoun}.
+            </p>
           </div>
         )}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   )
 }
 
@@ -2863,6 +3524,7 @@ function EntityDataView({
   queryError,
   page,
   pageSize,
+  rowOffset,
   onPageChange,
   dataFilterInput,
   onDataFilterInputChange,
@@ -2883,6 +3545,7 @@ function EntityDataView({
   serviceId,
   containerPath,
   entityName,
+  onNavigateToContainer,
 }: {
   entityInfo?: EntityInfoResponse
   entityInfoLoading: boolean
@@ -2891,6 +3554,9 @@ function EntityDataView({
   queryError: any
   page: number
   pageSize: number
+  /** Row offset of the current page; see `dataOffset` for why this is not
+   *  derived from `page * pageSize`. */
+  rowOffset: number
   onPageChange: (page: number) => void
   dataFilterInput: string
   onDataFilterInputChange: (filter: string) => void
@@ -2911,8 +3577,49 @@ function EntityDataView({
   serviceId: string
   containerPath: string
   entityName: string
+  /** Navigate up to a container path — powers the breadcrumb. */
+  onNavigateToContainer?: (path: string) => void
 }) {
   const [showSchema, setShowSchema] = useState(false)
+
+  // Column visibility. Wide tables (30+ columns) forced horizontal scrolling
+  // to read anything, so the operator picks what matters. Keyed by field name
+  // and reset when the entity changes, since column names don't carry over.
+  const [hiddenColumns, setHiddenColumns] = useState<Set<string>>(new Set())
+  useEffect(() => {
+    setHiddenColumns(new Set())
+  }, [entityInfo?.entity])
+
+  const allFields: FieldResponse[] = queryResult?.fields ?? []
+  const visibleFields = allFields.filter((f) => !hiddenColumns.has(f.name))
+
+  const toggleColumn = (name: string) => {
+    setHiddenColumns((prev) => {
+      const next = new Set(prev)
+      if (next.has(name)) {
+        next.delete(name)
+      } else {
+        // Never hide the last column — an empty table is a dead end with no
+        // affordance to recover from.
+        if (allFields.length - next.size <= 1) return prev
+        next.add(name)
+      }
+      return next
+    })
+  }
+
+  // Row detail. The index is into the current page's rows; cleared whenever a
+  // new result set arrives so a stale index can't point at a different row.
+  const [detailRowIndex, setDetailRowIndex] = useState<number | null>(null)
+  useEffect(() => {
+    setDetailRowIndex(null)
+  }, [queryResult])
+  const detailRow =
+    detailRowIndex !== null
+      ? ((queryResult?.rows?.[detailRowIndex] as
+          | Record<string, unknown>
+          | undefined) ?? null)
+      : null
   const [isFilterExpanded, setIsFilterExpanded] = useState(false)
   const [isDownloading, setIsDownloading] = useState(false)
 
@@ -3027,27 +3734,75 @@ function EntityDataView({
   const errorDetail = error?.detail
 
   return (
-    <div className="space-y-6">
-      {/* Entity Info Card */}
+    <div className="space-y-4">
+      {/* Entity header. Previously two stacked cards — one for the title, one
+          for "Data" — pushed the first row ~470px down the page. The table is
+          the content; the name and its stats fit on one line above it, and a
+          card around a heading adds a border for nothing. */}
       {entityInfo && (
-        <Card>
-          <CardHeader>
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle className="flex items-center gap-2">
-                  <div className="[&>svg]:h-5 [&>svg]:w-5">
+        <div>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
+              <div className="min-w-0">
+                {/* Breadcrumb inline with the name rather than stacked above
+                    it. Path, title and type on three separate rows spent a
+                    third of the header restating one identity; the parent
+                    segments are muted and clickable, the entity is the
+                    emphasis. Also the only way back up — the header's arrow
+                    exits to the service page, several levels too far. */}
+                <h2 className="flex flex-wrap items-center gap-x-1.5 gap-y-0.5 text-lg/7 font-semibold sm:text-base/6">
+                  <span className="shrink-0 [&>svg]:size-4">
                     {getEntityIcon(entityInfo.entity_type)}
-                  </div>
-                  {entityInfo.entity}
-                </CardTitle>
-                <CardDescription>
-                  Type: {entityInfo.entity_type}
+                  </span>
+                  {containerPath &&
+                    containerPath.split('/').map((segment, index, segments) => {
+                      const target = segments.slice(0, index + 1).join('/')
+                      return (
+                        <span
+                          key={target}
+                          className="flex items-center gap-1.5 font-normal text-muted-foreground"
+                        >
+                          <button
+                            type="button"
+                            onClick={() => onNavigateToContainer?.(target)}
+                            className="rounded-sm hover:text-foreground hover:underline"
+                          >
+                            {segment}
+                          </button>
+                          <span aria-hidden="true">/</span>
+                        </span>
+                      )
+                    })}
+                  <span className="truncate">{entityInfo.entity}</span>
+                </h2>
+                {/* Everything that was spread across two card descriptions
+                    and a standalone badge, on one muted line. */}
+                <p className="mt-0.5 text-base/6 text-muted-foreground sm:text-sm/6">
+                  {entityInfo.entity_type === 'BASE TABLE'
+                    ? 'table'
+                    : entityInfo.entity_type}
                   {!isObjectStore() && entityInfo.fields && (
-                    <> • {entityInfo.fields.length} fields</>
+                    <> · {entityInfo.fields.length} fields</>
                   )}
-                </CardDescription>
+                  {queryResult?.total_count !== undefined && (
+                    <>
+                      {' '}
+                      · <span className="tabular-nums">
+                        {queryResult.total_count.toLocaleString()}
+                      </span>{' '}
+                      rows
+                    </>
+                  )}
+                  {queryResult?.execution_time_ms !== undefined && (
+                    <>
+                      {' '}
+                      · <span className="tabular-nums">
+                        {queryResult.execution_time_ms}ms
+                      </span>
+                    </>
+                  )}
+                </p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 {/* Download button for S3 objects */}
                 {isObjectStore() && entityInfo.entity_type === 'object' && (
                   <Button
@@ -3076,30 +3831,24 @@ function EntityDataView({
                     size="sm"
                     onClick={() => setShowSchema(!showSchema)}
                   >
-                    {showSchema ? 'Hide' : 'Show'} Schema
+                    {showSchema ? 'Hide' : 'Show'} schema
                   </Button>
                 )}
                 {/* Only show Refresh button for non-S3-objects */}
                 {!(isObjectStore() && entityInfo.entity_type === 'object') && (
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    onClick={onRefresh}
-                    className="gap-2"
-                  >
-                    <RefreshCcw className="h-4 w-4" />
-                    Refresh
+                  <Button variant="ghost" size="sm" onClick={onRefresh}>
+                    <RefreshCcw className="size-4" />
+                    <span className="sr-only">Refresh</span>
                   </Button>
                 )}
               </div>
             </div>
-          </CardHeader>
 
           {/* Show object metadata for S3 objects */}
           {isObjectStore() &&
             entityInfo.entity_type === 'object' &&
             (entityInfo as any).metadata && (
-              <CardContent className="pt-0">
+              <div className="pt-2">
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-4">
                   {/* File Size */}
                   {(entityInfo as any).size_bytes !== undefined && (
@@ -3188,11 +3937,11 @@ function EntityDataView({
                     </div>
                   )}
                 </div>
-              </CardContent>
+              </div>
             )}
 
           {!isObjectStore() && showSchema && entityInfo.fields && (
-            <CardContent>
+            <div className="pt-2">
               <div className="space-y-2">
                 <h3 className="font-medium text-sm mb-3">Schema</h3>
                 <div className="rounded-md border">
@@ -3224,54 +3973,88 @@ function EntityDataView({
                   </table>
                 </div>
               </div>
-            </CardContent>
+            </div>
           )}
-        </Card>
+        </div>
       )}
 
       {/* Data Table - Only show for non-S3-objects */}
       {!(isObjectStore() && entityInfo?.entity_type === 'object') && (
-        <Card>
-          <CardHeader>
-            <div className="flex items-center justify-between">
-              <div>
-                <CardTitle className="flex items-center gap-2">
-                  Data
-                  {hasFilterSupport && (
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => setIsFilterExpanded(!isFilterExpanded)}
-                      className="h-7 px-2"
+        <div>
+          <div className="pb-3">
+            <div className="flex items-center justify-between gap-2">
+              {/* No "Data" heading: the table below is self-evidently the
+                  data, and the counts now live in the entity header line.
+                  Only the filter toggle needs a home here. */}
+              <div className="flex items-center gap-2">
+                {hasFilterSupport && (
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => setIsFilterExpanded(!isFilterExpanded)}
+                  >
+                    {isFilterExpanded ? (
+                      <ChevronDown className="size-4" />
+                    ) : (
+                      <ChevronRight className="size-4" />
+                    )}
+                    {isFilterExpanded ? 'Hide filter' : 'Filter'}
+                  </Button>
+                )}
+                {appliedFilter !== undefined && (
+                  <span className="text-sm/6 text-muted-foreground">
+                    filtered
+                  </span>
+                )}
+                {allFields.length > 1 && (
+                  <DropdownMenu>
+                    <DropdownMenuTrigger asChild>
+                      <Button variant="outline" size="sm">
+                        <Columns3 className="size-4" />
+                        Columns
+                        {hiddenColumns.size > 0 && (
+                          <span className="tabular-nums text-muted-foreground">
+                            {visibleFields.length}/{allFields.length}
+                          </span>
+                        )}
+                      </Button>
+                    </DropdownMenuTrigger>
+                    <DropdownMenuContent
+                      align="start"
+                      className="max-h-80 w-56 overflow-y-auto"
                     >
-                      {isFilterExpanded ? (
+                      <DropdownMenuLabel>Visible columns</DropdownMenuLabel>
+                      <DropdownMenuSeparator />
+                      {allFields.map((field) => (
+                        <DropdownMenuCheckboxItem
+                          key={field.name}
+                          checked={!hiddenColumns.has(field.name)}
+                          onCheckedChange={() => toggleColumn(field.name)}
+                          onSelect={(e) => e.preventDefault()}
+                        >
+                          <span className="truncate font-mono text-xs">
+                            {field.name}
+                          </span>
+                        </DropdownMenuCheckboxItem>
+                      ))}
+                      {hiddenColumns.size > 0 && (
                         <>
-                          <ChevronDown className="h-4 w-4" />
-                          <span className="text-xs ml-1">Hide Filter</span>
-                        </>
-                      ) : (
-                        <>
-                          <ChevronRight className="h-4 w-4" />
-                          <span className="text-xs ml-1">Show Filter</span>
+                          <DropdownMenuSeparator />
+                          <DropdownMenuItem
+                            onSelect={() => setHiddenColumns(new Set())}
+                          >
+                            Show all
+                          </DropdownMenuItem>
                         </>
                       )}
-                    </Button>
-                  )}
-                </CardTitle>
-                {queryResult && (
-                  <CardDescription>
-                    Showing {queryResult.returned_count} of{' '}
-                    {queryResult.total_count || '?'}{' '}
-                    {isObjectStore() ? 'objects' : 'rows'}
-                    {appliedFilter !== undefined && ' (filtered)'} • Execution
-                    time: {queryResult.execution_time_ms}ms
-                  </CardDescription>
+                    </DropdownMenuContent>
+                  </DropdownMenu>
                 )}
               </div>
               {queryLoading && (
-                <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  <span>Loading...</span>
+                <div className="flex items-center gap-2 text-sm/6 text-muted-foreground">
+                  <Loader2 className="size-4 animate-spin" />
+                  <span>Loading…</span>
                 </div>
               )}
             </div>
@@ -3351,29 +4134,19 @@ function EntityDataView({
                 </div>
               </div>
             )}
-            {/* Show info badge about capabilities */}
-            {explorerSupport && (
-              <div className="flex gap-2 mt-3">
-                {explorerSupport.capabilities.map((capability) => (
-                  <Badge
-                    key={capability}
-                    variant="secondary"
-                    className="text-xs"
-                  >
-                    {capability.toUpperCase()}
-                  </Badge>
-                ))}
-              </div>
-            )}
-          </CardHeader>
-          <CardContent>
+            {/* The capability badges ("SQL") used to sit on their own row
+                here. They describe the service, not this table, and are
+                already implied by the filter placeholder — dropping the row
+                buys back vertical space on every single table view. */}
+          </div>
+          <div>
             {queryResult && queryResult.rows && queryResult.rows.length > 0 ? (
               <>
                 <div className="rounded-md border overflow-x-auto">
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b bg-muted/50">
-                        {queryResult.fields?.map((field: FieldResponse) => (
+                        {visibleFields.map((field: FieldResponse) => (
                           <th
                             key={field.name}
                             className="text-left p-3 font-medium whitespace-nowrap"
@@ -3403,7 +4176,7 @@ function EntityDataView({
                           key={rowIndex}
                           className="border-b last:border-0 hover:bg-muted/30"
                         >
-                          {queryResult.fields?.map((field: FieldResponse) => (
+                          {visibleFields.map((field: FieldResponse) => (
                             <td
                               key={field.name}
                               className="p-3 align-middle"
@@ -3412,6 +4185,10 @@ function EntityDataView({
                                 value={row[field.name]}
                                 fieldType={field.field_type}
                                 fieldName={field.name}
+                                // Expanding a JSON cell used to open a panel
+                                // containing only that value, so you lost which
+                                // row it came from. Now it opens the whole row.
+                                onExpand={() => setDetailRowIndex(rowIndex)}
                               />
                             </td>
                           ))}
@@ -3421,16 +4198,112 @@ function EntityDataView({
                   </table>
                 </div>
 
+                {/* Row detail. Opening a JSON cell previously showed that
+                    value alone, stripped of the row it came from. This shows
+                    every field — including columns hidden from the table — so
+                    expanding a blob doesn't cost you the context around it. */}
+                <Sheet
+                  open={detailRow !== null}
+                  onOpenChange={(open) => {
+                    if (!open) setDetailRowIndex(null)
+                  }}
+                >
+                  <SheetContent className="w-full overflow-y-auto sm:max-w-xl">
+                    <SheetHeader>
+                      <SheetTitle>Row detail</SheetTitle>
+                      <SheetDescription>
+                        {entityInfo?.entity}
+                        {detailRowIndex !== null && (
+                          <>
+                            {' · row '}
+                            {rowOffset + detailRowIndex + 1}
+                          </>
+                        )}
+                      </SheetDescription>
+                    </SheetHeader>
+
+                    <dl className="mt-4 divide-y divide-border/60">
+                      {allFields.map((field) => {
+                        const raw = detailRow?.[field.name]
+                        const isStructured =
+                          raw !== null &&
+                          raw !== undefined &&
+                          typeof raw === 'object'
+                        const text = isStructured
+                          ? JSON.stringify(raw, null, 2)
+                          : String(raw ?? '')
+                        return (
+                          <div key={field.name} className="py-3">
+                            <dt className="flex items-baseline justify-between gap-2">
+                              <span className="font-mono text-xs font-medium">
+                                {field.name}
+                              </span>
+                              <span className="shrink-0 text-xs text-muted-foreground">
+                                {field.field_type}
+                                {hiddenColumns.has(field.name) && ' · hidden'}
+                              </span>
+                            </dt>
+                            <dd className="mt-1">
+                              {raw === null || raw === undefined ? (
+                                <span className="text-sm/6 italic text-muted-foreground">
+                                  null
+                                </span>
+                              ) : isStructured ? (
+                                <pre className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-xs whitespace-pre-wrap break-all">
+                                  {text}
+                                </pre>
+                              ) : (
+                                <span className="font-mono text-xs break-all">
+                                  {text}
+                                </span>
+                              )}
+                            </dd>
+                          </div>
+                        )
+                      })}
+                    </dl>
+
+                    <div className="mt-4 flex justify-end">
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() =>
+                          navigator.clipboard.writeText(
+                            JSON.stringify(detailRow ?? {}, null, 2)
+                          )
+                        }
+                      >
+                        <Copy className="size-4" />
+                        Copy row as JSON
+                      </Button>
+                    </div>
+                  </SheetContent>
+                </Sheet>
+
                 {/* Pagination */}
                 <div className="flex items-center justify-between mt-4">
                   <div className="text-sm text-muted-foreground flex items-center gap-2">
                     <span>
-                      Page {page} • Rows {(page - 1) * pageSize + 1} -{' '}
-                      {(page - 1) * pageSize + queryResult.returned_count}
+                      Page {page} • Rows {rowOffset + 1} -{' '}
+                      {rowOffset + queryResult.returned_count}
                     </span>
                     {appliedFilter !== undefined && (
                       <Badge variant="secondary" className="text-xs">
                         Filtered
+                      </Badge>
+                    )}
+                    {/* The server drops rows to stay inside a response size
+                        budget when a table holds large values (blobs, big
+                        JSON). Say so: a short page is otherwise indistinguish-
+                        able from having reached the end of the table. */}
+                    {queryResult.truncated && (
+                      <Badge
+                        variant="outline"
+                        className="text-xs gap-1 border-amber-500/50 text-amber-600 dark:text-amber-400"
+                        title="This page was shortened to stay within the response size limit. There are more rows at this offset — deselect large columns to fit more per page."
+                      >
+                        <AlertTriangle className="size-3" />
+                        Shortened to fit
                       </Badge>
                     )}
                   </div>
@@ -3446,8 +4319,14 @@ function EntityDataView({
                     <Button
                       variant="outline"
                       size="sm"
+                      // A byte-truncated page returns fewer rows than asked for
+                      // while there is still more data, so `returned_count <
+                      // pageSize` alone would disable Next and strand the user
+                      // partway through the table with no way forward.
                       disabled={
-                        !queryResult || queryResult.returned_count < pageSize
+                        !queryResult ||
+                        (queryResult.returned_count < pageSize &&
+                          !queryResult.truncated)
                       }
                       onClick={() => onPageChange(page + 1)}
                     >
@@ -3463,8 +4342,8 @@ function EntityDataView({
                   : 'No data found'}
               </div>
             )}
-          </CardContent>
-        </Card>
+          </div>
+        </div>
       )}
     </div>
   )

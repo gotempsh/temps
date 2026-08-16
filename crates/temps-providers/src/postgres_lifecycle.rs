@@ -360,6 +360,10 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
         })
     }
 
+    async fn docker_image(&self, service_id: i32) -> Result<String, String> {
+        Ok(self.load_postgres_config(service_id).await?.docker_image)
+    }
+
     async fn stop_and_remove(&self, service_id: i32) -> Result<(), String> {
         let svc = self.load_service_row(service_id).await?;
         let container_name = format!("postgres-{}", svc.name);
@@ -485,6 +489,14 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
                 "postgres".to_string(),
                 "-c".to_string(),
                 format!("max_connections={}", cfg.max_connections),
+                // Enable pg_stat_statements at provision time so the extension
+                // can be created after startup. A restart (not just a reload)
+                // is required to change shared_preload_libraries, so this is
+                // set once at container-creation time. Existing services that
+                // were provisioned before this change need a container restart
+                // (via the restart endpoint) for the change to take effect.
+                "-c".to_string(),
+                "shared_preload_libraries=pg_stat_statements".to_string(),
             ]),
             host_config: Some(host_config),
             networking_config,

@@ -64,12 +64,14 @@
 //! - `temps-query-redis` - Redis implementation (future)
 //! - `temps-query-mongodb` - MongoDB implementation (future)
 
+mod budget;
 pub mod error;
 pub mod registry;
 pub mod traits;
 pub mod types;
 
 // Re-export commonly used items
+pub use budget::BoundedRows;
 pub use error::{DataError, Result};
 pub use registry::{ConnectionConfig, DataSourceFactory, QueryRegistry};
 pub use traits::{
@@ -79,5 +81,5 @@ pub use traits::{
 pub use types::{
     Capability, ContainerCapabilities, ContainerInfo, ContainerPath, ContainerType, DataRow,
     DatabaseInfo, DatasetSchema, EntityCountHint, EntityInfo, EntityRef, FieldDef, FieldType,
-    NamespaceInfo, NamespaceRef, QueryOptions, QueryResult, QueryStats,
+    NamespaceInfo, NamespaceRef, QueryBudget, QueryOptions, QueryResult, QueryStats,
 };

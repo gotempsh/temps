@@ -50,6 +50,12 @@ impl TempsPlugin for AuthPlugin {
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
             let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
 
+            let permission_denial_recorder =
+                crate::permission_denial_recorder::PermissionDenialRecorder::new(
+                    audit_service.clone(),
+                );
+            context.register_service(permission_denial_recorder);
+
             // Require notification service
             let notification_service =
                 context.require_service::<dyn temps_core::notifications::NotificationService>();
@@ -61,6 +67,10 @@ impl TempsPlugin for AuthPlugin {
             // Create UserService
             let user_service = Arc::new(UserService::new(db.clone()));
             context.register_service(user_service.clone());
+
+            let sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer> =
+                Arc::new(crate::DefaultSensitiveActionAuthorizer::new(db.clone()));
+            context.register_service(sensitive_action_authorizer);
 
             // Create OidcService
             let oidc_service = Arc::new(crate::oidc_service::OidcService::new(
@@ -126,7 +136,13 @@ impl TempsPlugin for AuthPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         // Get the AuthState
-        let auth_state = context.require_service::<AuthState>();
+        let auth_state = Arc::new(
+            (*context.require_service::<AuthState>())
+                .clone()
+                .with_sensitive_action_authorizer(
+                    context.require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+                ),
+        );
 
         // Use the existing configure_routes function which includes all endpoints
         let auth_routes = handlers::configure_routes()
@@ -153,7 +169,7 @@ impl TempsPlugin for AuthPlugin {
                     .description(Some(
                         "Complete API for authentication, authorization, and user management. \
                         Includes login/logout, MFA, user CRUD operations, role management, \
-                        magic links, password reset, and email verification.",
+                        password reset, and email verification.",
                     ))
                     .version("1.0.0")
                     .build(),
@@ -211,6 +227,9 @@ impl TempsPlugin for AuthPlugin {
         let cookie_crypto = context.require_service::<temps_core::CookieCrypto>();
         let api_key_service = context.require_service::<crate::apikey_service::ApiKeyService>();
         let db = context.require_service::<sea_orm::DatabaseConnection>();
+        let permission_denial_recorder =
+            context
+                .require_service::<crate::permission_denial_recorder::PermissionDenialRecorder>();
 
         // Request-metadata middleware (runs on BOTH admin and public routers
         // because public ingest endpoints — session-replay init, analytics
@@ -227,6 +246,7 @@ impl TempsPlugin for AuthPlugin {
             user_service,
             cookie_crypto,
             db,
+            permission_denial_recorder,
         );
         middleware_collection.add_temps_middleware(Arc::new(auth_middleware));
 

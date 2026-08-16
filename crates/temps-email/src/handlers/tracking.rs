@@ -131,7 +131,7 @@ pub async fn track_open(
     get,
     path = "/emails/{email_id}/track/click/{link_index}",
     responses(
-        (status = 302, description = "Redirect to original URL"),
+        (status = 307, description = "Redirect to original URL"),
         (status = 404, description = "Link not found")
     ),
     params(
@@ -396,14 +396,14 @@ pub async fn get_email_tracking(
     // Count unique IPs for opens/clicks
     let unique_opens = events
         .iter()
-        .filter(|e| e.event_type == "open")
+        .filter(|e| e.event_type == "opened")
         .filter_map(|e| e.ip_address.as_ref())
         .collect::<std::collections::HashSet<_>>()
         .len() as u64;
 
     let unique_clicks = events
         .iter()
-        .filter(|e| e.event_type == "click")
+        .filter(|e| e.event_type == "clicked")
         .filter_map(|e| e.ip_address.as_ref())
         .collect::<std::collections::HashSet<_>>()
         .len() as u64;

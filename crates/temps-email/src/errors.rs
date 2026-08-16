@@ -43,6 +43,12 @@ pub enum EmailError {
     #[error("Scaleway error: {0}")]
     Scaleway(String),
 
+    #[error("Failed to build Scaleway HTTP client")]
+    ScalewayClientBuild {
+        #[source]
+        source: reqwest::Error,
+    },
+
     #[error("SMTP error: {0}")]
     Smtp(String),
 

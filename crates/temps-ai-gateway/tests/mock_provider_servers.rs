@@ -35,6 +35,7 @@ impl MockOpenAiServer {
     pub async fn start() -> Self {
         let app = Router::new()
             .route("/v1/chat/completions", post(openai_chat_completions))
+            .route("/v1/responses", post(openai_responses))
             .route("/v1/embeddings", post(openai_embeddings));
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -51,6 +52,126 @@ impl MockOpenAiServer {
             _handle: handle,
         }
     }
+}
+
+async fn openai_responses(
+    headers: HeaderMap,
+    Json(request): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let authenticated = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("Bearer ") && value.len() > 7);
+    if !authenticated {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({
+                "error": {"message": "Invalid API key"}
+            })),
+        )
+            .into_response();
+    }
+
+    let model = request
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("gpt-5.6-luna")
+        .to_string();
+    let tools = request.get("tools").and_then(serde_json::Value::as_array);
+    let has_tools = tools.is_some_and(|tools| !tools.is_empty());
+    let function_output_call_id = request
+        .get("input")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| {
+            items.iter().find_map(|item| {
+                (item.get("type").and_then(serde_json::Value::as_str)
+                    == Some("function_call_output"))
+                .then(|| item.get("call_id").and_then(serde_json::Value::as_str))
+                .flatten()
+            })
+        });
+    if function_output_call_id.is_some_and(|call_id| call_id != "call_mock") {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": {"message": "gateway tool call id was not restored to the upstream id"}
+            })),
+        )
+            .into_response();
+    }
+    if has_tools {
+        let flattened_tool = tools
+            .and_then(|tools| tools.first())
+            .and_then(|tool| tool.get("name"))
+            .and_then(serde_json::Value::as_str)
+            == Some("lookup");
+        let reasoning = request
+            .pointer("/reasoning/effort")
+            .and_then(serde_json::Value::as_str);
+        if !flattened_tool || reasoning != Some("medium") {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "error": {"message": "Responses tools must be flattened and retain reasoning effort"}
+            })))
+                .into_response();
+        }
+    }
+
+    if request.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
+        let stream = async_stream::stream! {
+            for event in [
+                serde_json::json!({
+                    "type": "response.created",
+                    "response": {"id": "resp_mock", "model": model, "created_at": 1710000000i64}
+                }),
+                serde_json::json!({"type": "response.output_text.delta", "delta": "Hello"}),
+                serde_json::json!({"type": "response.output_text.delta", "delta": " from Responses"}),
+                serde_json::json!({
+                    "type": "response.completed",
+                    "response": {
+                        "id": "resp_mock", "model": model, "created_at": 1710000000i64,
+                        "status": "completed",
+                        "output": [{"type": "message", "content": [{"type": "output_text", "text": "Hello from Responses"}]}],
+                        "usage": {"input_tokens": 5, "output_tokens": 3, "total_tokens": 8}
+                    }
+                }),
+            ] {
+                yield Ok::<_, std::convert::Infallible>(format!("event: {}\r\ndata: {}\r\n\r\n", event["type"].as_str().unwrap(), event));
+            }
+        };
+        return axum::response::Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(stream))
+            .unwrap()
+            .into_response();
+    }
+
+    let output = if function_output_call_id.is_some() {
+        serde_json::json!([
+            {"type": "message", "content": [{"type": "output_text", "text": "Tool result accepted"}]}
+        ])
+    } else if has_tools {
+        serde_json::json!([
+            {"type": "reasoning", "id": "rs_mock", "encrypted_content": "opaque"},
+            {"type": "function_call", "call_id": "call_mock", "name": "lookup", "arguments": "{}"}
+        ])
+    } else {
+        serde_json::json!([
+            {"type": "message", "content": [{"type": "output_text", "text": "Mock Responses result"}]}
+        ])
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "id": "resp_mock",
+            "model": model,
+            "created_at": 1710000000i64,
+            "status": "completed",
+            "output": output,
+            "usage": {"input_tokens": 7, "output_tokens": 4, "total_tokens": 11}
+        })),
+    )
+        .into_response()
 }
 
 #[derive(Deserialize)]

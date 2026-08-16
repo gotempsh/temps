@@ -12,7 +12,7 @@ impl AuthEmailService {
     }
 
     /// Whether an email provider capable of delivering transactional mail
-    /// (password reset, verification, magic link) is configured. This is
+    /// (password reset, email verification) is configured. This is
     /// specifically an *email* provider — a Slack-only notification setup
     /// does not count, since those features need a real inbox delivery.
     pub async fn is_email_provider_configured(&self) -> bool {
@@ -97,46 +97,6 @@ impl AuthEmailService {
                 </html>"#,
                 base_url = base_url,
                 token = token
-            )),
-            from: None,
-            reply_to: None,
-        };
-        self.notification_service
-            .send_transactional_email(message)
-            .await
-    }
-
-    pub async fn send_magic_link_email(
-        &self,
-        email: &str,
-        magic_link_url: &str,
-    ) -> Result<(), NotificationError> {
-        let message = EmailMessage {
-            to: vec![email.to_string()],
-            subject: "Your Magic Login Link".to_string(),
-            body: format!("Click here to login: {url}", url = magic_link_url),
-            html_body: Some(format!(
-                r#"<!DOCTYPE html>
-                <html>
-                <head>
-                    <style>
-                        body {{ font-family: Arial, sans-serif; line-height: 1.6; }}
-                        .container {{ max-width: 600px; margin: 0 auto; padding: 20px; }}
-                        .button {{ background-color: #28a745; color: white; padding: 12px 24px; text-decoration: none; border-radius: 4px; display: inline-block; margin: 20px 0; }}
-                        .warning {{ color: #666; font-size: 14px; margin-top: 20px; }}
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <h2>Magic Link Login</h2>
-                        <p>Click the link below to instantly log in to your account:</p>
-                        <a href="{url}" class="button">Login Now</a>
-                        <p class="warning">This link will expire in 15 minutes.</p>
-                        <p class="warning">If you didn't request this, please ignore this email.</p>
-                    </div>
-                </body>
-                </html>"#,
-                url = magic_link_url
             )),
             from: None,
             reply_to: None,
@@ -253,31 +213,6 @@ mod tests {
         assert!(html.contains("https://app.example.com/auth/reset-password?token=reset-token-456"));
         assert!(html.contains("reset-token-456"));
         assert!(html.contains("This link will expire in 1 hour"));
-    }
-
-    #[tokio::test]
-    async fn test_send_magic_link_email() {
-        let mock_service = Arc::new(MockNotificationService::new());
-        let email_service = AuthEmailService::new(mock_service.clone());
-
-        let magic_url = "https://example.com/auth/magic?token=magic-789";
-        let result = email_service
-            .send_magic_link_email("magic@example.com", magic_url)
-            .await;
-
-        assert!(result.is_ok());
-
-        let sent_emails = mock_service.get_sent_emails().await;
-        assert_eq!(sent_emails.len(), 1);
-
-        let email = &sent_emails[0];
-        assert_eq!(email.to, vec!["magic@example.com"]);
-        assert_eq!(email.subject, "Your Magic Login Link");
-        assert!(email.body.contains(magic_url));
-
-        let html = email.html_body.as_ref().unwrap();
-        assert!(html.contains(magic_url));
-        assert!(html.contains("This link will expire in 15 minutes"));
     }
 
     #[tokio::test]

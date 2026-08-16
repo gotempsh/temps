@@ -231,6 +231,20 @@ fn is_video_platform(hostname: &str) -> bool {
     VIDEO_PLATFORMS.iter().any(|vp| hostname_lower.contains(vp))
 }
 
+/// True when `referrer` is the same host as `current`, or a subdomain of it
+/// (or vice versa — `www.example.com` referring `example.com` is still us).
+///
+/// Comparison is case-insensitive and anchored on a dot boundary, so
+/// `nottemps.sh` is NOT a self-referral of `temps.sh`.
+fn is_same_site(referrer: &str, current: &str) -> bool {
+    let r = referrer.trim_end_matches('.').to_ascii_lowercase();
+    let c = current.trim_end_matches('.').to_ascii_lowercase();
+    if r.is_empty() || c.is_empty() {
+        return false;
+    }
+    r == c || r.ends_with(&format!(".{c}")) || c.ends_with(&format!(".{r}"))
+}
+
 /// Determine marketing channel from UTM parameters and referrer
 ///
 /// This follows Google Analytics 4 default channel groupings:
@@ -355,9 +369,16 @@ pub fn get_channel(
 
     // No UTM params - use referrer analysis
     if let Some(ref_host) = referrer_hostname {
-        // Check for self-referral
+        // Check for self-referral — the same host, or a subdomain of it.
+        //
+        // This must be a boundary-aware comparison, not a substring test. A
+        // bare `contains` treats `nottemps.sh` and `temps.sh.evil.example` as
+        // self-referrals of `temps.sh`, which silently deletes real referrals
+        // from acquisition reporting and lets any third party suppress its own
+        // attribution just by choosing a hostname that contains ours. Shorter
+        // apex domains make that trivial.
         if let Some(current) = current_hostname {
-            if ref_host.contains(current) || current.contains(ref_host) {
+            if is_same_site(ref_host, current) {
                 // Self-referral, treat as continuation of session
                 return Channel::Direct;
             }
@@ -512,6 +533,48 @@ mod tests {
         assert_eq!(
             get_channel(&utm, Some("example-blog.com"), Some("mysite.com")),
             Channel::Referral
+        );
+    }
+
+    #[test]
+    fn test_self_referral_match_is_boundary_anchored() {
+        let utm = UtmParams::default();
+        // Same host, and subdomains in both directions, are us.
+        assert_eq!(
+            get_channel(&utm, Some("temps.sh"), Some("temps.sh")),
+            Channel::Direct
+        );
+        assert_eq!(
+            get_channel(&utm, Some("www.temps.sh"), Some("temps.sh")),
+            Channel::Direct
+        );
+        assert_eq!(
+            get_channel(&utm, Some("temps.sh"), Some("www.temps.sh")),
+            Channel::Direct
+        );
+        assert_eq!(
+            get_channel(&utm, Some("TEMPS.SH"), Some("temps.sh")),
+            Channel::Direct,
+            "host comparison must be case-insensitive"
+        );
+
+        // Regression: a bare substring test classified all of these as Direct,
+        // which silently deletes real referrals and lets a third party suppress
+        // its own attribution by choosing a hostname containing ours.
+        assert_eq!(
+            get_channel(&utm, Some("nottemps.sh"), Some("temps.sh")),
+            Channel::Referral,
+            "a host merely ending in ours is a different site"
+        );
+        assert_eq!(
+            get_channel(&utm, Some("temps.sh.evil.example"), Some("temps.sh")),
+            Channel::Referral,
+            "a host merely starting with ours is a different site"
+        );
+        assert_eq!(
+            get_channel(&utm, Some("temps.shop"), Some("temps.sh")),
+            Channel::Referral,
+            "a longer TLD is a different site"
         );
     }
 

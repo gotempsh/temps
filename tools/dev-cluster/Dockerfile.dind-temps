@@ -15,7 +15,7 @@ FROM debian:trixie-slim
 # Runtime tools the kernel data plane + dockerd need.
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates curl gnupg jq bash \
+        ca-certificates curl gnupg jq bash openssl \
         iproute2 nftables bridge-utils iputils-ping \
         e2fsprogs xfsprogs xz-utils \
         libssl3 libgcc-s1 \

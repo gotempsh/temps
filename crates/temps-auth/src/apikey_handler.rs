@@ -35,6 +35,8 @@ pub struct ApiKeyState {
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Audit logger for write operations (e.g. key rotation)
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
+    /// Central policy evaluator for sensitive mutations.
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 /// Privilege-escalation ceiling: an API key must never grant more than the
@@ -51,12 +53,13 @@ pub struct ApiKeyState {
 /// requester actually holds the permissions being granted. Unparsable
 /// custom permission strings and unrecognized role names are left to that
 /// existing validation, which returns 400.
-fn enforce_permission_ceiling(
+fn enforce_permission_ceiling_for_role(
     auth: &crate::context::AuthContext,
-    request: &CreateApiKeyRequest,
+    role_type: &str,
+    permissions: Option<&[String]>,
 ) -> Result<(), Problem> {
-    if request.role_type == "custom" {
-        let Some(ref permissions) = request.permissions else {
+    if role_type == "custom" {
+        let Some(permissions) = permissions else {
             return Ok(());
         };
         for perm_str in permissions {
@@ -72,7 +75,7 @@ fn enforce_permission_ceiling(
     // Predefined role type: the minted key inherits that role's ENTIRE
     // permission set, so every permission the role carries must also be
     // held by the requester — not just some of them.
-    if let Some(role) = crate::permissions::Role::from_str(&request.role_type) {
+    if let Some(role) = crate::permissions::Role::from_str(role_type) {
         for perm in role.permissions() {
             if !auth.has_permission(perm) {
                 return Err(permission_ceiling_exceeded(&perm.to_string()));
@@ -80,6 +83,13 @@ fn enforce_permission_ceiling(
         }
     }
     Ok(())
+}
+
+fn enforce_permission_ceiling(
+    auth: &crate::context::AuthContext,
+    request: &CreateApiKeyRequest,
+) -> Result<(), Problem> {
+    enforce_permission_ceiling_for_role(auth, &request.role_type, request.permissions.as_deref())
 }
 
 fn permission_ceiling_exceeded(perm_str: &str) -> Problem {
@@ -102,6 +112,7 @@ fn permission_ceiling_exceeded(perm_str: &str) -> Problem {
         (status = 400, description = "Bad request"),
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
+        (status = 428, description = "Recent MFA verification required"),
         (status = 409, description = "Conflict - API key name already exists"),
         (status = 500, description = "Internal server error")
     ),
@@ -119,6 +130,13 @@ pub async fn create_api_key(
     permission_guard!(auth, ApiKeysCreate);
 
     enforce_permission_ceiling(&auth, &request)?;
+
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::CreateApiKey,
+    )
+    .await?;
 
     // Capture audit fields before request is moved into the service call.
     let role_type = request.role_type.clone();
@@ -383,6 +401,7 @@ pub async fn activate_api_key(
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Forbidden"),
         (status = 404, description = "Not found"),
+        (status = 428, description = "Recent MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
     tag = "API Keys",
@@ -397,6 +416,21 @@ pub async fn rotate_api_key(
     Path(api_key_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ApiKeysWrite);
+    permission_guard!(auth, ApiKeysCreate);
+
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::RotateApiKey { api_key_id },
+    )
+    .await?;
+
+    let target = state
+        .api_key_service
+        .get_api_key(auth.user_id(), api_key_id)
+        .await
+        .map_err(|e| e.to_problem())?;
+    enforce_permission_ceiling_for_role(&auth, &target.role_type, target.permissions.as_deref())?;
 
     let rotated = state
         .api_key_service
@@ -477,11 +511,65 @@ pub struct ApiKeyApiDoc;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use async_trait::async_trait;
     use chrono::Utc;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use temps_core::{SensitiveActionAuthorizationError, SensitiveActionDecision};
     use temps_entities::users;
 
     use crate::context::AuthContext;
     use crate::permissions::Role;
+
+    struct RequireVerificationAuthorizer;
+
+    #[async_trait]
+    impl temps_core::SensitiveActionAuthorizer for RequireVerificationAuthorizer {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<SensitiveActionDecision, SensitiveActionAuthorizationError> {
+            Ok(SensitiveActionDecision::RequireVerification {
+                mfa_setup_required: false,
+            })
+        }
+    }
+
+    struct NoopAuditLogger;
+
+    #[async_trait]
+    impl temps_core::AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> temps_core::anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn guarded_state() -> Arc<ApiKeyState> {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        Arc::new(ApiKeyState {
+            api_key_service: Arc::new(ApiKeyService::new(db)),
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            audit_service: Arc::new(NoopAuditLogger),
+            sensitive_action_authorizer: Arc::new(RequireVerificationAuthorizer),
+        })
+    }
+
+    fn request_metadata() -> RequestMetadata {
+        RequestMetadata {
+            ip_address: "127.0.0.1".to_string(),
+            user_agent: "sensitive-action-handler-test".to_string(),
+            headers: Default::default(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: "http://localhost".to_string(),
+            scheme: "http".to_string(),
+            host: "localhost".to_string(),
+            is_secure: false,
+        }
+    }
 
     fn test_user(id: i32) -> users::Model {
         let now = Utc::now();
@@ -495,6 +583,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -508,6 +597,56 @@ mod tests {
 
     fn user_auth(role: Role) -> AuthContext {
         AuthContext::new_session(test_user(42), role)
+    }
+
+    fn api_key_auth(role: Role) -> AuthContext {
+        AuthContext::new_api_key(test_user(42), Some(role), None, "caller".to_string(), 7)
+    }
+
+    fn persisted_admin_auth() -> AuthContext {
+        AuthContext::new_persisted_session(test_user(42), Role::Admin, 99)
+    }
+
+    #[tokio::test]
+    async fn create_handler_stops_before_service_when_step_up_is_required() {
+        let result = create_api_key(
+            RequireAuth(persisted_admin_auth()),
+            State(guarded_state()),
+            Extension(request_metadata()),
+            Json(predefined_request("admin")),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("API key creation must stop before querying the service"),
+        };
+
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(
+            error.body.get("action"),
+            Some(&serde_json::json!("create_api_key"))
+        );
+    }
+
+    #[tokio::test]
+    async fn rotation_handler_stops_before_service_when_step_up_is_required() {
+        let result = rotate_api_key(
+            RequireAuth(persisted_admin_auth()),
+            State(guarded_state()),
+            Extension(request_metadata()),
+            Path(123),
+        )
+        .await;
+        let error = match result {
+            Err(error) => error,
+            Ok(_) => panic!("API key rotation must stop before querying the service"),
+        };
+
+        assert_eq!(error.status_code, StatusCode::PRECONDITION_REQUIRED);
+        assert_eq!(
+            error.body.get("action"),
+            Some(&serde_json::json!("rotate_api_key"))
+        );
     }
 
     fn custom_request(permissions: Vec<&str>) -> CreateApiKeyRequest {
@@ -567,6 +706,32 @@ mod tests {
         let req = predefined_request("admin");
         let err = enforce_permission_ceiling(&auth, &req).unwrap_err();
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn lower_privileged_api_key_cannot_rotate_admin_key() {
+        let auth = api_key_auth(Role::User);
+        let err = enforce_permission_ceiling_for_role(&auth, "admin", None)
+            .expect_err("user API key must not acquire an admin key secret");
+
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            err.body.get("error_code"),
+            Some(&serde_json::json!("PERMISSION_CEILING_EXCEEDED"))
+        );
+    }
+
+    #[test]
+    fn api_key_can_rotate_key_within_its_permission_ceiling() {
+        let auth = api_key_auth(Role::User);
+
+        assert!(enforce_permission_ceiling_for_role(&auth, "user", None).is_ok());
+        assert!(enforce_permission_ceiling_for_role(
+            &auth,
+            "custom",
+            Some(&["projects:read".to_string()])
+        )
+        .is_ok());
     }
 
     /// A user requesting a predefined role that is a subset of (or equal

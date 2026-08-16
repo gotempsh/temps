@@ -1,8 +1,14 @@
-use chrono::{DateTime, Duration, Utc};
-use std::collections::HashMap;
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
+use std::collections::{HashMap, VecDeque};
 use std::hash::Hash;
 use std::sync::Arc;
-use tokio::sync::RwLock;
+use std::time::{Duration, Instant};
+use tokio::sync::{Mutex, RwLock};
+
+const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
+const COMMIT_LOOKUP_REQUESTS_PER_MINUTE: usize = 60;
+const TAG_REFRESH_REQUESTS_PER_MINUTE: usize = 5;
+const PROVIDER_LOOKUP_MAX_PRINCIPALS: usize = 10_000;
 
 /// Cache entry with expiration time
 #[derive(Clone, Debug)]
@@ -15,7 +21,7 @@ impl<T> CacheEntry<T> {
     fn new(value: T, ttl_minutes: i64) -> Self {
         Self {
             value,
-            expires_at: Utc::now() + Duration::minutes(ttl_minutes),
+            expires_at: Utc::now() + ChronoDuration::minutes(ttl_minutes),
         }
     }
 
@@ -32,6 +38,7 @@ where
 {
     cache: Arc<RwLock<HashMap<K, CacheEntry<V>>>>,
     default_ttl_minutes: i64,
+    max_entries: usize,
 }
 
 impl<K, V> GitProviderCache<K, V>
@@ -41,9 +48,15 @@ where
 {
     /// Create a new cache with the given default TTL in minutes
     pub fn new(default_ttl_minutes: i64) -> Self {
+        Self::new_with_capacity(default_ttl_minutes, DEFAULT_CACHE_MAX_ENTRIES)
+    }
+
+    /// Create a cache with an explicit entry bound.
+    pub fn new_with_capacity(default_ttl_minutes: i64, max_entries: usize) -> Self {
         Self {
             cache: Arc::new(RwLock::new(HashMap::new())),
             default_ttl_minutes,
+            max_entries: max_entries.max(1),
         }
     }
 
@@ -69,6 +82,14 @@ where
     /// Set a value in the cache with a custom TTL
     pub async fn set_with_ttl(&self, key: K, value: V, ttl_minutes: i64) {
         let mut cache = self.cache.write().await;
+        if cache.len() >= self.max_entries && !cache.contains_key(&key) {
+            cache.retain(|_, entry| !entry.is_expired());
+        }
+        if cache.len() >= self.max_entries && !cache.contains_key(&key) {
+            if let Some(eviction_key) = cache.keys().next().cloned() {
+                cache.remove(&eviction_key);
+            }
+        }
         cache.insert(key, CacheEntry::new(value, ttl_minutes));
     }
 
@@ -139,13 +160,83 @@ impl TagCacheKey {
     }
 }
 
-/// Cache key for commit existence checks
+/// Cache key for immutable commit metadata lookups
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct CommitCacheKey {
     pub connection_id: i32,
     pub owner: String,
     pub repo: String,
     pub commit_ref: String,
+}
+
+#[derive(Debug)]
+struct ProviderLookupWindow {
+    requests: VecDeque<Instant>,
+    last_seen: Instant,
+}
+
+/// Bounded, per-principal sliding-window limiter for upstream provider lookups.
+pub struct ProviderLookupRateLimiter {
+    windows: Mutex<HashMap<String, ProviderLookupWindow>>,
+    max_requests: usize,
+    window: Duration,
+    max_principals: usize,
+}
+
+impl ProviderLookupRateLimiter {
+    pub fn new(max_requests: usize, window: Duration, max_principals: usize) -> Self {
+        Self {
+            windows: Mutex::new(HashMap::new()),
+            max_requests: max_requests.max(1),
+            window,
+            max_principals: max_principals.max(1),
+        }
+    }
+
+    /// Record an upstream lookup, returning the retry delay when the limit is reached.
+    pub async fn check(&self, principal: &str) -> Result<(), u64> {
+        let now = Instant::now();
+        let cutoff = now.checked_sub(self.window).unwrap_or(now);
+        let mut windows = self.windows.lock().await;
+
+        windows.retain(|_, entry| entry.last_seen >= cutoff);
+        if windows.len() >= self.max_principals && !windows.contains_key(principal) {
+            if let Some(oldest) = windows
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_seen)
+                .map(|(key, _)| key.clone())
+            {
+                windows.remove(&oldest);
+            }
+        }
+
+        let entry = windows
+            .entry(principal.to_string())
+            .or_insert_with(|| ProviderLookupWindow {
+                requests: VecDeque::new(),
+                last_seen: now,
+            });
+        entry.last_seen = now;
+        while entry
+            .requests
+            .front()
+            .is_some_and(|request| *request < cutoff)
+        {
+            entry.requests.pop_front();
+        }
+
+        if entry.requests.len() >= self.max_requests {
+            let retry_after = entry
+                .requests
+                .front()
+                .map(|request| self.window.saturating_sub(now.duration_since(*request)))
+                .unwrap_or(self.window);
+            return Err(retry_after.as_secs().max(1));
+        }
+
+        entry.requests.push_back(now);
+        Ok(())
+    }
 }
 
 impl CommitCacheKey {
@@ -217,8 +308,16 @@ pub struct GitProviderCacheManager {
     /// Cache for repository tags (60 minutes TTL)
     pub tags: GitProviderCache<TagCacheKey, Vec<crate::services::git_provider::GitProviderTag>>,
 
-    /// Cache for commit existence checks (30 minutes TTL)
-    pub commits: GitProviderCache<CommitCacheKey, bool>,
+    /// Cache for immutable commit metadata and negative lookups (30 minutes TTL)
+    pub commits: GitProviderCache<CommitCacheKey, Option<crate::services::git_provider::Commit>>,
+
+    /// Per-user or API-key limiter for cache-miss provider lookups.
+    pub commit_lookup_rate_limiter: ProviderLookupRateLimiter,
+
+    /// Per-user or API-key limiter for cache-bypassing tag refreshes. A single
+    /// refresh can paginate through up to ten provider pages, so this is
+    /// intentionally stricter than the immutable commit lookup limiter.
+    pub tag_refresh_rate_limiter: ProviderLookupRateLimiter,
 
     /// Cache for public repository branches (15 minutes TTL - shorter due to rate limits)
     pub public_branches:
@@ -234,6 +333,16 @@ impl GitProviderCacheManager {
             branches: GitProviderCache::new(60), // 60 minutes for branches
             tags: GitProviderCache::new(60),     // 60 minutes for tags
             commits: GitProviderCache::new(30),  // 30 minutes for commits
+            commit_lookup_rate_limiter: ProviderLookupRateLimiter::new(
+                COMMIT_LOOKUP_REQUESTS_PER_MINUTE,
+                Duration::from_secs(60),
+                PROVIDER_LOOKUP_MAX_PRINCIPALS,
+            ),
+            tag_refresh_rate_limiter: ProviderLookupRateLimiter::new(
+                TAG_REFRESH_REQUESTS_PER_MINUTE,
+                Duration::from_secs(60),
+                PROVIDER_LOOKUP_MAX_PRINCIPALS,
+            ),
             public_branches: GitProviderCache::new(15), // 15 minutes for public branches (rate limit aware)
             public_presets: GitProviderCache::new(30),  // 30 minutes for public presets
         }
@@ -319,6 +428,76 @@ mod tests {
             cache.get(&"valid".to_string()).await,
             Some("value".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn cache_never_exceeds_its_entry_bound() {
+        let cache: GitProviderCache<String, String> = GitProviderCache::new_with_capacity(1, 2);
+
+        cache.set("one".to_string(), "1".to_string()).await;
+        cache.set("two".to_string(), "2".to_string()).await;
+        cache.set("three".to_string(), "3".to_string()).await;
+
+        assert_eq!(cache.len().await, 2);
+        assert_eq!(cache.get(&"three".to_string()).await.as_deref(), Some("3"));
+    }
+
+    #[tokio::test]
+    async fn commit_cache_distinguishes_negative_result_from_cache_miss() {
+        let cache: GitProviderCache<String, Option<crate::services::git_provider::Commit>> =
+            GitProviderCache::new(1);
+
+        cache.set("missing".to_string(), None).await;
+
+        assert!(cache.get(&"unknown".to_string()).await.is_none());
+        assert!(matches!(
+            cache.get(&"missing".to_string()).await,
+            Some(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn commit_lookup_rate_limiter_is_scoped_by_principal() {
+        let limiter = ProviderLookupRateLimiter::new(1, Duration::from_secs(60), 10);
+
+        assert!(limiter.check("user:1").await.is_ok());
+        assert!(limiter.check("user:1").await.is_err());
+        assert!(limiter.check("api-key:1").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn commit_lookup_rate_limiter_bounds_principal_memory() {
+        let limiter = ProviderLookupRateLimiter::new(1, Duration::from_secs(60), 2);
+
+        assert!(limiter.check("user:1").await.is_ok());
+        assert!(limiter.check("user:2").await.is_ok());
+        assert!(limiter.check("user:3").await.is_ok());
+
+        assert!(limiter.windows.lock().await.len() <= 2);
+    }
+
+    #[tokio::test]
+    async fn tag_refresh_rate_limiter_uses_the_stricter_provider_budget() {
+        let manager = GitProviderCacheManager::new();
+
+        for _ in 0..TAG_REFRESH_REQUESTS_PER_MINUTE {
+            assert!(manager
+                .tag_refresh_rate_limiter
+                .check("user:1")
+                .await
+                .is_ok());
+        }
+
+        assert!(manager
+            .tag_refresh_rate_limiter
+            .check("user:1")
+            .await
+            .is_err());
+        assert!(manager
+            .tag_refresh_rate_limiter
+            .check("user:2")
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ homepage.workspace = true
 [dependencies]
 # Internal crates
 temps-auth = { path = "../temps-auth" }
+temps-core = { path = "../temps-core" }
 
 # Async runtime
 tokio = { workspace = true }

@@ -23,6 +23,73 @@ use crate::ExternalServiceManager;
 /// Cache of active connections by (service_id, database_name)
 type ConnectionCache = HashMap<(i32, String), Arc<dyn DataSource>>;
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum PostgresConnectionPolicy {
+    Standard,
+    ManagedPrivate,
+}
+
+impl PostgresConnectionPolicy {
+    async fn connect(
+        self,
+        host: &str,
+        port: u16,
+        username: &str,
+        password: &str,
+        database: &str,
+    ) -> Result<PostgresSource> {
+        match self {
+            Self::Standard => {
+                PostgresSource::connect(host, port, username, password, database).await
+            }
+            Self::ManagedPrivate => {
+                PostgresSource::connect_private(host, port, username, password, database).await
+            }
+        }
+    }
+}
+
+fn postgres_connection_target(
+    cluster_primary: Option<(String, u16)>,
+    standalone_host: String,
+    standalone_port: u16,
+) -> (String, u16, PostgresConnectionPolicy) {
+    match cluster_primary {
+        Some((host, port)) => (host, port, PostgresConnectionPolicy::ManagedPrivate),
+        None => (
+            standalone_host,
+            standalone_port,
+            PostgresConnectionPolicy::Standard,
+        ),
+    }
+}
+
+/// Wall-clock ceiling applied to a data-browser query when the caller does not
+/// supply one.
+///
+/// Matches `QueryOptions::default()`. Long enough that an honest query over a
+/// large table on a busy box still completes; short enough that a request which
+/// is never going to finish stops holding a connection. This is a browser, not
+/// a reporting tool — anything slower than this wants a real client.
+pub const DEFAULT_QUERY_TIMEOUT_MS: u64 = 30_000;
+
+/// Hard ceiling on the caller-supplied timeout.
+///
+/// The deadline is the only thing bounding how long one request can hold a
+/// control-plane task and a connection to the operator's database, so it must
+/// not itself be caller-controlled without limit.
+pub const MAX_QUERY_TIMEOUT_MS: u64 = 60_000;
+
+/// Resolve the effective query deadline, clamped to [`MAX_QUERY_TIMEOUT_MS`].
+///
+/// Split out and public so the handler layer and the tests agree on the value
+/// without duplicating the clamp.
+pub fn effective_timeout_ms(requested: Option<u64>) -> u64 {
+    requested
+        .unwrap_or(DEFAULT_QUERY_TIMEOUT_MS)
+        .clamp(1, MAX_QUERY_TIMEOUT_MS)
+}
+
 /// Service for managing query connections to external services
 pub struct QueryService {
     external_service_manager: Arc<ExternalServiceManager>,
@@ -50,6 +117,7 @@ impl QueryService {
         admin_user: &str,
         admin_password: &str,
         database: &str,
+        connection_policy: PostgresConnectionPolicy,
     ) -> std::result::Result<String, DataError> {
         // Deterministic password derived from admin password so it's stable across calls
         use std::collections::hash_map::DefaultHasher;
@@ -59,7 +127,8 @@ impl QueryService {
         let explorer_password = format!("te_{:x}", hasher.finish());
 
         // Connect as admin to the target database
-        let pg_source = PostgresSource::connect(host, port, admin_user, admin_password, database)
+        let pg_source = connection_policy
+            .connect(host, port, admin_user, admin_password, database)
             .await
             .map_err(|e| {
                 DataError::ConnectionFailed(format!(
@@ -227,7 +296,7 @@ impl QueryService {
                 // `<svc>.temps.local` because they run on the overlay and
                 // resolve via the local Hickory listener — but that's the
                 // app's path, not ours.
-                let (host, port) = match self
+                let (host, port, connection_policy) = match self
                     .external_service_manager
                     .get_cluster_primary_address(service_id)
                     .await
@@ -237,7 +306,11 @@ impl QueryService {
                             "Using cluster primary {}:{} for service {} explorer",
                             primary_host, primary_port, service_id
                         );
-                        (primary_host, primary_port)
+                        postgres_connection_target(
+                            Some((primary_host, primary_port)),
+                            config.host.clone(),
+                            5432,
+                        )
                     }
                     Ok(None) => {
                         // Standalone service — use config host/port as before
@@ -251,7 +324,7 @@ impl QueryService {
                                     e
                                 ))
                             })?;
-                        (config.host.clone(), port)
+                        postgres_connection_target(None, config.host.clone(), port)
                     }
                     Err(e) => {
                         return Err(DataError::ConnectionFailed(format!(
@@ -272,6 +345,7 @@ impl QueryService {
                     &config.username,
                     &admin_password,
                     database,
+                    connection_policy,
                 )
                 .await
                 {
@@ -286,21 +360,16 @@ impl QueryService {
                 };
 
                 // Connect to the specified database with the explorer (or fallback admin) user
-                let pg_source = PostgresSource::connect(
-                    &host,
-                    port,
-                    &connect_user,
-                    &connect_password,
-                    database,
-                )
-                .await
-                .map_err(|e| {
-                    error!(
-                        "Failed to connect to PostgreSQL service {} database {}: {}",
-                        service_id, database, e
-                    );
-                    e
-                })?;
+                let pg_source = connection_policy
+                    .connect(&host, port, &connect_user, &connect_password, database)
+                    .await
+                    .map_err(|e| {
+                        error!(
+                            "Failed to connect to PostgreSQL service {} database {}: {}",
+                            service_id, database, e
+                        );
+                        e
+                    })?;
 
                 Arc::new(pg_source)
             }
@@ -357,11 +426,22 @@ impl QueryService {
                     )
                 };
 
-                // Create MongoDB source
-                let mongodb_source = MongoDBSource::new(&connection_string).await.map_err(|e| {
-                    error!("Failed to connect to MongoDB service {}: {}", service_id, e);
-                    e
-                })?;
+                // Create MongoDB source, pinned to the service's configured
+                // database.
+                //
+                // SECURITY: the pin must be passed explicitly. The URI built
+                // above deliberately carries no `/dbname` segment, so relying on
+                // the driver to infer the scope left `MongoDBSource` unpinned
+                // and its database guard inert — every non-system database on
+                // the server stayed reachable through path segment 0. This
+                // matches what the Postgres and MariaDB backends enforce.
+                let mongodb_source =
+                    MongoDBSource::new_scoped(&connection_string, Some(config.database.as_str()))
+                        .await
+                        .map_err(|e| {
+                            error!("Failed to connect to MongoDB service {}: {}", service_id, e);
+                            e
+                        })?;
 
                 Arc::new(mongodb_source)
             }
@@ -813,12 +893,30 @@ impl QueryService {
         let database = container_path.segments[0].clone();
         let path_clone = container_path.clone();
         let entity_name = entity_name.to_string();
-        self.with_connection_retry(service_id, &database, move |conn| {
+
+        // SECURITY / AVAILABILITY: bound this like `query_data`.
+        //
+        // The deadline originally covered the row path only, which left the
+        // more expensive one open: `get_entity_info` falls through to a full
+        // `COUNT(*)` on several backends (every view, and any table whose stats
+        // were never gathered), and it is in the AI read allowlist. "Check the
+        // row count of every table" would otherwise pin a connection per call
+        // with nothing to stop it.
+        let work = self.with_connection_retry(service_id, &database, move |conn| {
             let path_clone = path_clone.clone();
             let entity_name = entity_name.clone();
             async move { conn.get_entity_info(&path_clone, &entity_name).await }
-        })
+        });
+
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(DEFAULT_QUERY_TIMEOUT_MS),
+            work,
+        )
         .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(DataError::QueryTimeout(DEFAULT_QUERY_TIMEOUT_MS)),
+        }
     }
 
     /// Query data from an entity
@@ -839,7 +937,25 @@ impl QueryService {
         let database = container_path.segments[0].clone();
         let path_clone = container_path.clone();
         let entity_name = entity_name.to_string();
-        self.with_connection_retry(service_id, &database, move |conn| {
+
+        // SECURITY / AVAILABILITY: bound every data-browser query in wall-clock
+        // time, at the one place all four backends funnel through.
+        //
+        // Backends set their own server-side ceiling where the engine has one
+        // (`statement_timeout`, `maxTimeMS`, `max_execution_time`), which is
+        // what actually stops work on the operator's database. This outer
+        // deadline is the backstop for the engines that have no such knob and
+        // for the case where the server ignores it: without it a single request
+        // pins a control-plane task and a connection indefinitely, and the query
+        // keeps running after the HTTP client has disconnected. On the 3 vCPU /
+        // 4 GB reference box a handful of those exhausts the pool.
+        let deadline_ms = effective_timeout_ms(options.timeout_ms);
+        let options = QueryOptions {
+            timeout_ms: Some(deadline_ms),
+            ..options
+        };
+
+        let query = self.with_connection_retry(service_id, &database, move |conn| {
             let path_clone = path_clone.clone();
             let entity_name = entity_name.clone();
             let filters = filters.clone();
@@ -876,8 +992,12 @@ impl QueryService {
                     "Service does not support querying".to_string(),
                 ))
             }
-        })
-        .await
+        });
+
+        match tokio::time::timeout(std::time::Duration::from_millis(deadline_ms), query).await {
+            Ok(result) => result,
+            Err(_) => Err(DataError::QueryTimeout(deadline_ms)),
+        }
     }
 
     /// Get filter schema for a service (if it supports QuerySchemaProvider)
@@ -1024,5 +1144,50 @@ impl QueryService {
             }
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_postgres_connection_target_selects_policy_from_cluster_primary() {
+        let cluster = postgres_connection_target(
+            Some(("10.0.0.8".to_string(), 6432)),
+            "public.example".to_string(),
+            5432,
+        );
+        assert_eq!(cluster.0, "10.0.0.8");
+        assert_eq!(cluster.1, 6432);
+        assert_eq!(cluster.2, PostgresConnectionPolicy::ManagedPrivate);
+
+        let standalone = postgres_connection_target(None, "public.example".to_string(), 5433);
+        assert_eq!(standalone.0, "public.example");
+        assert_eq!(standalone.1, 5433);
+        assert_eq!(standalone.2, PostgresConnectionPolicy::Standard);
+    }
+
+    #[tokio::test]
+    async fn test_postgres_connection_policy_managed_private_rejects_public_credentials() {
+        for (username, password) in [
+            ("cluster_admin", "admin-secret"),
+            (QueryService::EXPLORER_USER, "explorer-secret"),
+        ] {
+            let result = PostgresConnectionPolicy::ManagedPrivate
+                .connect("203.0.113.10", 5432, username, password, "postgres")
+                .await;
+            let error = match result {
+                Ok(_) => panic!("managed cluster credentials must reject a public endpoint"),
+                Err(error) => error,
+            };
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("refusing to send cluster credentials even over verified TLS"),
+                "unexpected error for {username}: {error}"
+            );
+        }
     }
 }

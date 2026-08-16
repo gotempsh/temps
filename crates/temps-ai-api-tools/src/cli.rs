@@ -102,9 +102,17 @@ pub(crate) fn resolve<'a>(
         };
     }
 
-    // Leniency: accept a bare `operation_id` (it's globally unique).
+    // Leniency: accept a bare `operation_id` (it's globally unique) — but apply
+    // the same discovery filter as the section path. Without this, naming an
+    // operation directly skipped `permit` entirely, so the "operations you
+    // cannot read are not offered" property held only for callers who browsed
+    // to them. The router's `permission_guard!` was still the real boundary, so
+    // nothing was exploitable; this just stops a request being formed that
+    // should never have been.
     if let Some(op) = index.get(first) {
-        return resolve_operation(op, &tokens[1..]);
+        if permit(op) {
+            return resolve_operation(op, &tokens[1..]);
+        }
     }
 
     CliAction::Terminal(format!(
@@ -300,16 +308,26 @@ fn render_operation_help(op: &ApiOperation) -> String {
     } else {
         out.push_str("Flags:\n");
         for p in flags {
-            // Path params are structurally required; query params are optional
-            // filters (omit the ones you don't need).
-            let req = if matches!(p.location, ParamLocation::Path) {
-                " (required)"
-            } else {
-                ""
+            // Path params are structurally required, and so are body fields the
+            // schema marks required — a write call fails without them, so the
+            // help has to say which ones they are. (Query params stay unmarked:
+            // they're optional filters, and OpenAPI required-ness is frequently
+            // wrong for them, so claiming "required" would send the model
+            // inventing values for filters it should simply omit.)
+            let req = match p.location {
+                ParamLocation::Path => " (required)",
+                ParamLocation::Body if p.required => " (required)",
+                _ => "",
             };
             out.push_str(&format!("  --{} <{}>{}", p.name, p.ty, req));
             if !p.enum_values.is_empty() {
                 out.push_str(&format!(" — one of: {}", p.enum_values.join(", ")));
+            }
+            // For an object-valued field, the accepted JSON is the single most
+            // useful thing we can say — a bare "<object>" tells the caller
+            // nothing, and guessing it wrong fails the whole call.
+            if let Some(shape) = &p.object_shape {
+                out.push_str(&format!(" — {}", shape.describe()));
             }
             if let Some(d) = &p.description {
                 out.push_str(&format!(" — {d}"));
@@ -438,7 +456,8 @@ fn tokenize(s: &str) -> Vec<String> {
 }
 
 /// Parse `--name value` / `--name=value` / bare `--flag` tokens into a flat JSON
-/// object. Values are coerced to int/bool when they look like one, else string.
+/// object. Values are coerced to JSON scalars and structured values when they
+/// look like one, else string.
 fn parse_flags(tokens: &[String]) -> Result<Value, String> {
     let mut map = serde_json::Map::new();
     let mut i = 0;
@@ -450,10 +469,10 @@ fn parse_flags(tokens: &[String]) -> Result<Value, String> {
             ));
         };
         if let Some((k, v)) = rest.split_once('=') {
-            map.insert(k.to_string(), coerce(v));
+            map.insert(k.to_string(), coerce(k, v)?);
             i += 1;
         } else if i + 1 < tokens.len() && !tokens[i + 1].starts_with("--") {
-            map.insert(rest.to_string(), coerce(&tokens[i + 1]));
+            map.insert(rest.to_string(), coerce(rest, &tokens[i + 1])?);
             i += 2;
         } else {
             // A flag with no value → boolean true (e.g. `--only_errors`).
@@ -464,13 +483,25 @@ fn parse_flags(tokens: &[String]) -> Result<Value, String> {
     Ok(Value::Object(map))
 }
 
-fn coerce(s: &str) -> Value {
+fn coerce(flag: &str, s: &str) -> Result<Value, String> {
     if let Ok(n) = s.parse::<i64>() {
-        return Value::from(n);
+        return Ok(Value::from(n));
+    }
+    // Floats too, or every fractional value becomes a string and the API
+    // rejects it with `invalid type: string "0.5", expected f64`. Thresholds
+    // are the obvious case: `--threshold 0.5` has to arrive as a number.
+    // Guarded against `f64::from_str` accepting "inf"/"NaN", which are not
+    // representable in JSON and would serialize as `null`.
+    if let Ok(n) = s.parse::<f64>() {
+        if n.is_finite() {
+            if let Some(v) = serde_json::Number::from_f64(n) {
+                return Ok(Value::Number(v));
+            }
+        }
     }
     match s {
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
+        "true" => Ok(Value::Bool(true)),
+        "false" => Ok(Value::Bool(false)),
         _ => {
             // Object/array-shaped flag values (e.g. `--parameters {"database":"app"}`)
             // are real JSON, not opaque strings — a body param typed as a map/array
@@ -481,12 +512,17 @@ fn coerce(s: &str) -> Value {
             let trimmed = s.trim();
             if (trimmed.starts_with('{') && trimmed.ends_with('}'))
                 || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+                || (trimmed.starts_with('"') && trimmed.ends_with('"'))
             {
-                if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-                    return v;
-                }
+                return serde_json::from_str::<Value>(trimmed).map_err(|error| {
+                    format!(
+                        "Invalid JSON for `--{flag}`: {error}. Object and array values must be \
+                         valid JSON with double-quoted keys and string values, for example \
+                         `--{flag} '{{\"database\":\"postgres\",\"username\":\"postgres\"}}'`."
+                    )
+                });
             }
-            Value::String(s.to_string())
+            Ok(Value::String(s.to_string()))
         }
     }
 }
@@ -531,6 +567,41 @@ mod tests {
         assert_eq!(v["flag"], Value::Bool(true));
     }
 
+    /// `--threshold 0.5` must arrive as a JSON number. It used to fall through
+    /// to a string (only `i64` was attempted), and the API answered
+    /// `invalid type: string "0.5", expected f64`.
+    #[test]
+    fn parse_flags_coerces_floats_to_numbers() {
+        let v = parse_flags(&[
+            "--threshold".into(),
+            "0.5".into(),
+            "--ratio".into(),
+            "-1.25".into(),
+        ])
+        .unwrap();
+        assert_eq!(v["threshold"], serde_json::json!(0.5));
+        assert_eq!(v["ratio"], serde_json::json!(-1.25));
+        assert!(v["threshold"].is_number() && !v["threshold"].is_string());
+    }
+
+    /// Integers must keep parsing as integers, not become floats.
+    #[test]
+    fn parse_flags_keeps_integers_integral() {
+        let v = parse_flags(&["--window_secs".into(), "300".into()]).unwrap();
+        assert_eq!(v["window_secs"], Value::from(300));
+        assert!(v["window_secs"].is_i64());
+    }
+
+    /// `f64::from_str` accepts these; JSON cannot represent them, and
+    /// `Number::from_f64` would yield `null`. They stay strings.
+    #[test]
+    fn parse_flags_leaves_non_finite_floats_as_strings() {
+        for token in ["inf", "-inf", "NaN"] {
+            let v = parse_flags(&["--x".into(), token.into()]).unwrap();
+            assert!(v["x"].is_string(), "{token} became {:?}", v["x"]);
+        }
+    }
+
     #[test]
     fn parse_flags_rejects_bare_positional() {
         assert!(parse_flags(&["oops".into()]).is_err());
@@ -553,10 +624,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_flags_keeps_malformed_brace_string_as_string() {
-        // Not valid JSON — must fall back to a plain string rather than error.
-        let v = parse_flags(&["--name".into(), "{not json}".into()]).unwrap();
-        assert_eq!(v["name"], Value::from("{not json}"));
+    fn parse_flags_rejects_malformed_structured_values() {
+        let error = parse_flags(&[
+            "--parameters".into(),
+            "{database:postgres,username:postgres}".into(),
+        ])
+        .unwrap_err();
+
+        assert!(error.contains("Invalid JSON for `--parameters`"), "{error}");
+        assert!(error.contains("double-quoted keys"), "{error}");
+        assert!(error.contains(r#"{"database":"postgres""#), "{error}");
+    }
+
+    #[test]
+    fn escaped_json_quotes_are_not_silently_stripped_into_a_string() {
+        let tokens = tokenize(
+            r#"create_service --name postgres-test --service_type postgres --parameters {\"database\":\"postgres\",\"username\":\"postgres\"}"#,
+        );
+        let error = parse_flags(&tokens[1..]).unwrap_err();
+
+        assert!(error.contains("Invalid JSON for `--parameters`"), "{error}");
+    }
+
+    #[test]
+    fn parse_flags_decodes_a_json_quoted_string() {
+        let parsed = parse_flags(&["--service_type".into(), r#""postgres""#.into()]).unwrap();
+
+        assert_eq!(parsed["service_type"], Value::String("postgres".into()));
     }
 
     #[test]

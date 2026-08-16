@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_core::{JobResult, WorkflowContext, WorkflowError, WorkflowTask};
 use temps_logs::{LogLevel, LogService};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 /// Output from VerifyLocalImageJob
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +73,28 @@ impl std::fmt::Debug for VerifyLocalImageJob {
             .field("image_ref", &self.image_ref)
             .field("expected_image_id", &self.expected_image_id)
             .finish()
+    }
+}
+
+fn normalize_image_id(id: &str) -> String {
+    id.strip_prefix("sha256:").unwrap_or(id).to_lowercase()
+}
+
+fn image_ids_match(actual_id: &str, expected_id: &str) -> bool {
+    let actual_normalized = normalize_image_id(actual_id);
+    let expected_normalized = normalize_image_id(expected_id);
+
+    if actual_normalized.is_empty() || expected_normalized.is_empty() {
+        return false;
+    }
+    if expected_normalized.len() == 12
+        && expected_normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        actual_normalized.starts_with(&expected_normalized)
+    } else {
+        actual_normalized == expected_normalized
     }
 }
 
@@ -172,26 +194,19 @@ impl WorkflowTask for VerifyLocalImageJob {
         let image_id = image_inspect.id.clone().unwrap_or_default();
         let size_bytes = image_inspect.size.unwrap_or(0) as u64;
 
-        // Optionally verify the image ID matches what we expect
+        // Verify the image ID still matches the image that was imported for this deployment.
+        // Docker tags are mutable and shared across the daemon, so a mismatch means deploying
+        // by this tag could run a different image with this deployment's configuration.
         if let Some(ref expected_id) = self.expected_image_id {
-            // Normalize both IDs for comparison (strip sha256: prefix if present)
-            let normalize_id =
-                |id: &str| -> String { id.strip_prefix("sha256:").unwrap_or(id).to_lowercase() };
-
-            let actual_normalized = normalize_id(&image_id);
-            let expected_normalized = normalize_id(expected_id);
-
-            if !actual_normalized
-                .starts_with(&expected_normalized[..12.min(expected_normalized.len())])
-            {
-                let warning_msg = format!(
-                    "Image ID mismatch: expected '{}', found '{}'. Proceeding with found image.",
-                    expected_id, image_id
+            if !image_ids_match(&image_id, expected_id) {
+                let error_msg = format!(
+                    "Image ID mismatch for local image '{}': expected '{}', found '{}'. Refusing to deploy mutable tag.",
+                    self.image_ref, expected_id, image_id
                 );
-                debug!("{}", warning_msg);
-                self.log(LogLevel::Warning, &format!("⚠️ {}", warning_msg))
+                error!("{}", error_msg);
+                self.log(LogLevel::Error, &format!("❌ {}", error_msg))
                     .await;
-                // Don't fail - the image exists, just log the mismatch
+                return Ok(JobResult::failure(context, error_msg));
             }
         }
 
@@ -241,6 +256,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_image_ids_match_full_ids() {
+        assert!(image_ids_match(
+            "sha256:abcdef1234567890",
+            "sha256:abcdef1234567890"
+        ));
+    }
+
+    #[test]
+    fn test_image_ids_match_expected_short_id() {
+        assert!(image_ids_match("sha256:abcdef1234567890", "abcdef123456"));
+    }
+
+    #[test]
+    fn test_image_ids_match_detects_mismatch() {
+        assert!(!image_ids_match("sha256:abcdef1234567890", "123456abcdef"));
+        assert!(!image_ids_match("sha256:abcdef1234567890", "a"));
+        assert!(!image_ids_match("sha256:abcdef1234567890", "not-hex-id!!"));
+        assert!(!image_ids_match(
+            "sha256:abcdef1234567890",
+            "sha256:abcdef1234560000"
+        ));
+        assert!(!image_ids_match("", ""));
+    }
+
+    #[test]
     fn test_extract_tag_with_tag() {
         let docker = Arc::new(
             bollard::Docker::connect_with_local_defaults().expect("Failed to connect to Docker"),
@@ -279,5 +319,53 @@ mod tests {
         );
 
         assert_eq!(job.extract_tag(), "v1.0");
+    }
+
+    #[tokio::test]
+    async fn immutable_image_id_mismatch_fails_closed() {
+        use bollard::query_parameters::CreateImageOptionsBuilder;
+        use futures::StreamExt;
+
+        let Ok(docker) = bollard::Docker::connect_with_local_defaults() else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker not available, skipping");
+            return;
+        }
+
+        docker
+            .create_image(
+                Some(
+                    CreateImageOptionsBuilder::new()
+                        .from_image("hello-world:latest")
+                        .build(),
+                ),
+                None,
+                None,
+            )
+            .for_each(|_| async {})
+            .await;
+        if docker.inspect_image("hello-world:latest").await.is_err() {
+            println!("Could not fetch a test image (offline?), skipping");
+            return;
+        }
+
+        let job = VerifyLocalImageJob::new(
+            "verify-immutable".to_string(),
+            "hello-world:latest".to_string(),
+            Some("sha256:0000000000000000000000000000000000000000000000000000000000000000".into()),
+            Arc::new(docker),
+        );
+        let context = crate::test_utils::create_test_context("run-mismatch".into(), 1, 1, 1);
+        let result = job.execute(context).await.expect("verification result");
+
+        assert_eq!(result.status, temps_core::JobStatus::Failure);
+        assert!(result
+            .message
+            .as_deref()
+            .is_some_and(|message| message.contains("Image ID mismatch")
+                && message.contains("Refusing to deploy mutable tag")));
     }
 }

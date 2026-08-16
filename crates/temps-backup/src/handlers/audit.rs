@@ -63,6 +63,33 @@ pub struct BackupRunAudit {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct BackupDeletedAudit {
+    pub context: AuditContext,
+    pub backup_id: String,
+    pub s3_source_id: i32,
+    pub s3_location: String,
+    pub outcome: String,
+    pub failure_reason: Option<String>,
+    pub deleted_objects: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackupRetentionCleanupAudit {
+    pub context: AuditContext,
+    pub requested_backup_ids: Vec<String>,
+    pub requested_backup_ids_truncated: bool,
+    pub expired: u64,
+    pub deleted: u64,
+    pub failed: u64,
+    pub deleted_backup_ids: Vec<String>,
+    pub deleted_backup_ids_truncated: bool,
+    pub partially_deleted_backup_ids: Vec<String>,
+    pub partially_deleted_backup_ids_truncated: bool,
+    pub outcome: String,
+    pub failure_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ExternalServiceBackupRunAudit {
     pub context: AuditContext,
     pub service_id: i32,
@@ -90,8 +117,8 @@ impl AuditOperation for S3SourceCreatedAudit {
         "S3_SOURCE_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -113,8 +140,8 @@ impl AuditOperation for S3SourceUpdatedAudit {
         "S3_SOURCE_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -136,8 +163,8 @@ impl AuditOperation for S3SourceDeletedAudit {
         "S3_SOURCE_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -160,8 +187,8 @@ impl AuditOperation for BackupScheduleUpdatedAudit {
         "BACKUP_SCHEDULE_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -183,8 +210,8 @@ impl AuditOperation for BackupScheduleStatusChangedAudit {
         "BACKUP_SCHEDULE_STATUS_CHANGED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -206,8 +233,54 @@ impl AuditOperation for BackupRunAudit {
         "BACKUP_RUN".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for BackupDeletedAudit {
+    fn operation_type(&self) -> String {
+        "BACKUP_DELETED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+impl AuditOperation for BackupRetentionCleanupAudit {
+    fn operation_type(&self) -> String {
+        "BACKUP_RETENTION_CLEANUP".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -229,8 +302,8 @@ impl AuditOperation for ExternalServiceBackupRunAudit {
         "EXTERNAL_SERVICE_BACKUP_RUN".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -264,8 +337,8 @@ impl AuditOperation for ScheduleServicesAttachedAudit {
         "BACKUP_SCHEDULE_SERVICES_ATTACHED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -298,8 +371,8 @@ impl AuditOperation for ScheduleServiceDetachedAudit {
         "BACKUP_SCHEDULE_SERVICE_DETACHED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -336,8 +409,8 @@ impl AuditOperation for ScheduleRunNowAudit {
         "BACKUP_SCHEDULE_RUN_NOW".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -359,8 +432,8 @@ impl AuditOperation for RestoreRunAudit {
         "EXTERNAL_SERVICE_RESTORE_RUN".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {

@@ -41,10 +41,14 @@
 
 use async_trait::async_trait;
 use aws_credential_types::Credentials;
-use aws_sdk_s3::config::{Region, SharedCredentialsProvider};
+use aws_sdk_s3::config::{Region, SharedCredentialsProvider, SharedHttpClient};
 use aws_sdk_s3::Client;
+use aws_smithy_http_client::tls::{
+    rustls_provider::CryptoMode, Provider as TlsProvider, TlsContext, TrustStore,
+};
 use chrono::Utc;
 use std::collections::HashMap;
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::{debug, warn};
 
@@ -94,6 +98,37 @@ fn parse_connection_string(s: &str) -> Option<S3ConnParams<'_>> {
         secret_key,
         endpoint,
     })
+}
+
+/// Shared HTTPS client backed by Mozilla's bundled CA roots.
+///
+/// The AWS default client loads roots from the host OS. Minimal production
+/// images and sandboxed macOS test processes can return zero valid roots,
+/// which makes `aws-smithy-http-client` panic in debug builds and leaves HTTPS
+/// unusable in release builds. A compiled-in trust store keeps collection
+/// independent of ambient host certificate configuration.
+fn bundled_roots_http_client() -> Result<SharedHttpClient, String> {
+    static CLIENT: OnceLock<Result<SharedHttpClient, String>> = OnceLock::new();
+
+    CLIENT
+        .get_or_init(|| {
+            let mut trust_store = TrustStore::empty().with_native_roots(false);
+            for der in webpki_root_certs::TLS_SERVER_ROOT_CERTS {
+                let pem = pem::Pem::new("CERTIFICATE", der.to_vec());
+                trust_store = trust_store.with_pem_certificate(pem::encode(&pem).into_bytes());
+            }
+
+            let tls_context = TlsContext::builder()
+                .with_trust_store(trust_store)
+                .build()
+                .map_err(|error| format!("failed to build bundled S3 TLS context: {error}"))?;
+
+            Ok(aws_smithy_http_client::Builder::new()
+                .tls_provider(TlsProvider::Rustls(CryptoMode::AwsLc))
+                .tls_context(tls_context)
+                .build_https())
+        })
+        .clone()
 }
 
 #[async_trait]
@@ -151,10 +186,17 @@ async fn run_list_buckets(config: &CollectorConfig) -> Result<Vec<MetricPoint>, 
         "temps-metrics",
     );
     let creds_provider = SharedCredentialsProvider::new(credentials);
+    let http_client = bundled_roots_http_client().map_err(|reason| {
+        format!(
+            "Failed to configure S3 HTTPS client for source {}: {reason}",
+            config.source_id
+        )
+    })?;
 
     let mut aws_cfg_builder = aws_config::defaults(aws_config::BehaviorVersion::latest())
         .region(Region::new(params.region.to_string()))
-        .credentials_provider(creds_provider);
+        .credentials_provider(creds_provider)
+        .http_client(http_client);
 
     if let Some(ep) = params.endpoint {
         aws_cfg_builder = aws_cfg_builder.endpoint_url(ep);

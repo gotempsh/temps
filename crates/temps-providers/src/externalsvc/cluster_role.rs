@@ -92,7 +92,7 @@ pub enum PgAutoFailoverState {
     Primary,
     /// Single-node mode (no replica yet); still writable.
     Single,
-    /// About to be promoted to primary; not yet writable.
+    /// Promotion completed and writable, but no standby is currently attached.
     WaitPrimary,
     /// Streaming from the primary; healthy.
     Secondary,
@@ -123,17 +123,37 @@ pub enum PgAutoFailoverState {
 impl PgAutoFailoverState {
     /// `true` when this node is currently the **writable** primary.
     ///
-    /// `WaitPrimary` is deliberately excluded: in pg_auto_failover that
-    /// state means "candidate primary, waiting for the monitor to assign a
-    /// secondary" — the node is not yet writable. Treating it as primary
-    /// was the recurring bug called out at the top of this file. The
-    /// reconciler relies on this returning `false` so it doesn't flip the
-    /// `service_members.role` label or republish the primary DNS A record
-    /// while the node is still settling.
+    /// `WaitPrimary` IS included, deliberately: contrary to an earlier
+    /// version of this doc comment, it is not a "not yet writable"
+    /// transitional state. Per pg_auto_failover's own state machine, a node
+    /// enters `wait_primary` once promotion has already completed and it is
+    /// simply missing an attached standby — pg_auto_failover clears
+    /// `synchronous_standby_names` in that state for exactly this reason, so
+    /// writes keep flowing with no standby present (see
+    /// `services::cluster_states::WRITABLE`, which already modeled this
+    /// correctly — this enum had drifted out of sync with it). Verified live
+    /// against a real 2-data-node cluster after `docker stop`ing the
+    /// primary: pg_auto_failover promotes the survivor straight to
+    /// `wait_primary` and, because there is no third node to attach as its
+    /// new standby, it stays there *indefinitely* — this is the normal
+    /// steady state for a 2-node cluster post-failover, not a brief
+    /// transition — while `default_transaction_read_only` is already `off`
+    /// and `pg_is_in_recovery()` is already `false` on that node.
+    ///
+    /// Previously excluding `WaitPrimary` here meant the DNS reconciler
+    /// (`drafts_for_snapshot`, which filters on `is_primary()`) never
+    /// republished `primary.<svc>.temps.local` after exactly this failover —
+    /// the single most important moment for that record to update — so any
+    /// consumer resolving it kept getting the dead node's stale IP forever
+    /// on a 2-node cluster. `to_cluster_role()` had the matching
+    /// `service_members.role` consequence: a promoted `wait_primary` node
+    /// never got relabeled `Primary` in the DB either.
     pub fn is_primary(self) -> bool {
         matches!(
             self,
-            PgAutoFailoverState::Primary | PgAutoFailoverState::Single
+            PgAutoFailoverState::Primary
+                | PgAutoFailoverState::Single
+                | PgAutoFailoverState::WaitPrimary
         )
     }
 
@@ -260,10 +280,11 @@ mod tests {
 
     #[test]
     fn pg_state_classification() {
-        // Primary-side: only the writable states. `wait_primary` is a
-        // candidate-primary that hasn't yet accepted writes, so it must
-        // NOT classify as primary (see comment on `is_primary`).
-        for s in ["primary", "single"] {
+        // Primary-side: every writable state, including `wait_primary` —
+        // pg_auto_failover has already completed promotion by the time it
+        // reports that state, it's just missing an attached standby (see
+        // comment on `is_primary`).
+        for s in ["primary", "single", "wait_primary"] {
             let parsed: PgAutoFailoverState = s.parse().unwrap();
             assert!(parsed.is_primary(), "{s} should be primary");
             assert!(parsed.is_data_member());
@@ -284,11 +305,8 @@ mod tests {
             assert_eq!(parsed.to_cluster_role(), Some(ClusterRole::Replica));
         }
 
-        // Transient/unknown — must NOT flip the role. `wait_primary` lives
-        // here too: it's a transition state that should leave the existing
-        // label alone until the node either becomes `primary` or fails out.
+        // Transient/unknown — must NOT flip the role.
         for s in [
-            "wait_primary",
             "draining",
             "demoted",
             "demote_timeout",

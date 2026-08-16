@@ -8,6 +8,12 @@ pub enum DnsError {
     #[error("Provider not found: {0}")]
     ProviderNotFound(i32),
 
+    #[error("DNS provider {provider_id} ({provider_name}) is inactive")]
+    ProviderInactive {
+        provider_id: i32,
+        provider_name: String,
+    },
+
     #[error("Invalid provider type: {0}")]
     InvalidProviderType(String),
 
@@ -25,6 +31,26 @@ pub enum DnsError {
 
     #[error("Domain not found: {0}")]
     DomainNotFound(String),
+
+    #[error(
+        "Managed DNS domain '{requested_domain}' canonicalizes to '{canonical_domain}', which is already managed by domain ID {existing_managed_domain_id} on provider {existing_provider_id}"
+    )]
+    ManagedDomainAlreadyExists {
+        requested_domain: String,
+        canonical_domain: String,
+        existing_managed_domain_id: i32,
+        existing_provider_id: i32,
+    },
+
+    #[error(
+        "Ambiguous managed DNS zone '{canonical_zone}' for requested domain '{requested_domain}': managed domain IDs {managed_domain_ids:?} use provider IDs {provider_ids:?}"
+    )]
+    AmbiguousManagedDomain {
+        requested_domain: String,
+        canonical_zone: String,
+        managed_domain_ids: Vec<i32>,
+        provider_ids: Vec<i32>,
+    },
 
     #[error("Record not found: {0}")]
     RecordNotFound(String),

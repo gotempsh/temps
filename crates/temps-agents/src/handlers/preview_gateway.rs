@@ -57,7 +57,8 @@ pub struct LogsResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct UpgradeRequest {
     /// Image reference to pull and run (e.g.
-    /// `ghcr.io/gotempsh/temps-preview-gateway:latest`). Empty resets to default.
+    /// an immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
+    /// Empty resets to default.
     pub image: String,
 }
 

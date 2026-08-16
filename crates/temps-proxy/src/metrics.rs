@@ -12,6 +12,25 @@
 //! classes and durations to a fixed bucket ladder. No per-request attribute
 //! (path, host, project) ever becomes a metric dimension — per-project traffic
 //! breakdowns come from the proxy request logs instead.
+//!
+//! # Observation sets differ per series
+//!
+//! The gauges do not all divide by the same number of requests, and an
+//! operator reading them side by side needs to know which:
+//!
+//! | series | observation set |
+//! |---|---|
+//! | `proxy.requests*`, `proxy.error_rate_percent` | every request |
+//! | `proxy.request_duration_*` | every request except streaming sessions |
+//! | `proxy.upstream_duration_*` | every request that reached an upstream, streaming included (handshake clamped, see `MAX_HANDSHAKE_OBSERVATION_MS`) |
+//! | `proxy.self_duration_*` | proxied requests except streaming sessions |
+//! | `proxy.streaming_*` | streaming sessions only |
+//!
+//! Note for operators upgrading: the duration series exclude WebSocket/SSE
+//! lifetimes as of this change, so their values drop wherever streaming
+//! traffic exists. Alert thresholds tuned against the previous (inflated)
+//! numbers should be re-checked — a threshold that used to fire may now sit
+//! permanently below the trigger.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -21,6 +40,25 @@ pub const DURATION_BUCKETS_MS: [u64; 10] = [5, 10, 25, 50, 100, 250, 500, 1000, 
 
 /// Bucket count including the overflow bucket.
 const NUM_BUCKETS: usize = DURATION_BUCKETS_MS.len() + 1;
+
+/// Ceiling applied to a streaming session's time-to-first-header before it is
+/// recorded as backend latency.
+///
+/// `upstream_peer` gives a WebSocket upgrade a 1h read timeout — 60× the 60s
+/// it gives ordinary traffic — and selects it from the request's own `Upgrade`
+/// header. A hung upstream can therefore produce a single ~3_600_000ms
+/// observation, which is enough to drag `proxy.upstream_duration_avg_ms` into
+/// the millions while every percentile stays flat: the same unweighted-mean
+/// distortion the streaming carve-out exists to prevent, aimed at the backend
+/// series instead.
+///
+/// 60s is the ordinary read timeout, so clamping here makes a streaming
+/// handshake no more able to move the mean than any non-streaming request
+/// already is. The observation is kept rather than dropped: `upstream_count`
+/// stays honest, and 60s still lands in the overflow bucket, so the percentiles
+/// continue to report it as slow. A handshake beyond this bound is a hung
+/// upstream, not a latency worth averaging to the millisecond.
+const MAX_HANDSHAKE_OBSERVATION_MS: u64 = 60_000;
 
 /// Number of status classes tracked: 1xx, 2xx, 3xx, 4xx, 5xx.
 const NUM_CLASSES: usize = 5;
@@ -54,6 +92,28 @@ pub const METRIC_SELF_AVG: &str = "proxy.self_duration_avg_ms";
 pub const METRIC_SELF_P50: &str = "proxy.self_duration_p50_ms";
 pub const METRIC_SELF_P95: &str = "proxy.self_duration_p95_ms";
 pub const METRIC_SELF_P99: &str = "proxy.self_duration_p99_ms";
+/// Streaming sessions (WebSocket tunnels, SSE streams) that ended in this
+/// interval. Deliberately kept out of the total/self duration histograms above
+/// — see [`ProxyMetrics::record`] — and reported on their own instead.
+///
+/// # Detection is not exhaustive
+///
+/// A session is classified as streaming only when it ends in an HTTP `101`
+/// upgrade or the upstream declared `content-type: text/event-stream`. Other
+/// long-lived response shapes still land in the latency histograms and can
+/// still skew the mean the same way:
+///
+/// - HTTP/2 WebSockets (RFC 8441 extended `CONNECT`) answer `200`, not `101`.
+/// - gRPC streaming (`application/grpc`) and chunked long-poll / NDJSON feeds.
+/// - Large or slow downloads: `elapsed` covers the whole body transfer, so a
+///   multi-minute download to a slow client is booked as proxy self time.
+///
+/// Widening this would mean classifying on response *duration* rather than
+/// shape, which needs a threshold nobody can pick correctly for every deploy.
+/// The two cases covered here are the ones that produce hour-long sessions by
+/// design; the rest are bounded by the upstream read timeout.
+pub const METRIC_STREAMING_SESSIONS: &str = "proxy.streaming_sessions";
+pub const METRIC_STREAMING_DURATION_AVG: &str = "proxy.streaming_duration_avg_ms";
 
 /// Where a request was routed. The three variants are mutually exclusive and
 /// exhaustive, so their per-interval counters always sum to `proxy.requests`.
@@ -102,6 +162,11 @@ pub struct ProxyMetrics {
     duration_buckets: [AtomicU64; NUM_BUCKETS],
     /// Sum of all observed durations in milliseconds.
     duration_sum_ms: AtomicU64,
+    /// Number of requests contributing to `duration_buckets`/`duration_sum_ms`.
+    /// This is NOT the same as the status-class total: streaming sessions are
+    /// counted as requests but excluded from every duration histogram, so the
+    /// latency averages must divide by this instead.
+    duration_count: AtomicU64,
     /// Requests by destination (project / console / other).
     destinations: [AtomicU64; NUM_DESTINATIONS],
     /// Backend-latency histogram (upstream connect + processing + TTFB).
@@ -109,9 +174,17 @@ pub struct ProxyMetrics {
     upstream_buckets: [AtomicU64; NUM_BUCKETS],
     upstream_sum_ms: AtomicU64,
     upstream_count: AtomicU64,
-    /// Proxy self-time histogram (total − backend), same observation set.
+    /// Proxy self-time histogram (total − backend). Its observation set is a
+    /// SUBSET of the upstream histogram's: streaming sessions contribute a
+    /// backend latency but no self time, so this needs its own count rather
+    /// than borrowing `upstream_count` as the denominator.
     self_buckets: [AtomicU64; NUM_BUCKETS],
     self_sum_ms: AtomicU64,
+    self_count: AtomicU64,
+    /// Streaming sessions that ended in this interval, and their total
+    /// wall-clock lifetime. Reported separately from request latency.
+    streaming_sessions: AtomicU64,
+    streaming_sum_ms: AtomicU64,
 }
 
 /// Find the histogram bucket for a duration.
@@ -123,17 +196,38 @@ fn bucket_index(elapsed_ms: u64) -> usize {
 }
 
 impl ProxyMetrics {
-    /// Record one completed request. Hot path: 4 relaxed atomic adds, plus 5
-    /// more for proxied requests (`upstream_ms` present). No locks, no I/O.
+    /// Record one completed request. Hot path: 3 relaxed atomic adds, plus 6
+    /// more for proxied requests (`upstream_ms` present) or 3 more for a
+    /// streaming session. No locks, no allocation, no I/O.
     ///
     /// `upstream_ms` is the backend latency; `None` for requests the proxy
     /// answered itself. Proxy self time is derived as `elapsed − upstream`.
+    ///
+    /// `is_streaming` marks sessions whose `elapsed_ms` is a *connection
+    /// lifetime*, not a latency: established WebSocket tunnels and SSE
+    /// streams, which legitimately stay open for minutes or hours. They are
+    /// counted as requests (so the status-class and destination counters still
+    /// partition `proxy.requests`) but are kept out of the **total** and
+    /// **self-time** histograms, because `elapsed − upstream` for a one-hour
+    /// WebSocket is one hour of "proxy overhead" that the proxy never actually
+    /// spent. They DO contribute to the backend histogram — `upstream_ms` is
+    /// time-to-first-header, a real latency — clamped to
+    /// [`MAX_HANDSHAKE_OBSERVATION_MS`].
+    ///
+    /// The averages are unweighted, so without this carve-out a small number
+    /// of long-lived sessions ending in the same interval can dominate
+    /// `proxy.self_duration_avg_ms` — and because they are far out in the
+    /// tail, the percentiles stay flat while the mean moves, which is
+    /// indistinguishable on a chart from a genuine latency regression. Their
+    /// lifetime is reported on its own via `proxy.streaming_sessions` /
+    /// `proxy.streaming_duration_avg_ms`.
     pub fn record(
         &self,
         status_code: u16,
         elapsed_ms: u64,
         upstream_ms: Option<u64>,
         destination: RequestDestination,
+        is_streaming: bool,
     ) {
         let class = match status_code {
             100..=199 => 0,
@@ -144,11 +238,41 @@ impl ProxyMetrics {
             _ => 4,
         };
         self.status_classes[class].fetch_add(1, Ordering::Relaxed);
+        self.destinations[destination as usize].fetch_add(1, Ordering::Relaxed);
+
+        if is_streaming {
+            self.streaming_sessions.fetch_add(1, Ordering::Relaxed);
+            self.streaming_sum_ms
+                .fetch_add(elapsed_ms, Ordering::Relaxed);
+
+            // Backend latency IS meaningful for a stream: `upstream_ms` is
+            // measured at the first upstream response header (the `101`, or the
+            // SSE headers), before the tunnel starts carrying traffic. Dropping
+            // it would blind the backend-latency series to every streaming
+            // endpoint — a slow WebSocket handshake would be invisible. Only
+            // `elapsed_ms` and the derived self time are lifetimes, so those
+            // two are the ones that stay out.
+            //
+            // The value is clamped first: `upstream_peer` grants WebSocket
+            // upgrades a 1h read timeout (vs 60s for ordinary traffic) and
+            // picks that purely from the request's `Upgrade` header, so a hung
+            // upstream can hand us a ~3_600_000ms time-to-first-header. Feeding
+            // that into an unweighted mean is the very distortion this carve-out
+            // exists to prevent, just aimed at the backend series instead. See
+            // `MAX_HANDSHAKE_OBSERVATION_MS`.
+            if let Some(upstream) = upstream_ms {
+                let observed = upstream.min(MAX_HANDSHAKE_OBSERVATION_MS);
+                self.upstream_buckets[bucket_index(observed)].fetch_add(1, Ordering::Relaxed);
+                self.upstream_sum_ms.fetch_add(observed, Ordering::Relaxed);
+                self.upstream_count.fetch_add(1, Ordering::Relaxed);
+            }
+            return;
+        }
 
         self.duration_buckets[bucket_index(elapsed_ms)].fetch_add(1, Ordering::Relaxed);
         self.duration_sum_ms
             .fetch_add(elapsed_ms, Ordering::Relaxed);
-        self.destinations[destination as usize].fetch_add(1, Ordering::Relaxed);
+        self.duration_count.fetch_add(1, Ordering::Relaxed);
 
         if let Some(upstream) = upstream_ms {
             self.upstream_buckets[bucket_index(upstream)].fetch_add(1, Ordering::Relaxed);
@@ -160,6 +284,7 @@ impl ProxyMetrics {
             let self_ms = elapsed_ms.saturating_sub(upstream);
             self.self_buckets[bucket_index(self_ms)].fetch_add(1, Ordering::Relaxed);
             self.self_sum_ms.fetch_add(self_ms, Ordering::Relaxed);
+            self.self_count.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -171,6 +296,7 @@ impl ProxyMetrics {
                 self.duration_buckets[i].load(Ordering::Relaxed)
             }),
             duration_sum_ms: self.duration_sum_ms.load(Ordering::Relaxed),
+            duration_count: self.duration_count.load(Ordering::Relaxed),
             destinations: std::array::from_fn(|i| self.destinations[i].load(Ordering::Relaxed)),
             upstream_buckets: std::array::from_fn(|i| {
                 self.upstream_buckets[i].load(Ordering::Relaxed)
@@ -179,6 +305,9 @@ impl ProxyMetrics {
             upstream_count: self.upstream_count.load(Ordering::Relaxed),
             self_buckets: std::array::from_fn(|i| self.self_buckets[i].load(Ordering::Relaxed)),
             self_sum_ms: self.self_sum_ms.load(Ordering::Relaxed),
+            self_count: self.self_count.load(Ordering::Relaxed),
+            streaming_sessions: self.streaming_sessions.load(Ordering::Relaxed),
+            streaming_sum_ms: self.streaming_sum_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -189,12 +318,16 @@ pub struct MetricsSnapshot {
     status_classes: [u64; NUM_CLASSES],
     duration_buckets: [u64; NUM_BUCKETS],
     duration_sum_ms: u64,
+    duration_count: u64,
     destinations: [u64; NUM_DESTINATIONS],
     upstream_buckets: [u64; NUM_BUCKETS],
     upstream_sum_ms: u64,
     upstream_count: u64,
     self_buckets: [u64; NUM_BUCKETS],
     self_sum_ms: u64,
+    self_count: u64,
+    streaming_sessions: u64,
+    streaming_sum_ms: u64,
 }
 
 impl MetricsSnapshot {
@@ -212,6 +345,7 @@ impl MetricsSnapshot {
                 self.duration_buckets[i].saturating_sub(prev.duration_buckets[i])
             }),
             duration_sum_ms: self.duration_sum_ms.saturating_sub(prev.duration_sum_ms),
+            duration_count: self.duration_count.saturating_sub(prev.duration_count),
             destinations: std::array::from_fn(|i| {
                 self.destinations[i].saturating_sub(prev.destinations[i])
             }),
@@ -224,6 +358,11 @@ impl MetricsSnapshot {
                 self.self_buckets[i].saturating_sub(prev.self_buckets[i])
             }),
             self_sum_ms: self.self_sum_ms.saturating_sub(prev.self_sum_ms),
+            self_count: self.self_count.saturating_sub(prev.self_count),
+            streaming_sessions: self
+                .streaming_sessions
+                .saturating_sub(prev.streaming_sessions),
+            streaming_sum_ms: self.streaming_sum_ms.saturating_sub(prev.streaming_sum_ms),
         }
     }
 }
@@ -243,12 +382,16 @@ pub struct MetricsDelta {
     status_classes: [u64; NUM_CLASSES],
     duration_buckets: [u64; NUM_BUCKETS],
     duration_sum_ms: u64,
+    duration_count: u64,
     destinations: [u64; NUM_DESTINATIONS],
     upstream_buckets: [u64; NUM_BUCKETS],
     upstream_sum_ms: u64,
     upstream_count: u64,
     self_buckets: [u64; NUM_BUCKETS],
     self_sum_ms: u64,
+    self_count: u64,
+    streaming_sessions: u64,
+    streaming_sum_ms: u64,
 }
 
 impl MetricsDelta {
@@ -263,6 +406,10 @@ impl MetricsDelta {
     /// flat line instead of a gap). Duration/error-rate gauges are only
     /// emitted when at least one request completed, so idle intervals don't
     /// drag averages to zero.
+    ///
+    /// Note the two different denominators: the error rate divides by *all*
+    /// requests, while the latency gauges divide by `duration_count`, which
+    /// excludes streaming sessions.
     pub fn samples(&self) -> Vec<ProxySample> {
         let total = self.total_requests();
         let mut samples = vec![
@@ -311,6 +458,11 @@ impl MetricsDelta {
                 value: self.destinations[RequestDestination::Other as usize] as f64,
                 is_counter: true,
             },
+            ProxySample {
+                name: METRIC_STREAMING_SESSIONS,
+                value: self.streaming_sessions as f64,
+                is_counter: true,
+            },
         ];
 
         if total > 0 {
@@ -319,9 +471,25 @@ impl MetricsDelta {
                 value: (self.status_classes[4] as f64 / total as f64) * 100.0,
                 is_counter: false,
             });
+        }
+
+        // Streaming lifetimes get their own gauge; they are deliberately absent
+        // from every histogram below (see `ProxyMetrics::record`).
+        if self.streaming_sessions > 0 {
+            samples.push(ProxySample {
+                name: METRIC_STREAMING_DURATION_AVG,
+                value: self.streaming_sum_ms as f64 / self.streaming_sessions as f64,
+                is_counter: false,
+            });
+        }
+
+        // Latency gauges divide by the number of requests actually observed in
+        // the histogram, NOT by `total` — streaming sessions inflate `total`
+        // without contributing a duration.
+        if self.duration_count > 0 {
             samples.push(ProxySample {
                 name: METRIC_DURATION_AVG,
-                value: self.duration_sum_ms as f64 / total as f64,
+                value: self.duration_sum_ms as f64 / self.duration_count as f64,
                 is_counter: false,
             });
             samples.push(ProxySample {
@@ -341,8 +509,9 @@ impl MetricsDelta {
             });
         }
 
-        // Backend / proxy-self latency gauges: only for intervals where at
-        // least one request was actually proxied to an upstream.
+        // Backend latency: every request that reached an upstream, streaming
+        // sessions included (their `upstream_ms` is time-to-first-header, a
+        // real latency — see `ProxyMetrics::record`).
         if self.upstream_count > 0 {
             let n = self.upstream_count as f64;
             samples.push(ProxySample {
@@ -365,6 +534,13 @@ impl MetricsDelta {
                 value: percentile_from(&self.upstream_buckets, 0.99),
                 is_counter: false,
             });
+        }
+
+        // Proxy self time: a strict subset of the above — streaming sessions
+        // are absent, so this MUST NOT reuse `upstream_count` as its divisor
+        // or every stream would silently dilute the mean toward zero.
+        if self.self_count > 0 {
+            let n = self.self_count as f64;
             samples.push(ProxySample {
                 name: METRIC_SELF_AVG,
                 value: self.self_sum_ms as f64 / n,
@@ -448,15 +624,17 @@ mod tests {
     #[test]
     fn test_record_classifies_status_codes() {
         let m = ProxyMetrics::default();
-        m.record(101, 1, None, RequestDestination::Project);
-        m.record(200, 1, None, RequestDestination::Project);
-        m.record(204, 1, None, RequestDestination::Project);
-        m.record(301, 1, None, RequestDestination::Project);
-        m.record(404, 1, None, RequestDestination::Project);
-        m.record(500, 1, None, RequestDestination::Project);
-        m.record(503, 1, None, RequestDestination::Project);
+        // A real `101` is always a streaming session; pairing it with
+        // `is_streaming: false` would encode a state the proxy cannot produce.
+        m.record(101, 1, None, RequestDestination::Project, true);
+        m.record(200, 1, None, RequestDestination::Project, false);
+        m.record(204, 1, None, RequestDestination::Project, false);
+        m.record(301, 1, None, RequestDestination::Project, false);
+        m.record(404, 1, None, RequestDestination::Project, false);
+        m.record(500, 1, None, RequestDestination::Project, false);
+        m.record(503, 1, None, RequestDestination::Project, false);
         // Malformed status counts as 5xx.
-        m.record(0, 1, None, RequestDestination::Project);
+        m.record(0, 1, None, RequestDestination::Project, false);
 
         let s = m.snapshot();
         assert_eq!(s.status_classes, [1, 2, 1, 1, 3]);
@@ -465,10 +643,10 @@ mod tests {
     #[test]
     fn test_record_buckets_durations() {
         let m = ProxyMetrics::default();
-        m.record(200, 0, None, RequestDestination::Project); // <= 5ms bucket
-        m.record(200, 5, None, RequestDestination::Project); // <= 5ms bucket (inclusive bound)
-        m.record(200, 6, None, RequestDestination::Project); // <= 10ms bucket
-        m.record(200, 99_999, None, RequestDestination::Project); // overflow bucket
+        m.record(200, 0, None, RequestDestination::Project, false); // <= 5ms bucket
+        m.record(200, 5, None, RequestDestination::Project, false); // <= 5ms bucket (inclusive bound)
+        m.record(200, 6, None, RequestDestination::Project, false); // <= 10ms bucket
+        m.record(200, 99_999, None, RequestDestination::Project, false); // overflow bucket
 
         let s = m.snapshot();
         assert_eq!(s.duration_buckets[0], 2);
@@ -480,11 +658,11 @@ mod tests {
     #[test]
     fn test_delta_since_subtracts_baseline() {
         let m = ProxyMetrics::default();
-        m.record(200, 10, None, RequestDestination::Project);
+        m.record(200, 10, None, RequestDestination::Project, false);
         let first = m.snapshot();
 
-        m.record(200, 10, None, RequestDestination::Project);
-        m.record(500, 200, None, RequestDestination::Project);
+        m.record(200, 10, None, RequestDestination::Project, false);
+        m.record(500, 200, None, RequestDestination::Project, false);
         let second = m.snapshot();
 
         let delta = second.delta_since(&first);
@@ -497,11 +675,11 @@ mod tests {
     #[test]
     fn test_delta_saturates_instead_of_underflowing() {
         let m = ProxyMetrics::default();
-        m.record(200, 10, None, RequestDestination::Project);
+        m.record(200, 10, None, RequestDestination::Project, false);
         let later = m.snapshot();
         let m2 = ProxyMetrics::default();
-        m2.record(200, 1, None, RequestDestination::Project);
-        m2.record(200, 1, None, RequestDestination::Project);
+        m2.record(200, 1, None, RequestDestination::Project, false);
+        m2.record(200, 1, None, RequestDestination::Project, false);
         let earlier_but_bigger = m2.snapshot();
 
         let delta = later.delta_since(&earlier_but_bigger);
@@ -513,8 +691,212 @@ mod tests {
     fn test_samples_idle_interval_emits_only_counters() {
         let delta = MetricsDelta::default();
         let samples = delta.samples();
-        assert_eq!(samples.len(), 9);
+        assert_eq!(samples.len(), 10);
         assert!(samples.iter().all(|s| s.is_counter && s.value == 0.0));
+    }
+
+    /// Regression: a long-lived WebSocket/SSE session must not be booked as
+    /// proxy latency. A single one-hour tunnel among a thousand fast requests
+    /// is enough to move the mean by three orders of magnitude while every
+    /// percentile stays flat — the carve-out in `record` is what prevents it.
+    #[test]
+    fn test_streaming_session_does_not_inflate_latency() {
+        let m = ProxyMetrics::default();
+        // Ordinary fast traffic.
+        for _ in 0..1000 {
+            m.record(200, 2, Some(1), RequestDestination::Project, false);
+        }
+        // One WebSocket tunnel that lived a full hour before idling out.
+        m.record(101, 3_600_000, Some(3), RequestDestination::Project, true);
+
+        let samples = m
+            .snapshot()
+            .delta_since(&MetricsSnapshot::default())
+            .samples();
+        let get = |name: &str| {
+            samples
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing sample {name}"))
+                .value
+        };
+
+        // Latency is unmoved by the tunnel...
+        assert_eq!(get(METRIC_SELF_AVG), 1.0);
+        assert_eq!(get(METRIC_DURATION_AVG), 2.0);
+        assert!(get(METRIC_DURATION_P99) <= 5.0);
+        // ...but the session is still counted as a request, and its lifetime
+        // is reported on its own series.
+        assert_eq!(get(METRIC_REQUESTS), 1001.0);
+        assert_eq!(get(METRIC_STREAMING_SESSIONS), 1.0);
+        assert_eq!(get(METRIC_STREAMING_DURATION_AVG), 3_600_000.0);
+    }
+
+    #[test]
+    fn test_streaming_sessions_still_partition_request_total() {
+        let m = ProxyMetrics::default();
+        m.record(200, 5, Some(2), RequestDestination::Project, false);
+        m.record(101, 90_000, Some(2), RequestDestination::Project, true);
+        m.record(200, 60_000, Some(2), RequestDestination::Console, true);
+
+        let samples = m
+            .snapshot()
+            .delta_since(&MetricsSnapshot::default())
+            .samples();
+        let get = |name: &str| {
+            samples
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing sample {name}"))
+                .value
+        };
+
+        // The destination invariant must survive the streaming carve-out.
+        assert_eq!(
+            get(METRIC_REQUESTS_PROJECT)
+                + get(METRIC_REQUESTS_CONSOLE)
+                + get(METRIC_REQUESTS_OTHER),
+            get(METRIC_REQUESTS),
+        );
+        assert_eq!(get(METRIC_REQUESTS), 3.0);
+        assert_eq!(get(METRIC_STREAMING_SESSIONS), 2.0);
+        // Latency avg divides by the 1 non-streaming request, not by 3.
+        assert_eq!(get(METRIC_DURATION_AVG), 5.0);
+    }
+
+    #[test]
+    fn test_streaming_only_interval_emits_no_latency_gauges() {
+        let m = ProxyMetrics::default();
+        m.record(101, 120_000, Some(4), RequestDestination::Project, true);
+
+        let samples = m
+            .snapshot()
+            .delta_since(&MetricsSnapshot::default())
+            .samples();
+        let names: Vec<&str> = samples.iter().map(|s| s.name).collect();
+        let get = |name: &str| {
+            samples
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing sample {name}"))
+                .value
+        };
+
+        // Total and self time are lifetimes here, so neither is reported —
+        // better a gap than a divide-by-zero or a misleading 0ms.
+        assert!(!names.contains(&METRIC_DURATION_AVG));
+        assert!(!names.contains(&METRIC_SELF_AVG));
+        // ...but the backend latency IS real: 4ms to the upgrade response.
+        assert_eq!(get(METRIC_UPSTREAM_AVG), 4.0);
+        // Error rate still reported: it divides by all requests.
+        assert!(names.contains(&METRIC_ERROR_RATE));
+        assert_eq!(get(METRIC_STREAMING_DURATION_AVG), 120_000.0);
+    }
+
+    /// A WebSocket upgrade gets a 1h upstream read timeout chosen from the
+    /// request's own `Upgrade` header, so a hung upstream can report a
+    /// ~3_600_000ms time-to-first-header. Unclamped, one such observation
+    /// drags the backend mean into the millions — the same unweighted-mean
+    /// distortion the streaming carve-out exists to prevent.
+    #[test]
+    fn test_streaming_handshake_observation_is_clamped() {
+        let m = ProxyMetrics::default();
+        // 99 healthy streaming handshakes at 10ms...
+        for _ in 0..99 {
+            m.record(101, 500_000, Some(10), RequestDestination::Project, true);
+        }
+        // ...and one that sat on a hung upstream for very nearly the full hour.
+        m.record(
+            101,
+            3_600_000,
+            Some(3_599_000),
+            RequestDestination::Project,
+            true,
+        );
+
+        let samples = m
+            .snapshot()
+            .delta_since(&MetricsSnapshot::default())
+            .samples();
+        let get = |name: &str| {
+            samples
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing sample {name}"))
+                .value
+        };
+
+        // Unclamped this would be (99*10 + 3_599_000)/100 = 35_999.9ms.
+        // Clamped, the outlier contributes at most MAX_HANDSHAKE_OBSERVATION_MS.
+        let expected = (99.0 * 10.0 + MAX_HANDSHAKE_OBSERVATION_MS as f64) / 100.0;
+        assert_eq!(get(METRIC_UPSTREAM_AVG), expected);
+        assert!(
+            get(METRIC_UPSTREAM_AVG) < 1_000.0,
+            "one hung handshake must not move the backend mean into the seconds"
+        );
+        // The observation is kept, not dropped — the count stays honest.
+        assert_eq!(get(METRIC_STREAMING_SESSIONS), 100.0);
+
+        // And the reason a clamp is the only available defence: at 1-in-100 the
+        // outlier sits ABOVE p99, so the percentiles do not react to it however
+        // large it is. The mean is the only series that moves — precisely the
+        // signature that makes this distortion hard to read off a chart.
+        assert!(
+            get(METRIC_UPSTREAM_P99) <= 10.0,
+            "p99 should be unmoved by a single tail observation, got {}",
+            get(METRIC_UPSTREAM_P99)
+        );
+    }
+
+    #[test]
+    fn test_normal_streaming_handshake_is_not_clamped() {
+        let m = ProxyMetrics::default();
+        m.record(101, 120_000, Some(250), RequestDestination::Project, true);
+
+        let samples = m
+            .snapshot()
+            .delta_since(&MetricsSnapshot::default())
+            .samples();
+        let avg = samples
+            .iter()
+            .find(|s| s.name == METRIC_UPSTREAM_AVG)
+            .expect("upstream avg present")
+            .value;
+        // Below the ceiling -> recorded verbatim, no distortion of real data.
+        assert_eq!(avg, 250.0);
+    }
+
+    /// The self-time histogram observes a strict subset of the upstream
+    /// histogram. If `METRIC_SELF_AVG` ever divides by `upstream_count` again,
+    /// every streaming session silently drags the mean toward zero.
+    #[test]
+    fn test_self_avg_denominator_excludes_streaming_sessions() {
+        let m = ProxyMetrics::default();
+        // One ordinary proxied request: 30ms total, 10ms backend -> 20ms self.
+        m.record(200, 30, Some(10), RequestDestination::Project, false);
+        // Three streaming sessions, each with a real 10ms backend latency.
+        for _ in 0..3 {
+            m.record(101, 600_000, Some(10), RequestDestination::Project, true);
+        }
+
+        let samples = m
+            .snapshot()
+            .delta_since(&MetricsSnapshot::default())
+            .samples();
+        let get = |name: &str| {
+            samples
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap_or_else(|| panic!("missing sample {name}"))
+                .value
+        };
+
+        // Backend latency averages over all 4 upstream observations.
+        assert_eq!(get(METRIC_UPSTREAM_AVG), 10.0);
+        // Self time averages over the 1 non-streaming request only. Dividing
+        // by upstream_count (4) would yield 5.0 — the regression this guards.
+        assert_eq!(get(METRIC_SELF_AVG), 20.0);
+        assert_eq!(get(METRIC_STREAMING_SESSIONS), 3.0);
     }
 
     #[test]
@@ -568,13 +950,13 @@ mod tests {
         // requests recorded since the previous snapshot.
         let m = ProxyMetrics::default();
 
-        m.record(200, 10, None, RequestDestination::Project);
-        m.record(200, 10, None, RequestDestination::Console);
+        m.record(200, 10, None, RequestDestination::Project, false);
+        m.record(200, 10, None, RequestDestination::Console, false);
         let first_snapshot = m.snapshot();
         let first_delta = first_snapshot.delta_since(&MetricsSnapshot::default());
         assert_eq!(first_delta.total_requests(), 2);
 
-        m.record(503, 40, None, RequestDestination::Other);
+        m.record(503, 40, None, RequestDestination::Other, false);
         let second_snapshot = m.snapshot();
         let second_delta = second_snapshot.delta_since(&first_snapshot);
 
@@ -604,11 +986,11 @@ mod tests {
     fn test_upstream_and_self_latency_split() {
         let m = ProxyMetrics::default();
         // Proxied: 100ms total, 80ms in the backend -> 20ms proxy self time.
-        m.record(200, 100, Some(80), RequestDestination::Project);
+        m.record(200, 100, Some(80), RequestDestination::Project, false);
         // Proxied: 40ms total, 30ms backend -> 10ms self.
-        m.record(200, 40, Some(30), RequestDestination::Project);
+        m.record(200, 40, Some(30), RequestDestination::Project, false);
         // Proxy-handled (no upstream): must not affect upstream/self stats.
-        m.record(301, 1, None, RequestDestination::Other);
+        m.record(301, 1, None, RequestDestination::Other, false);
 
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
         let samples = delta.samples();
@@ -642,7 +1024,7 @@ mod tests {
     #[test]
     fn test_no_upstream_requests_emit_no_upstream_gauges() {
         let m = ProxyMetrics::default();
-        m.record(200, 5, None, RequestDestination::Console);
+        m.record(200, 5, None, RequestDestination::Console, false);
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
 
         let names: Vec<&str> = delta.samples().iter().map(|s| s.name).collect();
@@ -657,7 +1039,7 @@ mod tests {
         let m = ProxyMetrics::default();
         // Upstream reading slightly larger than total (different clock reads):
         // self time must clamp to 0, not underflow.
-        m.record(200, 10, Some(12), RequestDestination::Project);
+        m.record(200, 10, Some(12), RequestDestination::Project, false);
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
         let samples = delta.samples();
         let self_avg = samples
@@ -671,10 +1053,10 @@ mod tests {
     #[test]
     fn test_destination_counters_sum_to_total() {
         let m = ProxyMetrics::default();
-        m.record(200, 1, None, RequestDestination::Project);
-        m.record(200, 1, None, RequestDestination::Project);
-        m.record(404, 1, None, RequestDestination::Console);
-        m.record(301, 1, None, RequestDestination::Other);
+        m.record(200, 1, None, RequestDestination::Project, false);
+        m.record(200, 1, None, RequestDestination::Project, false);
+        m.record(404, 1, None, RequestDestination::Console, false);
+        m.record(301, 1, None, RequestDestination::Other, false);
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
 
         let samples = delta.samples();
@@ -700,8 +1082,8 @@ mod tests {
     #[test]
     fn test_samples_active_interval_emits_gauges() {
         let m = ProxyMetrics::default();
-        m.record(200, 10, None, RequestDestination::Project);
-        m.record(500, 30, None, RequestDestination::Project);
+        m.record(200, 10, None, RequestDestination::Project, false);
+        m.record(500, 30, None, RequestDestination::Project, false);
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
 
         let samples = delta.samples();
@@ -733,7 +1115,7 @@ mod tests {
         let m = ProxyMetrics::default();
         // 100 requests all in the (10, 25] bucket.
         for _ in 0..100 {
-            m.record(200, 20, None, RequestDestination::Project);
+            m.record(200, 20, None, RequestDestination::Project, false);
         }
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
 
@@ -748,12 +1130,12 @@ mod tests {
     fn test_percentile_spread_orders_correctly() {
         let m = ProxyMetrics::default();
         for _ in 0..90 {
-            m.record(200, 3, None, RequestDestination::Project); // fast
+            m.record(200, 3, None, RequestDestination::Project, false); // fast
         }
         for _ in 0..9 {
-            m.record(200, 400, None, RequestDestination::Project); // slow
+            m.record(200, 400, None, RequestDestination::Project, false); // slow
         }
-        m.record(200, 9000, None, RequestDestination::Project); // overflow tail
+        m.record(200, 9000, None, RequestDestination::Project, false); // overflow tail
         let delta = m.snapshot().delta_since(&MetricsSnapshot::default());
 
         let p50 = delta.percentile(0.50);

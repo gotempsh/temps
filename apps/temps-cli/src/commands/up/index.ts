@@ -17,6 +17,38 @@ import {
 } from '../../api/sdk.gen.js'
 import type { ProjectResponse, EnvironmentResponse } from '../../api/types.gen.js'
 import { watchDeployment } from '../../lib/deployment-watcher.jsx'
+import { waitForTriggeredDeployment } from '../../lib/find-triggered-deployment.js'
+
+export interface EnvironmentSelection {
+  environmentId: number | undefined
+  environmentName: string
+}
+
+/**
+ * Resolve `--environment <name>` against the project's real environments.
+ * A typo/stale name must NOT silently fall back to some other environment —
+ * it leaves environmentId undefined (so the caller can decide how to fail)
+ * while environmentName still reflects what the user actually asked for.
+ */
+export function resolveExplicitEnvironment(
+  environments: Pick<EnvironmentResponse, 'id' | 'name'>[],
+  name: string
+): EnvironmentSelection {
+  const env = environments.find(e => e.name === name)
+  return env
+    ? { environmentId: env.id, environmentName: env.name }
+    : { environmentId: undefined, environmentName: name }
+}
+
+/** Non-interactive (`--yes`) default: prefer `production`, else the first environment. */
+export function resolveDefaultEnvironment(
+  environments: Pick<EnvironmentResponse, 'id' | 'name'>[]
+): EnvironmentSelection {
+  const prodEnv = environments.find(e => e.name === 'production')
+  if (prodEnv) return { environmentId: prodEnv.id, environmentName: prodEnv.name }
+  if (environments[0]) return { environmentId: environments[0].id, environmentName: environments[0].name }
+  return { environmentId: undefined, environmentName: 'production' }
+}
 
 interface UpOptions {
   project?: string
@@ -156,11 +188,7 @@ async function up(projectArg: string | undefined, options: UpOptions): Promise<v
 
   if (environments.length > 0) {
     if (options.environment) {
-      const env = environments.find(e => e.name === options.environment)
-      if (env) {
-        environmentId = env.id
-        environmentName = env.name
-      }
+      ;({ environmentId, environmentName } = resolveExplicitEnvironment(environments, options.environment))
     } else if (!options.yes) {
       const selectedEnv = await promptSelect({
         message: 'Select environment',
@@ -174,14 +202,7 @@ async function up(projectArg: string | undefined, options: UpOptions): Promise<v
       environmentId = parseInt(selectedEnv, 10)
       environmentName = environments.find(e => e.id === environmentId)?.name ?? 'production'
     } else {
-      const prodEnv = environments.find(e => e.name === 'production')
-      if (prodEnv) {
-        environmentId = prodEnv.id
-        environmentName = prodEnv.name
-      } else if (environments[0]) {
-        environmentId = environments[0].id
-        environmentName = environments[0].name
-      }
+      ;({ environmentId, environmentName } = resolveDefaultEnvironment(environments))
     }
   }
 
@@ -248,6 +269,18 @@ async function up(projectArg: string | undefined, options: UpOptions): Promise<v
     )
     newline()
 
+    // Snapshot the pre-trigger latest id so we don't latch onto a prior deploy.
+    // trigger-pipeline only enqueues a job; the new row appears asynchronously.
+    const { data: baselineList } = await getProjectDeployments({
+      client,
+      path: { id: project.id },
+      query: {
+        per_page: 1,
+        ...(environmentId ? { environment_id: environmentId } : {}),
+      },
+    })
+    const afterId = baselineList?.deployments?.[0]?.id ?? 0
+
     // Trigger the pipeline
     startSpinner('Starting deployment...')
 
@@ -280,50 +313,45 @@ async function up(projectArg: string | undefined, options: UpOptions): Promise<v
         return
       }
 
-      // Find the deployment ID so we can watch it with the rich TUI
+      // Wait for the deployment created by this trigger (not a prior completed one)
       startSpinner('Waiting for deployment to start...')
-      let deploymentId: number | null = null
+      const waitResult = await waitForTriggeredDeployment(
+        async () => {
+          const { data: deployList, error: deployError } = await getProjectDeployments({
+            client,
+            path: { id: project.id },
+            query: {
+              per_page: 10,
+              ...(environmentId ? { environment_id: environmentId } : {}),
+            },
+          })
+          return { deployments: deployList?.deployments, error: deployError }
+        },
+        { afterId },
+      )
 
-      for (let attempt = 0; attempt < 15; attempt++) {
-        const { data: deployList, error: deployError } = await getProjectDeployments({
-          client,
-          path: { id: project.id },
-          query: {
-            per_page: 1,
-            ...(environmentId ? { environment_id: environmentId } : {}),
-          },
-        })
-
-        if (deployError) {
-          failSpinner('Failed to fetch deployment status')
-          info(`Error: ${getErrorMessage(deployError)}`)
-          return
-        }
-
-        const latest = deployList?.deployments?.[0]
-        if (latest?.id) {
-          deploymentId = latest.id
-          break
-        }
-
-        await new Promise((r) => setTimeout(r, 2000))
+      if (!waitResult.ok && waitResult.error === 'fetch_failed') {
+        failSpinner('Failed to fetch deployment status')
+        info(`Error: ${getErrorMessage(waitResult.cause)}`)
+        return
       }
 
-      if (deploymentId) {
-        succeedSpinner(`Deployment #${deploymentId} found`)
-        const result = await watchDeployment({
-          projectId: project.id,
-          deploymentId,
-          timeoutSecs: 600,
-          projectName: resolved.slug,
-        })
-
-        if (!result.success) {
-          process.exitCode = 1
-        }
-      } else {
+      if (!waitResult.ok) {
         failSpinner('Could not locate the deployment to track')
         info(`Check status: ${colors.muted('bunx @temps-sdk/cli status')}`)
+        return
+      }
+
+      succeedSpinner(`Deployment #${waitResult.deploymentId} found`)
+      const result = await watchDeployment({
+        projectId: project.id,
+        deploymentId: waitResult.deploymentId,
+        timeoutSecs: 600,
+        projectName: resolved.slug,
+      })
+
+      if (!result.success) {
+        process.exitCode = 1
       }
     } catch (err) {
       failSpinner('Deployment failed')

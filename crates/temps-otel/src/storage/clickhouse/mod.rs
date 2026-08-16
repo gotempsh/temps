@@ -10,10 +10,21 @@
 //! - **Span-domain reads** (`query_trace_summaries`, `count_traces`,
 //!   `query_spans`, `get_trace`, GenAI reads) run natively against ClickHouse
 //!   as of Phase 1.
-//! - **Non-span methods** (metrics, logs, anomaly helpers, retention) and
-//!   **control-row methods** (insights, health summaries, quota) are delegated
-//!   to the inner [`Arc<TimescaleDbStorage>`] unconditionally. These are
-//!   ADR-016 Phases 2–4.
+//! - **Metric writes and reads** (`store_metrics`, `query_metrics`,
+//!   `list_metric_names`, anomaly-detection helpers) also run natively
+//!   against ClickHouse — `store_metrics` writes only to CH, never to the
+//!   inner Postgres store (see the comment above `store_metrics`).
+//! - **Logs** (`store_logs`, `archive_logs`, `query_logs`) and
+//!   **control-row methods** (insights, health summaries) are delegated to
+//!   the inner [`Arc<TimescaleDbStorage>`] unconditionally.
+//! - **Storage quota** (`get_storage_quota`, `check_quota`) is NOT a plain
+//!   delegation: it combines ClickHouse-native byte accounting for
+//!   `spans`/`metrics` (via `system.parts`) with the inner store's
+//!   single-table share of `otel_log_events` — see `get_storage_quota`'s
+//!   doc comment for why summing the inner store's own 3-table
+//!   `get_storage_quota` would be wrong here (it would measure
+//!   near-empty Postgres `otel_spans`/`otel_metrics` tables that a
+//!   ClickHouse-enabled install never writes span/metric rows into).
 //!
 //! ## Activation
 //!
@@ -50,11 +61,15 @@ use temps_metrics::validate_metric_name;
 
 use crate::error::OtelError;
 use crate::storage::timescaledb::TimescaleDbStorage;
-use crate::storage::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageResult};
+use crate::storage::{
+    merge_trace_ref_projects, BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage,
+    StorageResult, TraceRefProject,
+};
 use crate::types::{
     GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, HistogramSummary, Insight,
     InsightStatus, LogQuery, LogRecord, MetricAggregation, MetricBucket, MetricPoint, MetricQuery,
-    SpanEvent, SpanKind, SpanRecord, SpanStatusCode, StorageQuota, TraceQuery, TraceSummary,
+    SpanEvent, SpanKind, SpanRecord, SpanStats, SpanStatsQuery, SpanStatusCode, StorageQuota,
+    TraceQuery, TraceSummary,
 };
 
 // ── Client configuration ────────────────────────────────────────────────────
@@ -112,6 +127,18 @@ pub struct ClickHouseOtelClient {
     pub(crate) client: ::clickhouse::Client,
 }
 
+/// Wall-clock ceiling for any single ClickHouse query, in seconds.
+/// A Traces list query that takes two minutes is already a failure from the
+/// user's point of view; this makes it fail as one.
+const CH_MAX_EXECUTION_TIME_SECS: &str = "120";
+
+/// Memory ceiling for any single ClickHouse query, in bytes (8 GiB).
+const CH_MAX_MEMORY_USAGE_BYTES: &str = "8589934592";
+
+/// Start spilling `GROUP BY` state to disk at half the memory ceiling, so
+/// aggregations degrade to slow rather than failing outright.
+const CH_MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY: &str = "4294967296";
+
 impl ClickHouseOtelClient {
     /// Build a client from configuration.
     ///
@@ -122,7 +149,27 @@ impl ClickHouseOtelClient {
             .with_url(config.url)
             .with_database(config.database)
             .with_user(config.user)
-            .with_password(config.password);
+            .with_password(config.password)
+            // Per-query blast radius. Without these, one authenticated read of
+            // a very large project (an unbounded `count_traces`, a wide window,
+            // a pathological offset) can hold many GB and many minutes on a
+            // ClickHouse instance every tenant on the node shares — the query
+            // fails either way, the question is whether it takes the server's
+            // other queries down with it. These bound it to a clean
+            // per-query MEMORY_LIMIT_EXCEEDED / TIMEOUT_EXCEEDED instead.
+            //
+            // Deliberately generous: a normal Traces page reads a window, not a
+            // table, so real usage is orders of magnitude under both. They are
+            // constants rather than settings because there is no operator
+            // demand for tuning them yet; if that appears, they belong on a
+            // settings row (CLAUDE.md forbids env-var config), not an env var.
+            .with_setting("max_execution_time", CH_MAX_EXECUTION_TIME_SECS)
+            .with_setting("max_memory_usage", CH_MAX_MEMORY_USAGE_BYTES)
+            // Spill GROUP BY state to disk rather than dying at the ceiling.
+            .with_setting(
+                "max_bytes_before_external_group_by",
+                CH_MAX_BYTES_BEFORE_EXTERNAL_GROUP_BY,
+            );
         Self { client }
     }
 
@@ -248,29 +295,97 @@ pub struct ChSpanRow {
     /// OTLP retries of the same span converge to one canonical row via
     /// ReplacingMergeTree (highest _version wins).
     pub _version: u64,
+
+    // ── Retention ───────────────────────────────────────────────────────────
+    /// retention_days  UInt16  DEFAULT 90
+    ///
+    /// Added by migration 0004_retention_days.sql. The TTL expression in
+    /// 0005_retention_ttl.sql reads this column.
+    pub retention_days: u16,
+
+    // ── Facet slot columns (migration 0008_facet_slots.sql) ─────────────────
+    //
+    // Pre-allocated generic slot columns for fast attribute filtering. When an
+    // admin registers an attribute key as a "facet" via the API, new spans
+    // that carry that attribute have its value written here. The query layer
+    // emits `facet_attr_N = ?` instead of `JSONExtractString(attributes,?) = ?`
+    // for registered keys, letting ClickHouse use the bloom-filter skip index.
+    //
+    // All slots are NULL for spans ingested before the corresponding facet was
+    // registered (or for spans that do not carry the attribute). Historical
+    // spans are back-filled via an async ClickHouse mutation at registration
+    // time.
+    //
+    // IMPORTANT: field order here must match the DDL ALTER TABLE ADD COLUMN
+    // order in 0008_facet_slots.sql (positional binary serialisation).
+    pub facet_attr_1: Option<String>,
+    pub facet_attr_2: Option<String>,
+    pub facet_attr_3: Option<String>,
+    pub facet_attr_4: Option<String>,
+    pub facet_attr_5: Option<String>,
+    pub facet_attr_6: Option<String>,
+    pub facet_attr_7: Option<String>,
+    pub facet_attr_8: Option<String>,
+    pub facet_attr_9: Option<String>,
+    pub facet_attr_10: Option<String>,
+    pub facet_attr_11: Option<String>,
+    pub facet_attr_12: Option<String>,
+    pub facet_attr_13: Option<String>,
+    pub facet_attr_14: Option<String>,
+    pub facet_attr_15: Option<String>,
+    pub facet_attr_16: Option<String>,
+    pub facet_attr_17: Option<String>,
+    pub facet_attr_18: Option<String>,
+    pub facet_attr_19: Option<String>,
+    pub facet_attr_20: Option<String>,
 }
 
 // ── From<&SpanRecord> for ChSpanRow ────────────────────────────────────────
 
 impl From<&SpanRecord> for ChSpanRow {
+    /// Convert a [`SpanRecord`] to a [`ChSpanRow`] with all facet slots `None`.
+    ///
+    /// Use [`ChSpanRow::from_span_with_facets`] on the hot ingest path when a
+    /// facet cache is available — this variant is kept for tests and code paths
+    /// that do not have access to the shared cache.
     fn from(span: &SpanRecord) -> Self {
-        // Serialize attributes and events to JSON strings. These are
-        // BTreeMap<String,String> / Vec<SpanEvent>, both of which are
-        // trivially serializable. We fall back to "{}" / "[]" on the
-        // (unreachable in practice) serialization error path rather than
-        // propagating — ingest must not drop spans over a serialization
-        // hiccup in metadata.
+        let empty = std::collections::HashMap::new();
+        let facet_slots = crate::services::facet_service::invert_facet_slots(&empty);
+        Self::from_span_with_facets(span, &facet_slots)
+    }
+}
+
+impl ChSpanRow {
+    /// Build a [`ChSpanRow`] from a [`SpanRecord`], populating facet slot
+    /// columns from a pre-inverted `slot -> key` lookup.
+    ///
+    /// `facet_slots[slot - 1]` is the attribute key assigned to that slot, if
+    /// any (see [`crate::services::facet_service::invert_facet_slots`]). For
+    /// each assigned slot, this function looks up the key in
+    /// `span.attributes` (span-level attributes only — the resource-level
+    /// attributes are not merged here because by ingest time the important
+    /// resource attrs are already in the denormalised columns like
+    /// `service_name`). If the key is present, its value goes into
+    /// `facet_attr_{slot}`; otherwise that slot is `None`.
+    ///
+    /// This is a lock-free, pure in-memory operation — the caller inverts the
+    /// `ArcSwap`-loaded cache once per batch, not once per span (the closure
+    /// here is then O(1) per slot per span, not O(MAX_FACET_SLOTS)).
+    pub fn from_span_with_facets(
+        span: &SpanRecord,
+        facet_slots: &[Option<&str>; crate::services::facet_service::MAX_FACET_SLOTS as usize],
+    ) -> Self {
         let attributes = serde_json::to_string(&span.attributes).unwrap_or_else(|_| "{}".into());
         let events = serde_json::to_string(&span.events).unwrap_or_else(|_| "[]".into());
 
-        // _version: Unix ms timestamp used as the ReplacingMergeTree dedup key.
-        // Using now() at conversion time (same moment as ingest). Spans retried
-        // by the OTLP exporter will produce a higher _version than the first
-        // attempt and win the dedup.
         let version = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
+
+        let slot_value = |slot: u8| -> Option<String> {
+            facet_slots[(slot - 1) as usize].and_then(|key| span.attributes.get(key).cloned())
+        };
 
         Self {
             project_id: span.project_id,
@@ -295,6 +410,29 @@ impl From<&SpanRecord> for ChSpanRow {
             attributes,
             events,
             _version: version,
+            // Callers that hold a RetentionResolver should override this field
+            // after construction. The fixed default matches the DDL DEFAULT.
+            retention_days: temps_core::RetentionTable::Spans.default_days(),
+            facet_attr_1: slot_value(1),
+            facet_attr_2: slot_value(2),
+            facet_attr_3: slot_value(3),
+            facet_attr_4: slot_value(4),
+            facet_attr_5: slot_value(5),
+            facet_attr_6: slot_value(6),
+            facet_attr_7: slot_value(7),
+            facet_attr_8: slot_value(8),
+            facet_attr_9: slot_value(9),
+            facet_attr_10: slot_value(10),
+            facet_attr_11: slot_value(11),
+            facet_attr_12: slot_value(12),
+            facet_attr_13: slot_value(13),
+            facet_attr_14: slot_value(14),
+            facet_attr_15: slot_value(15),
+            facet_attr_16: slot_value(16),
+            facet_attr_17: slot_value(17),
+            facet_attr_18: slot_value(18),
+            facet_attr_19: slot_value(19),
+            facet_attr_20: slot_value(20),
         }
     }
 }
@@ -591,6 +729,14 @@ struct ChMetricBucketRow {
     series_values: Vec<String>,
 }
 
+/// Typed empty array used when a metrics query has no `group_by` labels.
+///
+/// A bare ClickHouse `[]` literal can be exposed as `Array(Nothing)` in the
+/// response header. The Rust ClickHouse client cannot decode that element type
+/// into `Vec<String>`, so empty arrays projected into typed rows must carry a
+/// concrete element type explicitly.
+const EMPTY_STRING_ARRAY_SQL: &str = "CAST([], 'Array(String)')";
+
 /// Row of the temporality-aware histogram sub-aggregation (one per
 /// bucket × grouped-series). Matched back to [`ChMetricBucketRow`] by
 /// `(bucket_ms, series_values)`.
@@ -709,6 +855,187 @@ struct ChTraceSummaryRow {
 #[derive(::clickhouse::Row, Deserialize, Debug)]
 struct ChCountRow {
     cnt: u64,
+}
+
+/// Row returned by `query_span_stats` — one row per operation.
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChSpanStatsRow {
+    project_id: i32,
+    service_name: String,
+    span_name: String,
+    kind: String,
+    span_count: u64,
+    error_count: u64,
+    total_duration_ms: f64,
+    min_duration_ms: f64,
+    max_duration_ms: f64,
+    avg_duration_ms: f64,
+    stddev_duration_ms: f64,
+    p50_duration_ms: f64,
+    p95_duration_ms: f64,
+    p99_duration_ms: f64,
+    /// Unix milliseconds (toUnixTimestamp64Milli)
+    last_seen_ms: i64,
+}
+
+impl From<ChSpanStatsRow> for SpanStats {
+    fn from(r: ChSpanStatsRow) -> Self {
+        use chrono::TimeZone;
+        let last_seen = chrono::Utc
+            .timestamp_millis_opt(r.last_seen_ms)
+            .single()
+            .unwrap_or_default();
+        crate::types::build_span_stats(
+            crate::types::SpanStatsGroup {
+                project_id: r.project_id,
+                service_name: r.service_name,
+                span_name: r.span_name,
+                kind: str_to_span_kind(&r.kind),
+                count: r.span_count as i64,
+                error_count: r.error_count as i64,
+            },
+            crate::types::SpanDurationStats {
+                total_ms: r.total_duration_ms,
+                min_ms: r.min_duration_ms,
+                max_ms: r.max_duration_ms,
+                avg_ms: r.avg_duration_ms,
+                stddev_ms: r.stddev_duration_ms,
+                p50_ms: r.p50_duration_ms,
+                p95_ms: r.p95_duration_ms,
+                p99_ms: r.p99_duration_ms,
+            },
+            last_seen,
+        )
+    }
+}
+
+/// A value bound into a ClickHouse query, in placeholder order.
+#[derive(Clone, Debug)]
+pub(crate) enum ChBind {
+    I32(i32),
+    I64(i64),
+    F64(f64),
+    Str(String),
+}
+
+/// Apply an ordered bind list to a query builder.
+pub(crate) fn bind_all(
+    mut q: ::clickhouse::query::Query,
+    binds: Vec<ChBind>,
+) -> ::clickhouse::query::Query {
+    for b in binds {
+        q = match b {
+            ChBind::I32(v) => q.bind(v),
+            ChBind::I64(v) => q.bind(v),
+            ChBind::F64(v) => q.bind(v),
+            ChBind::Str(v) => q.bind(v),
+        };
+    }
+    q
+}
+
+/// Build the shared WHERE clause and ordered binds for the ClickHouse
+/// span-stats list/count queries.
+///
+/// The list and count queries MUST share this builder: a filter applied to one
+/// but not the other yields a total that disagrees with the rows.
+///
+/// `environment_id` is **not** applied here. Resolving an environment to its
+/// deployments requires the Postgres `deployments` table, which ClickHouse
+/// cannot join against — the same limitation `query_trace_summaries` has. The
+/// caller is warned rather than silently given unfiltered numbers.
+fn build_ch_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<ChBind>) {
+    let mut where_parts: Vec<String> = Vec::new();
+    let mut binds: Vec<ChBind> = Vec::new();
+
+    // `IN (...)` with one placeholder per id: the ClickHouse driver has no
+    // array-bind for Int32, and the list is bounded by the caller's project
+    // access, so rendering N placeholders is safe and stays parameterised.
+    let placeholders = std::iter::repeat_n("?", query.project_ids.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    where_parts.push(format!("project_id IN ({placeholders})"));
+    binds.extend(query.project_ids.iter().map(|id| ChBind::I32(*id)));
+
+    where_parts.push("start_time >= fromUnixTimestamp64Milli(?)".to_owned());
+    binds.push(ChBind::I64(query.start_time.timestamp_millis()));
+    where_parts.push("start_time <= fromUnixTimestamp64Milli(?)".to_owned());
+    binds.push(ChBind::I64(query.end_time.timestamp_millis()));
+
+    if let Some(ref svc) = query.service_name {
+        // Qualified: the SELECT list aliases `service_name`, and an unqualified
+        // reference in WHERE would bind to the aggregate (ClickHouse Code 184).
+        where_parts.push("spans.service_name = ?".to_owned());
+        binds.push(ChBind::Str(svc.clone()));
+    }
+    if let Some(ref name) = query.span_name {
+        where_parts.push("spans.name = ?".to_owned());
+        binds.push(ChBind::Str(name.clone()));
+    }
+    if let Some(ref pattern) = query.name_pattern {
+        where_parts.push("spans.name ILIKE ?".to_owned());
+        binds.push(ChBind::Str(format!(
+            "%{}%",
+            escape_like_pattern(pattern.as_str())
+        )));
+    }
+    if let Some(kind) = query.kind {
+        where_parts.push("spans.kind = ?".to_owned());
+        binds.push(ChBind::Str(kind.to_string()));
+    }
+    if let Some(status) = query.status {
+        where_parts.push("status_code = ?".to_owned());
+        binds.push(ChBind::Str(status.to_string()));
+    }
+    if let Some(min_dur) = query.min_duration_ms {
+        where_parts.push("duration_ms >= ?".to_owned());
+        binds.push(ChBind::F64(min_dur));
+    }
+    if let Some(did) = query.deployment_id {
+        where_parts.push("deployment_id = ?".to_owned());
+        binds.push(ChBind::I32(did));
+    }
+    if query.environment_id.is_some() {
+        tracing::warn!(
+            "span-stats environment_id filter ignored: the ClickHouse backend cannot join \
+             the Postgres deployments table. Filter by deployment_id instead."
+        );
+    }
+    if let Some(ref attrs) = query.attributes {
+        for (key, value) in attrs {
+            where_parts.push("JSONExtractString(attributes, ?) = ?".to_owned());
+            binds.push(ChBind::Str(key.clone()));
+            binds.push(ChBind::Str(value.clone()));
+        }
+    }
+
+    (where_parts.join(" AND "), binds)
+}
+
+/// The SELECT alias (or expression) a span-stats sort field orders by in
+/// ClickHouse.
+///
+/// The ratio fields are computed inline rather than selected, because they are
+/// derived in Rust (see [`crate::types::build_span_stats`]) and so have no
+/// alias to sort on. `nullIf` guards the denominator: dividing by zero in
+/// ClickHouse yields `inf`, which would sort above every real value and put
+/// all-zero-duration operations at the top of an "inconsistency" ranking.
+fn ch_span_stats_order_alias(field: crate::types::SpanStatsSortField) -> &'static str {
+    use crate::types::SpanStatsSortField as F;
+    match field {
+        F::TotalDurationMs => "total_duration_ms",
+        F::P50DurationMs => "p50_duration_ms",
+        F::P95DurationMs => "p95_duration_ms",
+        F::P99DurationMs => "p99_duration_ms",
+        F::MaxDurationMs => "max_duration_ms",
+        F::AvgDurationMs => "avg_duration_ms",
+        F::StddevDurationMs => "stddev_duration_ms",
+        F::Count => "span_count",
+        F::ErrorCount => "error_count",
+        F::ErrorRate => "error_count / nullIf(span_count, 0)",
+        F::CoefficientOfVariation => "stddev_duration_ms / nullIf(avg_duration_ms, 0)",
+        F::TailRatio => "p99_duration_ms / nullIf(p50_duration_ms, 0)",
+    }
 }
 
 /// Row returned by `query_genai_trace_summaries`.
@@ -882,6 +1209,38 @@ pub(crate) fn ch_query_err(operation: &str, err: ::clickhouse::error::Error) -> 
 
 // ── ClickHouseOtelStorage ────────────────────────────────────────────────────
 
+// ── Cross-project trace ref row ─────────────────────────────────────────────
+
+/// ClickHouse row matching the `cross_project_trace_refs` DDL in
+/// `0006_trace_refs.sql`. Field order must match the DDL column order
+/// exactly (positional binary serialization — same rule as [`ChSpanRow`]).
+#[derive(::clickhouse::Row, Serialize, Deserialize, Debug, Clone)]
+pub struct ChTraceRefRow {
+    /// trace_id  String
+    pub trace_id: String,
+    /// project_id  Int32
+    pub project_id: i32,
+    /// first_seen  DateTime64(3, 'UTC') — stored as Unix milliseconds
+    pub first_seen: i64,
+    /// retention_days  UInt16 — stamped from the same resolver value as span
+    /// rows so refs expire on exactly the trace retention horizon.
+    pub retention_days: u16,
+    /// _version  UInt64 — INVERTED first_seen (see [`trace_ref_version`]).
+    pub _version: u64,
+}
+
+/// Dedup version for a trace-ref row: `u64::MAX - first_seen_ms`.
+///
+/// The Postgres table's `ON CONFLICT DO NOTHING` gave `(trace_id, project_id)`
+/// pairs first-write-wins semantics — `first_seen` means "earliest
+/// observation". `ReplacingMergeTree` keeps the HIGHEST version, so the
+/// version is inverted: the earliest observation gets the highest version and
+/// survives merges, preserving those semantics (including against backfilled
+/// historical rows, which are older and therefore always win).
+pub fn trace_ref_version(first_seen_ms: i64) -> u64 {
+    u64::MAX - first_seen_ms.max(0) as u64
+}
+
 /// ClickHouse-backed OTel storage.
 ///
 /// Span writes go directly to ClickHouse. Span reads and all non-span
@@ -896,6 +1255,17 @@ pub struct ClickHouseOtelStorage {
     /// forwarded here verbatim. Phase 1 will replace span read delegation
     /// with native CH queries one method at a time.
     inner: Arc<TimescaleDbStorage>,
+    /// Resolves the per-project `retention_days` value stamped onto each
+    /// ingested span row. The default [`temps_core::FixedRetentionResolver`]
+    /// always returns 90; a plugin can register an alternative implementation.
+    resolver: Arc<dyn temps_core::RetentionResolver>,
+    /// Shared facet cache: attribute_key → slot (1..=20).
+    ///
+    /// Written by `FacetService` on create/delete and loaded once at startup.
+    /// Read lock-free via `ArcSwap::load()` on every span insert and query.
+    /// When `None`, all facet slot columns are written as NULL and queries
+    /// fall back to `JSONExtractString` predicates for all attributes.
+    facet_cache: Option<crate::services::FacetCache>,
 }
 
 impl ClickHouseOtelStorage {
@@ -906,13 +1276,28 @@ impl ClickHouseOtelStorage {
     ///   methods and (during Phase 0) span reads. Callers typically pass
     ///   the same `Arc<TimescaleDbStorage>` they would have registered
     ///   without ClickHouse.
-    pub fn new(config: ClickHouseOtelConfig, inner: Arc<TimescaleDbStorage>) -> Self {
+    /// - `resolver`: resolves per-project `retention_days` at ingest time.
+    ///   Pass `Arc::new(FixedRetentionResolver)` unless a plugin has
+    ///   registered a project-aware implementation.
+    /// - `facet_cache`: shared attribute-key→slot mapping. Pass `None` if
+    ///   `FacetService` is not registered; all facet columns will be NULL.
+    pub fn new(
+        config: ClickHouseOtelConfig,
+        inner: Arc<TimescaleDbStorage>,
+        resolver: Arc<dyn temps_core::RetentionResolver>,
+        facet_cache: Option<crate::services::FacetCache>,
+    ) -> Self {
         let ch = ::clickhouse::Client::default()
             .with_url(&config.url)
             .with_database(&config.database)
             .with_user(&config.user)
             .with_password(&config.password);
-        Self { ch, inner }
+        Self {
+            ch,
+            inner,
+            resolver,
+            facet_cache,
+        }
     }
 
     /// Expose the raw ClickHouse client for migration runners / health checks.
@@ -944,6 +1329,18 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         let total = spans.len() as u64;
 
+        // Load the facet cache once per batch (lock-free ArcSwap read).
+        // All spans in the batch share the same snapshot — a create/delete
+        // that races with this batch will apply to the NEXT batch.
+        let facet_snapshot = self
+            .facet_cache
+            .as_ref()
+            .map(|c| c.load_full())
+            .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+        // Invert once per batch, not once per span — see
+        // `invert_facet_slots` doc for why.
+        let facet_slots = crate::services::facet_service::invert_facet_slots(&facet_snapshot);
+
         for chunk in spans.chunks(MAX_SPAN_INSERT_BATCH) {
             let mut inserter = self
                 .ch
@@ -952,7 +1349,10 @@ impl OtelStorage for ClickHouseOtelStorage {
                 .map_err(|e| ch_ingest_err("store_spans (inserter setup)", e))?;
 
             for span in chunk {
-                let row = ChSpanRow::from(span);
+                let mut row = ChSpanRow::from_span_with_facets(span, &facet_slots);
+                row.retention_days = self
+                    .resolver
+                    .resolve(span.project_id, temps_core::RetentionTable::Spans);
                 inserter
                     .write(&row)
                     .await
@@ -986,17 +1386,15 @@ impl OtelStorage for ClickHouseOtelStorage {
         // QueryBuilder is not object-safe). Instead we use a small state
         // machine: we render SQL with `?` placeholders in the same order as
         // the values, then call .bind() in the same order.
-        let mut sql = String::from(
-            "SELECT project_id, deployment_id, service_name, service_version, \
-             deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
-             toUnixTimestamp64Milli(start_time) AS start_time_ms, \
-             toUnixTimestamp64Milli(end_time) AS end_time_ms, \
-             duration_ms, status_code, status_message, attributes, events \
-             FROM spans FINAL WHERE project_id = ?",
-        );
+        //
+        // The predicate is accumulated into `where_sql` rather than straight
+        // into the final statement because it is used TWICE — see the
+        // two-stage assembly at the end of this method.
+        let mut where_sql = String::from("project_id = ?");
 
         // We build bind values as a Vec<ChBindValue> — a local enum that lets
         // us defer the actual .bind() calls until we have the full query string.
+        #[derive(Clone)]
         enum Bv {
             I32(i32),
             I64(i64),
@@ -1005,32 +1403,43 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         let mut binds: Vec<Bv> = vec![Bv::I32(query.project_id)];
 
+        // The time predicates are ALSO tracked separately so the outer stage of
+        // the two-stage query can repeat them. Repeating them is what preserves
+        // monthly partition pruning on the outer read; the `IN` set alone would
+        // leave the outer query unbounded in time.
+        let mut time_sql = String::new();
+        let mut time_binds: Vec<Bv> = Vec::new();
+
         if let Some(ref tid) = query.trace_id {
-            sql.push_str(" AND trace_id = ?");
+            where_sql.push_str(" AND trace_id = ?");
             binds.push(Bv::Str(tid.clone()));
         }
         if let Some(ref svc) = query.service_name {
-            sql.push_str(" AND service_name = ?");
+            where_sql.push_str(" AND service_name = ?");
             binds.push(Bv::Str(svc.clone()));
         }
         if let Some(status) = query.status {
-            sql.push_str(" AND status_code = ?");
+            where_sql.push_str(" AND status_code = ?");
             binds.push(Bv::Str(span_status_to_str(status).to_owned()));
         }
         if let Some(min_dur) = query.min_duration_ms {
-            sql.push_str(" AND duration_ms >= ?");
+            where_sql.push_str(" AND duration_ms >= ?");
             binds.push(Bv::F64(min_dur));
         }
         if let Some(start) = query.start_time {
-            sql.push_str(" AND start_time >= fromUnixTimestamp64Milli(?)");
+            where_sql.push_str(" AND start_time >= fromUnixTimestamp64Milli(?)");
             binds.push(Bv::I64(start.timestamp_millis()));
+            time_sql.push_str(" AND start_time >= fromUnixTimestamp64Milli(?)");
+            time_binds.push(Bv::I64(start.timestamp_millis()));
         }
         if let Some(end) = query.end_time {
-            sql.push_str(" AND start_time <= fromUnixTimestamp64Milli(?)");
+            where_sql.push_str(" AND start_time <= fromUnixTimestamp64Milli(?)");
             binds.push(Bv::I64(end.timestamp_millis()));
+            time_sql.push_str(" AND start_time <= fromUnixTimestamp64Milli(?)");
+            time_binds.push(Bv::I64(end.timestamp_millis()));
         }
         if let Some(did) = query.deployment_id {
-            sql.push_str(" AND deployment_id = ?");
+            where_sql.push_str(" AND deployment_id = ?");
             binds.push(Bv::I32(did));
         }
         // environment_id: CH has no JOIN to deployments; filter delegated when
@@ -1039,34 +1448,142 @@ impl OtelStorage for ClickHouseOtelStorage {
         // for the common case; environment_id is not resolvable in CH without
         // a separate Postgres lookup, so we skip that filter here.
         if let Some(ref attrs) = query.attributes {
+            // Load the facet cache once for this query (lock-free ArcSwap read).
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
-                binds.push(Bv::Str(key.clone()));
-                binds.push(Bv::Str(value.clone()));
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    // Faceted key: use the pre-populated slot column + bloom index.
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_sql.push_str(&format!(" AND {column} = ?"));
+                    binds.push(Bv::Str(value.clone()));
+                } else {
+                    // Unfaceted key: fall back to JSON extraction.
+                    where_sql.push_str(" AND JSONExtractString(attributes, ?) = ?");
+                    binds.push(Bv::Str(key.clone()));
+                    binds.push(Bv::Str(value.clone()));
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {
-            sql.push_str(" AND name ILIKE ?");
+            where_sql.push_str(" AND name ILIKE ?");
             binds.push(Bv::Str(format!("%{}%", escape_like_pattern(pattern))));
+        }
+        if query.root_only {
+            // Root spans use the '' sentinel for parent_span_id in the CH
+            // schema (0001_spans.sql) — the NULL analog of TimescaleDB's
+            // `parent_span_id IS NULL`.
+            where_sql.push_str(" AND parent_span_id = ''");
         }
 
         // ORDER BY — enum-derived, injection-safe.
         let order_dir = query.sort_order.as_sql();
-        match query.sort_by {
-            crate::types::TraceSortField::Duration => {
-                sql.push_str(&format!(" ORDER BY duration_ms {order_dir}"));
-            }
-            crate::types::TraceSortField::StartTime => {
-                sql.push_str(&format!(" ORDER BY start_time {order_dir}"));
-            }
-        }
-        sql.push_str(" LIMIT ? OFFSET ?");
-        binds.push(Bv::I64(limit as i64));
-        binds.push(Bv::I64(offset as i64));
+        let order_sql = match query.sort_by {
+            crate::types::TraceSortField::Duration => format!("duration_ms {order_dir}"),
+            crate::types::TraceSortField::StartTime => format!("start_time {order_dir}"),
+        };
+
+        // The full row projection, shared by both assemblies below.
+        const SPAN_COLUMNS: &str = "project_id, deployment_id, service_name, service_version, \
+             deployment_environment, trace_id, span_id, parent_span_id, name, kind, \
+             toUnixTimestamp64Milli(start_time) AS start_time_ms, \
+             toUnixTimestamp64Milli(end_time) AS end_time_ms, \
+             duration_ms, status_code, status_message, attributes, events";
+
+        // NO FINAL in either form below. 0001_spans.sql reserves FINAL for reads
+        // "where dedup correctness is required (trace summaries list)"; this is a
+        // LIMIT-ed span list feeding the Observe console and the Traces page. A
+        // retried OTLP batch showing one span twice until the next merge is
+        // acceptable there; a merge-on-read pass over every part is not.
+        let (sql, all_binds) = if query.trace_id.is_some() {
+            // ── Single stage ─────────────────────────────────────────────────
+            // A trace_id-anchored query already matches a prefix of the sort key
+            // (project_id, trace_id, span_id), so ClickHouse reads one contiguous
+            // block and satisfies the LIMIT almost immediately. Splitting it in
+            // two would read that same prefix twice for nothing — measured on the
+            // 159.8M-span set: 8.0ms single-stage vs 14.6ms two-stage.
+            let sql =
+                format!("SELECT {SPAN_COLUMNS} FROM spans WHERE {where_sql} ORDER BY {order_sql} LIMIT ? OFFSET ?");
+            let mut all_binds = binds;
+            all_binds.push(Bv::I64(limit as i64));
+            all_binds.push(Bv::I64(offset as i64));
+            (sql, all_binds)
+        } else {
+            // ── Two stages ───────────────────────────────────────────────────
+            //
+            // Stage 1 (inner) resolves WHICH spans belong on the page, selecting
+            // only the identity columns. Stage 2 (outer) reads the wide row —
+            // including the `attributes` / `events` JSON blobs, which dominate
+            // the row size — for the ≤100 spans that survived, looking them up
+            // by (project_id, trace_id, span_id), the table's primary key.
+            //
+            // The single-stage form this replaces asked ClickHouse to
+            // materialise every column, blobs included, for every row matching
+            // the filter before sorting and discarding all but 100 of them.
+            // Without a trace_id, ordering by start_time has no sort-key prefix
+            // to lean on (trace_id is a random hash), so "every matching row"
+            // meant the project's entire month.
+            //
+            // Splitting the query also lets stage 1 be served by the
+            // `proj_recent` projection (0007_spans_recent_projection.sql), which
+            // stores exactly these narrow columns ordered by
+            // (project_id, start_time). The projection cannot serve the
+            // single-stage query at all, because that one selects blob columns
+            // the projection does not contain.
+            //
+            // Measured on 159.8M spans (150M in one project), root spans, 24h
+            // window, LIMIT 100: 5050ms single-stage with FINAL → 132ms here,
+            // with a byte-identical result set. The dedup added below costs a
+            // further ~8% (112ms → 122ms on a 10M re-measure).
+            // `LIMIT 1 BY (trace_id, span_id)` in BOTH stages is what keeps the
+            // page honest without FINAL. spans is a ReplacingMergeTree, so a
+            // retried OTLP batch leaves two physical rows for one span identity
+            // until the next merge:
+            //
+            //   * inner — without it, a duplicated pair consumes two of the
+            //     `limit` slots and the page comes back short on distinct spans.
+            //   * outer — without it, the IN-set matches every physical row for
+            //     each pair, so the statement can return MORE rows than the
+            //     caller asked for. The single-stage shape cannot drift this way
+            //     because its LIMIT applies to rows directly.
+            //
+            // This restores the row-count guarantee FINAL used to provide, at
+            // the cost of a dedup over ≤`limit` rows rather than a merge over
+            // every part. Retried rows are byte-identical apart from `_version`,
+            // so which copy survives is not observable (FINAL would keep the
+            // highest `_version`).
+            let inner_sql = format!(
+                "SELECT trace_id, span_id FROM spans WHERE {where_sql} \
+                 ORDER BY {order_sql} LIMIT 1 BY (trace_id, span_id) LIMIT ? OFFSET ?"
+            );
+            let sql = format!(
+                "SELECT {SPAN_COLUMNS} \
+                 FROM spans \
+                 WHERE project_id = ?{time_sql} AND (trace_id, span_id) IN ({inner_sql}) \
+                 ORDER BY {order_sql} LIMIT 1 BY (trace_id, span_id) LIMIT ?"
+            );
+
+            // Bind order must match the rendered placeholder order: the outer
+            // project_id and time bounds come first (they precede the subquery
+            // in the statement), then the subquery's own binds and its
+            // LIMIT/OFFSET, and finally the outer LIMIT.
+            let mut all_binds: Vec<Bv> = Vec::with_capacity(binds.len() + time_binds.len() + 4);
+            all_binds.push(Bv::I32(query.project_id));
+            all_binds.extend(time_binds);
+            all_binds.extend(binds);
+            all_binds.push(Bv::I64(limit as i64));
+            all_binds.push(Bv::I64(offset as i64));
+            all_binds.push(Bv::I64(limit as i64));
+            (sql, all_binds)
+        };
 
         // Apply binds sequentially to the query builder.
         let mut q = self.ch.query(&sql);
-        for b in binds {
+        for b in all_binds {
             q = match b {
                 Bv::I32(v) => q.bind(v),
                 Bv::I64(v) => q.bind(v),
@@ -1162,9 +1679,55 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// Aggregate spans into per-trace summaries using query-time GROUP BY.
     ///
     /// Chosen approach from benchmark (ADR-016 Phase 0): query-time GROUP BY
-    /// on `spans FINAL` beats the AggregatingMergeTree MV approach at our
-    /// benchmark scale (23ms vs 31ms best, 400k traces).  Re-evaluate if the
-    /// table grows past 10M distinct traces.
+    /// beats the AggregatingMergeTree MV approach at our benchmark scale
+    /// (23ms vs 31ms best, 400k traces).  Re-evaluate if the table grows past
+    /// 10M distinct traces.
+    ///
+    /// Runs in two stages, for the same reason `query_spans` does
+    /// (0007_spans_recent_projection.sql):
+    ///
+    ///   * Stage 1 picks the page's `trace_id`s. In the unfiltered case it
+    ///     touches only `project_id`, `start_time` and `trace_id` — exactly the
+    ///     columns `proj_recent` stores ordered by `(project_id, start_time)` —
+    ///     so ClickHouse serves it from the projection and reads granules
+    ///     proportional to the requested window. The single-stage form could
+    ///     not use the projection at all (it selects `name`, `duration_ms`,
+    ///     `status_code`, … which the projection does not contain), so a 1h
+    ///     query read the project's entire month.
+    ///   * Stage 2 aggregates the wide columns for just those ≤`limit` traces.
+    ///     `trace_id` is the second component of the table's sort key, so
+    ///     `project_id = ? AND trace_id IN (…)` is a primary-key lookup.
+    ///
+    /// Stage 2 repeats stage 1's full WHERE clause, not just the time bounds:
+    /// the single-stage query filtered spans before grouping, so `span_count`
+    /// and `error_count` have always counted only matching spans. Dropping the
+    /// filter here would silently change those two numbers.
+    ///
+    /// NO `FINAL` — but stage 2 still deduplicates explicitly, because dropping
+    /// FINAL outright would have been wrong.
+    ///
+    /// `spans` is a ReplacingMergeTree, so one `(project_id, trace_id, span_id)`
+    /// can have several physical rows until the next merge, and FINAL cost
+    /// 932ms vs 122ms on a 10M-span measure (0007 header) while also disabling
+    /// projection use. It is tempting to argue the aggregates are
+    /// duplicate-insensitive and leave it at that — that argument only holds
+    /// for OTLP exporter retries, which re-send byte-identical rows.
+    ///
+    /// It does NOT hold in general: `temps-cli`'s `ch_backfill_domains` is a
+    /// second writer into this table, copying Postgres `otel_spans` rows in
+    /// with `_version` set to the span's own `start_time` (deliberately lower
+    /// than a live row's ingest-time `_version`). A backfilled copy and a live
+    /// copy of the same span can therefore differ in `status_code`,
+    /// `attributes`, `duration_ms` and more. FINAL resolved that by keeping the
+    /// highest `_version`; nothing else would.
+    ///
+    /// So stage 2 reads through an `ORDER BY _version DESC LIMIT 1 BY
+    /// (trace_id, span_id)` subquery, which keeps exactly the row FINAL would
+    /// have kept. This is affordable precisely because stage 2 is already
+    /// narrowed to the page's <= `limit` traces (a few hundred rows), whereas
+    /// FINAL would have merged across every part of the scanned range.
+    /// With one row per span guaranteed, `count()` / `countIf()` are exact
+    /// again and `argMax` can no longer tie between divergent copies.
     ///
     /// `deployment_environment` is a denormalized LowCardinality column at
     /// ingest time; there is no CH→Postgres JOIN for environment names. The
@@ -1176,6 +1739,9 @@ impl OtelStorage for ClickHouseOtelStorage {
         let offset = query.offset.unwrap_or(0);
 
         // ── Build WHERE clause and ordered bind list ────────────────────────
+        // `Clone` because the WHERE clause is rendered twice (stage 2 and the
+        // stage 1 subquery), so its binds must be supplied twice as well.
+        #[derive(Clone)]
         enum Bv {
             I32(i32),
             I64(i64),
@@ -1217,10 +1783,27 @@ impl OtelStorage for ClickHouseOtelStorage {
         }
         // environment_id: skipped — no Postgres JOIN in CH (see doc comment).
         if let Some(ref attrs) = query.attributes {
+            // Load the facet cache once for this query (lock-free ArcSwap read).
+            // If no cache is installed (facet feature disabled) we get an empty
+            // map and every key falls through to the JSON-extract fallback.
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                where_parts.push("JSONExtractString(attributes, ?) = ?".to_owned());
-                binds.push(Bv::Str(key.clone()));
-                binds.push(Bv::Str(value.clone()));
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    // Faceted key: use the pre-populated slot column (bloom-indexed).
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_parts.push(format!("{column} = ?"));
+                    binds.push(Bv::Str(value.clone()));
+                } else {
+                    // Unfaceted key: fall back to JSON extraction.
+                    where_parts.push("JSONExtractString(attributes, ?) = ?".to_owned());
+                    binds.push(Bv::Str(key.clone()));
+                    binds.push(Bv::Str(value.clone()));
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {
@@ -1233,6 +1816,11 @@ impl OtelStorage for ClickHouseOtelStorage {
         // ── HAVING clause for status filter ────────────────────────────────
         // Mirrors TimescaleDB: ERROR = has at least one ERROR span;
         // Ok = has zero ERROR spans. `HAVING` can reference aggregate exprs.
+        //
+        // `countIf` is safe here without FINAL even though it counts duplicate
+        // physical rows: the test is `> 0` / `= 0`, and duplication can never
+        // turn a 0 into a positive count or vice versa. Only the counts we
+        // *return* need `uniqExact` (see the SELECT below).
         let having_sql = match query.status {
             Some(SpanStatusCode::Error) => " HAVING countIf(status_code = 'ERROR') > 0",
             Some(SpanStatusCode::Ok) => " HAVING countIf(status_code = 'ERROR') = 0",
@@ -1240,21 +1828,44 @@ impl OtelStorage for ClickHouseOtelStorage {
         };
 
         // ── ORDER BY — enum-derived, injection-safe ─────────────────────────
+        // Written as aggregate expressions rather than SELECT aliases so the
+        // identical clause can be used by stage 1, which selects `trace_id`
+        // only and therefore has no `max_duration_ms` alias to refer to.
         let order_dir = query.sort_order.as_sql();
         let order_sql = match query.sort_by {
             crate::types::TraceSortField::Duration => {
-                format!("ORDER BY max_duration_ms {order_dir}, min(start_time) DESC, trace_id")
+                format!("ORDER BY max(duration_ms) {order_dir}, min(start_time) DESC, trace_id")
             }
             crate::types::TraceSortField::StartTime => {
                 format!("ORDER BY min(start_time) {order_dir}, trace_id")
             }
         };
 
-        // ── Full query ──────────────────────────────────────────────────────
+        // ── Stage 1: the page's trace_ids ───────────────────────────────────
+        // Projection-eligible when no column outside proj_recent is filtered
+        // or sorted on — which is the default Traces-list query.
+        let stage1_sql = format!(
+            "SELECT trace_id FROM spans \
+             WHERE {where_sql} \
+             GROUP BY trace_id{having_sql} \
+             {order_sql} \
+             LIMIT ? OFFSET ?"
+        );
+
+        // ── Stage 2: full aggregation, scoped to those traces ───────────────
         // argMax(name, …) picks the root-span name: root spans have
         // parent_span_id = '' (our empty-string sentinel), so we boost their
         // priority with a large addend so argMax always selects them when
         // present; otherwise falls back to the longest span (max duration).
+        //
+        // The inner SELECT is the FINAL replacement (see the doc comment):
+        // `ORDER BY _version DESC LIMIT 1 BY (trace_id, span_id)` keeps exactly
+        // the row FINAL would have kept, over the few hundred rows belonging to
+        // this page's traces. Because that guarantees one row per span,
+        // `count()` and `countIf()` are exact and do not need `uniqExact`.
+        //
+        // No HAVING: stage 1 already applied it, and stage 2 groups the same
+        // spans over the same filter, so it would be a no-op.
         let sql = format!(
             r#"SELECT
                 trace_id,
@@ -1274,15 +1885,27 @@ impl OtelStorage for ClickHouseOtelStorage {
                 max(duration_ms) AS max_duration_ms,
                 count() AS span_count,
                 countIf(status_code = 'ERROR') AS error_count
-            FROM spans FINAL
-            WHERE {where_sql}
+            FROM (
+                SELECT trace_id, span_id, parent_span_id, name, service_name,
+                       kind, deployment_environment, start_time, duration_ms,
+                       status_code
+                FROM spans
+                WHERE {where_sql} AND trace_id IN ({stage1_sql})
+                ORDER BY _version DESC
+                LIMIT 1 BY (trace_id, span_id)
+            )
             GROUP BY trace_id
-            {having_sql}
-            {order_sql}
-            LIMIT ? OFFSET ?"#
+            {order_sql}"#
         );
-        binds.push(Bv::I64(limit as i64));
-        binds.push(Bv::I64(offset as i64));
+
+        // Bind order follows the rendered placeholder order: stage 2's WHERE
+        // comes first, then the stage 1 subquery's WHERE, then its LIMIT/OFFSET.
+        let mut all_binds: Vec<Bv> = Vec::with_capacity(binds.len() * 2 + 2);
+        all_binds.extend(binds.iter().cloned());
+        all_binds.extend(binds);
+        all_binds.push(Bv::I64(limit as i64));
+        all_binds.push(Bv::I64(offset as i64));
+        let binds = all_binds;
 
         let mut q = self.ch.query(&sql);
         for b in binds {
@@ -1341,6 +1964,42 @@ impl OtelStorage for ClickHouseOtelStorage {
     /// Mirrors `query_trace_summaries` filters exactly — including `status`
     /// (via a HAVING on countIf) and `min_duration_ms` — so the pagination
     /// count matches the actual result set returned by that method.
+    ///
+    /// Two shapes, because the cheap one only works without a status filter:
+    ///
+    ///   * No status filter → `uniqExact(trace_id)`, a single pass that never
+    ///     materialises per-trace groups. It reads only `project_id`,
+    ///     `start_time` and `trace_id` in the common case, so `proj_recent`
+    ///     serves it and the scan is proportional to the window rather than to
+    ///     the whole month (see `query_trace_summaries`).
+    ///   * Status filter → the per-trace GROUP BY + HAVING is unavoidable, so
+    ///     keep the subquery form.
+    ///
+    /// NO `FINAL` in either shape:
+    ///
+    ///   * `uniqExact(trace_id)` counts DISTINCT trace IDs, so duplicate
+    ///     physical rows cannot inflate it no matter how they differ.
+    ///   * The status `HAVING` is a `> 0` / `= 0` test, which byte-identical
+    ///     duplicates (the OTLP-retry case) cannot flip either.
+    ///
+    /// KNOWN RESIDUAL, deliberately not fixed here. `query_trace_summaries`
+    /// explains how a `ch_backfill_domains` copy of a span can disagree with
+    /// the live copy about `status_code`. Where that happens, this `HAVING` —
+    /// and the identical one in the page's stage 1 — can call a trace errored
+    /// on the strength of a superseded row, while the page's stage 2 (which
+    /// does deduplicate) reports `error_count = 0` for it.
+    ///
+    /// Resolving it here would mean grouping by `(trace_id, span_id)` to pick
+    /// `argMax(status_code, _version)` first: one group per SPAN instead of per
+    /// trace, across the whole window, on the exact query this module was
+    /// rewritten to make cheap. That is the wrong trade. The divergence needs
+    /// the same span to have been ingested into BOTH Postgres and ClickHouse
+    /// with different content — spans are never dual-written (`self.inner`
+    /// handles logs/insights/quota, not spans), and a re-run of the backfill
+    /// re-inserts byte-identical rows because its `_version` is derived from
+    /// `start_time`. It is narrow, transient, and a merge resolves it. The
+    /// `status = OK` direction cannot misreport at all: `= 0` means no copy is
+    /// ERROR, so the winning copy is not either.
     async fn count_traces(&self, query: TraceQuery) -> StorageResult<u64> {
         enum Bv {
             I32(i32),
@@ -1405,18 +2064,24 @@ impl OtelStorage for ClickHouseOtelStorage {
             _ => "",
         };
 
-        // Use a subquery so we can apply HAVING on per-trace aggregates and
-        // then count the filtered set. `uniqExact` on the outer query is not
-        // needed because the inner GROUP BY already yields one row per trace.
-        let sql = format!(
-            "SELECT count() AS cnt FROM (\
-                SELECT trace_id \
-                FROM spans FINAL \
-                WHERE {where_sql} \
-                GROUP BY trace_id\
-                {having_sql}\
-            )"
-        );
+        // With a status filter, resolve one status_code per span (the highest
+        // `_version`, i.e. what FINAL would have kept) before applying HAVING
+        // on per-trace aggregates, then count the filtered set. `count()` on
+        // the outer query is enough because the middle GROUP BY already yields
+        // one row per trace. Without a status filter, skip all of it.
+        let sql = if having_sql.is_empty() {
+            format!("SELECT uniqExact(trace_id) AS cnt FROM spans WHERE {where_sql}")
+        } else {
+            format!(
+                "SELECT count() AS cnt FROM (\
+                    SELECT trace_id \
+                    FROM spans \
+                    WHERE {where_sql} \
+                    GROUP BY trace_id\
+                    {having_sql}\
+                )"
+            )
+        };
 
         let mut q = self.ch.query(&sql);
         for b in binds {
@@ -1434,6 +2099,36 @@ impl OtelStorage for ClickHouseOtelStorage {
             .map_err(|e| ch_query_err("count_traces", e))?;
 
         Ok(row.cnt)
+    }
+
+    /// Whether `project_id` has ever received at least one span.
+    ///
+    /// Deliberately NOT `count_traces(query) > 0` or a `LIMIT 1` read through
+    /// `query_trace_summaries`: both aggregate by `trace_id`, which forces a
+    /// per-project GROUP BY over every matching row when no time bound is
+    /// given — the exact shape that drove sustained ClickHouse CPU when the
+    /// project-setup checklist polled trace-summaries with `limit=1` and no
+    /// window (it only needed a yes/no answer). This issues no GROUP BY, no
+    /// `argMax`, and no ORDER BY: `project_id` is the first column of spans'
+    /// `ORDER BY (project_id, trace_id, span_id)` (0001_spans.sql), so
+    /// `LIMIT 1` resolves against the sparse index — a seek to the first
+    /// granule for this project, not a scan.
+    async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
+        #[derive(::clickhouse::Row, Deserialize, Debug)]
+        struct ChExistsRow {
+            #[allow(dead_code)]
+            one: u8,
+        }
+
+        let rows = self
+            .ch
+            .query("SELECT 1 AS one FROM spans WHERE project_id = ? LIMIT 1")
+            .bind(project_id)
+            .fetch_all::<ChExistsRow>()
+            .await
+            .map_err(|e| ch_query_err("has_traces", e))?;
+
+        Ok(!rows.is_empty())
     }
 
     /// Fetch all spans of a single trace, ordered by start_time ASC.
@@ -1539,6 +2234,116 @@ impl OtelStorage for ClickHouseOtelStorage {
             "ClickHouseOtelStorage: get_trace"
         );
         Ok(spans)
+    }
+
+    /// Per-operation latency statistics, aggregated over the queried window.
+    ///
+    /// # Duplicate rows are not resolved, deliberately
+    ///
+    /// `spans` is a `ReplacingMergeTree`, so a retried OTLP batch can leave a
+    /// superseded copy of a span visible until the next merge. Removing those
+    /// copies means grouping by `(trace_id, span_id)` first — one group per
+    /// span, across the whole window — which is precisely the shape
+    /// `count_traces` documents as "the wrong trade", and it would make peak
+    /// memory proportional to the window rather than to the number of distinct
+    /// operations. On the 4 GB reference box that is the difference between a
+    /// report and an OOM.
+    ///
+    /// What that costs, concretely: `count` and `total_duration_ms` can be
+    /// inflated by the fraction of spans whose retry has not yet merged
+    /// (transient, typically minutes, and proportionally tiny). The shape
+    /// statistics — percentiles, min, max, avg, and the two ratios — are
+    /// effectively unaffected, because a duplicate re-samples a value already
+    /// in the distribution rather than introducing a new one. That is the right
+    /// trade for a ranking report; it would be the wrong one for billing.
+    ///
+    /// # Percentiles are approximate here
+    ///
+    /// `quantileTDigest` keeps memory bounded per group and stays accurate in
+    /// the tail, where this report is read. The TimescaleDB backend uses exact
+    /// `percentile_cont`, so the two can disagree in the last digit or two —
+    /// they never disagree about which operation is the outlier.
+    async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>> {
+        let (where_sql, binds) = build_ch_span_stats_filters(&query);
+        let limit = query.effective_limit();
+        let offset = query.effective_offset();
+
+        // sort_by/sort_order are fixed enums, never user strings, so
+        // interpolating them is injection-safe. Ordering references the SELECT
+        // aliases, which ClickHouse resolves after aggregation. The trailing
+        // tie-breaker keeps pagination deterministic.
+        let order_expr = ch_span_stats_order_alias(query.sort_by);
+        let order_dir = query.sort_order.as_sql();
+
+        let sql = format!(
+            r#"SELECT
+                project_id,
+                service_name,
+                name AS span_name,
+                argMax(kind, start_time) AS kind,
+                count() AS span_count,
+                countIf(status_code = 'ERROR') AS error_count,
+                sum(duration_ms) AS total_duration_ms,
+                min(duration_ms) AS min_duration_ms,
+                max(duration_ms) AS max_duration_ms,
+                avg(duration_ms) AS avg_duration_ms,
+                -- `stddevSamp` returns NaN (not NULL) for a single-sample
+                -- group, and NaN serializes to JSON `null` and poisons every
+                -- ratio derived from it. `ifNotFinite` is the only guard that
+                -- catches it; `ifNull` does not.
+                ifNotFinite(stddevSamp(duration_ms), 0) AS stddev_duration_ms,
+                -- `quantileTDigest` yields Float32; the row struct and every
+                -- other duration column are f64, and the driver rejects the
+                -- mismatch at deserialization rather than coercing.
+                toFloat64(quantileTDigest(0.50)(duration_ms)) AS p50_duration_ms,
+                toFloat64(quantileTDigest(0.95)(duration_ms)) AS p95_duration_ms,
+                toFloat64(quantileTDigest(0.99)(duration_ms)) AS p99_duration_ms,
+                toUnixTimestamp64Milli(max(start_time)) AS last_seen_ms
+            FROM spans
+            WHERE {where_sql}
+            GROUP BY project_id, service_name, name
+            HAVING count() >= ?
+            ORDER BY {order_expr} {order_dir}, project_id, service_name, span_name
+            LIMIT ? OFFSET ?"#
+        );
+
+        let mut q = bind_all(self.ch.query(&sql), binds);
+        q = q
+            .bind(query.min_count as i64)
+            .bind(limit as i64)
+            .bind(offset as i64);
+
+        let rows = q
+            .fetch_all::<ChSpanStatsRow>()
+            .await
+            .map_err(|e| ch_query_err("query_span_stats", e))?;
+
+        Ok(rows.into_iter().map(SpanStats::from).collect())
+    }
+
+    async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {
+        let (where_sql, binds) = build_ch_span_stats_filters(&query);
+
+        // Mirrors the list query's GROUP BY/HAVING exactly so the total agrees
+        // with the rows. `uniqExact` over the grouping tuple would be cheaper
+        // but cannot express the `min_count` floor, which is part of the filter.
+        let sql = format!(
+            r#"SELECT count() AS cnt FROM (
+                SELECT project_id, service_name, name
+                FROM spans
+                WHERE {where_sql}
+                GROUP BY project_id, service_name, name
+                HAVING count() >= ?
+            )"#
+        );
+
+        let q = bind_all(self.ch.query(&sql), binds).bind(query.min_count as i64);
+
+        let row = q
+            .fetch_one::<ChCountRow>()
+            .await
+            .map_err(|e| ch_query_err("count_span_stats", e))?;
+        Ok(row.cnt)
     }
 
     /// List GenAI trace summaries from ClickHouse.
@@ -2121,7 +2926,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // Grouped label values as an Array(String), in group_by order. CH binds
         // the key via the `?` map-index parameter, never string interpolation.
         let group_select = if query.group_by.is_empty() {
-            "[] AS series_values".to_string()
+            format!("{EMPTY_STRING_ARRAY_SQL} AS series_values")
         } else {
             let parts: Vec<String> = query
                 .group_by
@@ -2138,7 +2943,7 @@ impl OtelStorage for ClickHouseOtelStorage {
         // The grouped-label array WITHOUT the `AS series_values` alias, for reuse
         // inside the histogram sub-aggregation's projection.
         let group_array = if query.group_by.is_empty() {
-            "[]".to_string()
+            EMPTY_STRING_ARRAY_SQL.to_string()
         } else {
             let parts: Vec<String> = query
                 .group_by
@@ -2448,7 +3253,102 @@ impl OtelStorage for ClickHouseOtelStorage {
         self.inner.query_logs(query).await
     }
 
-    // ── Control-row methods — always Postgres (insights, health, quota) ──────
+    // ── Cross-project trace refs — native ClickHouse (ADR-027) ──────────────
+
+    /// Insert `(trace_id, project_id)` pairs into the ClickHouse
+    /// `cross_project_trace_refs` table. `ReplacingMergeTree` with the
+    /// inverted `_version` dedupes re-recordings while keeping the earliest
+    /// `first_seen` — the CH equivalent of the Postgres table's
+    /// `ON CONFLICT DO NOTHING`.
+    async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
+        if trace_ids.is_empty() {
+            return Ok(0);
+        }
+
+        let first_seen_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        let retention_days = self
+            .resolver
+            .resolve(project_id, temps_core::RetentionTable::Spans);
+
+        let mut inserter = self
+            .ch
+            .insert::<ChTraceRefRow>("cross_project_trace_refs")
+            .await
+            .map_err(|e| OtelError::Storage {
+                message: format!("ClickHouse cross_project_trace_refs inserter setup failed: {e}"),
+            })?;
+        for trace_id in trace_ids {
+            inserter
+                .write(&ChTraceRefRow {
+                    trace_id: trace_id.clone(),
+                    project_id,
+                    first_seen: first_seen_ms,
+                    retention_days,
+                    _version: trace_ref_version(first_seen_ms),
+                })
+                .await
+                .map_err(|e| OtelError::Storage {
+                    message: format!("ClickHouse cross_project_trace_refs write failed: {e}"),
+                })?;
+        }
+        inserter.end().await.map_err(|e| OtelError::Storage {
+            message: format!("ClickHouse cross_project_trace_refs insert failed: {e}"),
+        })?;
+
+        Ok(trace_ids.len() as u64)
+    }
+
+    /// Union of the native ClickHouse rows and any legacy rows still in the
+    /// Postgres `cross_project_trace_refs` table (earliest `first_seen` wins
+    /// per project). The union makes enabling ClickHouse migration-free:
+    /// pre-cutover traces resolve from Postgres until they age out (or are
+    /// copied over via `temps backfill clickhouse --domain trace-refs`).
+    async fn get_trace_ref_projects(&self, trace_id: &str) -> StorageResult<Vec<TraceRefProject>> {
+        #[derive(::clickhouse::Row, Deserialize)]
+        struct RefRow {
+            project_id: i32,
+            first_seen_ms: i64,
+        }
+
+        // min(first_seen) at query time keeps the earliest observation even
+        // before ReplacingMergeTree merges collapse duplicate pairs.
+        let ch_rows = self
+            .ch
+            .query(
+                "SELECT project_id, \
+                        toInt64(toUnixTimestamp64Milli(min(first_seen))) AS first_seen_ms \
+                 FROM cross_project_trace_refs \
+                 WHERE trace_id = ? \
+                 GROUP BY project_id",
+            )
+            .bind(trace_id)
+            .fetch_all::<RefRow>()
+            .await
+            .map_err(|e| OtelError::Storage {
+                message: format!("ClickHouse cross_project_trace_refs query failed: {e}"),
+            })?;
+
+        let ch_refs: Vec<TraceRefProject> = ch_rows
+            .into_iter()
+            .map(|r| TraceRefProject {
+                project_id: r.project_id,
+                first_seen: chrono::DateTime::from_timestamp_millis(r.first_seen_ms)
+                    .unwrap_or_default(),
+            })
+            .collect();
+
+        let pg_refs = self.inner.get_trace_ref_projects(trace_id).await?;
+
+        Ok(merge_trace_ref_projects(ch_refs, pg_refs))
+    }
+
+    // ── Control-row methods — always Postgres (insights, health) ─────────────
+    //
+    // Storage quota is handled separately below: it is NOT purely
+    // Postgres-delegated. See `get_storage_quota`'s doc comment.
 
     async fn upsert_insight(&self, insight: &Insight) -> StorageResult<i64> {
         self.inner.upsert_insight(insight).await
@@ -2484,12 +3384,134 @@ impl OtelStorage for ClickHouseOtelStorage {
             .await
     }
 
+    /// Real per-project storage-quota accounting for a ClickHouse-backed
+    /// install.
+    ///
+    /// This does NOT delegate wholesale to `self.inner` — `spans` and
+    /// `metrics` are ClickHouse-native (see module doc: `store_spans` /
+    /// `store_metrics` write only to CH), so `self.inner`'s three-table sum
+    /// would measure Postgres tables that ClickHouse-enabled installs never
+    /// write span/metric rows into and silently under-report the real
+    /// volume — the exact "quota inert for CH-backed installs" gap tracked
+    /// as a known limitation until this fix.
+    ///
+    /// Instead: ClickHouse's own `spans`/`metrics` byte volume is computed
+    /// natively here (proportional estimate using `system.parts`, CH's
+    /// chunk-aware equivalent of TimescaleDB's `hypertable_size()`), and
+    /// combined with the ONE domain still genuinely Postgres-owned even
+    /// with CH enabled: `otel_log_events` (`store_logs` / `archive_logs`
+    /// always delegate to `self.inner` — see module doc). That single-table
+    /// share is read via `TimescaleDbStorage::hypertable_bytes_for_project`
+    /// rather than `get_storage_quota`'s 3-table sum, which would double
+    /// count against near-empty `otel_spans`/`otel_metrics` Postgres tables.
     async fn get_storage_quota(&self, project_id: i32) -> StorageResult<StorageQuota> {
-        self.inner.get_storage_quota(project_id).await
+        // Quota is opt-in. Mirrors the early-exit in
+        // `TimescaleDbStorage::get_storage_quota`: this sits on the ingest
+        // hot path (`OtelService::check_quota` on every quota-cache miss),
+        // so a disabled quota must never touch ClickHouse or Postgres.
+        let Some(limit_bytes) = self.inner.quota_bytes_per_project() else {
+            return Ok(StorageQuota {
+                project_id,
+                metrics_bytes: 0,
+                traces_bytes: 0,
+                logs_bytes: 0,
+                total_bytes: 0,
+                limit_bytes: 0,
+                usage_pct: 0.0,
+            });
+        };
+
+        // `total_bytes` comes back as `Nullable(UInt64)`: ClickHouse's type
+        // inference marks the `toUInt64(...) + toUInt64(...)` expression
+        // nullable because it is built from `least`/`greatest` over
+        // aggregate subqueries, even though the `COALESCE(..., 0)`s make a
+        // real NULL impossible here. Modeling it as `Option<u64>` (defaulting
+        // to 0) sidesteps relying on that inference rather than fighting it
+        // with more SQL-side casts.
+        #[derive(::clickhouse::Row, Deserialize, Debug)]
+        struct ChQuotaBytesRow {
+            total_bytes: Option<u64>,
+        }
+
+        // Per-table proportional estimate, ClickHouse-native:
+        //   table_bytes(active parts) * min(1.0, project_rows / total_rows)
+        //
+        // `system.parts` is metadata (no data scan): `bytes_on_disk` sums
+        // real compressed on-disk size of active parts (ClickHouse's
+        // equivalent of `hypertable_size()`'s chunk sum — MERGED-away parts
+        // are excluded via `active = 1` so dropped/superseded data is never
+        // double counted), and `rows` sums the row-count denominator the
+        // same way. The per-project numerator (`count() WHERE project_id =
+        // ?`) does scan, but `ORDER BY (project_id, ...)` on both `spans`
+        // and `metrics` (see the migration DDL) makes it a primary-index
+        // read bounded to this project's granules, not a full table scan.
+        const CH_QUOTA_BYTES_SQL: &str = r#"
+            SELECT toUInt64(
+                COALESCE((
+                    SELECT sum(bytes_on_disk) FROM system.parts
+                    WHERE database = currentDatabase() AND table = 'spans' AND active = 1
+                ), 0) *
+                least(1.0, toFloat64((SELECT count() FROM spans WHERE project_id = ?)) /
+                    greatest(toFloat64(COALESCE((
+                        SELECT sum(rows) FROM system.parts
+                        WHERE database = currentDatabase() AND table = 'spans' AND active = 1
+                    ), 0)), 1.0))
+            ) +
+            toUInt64(
+                COALESCE((
+                    SELECT sum(bytes_on_disk) FROM system.parts
+                    WHERE database = currentDatabase() AND table = 'metrics' AND active = 1
+                ), 0) *
+                least(1.0, toFloat64((SELECT count() FROM metrics WHERE project_id = ?)) /
+                    greatest(toFloat64(COALESCE((
+                        SELECT sum(rows) FROM system.parts
+                        WHERE database = currentDatabase() AND table = 'metrics' AND active = 1
+                    ), 0)), 1.0))
+            ) AS total_bytes
+        "#;
+
+        let ch_bytes = self
+            .ch
+            .query(CH_QUOTA_BYTES_SQL)
+            .bind(project_id)
+            .bind(project_id)
+            .fetch_one::<ChQuotaBytesRow>()
+            .await
+            .map_err(|e| ch_query_err("get_storage_quota", e))?
+            .total_bytes
+            .unwrap_or(0);
+
+        // otel_log_events is the one domain still genuinely Postgres-owned
+        // (logs are never dual-written or CH-native — see module doc).
+        let logs_bytes = self
+            .inner
+            .hypertable_bytes_for_project("otel_log_events", project_id)
+            .await?;
+
+        let total_bytes = ch_bytes.saturating_add(logs_bytes);
+        let usage_pct = if limit_bytes > 0 {
+            (total_bytes as f64 / limit_bytes as f64) * 100.0
+        } else {
+            0.0
+        };
+
+        Ok(StorageQuota {
+            project_id,
+            metrics_bytes: 0, // Approximate breakdown not available cheaply
+            traces_bytes: 0,
+            logs_bytes: 0,
+            total_bytes,
+            limit_bytes,
+            usage_pct,
+        })
     }
 
     async fn check_quota(&self, project_id: i32) -> StorageResult<bool> {
-        self.inner.check_quota(project_id).await
+        // With no quota configured, get_storage_quota short-circuits to
+        // zeros without touching ClickHouse or Postgres, so this is always
+        // "not exceeded".
+        let quota = self.get_storage_quota(project_id).await?;
+        Ok(quota.usage_pct >= 100.0)
     }
 
     // ── Anomaly-detection helpers (ClickHouse — native) ──────────────────────
@@ -2670,6 +3692,17 @@ mod tests {
     use crate::types::{ResourceInfo, SpanKind, SpanRecord, SpanStatusCode};
     use chrono::Utc;
     use std::collections::BTreeMap;
+
+    /// The inverted version must give the EARLIEST observation the HIGHEST
+    /// version, so ReplacingMergeTree merges keep first-write-wins semantics.
+    #[test]
+    fn trace_ref_version_is_first_wins() {
+        let earlier = trace_ref_version(1_000);
+        let later = trace_ref_version(2_000);
+        assert!(earlier > later);
+        // Negative (pre-epoch) timestamps clamp to 0 rather than wrapping.
+        assert_eq!(trace_ref_version(-5), u64::MAX);
+    }
 
     fn make_span() -> SpanRecord {
         SpanRecord {
@@ -2921,6 +3954,12 @@ mod tests {
         let err = ::clickhouse::error::Error::BadResponse("timeout".into());
         let otel_err = ch_query_err("query_trace_summaries", err);
         assert!(otel_err.to_string().contains("query_trace_summaries"));
+    }
+
+    #[test]
+    fn empty_metric_series_array_has_explicit_clickhouse_type() {
+        assert_eq!(EMPTY_STRING_ARRAY_SQL, "CAST([], 'Array(String)')");
+        assert_ne!(EMPTY_STRING_ARRAY_SQL, "[]");
     }
 
     // ── Metric row tests ────────────────────────────────────────────────────

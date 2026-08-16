@@ -1,0 +1,4 @@
+interface:
+  display_name: "Temps"
+  short_description: "Deploy, operate, and instrument apps on Temps"
+  default_prompt: "Use $temps to prepare and complete this Temps product workflow safely."

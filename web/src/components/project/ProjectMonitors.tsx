@@ -8,6 +8,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { ProjectResponse, MonitorResponse, EnvironmentResponse } from '@/api/client'
 import { Button } from '@/components/ui/button'
+import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Card, CardContent } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -22,7 +23,7 @@ import {
   MoreVertical,
 } from 'lucide-react'
 import { useMemo, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
 import * as z from 'zod'
@@ -49,7 +50,6 @@ import {
   DialogFooter,
   DialogHeader,
   DialogTitle,
-  DialogTrigger,
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import {
@@ -397,13 +397,11 @@ export function ProjectMonitors({ project }: ProjectMonitorsProps) {
             Monitor your project&apos;s uptime and performance
           </p>
         </div>
+        <CreateActionButton
+          onClick={() => setIsCreateDialogOpen(true)}
+          label="Create Monitor"
+        />
         <Dialog open={isCreateDialogOpen} onOpenChange={setIsCreateDialogOpen}>
-          <DialogTrigger asChild>
-            <Button>
-              <Plus className="mr-2 h-4 w-4" />
-              Create Monitor
-            </Button>
-          </DialogTrigger>
           <DialogContent>
             <DialogHeader>
               <DialogTitle>Create Monitor</DialogTitle>

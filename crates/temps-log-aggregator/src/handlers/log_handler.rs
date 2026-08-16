@@ -202,8 +202,8 @@ impl temps_core::AuditOperation for LogsPurgedAudit {
         "LOGS_PURGED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -758,6 +758,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -794,6 +795,7 @@ mod tests {
                         email_verification_expires: None,
                         password_reset_token: None,
                         password_reset_expires: None,
+                        must_change_password: false,
                         deleted_at: None,
                         mfa_secret: None,
                         mfa_enabled: false,
@@ -824,7 +826,7 @@ mod tests {
             .layer(auth_middleware)
             .with_state(app_state);
 
-        TestServer::new(app).expect("Failed to create test server")
+        TestServer::new(app)
     }
 
     /// Create a test log line with the given parameters.
@@ -1674,7 +1676,7 @@ mod tests {
         let ctx = create_test_context().await;
 
         let app = configure_routes().with_state(ctx.app_state.clone());
-        let server = TestServer::new(app).expect("Failed to create test server");
+        let server = TestServer::new(app);
         let now = Utc::now();
 
         let response = server

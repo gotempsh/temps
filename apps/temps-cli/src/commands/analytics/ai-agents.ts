@@ -23,6 +23,76 @@ function formatNumber(n: number): string {
   return n.toLocaleString('en-US')
 }
 
+export interface AiAgentRow {
+  label: string
+  provider: string
+  agent: string
+  purpose: string
+  requestCount: number
+  uniqueIps: number
+  percentage: number
+}
+
+export interface AiAgentBreakdownItem {
+  provider: string
+  agent: string
+  purpose?: string
+  request_count: number
+  unique_ips: number
+}
+
+/**
+ * Shapes the raw per-agent breakdown into display rows, optionally
+ * aggregating by provider. The API always returns one row per agent — the
+ * "by provider" view is computed client-side to match the web toggle.
+ */
+export function buildAiAgentRows(
+  items: AiAgentBreakdownItem[],
+  groupBy: 'agent' | 'provider'
+): AiAgentRow[] {
+  const total = items.reduce((sum, r) => sum + (r.request_count ?? 0), 0)
+
+  if (groupBy === 'provider') {
+    const byProvider = new Map<string, { count: number; uniqueIps: number; sample: string }>()
+    for (const row of items) {
+      const prev = byProvider.get(row.provider)
+      if (prev) {
+        prev.count += row.request_count
+        prev.uniqueIps += row.unique_ips
+      } else {
+        byProvider.set(row.provider, {
+          count: row.request_count,
+          uniqueIps: row.unique_ips,
+          sample: row.agent,
+        })
+      }
+    }
+    return Array.from(byProvider.entries())
+      .map(([provider, v]) => ({
+        label: provider,
+        provider,
+        agent: v.sample,
+        purpose: '',
+        requestCount: v.count,
+        uniqueIps: v.uniqueIps,
+        percentage: total > 0 ? (v.count / total) * 100 : 0,
+      }))
+      .sort((a, b) => b.requestCount - a.requestCount)
+  }
+
+  return items
+    .map((row) => ({
+      label: row.agent,
+      provider: row.provider,
+      agent: row.agent,
+      purpose: row.purpose ?? '',
+      requestCount: row.request_count,
+      uniqueIps: row.unique_ips,
+      percentage: total > 0 ? (row.request_count / total) * 100 : 0,
+    }))
+    .sort((a, b) => b.requestCount - a.requestCount)
+}
+
 export async function aiAgents(options: AiAgentsOptions): Promise<void> {
   const groupBy = options.groupBy ?? 'agent'
   if (groupBy !== 'agent' && groupBy !== 'provider') {
@@ -70,66 +140,12 @@ export async function aiAgents(options: AiAgentsOptions): Promise<void> {
 
   const items = (data as any)?.items ?? []
 
-  // Group by provider if requested. The API returns one row per agent; we
-  // aggregate here so the CLI matches the web "By provider" toggle.
-  type Row = {
-    label: string
-    provider: string
-    agent: string
-    purpose: string
-    requestCount: number
-    uniqueIps: number
-    percentage: number
-  }
-
   const total = items.reduce(
     (sum: number, r: any) => sum + (r.request_count ?? 0),
     0
   )
 
-  let rows: Row[]
-  if (groupBy === 'provider') {
-    const byProvider = new Map<
-      string,
-      { count: number; uniqueIps: number; sample: string }
-    >()
-    for (const row of items) {
-      const prev = byProvider.get(row.provider)
-      if (prev) {
-        prev.count += row.request_count
-        prev.uniqueIps += row.unique_ips
-      } else {
-        byProvider.set(row.provider, {
-          count: row.request_count,
-          uniqueIps: row.unique_ips,
-          sample: row.agent,
-        })
-      }
-    }
-    rows = Array.from(byProvider.entries())
-      .map(([provider, v]) => ({
-        label: provider,
-        provider,
-        agent: v.sample,
-        purpose: '',
-        requestCount: v.count,
-        uniqueIps: v.uniqueIps,
-        percentage: total > 0 ? (v.count / total) * 100 : 0,
-      }))
-      .sort((a, b) => b.requestCount - a.requestCount)
-  } else {
-    rows = items
-      .map((row: any) => ({
-        label: row.agent,
-        provider: row.provider,
-        agent: row.agent,
-        purpose: row.purpose ?? '',
-        requestCount: row.request_count,
-        uniqueIps: row.unique_ips,
-        percentage: total > 0 ? (row.request_count / total) * 100 : 0,
-      }))
-      .sort((a: Row, b: Row) => b.requestCount - a.requestCount)
-  }
+  const rows = buildAiAgentRows(items, groupBy)
 
   if (options.json) {
     jsonOut({

@@ -1,7 +1,13 @@
-use super::{DockerfileWithArgs, PackageManager, Preset, ProjectType};
+use super::{
+    DockerfileWithArgs, PackageManager, Preset, PresetResolutionError, ProjectType, StoredPreset,
+};
 use async_trait::async_trait;
 use std::fmt;
 use std::path::Path;
+use temps_entities::preset::{
+    DockerfileConfig as StoredDockerfileConfig, DockerfileVariant, Preset as StoredPresetType,
+    PresetConfig as StoredPresetConfig,
+};
 
 pub struct DockerfilePreset;
 
@@ -9,6 +15,32 @@ pub struct DockerfilePreset;
 impl Preset for DockerfilePreset {
     fn slug(&self) -> String {
         "dockerfile".to_string()
+    }
+
+    fn stored_preset(&self) -> Option<StoredPresetType> {
+        Some(StoredPresetType::Dockerfile)
+    }
+
+    fn resolve_storage(
+        &self,
+        config: Option<StoredPresetConfig>,
+    ) -> Result<StoredPreset, PresetResolutionError> {
+        let mut config = match config {
+            Some(StoredPresetConfig::Dockerfile(config)) => config,
+            Some(other) => {
+                return Err(PresetResolutionError::ConfigMismatch {
+                    config_preset: other.preset_type(),
+                    slug: self.slug(),
+                });
+            }
+            None => StoredDockerfileConfig::default(),
+        };
+        config.variant = DockerfileVariant::File;
+
+        Ok(StoredPreset {
+            preset: StoredPresetType::Dockerfile,
+            config: Some(StoredPresetConfig::Dockerfile(config)),
+        })
     }
 
     fn project_type(&self) -> ProjectType {

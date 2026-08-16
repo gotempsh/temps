@@ -479,8 +479,83 @@ Sentry.addBreadcrumb({
 
 ---
 
+### Source Context (see the code) {{ anchor: true, id: 'source-context' }}
+
+Temps can show the actual source code around each stack frame, not just
+`file:line`. How the source gets there depends on the language:
+
+- **JavaScript / TypeScript** — upload **source maps**. The original source
+  travels inside the `.map` (`sourcesContent`), so minified production frames
+  resolve to readable code automatically. The official Sentry build plugins and
+  `sentry-cli` upload to Temps unchanged (Temps injects `SENTRY_URL` /
+  `SENTRY_AUTH_TOKEN` for git-based deploys).
+
+- **Go, Rust, Python, and other native languages** — these already report the
+  *original* `file:line`, they just don't ship the source. Upload the raw
+  source per release and Temps renders the code around each frame.
+
+  Native source context is **opt-in per project** (Settings → General → *Error
+  Tracking Source Context*) — application source is only stored when you enable
+  it.
+
+For **git-based deploys**, that's all you need: once the toggle is on, Temps
+captures the source automatically after each deploy, keyed by the commit SHA.
+By default it captures from the **Docker build context** — the exact directory
+the image was built from — which is the right root for Dockerfile deploys and
+monorepos (frame paths are relative to what was copied into the build). To
+narrow or override it:
+
+```yaml {{ title: '.temps.yaml' }}
+sourceContext:
+  root: services/api    # capture from here (relative to the repo); default: build context
+  include: [go, rs]     # override the default source-extension set
+```
+
+...or set the **Source Root** in the project's error-tracking settings. For
+**image deploys / external CI**, upload the source yourself (below).
+
+The release you upload under **must match the SDK's reported release**
+(`SENTRY_RELEASE`) — typically the deployed commit SHA or tag. For image-based
+deploys Temps injects `SENTRY_RELEASE` from the deployed image tag/digest, so
+key your upload the same way.
+
+<CodeGroup title="Upload source in CI (native)">
+```bash {{ title: 'Whole tree' }}
+# Upload every source file under the repo, keyed by the release.
+# file_path is each file's path relative to the root — exactly how a
+# -trimpath Go binary (and most native SDKs) report frame filenames.
+bunx @temps-sdk/cli errors source-files upload \
+  --project-id 42 \
+  --release "$CI_COMMIT_SHA" \
+  --dir .
+```
+
+```bash {{ title: 'Single file' }}
+bunx @temps-sdk/cli errors source-files upload \
+  --project-id 42 \
+  --release "$CI_COMMIT_SHA" \
+  --file internal/gateway/middleware.go \
+  --file-path internal/gateway/middleware.go
+```
+
+```bash {{ title: 'List / delete' }}
+bunx @temps-sdk/cli errors source-files list   --project-id 42 --release "$CI_COMMIT_SHA"
+bunx @temps-sdk/cli errors source-files delete --project-id 42 --release "$CI_COMMIT_SHA"
+```
+</CodeGroup>
+
 <Note>
-  **Source Maps:** Source map upload and parsing is currently a work in progress (WIP). This feature will allow you to upload source maps to debug minified production code with readable stack traces.
+  **Compiled services (Go, Rust, …): don't hard-code the release.** Some SDKs
+  let you set the release in code (e.g. `sentry.ClientOptions{ Release: version }`).
+  If you bake a placeholder like `"dev"` into the binary, the SDK will **ignore**
+  the `SENTRY_RELEASE` Temps injects at deploy time, and your events won't line up
+  with the source you uploaded. Either:
+
+  - leave the release **unset** in code so the injected `SENTRY_RELEASE` wins, or
+  - bake the **real** commit/tag at build time, e.g. Go
+    `-ldflags "-X main.version=$VERSION"` with
+    `VERSION="${CI_COMMIT_TAG:-$CI_COMMIT_SHA}"` (and pass the same value as the
+    `--release` you upload source under).
 </Note>
 
 ---

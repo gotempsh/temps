@@ -58,7 +58,10 @@ export default tseslint.config(
     },
     settings: {
       react: {
-        version: 'detect',
+        // 'detect' calls context.getFilename(), which ESLint 10 removed —
+        // eslint-plugin-react 7.37.5 (latest) caps peerDeps at ^9.7 and crashes
+        // under 'detect'. Pin explicitly until upstream ships ESLint 10 support.
+        version: '19.2.7',
       },
     },
     rules: {
@@ -100,6 +103,21 @@ export default tseslint.config(
 
       // Prettier integration
       'prettier/prettier': 'warn',
+    },
+  },
+
+  // Playwright end-to-end specs. These are Node-side test code, not React.
+  {
+    files: ['e2e/**/*.ts'],
+    rules: {
+      // Playwright's fixture signature is `async ({ page }, use) => { ... }`,
+      // and the linter mistakes that `use(...)` call for the React `use` hook,
+      // reporting "React Hook 'use' is called in function 'consoleErrors'".
+      // There is no React in this directory.
+      'react-hooks/rules-of-hooks': 'off',
+      // Specs legitimately print diagnostics (which endpoint 404'd, which
+      // sidebar link is dead) -- that output is the point when CI goes red.
+      'no-console': 'off',
     },
   },
 

@@ -42,6 +42,78 @@ pub struct ProjectUpdatedFields {
     pub main_branch: Option<String>,
     pub preset: Option<String>,
     pub automatic_deploy: Option<bool>,
+    /// Records that Compose routing, service selection, permissions, or the
+    /// advanced override changed without persisting any secret-bearing YAML.
+    pub compose_configuration_updated: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomDomainReassignmentRequestedAudit {
+    pub context: AuditContext,
+    pub custom_domain_id: i32,
+    pub source_project_id: i32,
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
+}
+
+impl AuditOperation for CustomDomainReassignmentRequestedAudit {
+    fn operation_type(&self) -> String {
+        "CUSTOM_DOMAIN_REASSIGNMENT_REQUESTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        // AuditOperation's shared contract currently returns anyhow::Result;
+        // preserve the serialization source while adding operation context.
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!("Failed to serialize domain reassignment request: {error}")
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomDomainReassignedAudit {
+    pub context: AuditContext,
+    pub custom_domain_id: i32,
+    pub domain: String,
+    pub source_project_id: i32,
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
+}
+
+impl AuditOperation for CustomDomainReassignedAudit {
+    fn operation_type(&self) -> String {
+        "CUSTOM_DOMAIN_REASSIGNED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        // AuditOperation's shared contract currently returns anyhow::Result.
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize domain reassignment: {error}"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -61,8 +133,8 @@ impl AuditOperation for PipelineTriggeredAudit {
         "PIPELINE_TRIGGERED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -104,6 +176,9 @@ pub struct ProjectSettingsUpdatedFields {
     pub memory_request: Option<i32>,
     pub memory_limit: Option<i32>,
     pub performance_metrics_enabled: Option<bool>,
+    /// Security-relevant Compose settings changed; values are deliberately
+    /// omitted because preset_config may contain credentials.
+    pub compose_configuration_updated: Option<bool>,
 }
 
 impl AuditOperation for ProjectCreatedAudit {
@@ -111,8 +186,8 @@ impl AuditOperation for ProjectCreatedAudit {
         "PROJECT_CREATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -134,8 +209,8 @@ impl AuditOperation for ProjectUpdatedAudit {
         "PROJECT_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -157,8 +232,8 @@ impl AuditOperation for ProjectDeletedAudit {
         "PROJECT_DELETED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -180,8 +255,8 @@ impl AuditOperation for ProjectSettingsUpdatedAudit {
         "PROJECT_SETTINGS_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -212,8 +287,8 @@ impl AuditOperation for DeploymentConfigUpdatedAudit {
         "DEPLOYMENT_CONFIG_UPDATED".to_string()
     }
 
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
 
     fn ip_address(&self) -> Option<String> {
@@ -227,5 +302,39 @@ impl AuditOperation for DeploymentConfigUpdatedAudit {
     fn serialize(&self) -> Result<String> {
         serde_json::to_string(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compose_settings_audit_records_change_without_secret_values() {
+        let audit = ProjectSettingsUpdatedAudit {
+            context: AuditContext {
+                user_id: 7,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "test-agent".to_string(),
+            },
+            project_id: 11,
+            project_name: "example".to_string(),
+            project_slug: "example".to_string(),
+            updated_settings: ProjectSettingsUpdatedFields {
+                slug: None,
+                cpu_request: None,
+                cpu_limit: None,
+                memory_request: None,
+                memory_limit: None,
+                performance_metrics_enabled: None,
+                compose_configuration_updated: Some(true),
+            },
+        };
+
+        let serialized = AuditOperation::serialize(&audit).expect("audit should serialize");
+
+        assert!(serialized.contains("\"compose_configuration_updated\":true"));
+        assert!(!serialized.contains("composeOverride"));
+        assert!(!serialized.contains("environment"));
     }
 }

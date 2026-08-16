@@ -30,6 +30,10 @@ macro_rules! permission_guard {
                 $crate::permissions::Permission::$permission.to_string(),
             )
             .value("user_role", $auth.effective_role.to_string())
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                Some($crate::permissions::Permission::$permission.to_string()),
+            )
             .build());
         }
     };
@@ -74,6 +78,10 @@ macro_rules! project_scope_guard {
                 "This deployment token is scoped to a different project and \
                  cannot access this resource",
             )
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::CrossProjectScope,
+                None,
+            )
             .build());
         }
     };
@@ -112,6 +120,10 @@ macro_rules! deny_deployment_token {
             .detail(
                 "This endpoint requires user or API-key authentication; \
                  deployment tokens are not permitted",
+            )
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::DeploymentTokenNotAllowed,
+                None,
             )
             .build());
         }
@@ -183,6 +195,10 @@ macro_rules! project_access_guard {
                                 .detail(
                                     "Your team membership does not include access to \
                                      this project",
+                                )
+                                .permission_denial(
+                                    temps_core::problemdetails::PermissionDenialKind::ProjectAccess,
+                                    None,
                                 )
                                 .build());
                             }
@@ -266,9 +282,11 @@ macro_rules! project_access_guard {
 ///    out).
 /// 4. Otherwise, `checker.effective_project_permissions(user_id, project_id)`
 ///    is consulted:
-///    - `Ok(None)` → unrestricted from this checker's perspective (no plugin
-///      registered, or the project has no team grants) — the instance-wide
-///      result from step 1 stands.
+///    - `Ok(None)` → no permission-specific opinion, so the guard falls back
+///      to `checker.user_can_access_project(user_id, project_id)` to preserve
+///      the coarse team-membership check for existing checker implementations.
+///      If that coarse check allows, the instance-wide result from step 1
+///      stands; if it denies, this guard returns 403.
 ///    - `Ok(Some(perms))` → the permission must be present in `perms`, else
 ///      403. An empty `perms` denies every project-scoped permission.
 ///    - `Err(_)` → fail-closed, 500. Never a silent allow.
@@ -291,6 +309,10 @@ macro_rules! project_permission_guard {
                 $crate::permissions::Permission::$permission.to_string(),
             )
             .value("user_role", $auth.effective_role.to_string())
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                Some($crate::permissions::Permission::$permission.to_string()),
+            )
             .build());
         }
 
@@ -307,8 +329,49 @@ macro_rules! project_permission_guard {
                             .effective_project_permissions(__user_id, $project_id)
                             .await
                         {
-                            // No opinion from this checker — instance-wide result stands.
-                            Ok(None) => {}
+                            // No permission-specific opinion from this checker —
+                            // preserve the legacy coarse project-access check so
+                            // existing ProjectAccessChecker implementations that only
+                            // implement user_can_access_project() cannot be bypassed.
+                            Ok(None) => {
+                                match __checker
+                                    .user_can_access_project(__user_id, $project_id)
+                                    .await
+                                {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        return Err(temps_core::error_builder::ErrorBuilder::new(
+                                            ::axum::http::StatusCode::FORBIDDEN,
+                                        )
+                                        .type_("https://temps.sh/probs/project-access-denied")
+                                        .title("Project Access Denied")
+                                        .detail(
+                                            "Your team membership does not include access to \
+                                             this project",
+                                        )
+                                        .build());
+                                    }
+                                    Err(__e) => {
+                                        ::tracing::error!(
+                                            project_id = $project_id,
+                                            user_id = __user_id,
+                                            error = %__e,
+                                            "ProjectAccessChecker::user_can_access_project \
+                                             infrastructure failure after no \
+                                             permission-specific opinion — denying access"
+                                        );
+                                        return Err(temps_core::error_builder::ErrorBuilder::new(
+                                            ::axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                        )
+                                        .type_("https://temps.sh/probs/project-access-check-failed")
+                                        .title("Project Access Check Failed")
+                                        .detail(
+                                            "Could not verify project access; please try again",
+                                        )
+                                        .build());
+                                    }
+                                }
+                            }
                             Ok(Some(__perms)) => {
                                 let __required =
                                     $crate::permissions::Permission::$permission.to_string();
@@ -324,6 +387,10 @@ macro_rules! project_permission_guard {
                                         __required
                                     ))
                                     .value("required_permission", __required)
+                                    .permission_denial(
+                                        temps_core::problemdetails::PermissionDenialKind::ProjectPermission,
+                                        Some($crate::permissions::Permission::$permission.to_string()),
+                                    )
                                     .build());
                                 }
                             }
@@ -361,6 +428,10 @@ macro_rules! project_permission_guard {
                         .title("Insufficient Permissions")
                         .detail(
                             "Could not resolve caller identity for project permission check",
+                        )
+                        .permission_denial(
+                            temps_core::problemdetails::PermissionDenialKind::MissingPrincipal,
+                            Some($crate::permissions::Permission::$permission.to_string()),
                         )
                         .build());
                     }
@@ -401,6 +472,10 @@ macro_rules! permission_check {
             ))
             .value("required_permission", $permission.to_string())
             .value("user_role", $auth.effective_role.to_string())
+            .permission_denial(
+                temps_core::problemdetails::PermissionDenialKind::InsufficientPermission,
+                Some($permission.to_string()),
+            )
             .build());
         }
     };
@@ -408,16 +483,20 @@ macro_rules! permission_check {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
 
     use async_trait::async_trait;
+    use axum::response::IntoResponse;
     use chrono::Utc;
-    use temps_core::problemdetails::Problem;
+    use temps_core::problemdetails::{PermissionDenialKind, PermissionDenialMarker, Problem};
     use temps_core::ProjectAccessChecker;
     use temps_entities::users;
 
     use crate::context::AuthContext;
-    use crate::permissions::Role;
+    use crate::permissions::{Permission, Role};
 
     // ---------------------------------------------------------------------------
     // Test helpers
@@ -435,6 +514,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -459,6 +539,65 @@ mod tests {
             "deploy-token".to_string(),
             vec![],
         )
+    }
+
+    fn denial_marker(problem: Problem) -> Option<PermissionDenialMarker> {
+        problem
+            .into_response()
+            .extensions()
+            .get::<PermissionDenialMarker>()
+            .cloned()
+    }
+
+    fn run_instance_permission_guard(auth: &AuthContext) -> Result<(), Problem> {
+        permission_guard!(auth, UsersWrite);
+        Ok(())
+    }
+
+    fn run_permission_check(auth: &AuthContext) -> Result<(), Problem> {
+        permission_check!(auth, Permission::UsersWrite);
+        Ok(())
+    }
+
+    fn run_project_scope_guard(auth: &AuthContext, project_id: i32) -> Result<(), Problem> {
+        project_scope_guard!(auth, project_id);
+        Ok(())
+    }
+
+    fn run_deny_deployment_token(auth: &AuthContext) -> Result<(), Problem> {
+        deny_deployment_token!(auth);
+        Ok(())
+    }
+
+    #[test]
+    fn synchronous_guard_denials_carry_stable_markers() {
+        let auth = user_auth(Role::User);
+        for problem in [
+            run_instance_permission_guard(&auth).expect_err("user lacks users:write"),
+            run_permission_check(&auth).expect_err("user lacks users:write"),
+        ] {
+            let marker = denial_marker(problem).expect("permission denial marker");
+            assert_eq!(marker.kind(), PermissionDenialKind::InsufficientPermission);
+            assert_eq!(marker.required_permission(), Some("users:write"));
+        }
+
+        let token = deployment_token_auth();
+        let marker = denial_marker(
+            run_project_scope_guard(&token, 8).expect_err("token is bound to project 7"),
+        )
+        .expect("project scope denial marker");
+        assert_eq!(marker.kind(), PermissionDenialKind::CrossProjectScope);
+        assert_eq!(marker.required_permission(), None);
+
+        let marker = denial_marker(
+            run_deny_deployment_token(&token).expect_err("deployment token is denied"),
+        )
+        .expect("deployment token denial marker");
+        assert_eq!(
+            marker.kind(),
+            PermissionDenialKind::DeploymentTokenNotAllowed
+        );
+        assert_eq!(marker.required_permission(), None);
     }
 
     /// A mock [`ProjectAccessChecker`] that returns a fixed outcome.
@@ -545,6 +684,9 @@ mod tests {
             axum::http::StatusCode::FORBIDDEN,
             "denial should be HTTP 403"
         );
+        let marker = denial_marker(err).expect("project access denial marker");
+        assert_eq!(marker.kind(), PermissionDenialKind::ProjectAccess);
+        assert_eq!(marker.required_permission(), None);
     }
 
     // ---------------------------------------------------------------------------
@@ -561,6 +703,10 @@ mod tests {
             err.status_code,
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             "infrastructure failure should be HTTP 500"
+        );
+        assert!(
+            denial_marker(err).is_none(),
+            "infrastructure failures must not be marked as auth denials"
         );
     }
 
@@ -759,6 +905,9 @@ mod tests {
             err.body.get("type").and_then(|v| v.as_str()),
             Some("https://temps.sh/probs/project-permission-denied")
         );
+        let marker = denial_marker(err).expect("project permission denial marker");
+        assert_eq!(marker.kind(), PermissionDenialKind::ProjectPermission);
+        assert_eq!(marker.required_permission(), Some("deployments:create"));
     }
 
     #[tokio::test]
@@ -796,6 +945,48 @@ mod tests {
         );
     }
 
+    struct LegacyDenyChecker {
+        user_can_access_calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for LegacyDenyChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            self.user_can_access_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_guard_preserves_legacy_coarse_project_denial() {
+        // A checker compiled before effective_project_permissions() existed only
+        // implements user_can_access_project(). The default permission-specific
+        // response is Ok(None), but project_permission_guard! must still invoke
+        // the legacy coarse access check and deny if it denies.
+        let auth = user_auth(Role::User);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let checker: Arc<dyn ProjectAccessChecker> = Arc::new(LegacyDenyChecker {
+            user_can_access_calls: Arc::clone(&calls),
+        });
+
+        let result = run_permission_guard(&auth, 1, Some(checker)).await;
+        let err = result.expect_err("legacy coarse project denial must still deny");
+        assert_eq!(err.status_code, axum::http::StatusCode::FORBIDDEN);
+        assert_eq!(
+            err.body.get("type").and_then(|v| v.as_str()),
+            Some("https://temps.sh/probs/project-access-denied")
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "project_permission_guard! must fall back to user_can_access_project() on Ok(None)"
+        );
+    }
+
     #[tokio::test]
     async fn permission_guard_resolver_error_returns_500() {
         let auth = user_auth(Role::User);
@@ -805,6 +996,10 @@ mod tests {
         assert_eq!(
             err.status_code,
             axum::http::StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert!(
+            denial_marker(err).is_none(),
+            "resolver failures must not be marked as auth denials"
         );
     }
 
@@ -893,7 +1088,9 @@ mod tests {
     // ADR-028 Phase B: Coverage enumeration
     //
     // Every Rust source file that contains `project_scope_guard!` must also
-    // contain `project_access_guard!` — the two guards are always paired.
+    // contain either `project_access_guard!` or the stricter, self-contained
+    // `project_permission_guard!` — the scope guard is always paired with one
+    // of these project-access checks.
     // This test scans the workspace at test time and fails if any file has one
     // without the other, catching handlers added in future crates that omit the
     // companion guard.
@@ -926,13 +1123,14 @@ mod tests {
             // doc-comment references like `[`project_scope_guard!`]`.
             let has_scope_guard = contents.contains("project_scope_guard!(");
             let has_access_guard = contents.contains("project_access_guard!(");
+            let has_permission_guard = contents.contains("project_permission_guard!(");
             // Skip the file that defines the macros themselves.
             let is_definition_file = contents.contains("macro_rules! project_scope_guard")
                 || contents.contains("macro_rules! project_access_guard");
             if is_definition_file {
                 continue;
             }
-            if has_scope_guard && !has_access_guard {
+            if has_scope_guard && !has_access_guard && !has_permission_guard {
                 violations.push(format!("{}", path.display()));
             }
         }
@@ -940,7 +1138,8 @@ mod tests {
         assert!(
             violations.is_empty(),
             "The following files have `project_scope_guard!` but are missing \
-             `project_access_guard!` (ADR-028 Phase B requires both to be paired):\n{}",
+             both `project_access_guard!` and `project_permission_guard!` \
+             (ADR-028 requires project scope and access checks to be paired):\n{}",
             violations.join("\n")
         );
     }
@@ -963,13 +1162,17 @@ mod tests {
         let expected_crates: &[&str] = &[
             "temps-agents",
             "temps-ai-chat",
+            "temps-ai-gateway",
             "temps-analytics",
             "temps-analytics-events",
             "temps-analytics-funnels",
             "temps-analytics-session-replay",
+            "temps-blob",
             "temps-deployments",
             "temps-environments",
             "temps-error-tracking",
+            "temps-flags",
+            "temps-kv",
             "temps-log-aggregator",
             "temps-monitoring",
             "temps-observability",
@@ -977,7 +1180,15 @@ mod tests {
             "temps-projects",
             "temps-providers",
             "temps-revenue",
+            // Creating a sandbox *from* a project reads that project's repo
+            // URL and git credential, so it is gated like any other
+            // project-scoped read (ADR-036).
+            "temps-sandbox",
             "temps-status-page",
+            // Who a project is shared with is part of that project's data:
+            // the access-grant endpoints guard themselves with the very
+            // checker they register.
+            "temps-teams",
             "temps-vulnerability-scanner",
             "temps-webhooks",
         ];
@@ -1075,8 +1286,12 @@ mod tests {
     /// both accidental removal and silent, unreviewed expansion.
     #[test]
     fn project_permission_guard_coverage_snapshot() {
-        let expected_crates: &[&str] =
-            &["temps-deployments", "temps-environments", "temps-projects"];
+        let expected_crates: &[&str] = &[
+            "temps-deployments",
+            "temps-environments",
+            "temps-projects",
+            "temps-proxy",
+        ];
 
         let mut sorted = expected_crates.to_vec();
         sorted.sort_unstable();

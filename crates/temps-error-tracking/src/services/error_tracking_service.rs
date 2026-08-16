@@ -389,12 +389,14 @@ impl ErrorTrackingService {
             return notifications;
         }
 
-        // Look up project name
-        let project_name = projects::Entity::find_by_id(project_id)
+        // Look up project name and slug (slug is used to build deep links in notifications)
+        let project = projects::Entity::find_by_id(project_id)
             .one(self.db.as_ref())
             .await
             .ok()
-            .flatten()
+            .flatten();
+        let project_slug = project.as_ref().map(|p| p.slug.clone());
+        let project_name = project
             .map(|p| p.name)
             .unwrap_or_else(|| format!("Project {}", project_id));
 
@@ -417,6 +419,7 @@ impl ErrorTrackingService {
             .into_iter()
             .map(|mut n| {
                 n.project_name = Some(project_name.clone());
+                n.project_slug = project_slug.clone();
                 if let Some(env_id) = n.environment_id {
                     n.environment_name = env_names.get(&env_id).cloned();
                 }

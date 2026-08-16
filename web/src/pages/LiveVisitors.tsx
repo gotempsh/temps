@@ -5,7 +5,7 @@ import { Button } from '@/components/ui/button'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 import { Skeleton } from '@/components/ui/skeleton'
 
 interface LiveVisitorsProps {

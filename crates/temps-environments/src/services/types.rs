@@ -27,6 +27,17 @@ pub struct EnvVarWithEnvironments {
     pub is_secret: bool,
 }
 
+/// Result of an env-var update. Carries the updated row plus whether this
+/// particular write flipped the variable from regular to secret, so the handler
+/// can audit that one-way transition without re-reading the row.
+#[derive(Debug, Serialize)]
+pub struct UpdateEnvVarOutcome {
+    pub var: EnvVarWithEnvironments,
+    /// True only when the row was non-secret before this update and is secret
+    /// after it. A no-op update of an already-secret row reports `false`.
+    pub promoted_to_secret: bool,
+}
+
 // Secret types. Deliberately NO `value` field — secret plaintext never leaves
 // the service boundary except via SecretService::get_for_deploy.
 #[derive(Debug, Clone, Serialize)]

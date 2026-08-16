@@ -15,8 +15,13 @@ import {
   cancelDomainOrder,
   setupDnsChallenge as setupDnsChallengeApi,
   getHttpChallengeDebug,
+  listRenewalAttempts as listRenewalAttemptsApi,
 } from '../../api/sdk.gen.js'
-import type { DomainResponse, AcmeOrderResponse, HttpChallengeDebugResponse } from '../../api/types.gen.js'
+import type {
+  DomainResponse,
+  AcmeOrderResponse,
+  RenewalAttemptResponse,
+} from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -25,13 +30,29 @@ import {
   keyValue, formatDate, box
 } from '../../ui/output.js'
 
+// Exact match only — a case-insensitive or partial match here would let
+// `domains ssl`/`domains status` silently target the wrong domain.
+export function findDomainByName(domains: DomainResponse[], domainName: string): number | null {
+  const domain = domains.find((d) => d.domain === domainName)
+  return domain?.id ?? null
+}
+
 // Helper function to find domain ID by domain name
 async function findDomainIdByName(domainName: string): Promise<number | null> {
   const { data, error } = await listDomainsApi({ client })
   if (error || !data?.domains) return null
 
-  const domain = data.domains.find((d: DomainResponse) => d.domain === domainName)
-  return domain?.id ?? null
+  return findDomainByName(data.domains, domainName)
+}
+
+// The ACME TXT record for a wildcard domain (`*.example.com`) is always
+// scoped to the base domain, never the literal `*.` name.
+export function wildcardBaseDomain(domain: string): string {
+  return domain.startsWith('*.') ? domain.slice(2) : domain
+}
+
+export function isProvisionedStatus(status: string): boolean {
+  return status === 'active' || status === 'provisioned'
 }
 
 interface AddOptions {
@@ -57,6 +78,13 @@ interface SslOptions {
 
 interface StatusOptions {
   domain: string
+}
+
+interface RenewalAttemptsOptions {
+  domain: string
+  page?: string
+  pageSize?: string
+  json?: boolean
 }
 
 interface OrderShowOptions {
@@ -136,6 +164,15 @@ export function registerDomainsCommands(program: Command): void {
     .description('Check domain status')
     .requiredOption('-d, --domain <domain>', 'Domain name')
     .action(domainStatus)
+
+  domains
+    .command('renewal-attempts')
+    .description('Show the certificate renewal-attempt history for a domain')
+    .requiredOption('-d, --domain <domain>', 'Domain name')
+    .option('--page <page>', 'Page number (1-indexed)', '1')
+    .option('--page-size <pageSize>', 'Items per page (max 100)', '20')
+    .option('--json', 'Output in JSON format')
+    .action(listRenewalAttempts)
 
   // --- Nested orders command group ---
   const orders = domains
@@ -252,7 +289,7 @@ async function addDomain(options: AddOptions): Promise<void> {
   success(`Domain ${domain} added`)
 
   if (result?.dns_challenge_token && result?.dns_challenge_value) {
-    const baseDomain = domain.startsWith('*.') ? domain.slice(2) : domain
+    const baseDomain = wildcardBaseDomain(domain)
     newline()
     box(
       `Type: TXT\n` +
@@ -293,7 +330,7 @@ async function verifyDomain(options: VerifyOptions): Promise<void> {
   // Handle union type based on 'type' discriminator
   if (result.type === 'complete') {
     const domainData = result
-    if (domainData.status === 'active' || domainData.status === 'provisioned') {
+    if (isProvisionedStatus(domainData.status)) {
       success(`Domain ${domain} verified and SSL certificate provisioned`)
     } else {
       warning(`Domain status: ${domainData.status}`)
@@ -438,6 +475,62 @@ async function domainStatus(options: StatusOptions): Promise<void> {
   }
 
   newline()
+}
+
+async function listRenewalAttempts(options: RenewalAttemptsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const page = Number.parseInt(options.page ?? '1', 10) || 1
+  const pageSize = Number.parseInt(options.pageSize ?? '20', 10) || 20
+
+  const result = await withSpinner(`Fetching renewal attempts for ${options.domain}...`, async () => {
+    const { data, error } = await listRenewalAttemptsApi({
+      client,
+      path: { domain: options.domain },
+      query: { page, page_size: pageSize },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  newline()
+  header(`${icons.lock} Renewal Attempts for ${options.domain} (${result?.total ?? 0} total, page ${result?.page ?? page}/${Math.max(1, Math.ceil((result?.total ?? 0) / (result?.page_size ?? pageSize)))})`)
+
+  const attempts = result?.attempts ?? []
+  if (attempts.length === 0) {
+    info('No renewal attempts recorded for this domain')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<RenewalAttemptResponse>[] = [
+    {
+      header: 'When',
+      accessor: (a) => formatDate(new Date(a.created_at).toISOString()),
+      color: (v) => colors.muted(v),
+    },
+    { header: 'Stage', key: 'stage' },
+    { header: 'Method', key: 'verification_method' },
+    { header: 'Outcome', key: 'outcome', color: (v) => statusBadge(v) },
+    {
+      header: 'Error',
+      accessor: (a) => a.error ?? '-',
+      color: (v) => (v === '-' ? colors.muted(v) : colors.error(v)),
+    },
+  ]
+
+  printTable(attempts, columns)
+  newline()
+  if ((result?.total ?? 0) > page * pageSize) {
+    info(`Run with --page ${page + 1} to see more`)
+    newline()
+  }
 }
 
 // --- ACME Orders ---
@@ -636,7 +729,7 @@ async function finalizeOrder(options: OrderFinalizeOptions): Promise<void> {
   }
 
   newline()
-  if (result.status === 'active' || result.status === 'provisioned') {
+  if (isProvisionedStatus(result.status)) {
     success(`ACME order finalized for ${result.domain}`)
     keyValue('Status', statusBadge(result.status))
     if (result.expiration_time) {

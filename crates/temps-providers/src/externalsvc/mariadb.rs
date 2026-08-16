@@ -1,5 +1,6 @@
 use crate::utils::ensure_network_exists;
 
+use super::port_util::{find_available_port, find_available_port_async};
 use super::{
     ExternalService, HealthProbeResult, LogicalResource, NewServiceRestoreResult, RecoveryTarget,
     RuntimeEnvVar, ServiceConfig, ServiceResourceLimits, ServiceType,
@@ -13,7 +14,6 @@ use futures::{StreamExt, TryStreamExt};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -234,28 +234,28 @@ pub struct BinlogManifest {
 pub struct MariaDbInputConfig {
     /// MariaDB host address.
     #[serde(default = "default_host")]
-    #[schemars(example = "example_host", default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
     pub host: String,
 
     /// MariaDB host port (auto-assigned if not provided).
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// Initial application database.
     #[serde(default = "default_database")]
-    #[schemars(example = "example_database", default = "default_database")]
+    #[schemars(example = example_database(), default = "default_database")]
     pub database: String,
 
     /// Initial application user.
     #[serde(default = "default_username")]
-    #[schemars(example = "example_username", default = "default_username")]
+    #[schemars(example = example_username(), default = "default_username")]
     pub username: String,
 
     /// Application user password (auto-generated if not provided or too short).
     #[serde(default, deserialize_with = "deserialize_optional_password")]
     #[schemars(
         with = "Option<String>",
-        example = "example_password",
+        example = example_password(),
         description = "Application user password (minimum 8 characters, auto-generated if not provided)"
     )]
     pub password: Option<String>,
@@ -264,14 +264,14 @@ pub struct MariaDbInputConfig {
     #[serde(default, deserialize_with = "deserialize_optional_password")]
     #[schemars(
         with = "Option<String>",
-        example = "example_root_password",
+        example = example_root_password(),
         description = "Root password (minimum 8 characters, auto-generated if not provided)"
     )]
     pub root_password: Option<String>,
 
     /// Full Docker image reference.
     #[serde(default = "default_docker_image")]
-    #[schemars(example = "example_docker_image", default = "default_docker_image")]
+    #[schemars(example = example_docker_image(), default = "default_docker_image")]
     pub docker_image: String,
 
     /// Managed service size/tuning profile.
@@ -409,17 +409,9 @@ fn example_docker_image() -> &'static str {
     DEFAULT_MARIADB_IMAGE
 }
 
-fn is_port_available(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_ok()
-}
-
-fn find_available_port(start_port: u16) -> Option<u16> {
-    (start_port..start_port + 100).find(|&port| is_port_available(port))
-}
-
 fn generate_password() -> String {
-    use rand::{distributions::Alphanumeric, Rng};
-    rand::thread_rng()
+    use rand::{distr::Alphanumeric, RngExt};
+    rand::rng()
         .sample_iter(&Alphanumeric)
         .take(24)
         .map(char::from)
@@ -2516,9 +2508,12 @@ impl MariaDbService {
         let mut config = self.get_mariadb_config(source_config.clone())?;
 
         // Fresh port (the source's is taken). A restored new service is its own
-        // container, not an imported one.
+        // container, not an imported one. Docker-aware here because we have a
+        // client: it also skips ports published by other containers, not just
+        // ones the OS reports as bound.
         config.container_name = None;
-        let new_port = find_available_port(3306)
+        let new_port = find_available_port_async(&self.docker, 3306)
+            .await
             .ok_or_else(|| anyhow::anyhow!("No available ports for new MariaDB service"))?
             .to_string();
         config.port = new_port;
@@ -4708,6 +4703,39 @@ mod tests {
         assert!(
             !schema.to_string().contains("container_name"),
             "container_name leaked into the MariaDB create schema"
+        );
+    }
+
+    /// Regression guard for the cross-tenant IDOR: a client-supplied
+    /// `container_name` in a create request would make every subsequent Docker
+    /// operation (start, exec, backup, restore) target that named container
+    /// instead of creating a new one. Because Docker names are global and
+    /// predictable (`mariadb-{slug}`), this lets a tenant redirect operations
+    /// to a different tenant's live database container.
+    ///
+    /// The schema-level `#[schemars(skip)]` only hides the field from the UI
+    /// form — it does NOT stop `serde_json::from_value` from deserialising a
+    /// client-supplied value. `validate_for_creation` must reject it explicitly.
+    #[test]
+    fn test_container_name_rejected_by_validate_for_creation() {
+        use crate::parameter_strategies::MariaDbParameterStrategy;
+        let strategy = MariaDbParameterStrategy;
+        let mut params = std::collections::HashMap::new();
+        params.insert(
+            "container_name".to_string(),
+            serde_json::Value::String("mariadb-victim-slug".to_string()),
+        );
+        let result = crate::parameter_strategies::ParameterStrategy::validate_for_creation(
+            &strategy, &params,
+        );
+        assert!(
+            result.is_err(),
+            "validate_for_creation must reject a client-supplied container_name"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("container_name"),
+            "error message should mention 'container_name', got: {err}"
         );
     }
 }

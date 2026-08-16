@@ -7,7 +7,7 @@ use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
 use crate::services::project::ProjectService;
-use crate::services::types::ProjectError;
+use crate::services::types::{CreateProjectEnvVar, ProjectError};
 use http::StatusCode;
 use std::sync::Arc;
 use temps_core::problemdetails;
@@ -17,9 +17,12 @@ use temps_presets::preset_config_schema::PresetConfigSchema;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
+    pub deployment_canceller: Arc<dyn temps_core::DeploymentCanceller>,
+    pub deployment_container_cleaner: Arc<dyn temps_core::DeploymentContainerCleaner>,
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
+    pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker enforcing team-based project access for human sessions.
     ///
@@ -142,6 +145,25 @@ pub struct ProjectList {
     pub projects: Vec<ProjectResponse>,
 }
 
+/// Documentation-only schema for a project-creation environment variable.
+///
+/// The wire format is deserialized by [`CreateProjectEnvVar`], which also
+/// accepts the legacy `["KEY", "value"]` tuple form. This struct exists so the
+/// OpenAPI spec (and the generated clients) describe the preferred object form
+/// with its `is_secret` flag.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ProjectEnvVarInput {
+    /// Variable name, e.g. `DATABASE_URL`
+    pub key: String,
+    /// Variable value
+    pub value: String,
+    /// Mark the variable as a write-only secret. Secret values are encrypted at
+    /// rest and never returned in plaintext by the API — they can only be
+    /// replaced, not read back. Defaults to `false`.
+    #[serde(default)]
+    pub is_secret: bool,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
     pub name: String,
@@ -154,7 +176,8 @@ pub struct CreateProjectRequest {
     ///
     /// Different presets accept different configuration options:
     /// - **Dockerfile preset**: Accepts `DockerfilePresetConfig` with `dockerfile_path` and `build_context`
-    /// - **Nixpacks preset**: Uses `nixpacks.toml` file for configuration (no params needed)
+    /// - **Nixpacks preset**: Accepts ordered `providers` (for example `["...", "python"]`)
+    ///   and optional inline `nixpacksConfig` TOML
     /// - **Static presets** (Vite, Next.js, etc.): Accept `StaticPresetConfig` with build commands and output dir
     ///
     /// Example for Dockerfile preset:
@@ -170,7 +193,13 @@ pub struct CreateProjectRequest {
     pub output_dir: Option<String>,
     pub build_command: Option<String>,
     pub install_command: Option<String>,
-    pub environment_variables: Option<Vec<(String, String)>>,
+    /// Environment variables to seed the default (production) environment with.
+    ///
+    /// Accepts objects — `{"key": "API_KEY", "value": "sk-...", "is_secret": true}`
+    /// — or the legacy two-element form `["API_KEY", "sk-..."]`, which implies
+    /// `is_secret: false`.
+    #[schema(value_type = Option<Vec<ProjectEnvVarInput>>)]
+    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
     pub automatic_deploy: Option<bool>,
     pub project_type: Option<String>,
     pub is_web_app: Option<bool>,
@@ -277,6 +306,9 @@ pub struct ProjectResponse {
     pub updated_at: i64,
     pub last_deployment: Option<i64>,
     pub git_provider_connection_id: Option<i32>,
+    /// Authoritative repository visibility. A missing connection alone does
+    /// not imply that an incompletely configured repository is public.
+    pub is_public_repo: bool,
     /// Git clone URL for the repository (used for public repos without a provider connection)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git_url: Option<String>,
@@ -290,6 +322,14 @@ pub struct ProjectResponse {
     pub ai_debug_chat_enabled: Option<bool>,
     /// Opt-in to AI propose-then-confirm write capability (false = off).
     pub ai_write_actions_enabled: bool,
+    /// Opt-in to AI summarization of API traffic analytics (NULL/false = off).
+    pub ai_api_traffic_summary_enabled: Option<bool>,
+    /// Opt-in to native error-tracking source context (false = off). When on,
+    /// Temps stores uploaded source files and shows source code in stack traces.
+    pub error_source_context_enabled: bool,
+    /// Where auto-capture reads source from (relative to the checkout). Null =
+    /// the deployment's Docker build context.
+    pub error_source_root: Option<String>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
     /// When true, newly-created preview environments default to on-demand mode
@@ -337,11 +377,15 @@ impl ProjectResponse {
             updated_at: project.updated_at.timestamp_millis(),
             last_deployment: project.last_deployment.map(|d| d.timestamp_millis()),
             git_provider_connection_id: project.git_provider_connection_id,
+            is_public_repo: project.is_public_repo,
             git_url: project.git_url,
             attack_mode: project.attack_mode,
             ai_alert_summaries_enabled: project.ai_alert_summaries_enabled,
             ai_debug_chat_enabled: project.ai_debug_chat_enabled,
             ai_write_actions_enabled: project.ai_write_actions_enabled,
+            ai_api_traffic_summary_enabled: project.ai_api_traffic_summary_enabled,
+            error_source_context_enabled: project.error_source_context_enabled,
+            error_source_root: project.error_source_root,
             enable_preview_environments: project.enable_preview_environments,
             preview_envs_on_demand: project.preview_envs_on_demand,
             preview_envs_idle_timeout_seconds: project.preview_envs_idle_timeout_seconds,
@@ -423,11 +467,31 @@ impl ProjectResponse {
                     .clone()
                     .map(|c| c.wake_timeout_seconds)
                     .unwrap_or(30),
+                request_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.request_timeout_seconds),
+                sse_idle_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.sse_idle_timeout_seconds),
+                websocket_idle_timeout_seconds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.websocket_idle_timeout_seconds),
+                max_concurrent_connections: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.max_concurrent_connections),
                 container_exec_enabled: project
                     .deployment_config
                     .clone()
                     .map(|c| c.container_exec_enabled)
                     .unwrap_or(false),
+                cross_architecture_builds: project
+                    .deployment_config
+                    .clone()
+                    .and_then(|c| c.cross_architecture_builds),
             },
         }
     }
@@ -442,6 +506,12 @@ pub struct CustomDomainRequest {
     pub environment_id: i32,
     /// Docker Compose service name this domain routes to (only for docker-compose projects)
     pub service_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ReassignCustomDomainRequest {
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -545,6 +615,36 @@ pub struct UpdateDeploymentConfigRequest {
     pub session_recording_enabled: Option<bool>,
     pub replicas: Option<i32>,
     pub security: Option<temps_entities::deployment_config::SecurityConfig>,
+    /// Build one image per architecture the eligible nodes run. Off by
+    /// default; environments inherit this and may override it. Cross-builds
+    /// are emulated on the control plane and substantially slower, so they are
+    /// opted into rather than triggered by cluster topology.
+    pub cross_architecture_builds: Option<bool>,
+    /// Project-level default timeout for regular (non-streaming) HTTP
+    /// requests, in seconds (0 = no timeout, or 1-86400). Environments may
+    /// override this; always clamped to the operator's global hard ceiling
+    /// regardless of what's set here. Absent leaves the current value
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_timeout_seconds: Option<i32>,
+    /// Project-level default idle timeout for Server-Sent Events streams, in
+    /// seconds (0 = no timeout, or 1-86400). Environments may override this;
+    /// always clamped to the operator's global hard ceiling. Absent leaves
+    /// the current value unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sse_idle_timeout_seconds: Option<i32>,
+    /// Project-level default idle timeout for WebSocket connections, in
+    /// seconds (0 = no timeout, or 1-86400). Environments may override this;
+    /// always clamped to the operator's global hard ceiling. Absent leaves
+    /// the current value unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub websocket_idle_timeout_seconds: Option<i32>,
+    /// Project-level default cap on concurrent in-flight requests to a
+    /// single environment's upstream (0 = unlimited). Environments may
+    /// override this. Absent leaves the current value unchanged. See
+    /// issue #646.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_concurrent_connections: Option<i32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
@@ -564,6 +664,15 @@ pub struct UpdateProjectSettingsRequest {
     pub ai_debug_chat_enabled: Option<bool>,
     /// Opt in to AI propose-then-confirm write capability.
     pub ai_write_actions_enabled: Option<bool>,
+    /// Opt in to AI summarization of API traffic analytics.
+    pub ai_api_traffic_summary_enabled: Option<bool>,
+    /// Opt in to native error-tracking source context (source-file upload +
+    /// source code shown in stack traces).
+    pub error_source_context_enabled: Option<bool>,
+    /// Set the auto-capture source root (relative to the checkout). Send an
+    /// empty string to clear it back to the build-context default. Omit to
+    /// leave unchanged.
+    pub error_source_root: Option<String>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: Option<bool>,
     /// When true, newly-created preview environments default to on-demand mode.
@@ -713,7 +822,8 @@ pub struct CreateProjectFromTemplateRequest {
     pub github_owner: String,
     pub github_name: String,
     pub template_name: String,
-    pub environment_variables: Option<Vec<(String, String)>>,
+    #[schema(value_type = Option<Vec<ProjectEnvVarInput>>)]
+    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
     pub automatic_deploy: Option<bool>,
     pub performance_metrics_enabled: Option<bool>,
     pub storage_service_ids: Vec<i32>,
@@ -842,6 +952,14 @@ impl From<ProjectError> for Problem {
                     "The requested project could not be found: {}",
                     reason
                 )),
+            ProjectError::GitProviderConnectionNotFound { connection_id } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("Git Provider Connection Not Found")
+                    .with_detail(format!(
+                        "Git provider connection {} not found or not accessible",
+                        connection_id
+                    ))
+            }
 
             ProjectError::TemplateNotFound => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Template Not Found")
@@ -886,6 +1004,18 @@ impl From<ProjectError> for Problem {
                     .with_detail(msg)
             }
 
+            ProjectError::DeploymentCleanupFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Project Runtime Cleanup Failed")
+                    .with_detail(error.to_string())
+            }
+
+            ProjectError::RouteReloadFailed { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Proxy Route Reload Failed")
+                    .with_detail(error.to_string())
+            }
+
             ProjectError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -903,10 +1033,10 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
         use crate::services::custom_domains::CustomDomainError;
 
         match error {
-            CustomDomainError::Database(msg) => {
+            CustomDomainError::Database(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
-                    .with_detail(msg.to_string())
+                    .with_detail("A database operation failed while managing custom domains")
             }
             CustomDomainError::NotFound(msg) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Custom Domain Not Found")
@@ -927,6 +1057,49 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                     .with_title("Invalid Redirect URL")
                     .with_detail(msg)
             }
+            CustomDomainError::AssignmentChanged {
+                domain_id,
+                source_project_id,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Domain Assignment Changed")
+                .with_detail(format!(
+                    "Custom domain {domain_id} is no longer assigned to source project {source_project_id}; refresh and try again"
+                )),
+            CustomDomainError::AuditIntentFailed {
+                domain_id,
+                source_project_id,
+                target_project_id,
+                ..
+            } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Domain Reassignment Audit Failed")
+                    .with_detail(format!(
+                        "Custom domain {domain_id} could not be reassigned from project {source_project_id} to project {target_project_id} because the required audit record could not be persisted; no ownership change was made"
+                    ))
+            }
+            CustomDomainError::EnrichmentDatabase {
+                operation,
+                domain_id,
+                certificate_id,
+                environment_id,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Custom Domain Metadata Unavailable")
+                .with_detail(format!(
+                    "Could not {operation} for custom domain {domain_id} (certificate {certificate_id:?}, environment {environment_id})"
+                )),
+            CustomDomainError::ReassignmentDatabase {
+                operation,
+                domain_id,
+                source_project_id,
+                target_project_id,
+                target_environment_id,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Domain Reassignment Failed")
+                .with_detail(format!(
+                    "Database operation '{operation}' failed while reassigning custom domain {domain_id} from project {source_project_id} to project {target_project_id} environment {target_environment_id}"
+                )),
             CustomDomainError::Internal(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -1012,4 +1185,33 @@ pub struct ReinstallWebhookResponse {
     pub hook_id: i32,
     /// Human-readable status message.
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::custom_domains::CustomDomainError;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn test_custom_domain_error_assignment_changed_maps_to_conflict_with_context() {
+        let problem: Problem = CustomDomainError::AssignmentChanged {
+            domain_id: 41,
+            source_project_id: 7,
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title"),
+            Some(&serde_json::json!("Domain Assignment Changed"))
+        );
+        assert_eq!(
+            problem.body.get("detail"),
+            Some(&serde_json::json!(
+                "Custom domain 41 is no longer assigned to source project 7; refresh and try again"
+            ))
+        );
+        assert_eq!(problem.into_response().status(), StatusCode::CONFLICT);
+    }
 }

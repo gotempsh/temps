@@ -30,6 +30,32 @@ interface ContextRow {
   isActive?: boolean
 }
 
+/**
+ * Whether a context row should be shown as active. `TEMPS_CONTEXT` overrides
+ * the on-disk `isActive` flag for the whole CLI, so the "●" marker (and the
+ * JSON `isActive` field a script might branch on) must reflect the env
+ * selection — otherwise `context ls` lies about what the next command will
+ * actually use.
+ */
+export function isActiveContextRow(
+  context: { name: string; isActive?: boolean },
+  envContext: string | null,
+): boolean {
+  return envContext ? context.name === envContext : !!context.isActive
+}
+
+/**
+ * Which of the two failure modes `renameContext` collapsed into a bare
+ * `false`: the source context doesn't exist, or the target name is already
+ * taken. Determines which error message the user sees.
+ */
+export function renameFailureReason(
+  oldName: string,
+  contexts: Array<{ name: string }>,
+): 'not-found' | 'name-taken' {
+  return contexts.some((c) => c.name === oldName) ? 'name-taken' : 'not-found'
+}
+
 async function listAction(options: { json?: boolean }): Promise<void> {
   const contexts = await listContexts()
 
@@ -41,8 +67,7 @@ async function listAction(options: { json?: boolean }): Promise<void> {
   const envContextExists = envContext
     ? contexts.some((c) => c.name === envContext)
     : false
-  const isActiveRow = (c: ContextRow): boolean =>
-    envContext ? c.name === envContext : !!c.isActive
+  const isActiveRow = (c: ContextRow): boolean => isActiveContextRow(c, envContext)
 
   if (contexts.length === 0) {
     if (options.json) {
@@ -87,24 +112,28 @@ async function listAction(options: { json?: boolean }): Promise<void> {
   const columns: TableColumn<ContextRow>[] = [
     {
       header: '',
-      accessor: (c) => (isActiveRow(c) ? colors.success('●') : colors.muted('○')),
+      accessor: (c) => (isActiveRow(c) ? '●' : '○'),
+      color: (value, c) => isActiveRow(c) ? colors.success(value) : colors.muted(value),
     },
     { header: 'Name', key: 'name', color: (v) => colors.bold(String(v)) },
     { header: 'URL', key: 'url', color: (v) => colors.primary(String(v)) },
     {
       header: 'Email',
-      accessor: (c) => c.email || colors.muted('-'),
+      accessor: (c) => c.email || '-',
+      color: (value, c) => c.email ? value : colors.muted(value),
     },
     {
       header: 'Key',
-      accessor: (c) => (c.keyPrefix ? colors.muted(`${c.keyPrefix}…`) : colors.muted('-')),
+      accessor: (c) => (c.keyPrefix ? `${c.keyPrefix}…` : '-'),
+      color: (value) => colors.muted(value),
     },
     {
       header: 'Expires',
       accessor: (c) =>
         c.expiresAt
           ? new Date(c.expiresAt).toISOString().split('T')[0] ?? '-'
-          : colors.muted('-'),
+          : '-',
+      color: (value, c) => c.expiresAt ? value : colors.muted(value),
     },
   ]
 
@@ -174,7 +203,7 @@ async function renameAction(oldName: string, newName: string): Promise<void> {
   const result = await renameContext(oldName, newName)
   if (!result) {
     const contexts = await listContexts()
-    if (!contexts.some((c) => c.name === oldName)) {
+    if (renameFailureReason(oldName, contexts) === 'not-found') {
       errorOutput(`Context "${oldName}" not found.`)
       if (contexts.length > 0) {
         info(`Available: ${contexts.map((c) => c.name).join(', ')}`)

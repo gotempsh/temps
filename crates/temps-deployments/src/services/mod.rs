@@ -26,6 +26,9 @@ pub use job_tracker::*;
 pub mod database_cron_service;
 pub use database_cron_service::*;
 
+pub mod database_metric_alert_service;
+pub use database_metric_alert_service::*;
+
 pub mod external_deployment;
 pub use external_deployment::*;
 
@@ -49,3 +52,9 @@ pub use remote_log_source::*;
 
 pub mod sensitive_envelope;
 pub use sensitive_envelope::*;
+
+pub mod log_redaction;
+pub use log_redaction::*;
+
+pub mod failure_report_service;
+pub use failure_report_service::*;

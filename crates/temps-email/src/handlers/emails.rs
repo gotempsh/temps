@@ -9,7 +9,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, internal_server_error, not_found},
     problemdetails::Problem,
@@ -55,6 +55,7 @@ pub async fn send_email(
     Json(request): Json<SendEmailRequestBody>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailsSend);
+    deny_deployment_token!(auth);
 
     // Validate request
     if request.to.is_empty() {

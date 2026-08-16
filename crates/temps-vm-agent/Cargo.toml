@@ -1,0 +1,29 @@
+[package]
+name = "temps-vm-agent"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# Guest-side agent for Firecracker sandboxes (ADR-029 §5). The binary runs
+# as PID 1 inside the microVM and serves exec/fs RPCs over vsock; the lib
+# target exposes the wire protocol types so the host-side provider in
+# `temps-agents` speaks the same schema. Keep dependencies minimal and pure
+# Rust — this must build as a fully static musl binary that runs on any
+# guest image (glibc, musl, distroless).
+
+[lib]
+name = "temps_vm_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "temps-vm-agent"
+path = "src/main.rs"
+
+[dependencies]
+libc = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }

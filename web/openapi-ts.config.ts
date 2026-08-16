@@ -9,11 +9,19 @@ export default {
   client: '@hey-api/client-fetch',
   // input: 'https://app.localup.dev/api-docs/openapi.json',
   input: {
-    path: 'http://localhost:8080/api/api-docs/openapi.json',
+    path:
+      env.TEMPS_OPENAPI_URL ??
+      'http://localhost:8080/api/api-docs/openapi.json',
     fetch: {
-      headers: env.TEMPS_API_KEY
-        ? { Authorization: `Bearer ${env.TEMPS_API_KEY}` }
-        : undefined,
+      headers:
+        env.TEMPS_API_KEY || env.TEMPS_API_COOKIE
+          ? {
+              ...(env.TEMPS_API_KEY
+                ? { Authorization: `Bearer ${env.TEMPS_API_KEY}` }
+                : {}),
+              ...(env.TEMPS_API_COOKIE ? { Cookie: env.TEMPS_API_COOKIE } : {}),
+            }
+          : undefined,
     },
   },
   output: 'src/api/client',
@@ -33,6 +41,7 @@ export default {
         // this can be revisited.
         exclude: [
           'POST /projects/{project_id}/ai/conversations/{public_id}/messages',
+          'POST /projects/{project_id}/ai/structured-output/stream',
           'POST /settings/sandbox-rebuild',
         ],
       },

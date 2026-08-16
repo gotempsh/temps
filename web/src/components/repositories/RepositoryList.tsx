@@ -9,14 +9,7 @@ import { RepositoryResponse } from '@/api/client'
 import { useDebounce } from '@/hooks/useDebounce'
 import { Input } from '@/components/ui/input'
 import { Button } from '@/components/ui/button'
-import { Badge } from '@/components/ui/badge'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card } from '@/components/ui/card'
 import {
   Select,
   SelectContent,
@@ -30,7 +23,6 @@ import { Alert, AlertDescription } from '@/components/ui/alert'
 import { toast } from 'sonner'
 import {
   Search,
-  GitBranch,
   Lock,
   Unlock,
   ChevronLeft,
@@ -39,12 +31,16 @@ import {
   AlertCircle,
   CheckCircle2,
   FolderGit2,
-  Calendar,
   Filter,
+  ArrowRight,
+  X,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { usePresets } from '@/contexts/PresetContext'
+import { RepositoryAvatar } from './RepositoryAvatar'
+import { hasNextRepositoryPage } from '@/lib/repository-pagination'
+import { RepositoryPresetLogos } from './RepositoryPresetLogos'
 
 interface RepositoryListProps {
   connectionId: number
@@ -55,6 +51,7 @@ interface RepositoryListProps {
   className?: string
   showHeader?: boolean
   compactMode?: boolean
+  providerType?: string | null
 }
 
 type SortOption = 'name' | 'pushed' | 'created'
@@ -69,11 +66,13 @@ export function RepositoryList({
   className,
   showHeader = true,
   compactMode = false,
+  providerType,
 }: RepositoryListProps) {
   const [searchQuery, setSearchQuery] = useState('')
   const [currentPage, setCurrentPage] = useState(1)
   const [sortBy, setSortBy] = useState<SortOption>('pushed')
   const [filterBy, setFilterBy] = useState<FilterOption>('all')
+  const [searchOpen, setSearchOpen] = useState(false)
   const queryClient = useQueryClient()
   const { getPresetBySlug } = usePresets()
 
@@ -109,6 +108,7 @@ export function RepositoryList({
         direction: 'desc',
         page: currentPage,
         per_page: itemsPerPage,
+        private: filterBy === 'all' ? undefined : filterBy === 'private',
       },
     }),
     enabled: !!connectionId,
@@ -190,21 +190,10 @@ export function RepositoryList({
     })
   }
 
-  // Apply client-side visibility filter since API doesn't support it
   const processedRepositories = useMemo(() => {
     if (!repositories?.repositories) return []
-
-    let filtered = [...repositories.repositories]
-
-    // Apply visibility filter (client-side only)
-    if (filterBy !== 'all') {
-      filtered = filtered.filter((repo) =>
-        filterBy === 'private' ? repo.private : !repo.private
-      )
-    }
-
-    return filtered
-  }, [repositories, filterBy])
+    return repositories.repositories
+  }, [repositories])
 
   // Reset page when debounced search changes
   useEffect(() => {
@@ -212,11 +201,12 @@ export function RepositoryList({
     setCurrentPage(1)
   }, [debouncedSearchQuery])
 
-  // Since we're using server-side pagination, we need to estimate total pages
-  // If we got less than per_page items, we're on the last page
-  const hasMorePages =
-    repositories?.repositories &&
-    repositories.repositories.length === itemsPerPage
+  const totalCount = repositories?.total_count ?? 0
+  const hasMorePages = hasNextRepositoryPage(
+    totalCount,
+    currentPage,
+    itemsPerPage
+  )
   const paginatedRepositories = processedRepositories
 
   // Handle search change without resetting page immediately
@@ -255,28 +245,37 @@ export function RepositoryList({
   return (
     <div className={cn('space-y-4', className)}>
       {showHeader && (
-        <div className="space-y-4">
-          {/* Search and Filters */}
-          <div className="flex flex-col sm:flex-row gap-3">
-            <div className="relative flex-1">
-              <Search className="absolute left-3 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
-              <Input
-                value={searchQuery}
-                onChange={(e) => handleSearchChange(e.target.value)}
-                placeholder="Search repositories..."
-                className="pl-9 pr-10"
-              />
-              {searchQuery !== debouncedSearchQuery && (
-                <div className="absolute right-3 top-1/2 -translate-y-1/2">
-                  <RefreshCw className="h-4 w-4 animate-spin text-muted-foreground" />
-                </div>
-              )}
+        <div className="space-y-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-base/6 text-muted-foreground sm:text-sm/5">
+              {totalCount === 0
+                ? 'No repositories found'
+                : searchQuery
+                  ? `${totalCount} matching`
+                  : `${totalCount} repositories`}
+              <span aria-hidden="true" className="px-1.5 opacity-40">
+                ·
+              </span>
+              <span className="tabular-nums">Page {currentPage}</span>
             </div>
 
-            <div className="flex gap-2">
+            <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
+              {compactMode && (
+                <Button
+                  type="button"
+                  variant={searchOpen ? 'secondary' : 'outline'}
+                  size="sm"
+                  onClick={() => setSearchOpen((open) => !open)}
+                  className="gap-1.5"
+                  aria-expanded={searchOpen}
+                >
+                  <Search className="size-4 shrink-0" />
+                  Search
+                </Button>
+              )}
               <Select value={filterBy} onValueChange={handleFilterChange}>
-                <SelectTrigger className="w-32">
-                  <Filter className="h-4 w-4 mr-2" />
+                <SelectTrigger className="w-[140px] max-sm:flex-1">
+                  <Filter className="mr-2 size-4 shrink-0" />
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -287,7 +286,7 @@ export function RepositoryList({
               </Select>
 
               <Select value={sortBy} onValueChange={handleSortChange}>
-                <SelectTrigger className="w-36">
+                <SelectTrigger className="w-[160px] max-sm:flex-1">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
@@ -298,32 +297,67 @@ export function RepositoryList({
               </Select>
 
               <Button
+                type="button"
                 variant="outline"
-                size="icon"
-                onClick={() => refetch()}
-                disabled={isLoading}
+                size="sm"
+                className="relative shrink-0 gap-1.5"
+                onClick={handleSyncRepositories}
+                disabled={syncMutation.isPending || isConnectionSyncing}
+                aria-label="Sync repositories from provider"
               >
-                <RefreshCw
-                  className={cn('h-4 w-4', isLoading && 'animate-spin')}
+                <span
+                  className="pointer-fine:hidden absolute top-1/2 left-1/2 size-[max(100%,3rem)] -translate-1/2"
+                  aria-hidden="true"
                 />
+                <RefreshCw
+                  className={cn(
+                    'size-4 shrink-0',
+                    (syncMutation.isPending || isConnectionSyncing) &&
+                      'animate-spin'
+                  )}
+                />
+                {syncMutation.isPending || isConnectionSyncing
+                  ? 'Syncing…'
+                  : 'Sync repositories'}
               </Button>
             </div>
           </div>
 
-          {/* Results count */}
-          <div className="flex items-center justify-between text-sm text-muted-foreground">
-            <span>
-              {processedRepositories.length === 0
-                ? 'No repositories found'
-                : searchQuery
-                  ? `Found ${processedRepositories.length} matching repositories`
-                  : `Showing ${processedRepositories.length} repositories`}
-            </span>
-            <span>
-              Page {currentPage}
-              {hasMorePages ? '+' : ''}
-            </span>
-          </div>
+          {(!compactMode || searchOpen) && (
+            <div className="relative">
+              <Search className="pointer-events-none absolute top-1/2 left-3 size-4 -translate-y-1/2 shrink-0 stroke-muted-foreground" />
+              <Input
+                name="repository-search"
+                aria-label="Search repositories"
+                value={searchQuery}
+                onChange={(e) => handleSearchChange(e.target.value)}
+                placeholder="Search repositories…"
+                className="pr-10 pl-9 max-sm:text-base/6"
+                autoFocus={compactMode}
+              />
+              {searchQuery !== debouncedSearchQuery ? (
+                <RefreshCw className="absolute top-1/2 right-3 size-4 -translate-y-1/2 animate-spin shrink-0 stroke-muted-foreground" />
+              ) : (
+                compactMode && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSearchQuery('')
+                      setSearchOpen(false)
+                    }}
+                    className="absolute top-1/2 right-2 flex size-8 -translate-y-1/2 items-center justify-center rounded-md hover:bg-muted focus-visible:outline-2 focus-visible:outline-ring"
+                    aria-label="Close repository search"
+                  >
+                    <span
+                      className="pointer-fine:hidden absolute top-1/2 left-1/2 size-[max(100%,3rem)] -translate-1/2"
+                      aria-hidden="true"
+                    />
+                    <X className="size-4 shrink-0 stroke-muted-foreground" />
+                  </button>
+                )
+              )}
+            </div>
+          )}
         </div>
       )}
 
@@ -345,18 +379,34 @@ export function RepositoryList({
       {isLoading ? (
         <div
           className={cn(
-            'grid gap-2',
+            'grid',
             compactMode
-              ? 'grid-cols-1'
-              : 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3'
+              ? 'grid-cols-1 gap-2 lg:grid-cols-2 xl:grid-cols-3'
+              : 'grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3'
           )}
         >
           {Array.from({ length: itemsPerPage }).map((_, i) => (
-            <Card key={i} className="p-3">
-              <Skeleton className="h-3 w-3/4 mb-1.5" />
-              <Skeleton className="h-2.5 w-1/2 mb-2" />
-              <Skeleton className="h-2.5 w-full" />
-            </Card>
+            <div
+              key={i}
+              className={cn(
+                'border bg-card',
+                compactMode ? 'rounded-lg p-2.5' : 'rounded-xl p-4'
+              )}
+            >
+              <div className="flex items-center gap-3">
+                <Skeleton className="size-9 shrink-0 rounded-md" />
+                <div className="flex-1 space-y-1.5">
+                  <Skeleton className="h-3 w-2/3" />
+                  <Skeleton className="h-2.5 w-1/3" />
+                </div>
+              </div>
+              {!compactMode && (
+                <>
+                  <Skeleton className="mt-3 h-4 w-24 rounded-full" />
+                  <Skeleton className="mt-3 h-2.5 w-full" />
+                </>
+              )}
+            </div>
           ))}
         </div>
       ) : paginatedRepositories.length === 0 ? (
@@ -410,141 +460,221 @@ export function RepositoryList({
       ) : (
         <div
           className={cn(
-            'grid gap-2',
+            'grid',
             compactMode
-              ? 'grid-cols-1'
-              : 'grid-cols-1 md:grid-cols-2 xl:grid-cols-3'
+              ? 'grid-cols-1 gap-2 lg:grid-cols-2 xl:grid-cols-3'
+              : 'grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3'
           )}
         >
-          {paginatedRepositories.map((repo) => (
-            <Card
-              key={repo.id}
-              className={cn(
-                'group relative cursor-pointer transition-all hover:shadow-md',
-                showSelection && selectedRepositoryId === repo.id
-                  ? 'ring-2 ring-primary border-primary bg-primary/5'
-                  : 'hover:border-primary/50',
-                onRepositorySelect && 'cursor-pointer'
-              )}
-              onClick={() => handleRepositoryClick(repo)}
-            >
-              <CardHeader className="p-3 pb-2">
-                <div className="space-y-1.5">
-                  <div className="flex items-start justify-between gap-2">
-                    <div className="flex items-center gap-2 flex-1 min-w-0">
-                      <GitBranch className="h-3.5 w-3.5 text-primary flex-shrink-0" />
-                      <div className="flex-1 min-w-0">
-                        <CardTitle className="text-sm font-semibold leading-tight">
-                          {repo.name}
-                        </CardTitle>
-                        <CardDescription className="text-xs text-muted-foreground mt-0.5">
-                          {repo.owner}
-                        </CardDescription>
+          {paginatedRepositories.map((repo) => {
+            const isSelected = showSelection && selectedRepositoryId === repo.id
+            const interactive = !!onRepositorySelect
+            if (compactMode) {
+              return (
+                <div
+                  key={repo.id}
+                  className={cn(
+                    'group flex min-w-0 items-center rounded-lg border bg-card',
+                    interactive &&
+                      !isSelected &&
+                      'hover:border-primary/40 hover:bg-accent/40',
+                    isSelected &&
+                      'border-primary bg-primary/5 ring-1 ring-primary'
+                  )}
+                >
+                  <button
+                    type="button"
+                    onClick={() => handleRepositoryClick(repo)}
+                    disabled={!interactive}
+                    aria-pressed={isSelected}
+                    className={cn(
+                      'flex min-w-0 flex-1 items-center gap-3 p-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                      !interactive && 'cursor-default'
+                    )}
+                  >
+                    <RepositoryAvatar
+                      repository={repo}
+                      providerType={providerType}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-base font-semibold sm:text-sm">
+                        {repo.name}
+                      </p>
+                      <div className="flex min-w-0 items-center gap-1.5 text-base/6 text-muted-foreground sm:text-sm/5">
+                        <span className="truncate">{repo.owner}</span>
+                        <span
+                          aria-hidden="true"
+                          className="shrink-0 opacity-40"
+                        >
+                          ·
+                        </span>
+                        <span className="shrink-0">
+                          {repo.private ? 'Private' : 'Public'}
+                        </span>
+                        {repo.language && (
+                          <>
+                            <span
+                              aria-hidden="true"
+                              className="shrink-0 opacity-40"
+                            >
+                              ·
+                            </span>
+                            <span className="flex min-w-0 items-center gap-1.5">
+                              <span
+                                className={cn(
+                                  'size-2 shrink-0 rounded-full',
+                                  getLanguageColor(repo.language)
+                                )}
+                              />
+                              <span className="truncate">{repo.language}</span>
+                            </span>
+                          </>
+                        )}
                       </div>
                     </div>
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      {showSelection && selectedRepositoryId === repo.id && (
-                        <CheckCircle2 className="h-4 w-4 text-primary" />
-                      )}
-                    </div>
-                  </div>
-                  <div className="flex items-center gap-1.5 flex-wrap">
-                    {repo.private ? (
-                      <Badge
-                        variant="secondary"
-                        className="text-[10px] h-5 px-1.5"
-                      >
-                        <Lock className="h-2.5 w-2.5 mr-1" />
-                        Private
-                      </Badge>
+                    {isSelected ? (
+                      <CheckCircle2 className="size-5 shrink-0 stroke-primary sm:size-4" />
                     ) : (
-                      <Badge
-                        variant="outline"
-                        className="text-[10px] h-5 px-1.5"
-                      >
-                        <Unlock className="h-2.5 w-2.5 mr-1" />
-                        Public
-                      </Badge>
+                      interactive && (
+                        <ArrowRight className="size-5 shrink-0 stroke-muted-foreground opacity-0 transition-transform group-hover:translate-x-0.5 group-hover:opacity-100 sm:size-4" />
+                      )
                     )}
-                    {repo.preset && repo.preset.length > 0 && (
-                      <>
-                        {repo.preset.slice(0, 3).map((presetItem, index) => {
-                          const presetInfo = getPresetBySlug(presetItem.preset)
-                          const iconUrl =
-                            presetInfo?.icon_url || '/presets/custom.svg'
-                          return (
-                            <Badge
-                              key={index}
-                              variant="default"
-                              className="text-[10px] h-5 px-1.5"
-                            >
-                              <img
-                                src={iconUrl}
-                                alt={presetItem.presetLabel}
-                                className="h-2.5 w-2.5 mr-1"
-                                style={{ objectFit: 'contain' }}
-                                onError={(e) => {
-                                  e.currentTarget.src = '/presets/custom.svg'
-                                }}
-                              />
-                              {presetItem.presetLabel}
-                              {presetItem.path !== './' && (
-                                <span className="text-[9px] ml-0.5 opacity-70">
-                                  ({presetItem.path})
-                                </span>
-                              )}
-                            </Badge>
-                          )
-                        })}
-                        {repo.preset.length > 3 && (
-                          <Badge
-                            variant="secondary"
-                            className="text-[10px] h-5 px-1.5"
-                          >
-                            +{repo.preset.length - 3} more
-                          </Badge>
-                        )}
-                      </>
-                    )}
+                  </button>
+                  <div className="shrink-0 pr-1.5">
+                    <RepositoryPresetLogos
+                      repository={repo}
+                      automaticDetectionEnabled={
+                        connection?.has_authenticated_credentials ?? false
+                      }
+                    />
                   </div>
                 </div>
-              </CardHeader>
+              )
+            }
+            return (
+              <button
+                key={repo.id}
+                type="button"
+                onClick={() => handleRepositoryClick(repo)}
+                disabled={!interactive}
+                aria-pressed={isSelected}
+                className={cn(
+                  'group flex flex-col rounded-lg border bg-card p-4 text-left',
+                  'focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring',
+                  interactive &&
+                    !isSelected &&
+                    'hover:border-primary/40 hover:bg-accent/40',
+                  isSelected &&
+                    'border-primary bg-primary/5 ring-1 ring-primary',
+                  !interactive && 'cursor-default'
+                )}
+              >
+                <>
+                  {/* Title row: repository identity and selection affordance. */}
+                  <div className="flex items-start gap-3">
+                    <RepositoryAvatar
+                      repository={repo}
+                      providerType={providerType}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <p className="truncate text-base font-semibold sm:text-sm">
+                        {repo.name}
+                      </p>
+                      <p className="truncate text-base/6 text-muted-foreground sm:text-sm/5">
+                        {repo.owner}
+                      </p>
+                    </div>
+                    {isSelected ? (
+                      <CheckCircle2 className="size-5 shrink-0 stroke-primary sm:size-4" />
+                    ) : (
+                      interactive && (
+                        <ArrowRight className="size-5 shrink-0 stroke-muted-foreground opacity-0 transition-transform group-hover:translate-x-0.5 group-hover:opacity-100 sm:size-4" />
+                      )
+                    )}
+                  </div>
 
-              <CardContent className="p-3 pt-0">
-                <div className="space-y-1">
+                  {/* Badges: visibility + detected framework presets */}
+                  <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                    <span
+                      className={cn(
+                        'inline-flex items-center gap-1 rounded-md border py-1 pr-2 pl-1 text-base/6 sm:text-sm/5',
+                        repo.private
+                          ? 'bg-muted/60 text-muted-foreground'
+                          : 'bg-background text-muted-foreground'
+                      )}
+                    >
+                      {repo.private ? (
+                        <Lock className="size-5 shrink-0 sm:size-4" />
+                      ) : (
+                        <Unlock className="size-5 shrink-0 sm:size-4" />
+                      )}
+                      {repo.private ? 'Private' : 'Public'}
+                    </span>
+                    {repo.preset?.slice(0, 3).map((presetItem, index) => {
+                      const presetInfo = getPresetBySlug(presetItem.preset)
+                      const iconUrl =
+                        presetInfo?.icon_url || '/presets/custom.svg'
+                      return (
+                        <span
+                          key={index}
+                          className="inline-flex items-center gap-1 rounded-md border bg-background px-1.5 py-0.5 text-[11px] text-foreground/80"
+                        >
+                          <img
+                            src={iconUrl}
+                            alt=""
+                            aria-hidden
+                            className="size-3 object-contain"
+                            onError={(e) => {
+                              e.currentTarget.src = '/presets/custom.svg'
+                            }}
+                          />
+                          {presetItem.presetLabel}
+                          {presetItem.path !== './' && (
+                            <span className="opacity-60">
+                              ({presetItem.path})
+                            </span>
+                          )}
+                        </span>
+                      )
+                    })}
+                    {repo.preset && repo.preset.length > 3 && (
+                      <span className="inline-flex items-center rounded-md border bg-muted/60 px-1.5 py-0.5 text-[11px] text-muted-foreground">
+                        +{repo.preset.length - 3} more
+                      </span>
+                    )}
+                  </div>
+
                   {repo.description && (
-                    <p className="text-[11px] text-muted-foreground line-clamp-1">
+                    <p className="mt-2 line-clamp-1 text-base/6 text-muted-foreground sm:text-sm/5">
                       {repo.description}
                     </p>
                   )}
 
-                  <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
+                  <div className="mt-auto flex items-center gap-2 pt-3 text-base/6 text-muted-foreground sm:text-sm/5">
                     {repo.pushed_at && (
-                      <>
-                        <Calendar className="h-2.5 w-2.5" />
-                        <span>Pushed </span>
-                        <TimeAgo date={repo.pushed_at} className="" />
-                      </>
+                      <span className="inline-flex items-center gap-1">
+                        Pushed <TimeAgo date={repo.pushed_at} />
+                      </span>
                     )}
                     {repo.language && repo.pushed_at && (
-                      <span className="text-muted-foreground/50">•</span>
+                      <span className="text-muted-foreground/40">•</span>
                     )}
                     {repo.language && (
-                      <div className="flex items-center gap-1">
-                        <div
+                      <span className="inline-flex items-center gap-1.5">
+                        <span
                           className={cn(
-                            'h-1.5 w-1.5 rounded-full',
+                            'size-2 rounded-full',
                             getLanguageColor(repo.language)
                           )}
                         />
                         {repo.language}
-                      </div>
+                      </span>
                     )}
                   </div>
-                </div>
-              </CardContent>
-            </Card>
-          ))}
+                </>
+              </button>
+            )
+          })}
         </div>
       )}
 
@@ -557,11 +687,11 @@ export function RepositoryList({
             onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
             disabled={currentPage === 1}
           >
-            <ChevronLeft className="h-4 w-4" />
-            Previous
+            <ChevronLeft className="h-4 w-4 sm:mr-1" />
+            <span className="hidden sm:inline">Previous</span>
           </Button>
 
-          <span className="text-sm text-muted-foreground px-3">
+          <span className="px-2 text-sm tabular-nums text-muted-foreground">
             Page {currentPage}
           </span>
 
@@ -571,8 +701,8 @@ export function RepositoryList({
             onClick={() => setCurrentPage((p) => p + 1)}
             disabled={!hasMorePages}
           >
-            Next
-            <ChevronRight className="h-4 w-4" />
+            <span className="hidden sm:inline">Next</span>
+            <ChevronRight className="h-4 w-4 sm:ml-1" />
           </Button>
         </div>
       )}

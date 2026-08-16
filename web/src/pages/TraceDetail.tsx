@@ -1,8 +1,12 @@
 import { LogSeverity, ProjectResponse } from '@/api/client'
 import {
+  createFacetMutation,
+  deleteFacetMutation,
   getCrossProjectTraceSiblingsOptions,
   getTraceOptions,
   getUnifiedTraceOptions,
+  listFacetsOptions,
+  listFacetsQueryKey,
   queryLogsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
@@ -29,6 +33,11 @@ import {
 import { useIsMobile } from '@/components/hooks/use-mobile'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
+  Tooltip,
+  TooltipContent,
+  TooltipTrigger,
+} from '@/components/ui/tooltip'
+import {
   Tabs,
   TabsContent,
   TabsList,
@@ -44,12 +53,15 @@ import {
   serviceColor,
   statusIcon,
 } from '@/components/traces/SpanWaterfall'
-import { ProjectBadge } from '@/components/traces/ProjectBadge'
+import {
+  ProjectDot,
+  ProjectLegend,
+} from '@/components/traces/ProjectBadge'
 import { TraceStatBadges } from '@/components/traces/TraceStatBadges'
-import { buildSpanTree, flattenTree } from '@/utils/spanTree'
+import { buildSpanTree, flattenTree, traceWindow } from '@/utils/spanTree'
 import type { SpanTreeNode } from '@/utils/spanTree'
 import { cn } from '@/lib/utils'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   ArrowLeft,
   ChevronRight,
@@ -59,9 +71,14 @@ import {
   Layers,
   RefreshCw,
   Bot,
+  Pin,
+  PinOff,
+  Loader2,
 } from 'lucide-react'
 import { useCallback, useMemo, type ReactNode } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
+import { useGoBack } from '@/hooks/useGoBack'
+import { toast } from 'sonner'
 
 interface TraceDetailProps {
   project: ProjectResponse
@@ -97,6 +114,98 @@ function statusBadgeVariant(
     default:
       return 'secondary'
   }
+}
+
+/** Pin/unpin an attribute key as a platform-global ClickHouse facet (fast
+ *  filtering across the whole `spans` table — see ADR-039). Facets are shared
+ *  across every project since the underlying table is global, so this list
+ *  is fetched once and reused everywhere the toggle appears. */
+function FacetToggle({ attributeKey }: { attributeKey: string }) {
+  const queryClient = useQueryClient()
+  const { data: facetsData } = useQuery({
+    ...listFacetsOptions(),
+    staleTime: 30_000,
+  })
+  const facets = facetsData?.data ?? []
+  const isFaceted = facets.some((f) => f.attribute_key === attributeKey)
+  const atCapacity = facets.length >= 20
+
+  const invalidate = useCallback(
+    () =>
+      queryClient.invalidateQueries({ queryKey: listFacetsQueryKey() }),
+    [queryClient],
+  )
+
+  const create = useMutation({
+    ...createFacetMutation(),
+    onSuccess: () => {
+      toast.success(`"${attributeKey}" is now fast-filterable`)
+      invalidate()
+    },
+    onError: (err) => {
+      toast.error('Failed to register facet', {
+        description:
+          (err as ProblemDetails)?.detail ??
+          (err as ProblemDetails)?.title ??
+          'Unknown error',
+      })
+    },
+  })
+  const remove = useMutation({
+    ...deleteFacetMutation(),
+    onSuccess: () => {
+      toast.success(`"${attributeKey}" is no longer faceted`)
+      invalidate()
+    },
+    onError: (err) => {
+      toast.error('Failed to remove facet', {
+        description:
+          (err as ProblemDetails)?.detail ??
+          (err as ProblemDetails)?.title ??
+          'Unknown error',
+      })
+    },
+  })
+
+  const isPending = create.isPending || remove.isPending
+
+  return (
+    <Tooltip>
+      <TooltipTrigger asChild>
+        <button
+          type="button"
+          disabled={isPending || (!isFaceted && atCapacity)}
+          onClick={(e) => {
+            e.stopPropagation()
+            if (isFaceted) {
+              remove.mutate({ path: { key: attributeKey } })
+            } else {
+              create.mutate({ body: { attribute_key: attributeKey } })
+            }
+          }}
+          className={cn(
+            'inline-flex shrink-0 items-center justify-center rounded p-0.5 text-muted-foreground transition-colors hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40',
+            isFaceted && 'text-primary hover:text-primary'
+          )}
+        >
+          {isPending ? (
+            <Loader2 className="h-3 w-3 animate-spin" />
+          ) : isFaceted ? (
+            <Pin className="h-3 w-3 fill-current" />
+          ) : (
+            <PinOff className="h-3 w-3" />
+          )}
+        </button>
+      </TooltipTrigger>
+      <TooltipContent>
+        {isFaceted
+          ? `Faceted — fast-filterable across all traces. Click to unfacet.`
+          : atCapacity
+            ? 'Facet capacity reached (20/20) — remove one to add another'
+            : 'Click to make this attribute fast-filterable across all traces'}
+      </TooltipContent>
+    </Tooltip>
+  )
 }
 
 /** Full detail for one span — reused by every layout (drawer, side panel, or
@@ -188,8 +297,9 @@ function SpanDetailBody({
               {Object.entries(span.attributes).map(([key, value]) => (
                 <div
                   key={key}
-                  className="flex gap-2 border-b border-border/50 py-0.5 font-mono text-xs"
+                  className="flex items-center gap-2 border-b border-border/50 py-0.5 font-mono text-xs"
                 >
+                  <FacetToggle attributeKey={key} />
                   <span className="shrink-0 text-muted-foreground">{key}:</span>
                   <span className="break-all">
                     {typeof value === 'object' ? JSON.stringify(value) : String(value)}
@@ -473,6 +583,7 @@ function CrossProjectBar({
 export default function TraceDetail({ project }: TraceDetailProps) {
   const { traceId } = useParams()
   const navigate = useNavigate()
+  const goBack = useGoBack(`/projects/${project.slug}/traces`)
 
   const { data, isLoading, isFetching, error, refetch } = useQuery({
     ...getTraceOptions({
@@ -565,17 +676,11 @@ export default function TraceDetail({ project }: TraceDetailProps) {
   usePageTitle(tree[0]?.span?.name ?? 'Trace')
 
   // Calculate trace-level timing for waterfall positioning
-  const traceStart = useMemo(() => {
-    if (displaySpans.length === 0) return 0
-    return Math.min(...displaySpans.map((s) => new Date(s.start_time).getTime()))
-  }, [displaySpans])
-
-  const traceEnd = useMemo(() => {
-    if (displaySpans.length === 0) return 0
-    return Math.max(...displaySpans.map((s) => new Date(s.end_time).getTime()))
-  }, [displaySpans])
-
-  const traceDuration = traceEnd - traceStart
+  const {
+    start: traceStart,
+    end: traceEnd,
+    duration: traceDuration,
+  } = useMemo(() => traceWindow(displaySpans), [displaySpans])
 
   // Shared props for every trace-detail layout variant (ui.sh picker below).
   // In the unified view, tag each span with its project and de-emphasise spans
@@ -586,15 +691,16 @@ export default function TraceDetail({ project }: TraceDetailProps) {
     traceEnd,
     traceDuration,
     correlatedLogs,
+    // Dot, not badge: `ProjectLegend` below decodes the colour once, so the
+    // name column isn't spending ~88px per row on a truncated slug.
     renderRowBadge: usingUnified
       ? (span) => (
-          <ProjectBadge
+          <ProjectDot
             projectId={span.project_id}
             name={
               projectById.get(span.project_id)?.project_name ??
               `Project ${span.project_id}`
             }
-            className="shrink-0"
           />
         )
       : undefined,
@@ -669,7 +775,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(-1)}
+          onClick={() => goBack()}
           className="gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
@@ -696,7 +802,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(-1)}
+          onClick={() => goBack()}
           className="gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
@@ -720,7 +826,7 @@ export default function TraceDetail({ project }: TraceDetailProps) {
         <Button
           variant="ghost"
           size="sm"
-          onClick={() => navigate(-1)}
+          onClick={() => goBack()}
           className="shrink-0 gap-2"
         >
           <ArrowLeft className="h-4 w-4" />
@@ -768,6 +874,10 @@ export default function TraceDetail({ project }: TraceDetailProps) {
           onSetView={setView}
         />
       )}
+
+      {/* Decodes the per-span dots. Only the unified view colours spans by
+          project, so the legend appears with it. */}
+      {usingUnified && <ProjectLegend projects={unifiedData?.projects ?? []} />}
 
       {/* AI conversation jump — when this trace has GenAI (LLM) spans, the
           prompts/responses read far better in the dedicated AI view than in the

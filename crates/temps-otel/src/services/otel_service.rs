@@ -8,6 +8,7 @@ use std::sync::{
     Arc,
 };
 use std::time::Duration;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{error, warn};
 
 use crate::error::OtelError;
@@ -33,8 +34,26 @@ pub struct OtelService {
     /// over the OTel hypertables on every ingest request. See
     /// [`crate::ingest::quota_cache`].
     quota_cache: Arc<QuotaCache>,
+    ingest_semaphore: Arc<Semaphore>,
+    /// The configured value backing `ingest_semaphore`'s capacity, kept
+    /// alongside it so `IngestSaturated` errors report the limit that is
+    /// actually in effect (which may differ from
+    /// [`DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS`] when overridden via
+    /// `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`).
+    ingest_permit_limit: usize,
     stats: PipelineStatsAtomic,
 }
+
+/// Default process-wide limit for OTLP requests that may authenticate,
+/// decompress, decode, and write concurrently. The permit is acquired before
+/// Axum buffers the request body, bounding both task and payload memory
+/// during exporter retry storms.
+///
+/// This is a process-wide operational tuning knob, not per-tenant config, so
+/// deployments that need a higher ceiling (larger hardware, many
+/// projects/services sharing one instance) can override it via
+/// `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS` — see `OtelConfig::from_env`.
+pub const DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS: usize = 64;
 
 /// Max `si_` ingest requests per service per window. ~10 req/s — far above a
 /// healthy exporter's cadence, low enough to stop a tight-loop flood from
@@ -81,6 +100,7 @@ impl OtelService {
         storage: Arc<dyn OtelStorage>,
         auth_service: Arc<OtelAuthService>,
         rate_limiter: Arc<RateLimiter>,
+        max_concurrent_ingest_requests: usize,
     ) -> Self {
         Self {
             storage,
@@ -91,8 +111,20 @@ impl OtelService {
                 SERVICE_INGEST_WINDOW,
             )),
             quota_cache: Arc::new(QuotaCache::new(QUOTA_CACHE_TTL)),
+            ingest_semaphore: Arc::new(Semaphore::new(max_concurrent_ingest_requests)),
+            ingest_permit_limit: max_concurrent_ingest_requests,
             stats: PipelineStatsAtomic::default(),
         }
+    }
+
+    /// Acquire an ingest slot without queueing more work in memory.
+    pub fn try_acquire_ingest_permit(&self) -> Result<OwnedSemaphorePermit, OtelError> {
+        self.ingest_semaphore
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| OtelError::IngestSaturated {
+                limit: self.ingest_permit_limit,
+            })
     }
 
     /// Authenticate a token (API key `tk_` or deployment token `dt_`).
@@ -351,12 +383,82 @@ impl OtelService {
         self.storage.count_traces(query).await
     }
 
+    /// Whether `project_id` has ever received at least one span — the
+    /// existence check backing onboarding/setup UI. Cheaper than
+    /// `count_traces`/`query_trace_summaries` for that purpose: see
+    /// [`crate::storage::OtelStorage::has_traces`].
+    pub async fn has_traces(&self, project_id: i32) -> Result<bool, OtelError> {
+        self.storage.has_traces(project_id).await
+    }
+
     pub async fn get_trace(
         &self,
         project_id: i32,
         trace_id: &str,
     ) -> Result<Vec<SpanRecord>, OtelError> {
         self.storage.get_trace(project_id, trace_id).await
+    }
+
+    /// Per-operation latency statistics for the queried window.
+    ///
+    /// Validates the window here rather than in the handler so every caller —
+    /// including future internal ones — gets the same guarantee the storage
+    /// backends rely on: a bounded, correctly-ordered time range over at least
+    /// one project.
+    pub async fn query_span_stats(
+        &self,
+        query: SpanStatsQuery,
+    ) -> Result<Vec<SpanStats>, OtelError> {
+        Self::validate_span_stats_query(&query)?;
+        self.storage.query_span_stats(query).await
+    }
+
+    /// Count the operations a span-stats query matches, for pagination.
+    pub async fn count_span_stats(&self, query: SpanStatsQuery) -> Result<u64, OtelError> {
+        Self::validate_span_stats_query(&query)?;
+        self.storage.count_span_stats(query).await
+    }
+
+    fn validate_span_stats_query(query: &SpanStatsQuery) -> Result<(), OtelError> {
+        if query.project_ids.is_empty() {
+            return Err(OtelError::Validation {
+                message: "span-stats requires at least one project id".to_string(),
+            });
+        }
+        if query.project_ids.len() > SPAN_STATS_MAX_PROJECTS {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "span-stats accepts at most {} projects per query, got {}",
+                    SPAN_STATS_MAX_PROJECTS,
+                    query.project_ids.len()
+                ),
+            });
+        }
+        if query.end_time <= query.start_time {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "span-stats time window is empty or inverted: start_time {} is not before \
+                     end_time {}",
+                    query.start_time.to_rfc3339(),
+                    query.end_time.to_rfc3339()
+                ),
+            });
+        }
+        // Reject rather than silently truncate: a caller asking for 90 days and
+        // getting 31 back would read the result as "the last 90 days", and the
+        // whole point of the report is that the numbers mean what they say.
+        let window = query.end_time - query.start_time;
+        if window > chrono::Duration::days(SPAN_STATS_MAX_WINDOW_DAYS) {
+            return Err(OtelError::Validation {
+                message: format!(
+                    "span-stats time window is {} days, which exceeds the {}-day maximum; \
+                     narrow start_time/end_time",
+                    window.num_days(),
+                    SPAN_STATS_MAX_WINDOW_DAYS
+                ),
+            });
+        }
+        Ok(())
     }
 
     pub async fn query_logs(&self, query: LogQuery) -> Result<Vec<LogRecord>, OtelError> {
@@ -457,7 +559,12 @@ mod tests {
         let db = Arc::new(sea_orm::DatabaseConnection::Disconnected);
         let auth = Arc::new(crate::ingest::auth::OtelAuthService::new(db));
         let limiter = Arc::new(RateLimiter::new(1000, Duration::from_secs(60)));
-        let svc = OtelService::new(Arc::new(storage) as Arc<dyn OtelStorage>, auth, limiter);
+        let svc = OtelService::new(
+            Arc::new(storage) as Arc<dyn OtelStorage>,
+            auth,
+            limiter,
+            DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+        );
         (svc, storage_clone)
     }
 
@@ -723,7 +830,12 @@ mod tests {
         let auth = Arc::new(crate::ingest::auth::OtelAuthService::new(db));
         let limiter = Arc::new(RateLimiter::new(2, Duration::from_secs(60))); // only 2 allowed
         let storage = Arc::new(MockOtelStorage::new()) as Arc<dyn OtelStorage>;
-        let svc = OtelService::new(storage, auth, limiter);
+        let svc = OtelService::new(
+            storage,
+            auth,
+            limiter,
+            DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+        );
 
         assert!(svc.check_rate_limit(1).is_ok());
         assert!(svc.check_rate_limit(1).is_ok());
@@ -787,7 +899,12 @@ mod tests {
         let auth = Arc::new(crate::ingest::auth::OtelAuthService::new(db));
         let project_limiter = Arc::new(RateLimiter::new(2, Duration::from_secs(60)));
         let storage = Arc::new(MockOtelStorage::new()) as Arc<dyn OtelStorage>;
-        let svc = OtelService::new(storage, auth, project_limiter);
+        let svc = OtelService::new(
+            storage,
+            auth,
+            project_limiter,
+            DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+        );
 
         // Spend many service-ingest tokens for service 1...
         for _ in 0..10 {
@@ -1130,5 +1247,97 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, OtelError::Validation { .. }));
+    }
+
+    #[test]
+    fn ingest_concurrency_is_bounded_and_permits_are_released() {
+        let (service, _storage) = make_service(MockOtelStorage::new());
+        let permits: Vec<_> = (0..DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS)
+            .map(|_| service.try_acquire_ingest_permit().unwrap())
+            .collect();
+
+        assert!(matches!(
+            service.try_acquire_ingest_permit(),
+            Err(OtelError::IngestSaturated {
+                limit: DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS
+            })
+        ));
+
+        drop(permits);
+        assert!(service.try_acquire_ingest_permit().is_ok());
+    }
+
+    // ── span-stats query validation ─────────────────────────────────
+
+    fn span_stats_query(project_ids: Vec<i32>, window_days: i64) -> SpanStatsQuery {
+        let end = chrono::Utc::now();
+        SpanStatsQuery {
+            project_ids,
+            start_time: end - chrono::Duration::days(window_days),
+            end_time: end,
+            service_name: None,
+            span_name: None,
+            name_pattern: None,
+            kind: None,
+            status: None,
+            environment_id: None,
+            deployment_id: None,
+            attributes: None,
+            min_duration_ms: None,
+            min_count: 1,
+            sort_by: SpanStatsSortField::default(),
+            sort_order: SortOrder::default(),
+            limit: None,
+            offset: None,
+        }
+    }
+
+    #[test]
+    fn span_stats_rejects_more_projects_than_the_cap() {
+        // The handler checks a project's access one round-trip at a time, and
+        // an instance admin skips those checks entirely — so the id list has to
+        // be bounded before it reaches storage, not just before it reaches auth.
+        let too_many: Vec<i32> = (1..=(SPAN_STATS_MAX_PROJECTS as i32 + 1)).collect();
+        let err = OtelService::validate_span_stats_query(&span_stats_query(too_many, 1))
+            .expect_err("over-cap project list must be rejected");
+        assert!(matches!(err, OtelError::Validation { .. }), "got {err:?}");
+        assert!(err.to_string().contains("at most"), "got {err}");
+
+        let at_cap: Vec<i32> = (1..=SPAN_STATS_MAX_PROJECTS as i32).collect();
+        assert!(OtelService::validate_span_stats_query(&span_stats_query(at_cap, 1)).is_ok());
+    }
+
+    #[test]
+    fn span_stats_rejects_a_window_wider_than_the_cap() {
+        // This report aggregates the whole window before it can rank anything,
+        // so an unbounded window is an unbounded query on a small box.
+        let err = OtelService::validate_span_stats_query(&span_stats_query(
+            vec![1],
+            SPAN_STATS_MAX_WINDOW_DAYS + 1,
+        ))
+        .expect_err("over-wide window must be rejected");
+        assert!(matches!(err, OtelError::Validation { .. }), "got {err:?}");
+        assert!(err.to_string().contains("exceeds"), "got {err}");
+
+        // Rejected, never silently narrowed: a caller who asked for 90 days and
+        // got 31 back would read the numbers as covering 90.
+        assert!(OtelService::validate_span_stats_query(&span_stats_query(
+            vec![1],
+            SPAN_STATS_MAX_WINDOW_DAYS
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn span_stats_still_rejects_empty_and_inverted_windows() {
+        assert!(OtelService::validate_span_stats_query(&span_stats_query(vec![], 1)).is_err());
+
+        let now = chrono::Utc::now();
+        let inverted = SpanStatsQuery {
+            start_time: now,
+            end_time: now - chrono::Duration::hours(1),
+            ..span_stats_query(vec![1], 1)
+        };
+        assert!(OtelService::validate_span_stats_query(&inverted).is_err());
     }
 }

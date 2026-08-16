@@ -90,6 +90,50 @@ fn filter_agents_for_trigger(
 /// agent-executed commands **directly on the host** with no namespace
 /// isolation, no resource limits, and no capability dropping — it is safe
 /// only for single-developer machines. We require an explicit opt-in via
+/// Assemble the sandbox provider registered for the whole server (ADR-029
+/// §2/§3). Docker is always present at this point; Firecracker joins when
+/// `temps firecracker setup` has provisioned this host and its smoke test
+/// passed. With both live, consumers get the routing provider — still one
+/// `Arc<dyn SandboxProvider>`, per ADR-010. Registration is passive: this
+/// probes, it never downloads or mutates the host.
+async fn build_sandbox_provider(
+    docker_provider: Arc<DockerSandboxProvider>,
+    docker: Arc<bollard::Docker>,
+    settings: &temps_core::AgentSandboxSettings,
+) -> Arc<dyn SandboxProvider> {
+    use crate::sandbox::firecracker::{FirecrackerSandboxConfig, FirecrackerSandboxProvider};
+    use crate::sandbox::routing::RoutingSandboxProvider;
+    use crate::sandbox::SandboxBackend;
+
+    let data_dir = std::env::var("TEMPS_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                .join(".temps")
+        });
+    let firecracker = Arc::new(FirecrackerSandboxProvider::new(
+        FirecrackerSandboxConfig::from_data_dir(data_dir),
+        docker,
+    ));
+    if !firecracker.is_available().await {
+        return docker_provider;
+    }
+
+    let default = match settings.sandbox_backend.as_deref() {
+        Some("firecracker") => SandboxBackend::Firecracker,
+        _ => SandboxBackend::Docker,
+    };
+    let mut backends: std::collections::HashMap<SandboxBackend, Arc<dyn SandboxProvider>> =
+        std::collections::HashMap::new();
+    backends.insert(SandboxBackend::Docker, docker_provider);
+    backends.insert(SandboxBackend::Firecracker, firecracker);
+    tracing::info!(
+        "Firecracker sandbox backend available; routing provider active (default: {})",
+        default
+    );
+    Arc::new(RoutingSandboxProvider::new(backends, default))
+}
+
 /// `TEMPS_ALLOW_LOCAL_SANDBOX=1` so production deployments that temporarily
 /// lose Docker don't silently fall through to executing untrusted agent
 /// code as the `temps` service user.
@@ -477,11 +521,12 @@ impl TempsPlugin for AgentsPlugin {
                                     default_memory_limit_mb: global_sandbox.memory_limit_mb,
                                     network_mode: global_sandbox.network_mode.clone(),
                                 };
-                                let provider = Arc::new(DockerSandboxProvider::new(docker, config));
+                                let provider =
+                                    Arc::new(DockerSandboxProvider::new(docker.clone(), config));
                                 tracing::info!(
                                     "Docker sandbox provider initialized (image built on demand at first agent run)"
                                 );
-                                provider as Arc<dyn SandboxProvider>
+                                build_sandbox_provider(provider, docker, &global_sandbox).await
                             }
                             Err(e) => {
                                 tracing::warn!("Docker not responding, using local sandbox: {}", e);
@@ -500,11 +545,28 @@ impl TempsPlugin for AgentsPlugin {
             context.register_service(sandbox_provider.clone());
 
             let sandbox_registry = Arc::new(SandboxRegistry::new(sandbox_provider));
+            // Registered so the temps-sandbox plugin can inject its managed
+            // run-sandbox service (agent runs then get first-class
+            // `sandboxes` rows in the standalone sandbox API).
+            context.register_service(sandbox_registry.clone());
 
             let config_service = Arc::new(AgentConfigService::new(
                 db.clone(),
                 encryption_service.clone(),
             ));
+            match config_service.encrypt_legacy_inline_configs().await {
+                Ok(0) => {}
+                Ok(updated) => tracing::info!(
+                    updated,
+                    "Encrypted legacy inline agent MCP and custom-tool configurations"
+                ),
+                Err(error) => {
+                    return Err(PluginError::InitializationFailed(format!(
+                        "agents: failed to encrypt legacy inline agent credentials: {}",
+                        error
+                    )));
+                }
+            }
             context.register_service(config_service.clone());
 
             let secret_service =
@@ -528,7 +590,21 @@ impl TempsPlugin for AgentsPlugin {
             let definition_service =
                 Arc::new(crate::services::definition_service::DefinitionService::new(
                     context.require_service::<sea_orm::DatabaseConnection>(),
+                    encryption_service.clone(),
                 ));
+            match definition_service.encrypt_legacy_mcp_configs().await {
+                Ok(0) => {}
+                Ok(updated) => tracing::info!(
+                    updated,
+                    "Encrypted legacy MCP environment and header credentials"
+                ),
+                Err(error) => {
+                    return Err(PluginError::InitializationFailed(format!(
+                        "agents: failed to encrypt legacy MCP credentials: {}",
+                        error
+                    )));
+                }
+            }
             context.register_service(definition_service.clone());
             let executor = Arc::new(AgentExecutor::new(
                 db.clone(),

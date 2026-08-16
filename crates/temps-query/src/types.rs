@@ -167,6 +167,33 @@ pub struct QueryOptions {
     pub timeout_ms: Option<u64>,
     /// Include null values
     pub include_nulls: bool,
+    /// Server-controlled memory and structural budget. Callers must not expose
+    /// these values as unconstrained request parameters.
+    #[serde(default)]
+    pub budget: QueryBudget,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct QueryBudget {
+    pub max_bytes: usize,
+    pub max_cells: usize,
+    pub max_cells_per_row: usize,
+    pub max_cell_bytes: usize,
+    pub max_value_elements_per_row: usize,
+    pub max_nesting_depth: usize,
+}
+
+impl Default for QueryBudget {
+    fn default() -> Self {
+        Self {
+            max_bytes: 8 * 1024 * 1024,
+            max_cells: 16_384,
+            max_cells_per_row: 256,
+            max_cell_bytes: 1024 * 1024,
+            max_value_elements_per_row: 10_000,
+            max_nesting_depth: 64,
+        }
+    }
 }
 
 impl Default for QueryOptions {
@@ -179,6 +206,7 @@ impl Default for QueryOptions {
             sort_order: Some("asc".to_string()),
             timeout_ms: Some(30000),
             include_nulls: true,
+            budget: QueryBudget::default(),
         }
     }
 }
@@ -199,6 +227,8 @@ pub struct QueryStats {
     pub has_more: bool,
     /// Next cursor for pagination (if applicable)
     pub next_cursor: Option<String>,
+    /// True when a backend stopped reading because the result budget filled.
+    pub truncated: bool,
 }
 
 /// Result of executing a query
@@ -227,6 +257,7 @@ impl QueryResult {
                 execution_ms,
                 has_more,
                 next_cursor: None,
+                truncated: false,
             },
         }
     }
@@ -251,6 +282,7 @@ impl QueryResult {
                 execution_ms,
                 has_more,
                 next_cursor,
+                truncated: false,
             },
         }
     }

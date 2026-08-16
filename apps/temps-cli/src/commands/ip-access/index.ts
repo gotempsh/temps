@@ -49,6 +49,20 @@ interface CheckOptions {
   json?: boolean
 }
 
+const IP_ACCESS_ACTIONS = ['allow', 'deny', 'block']
+
+/**
+ * Validates a raw --action value and normalizes "deny" to the "block" value
+ * the API expects. Returns undefined for anything not in the allowed set so
+ * callers can reject before a malformed action reaches the API.
+ */
+export function resolveIpAccessAction(rawAction: string): string | undefined {
+  if (!IP_ACCESS_ACTIONS.includes(rawAction)) {
+    return undefined
+  }
+  return rawAction === 'deny' ? 'block' : rawAction
+}
+
 export function registerIpAccessCommands(program: Command): void {
   const ipAccess = program
     .command('ip-access')
@@ -150,8 +164,6 @@ async function createIpAccessAction(options: CreateOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const validActions = ['allow', 'deny', 'block']
-
   let ipAddress: string
   let action: string
   let reason: string | null = null
@@ -163,15 +175,12 @@ async function createIpAccessAction(options: CreateOptions): Promise<void> {
     action = options.action!
     reason = options.description || null
 
-    // Normalize "deny" to "block" for the API
-    if (action === 'deny') {
-      action = 'block'
-    }
-
-    if (!validActions.includes(action)) {
+    const resolved = resolveIpAccessAction(action)
+    if (resolved === undefined) {
       warning(`Invalid action: ${action}. Available: allow, deny`)
       return
     }
+    action = resolved
   } else {
     ipAddress = options.ip || await promptText({
       message: 'IP address or CIDR range',
@@ -183,15 +192,12 @@ async function createIpAccessAction(options: CreateOptions): Promise<void> {
       required: true,
     })
 
-    // Normalize "deny" to "block" for the API
-    if (action === 'deny') {
-      action = 'block'
-    }
-
-    if (!validActions.includes(action)) {
+    const resolved = resolveIpAccessAction(action)
+    if (resolved === undefined) {
       warning(`Invalid action: ${action}. Available: allow, deny`)
       return
     }
+    action = resolved
 
     reason = options.description || await promptText({
       message: 'Description/reason (optional)',
@@ -271,15 +277,12 @@ async function updateIpAccessAction(options: UpdateOptions): Promise<void> {
   }
 
   if (options.action) {
-    let action = options.action
-    if (action === 'deny') {
-      action = 'block'
-    }
-    if (!['allow', 'block', 'deny'].includes(options.action)) {
+    const resolved = resolveIpAccessAction(options.action)
+    if (resolved === undefined) {
       warning(`Invalid action: ${options.action}. Available: allow, deny`)
       return
     }
-    body.action = action
+    body.action = resolved
   }
 
   if (options.description !== undefined) {

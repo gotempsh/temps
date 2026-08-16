@@ -1,4 +1,4 @@
-import { DeploymentResponse } from '@/api/client'
+import { DeploymentResponse, type SourceType } from '@/api/client'
 import { getDeploymentOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
@@ -13,14 +13,18 @@ import { useQuery } from '@tanstack/react-query'
 import {
   ArrowUpRight,
   CheckCircle2,
+  Container,
+  FileArchive,
   GitBranch,
   GitCommit,
   MoreHorizontal,
+  Package,
   RefreshCw,
   RotateCcw,
   X,
 } from 'lucide-react'
 import { useCallback, useEffect, useMemo } from 'react'
+import { deploymentSourceSummary } from '@/lib/deployment-source-summary'
 import { TimeAgo } from '../utils/TimeAgo'
 import { DeploymentStatusBadge } from './DeploymentStatusBadge'
 
@@ -31,6 +35,7 @@ interface DeploymentCompactRowProps {
   onRollback?: () => void
   onPromote?: () => void
   onDeploymentUpdate?: (updatedDeployment: DeploymentResponse) => void
+  projectSourceType?: SourceType
 }
 
 export default function DeploymentCompactRow({
@@ -40,6 +45,7 @@ export default function DeploymentCompactRow({
   onRollback,
   onPromote,
   onDeploymentUpdate,
+  projectSourceType,
 }: DeploymentCompactRowProps) {
   const { refetch, data: refreshedDeployment } = useQuery({
     ...getDeploymentOptions({
@@ -57,8 +63,9 @@ export default function DeploymentCompactRow({
 
   const deployment = useMemo(
     () => refreshedDeployment ?? initialDeployment,
-    [refreshedDeployment, initialDeployment],
+    [refreshedDeployment, initialDeployment]
   )
+  const source = deploymentSourceSummary(deployment, projectSourceType)
 
   const pollDeployment = useCallback(async () => {
     const { data } = await refetch()
@@ -85,7 +92,10 @@ export default function DeploymentCompactRow({
       {/* Primary line: id + status + env + current */}
       <div className="flex min-w-0 items-center gap-2 sm:shrink-0">
         <span className="font-medium text-sm">#{deployment.id}</span>
-        <DeploymentStatusBadge deployment={deployment} className="text-[10px] px-1.5 py-0 h-5" />
+        <DeploymentStatusBadge
+          deployment={deployment}
+          className="text-[10px] px-1.5 py-0 h-5"
+        />
         <Badge variant="secondary" className="text-[10px] px-1.5 py-0 h-5">
           {deployment.environment.name}
         </Badge>
@@ -97,21 +107,48 @@ export default function DeploymentCompactRow({
         )}
       </div>
 
-      {/* Meta line: commit info — takes remaining space, truncates */}
+      {/* Meta line: source info — takes remaining space, truncates */}
       <div className="flex min-w-0 flex-1 items-center gap-3 text-xs text-muted-foreground">
-        <div className="flex items-center gap-1 shrink-0">
-          <GitBranch className="h-3 w-3" />
-          <span className="truncate max-w-[100px]">{deployment.branch}</span>
-        </div>
-        <div className="flex items-center gap-1 shrink-0">
-          <GitCommit className="h-3 w-3" />
-          <span className="font-mono">
-            {deployment.commit_hash?.slice(0, 7)}
-          </span>
-        </div>
-        <span className="truncate min-w-0">
-          {deployment.commit_message}
-        </span>
+        {source.kind === 'git' ? (
+          <>
+            {source.branch && (
+              <div className="flex shrink-0 items-center gap-1">
+                <GitBranch className="h-3 w-3" />
+                <span className="max-w-[100px] truncate">{source.branch}</span>
+              </div>
+            )}
+            {source.commit && (
+              <div className="flex shrink-0 items-center gap-1">
+                <GitCommit className="h-3 w-3" />
+                <span className="font-mono">{source.commit.slice(0, 7)}</span>
+              </div>
+            )}
+            {source.message && (
+              <span className="min-w-0 truncate">{source.message}</span>
+            )}
+          </>
+        ) : (
+          <div className="flex min-w-0 items-center gap-1.5">
+            {source.kind === 'docker_image' ? (
+              <Container className="h-3.5 w-3.5 shrink-0" />
+            ) : source.kind === 'manual' ? (
+              <Package className="h-3.5 w-3.5 shrink-0" />
+            ) : (
+              <FileArchive className="h-3.5 w-3.5 shrink-0" />
+            )}
+            <span className="shrink-0 font-medium text-foreground/80">
+              {source.label}
+            </span>
+            {source.detail && (
+              <span
+                className="min-w-0 truncate font-mono"
+                title={source.detail}
+              >
+                {source.detail}
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Right cluster: author + time + menu */}

@@ -21,7 +21,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-scraper = "0.25"
+scraper = "0.27"
 url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 thiserror = { workspace = true }

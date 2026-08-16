@@ -8,7 +8,23 @@ use std::sync::Arc;
 use temps_core::{EncryptionService, SecretsManagerResolver};
 use temps_entities::{deployment_jobs, deployments, environments, projects, types::JobStatus};
 use temps_logs::LogService;
-use tracing::{debug, info};
+use thiserror::Error;
+use tracing::{debug, info, warn};
+
+#[derive(Debug, Error)]
+pub enum WorkflowPlanningError {
+    #[error(
+        "Failed to seal workflow field '{field}' for deployment {deployment_id} \
+         (project {project_id}): {source}"
+    )]
+    SealSensitiveField {
+        deployment_id: i32,
+        project_id: i32,
+        field: &'static str,
+        #[source]
+        source: crate::services::sensitive_envelope::SensitiveEnvelopeError,
+    },
+}
 
 /// Shared slot type for the optional [`temps_core::SecretsManagerResolver`].
 ///
@@ -33,6 +49,26 @@ pub struct JobDefinition {
 
 use super::deployment_token_service::DeploymentTokenService;
 
+const BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG: &str = "BUILDKIT_CACHE_MOUNT_NS";
+
+/// Derive an opaque, stable namespace for BuildKit cache mounts.
+///
+/// Cache mounts are writable and live on a shared builder. A public namespace
+/// would allow an unrelated project to mount or poison another project's
+/// cache. The HMAC-derived value is stable for warm builds of the same ref but
+/// cannot be derived by tenants that do not hold the Temps master key.
+fn buildkit_cache_mount_namespace(
+    encryption_service: &EncryptionService,
+    project_id: i32,
+    environment_id: i32,
+    cache_ref: &str,
+) -> String {
+    let domain = format!(
+        "temps-buildkit-cache-v1:project={project_id}:environment={environment_id}:ref={cache_ref}"
+    );
+    hex::encode(encryption_service.derive_subkey(&domain))
+}
+
 /// Plans and creates workflow jobs based on project configuration
 pub struct WorkflowPlanner {
     db: Arc<DatabaseConnection>,
@@ -56,6 +92,50 @@ pub struct WorkflowPlanner {
 }
 
 impl WorkflowPlanner {
+    fn seal_sensitive_field(
+        &self,
+        job_config: &mut serde_json::Map<String, serde_json::Value>,
+        deployment: &deployments::Model,
+        field: &'static str,
+        values: &std::collections::HashMap<String, String>,
+    ) -> Result<(), WorkflowPlanningError> {
+        crate::services::sensitive_envelope::write_sealed(
+            job_config,
+            self.encryption_service.as_ref(),
+            field,
+            values,
+        )
+        .map_err(|source| WorkflowPlanningError::SealSensitiveField {
+            deployment_id: deployment.id,
+            project_id: deployment.project_id,
+            field,
+            source,
+        })
+    }
+
+    fn buildkit_cache_namespace_for(
+        &self,
+        project: &projects::Model,
+        environment: &environments::Model,
+        deployment: &deployments::Model,
+    ) -> String {
+        // Tags take precedence during checkout, followed by branches and
+        // direct commit deployments. Branch deployments retain a stable cache
+        // namespace across commits, while detached commits remain isolated.
+        let cache_ref = deployment
+            .tag_ref
+            .as_deref()
+            .or(deployment.branch_ref.as_deref())
+            .or(deployment.commit_sha.as_deref())
+            .unwrap_or(&project.main_branch);
+        buildkit_cache_mount_namespace(
+            self.encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            cache_ref,
+        )
+    }
+
     pub fn new(
         db: Arc<DatabaseConnection>,
         log_service: Arc<LogService>,
@@ -354,6 +434,19 @@ impl WorkflowPlanner {
                         if let Some(public_var) = public_sentry_dsn_var(project.preset) {
                             env_vars_map.insert(public_var.to_string(), project_dsn.dsn);
                         }
+
+                        // Add the same-origin tunnel path browser SDKs should pass as
+                        // `Sentry.init({ tunnel })`. The value is a constant (not
+                        // project-specific), but injecting it as an env var — rather
+                        // than hardcoding it in every framework's setup snippet — means
+                        // the path can change in one place (here) without touching
+                        // deployed apps' source or docs.
+                        if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
+                            env_vars_map.insert(
+                                tunnel_var.to_string(),
+                                format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH),
+                            );
+                        }
                     }
                     Err(e) => {
                         // Warn about Sentry DSN failure but don't fail the deployment
@@ -456,13 +549,16 @@ impl WorkflowPlanner {
                 "http/protobuf".to_string(),
             );
 
-            // Auth header using the deployment token (already in TEMPS_API_TOKEN)
-            if let Some(token) = env_vars_map.get("TEMPS_API_TOKEN").cloned() {
-                env_vars_map.insert(
-                    "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
-                    format!("Authorization=Bearer {}", token),
-                );
-            }
+            // Always include the project slug so authentication failures retain
+            // project context. Authorization is added when token provisioning
+            // succeeded (the token is already in TEMPS_API_TOKEN).
+            let token = env_vars_map.get("TEMPS_API_TOKEN").map(String::as_str);
+            let existing_headers = env_vars_map
+                .get("OTEL_EXPORTER_OTLP_HEADERS")
+                .map(String::as_str);
+            let otel_headers =
+                super::env_resolver::otel_exporter_headers(token, existing_headers, &project.slug);
+            env_vars_map.insert("OTEL_EXPORTER_OTLP_HEADERS".to_string(), otel_headers);
 
             env_vars_map.insert("OTEL_SERVICE_NAME".to_string(), project.name.clone());
 
@@ -673,14 +769,15 @@ impl WorkflowPlanner {
                     for (key, value) in remote_vars.iter_mut() {
                         // Replace container_name:internal_port → private_address:host_port
                         if value.contains(&container_name) {
-                            let old_value = value.clone();
                             *value = value
                                 .replace(
                                     &format!("{}:{}", container_name, internal_port),
                                     &format!("{}:{}", private_address, host_port),
                                 )
                                 .replace(&container_name, &private_address);
-                            info!("Rewrote {}={} -> {}", key, old_value, value);
+                            // Connection strings contain credentials. Log the
+                            // affected key, never either secret-bearing value.
+                            info!("Rewrote environment variable {} for remote deployment", key);
                             rewritten_count += 1;
                         }
                     }
@@ -917,6 +1014,11 @@ impl WorkflowPlanner {
                 debug!("Inferred StaticFiles deployment from static_bundle_path in metadata");
                 return SourceType::StaticFiles;
             }
+
+            if metadata.source_bundle_path.is_some() {
+                debug!("Inferred UploadedSource deployment from source_bundle_path in metadata");
+                return SourceType::UploadedSource;
+            }
         }
 
         // 4. Non-flexible projects: use project source type
@@ -965,6 +1067,20 @@ impl WorkflowPlanner {
             .gather_environment_variables(project, environment, deployment)
             .await?;
 
+        // This is a platform-owned build argument, not a tenant runtime
+        // variable. Drop any user-controlled value before planning so it
+        // cannot override the HMAC namespace or leak into deployed containers.
+        if env_vars
+            .remove(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+            .is_some()
+        {
+            warn!(
+                project_id = project.id,
+                environment_id = environment.id,
+                "Ignoring tenant-provided reserved BuildKit cache namespace"
+            );
+        }
+
         // Inject TEMPS_ASSET_PREFIX for stale-chunk prevention.
         // Frameworks can use this to namespace static assets per deployment:
         //   Next.js: assetPrefix: process.env.NEXT_PUBLIC_TEMPS_ASSET_PREFIX || ''
@@ -997,8 +1113,16 @@ impl WorkflowPlanner {
 
         // Docker Compose preset uses its own deployment path
         if project.preset == temps_entities::preset::Preset::DockerCompose {
+            let buildkit_cache_namespace =
+                self.buildkit_cache_namespace_for(project, environment, deployment);
             return self
-                .plan_compose_deployment(project, environment, deployment, env_vars)
+                .plan_compose_deployment(
+                    project,
+                    environment,
+                    deployment,
+                    env_vars,
+                    buildkit_cache_namespace,
+                )
                 .await;
         }
 
@@ -1020,6 +1144,17 @@ impl WorkflowPlanner {
                     .await
             }
             SourceType::Git => {
+                self.plan_git_deployment(
+                    project,
+                    environment,
+                    deployment,
+                    env_vars,
+                    remote_env_vars,
+                    secrets,
+                )
+                .await
+            }
+            SourceType::UploadedSource => {
                 self.plan_git_deployment(
                     project,
                     environment,
@@ -1063,6 +1198,23 @@ impl WorkflowPlanner {
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
 
+        let source_bundle_path = deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_bundle_path.clone());
+        let source_job_id = if source_bundle_path.is_some() {
+            "prepare_source_bundle"
+        } else {
+            "download_repo"
+        };
+
+        // BuildKit's predefined BUILDKIT_CACHE_MOUNT_NS argument is applied to
+        // every RUN --mount=type=cache ID. Scope it by project, environment,
+        // and checked-out ref so unrelated tenants and preview branches cannot
+        // read or poison each other's writable compiler/package caches.
+        let buildkit_cache_namespace =
+            self.buildkit_cache_namespace_for(project, environment, deployment);
+
         // Inject SENTRY_RELEASE so the SDK tags events with the correct release version.
         // This must match the release used for source map uploads.
         if let Some(ref commit_sha) = deployment.commit_sha {
@@ -1099,7 +1251,17 @@ impl WorkflowPlanner {
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
 
         // Job 1: Download repository (only if git info is available)
-        if has_git_info {
+        if let Some(archive_path) = source_bundle_path {
+            jobs.push(JobDefinition {
+                job_id: source_job_id.to_string(),
+                job_type: "PrepareSourceBundleJob".to_string(),
+                name: "Prepare Uploaded Source".to_string(),
+                description: Some("Securely extract uploaded source code".to_string()),
+                dependencies: vec![],
+                job_config: Some(serde_json::json!({ "archive_path": archive_path })),
+                required_for_completion: true,
+            });
+        } else if has_git_info {
             // Determine which branch/commit to use for this deployment
             // Priority: deployment.branch_ref > deployment.commit_sha > project.main_branch
             let branch_or_commit = deployment
@@ -1138,19 +1300,22 @@ impl WorkflowPlanner {
 
         // Check if this preset supports static deployment using temps-presets
         // Get the preset instance and check if it has a static output directory
-        let preset_instance = temps_presets::get_preset_by_slug(project.preset.as_str());
+        let runtime_slug =
+            temps_presets::runtime_slug(project.preset, project.preset_config.as_ref());
+        let preset_instance =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())?;
         let static_output_dir = preset_instance.as_ref().and_then(|p| p.static_output_dir());
 
         debug!(
             "Preset {} static output directory: {:?}",
-            project.preset, static_output_dir
+            runtime_slug, static_output_dir
         );
 
         // Job 2: Build container image (skip for static deployments)
         // The BuildImageJob will generate Dockerfile from preset if it doesn't exist
         // Depends on download_repo only if git info is available
-        let build_dependencies = if has_git_info {
-            vec!["download_repo".to_string()]
+        let build_dependencies = if has_git_info || source_job_id == "prepare_source_bundle" {
+            vec![source_job_id.to_string()]
         } else {
             vec![]
         };
@@ -1161,11 +1326,18 @@ impl WorkflowPlanner {
             debug!("📦 Using static deployment for preset {}", project.preset);
             debug!("📂 Static output directory: {}", output_dir);
 
-            // Convert environment variables to build args
-            let mut build_args_map = serde_json::Map::new();
-            for (key, value) in &env_vars {
-                build_args_map.insert(key.clone(), serde_json::Value::String(value.clone()));
-            }
+            // Build args contain every resolved environment value, including
+            // secrets. Keep the static-deployment path aligned with container
+            // deployments: store only an encrypted envelope plus a plaintext
+            // key index for diagnostics.
+            let mut build_args_map: std::collections::HashMap<String, String> = env_vars
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect();
+            build_args_map.insert(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace.clone(),
+            );
 
             // Parse preset_config if present (for Dockerfile preset)
             let mut dockerfile_path = "Dockerfile".to_string();
@@ -1182,6 +1354,14 @@ impl WorkflowPlanner {
                 }
             }
 
+            let mut build_job_config = serde_json::json!({
+                "dockerfile_path": dockerfile_path,
+                "build_context": build_context,
+            });
+            if let Some(obj) = build_job_config.as_object_mut() {
+                self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
+            }
+
             // Job 2: Build image (for static deployments, this builds the static files inside container)
             jobs.push(JobDefinition {
                 job_id: "build_image".to_string(),
@@ -1189,11 +1369,7 @@ impl WorkflowPlanner {
                 name: "Build Container Image".to_string(),
                 description: Some("Build Docker image and compile static files".to_string()),
                 dependencies: build_dependencies.clone(),
-                job_config: Some(serde_json::json!({
-                    "dockerfile_path": dockerfile_path,
-                    "build_args": build_args_map,
-                    "build_context": build_context
-                })),
+                job_config: Some(build_job_config),
                 required_for_completion: true,
             });
 
@@ -1261,10 +1437,14 @@ impl WorkflowPlanner {
             // whole map under `build_args_encrypted` instead so an operator
             // dumping `deployment_jobs.job_config` for debugging never sees
             // an env-var value they shouldn't.
-            let build_args_map: std::collections::HashMap<String, String> = env_vars
+            let mut build_args_map: std::collections::HashMap<String, String> = env_vars
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect();
+            build_args_map.insert(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace,
+            );
 
             // Parse preset_config if present (for Dockerfile preset)
             let mut dockerfile_path = "Dockerfile".to_string();
@@ -1286,13 +1466,7 @@ impl WorkflowPlanner {
                 "build_context": build_context,
             });
             if let Some(obj) = build_job_config.as_object_mut() {
-                crate::services::sensitive_envelope::write_sealed(
-                    obj,
-                    self.encryption_service.as_ref(),
-                    "build_args",
-                    &build_args_map,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal build_args: {}", e))?;
+                self.seal_sensitive_field(obj, deployment, "build_args", &build_args_map)?;
             }
 
             jobs.push(JobDefinition {
@@ -1343,28 +1517,24 @@ impl WorkflowPlanner {
                 // Seal env vars, remote env vars, and secret-file contents.
                 // None of these end up in `job_config` in plaintext anymore;
                 // the executor pulls them back through `read_sealed`.
-                crate::services::sensitive_envelope::write_sealed(
+                self.seal_sensitive_field(
                     obj,
-                    self.encryption_service.as_ref(),
+                    deployment,
                     "environment_variables",
                     &deploy_env_vars,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+                )?;
 
                 if let Some(ref remote_vars) = remote_deploy_env_vars {
                     info!(
                         "Sealing remote_environment_variables in job config ({} keys)",
                         remote_vars.len()
                     );
-                    crate::services::sensitive_envelope::write_sealed(
+                    self.seal_sensitive_field(
                         obj,
-                        self.encryption_service.as_ref(),
+                        deployment,
                         "remote_environment_variables",
                         remote_vars,
-                    )
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
-                    })?;
+                    )?;
                 } else {
                     info!("No remote_environment_variables to store (single-node mode or no active nodes)");
                 }
@@ -1374,13 +1544,7 @@ impl WorkflowPlanner {
                         "Sealing {} secret file(s) in deploy job config",
                         secrets.len()
                     );
-                    crate::services::sensitive_envelope::write_sealed(
-                        obj,
-                        self.encryption_service.as_ref(),
-                        "secrets",
-                        &secrets,
-                    )
-                    .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+                    self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
                 }
             }
 
@@ -1486,12 +1650,34 @@ impl WorkflowPlanner {
                 job_config: Some(serde_json::json!({
                     "project_id": project.id,
                     "environment_id": deployment.environment_id,
-                    "download_job_id": "download_repo"
+                    "download_job_id": source_job_id
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
             });
             debug!(
                 "Added configure_crons job to workflow (runs after deployment is marked complete)"
+            );
+
+            // Job: Reconcile metric alert rules from .temps.yaml alerts: section.
+            // Runs in parallel with configure_crons, after deployment is complete.
+            // NOT required for deployment completion.
+            jobs.push(JobDefinition {
+                job_id: "configure_metric_alerts".to_string(),
+                job_type: "ConfigureMetricAlertsJob".to_string(),
+                name: "Configure Metric Alerts".to_string(),
+                description: Some(
+                    "Reconcile metric alert rules from .temps.yaml with the database".to_string(),
+                ),
+                dependencies: vec!["mark_deployment_complete".to_string()],
+                job_config: Some(serde_json::json!({
+                    "project_id": project.id,
+                    "environment_id": deployment.environment_id,
+                    "download_job_id": source_job_id
+                })),
+                required_for_completion: false,
+            });
+            debug!(
+                "Added configure_metric_alerts job to workflow (runs after deployment is marked complete)"
             );
 
             // Job: Sync agent definitions from .temps/agents/*.yaml
@@ -1504,7 +1690,7 @@ impl WorkflowPlanner {
                 dependencies: vec!["mark_deployment_complete".to_string()],
                 job_config: Some(serde_json::json!({
                     "project_id": project.id,
-                    "download_job_id": "download_repo"
+                    "download_job_id": source_job_id
                 })),
                 required_for_completion: false,
             });
@@ -1555,7 +1741,7 @@ impl WorkflowPlanner {
                     "environment_id": deployment.environment_id,
                     "branch": deployment.branch_ref,
                     "commit_hash": deployment.commit_sha,
-                    "download_job_id": "download_repo",
+                    "download_job_id": source_job_id,
                     "build_job_id": "build_image"
                 })),
                 required_for_completion: false, // Post-deployment job - not required for deployment success
@@ -1621,6 +1807,46 @@ impl WorkflowPlanner {
             );
         }
 
+        // Job 9: Capture source files (native symbolication — Go/Rust/etc.).
+        // Uploads raw source from the git checkout so native stack frames show
+        // source code. Opt-in per project, so it is only scheduled when the
+        // project has enabled source context (no overhead for anyone else).
+        if has_git_info && project.error_source_context_enabled {
+            let release = deployment
+                .commit_sha
+                .clone()
+                .unwrap_or_else(|| format!("deploy-{}", deployment.id));
+
+            jobs.push(JobDefinition {
+                job_id: "capture_source_files".to_string(),
+                job_type: "CaptureSourceFilesJob".to_string(),
+                name: "Capture Source Files".to_string(),
+                description: Some(
+                    "Upload application source from the checkout for native error symbolication"
+                        .to_string(),
+                ),
+                dependencies: vec!["mark_deployment_complete".to_string()],
+                job_config: Some(serde_json::json!({
+                    "project_id": project.id,
+                    "release": release,
+                    "download_job_id": source_job_id,
+                    "build_job_id": "build_image",
+                    // None = default to the Docker build context; a set value
+                    // (or .temps.yaml sourceContext.root) overrides it.
+                    "error_source_root": project.error_source_root,
+                    "extensions": [
+                        "go", "rs", "py", "rb", "js", "jsx", "ts", "tsx", "java", "kt",
+                        "c", "h", "cpp", "cc", "hpp", "cs", "php", "swift", "scala", "ex", "exs",
+                    ],
+                })),
+                required_for_completion: false,
+            });
+            debug!(
+                "Added capture_source_files job to workflow (release: {})",
+                release
+            );
+        }
+
         info!(
             "Planned {} jobs for Git-based project {}",
             jobs.len(),
@@ -1637,14 +1863,30 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         env_vars: std::collections::HashMap<String, String>,
+        buildkit_cache_namespace: String,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
+
+        let source_bundle_path = deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_bundle_path.clone());
 
         // Check if git info is available
         let has_git_info = !project.repo_owner.is_empty() && !project.repo_name.is_empty();
 
-        // Job 1: Download repository (only if git-backed)
-        if has_git_info {
+        // Job 1: prepare either the uploaded archive or the Git checkout.
+        if let Some(archive_path) = source_bundle_path {
+            jobs.push(JobDefinition {
+                job_id: "prepare_source_bundle".to_string(),
+                job_type: "PrepareSourceBundleJob".to_string(),
+                name: "Prepare Uploaded Source".to_string(),
+                description: Some("Securely extract uploaded source code".to_string()),
+                dependencies: vec![],
+                job_config: Some(serde_json::json!({ "archive_path": archive_path })),
+                required_for_completion: true,
+            });
+        } else if has_git_info {
             let branch_or_commit = deployment
                 .branch_ref
                 .as_ref()
@@ -1686,7 +1928,14 @@ impl WorkflowPlanner {
             .unwrap_or_else(|| "docker-compose.yml".to_string());
 
         // Job 2: Deploy Compose Stack (no build step)
-        let deploy_dependencies = if has_git_info {
+        let deploy_dependencies = if deployment
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.source_bundle_path.as_ref())
+            .is_some()
+        {
+            vec!["prepare_source_bundle".to_string()]
+        } else if has_git_info {
             vec!["download_repo".to_string()]
         } else {
             vec![]
@@ -1699,13 +1948,12 @@ impl WorkflowPlanner {
             "directory": project.directory,
         });
         if let Some(obj) = compose_job_config.as_object_mut() {
-            crate::services::sensitive_envelope::write_sealed(
-                obj,
-                self.encryption_service.as_ref(),
-                "environment_vars",
-                &env_vars,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to seal compose environment_vars: {}", e))?;
+            self.seal_sensitive_field(obj, deployment, "environment_vars", &env_vars)?;
+            let build_args = std::collections::HashMap::from([(
+                BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
+                buildkit_cache_namespace,
+            )]);
+            self.seal_sensitive_field(obj, deployment, "build_args", &build_args)?;
         }
 
         jobs.push(JobDefinition {
@@ -1850,12 +2098,38 @@ impl WorkflowPlanner {
             .resolve_exposed_port(environment, project, Some(&external_image_ref))
             .await;
 
+        // Release identity for image deploys. Unlike git builds (which have a
+        // commit SHA), an image deploy is pinned to an image tag/digest — that
+        // IS the deployed artifact's identity. Inject it as SENTRY_RELEASE /
+        // OTEL_SERVICE_VERSION so error events and traces are attributable to
+        // the exact image, and so it can be used as the join key for source-map
+        // / source-file uploads. Prefer an explicit commit SHA when present,
+        // then the image tag, falling back to the full ref (e.g. a digest).
+        // `or_insert` so a user-provided value always wins.
+        let release_id = deployment
+            .commit_sha
+            .clone()
+            .or_else(|| image_ref_release(&external_image_ref))
+            .unwrap_or_else(|| external_image_ref.clone());
+
         let mut deploy_env_vars = env_vars.clone();
         deploy_env_vars.insert("PORT".to_string(), exposed_port.to_string());
+        deploy_env_vars
+            .entry("SENTRY_RELEASE".to_string())
+            .or_insert_with(|| release_id.clone());
+        deploy_env_vars
+            .entry("OTEL_SERVICE_VERSION".to_string())
+            .or_insert_with(|| release_id.clone());
 
         let remote_deploy_env_vars = remote_env_vars.as_ref().map(|rv| {
             let mut remote = rv.clone();
             remote.insert("PORT".to_string(), exposed_port.to_string());
+            remote
+                .entry("SENTRY_RELEASE".to_string())
+                .or_insert_with(|| release_id.clone());
+            remote
+                .entry("OTEL_SERVICE_VERSION".to_string())
+                .or_insert_with(|| release_id.clone());
             remote
         });
 
@@ -1873,28 +2147,19 @@ impl WorkflowPlanner {
             "use_external_image": true,
         });
         if let Some(obj) = job_config.as_object_mut() {
-            crate::services::sensitive_envelope::write_sealed(
-                obj,
-                self.encryption_service.as_ref(),
-                "environment_variables",
-                &deploy_env_vars,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to seal environment_variables: {}", e))?;
+            self.seal_sensitive_field(obj, deployment, "environment_variables", &deploy_env_vars)?;
 
             if let Some(ref remote_vars) = remote_deploy_env_vars {
                 info!(
                     "Sealing remote_environment_variables in docker image job config ({} keys)",
                     remote_vars.len()
                 );
-                crate::services::sensitive_envelope::write_sealed(
+                self.seal_sensitive_field(
                     obj,
-                    self.encryption_service.as_ref(),
+                    deployment,
                     "remote_environment_variables",
                     remote_vars,
-                )
-                .map_err(|e| {
-                    anyhow::anyhow!("Failed to seal remote_environment_variables: {}", e)
-                })?;
+                )?;
             } else {
                 info!("No remote_environment_variables for docker image deployment");
             }
@@ -1904,13 +2169,7 @@ impl WorkflowPlanner {
                     "Sealing {} secret file(s) in docker image deploy job config",
                     secrets.len()
                 );
-                crate::services::sensitive_envelope::write_sealed(
-                    obj,
-                    self.encryption_service.as_ref(),
-                    "secrets",
-                    &secrets,
-                )
-                .map_err(|e| anyhow::anyhow!("Failed to seal secrets: {}", e))?;
+                self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
             }
         }
 
@@ -2014,6 +2273,7 @@ impl WorkflowPlanner {
                 "project_slug": project.slug,
                 "environment_slug": environment.slug,
                 "deployment_slug": deployment.slug,
+                "source_directory": project.directory,
             })),
             required_for_completion: true,
         });
@@ -2099,8 +2359,77 @@ pub(crate) fn public_sentry_dsn_var(
         | Preset::Dockerfile
         | Preset::DockerCompose
         | Preset::Nixpacks
+        | Preset::Autopack
         | Preset::Static => None,
     }
+}
+
+/// Public-prefix env var carrying the same-origin Sentry tunnel path for
+/// browser presets (see `temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH` for
+/// what it points at and why). Mirrors `public_sentry_dsn_var`'s preset
+/// groups exactly — a browser bundle that gets the DSN gets the tunnel path
+/// too, under the same public prefix, so both env vars land in the same
+/// `Sentry.init({ dsn, tunnel })` call. `None` for the same presets that get
+/// no public DSN var (server-only, or no build-time public-prefix
+/// convention).
+pub(crate) fn public_sentry_tunnel_var(
+    preset: temps_entities::preset::Preset,
+) -> Option<&'static str> {
+    use temps_entities::preset::Preset;
+    match preset {
+        Preset::NextJs => Some("NEXT_PUBLIC_SENTRY_TUNNEL"),
+        Preset::Nuxt => Some("NUXT_PUBLIC_SENTRY_TUNNEL"),
+        Preset::Vite | Preset::React | Preset::Vue | Preset::SolidStart | Preset::Remix => {
+            Some("VITE_SENTRY_TUNNEL")
+        }
+        Preset::SvelteKit | Preset::Astro | Preset::Rsbuild => Some("PUBLIC_SENTRY_TUNNEL"),
+        Preset::Docusaurus => Some("REACT_APP_SENTRY_TUNNEL"),
+        Preset::Angular
+        | Preset::Python
+        | Preset::FastApi
+        | Preset::Flask
+        | Preset::Django
+        | Preset::Rails
+        | Preset::Go
+        | Preset::Rust
+        | Preset::Java
+        | Preset::Laravel
+        | Preset::NodeJs
+        | Preset::Dockerfile
+        | Preset::DockerCompose
+        | Preset::Nixpacks
+        | Preset::Autopack
+        | Preset::Static => None,
+    }
+}
+
+/// Extract a release identifier (tag or digest) from a container image
+/// reference. This is the deployed artifact's identity for image deploys —
+/// used as SENTRY_RELEASE / OTEL_SERVICE_VERSION.
+///
+/// Handles the registry-port ambiguity: the tag separator is the LAST `:` and
+/// only counts if it comes after the last `/` (so `registry:5000/app` has no
+/// tag, but `registry:5000/app:v1` → `v1`). A `@sha256:...` digest is returned
+/// whole. Returns `None` when the ref carries no explicit tag or digest.
+fn image_ref_release(image_ref: &str) -> Option<String> {
+    // Digest form: name@sha256:abcdef... — the digest is the identity.
+    if let Some((_, digest)) = image_ref.split_once('@') {
+        if !digest.is_empty() {
+            return Some(digest.to_string());
+        }
+    }
+
+    // Tag form: the tag is after the last ':', but only if that ':' is in the
+    // final path segment (otherwise it's a registry host:port).
+    let last_segment_start = image_ref.rfind('/').map(|i| i + 1).unwrap_or(0);
+    let last_segment = &image_ref[last_segment_start..];
+    if let Some((_, tag)) = last_segment.rsplit_once(':') {
+        if !tag.is_empty() {
+            return Some(tag.to_string());
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -2113,6 +2442,65 @@ mod tests {
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+
+    #[test]
+    fn buildkit_cache_namespace_is_stable_and_opaque() {
+        let encryption_service = create_test_encryption_service();
+
+        let first =
+            buildkit_cache_mount_namespace(encryption_service.as_ref(), 42, 7, "refs/heads/main");
+        let second =
+            buildkit_cache_mount_namespace(encryption_service.as_ref(), 42, 7, "refs/heads/main");
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 64);
+        assert!(first.chars().all(|character| character.is_ascii_hexdigit()));
+        assert!(!first.contains("main"));
+        assert!(!first.contains("42"));
+    }
+
+    #[test]
+    fn buildkit_cache_namespace_isolates_tenants_and_refs() {
+        let encryption_service = create_test_encryption_service();
+        let namespace = |project_id, environment_id, cache_ref| {
+            buildkit_cache_mount_namespace(
+                encryption_service.as_ref(),
+                project_id,
+                environment_id,
+                cache_ref,
+            )
+        };
+
+        let baseline = namespace(42, 7, "refs/heads/main");
+        assert_ne!(baseline, namespace(43, 7, "refs/heads/main"));
+        assert_ne!(baseline, namespace(42, 8, "refs/heads/main"));
+        assert_ne!(baseline, namespace(42, 7, "refs/heads/feature"));
+    }
+
+    #[test]
+    fn image_ref_release_extracts_tag_digest_and_handles_registry_port() {
+        // Simple tag.
+        assert_eq!(
+            image_ref_release("registry.gitlab.com/group/app:prod-7c3a1ac9"),
+            Some("prod-7c3a1ac9".to_string())
+        );
+        // Registry with a port must NOT be mistaken for a tag.
+        assert_eq!(image_ref_release("localhost:5000/app"), None);
+        // Registry port AND a tag.
+        assert_eq!(
+            image_ref_release("localhost:5000/app:v1.2.3"),
+            Some("v1.2.3".to_string())
+        );
+        // Digest form wins and is returned whole.
+        assert_eq!(
+            image_ref_release("registry.io/app@sha256:abc123"),
+            Some("sha256:abc123".to_string())
+        );
+        // No tag / no digest.
+        assert_eq!(image_ref_release("registry.io/app"), None);
+        // Bare name with tag.
+        assert_eq!(image_ref_release("app:latest"), Some("latest".to_string()));
+    }
 
     fn create_test_config_service(db: Arc<DatabaseConnection>) -> Arc<ConfigService> {
         let server_config = Arc::new(
@@ -2435,6 +2823,7 @@ mod tests {
     async fn test_job_configuration() -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
         let log_service = Arc::new(LogService::new(std::env::temp_dir()));
         let config_service = create_test_config_service(db.clone());
         let dsn_service = create_test_dsn_service(db.clone());
@@ -2445,10 +2834,10 @@ mod tests {
             external_service_manager,
             config_service,
             dsn_service,
-            create_test_encryption_service(),
+            encryption_service.clone(),
         );
 
-        let (_project, _environment, deployment) =
+        let (project, environment, deployment) =
             create_test_project(db.as_ref(), Preset::NextJs).await?;
 
         let jobs = planner.create_deployment_jobs(deployment.id).await?;
@@ -2475,10 +2864,38 @@ mod tests {
                 config_obj.get("build_args_keys").is_some(),
                 "build_image config must include build_args_keys index",
             );
+            let build_arg_keys = config_obj
+                .get("build_args_keys")
+                .and_then(|value| value.as_array())
+                .expect("build_args_keys must be an array");
+            assert!(
+                build_arg_keys
+                    .iter()
+                    .any(|key| { key.as_str() == Some(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG) }),
+                "BuildKit cache namespace must be forwarded as a build arg",
+            );
             // Plaintext `build_args` must NOT appear — that would leak env-var values.
             assert!(
                 config_obj.get("build_args").is_none(),
                 "plaintext build_args must not be present (envelope leak)",
+            );
+            let opened = crate::services::sensitive_envelope::read_sealed(
+                config,
+                Some(&encryption_service),
+                "build_args",
+            )?;
+            let expected_namespace = buildkit_cache_mount_namespace(
+                encryption_service.as_ref(),
+                project.id,
+                environment.id,
+                &project.main_branch,
+            );
+            assert_eq!(
+                opened
+                    .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                    .map(String::as_str),
+                Some(expected_namespace.as_str()),
+                "planner must overwrite the reserved build arg with its HMAC namespace",
             );
         }
 
@@ -2493,6 +2910,269 @@ mod tests {
             assert!(config_obj.get("port").is_some());
             assert!(config_obj.get("replicas").is_some());
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_static_build_args_are_sealed() -> Result<(), Box<dyn std::error::Error>> {
+        const STATIC_SECRET: &str = "static-build-secret-must-not-leak";
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping static build-args sealing test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let mut secrets = std::collections::HashMap::new();
+        secrets.insert(
+            "STATIC_DATABASE_PASSWORD".to_string(),
+            STATIC_SECRET.to_string(),
+        );
+        let resolver: Arc<dyn temps_core::SecretsManagerResolver> =
+            Arc::new(SucceedingSecretsResolver { secrets });
+        *planner.secrets_resolver_handle().write().await = Some(resolver);
+
+        let (project, environment, deployment) =
+            create_test_project(db.as_ref(), Preset::Static).await?;
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let build_job = jobs
+            .iter()
+            .find(|job| job.job_id == "build_image")
+            .expect("static deployment must include build_image");
+        let config = build_job
+            .job_config
+            .as_ref()
+            .expect("build_image must include job_config");
+
+        assert!(
+            config.get("build_args").is_none(),
+            "static build args must never be persisted in plaintext",
+        );
+        assert!(config.get("build_args_encrypted").is_some());
+        let build_arg_keys = config
+            .get("build_args_keys")
+            .and_then(serde_json::Value::as_array)
+            .expect("static build args must include a plaintext key index");
+        assert!(
+            build_arg_keys
+                .iter()
+                .any(|key| key.as_str() == Some(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)),
+            "static builds must receive the BuildKit cache namespace",
+        );
+        assert!(
+            !config.to_string().contains(STATIC_SECRET),
+            "sealed static job_config must not contain secret values",
+        );
+
+        let opened = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        assert_eq!(
+            opened.get("STATIC_DATABASE_PASSWORD").map(String::as_str),
+            Some(STATIC_SECRET),
+            "executor must recover static build args from the sealed envelope",
+        );
+        let expected_namespace = buildkit_cache_mount_namespace(
+            encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            &project.main_branch,
+        );
+        assert_eq!(
+            opened
+                .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                .map(String::as_str),
+            Some(expected_namespace.as_str()),
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn compose_cache_namespace_is_sealed_build_only_and_tenant_proof(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::{env_var_environments, env_vars};
+
+        const TENANT_VALUE: &str = "tenant-controlled-cache-namespace";
+        const CACHE_REF: &str = "feature/compose-cache";
+
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping Compose cache namespace test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let encryption_service = create_test_encryption_service();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            encryption_service.clone(),
+        );
+
+        let (project, environment, deployment) =
+            create_test_project(db.as_ref(), Preset::DockerCompose).await?;
+        let mut deployment_active: deployments::ActiveModel = deployment.into();
+        deployment_active.branch_ref = Set(Some(CACHE_REF.to_string()));
+        let deployment = deployment_active.update(db.as_ref()).await?;
+
+        let tenant_var = env_vars::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            key: Set(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string()),
+            value: Set(TENANT_VALUE.to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        env_var_environments::ActiveModel {
+            env_var_id: Set(tenant_var.id),
+            environment_id: Set(environment.id),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let compose_job = jobs
+            .iter()
+            .find(|job| job.job_id == "deploy_compose")
+            .expect("Compose deployment must include deploy_compose");
+        let config = compose_job
+            .job_config
+            .as_ref()
+            .expect("Compose job must have configuration");
+
+        assert!(config.get("build_args").is_none());
+        assert!(config.get("build_args_encrypted").is_some());
+        let build_args = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "build_args",
+        )?;
+        let expected_namespace = buildkit_cache_mount_namespace(
+            encryption_service.as_ref(),
+            project.id,
+            environment.id,
+            CACHE_REF,
+        );
+        assert_eq!(
+            build_args
+                .get(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG)
+                .map(String::as_str),
+            Some(expected_namespace.as_str()),
+        );
+        assert!(!config.to_string().contains(TENANT_VALUE));
+
+        let runtime_env = crate::services::sensitive_envelope::read_sealed(
+            config,
+            Some(&encryption_service),
+            "environment_vars",
+        )?;
+        assert!(
+            !runtime_env.contains_key(BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG),
+            "reserved BuildKit namespace must never enter Compose service runtime environments",
+        );
+        assert!(!runtime_env
+            .values()
+            .any(|value| value == &expected_namespace));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn uploaded_compose_uses_prepared_archive_as_its_repository(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping uploaded Compose planner test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let planner = WorkflowPlanner::new(
+            db.clone(),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            create_test_external_service_manager(db.clone()),
+            create_test_config_service(db.clone()),
+            create_test_dsn_service(db.clone()),
+            create_test_encryption_service(),
+        );
+        let (project, _environment, deployment) =
+            create_test_project(db.as_ref(), Preset::DockerCompose).await?;
+
+        let mut project_update: projects::ActiveModel = project.into();
+        project_update.source_type = Set(temps_entities::source_type::SourceType::UploadedSource);
+        project_update.repo_owner = Set(String::new());
+        project_update.repo_name = Set(String::new());
+        project_update.update(db.as_ref()).await?;
+
+        let mut deployment_update: deployments::ActiveModel = deployment.into();
+        deployment_update.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            source_bundle_path: Some("source-bundles/fixture.zip".to_string()),
+            deployment_source_type: Some(temps_entities::source_type::SourceType::UploadedSource),
+            ..Default::default()
+        }));
+        let deployment = deployment_update.update(db.as_ref()).await?;
+
+        let jobs = planner.create_deployment_jobs(deployment.id).await?;
+        let prepare = jobs
+            .iter()
+            .find(|job| job.job_id == "prepare_source_bundle")
+            .expect("uploaded Compose must prepare its source archive");
+        assert_eq!(
+            prepare
+                .job_config
+                .as_ref()
+                .and_then(|config| config.get("archive_path"))
+                .and_then(serde_json::Value::as_str),
+            Some("source-bundles/fixture.zip")
+        );
+        let compose = jobs
+            .iter()
+            .find(|job| job.job_id == "deploy_compose")
+            .expect("uploaded Compose must deploy the stack");
+        assert_eq!(
+            compose.dependencies,
+            Some(serde_json::json!(["prepare_source_bundle"]))
+        );
 
         Ok(())
     }
@@ -2713,6 +3393,69 @@ mod tests {
                 public_sentry_dsn_var(preset),
                 None,
                 "expected no public DSN var for {:?}",
+                preset
+            );
+        }
+    }
+
+    #[test]
+    fn public_sentry_tunnel_var_mirrors_dsn_var_presets() {
+        use temps_entities::preset::Preset;
+
+        // Every preset that gets a public DSN var must also get a tunnel
+        // var, under the same public prefix — they're both read by the same
+        // `Sentry.init({ dsn, tunnel })` call in the browser bundle.
+        for preset in [
+            Preset::NextJs,
+            Preset::Nuxt,
+            Preset::Vite,
+            Preset::React,
+            Preset::Vue,
+            Preset::SolidStart,
+            Preset::Remix,
+            Preset::SvelteKit,
+            Preset::Astro,
+            Preset::Rsbuild,
+            Preset::Docusaurus,
+        ] {
+            let dsn_var = public_sentry_dsn_var(preset);
+            let tunnel_var = public_sentry_tunnel_var(preset);
+            assert!(
+                dsn_var.is_some() && tunnel_var.is_some(),
+                "expected both DSN and tunnel vars for {:?}",
+                preset
+            );
+            assert_eq!(
+                dsn_var.unwrap().replace("_DSN", "_TUNNEL"),
+                tunnel_var.unwrap(),
+                "tunnel var must share the DSN var's public prefix for {:?}",
+                preset
+            );
+        }
+
+        // Presets with no public DSN var get no tunnel var either.
+        for preset in [
+            Preset::Angular,
+            Preset::Python,
+            Preset::FastApi,
+            Preset::Flask,
+            Preset::Django,
+            Preset::Rails,
+            Preset::Go,
+            Preset::Rust,
+            Preset::Java,
+            Preset::Laravel,
+            Preset::NodeJs,
+            Preset::Dockerfile,
+            Preset::DockerCompose,
+            Preset::Nixpacks,
+            Preset::Autopack,
+            Preset::Static,
+        ] {
+            assert_eq!(
+                public_sentry_tunnel_var(preset),
+                None,
+                "expected no tunnel var for {:?}",
                 preset
             );
         }

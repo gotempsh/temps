@@ -25,15 +25,13 @@ import {
   Square,
 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
+import { ContainerMetricHistory } from './ContainerMetricHistory'
 
 interface ContainerListProps {
   project: ProjectResponse
   environmentId: string
-  onAction?: (
-    containerId: string,
-    action: 'start' | 'stop' | 'restart'
-  ) => void
+  onAction?: (containerId: string, action: 'start' | 'stop' | 'restart') => void
 }
 
 export function ContainerList({
@@ -206,6 +204,29 @@ function ContainerRow({
         </div>
       </div>
 
+      <ContainerMetricHistory
+        projectId={project.id}
+        environmentId={parseInt(environmentId)}
+        containerId={container.container_id}
+        metric="container.cpu_percent"
+        label="CPU"
+        format={(v) => `${v.toFixed(1)}%`}
+        hideWithoutHistory
+        enabled={running}
+        className="hidden lg:flex"
+      />
+      <ContainerMetricHistory
+        projectId={project.id}
+        environmentId={parseInt(environmentId)}
+        containerId={container.container_id}
+        metric="container.memory_used_bytes"
+        label="Mem"
+        format={formatBytes}
+        hideWithoutHistory
+        enabled={running}
+        className="hidden lg:flex"
+      />
+
       <div
         className="flex items-center gap-1 shrink-0"
         onClick={(e) => e.stopPropagation()}
@@ -265,13 +286,14 @@ function ContainerRow({
 }
 
 function UptimeInline({ createdAt }: { createdAt: string }) {
-  const [label, setLabel] = useState(() => formatUptime(createdAt))
+  // The label is derived from `createdAt` at render time; the interval only
+  // forces a periodic re-render so the elapsed time stays fresh.
+  const [, setTick] = useState(0)
   useEffect(() => {
-    setLabel(formatUptime(createdAt))
-    const id = setInterval(() => setLabel(formatUptime(createdAt)), 30_000)
+    const id = setInterval(() => setTick((t) => t + 1), 30_000)
     return () => clearInterval(id)
-  }, [createdAt])
-  return <span className="tabular-nums">{label} uptime</span>
+  }, [])
+  return <span className="tabular-nums">{formatUptime(createdAt)} uptime</span>
 }
 
 function formatUptime(createdAt: string): string {

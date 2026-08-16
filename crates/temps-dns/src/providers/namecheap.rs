@@ -29,12 +29,30 @@ pub struct NamecheapProvider {
 }
 
 impl NamecheapProvider {
+    /// Summarize an API request without exposing parameter values in logs.
+    fn api_request_summary(command: &str, params: &[(&str, &str)]) -> String {
+        let parameter_names = params
+            .iter()
+            .map(|(name, _)| *name)
+            .collect::<Vec<_>>()
+            .join(",");
+
+        format!(
+            "command={} parameter_count={} parameter_names=[{}]",
+            command,
+            params.len(),
+            parameter_names
+        )
+    }
+
     /// Create a new Namecheap provider with the given credentials
     pub fn new(credentials: NamecheapCredentials) -> Result<Self, DnsError> {
         let client = Client::builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .map_err(|e| DnsError::ApiError(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| {
+                DnsError::ApiError(format!("Failed to create HTTP client: {}", e.without_url()))
+            })?;
 
         let base_url = if credentials.sandbox {
             NAMECHEAP_SANDBOX_URL.to_string()
@@ -61,12 +79,13 @@ impl NamecheapProvider {
             .get("https://api.ipify.org")
             .send()
             .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to get public IP: {}", e)))?;
+            .map_err(|e| {
+                DnsError::ApiError(format!("Failed to get public IP: {}", e.without_url()))
+            })?;
 
-        response
-            .text()
-            .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to read IP response: {}", e)))
+        response.text().await.map_err(|e| {
+            DnsError::ApiError(format!("Failed to read IP response: {}", e.without_url()))
+        })
     }
 
     /// Make an API request to Namecheap
@@ -88,8 +107,8 @@ impl NamecheapProvider {
         query_params.extend(params);
 
         debug!(
-            "Namecheap API request: {} with params: {:?}",
-            command, params
+            request = %Self::api_request_summary(command, params),
+            "Namecheap API request"
         );
 
         let response = self
@@ -98,13 +117,12 @@ impl NamecheapProvider {
             .query(&query_params)
             .send()
             .await
-            .map_err(|e| DnsError::ApiError(format!("API request failed: {}", e)))?;
+            .map_err(|e| DnsError::ApiError(format!("API request failed: {}", e.without_url())))?;
 
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|e| DnsError::ApiError(format!("Failed to read response: {}", e)))?;
+        let body = response.text().await.map_err(|e| {
+            DnsError::ApiError(format!("Failed to read response: {}", e.without_url()))
+        })?;
 
         if !status.is_success() {
             return Err(DnsError::ApiError(format!(
@@ -293,6 +311,7 @@ impl DnsProvider for NamecheapProvider {
             proxy: false,
             auto_ssl: false,
             wildcard: true,
+            flat_hostnames: false,
         }
     }
 
@@ -515,6 +534,24 @@ mod tests {
         let (sld, tld) = NamecheapProvider::split_domain("sub.example.com");
         assert_eq!(sld, "sub.example");
         assert_eq!(tld, "com");
+    }
+
+    #[test]
+    fn test_api_request_summary_excludes_parameter_values() {
+        const SENTINEL_TXT_VALUE: &str = "acme-secret-sentinel-value";
+        let params = [
+            ("SLD", "example"),
+            ("TLD", "com"),
+            ("Address1", SENTINEL_TXT_VALUE),
+        ];
+
+        let summary =
+            NamecheapProvider::api_request_summary("namecheap.domains.dns.setHosts", &params);
+
+        assert!(!summary.contains(SENTINEL_TXT_VALUE));
+        assert!(summary.contains("command=namecheap.domains.dns.setHosts"));
+        assert!(summary.contains("parameter_count=3"));
+        assert!(summary.contains("parameter_names=[SLD,TLD,Address1]"));
     }
 
     #[test]
@@ -930,6 +967,34 @@ mod integration_tests {
             credentials: creds,
             base_url: mock_server.uri(),
         }
+    }
+
+    #[tokio::test]
+    async fn test_list_zones_transport_failure_redacts_api_key() {
+        const SECRET_API_KEY: &str = "namecheap-secret-api-key-sentinel";
+        let provider = NamecheapProvider {
+            client: Client::builder()
+                .timeout(std::time::Duration::from_secs(1))
+                .build()
+                .unwrap(),
+            credentials: NamecheapCredentials {
+                api_user: "testuser".to_string(),
+                api_key: SECRET_API_KEY.to_string(),
+                client_ip: Some("127.0.0.1".to_string()),
+                sandbox: true,
+            },
+            // Port 9 is expected to refuse the connection, forcing reqwest's
+            // transport-error path after query parameters have been attached.
+            base_url: "http://127.0.0.1:9/xml.response".to_string(),
+        };
+
+        let error = provider
+            .list_zones()
+            .await
+            .expect_err("the forced transport failure must return an error");
+
+        assert!(error.to_string().contains("API request failed"));
+        assert!(!error.to_string().contains(SECRET_API_KEY));
     }
 
     #[tokio::test]

@@ -28,11 +28,13 @@ use sea_orm::{
     ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
     QuerySelect,
 };
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::ch_fanout::{row_to_ch, ChEventRow};
 use temps_core::DBDateTime;
 use temps_entities::{events, ip_geolocations};
+
+const WINDOW_LOG_TARGET: &str = "temps_analytics_events::services::ch_backfill::window";
 
 /// Errors surfaced by the backfill helper. Mirrors `ChFanoutError` but is a
 /// distinct type because the surface is much narrower (no orphans, no
@@ -94,7 +96,11 @@ pub async fn backfill_events_window(
     start_cursor: BackfillCursor,
     rate_limit: Option<Duration>,
 ) -> Result<BackfillReport, ChBackfillError> {
-    info!(
+    // This helper runs once per CLI chunk while indicatif owns the terminal.
+    // Keep routine window lifecycle events below INFO so they do not force the
+    // interactive progress bar onto a new line for every chunk.
+    debug!(
+        target: WINDOW_LOG_TARGET,
         from = %from,
         to = %to,
         project_id = ?project_id,
@@ -146,7 +152,8 @@ pub async fn backfill_events_window(
         }
     }
 
-    info!(
+    debug!(
+        target: WINDOW_LOG_TARGET,
         events_pushed = total,
         batches, "ch_backfill window complete"
     );
@@ -289,3 +296,82 @@ async fn push_batch(
 // without taking a direct dependency on `temps-analytics-backend`.
 pub use temps_analytics_backend::clickhouse::{ClickHouseBackend, ClickHouseConfig};
 pub use temps_analytics_backend::migrations::MigrationReport;
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use tracing::{instrument::WithSubscriber, Level};
+    use tracing_subscriber::{layer::SubscriberExt, Layer};
+
+    use super::*;
+
+    #[derive(Clone, Default)]
+    struct CapturedEvents(Arc<Mutex<Vec<(String, Level)>>>);
+
+    impl<S> Layer<S> for CapturedEvents
+    where
+        S: tracing::Subscriber,
+    {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0
+                .lock()
+                .expect("captured-level mutex should not be poisoned")
+                .push((
+                    event.metadata().target().to_string(),
+                    *event.metadata().level(),
+                ));
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backfill_events_window_empty_window_emits_only_debug_lifecycle_events() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results::<events::Model, _, _>(vec![vec![]])
+                .into_connection(),
+        );
+        let captured = CapturedEvents::default();
+        let subscriber = tracing_subscriber::registry().with(captured.clone());
+        let now = chrono::Utc::now();
+
+        let report = async {
+            backfill_events_window(
+                db,
+                Arc::new(::clickhouse::Client::default()),
+                now,
+                now,
+                None,
+                10_000,
+                BackfillCursor::default(),
+                None,
+            )
+            .await
+        }
+        .with_subscriber(subscriber)
+        .await
+        .expect("empty backfill window should succeed");
+
+        assert_eq!(report.events_pushed, 0);
+        assert_eq!(report.batches, 0);
+        let events = captured
+            .0
+            .lock()
+            .expect("captured-level mutex should not be poisoned");
+        let lifecycle_levels: Vec<Level> = events
+            .iter()
+            .filter(|(target, _)| target == WINDOW_LOG_TARGET)
+            .map(|(_, level)| *level)
+            .collect();
+        assert_eq!(
+            lifecycle_levels,
+            vec![Level::DEBUG, Level::DEBUG],
+            "routine per-window events must stay below INFO so they cannot corrupt the CLI progress bar"
+        );
+    }
+}

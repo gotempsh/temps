@@ -478,3 +478,40 @@ body {
     animation: none;
   }
 }
+
+/* Shiki syntax highlighting.
+   The docs site (temps-landing) compiles its MDX with the same github-light /
+   github-dark pair and `defaultColor: false`, which makes shiki emit both
+   colours as custom properties on every token instead of baking one theme in.
+   Mapping them here is what lets a snippet follow the console's theme toggle
+   with no re-highlight — and keeps console snippets visually identical to the
+   ones in the documentation. */
+[style*='--shiki-light'] {
+  color: var(--shiki-light);
+}
+
+.dark [style*='--shiki-dark'] {
+  color: var(--shiki-dark);
+}
+
+/* Shiki emits one <span class="line"> per source line, separated by real
+   newlines. The wrapping <pre> already preserves those, so the line spans
+   stay inline — making them blocks would render every break twice and
+   double-space the whole snippet. */
+
+/* Line numbers via a counter rather than injected text, so copying the block
+   never picks the numbers up. */
+.shiki-code.shiki-line-numbers {
+  counter-reset: shiki-line;
+}
+
+.shiki-code.shiki-line-numbers .line::before {
+  counter-increment: shiki-line;
+  content: counter(shiki-line);
+  display: inline-block;
+  min-width: 3ch;
+  padding-right: 1rem;
+  text-align: right;
+  color: color-mix(in oklch, var(--muted-foreground) 40%, transparent);
+  user-select: none;
+}

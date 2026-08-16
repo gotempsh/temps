@@ -75,6 +75,44 @@ pub struct ProviderCatalogDto {
     /// picked. `None` means "use the CLI's own default" — the UI renders
     /// that as "Use provider default".
     pub default_model: Option<String>,
+    /// Default max turns for the autofixer analysis phase. `None` = built-in
+    /// default (10). Only enforced for CLIs with a turn flag (Claude Code).
+    pub max_turns_analysis: Option<i32>,
+    /// Default max turns for the autofixer fix phase. `None` = built-in
+    /// default (20).
+    pub max_turns_fix: Option<i32>,
+    /// Default max turns for autofixer feedback rounds. `None` = built-in
+    /// default (10).
+    pub max_turns_feedback: Option<i32>,
+    /// True when this provider's CLI supports enforcing a turn cap. False
+    /// for Codex/OpenCode, which run to completion — the UI labels their
+    /// max-turns inputs accordingly.
+    pub supports_max_turns: bool,
+    /// True when the CLI is installed AND authenticated on **this host** —
+    /// the machine running the Temps server process. This is a completely
+    /// different signal from `credential_saved`: that field is about a
+    /// credential seeded into a *sandboxed autofixer container*, while this
+    /// one is what actually gates whether the AI Gateway can route requests
+    /// to this provider (ADR-037's `AgentCliAiService` uses only the host's
+    /// ambient CLI session — ordering `claude setup-token`/`codex login` on
+    /// this machine — and never reads the sandbox credential at all). A
+    /// provider can show `credential_saved: true` and `host_authenticated:
+    /// false` at the same time; only the latter means chat/gateway routing
+    /// will actually work.
+    pub host_authenticated: bool,
+    /// Authentication mechanism reported by the CLI running in the Temps
+    /// process environment (for example `chatgpt_subscription` or
+    /// `host_auth_store`). Never contains credential material.
+    pub host_auth_method: Option<String>,
+    /// Installed CLI version used as part of the model-cache identity.
+    pub host_version: Option<String>,
+    /// `live`, `cache`, `stale_cache`, or `bootstrap`.
+    pub model_source: String,
+    /// Time of the last successful account-aware CLI model discovery.
+    pub models_refreshed_at: Option<String>,
+    /// Explains why `host_authenticated` is false (not installed vs.
+    /// installed-but-not-authenticated), or `None` when it's true.
+    pub host_auth_hint: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -124,6 +162,20 @@ pub struct UpdateProviderRequest {
     /// value so the CLI falls back to its own default.
     #[serde(default)]
     pub default_model: Option<String>,
+    /// Default max turns for the autofixer analysis phase (1–200). `0`
+    /// clears the stored value (built-in default applies); omitted/`None`
+    /// leaves the current value unchanged — so a PATCH that only updates
+    /// `default_model` doesn't wipe the turn settings.
+    #[serde(default)]
+    pub max_turns_analysis: Option<i32>,
+    /// Default max turns for the autofixer fix phase (1–200). `0` clears;
+    /// omitted leaves unchanged.
+    #[serde(default)]
+    pub max_turns_fix: Option<i32>,
+    /// Default max turns for autofixer feedback rounds (1–200). `0` clears;
+    /// omitted leaves unchanged.
+    #[serde(default)]
+    pub max_turns_feedback: Option<i32>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -131,6 +183,9 @@ pub struct UpdateProviderRequest {
 pub struct UpdateProviderResponse {
     pub provider_id: String,
     pub default_model: Option<String>,
+    pub max_turns_analysis: Option<i32>,
+    pub max_turns_fix: Option<i32>,
+    pub max_turns_feedback: Option<i32>,
 }
 
 // ── Routes ────────────────────────────────────────────────────────────────────
@@ -175,48 +230,130 @@ pub async fn list_ai_providers(
 
     let sandbox = load_agent_sandbox(&app_state).await?;
 
-    let providers = PROVIDER_CATALOG
-        .iter()
-        .map(|entry| {
-            let provider_cfg = sandbox.provider_config(entry.id);
-            let credential_saved = provider_cfg.credentials_encrypted.is_some();
-            let current_auth_type = if credential_saved {
-                Some(provider_cfg.auth_type)
-            } else {
-                None
-            };
+    let mut providers = Vec::with_capacity(PROVIDER_CATALOG.len());
+    for entry in PROVIDER_CATALOG.iter() {
+        let provider_cfg = sandbox.provider_config(entry.id);
+        let credential_saved = provider_cfg.credentials_encrypted.is_some();
+        let current_auth_type = if credential_saved {
+            Some(provider_cfg.auth_type)
+        } else {
+            None
+        };
 
-            ProviderCatalogDto {
-                id: entry.id.to_string(),
-                name: entry.name.to_string(),
-                install_command: entry.install_command.to_string(),
-                auth_command: entry.auth_command.to_string(),
-                auth_flavors: entry
-                    .auth_flavors
-                    .iter()
-                    .map(|f| AuthFlavorDto {
-                        id: f.id.to_string(),
-                        label: f.label.to_string(),
-                        description: f.description.to_string(),
-                        format: match f.format {
-                            CredentialFormat::ApiKey => "api_key".to_string(),
-                            CredentialFormat::OauthToken => "oauth_token".to_string(),
-                            CredentialFormat::ConfigFile => "config_file".to_string(),
-                        },
-                        env_var: if matches!(f.format, CredentialFormat::ApiKey) {
-                            Some(f.env_var.to_string())
-                        } else {
-                            None
-                        },
+        let (
+            host_authenticated,
+            host_auth_method,
+            host_auth_hint,
+            host_version,
+            discovered_models,
+            discovered_source,
+            models_refreshed_at,
+        ) = match crate::ai_cli::create_provider(entry.id) {
+            Some(provider) => {
+                let status = provider.get_status().await;
+                let authenticated = status.installed && status.authenticated;
+                let version = status.version.clone();
+                let identity = format!(
+                    "{}|{}|{}|{}",
+                    version.as_deref().unwrap_or("unknown"),
+                    status.auth_method.as_deref().unwrap_or("unknown"),
+                    status.email.as_deref().unwrap_or("unknown"),
+                    status.subscription_type.as_deref().unwrap_or("unknown")
+                );
+                let snapshot = if status.installed {
+                    Some(
+                        crate::ai_cli::discover_model_capabilities_cached(
+                            provider.as_ref(),
+                            identity,
+                            false,
+                        )
+                        .await,
+                    )
+                } else {
+                    None
+                };
+                let models = snapshot
+                    .as_ref()
+                    .map(|snapshot| {
+                        snapshot
+                            .models
+                            .iter()
+                            .map(|model| model.id.clone())
+                            .collect()
                     })
-                    .collect(),
-                models: entry.models.iter().map(|m| m.to_string()).collect(),
-                credential_saved,
-                current_auth_type,
-                default_model: provider_cfg.default_model.clone(),
+                    .unwrap_or_default();
+                (
+                    authenticated,
+                    status.auth_method,
+                    if authenticated {
+                        None
+                    } else {
+                        status.setup_hint
+                    },
+                    version,
+                    models,
+                    snapshot
+                        .as_ref()
+                        .map(|snapshot| snapshot.source)
+                        .unwrap_or("unavailable"),
+                    snapshot.as_ref().and_then(|snapshot| {
+                        (!snapshot.models.is_empty()).then(|| snapshot.refreshed_at.to_rfc3339())
+                    }),
+                )
             }
-        })
-        .collect();
+            None => (false, None, None, None, Vec::new(), "unavailable", None),
+        };
+        let (models, model_source) = if discovered_models.is_empty() {
+            (
+                entry.models.iter().map(|model| model.to_string()).collect(),
+                "bootstrap".to_string(),
+            )
+        } else {
+            (discovered_models, discovered_source.to_string())
+        };
+
+        providers.push(ProviderCatalogDto {
+            id: entry.id.to_string(),
+            name: entry.name.to_string(),
+            install_command: entry.install_command.to_string(),
+            auth_command: entry.auth_command.to_string(),
+            auth_flavors: entry
+                .auth_flavors
+                .iter()
+                .map(|f| AuthFlavorDto {
+                    id: f.id.to_string(),
+                    label: f.label.to_string(),
+                    description: f.description.to_string(),
+                    format: match f.format {
+                        CredentialFormat::ApiKey => "api_key".to_string(),
+                        CredentialFormat::OauthToken => "oauth_token".to_string(),
+                        CredentialFormat::ConfigFile => "config_file".to_string(),
+                    },
+                    env_var: if matches!(f.format, CredentialFormat::ApiKey) {
+                        Some(f.env_var.to_string())
+                    } else {
+                        None
+                    },
+                })
+                .collect(),
+            models,
+            credential_saved,
+            current_auth_type,
+            default_model: provider_cfg.default_model.clone(),
+            max_turns_analysis: provider_cfg.max_turns_analysis,
+            max_turns_fix: provider_cfg.max_turns_fix,
+            max_turns_feedback: provider_cfg.max_turns_feedback,
+            // Only Claude Code has a --max-turns flag today; Codex and
+            // OpenCode run to completion regardless of these settings.
+            supports_max_turns: entry.id == "claude_cli",
+            host_authenticated,
+            host_auth_method,
+            host_version,
+            model_source,
+            models_refreshed_at,
+            host_auth_hint,
+        });
+    }
 
     Ok(Json(ProviderCatalogResponse {
         default_provider: sandbox.default_provider,
@@ -476,21 +613,55 @@ pub async fn update_ai_provider(
         })
     })?;
 
+    // Validate turn caps up front: 0 = clear, 1..=200 = set, else reject.
+    for (field, value) in [
+        ("max_turns_analysis", request.max_turns_analysis),
+        ("max_turns_fix", request.max_turns_fix),
+        ("max_turns_feedback", request.max_turns_feedback),
+    ] {
+        if let Some(v) = value {
+            if v != 0 && !(1..=200).contains(&v) {
+                return Err(Problem::from(AgentError::Validation {
+                    message: format!(
+                        "{} for provider '{}' must be between 1 and 200 (or 0 to clear), got {}",
+                        field, provider_id, v
+                    ),
+                }));
+            }
+        }
+    }
+
     // Normalize the incoming model: empty string → None (clear the field).
-    // Also validate against the catalog when the provider has a non-empty
-    // model list — for free-form providers (OpenCode) we accept anything
-    // the user types, since the catalog doesn't enumerate their models.
-    let new_model = match request.default_model.as_deref() {
+    // The catalog `models` list is a convenience, not an allowlist — CLIs
+    // (especially free-form ones like OpenCode) evolve faster than this
+    // table, so we accept unknown ids. But the stored value is read back at
+    // run time and, for OpenCode, interpolated into a `bash -lc` string, so
+    // we reject shell metacharacters and cap length here to close the stored
+    // command-injection vector. Real model ids use only [A-Za-z0-9._/-:].
+    let new_model = match request.default_model.as_deref().map(str::trim) {
         None | Some("") => None,
         Some(m) => {
-            if !provider.models.is_empty() && !provider.models.contains(&m) {
-                // Allow unknown models too — the catalog `models` list is a
-                // convenience, not an allowlist. CLIs evolve faster than
-                // this table. We just trim + pass through.
-                Some(m.trim().to_string())
-            } else {
-                Some(m.trim().to_string())
+            if m.len() > 128 {
+                return Err(Problem::from(AgentError::Validation {
+                    message: format!(
+                        "model id is too long ({} chars, max 128) for provider '{}'",
+                        m.len(),
+                        provider_id
+                    ),
+                }));
             }
+            if !m
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | ':'))
+            {
+                return Err(Problem::from(AgentError::Validation {
+                    message: format!(
+                        "model id '{}' for provider '{}' contains invalid characters (allowed: letters, digits, . _ / - :)",
+                        m, provider_id
+                    ),
+                }));
+            }
+            Some(m.to_string())
         }
     };
 
@@ -540,6 +711,22 @@ pub async fn update_ai_provider(
             None => serde_json::Value::Null,
         },
     );
+    // Turn caps: omitted → leave the stored value alone; 0 → clear; n → set.
+    for (key, value) in [
+        ("max_turns_analysis", request.max_turns_analysis),
+        ("max_turns_fix", request.max_turns_fix),
+        ("max_turns_feedback", request.max_turns_feedback),
+    ] {
+        match value {
+            None => {}
+            Some(0) => {
+                merged.insert(key.to_string(), serde_json::Value::Null);
+            }
+            Some(v) => {
+                merged.insert(key.to_string(), serde_json::Value::from(v));
+            }
+        }
+    }
     // Fill in required fields if this is the first write for the provider.
     merged
         .entry("auth_type".to_string())
@@ -547,6 +734,12 @@ pub async fn update_ai_provider(
     merged
         .entry("extra".to_string())
         .or_insert(serde_json::Value::Null);
+    // Capture the effective stored values for the response before handing
+    // the object to the settings blob.
+    let stored_turns = |key: &str| merged.get(key).and_then(|v| v.as_i64()).map(|v| v as i32);
+    let effective_max_turns_analysis = stored_turns("max_turns_analysis");
+    let effective_max_turns_fix = stored_turns("max_turns_fix");
+    let effective_max_turns_feedback = stored_turns("max_turns_feedback");
     providers_value.insert(provider_id.clone(), serde_json::Value::Object(merged));
 
     let active = temps_entities::settings::ActiveModel {
@@ -562,6 +755,9 @@ pub async fn update_ai_provider(
     Ok(Json(UpdateProviderResponse {
         provider_id,
         default_model: new_model,
+        max_turns_analysis: effective_max_turns_analysis,
+        max_turns_fix: effective_max_turns_fix,
+        max_turns_feedback: effective_max_turns_feedback,
     }))
 }
 

@@ -5,7 +5,12 @@
  */
 
 import { Button } from '@/components/ui/button'
-import { TOOLTIP_CONTENT_STYLE, TOOLTIP_LABEL_STYLE } from '@/lib/chart-tooltip'
+import {
+  TOOLTIP_CONTENT_STYLE,
+  TOOLTIP_LABEL_STYLE,
+  formatChartTick,
+  formatChartTooltipLabel,
+} from '@/lib/chart-tooltip'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   Collapsible,
@@ -62,7 +67,7 @@ import {
   Trash2,
 } from 'lucide-react'
 import { useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { toast } from 'sonner'
 import {
   LineChart,
@@ -161,6 +166,20 @@ const ENGINE_STAT_METRICS: Record<EngineKind, string[]> = {
     'rustfs_cluster_objects_total',
   ],
 }
+
+// Container resource metrics — CPU/memory of the docker container(s) backing
+// the service, sampled every ~30s by the health monitor. Engine-agnostic:
+// shown for every engine ahead of the engine-specific stats.
+const CONTAINER_STAT_METRICS = [
+  'container.cpu_percent',
+  'container.memory_used_bytes',
+]
+
+const CONTAINER_METRICS = [
+  'container.cpu_percent',
+  'container.memory_used_bytes',
+  'container.memory_percent',
+]
 
 const DEFAULT_CHART_METRIC: Record<EngineKind, string> = {
   postgres: 'pg.connections',
@@ -327,7 +346,15 @@ function formatMetricValue(name: string, value: number): string {
   return value.toFixed(2)
 }
 
+const METRIC_LABELS: Record<string, string> = {
+  // Docker CLI convention: 100% == one core fully used.
+  'container.cpu_percent': 'CPU',
+  'container.memory_used_bytes': 'Memory',
+  'container.memory_percent': 'Memory %',
+}
+
 function labelForMetric(name: string): string {
+  if (METRIC_LABELS[name]) return METRIC_LABELS[name]
   // Strip engine prefix (e.g. "pg.", "redis.", "mongo.", "s3.")
   const bare = name.replace(/^[a-z0-9]+\./, '')
   return bare.replace(/_/g, ' ').replace(/\b\w/g, (c) => c.toUpperCase())
@@ -365,8 +392,9 @@ function AddAlertRuleDialog({
   engine,
   onSuccess,
 }: AddAlertRuleDialogProps) {
+  const alertMetrics = [...CONTAINER_METRICS, ...KNOWN_METRICS[engine]]
   const [name, setName] = useState('')
-  const [metricName, setMetricName] = useState(KNOWN_METRICS[engine][0] ?? '')
+  const [metricName, setMetricName] = useState(alertMetrics[0] ?? '')
   const [threshold, setThreshold] = useState('0')
   const [comparator, setComparator] = useState<Comparator>('gt')
   const [severity, setSeverity] = useState<Severity>('warning')
@@ -409,7 +437,7 @@ function AddAlertRuleDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                {KNOWN_METRICS[engine].map((m) => (
+                {alertMetrics.map((m) => (
                   <SelectItem key={m} value={m}>
                     {labelForMetric(m)}
                   </SelectItem>
@@ -771,7 +799,12 @@ type LiveMetricsProps = {
 const CHART_LINE_COLOR = '#0070f3'
 
 function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
-  const statMetrics = ENGINE_STAT_METRICS[engine]
+  // Container CPU/memory first — resource saturation is the first thing an
+  // operator checks — then the engine-specific headline stats.
+  const statMetrics = [
+    ...CONTAINER_STAT_METRICS,
+    ...ENGINE_STAT_METRICS[engine],
+  ]
   const [selectedMetric, setSelectedMetric] = useState(
     DEFAULT_CHART_METRIC[engine]
   )
@@ -805,10 +838,7 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
   })
 
   const chartData = (rangeData ?? []).map((p) => ({
-    time: new Date(p.time).toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-    }),
+    time: new Date(p.time).getTime(),
     value: p.value,
   }))
 
@@ -831,7 +861,7 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
       )}
 
       {/* Stat row */}
-      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-6">
         {statMetrics.map((name) => {
           const latest = latestByName.get(name)
           const isSelected = name === selectedMetric
@@ -895,10 +925,12 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
               >
                 <XAxis
                   dataKey="time"
+                  type="number"
+                  domain={['dataMin', 'dataMax']}
                   tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
                   tickLine={false}
                   axisLine={false}
-                  interval="preserveStartEnd"
+                  tickFormatter={formatChartTick}
                 />
                 <YAxis
                   tick={{ fontSize: 10, fill: 'rgba(156,163,175,0.9)' }}
@@ -923,8 +955,11 @@ function LiveMetrics({ serviceId, engine, latestMetrics }: LiveMetricsProps) {
                   labelStyle={TOOLTIP_LABEL_STYLE}
                   itemStyle={{ color: CHART_LINE_COLOR }}
                   cursor={{ stroke: 'rgba(128,128,128,0.3)', strokeWidth: 1 }}
-                  formatter={(v: number) => [
-                    formatMetricValue(selectedMetric, v),
+                  labelFormatter={(label) =>
+                    formatChartTooltipLabel(Number(label))
+                  }
+                  formatter={(v) => [
+                    formatMetricValue(selectedMetric, Number(v)),
                     labelForMetric(selectedMetric),
                   ]}
                 />

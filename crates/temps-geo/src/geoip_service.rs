@@ -1,9 +1,9 @@
 use maxminddb::geoip2;
-use rand::seq::SliceRandom;
+use rand::prelude::IndexedRandom;
 use serde::Serialize;
 use std::net::IpAddr;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Serialize, Clone)]
 pub struct GeoLocation {
@@ -15,6 +15,60 @@ pub struct GeoLocation {
     pub region: Option<String>,
     pub timezone: Option<String>,
     pub is_eu: bool,
+    /// The organization that owns the ASN this IP belongs to (e.g. "Hetzner Online GmbH").
+    /// `None` when the ASN database isn't available or the ASN has no organization on file.
+    pub asn_org: Option<String>,
+    /// Best-effort heuristic: does `asn_org` match a known hosting/cloud/VPS provider
+    /// pattern? Datacenter IPs are never real end-user visitors, so this flags traffic
+    /// (often scrapers spoofing a real browser user-agent) that the user-agent-based
+    /// bot detector in temps-analytics-events can't catch. `None` when the ASN database
+    /// isn't available (can't tell either way).
+    pub is_hosting_provider: Option<bool>,
+}
+
+/// Substring patterns (lowercased) matched against an ASN organization name to
+/// flag traffic originating from hosting/cloud/VPS providers rather than
+/// residential or mobile ISPs. Best-effort: a legitimate visitor tunneling
+/// through a corporate VPN hosted on one of these providers would also match,
+/// so this is a signal for the live-visitors view, not a hard security boundary.
+const HOSTING_ORG_PATTERNS: &[&str] = &[
+    "hosting",
+    "vps",
+    "datacenter",
+    "data center",
+    "colocation",
+    "cloud",
+    "server",
+    "amazon",
+    "aws",
+    "google cloud",
+    "microsoft azure",
+    "digitalocean",
+    "linode",
+    "vultr",
+    "ovh",
+    "hetzner",
+    "leaseweb",
+    "scaleway",
+    "contabo",
+    "packet",
+    "equinix",
+    "choopa",
+    "he.net",
+    "hurricane electric",
+    "subnet digital",
+    "americancloud",
+];
+
+/// Detect whether an ASN organization name belongs to a known hosting/cloud/VPS
+/// provider. Returns `false` for an empty name rather than matching everything.
+fn is_hosting_org(org: &str) -> bool {
+    let trimmed = org.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_lowercase();
+    HOSTING_ORG_PATTERNS.iter().any(|pat| lower.contains(pat))
 }
 
 #[derive(Error, Debug)]
@@ -126,8 +180,40 @@ const MOCK_CITIES: &[MockCity] = &[
 ];
 
 pub enum GeoIpService {
-    MaxMind(MaxMindGeoIpService),
+    MaxMind(Box<MaxMindGeoIpService>),
     Mock(MockGeoIpService),
+}
+
+/// Resolves an mmdb filename the same way `validate_geolite2_database`
+/// (temps-cli's serve startup check) does: current working directory first,
+/// falling back to `TEMPS_DATA_DIR` if the CWD candidate doesn't exist. The
+/// two resolution orders must stay in sync -- when they diverged (this
+/// function previously only checked CWD), `temps serve` could pass its own
+/// startup validation (which checks + downloads to `TEMPS_DATA_DIR`) and
+/// then fail to actually open the database here, because a process whose
+/// working directory isn't its data directory (e.g. any Docker/systemd
+/// deployment that doesn't `cd` into `TEMPS_DATA_DIR` before running) would
+/// have downloaded the file to `TEMPS_DATA_DIR` but only ever looked in CWD.
+pub(crate) fn resolve_mmdb_path(filename: &str) -> std::path::PathBuf {
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let data_dir = std::env::var_os("TEMPS_DATA_DIR").map(std::path::PathBuf::from);
+    resolve_mmdb_path_from(filename, &cwd, data_dir.as_deref())
+}
+
+fn resolve_mmdb_path_from(
+    filename: &str,
+    cwd: &std::path::Path,
+    data_dir: Option<&std::path::Path>,
+) -> std::path::PathBuf {
+    let cwd_path = cwd.join(filename);
+    if cwd_path.exists() {
+        return cwd_path;
+    }
+
+    // When neither file exists yet, prefer the configured data directory:
+    // startup downloads there. Returning the absent CWD candidate would make
+    // the plugin wait loop watch a path that can never receive the download.
+    data_dir.map(|path| path.join(filename)).unwrap_or(cwd_path)
 }
 
 impl GeoIpService {
@@ -142,7 +228,7 @@ impl GeoIpService {
             return Ok(Self::Mock(MockGeoIpService::new()));
         }
 
-        let db_path = std::env::current_dir()?.join("GeoLite2-City.mmdb");
+        let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
         debug!("Loading MaxMind database from: {:?}", db_path);
         let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
             GeoIpError::Other(format!(
@@ -151,7 +237,31 @@ impl GeoIpService {
                 e
             ))
         })?;
-        Ok(Self::MaxMind(MaxMindGeoIpService { reader }))
+
+        // ASN database is optional: hosting-provider detection degrades gracefully
+        // (asn_org/is_hosting_provider stay None) rather than failing startup when
+        // the operator hasn't provisioned it, same as the City database's own
+        // optional-file convention in Dockerfile/docker-compose.
+        let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
+        let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
+            Ok(reader) => {
+                info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
+                Some(reader)
+            }
+            Err(e) => {
+                warn!(
+                    "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
+                    asn_db_path.display(),
+                    e
+                );
+                None
+            }
+        };
+
+        Ok(Self::MaxMind(Box::new(MaxMindGeoIpService {
+            reader,
+            asn_reader,
+        })))
     }
 
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
@@ -164,6 +274,7 @@ impl GeoIpService {
 
 pub struct MaxMindGeoIpService {
     reader: maxminddb::Reader<Vec<u8>>,
+    asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
 }
 
 impl MaxMindGeoIpService {
@@ -177,7 +288,39 @@ impl MaxMindGeoIpService {
             .map_err(|e| GeoIpError::NotFound(format!("Failed to decode city data: {}", e)))?
             .ok_or_else(|| GeoIpError::NotFound(format!("No data found for IP: {}", ip)))?;
 
-        Ok(Self::extract_geo_location(&city_data))
+        let mut geo_location = Self::extract_geo_location(&city_data);
+        let (asn_org, is_hosting_provider) = self.lookup_asn(ip);
+        geo_location.asn_org = asn_org;
+        geo_location.is_hosting_provider = is_hosting_provider;
+
+        Ok(geo_location)
+    }
+
+    /// Look up the ASN organization for `ip` and classify it as a hosting
+    /// provider. Any lookup/decode failure degrades to `(None, None)` rather
+    /// than failing the whole geolocation — the City lookup already succeeded
+    /// and callers shouldn't lose city/country data over an optional signal.
+    fn lookup_asn(&self, ip: IpAddr) -> (Option<String>, Option<bool>) {
+        let Some(asn_reader) = &self.asn_reader else {
+            return (None, None);
+        };
+
+        let asn_data = match asn_reader
+            .lookup(ip)
+            .and_then(|result| result.decode::<geoip2::Asn>())
+        {
+            Ok(Some(data)) => data,
+            Ok(None) => return (None, Some(false)),
+            Err(e) => {
+                debug!("ASN lookup failed for IP {}: {}", ip, e);
+                return (None, None);
+            }
+        };
+
+        let org = asn_data.autonomous_system_organization.map(str::to_string);
+        let is_hosting = org.as_deref().map(is_hosting_org);
+
+        (org, is_hosting)
     }
 
     fn extract_geo_location(city_data: &geoip2::City<'_>) -> GeoLocation {
@@ -210,6 +353,8 @@ impl MaxMindGeoIpService {
             region,
             timezone,
             is_eu,
+            asn_org: None,
+            is_hosting_provider: None,
         }
     }
 }
@@ -246,11 +391,13 @@ impl MockGeoIpService {
             region: Some("Unknown".to_string()),
             timezone: Some("UTC".to_string()),
             is_eu: false,
+            asn_org: None,
+            is_hosting_provider: None,
         })
     }
 
     fn random_mock_location() -> Result<GeoLocation, GeoIpError> {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let mock_city = MOCK_CITIES
             .choose(&mut rng)
             .ok_or_else(|| GeoIpError::Other("Failed to select mock city".to_string()))?;
@@ -264,6 +411,8 @@ impl MockGeoIpService {
             region: Some(mock_city.region.to_string()),
             timezone: Some(mock_city.timezone.to_string()),
             is_eu: mock_city.is_eu,
+            asn_org: None,
+            is_hosting_provider: None,
         })
     }
 
@@ -272,5 +421,74 @@ impl MockGeoIpService {
             IpAddr::V4(ipv4) => ipv4.is_private() || ipv4.is_link_local(),
             IpAddr::V6(ipv6) => ipv6.is_loopback() || ipv6.is_unique_local(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_known_hosting_orgs_detected() {
+        assert!(is_hosting_org("EGIHosting"));
+        assert!(is_hosting_org("Subnet Digital LLC (SDL-166)"));
+        assert!(is_hosting_org("Hetzner Online GmbH"));
+        assert!(is_hosting_org("Amazon.com, Inc."));
+        assert!(is_hosting_org("DigitalOcean, LLC"));
+        assert!(is_hosting_org("OVH SAS"));
+    }
+
+    #[test]
+    fn test_residential_isp_not_flagged() {
+        assert!(!is_hosting_org("Comcast Cable Communications, LLC"));
+        assert!(!is_hosting_org("Verizon Communications"));
+        assert!(!is_hosting_org("British Telecommunications PLC"));
+    }
+
+    #[test]
+    fn test_empty_org_not_flagged() {
+        assert!(!is_hosting_org(""));
+        assert!(!is_hosting_org("   "));
+    }
+
+    #[test]
+    fn test_case_insensitive_match() {
+        assert!(is_hosting_org("SUBNET DIGITAL LLC"));
+        assert!(is_hosting_org("subnet digital llc"));
+    }
+
+    #[test]
+    fn mmdb_resolution_watches_data_dir_when_download_is_pending() {
+        let unique = format!(
+            "temps-geo-resolution-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_nanos()
+        );
+        let cwd = std::env::temp_dir().join(&unique).join("cwd");
+        let data_dir = std::env::temp_dir().join(&unique).join("data");
+
+        assert_eq!(
+            resolve_mmdb_path_from("GeoLite2-City.mmdb", &cwd, Some(&data_dir)),
+            data_dir.join("GeoLite2-City.mmdb")
+        );
+    }
+
+    #[test]
+    fn mmdb_resolution_keeps_existing_cwd_file_precedence() {
+        let root = std::env::temp_dir().join(format!("temps-geo-existing-{}", std::process::id()));
+        let cwd = root.join("cwd");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&cwd).expect("create test cwd");
+        let cwd_file = cwd.join("GeoLite2-City.mmdb");
+        std::fs::write(&cwd_file, b"test").expect("write test mmdb placeholder");
+
+        assert_eq!(
+            resolve_mmdb_path_from("GeoLite2-City.mmdb", &cwd, Some(&data_dir)),
+            cwd_file
+        );
+
+        std::fs::remove_dir_all(&root).expect("remove test directories");
     }
 }

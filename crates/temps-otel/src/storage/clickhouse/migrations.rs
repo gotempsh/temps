@@ -34,6 +34,26 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_metrics",
         sql: include_str!("../../../migrations/clickhouse/0003_metrics.sql"),
     },
+    Migration {
+        name: "0004_retention_days",
+        sql: include_str!("../../../migrations/clickhouse/0004_retention_days.sql"),
+    },
+    Migration {
+        name: "0005_retention_ttl",
+        sql: include_str!("../../../migrations/clickhouse/0005_retention_ttl.sql"),
+    },
+    Migration {
+        name: "0006_trace_refs",
+        sql: include_str!("../../../migrations/clickhouse/0006_trace_refs.sql"),
+    },
+    Migration {
+        name: "0007_spans_recent_projection",
+        sql: include_str!("../../../migrations/clickhouse/0007_spans_recent_projection.sql"),
+    },
+    Migration {
+        name: "0008_facet_slots",
+        sql: include_str!("../../../migrations/clickhouse/0008_facet_slots.sql"),
+    },
 ];
 
 /// SQL for the migration tracking table. Created on first run.

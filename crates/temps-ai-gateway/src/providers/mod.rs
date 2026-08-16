@@ -1,11 +1,15 @@
 pub mod anthropic;
 pub mod gemini;
 pub mod openai_compat;
+mod openai_responses;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::time::Duration;
 use tokio_stream::Stream;
 
 use crate::error::AiGatewayError;
@@ -127,6 +131,55 @@ pub struct ProviderConfig {
     pub provider_id: String,
     pub api_key: String,
     pub base_url: String,
+}
+
+/// DNS resolver used by every provider HTTP client. It rejects an entire DNS
+/// answer when any address is private or otherwise non-public, so a custom
+/// provider hostname cannot rebind to metadata or an internal service between
+/// URL validation and connect time.
+#[derive(Debug)]
+struct ExternalOnlyResolver;
+
+impl reqwest::dns::Resolve for ExternalOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?
+                .collect();
+            if addresses.is_empty() {
+                return Err(format!("provider hostname '{host}' resolved to no addresses").into());
+            }
+            for address in &addresses {
+                let result = match address.ip() {
+                    std::net::IpAddr::V4(ip) => temps_core::url_validation::validate_ipv4(&ip),
+                    std::net::IpAddr::V6(ip) => temps_core::url_validation::validate_ipv6(&ip),
+                };
+                if result.is_err() {
+                    return Err(format!(
+                        "provider hostname '{host}' resolved to a blocked internal address"
+                    )
+                    .into());
+                }
+            }
+            let addresses: reqwest::dns::Addrs = Box::new(addresses.into_iter());
+            Ok(addresses)
+        })
+    }
+}
+
+/// Build the hardened client shared by inference and model discovery.
+/// Redirects are disabled because an otherwise-public provider endpoint must
+/// not forward an API key to an attacker-selected internal redirect target.
+pub(crate) fn external_http_client(timeout: Duration) -> reqwest::Client {
+    reqwest::Client::builder()
+        .timeout(timeout)
+        .connect_timeout(Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .dns_resolver(Arc::new(ExternalOnlyResolver))
+        .build()
+        .expect("provider HTTP client configuration is valid")
 }
 
 #[cfg(test)]

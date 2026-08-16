@@ -150,14 +150,16 @@ async function listBackupsAction(options: ListBackupsOptions): Promise<void> {
       accessor: (r) =>
         typeof r.size_bytes === 'number' && r.size_bytes != null
           ? formatBytes(r.size_bytes)
-          : colors.muted('—'),
+          : '—',
+      color: (value, r) => typeof r.size_bytes === 'number' && r.size_bytes != null ? value : colors.muted(value),
     },
     {
       header: 'Location',
       accessor: (r) =>
         (r.location ?? '').startsWith('s3://')
-          ? colors.success('WAL-G')
-          : colors.muted('legacy'),
+          ? 'WAL-G'
+          : 'legacy',
+      color: (value, r) => (r.location ?? '').startsWith('s3://') ? colors.success(value) : colors.muted(value),
     },
     {
       header: 'Created',
@@ -258,14 +260,7 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
 
   // Step 4: confirmation.
   if (!options.yes) {
-    const modeLabel =
-      mode.mode === 'in_place'
-        ? `Restore in place (DESTRUCTIVE) onto '${serviceName}'`
-        : mode.mode === 'new_service'
-          ? `Clone into new service '${targetName}'`
-          : mode.to_new_service
-            ? `Point-in-time recovery → new service '${targetName}'`
-            : `Point-in-time recovery (DESTRUCTIVE) onto '${serviceName}'`
+    const modeLabel = describeRestoreMode(mode, serviceName, targetName)
     newline()
     header(`${icons.arrow} ${modeLabel}`)
     keyValue('Source service', `${serviceName} (id ${serviceId}, ${serviceType})`)
@@ -275,10 +270,7 @@ async function restoreAction(options: RestoreOptions): Promise<void> {
     }
     newline()
     const go = await promptConfirm({
-      message:
-        mode.mode === 'in_place' || (mode.mode === 'pitr' && !mode.to_new_service)
-          ? `This will OVERWRITE data on '${serviceName}'. Continue?`
-          : `Proceed with restore?`,
+      message: describeRestoreConfirmPrompt(mode, serviceName),
       default: false,
     })
     if (!go) {
@@ -358,17 +350,18 @@ async function listRunsAction(options: RestoreRunsOptions): Promise<void> {
     { header: 'Phase', accessor: (r) => r.phase },
     {
       header: 'Status',
-      accessor: (r) =>
-        statusBadge(
-          r.status === 'completed' ? 'active' : r.status === 'failed' ? 'inactive' : 'pending',
-        ),
+      accessor: (r) => r.status,
+      color: (_value, r) => statusBadge(
+        r.status === 'completed' ? 'active' : r.status === 'failed' ? 'inactive' : 'pending',
+      ),
     },
     {
       header: 'Target',
       accessor: (r) =>
         r.target_service_id != null
           ? `#${r.target_service_id} (${r.target_service_name ?? ''})`
-          : colors.muted('—'),
+          : '—',
+      color: (value, r) => r.target_service_id != null ? value : colors.muted(value),
     },
     {
       header: 'Started',
@@ -422,6 +415,33 @@ async function showRunAction(options: RestoreRunShowOptions): Promise<void> {
 }
 
 // ---- Helpers -------------------------------------------------------------
+
+/**
+ * Describe the confirmation header shown before a restore runs. Getting the
+ * DESTRUCTIVE/OVERWRITE wording right matters: it's the only warning a human
+ * operator sees before data on the source service is replaced in place.
+ */
+export function describeRestoreMode(
+  mode: RestoreRequestMode,
+  serviceName: string,
+  targetName?: string,
+): string {
+  return mode.mode === 'in_place'
+    ? `Restore in place (DESTRUCTIVE) onto '${serviceName}'`
+    : mode.mode === 'new_service'
+      ? `Clone into new service '${targetName}'`
+      : mode.to_new_service
+        ? `Point-in-time recovery → new service '${targetName}'`
+        : `Point-in-time recovery (DESTRUCTIVE) onto '${serviceName}'`
+}
+
+/** Only in-place restores (or PITR that stays in place) overwrite the source
+ *  service, so only those get the OVERWRITE warning in the confirm prompt. */
+export function describeRestoreConfirmPrompt(mode: RestoreRequestMode, serviceName: string): string {
+  return mode.mode === 'in_place' || (mode.mode === 'pitr' && !mode.to_new_service)
+    ? `This will OVERWRITE data on '${serviceName}'. Continue?`
+    : `Proceed with restore?`
+}
 
 async function askForBackupId(): Promise<number> {
   const value = await promptText({
@@ -485,7 +505,7 @@ async function pollRestoreRun(runId: number): Promise<RestoreRunView> {
   throw new Error('Restore poll timeout')
 }
 
-function formatBytes(n: number): string {
+export function formatBytes(n: number): string {
   if (!Number.isFinite(n) || n <= 0) return '0 B'
   const units = ['B', 'KB', 'MB', 'GB', 'TB']
   let v = n

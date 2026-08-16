@@ -108,6 +108,22 @@ impl AgentCommand {
 
             tracing::info!("Starting temps agent (node_id={})...", config.node_id);
 
+            // Nightly Docker image + build-cache prune. Worker nodes build
+            // and pull images locally but never run the console's plugin
+            // system (where `DockerCleanupService` normally lives), so
+            // without this they accumulate build cache/images forever.
+            // See `DockerOnlyCleanupScheduler` for why this is split out
+            // from the console's DB-backed cleanup service.
+            tokio::spawn({
+                let cleanup_scheduler =
+                    temps_deployments::services::DockerOnlyCleanupScheduler::new(Arc::new(
+                        temps_deployments::services::DefaultDockerClient,
+                    ));
+                async move {
+                    cleanup_scheduler.start_cleanup_scheduler().await;
+                }
+            });
+
             // Internal-zone route store (Option 1 sync). Hydrated from
             // disk so the agent serves correctly across restarts even
             // when the CP is briefly unreachable. The sync client below
@@ -159,6 +175,7 @@ impl AgentCommand {
             {
                 let bridge_slot = overlay_bridge_address.clone();
                 let store = route_store.clone();
+                let proxy_docker = docker.clone();
                 let proxy_shutdown = route_sync_shutdown.clone();
                 tokio::spawn(async move {
                     let bridge_ip = loop {
@@ -179,9 +196,14 @@ impl AgentCommand {
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     };
-                    if let Err(e) =
-                        temps_agent::internal_proxy::spawn(bridge_ip, 80, store, proxy_shutdown)
-                            .await
+                    if let Err(e) = temps_agent::internal_proxy::spawn(
+                        bridge_ip,
+                        80,
+                        store,
+                        proxy_docker,
+                        proxy_shutdown,
+                    )
+                    .await
                     {
                         tracing::warn!(
                             error = %e,

@@ -1,20 +1,25 @@
-import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 
 export function ProjectCardSkeleton() {
   return (
-    <Card>
-      <CardHeader className="flex flex-row items-center gap-4">
-        <Skeleton className="h-10 w-10 rounded-lg" />
-        <div className="flex-1 space-y-2">
-          <Skeleton className="h-4 w-[200px]" />
-          <Skeleton className="h-4 w-[160px]" />
+    <div className="grid gap-4 px-4 py-3.5 lg:grid-cols-[minmax(14rem,0.8fr)_minmax(30rem,1.7fr)_minmax(11rem,0.65fr)_2.5rem] lg:items-center">
+      <div className="flex items-center gap-3">
+        <Skeleton className="size-9 shrink-0 rounded-md" />
+        <div className="space-y-1.5">
+          <Skeleton className="h-4 w-36" />
+          <Skeleton className="h-3 w-24" />
         </div>
-      </CardHeader>
-      <CardContent className="flex items-center justify-between">
-        <Skeleton className="h-4 w-[100px]" />
-        <Skeleton className="h-4 w-[60px]" />
-      </CardContent>
-    </Card>
+      </div>
+      <div className="grid grid-cols-2 gap-6 xl:grid-cols-3">
+        <Skeleton className="h-8 w-28" />
+        <Skeleton className="h-8 w-28" />
+        <Skeleton className="h-8 w-36" />
+      </div>
+      <div className="space-y-1.5">
+        <Skeleton className="h-5 w-20" />
+        <Skeleton className="h-3 w-24" />
+      </div>
+      <Skeleton className="hidden h-5 w-9 lg:block" />
+    </div>
   )
 }

@@ -29,15 +29,15 @@ aws-sdk-s3 = { workspace = true }
 # list at compile time also makes prod hosts immune to a missing/broken
 # /etc/ssl/certs, and keeps test runs hermetic.
 aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
-webpki-root-certs = "0.26"
-pem = "3"
+webpki-root-certs = "1.0"
+pem = "4"
 sea-orm = { workspace = true }
 serde_json = { workspace = true }
 serde_derive = { workspace = true }
 thiserror = { workspace = true }
 serde_yaml = { workspace = true }
 tracing = { workspace = true }
-cron = "0.15.0"
+cron = "0.17.0"
 anyhow = { workspace = true }
 chrono = { workspace = true }
 tokio-util = { workspace = true }

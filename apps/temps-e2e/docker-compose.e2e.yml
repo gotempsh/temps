@@ -1,0 +1,131 @@
+# Local ACME (TLS certificate) and email test infrastructure.
+#
+# `tls-scenario` proves the real HTTP-01 issuance path end to end -- it needs
+# a live ACME server, and hitting real Let's Encrypt from every dev machine
+# and CI run would mean real rate limits and real public DNS. Pebble is
+# Let's Encrypt's own ACME v2 test server for exactly this: no rate limits,
+# a fixed self-signed test root, and it validates for real (a genuine
+# HTTP request against whatever answers on the challenge port), it just
+# never talks to the public internet.
+#
+# `email-scenario` needs an SMTP target that actually receives mail so the
+# test can assert on content, not just "the send call returned 200" --
+# Mailpit is the same image already proven for this in
+# crates/temps-notifications's Rust integration tests.
+#
+# Usage: see apps/temps-e2e/README.md for the full walkthrough, including
+# why `tls-scenario` needs the target `temps serve` instance's proxy running
+# on a fixed port (5002) rather than a normal dev slot's port.
+
+networks:
+  # Named explicitly (not left as the project-directory-derived default) so
+  # the tls-scenario setup step can join this network by a name that's
+  # stable regardless of which directory `docker compose` is invoked from.
+  pebble-net:
+    name: temps-e2e-pebble-net
+
+services:
+  pebble:
+    image: ghcr.io/letsencrypt/pebble:latest
+    # -dnsserver points Pebble's own domain resolution (used to find where to
+    # send HTTP-01/DNS-01 validation requests) at pebble-challtestsrv instead
+    # of real DNS. PEBBLE_VA_NOSLEEP skips Pebble's artificial validation
+    # delay (present by default to mimic real-world latency) so runs aren't
+    # slower than they need to be.
+    # ENTRYPOINT is already the `pebble` binary -- `command:` supplies only
+    # its flags, not the binary name again.
+    command:
+      [
+        "-config",
+        "/test/config/pebble-config.json",
+        "-dnsserver",
+        "pebble-challtestsrv:8053",
+      ]
+    environment:
+      PEBBLE_VA_NOSLEEP: "1"
+    ports:
+      # 14000: ACME directory (what ACME_DIRECTORY_URL points at).
+      # 15000: management API, unused here but harmless to expose.
+      - "14000:14000"
+      - "15000:15000"
+    depends_on:
+      - pebble-challtestsrv
+    networks:
+      - pebble-net
+
+  pebble-challtestsrv:
+    image: ghcr.io/letsencrypt/pebble-challtestsrv:latest
+    # challtestsrv ships its own built-in HTTP-01/HTTPS-01/TLS-ALPN-01
+    # responders (default ports 5002/5003/5001) for testing ACME *clients*
+    # against a fake backend. We don't want that here -- the thing being
+    # validated is temps' own proxy, which serves the real challenge itself,
+    # so those are disabled (empty string) to avoid a port collision with it.
+    # Only the DNS server (for resolving the test domain to the host) and the
+    # management API (for /set-default-ipv4 and DNS-01 TXT records) run.
+    # ENTRYPOINT is already the `pebble-challtestsrv` binary -- `command:`
+    # supplies only its flags, not the binary name again.
+    command:
+      [
+        "-dnsserver",
+        ":8053",
+        "-http01",
+        "",
+        "-https01",
+        "",
+        "-tlsalpn01",
+        "",
+        "-doh",
+        "",
+        "-management",
+        ":8055",
+      ]
+    ports:
+      - "8053:8053/udp"
+      # Management API (temps-dns's PebbleDnsProvider talks to this for
+      # DNS-01, and tls-scenario's setup step uses /set-default-ipv4 here so
+      # Pebble's HTTP-01 validation request reaches the host). Published on
+      # the host as 8056, not challtestsrv's own default of 8055, because
+      # 8055 is already in persistent use by an unrelated container on dev
+      # machines running other DNS-governance work -- PebbleCredentials'
+      # `management_url` is a plain config value, not a hardcoded port, so
+      # this is just what this compose file happens to publish it as.
+      - "8056:8055"
+    # Pebble and pebble-challtestsrv run in Docker; the `temps serve` process
+    # under test runs natively on the host (per the start-temps skill). This
+    # gives both containers a stable way to reach the host regardless of
+    # platform -- Docker Desktop provides `host.docker.internal` natively,
+    # this makes it work the same way on plain dockerd (GitHub Actions
+    # Linux runners) too.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    networks:
+      - pebble-net
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      # 1025: SMTP -- point the e2e SMTP provider's host/port at this.
+      # 8025: web UI + REST API (GET /api/v1/messages) used to assert receipt.
+      - "1025:1025"
+      - "8025:8025"
+
+  minio:
+    image: minio/minio:latest
+    # `backup-restore-scenario` needs a real S3-compatible target so the
+    # backup engine's actual upload (and the restore's actual download) get
+    # exercised, not just the API's bookkeeping rows -- same reasoning as
+    # Pebble/Mailpit above. This is the same image + credentials already
+    # proven in crates/temps-backup's own testcontainers-based Rust
+    # integration tests (`test_backup_to_minio_integration`).
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    ports:
+      # Published as 9092/9093, not MinIO's own defaults of 9000/9001,
+      # because 9000-9004 are already in persistent use by unrelated
+      # containers on dev machines running other work -- same reasoning as
+      # pebble-challtestsrv's 8055->8056 remap above. The S3 source's
+      # `endpoint` is a plain config value, not a hardcoded port.
+      - "9092:9000" # S3 API
+      - "9093:9001" # web console, unused here but harmless to expose

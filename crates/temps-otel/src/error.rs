@@ -6,6 +6,11 @@ pub enum OtelError {
     #[error("Authentication failed for project: {reason}")]
     AuthFailed { reason: String },
 
+    #[error(
+        "Authentication failed for claimed project '{claimed_project_slug}': Missing token in Authorization or X-Temps-Api-Key header"
+    )]
+    MissingAuthToken { claimed_project_slug: String },
+
     #[error("Invalid API key format")]
     InvalidApiKey,
 
@@ -17,6 +22,9 @@ pub enum OtelError {
 
     #[error("Rate limit exceeded for service {service_id}: {limit} requests/min")]
     ServiceRateLimitExceeded { service_id: i32, limit: u32 },
+
+    #[error("OTel ingest is saturated: at most {limit} requests may be processed concurrently")]
+    IngestSaturated { limit: usize },
 
     #[error(
         "Storage quota exceeded for project {project_id}: used {used_bytes} of {limit_bytes} bytes"
@@ -80,6 +88,17 @@ mod tests {
     }
 
     #[test]
+    fn test_display_missing_auth_token_includes_project_slug() {
+        let err = OtelError::MissingAuthToken {
+            claimed_project_slug: "example-project".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "Authentication failed for claimed project 'example-project': Missing token in Authorization or X-Temps-Api-Key header"
+        );
+    }
+
+    #[test]
     fn test_display_invalid_api_key() {
         let err = OtelError::InvalidApiKey;
         assert_eq!(err.to_string(), "Invalid API key format");
@@ -100,6 +119,15 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Rate limit exceeded for project 7: 500 requests/min"
+        );
+    }
+
+    #[test]
+    fn test_display_ingest_saturated() {
+        let err = OtelError::IngestSaturated { limit: 64 };
+        assert_eq!(
+            err.to_string(),
+            "OTel ingest is saturated: at most 64 requests may be processed concurrently"
         );
     }
 

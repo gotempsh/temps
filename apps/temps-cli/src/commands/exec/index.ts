@@ -18,6 +18,23 @@ interface ExecOptions {
   environment?: string
 }
 
+/**
+ * Pick which environment's containers to show as "helpful context".
+ *
+ * Matches by name (case-insensitive) or exact slug so `--environment prod`
+ * and `--environment Production` both work; falls back to the first
+ * environment when no `--environment` flag was given.
+ */
+export function selectTargetEnvironment<T extends { name: string; slug: string }>(
+  environments: T[],
+  environmentOption?: string,
+): T | undefined {
+  if (!environmentOption) return environments[0]
+  return environments.find(
+    (e) => e.name.toLowerCase() === environmentOption.toLowerCase() || e.slug === environmentOption
+  )
+}
+
 async function exec(_command: string | undefined, options: ExecOptions): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -57,11 +74,7 @@ async function exec(_command: string | undefined, options: ExecOptions): Promise
       if (envsError || !environments || environments.length === 0) return []
 
       // Fetch containers from the first environment (or specified one)
-      const targetEnv = options.environment
-        ? environments.find(
-            e => e.name.toLowerCase() === options.environment!.toLowerCase() || e.slug === options.environment
-          )
-        : environments[0]
+      const targetEnv = selectTargetEnvironment(environments, options.environment)
 
       if (!targetEnv) return []
 

@@ -41,7 +41,7 @@ import {
   User,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 
 // Type definitions for event data
 interface IncrementalSnapshotData {

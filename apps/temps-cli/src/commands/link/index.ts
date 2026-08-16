@@ -5,10 +5,38 @@ import { getProjectBySlug, getProjects, getEnvironments } from '../../api/sdk.ge
 import { writeProjectConfig, hasProjectConfig, readProjectConfig } from '../../config/project-config.js'
 import { promptSearch, promptSelect, promptConfirm } from '../../ui/prompts.js'
 import { withSpinner } from '../../ui/spinner.js'
-import { success, info, warning, newline, icons, colors, keyValue, box } from '../../ui/output.js'
+import { info, warning, newline, icons, colors, box } from '../../ui/output.js'
 
 interface LinkOptions {
   environment?: string
+}
+
+interface SearchChoice {
+  name: string
+  value: string
+  description?: string
+}
+
+/** Shape the project search prompt's choices: label, slug, and an optional branch hint. */
+export function toProjectChoices(
+  projects: Array<{ name: string; slug: string; main_branch?: string | null }>,
+): SearchChoice[] {
+  return projects.map((p) => ({
+    name: `${p.name} (${p.slug})`,
+    value: p.slug,
+    description: p.main_branch ? `Branch: ${p.main_branch}` : undefined,
+  }))
+}
+
+/** Shape the environment select prompt's choices, flagging previews. */
+export function toEnvironmentChoices(
+  envs: Array<{ name: string; is_preview?: boolean }>,
+): SearchChoice[] {
+  return envs.map((e) => ({
+    name: e.name,
+    value: e.name,
+    description: e.is_preview ? 'Preview' : undefined,
+  }))
 }
 
 async function link(projectSlug: string | undefined, options: LinkOptions): Promise<void> {
@@ -69,11 +97,7 @@ async function link(projectSlug: string | undefined, options: LinkOptions): Prom
 
     slug = await promptSearch({
       message: 'Select a project to link',
-      choices: projects.map(p => ({
-        name: `${p.name} (${p.slug})`,
-        value: p.slug,
-        description: p.main_branch ? `Branch: ${p.main_branch}` : undefined,
-      })),
+      choices: toProjectChoices(projects),
     })
   }
 
@@ -98,11 +122,7 @@ async function link(projectSlug: string | undefined, options: LinkOptions): Prom
           if (setDefault) {
             environmentName = await promptSelect({
               message: 'Default environment',
-              choices: envs.map(e => ({
-                name: e.name,
-                value: e.name,
-                description: e.is_preview ? 'Preview' : undefined,
-              })),
+              choices: toEnvironmentChoices(envs),
             })
           }
         }

@@ -1,6 +1,6 @@
 {
 	"name": "@temps-sdk/vue-analytics",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"description": "Temps analytics for Vue 3 — plugin + composables for events, Web Vitals, engagement, and session replay.",
 	"private": false,
 	"type": "module",

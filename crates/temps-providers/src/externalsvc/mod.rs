@@ -10,6 +10,7 @@ pub mod managed_s3;
 pub mod mariadb;
 pub mod mariadb_binlog_health;
 pub mod mongodb;
+pub mod naming;
 pub mod port_util;
 pub mod postgres;
 pub mod postgres_cluster;
@@ -40,6 +41,7 @@ pub use cluster_role::{ClusterRole, PgAutoFailoverState};
 pub use managed_s3::{ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection};
 pub use mariadb::{BinlogManifest, MariaDbService};
 pub use mongodb::MongodbService;
+pub use naming::{legacy_managed_instance_names, managed_instance_name};
 pub use postgres::PostgresService;
 pub use postgres_cluster::PostgresClusterService;
 pub use redis::RedisService;
@@ -779,6 +781,46 @@ pub trait ExternalService: Send + Sync {
         Ok(())
     }
 
+    /// Force this service's container to be recreated so a CMD-level config
+    /// change (e.g. `shared_preload_libraries`) takes effect.
+    ///
+    /// Unlike a plain `start()` on a fresh, unhydrated instance, callers here
+    /// pass `service_config` explicitly so the engine can populate its
+    /// in-memory config before recreating — a freshly-constructed instance
+    /// (as returned by `ExternalServiceManager::create_service_instance_for_parameter_value`)
+    /// has no config until `init()`/this method hydrates it, and the normal
+    /// reconcile-on-start drift check needs that config to build the new
+    /// container once a recreate is warranted.
+    ///
+    /// Default is a no-op; only engines with CMD-baked config that can drift
+    /// post-creation (currently Postgres, for `shared_preload_libraries`)
+    /// override this.
+    async fn force_recreate(&self, _service_config: ServiceConfig) -> Result<()> {
+        Ok(())
+    }
+
+    /// Enable continuous WAL/log-shipping archiving into `walg_prefix` after
+    /// a successful base backup, so a subsequent restore isn't limited to
+    /// exactly the backup's snapshot moment.
+    ///
+    /// Without this, `wal-g backup-push` alone produces a base backup whose
+    /// `backup_label` references a stop LSN/checkpoint that no WAL segment
+    /// ever gets archived for — restore then fails at Postgres startup with
+    /// "could not locate required checkpoint record", because
+    /// `wal-g wal-fetch` has nothing to fetch. Callers should treat failure
+    /// here as non-fatal to the backup itself (log and continue): the base
+    /// backup already succeeded, only continuous archiving is missing.
+    ///
+    /// Default is a no-op; only Postgres (WAL-G) overrides it.
+    async fn enable_continuous_archiving(
+        &self,
+        _service_config: ServiceConfig,
+        _s3_credentials: &S3Credentials,
+        _walg_prefix: &str,
+    ) -> Result<()> {
+        Ok(())
+    }
+
     /// Get service type
     fn get_type(&self) -> ServiceType;
 
@@ -911,6 +953,20 @@ pub trait ExternalService: Send + Sync {
         _service_config: ServiceConfig,
     ) -> Result<()> {
         Err(anyhow::anyhow!("Restore not implemented for this service"))
+    }
+
+    /// Restore into the existing service with access to the selected backup row.
+    /// Engines that need backup-specific metadata (for example WAL-G user data)
+    /// override this method; the default preserves the legacy restore path.
+    async fn restore_in_place(&self, ctx: RestoreContext<'_>) -> Result<()> {
+        self.restore_from_s3(
+            ctx.s3_client,
+            ctx.s3_credentials,
+            ctx.backup_location,
+            ctx.s3_source,
+            ctx.source_config,
+        )
+        .await
     }
 
     // -----------------------------------------------------------------------

@@ -30,6 +30,7 @@ interface SandboxStatus {
   image_ready: boolean
   image_name: string
   error: string | null
+  firecracker_available: boolean
 }
 
 const RUNTIME_PRESETS = [
@@ -67,6 +68,7 @@ export function AgentSandboxSandboxPage() {
   const [globalConfigRepo, setGlobalConfigRepo] = useState('')
   const [globalConfigRepoBranch, setGlobalConfigRepoBranch] = useState('main')
   const [defaultProvider, setDefaultProvider] = useState('claude_cli')
+  const [sandboxBackend, setSandboxBackend] = useState('docker')
   const [isDirty, setIsDirty] = useState(false)
 
   const [sandboxStatus, setSandboxStatus] = useState<SandboxStatus | null>(null)
@@ -97,6 +99,7 @@ export function AgentSandboxSandboxPage() {
       setCpuLimit(s.cpu_limit)
       setMemoryLimitMb(s.memory_limit_mb)
       setResourcePreset(getResourcePresetLabel(s.cpu_limit, s.memory_limit_mb))
+      setSandboxBackend(s.sandbox_backend || 'docker')
     }
     if (settings?.ai_config) {
       setGlobalConfigRepo(settings.ai_config.config_repo || '')
@@ -188,6 +191,7 @@ export function AgentSandboxSandboxPage() {
           api_key_saved: settings?.agent_sandbox?.api_key_saved ?? false,
           auth_type: settings?.agent_sandbox?.auth_type ?? '',
           providers: settings?.agent_sandbox?.providers ?? {},
+          sandbox_backend: sandboxBackend,
         },
         ai_config: {
           ...(settings?.ai_config ?? {}),
@@ -315,6 +319,66 @@ export function AgentSandboxSandboxPage() {
                 to start.
               </AlertDescription>
             </Alert>
+          </CardContent>
+        </Card>
+
+        <Card>
+          <CardHeader>
+            <CardTitle className="text-base">Isolation Backend</CardTitle>
+            <CardDescription>
+              Default sandbox isolation technology for new workflow runs.
+              Firecracker provides stronger isolation via KVM microVMs; Docker is the
+              standard default.
+            </CardDescription>
+          </CardHeader>
+          <CardContent>
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+              <button
+                onClick={() => {
+                  setSandboxBackend('docker')
+                  setIsDirty(true)
+                }}
+                className={`rounded-lg border p-3 text-left transition-colors ${
+                  sandboxBackend === 'docker'
+                    ? 'border-primary bg-primary/5'
+                    : 'border-border hover:border-primary/50'
+                }`}
+              >
+                <p className="text-sm font-medium">Docker</p>
+                <p className="text-xs text-muted-foreground">
+                  Container-based isolation — available on all hosts with Docker.
+                </p>
+              </button>
+              <div
+                title={
+                  sandboxStatus && !sandboxStatus.firecracker_available
+                    ? 'Firecracker is not yet available — run `temps firecracker setup` to provision this host'
+                    : undefined
+                }
+              >
+                <button
+                  onClick={() => {
+                    if (!sandboxStatus || sandboxStatus.firecracker_available) {
+                      setSandboxBackend('firecracker')
+                      setIsDirty(true)
+                    }
+                  }}
+                  disabled={sandboxStatus != null && !sandboxStatus.firecracker_available}
+                  className={`w-full rounded-lg border p-3 text-left transition-colors ${
+                    sandboxBackend === 'firecracker'
+                      ? 'border-primary bg-primary/5'
+                      : 'border-border hover:border-primary/50'
+                  } disabled:opacity-50 disabled:cursor-not-allowed`}
+                >
+                  <p className="text-sm font-medium">Firecracker</p>
+                  <p className="text-xs text-muted-foreground">
+                    {sandboxStatus && !sandboxStatus.firecracker_available
+                      ? 'Not available — run `temps firecracker setup`'
+                      : 'KVM microVM isolation — stronger security boundary.'}
+                  </p>
+                </button>
+              </div>
+            </div>
           </CardContent>
         </Card>
 
@@ -496,7 +560,7 @@ export function AgentSandboxSandboxPage() {
           and auto-dismisses when the user saves successfully. */}
       {isDirty && (
         <div className="fixed bottom-0 left-0 right-0 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg z-30">
-          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between gap-3">
+          <div className="w-full px-4 sm:px-6 lg:px-8 py-3 flex items-center justify-between gap-3">
             <p className="text-sm text-muted-foreground">
               You have unsaved sandbox changes.
             </p>

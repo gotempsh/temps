@@ -1266,6 +1266,7 @@ mod tests {
             health_metadata: None,
             metrics_enabled: true,
             default_backup_provisioned: false,
+            ai_data_access: false,
             container_name: None,
         }
     }

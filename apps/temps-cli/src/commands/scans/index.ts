@@ -511,7 +511,7 @@ function displayScanDetails(scan: ScanResponse): void {
   newline()
 }
 
-function scanStatusColor(status: string): string {
+export function scanStatusColor(status: string): string {
   switch (status.toLowerCase()) {
     case 'completed':
       return statusBadge('success')
@@ -529,7 +529,7 @@ function scanStatusColor(status: string): string {
   }
 }
 
-function severityColor(severity: string): string {
+export function severityColor(severity: string): string {
   switch (severity.toUpperCase()) {
     case 'CRITICAL':
       return colors.error(severity)
@@ -544,7 +544,7 @@ function severityColor(severity: string): string {
   }
 }
 
-function truncate(str: string, maxLength: number): string {
+export function truncate(str: string, maxLength: number): string {
   if (str.length <= maxLength) return str
   return str.slice(0, maxLength - 3) + '...'
 }

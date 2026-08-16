@@ -29,9 +29,10 @@ import { useSettings } from '@/hooks/useSettings'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Globe, Loader2, RefreshCw, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
-import { useParams } from 'react-router-dom'
+import { useParams } from 'react-router'
 import { toast } from 'sonner'
 import { EnvironmentConfigurationCard } from './EnvironmentConfigurationCard'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 interface EnvironmentDetailProps {
   project: ProjectResponse
@@ -276,6 +277,8 @@ export function EnvironmentDetail({
   }>()
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false)
   const queryClient = useQueryClient()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   // Use prop if provided, otherwise use URL param
   const environmentId = propEnvironmentId ?? Number(paramEnvironmentId)
@@ -312,8 +315,19 @@ export function EnvironmentDetail({
         window.history.back()
       }
     },
-    onError: (error: any) => {
-      toast.error(error?.message || 'Failed to delete environment')
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          removeEnvironmentMutation.mutate(variables)
+        )
+      ) {
+        setShowDeleteConfirm(false)
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(
+        problem.detail || problem.message || 'Failed to delete environment'
+      )
     },
   })
 
@@ -337,6 +351,7 @@ export function EnvironmentDetail({
 
   return (
     <div className="space-y-6">
+      {verificationDialog}
       <EnvironmentConfigurationCard
         project={project}
         environment={environment}

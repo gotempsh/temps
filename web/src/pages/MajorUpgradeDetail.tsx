@@ -34,7 +34,7 @@ import {
   XCircle,
 } from 'lucide-react'
 import { useEffect } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 function statusVariant(status: string): 'default' | 'secondary' | 'destructive' | 'outline' {

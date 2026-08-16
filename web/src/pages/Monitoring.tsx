@@ -1,7 +1,7 @@
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect } from 'react'
-import { Outlet } from 'react-router-dom'
+import { Outlet } from 'react-router'
 
 export function Monitoring() {
   const { setBreadcrumbs } = useBreadcrumbs()

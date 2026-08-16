@@ -48,10 +48,10 @@ impl ScreenshotProvider for NoopScreenshotProvider {
         "noop"
     }
 
-    async fn is_available(&self) -> bool {
+    async fn check_availability(&self) -> ScreenshotResult<()> {
         // Always available since it doesn't do anything
-        debug!("NoopScreenshotProvider: is_available() returning true (noop mode)");
-        true
+        debug!("NoopScreenshotProvider: check_availability() returning Ok (noop mode)");
+        Ok(())
     }
 }
 

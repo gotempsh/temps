@@ -45,6 +45,15 @@ pub struct AgentState {
     /// per-peer routes inside each new container's netns. Empty until
     /// the first successful network/peers poll.
     pub overlay_peers: crate::network_sync::SharedPeers,
+    /// Container platform of the Docker daemon this agent drives, in OCI form
+    /// (`linux/amd64`, `linux/arm64`), once discovered from `docker info`
+    /// (see [`crate::server::detect_agent_platform`]).
+    ///
+    /// Shared with the heartbeat loop, which keeps retrying discovery while it
+    /// is `None` — the daemon is often not up yet when the agent starts. The
+    /// health report exposes it so the control plane can resolve a node whose
+    /// stored architecture is still unknown before transferring an image.
+    pub platform: crate::server::SharedPlatform,
 }
 
 /// Response wrapper for consistent agent API responses.
@@ -76,6 +85,18 @@ fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
             error: Some(message),
         }),
     )
+}
+
+fn remove_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
+    match error {
+        temps_deployer::DeployerError::ContainerNotFound(_) => StatusCode::NOT_FOUND,
+        temps_deployer::DeployerError::DeploymentFailed(_)
+        | temps_deployer::DeployerError::ImageNotFound(_)
+        | temps_deployer::DeployerError::NetworkError(_)
+        | temps_deployer::DeployerError::ResourceAllocationFailed(_)
+        | temps_deployer::DeployerError::SecretMountFailed { .. }
+        | temps_deployer::DeployerError::Other(_) => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 #[derive(OpenApi)]
@@ -309,6 +330,7 @@ pub async fn start_container(
     responses(
         (status = 200, description = "Container removed", body = AgentResponse<String>),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container not found"),
         (status = 500, description = "Remove failed")
     ),
     security(("bearer_auth" = []))
@@ -328,13 +350,40 @@ pub async fn remove_container(
             AgentResponse::ok("removed".to_string()).into_response()
         }
         Err(e) => {
-            tracing::error!(container_id = %container_id, "Remove failed: {}", e);
+            let status = remove_error_status(&e);
+            if status == StatusCode::NOT_FOUND {
+                tracing::info!(container_id = %container_id, reason = %e, "Container already absent");
+            } else {
+                tracing::error!(container_id = %container_id, "Remove failed: {}", e);
+            }
             error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 format!("Remove failed for container {}: {}", container_id, e),
             )
             .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod remove_tests {
+    use super::*;
+
+    #[test]
+    fn missing_container_maps_to_http_not_found_for_idempotent_remote_cleanup() {
+        let error = temps_deployer::DeployerError::ContainerNotFound(
+            "container no longer exists".to_string(),
+        );
+        assert_eq!(remove_error_status(&error), StatusCode::NOT_FOUND);
+    }
+
+    #[test]
+    fn operational_remove_failure_maps_to_http_internal_server_error() {
+        let error = temps_deployer::DeployerError::NetworkError("dockerd unavailable".to_string());
+        assert_eq!(
+            remove_error_status(&error),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }
 
@@ -888,7 +937,12 @@ pub async fn get_container_info(
         .get_container_info(&container_id)
         .await
     {
-        Ok(info) => AgentResponse::ok(info).into_response(),
+        Ok(info) => match managed_container_detail(info) {
+            Some(info) => AgentResponse::ok(info).into_response(),
+            None => {
+                error_response(StatusCode::NOT_FOUND, "Container not found".into()).into_response()
+            }
+        },
         Err(e) => {
             tracing::error!(container_id = %container_id, "Failed to get info: {}", e);
             error_response(
@@ -900,22 +954,94 @@ pub async fn get_container_info(
     }
 }
 
-/// List all containers on this worker node
+fn is_temps_managed_container(container: &temps_deployer::ContainerInfo) -> bool {
+    container
+        .labels
+        .get("sh.temps.managed")
+        .is_some_and(|value| value == "true")
+}
+
+fn managed_container_detail(
+    mut container: temps_deployer::ContainerInfo,
+) -> Option<temps_deployer::ContainerInfo> {
+    if !is_temps_managed_container(&container) {
+        return None;
+    }
+    container.environment_vars.clear();
+    Some(container)
+}
+
+fn managed_container_inventory(
+    containers: Vec<temps_deployer::ContainerInfo>,
+) -> Vec<temps_deployer::ContainerInfo> {
+    containers
+        .into_iter()
+        .filter(is_temps_managed_container)
+        .map(|mut container| {
+            container.environment_vars.clear();
+            container
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod inventory_tests {
+    use super::*;
+
+    fn container(name: &str, managed_label: Option<&str>) -> temps_deployer::ContainerInfo {
+        let mut info = temps_deployer::ContainerInfo {
+            container_name: name.to_string(),
+            ..Default::default()
+        };
+        if let Some(value) = managed_label {
+            info.labels
+                .insert("sh.temps.managed".to_string(), value.to_string());
+        }
+        info.environment_vars
+            .insert("DATABASE_URL".to_string(), "postgres://secret".to_string());
+        info
+    }
+
+    #[test]
+    fn inventory_only_returns_managed_containers_without_environment_secrets() {
+        let inventory = managed_container_inventory(vec![
+            container("unmanaged", None),
+            container("false-label", Some("false")),
+            container("managed", Some("true")),
+        ]);
+
+        assert_eq!(inventory.len(), 1);
+        assert_eq!(inventory[0].container_name, "managed");
+        assert!(inventory[0].environment_vars.is_empty());
+    }
+
+    #[test]
+    fn detail_policy_rejects_unmanaged_and_redacts_managed_containers() {
+        assert!(managed_container_detail(container("unmanaged", None)).is_none());
+        let managed = managed_container_detail(container("managed", Some("true")))
+            .expect("managed container remains visible");
+        assert!(managed.environment_vars.is_empty());
+    }
+}
+
+/// List Temps-managed containers on this worker node without environment variables.
 #[utoipa::path(
     tag = "Containers",
     get,
     path = "/agent/containers",
     responses(
-        (status = 200, description = "List of containers", body = AgentResponse<Vec<temps_deployer::ContainerInfo>>),
+        (status = 200, description = "List of Temps-managed containers with environment variables redacted", body = AgentResponse<Vec<temps_deployer::ContainerInfo>>),
         (status = 401, description = "Unauthorized"),
         (status = 500, description = "Failed to list containers")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn list_containers(State(state): State<Arc<AgentState>>) -> impl IntoResponse {
-    tracing::debug!("Listing containers");
+    tracing::debug!("Listing Temps-managed containers");
     match state.container_deployer.list_containers().await {
-        Ok(containers) => AgentResponse::ok(containers).into_response(),
+        Ok(containers) => {
+            AgentResponse::ok(managed_container_inventory(containers)).into_response()
+        }
         Err(e) => {
             tracing::error!("Failed to list containers: {}", e);
             error_response(
@@ -1077,21 +1203,20 @@ pub async fn health_check(State(state): State<Arc<AgentState>>) -> impl IntoResp
 
 /// Collect real system metrics using sysinfo.
 async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
-    use sysinfo::{CpuExt, DiskExt, SystemExt};
+    use sysinfo::{Disks, System};
 
-    let mut sys = sysinfo::System::new();
-    sys.refresh_cpu();
+    let mut sys = System::new();
+    sys.refresh_cpu_all();
     sys.refresh_memory();
-    sys.refresh_disks_list();
-    sys.refresh_disks();
+    let disks = Disks::new_with_refreshed_list();
 
-    let cpu_percent = sys.global_cpu_info().cpu_usage() as f64;
+    let cpu_percent = sys.global_cpu_usage() as f64;
     let memory_used_bytes = sys.used_memory();
     let memory_total_bytes = sys.total_memory();
 
     // Use only the root mount point to avoid double-counting overlapping mounts
-    let (disk_used, disk_total) = sys
-        .disks()
+    let (disk_used, disk_total) = disks
+        .list()
         .iter()
         .find(|d| d.mount_point() == std::path::Path::new("/"))
         .map(|d| (d.total_space() - d.available_space(), d.total_space()))
@@ -1110,5 +1235,8 @@ async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
         disk_used_bytes: disk_used,
         disk_total_bytes: disk_total,
         running_containers,
+        // Empty means "not discovered yet" — the control plane treats a blank
+        // platform as unknown rather than as a claim about this node.
+        platform: crate::server::read_platform(&state.platform).unwrap_or_default(),
     }
 }

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde;
 use serde_json::Value;
 
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::{http::header::CONTENT_TYPE, response::IntoResponse, Json};
 use serde::Serialize;
 
@@ -48,6 +48,53 @@ pub struct Problem {
     pub status_code: StatusCode,
     /// The actual body of the problem.
     pub body: BTreeMap<String, Value>,
+    /// Internal-only metadata carried to response middleware. This is never
+    /// serialized into the RFC 7807 response body.
+    permission_denial: Option<PermissionDenialMarker>,
+}
+
+/// Stable authorization guard denial categories used by security auditing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionDenialKind {
+    InsufficientPermission,
+    CrossProjectScope,
+    DeploymentTokenNotAllowed,
+    ProjectAccess,
+    ProjectPermission,
+    MissingPrincipal,
+}
+
+impl PermissionDenialKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::InsufficientPermission => "insufficient_permission",
+            Self::CrossProjectScope => "cross_project_scope",
+            Self::DeploymentTokenNotAllowed => "deployment_token_not_allowed",
+            Self::ProjectAccess => "project_access",
+            Self::ProjectPermission => "project_permission",
+            Self::MissingPrincipal => "missing_principal",
+        }
+    }
+}
+
+/// A server-generated response extension proving that a 403 came from an
+/// authorization guard. Its fields are intentionally private so callers can
+/// inspect, but cannot forge or mutate, the marker.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionDenialMarker {
+    kind: PermissionDenialKind,
+    required_permission: Option<String>,
+}
+
+impl PermissionDenialMarker {
+    pub fn kind(&self) -> PermissionDenialKind {
+        self.kind
+    }
+
+    pub fn required_permission(&self) -> Option<&str> {
+        self.required_permission.as_deref()
+    }
 }
 
 /// Create a new `Problem` response to send to the client.
@@ -58,10 +105,26 @@ where
     Problem {
         status_code: status_code.into(),
         body: BTreeMap::new(),
+        permission_denial: None,
     }
 }
 
 impl Problem {
+    /// Mark this problem as a genuine authorization-guard denial. The marker
+    /// is attached only to the resulting HTTP response extensions.
+    #[doc(hidden)]
+    pub fn with_permission_denial(
+        mut self,
+        kind: PermissionDenialKind,
+        required_permission: Option<String>,
+    ) -> Self {
+        self.permission_denial = Some(PermissionDenialMarker {
+            kind,
+            required_permission,
+        });
+        self
+    }
+
     /// Specify the "type" to use for the problem.
     pub fn with_type<S>(self, value: S) -> Self
     where
@@ -122,16 +185,67 @@ pub type Result<T> = std::result::Result<T, Problem>;
 
 impl IntoResponse for Problem {
     fn into_response(self) -> axum::response::Response {
-        if self.body.is_empty() {
+        let mut response = if self.body.is_empty() {
             self.status_code.into_response()
         } else {
             let body = Json(self.body);
             let mut response = (self.status_code, body).into_response();
 
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/problem+json"),
+            );
             response
-                .headers_mut()
-                .insert(CONTENT_TYPE, "application/problem+json".parse().unwrap());
-            response
+        };
+
+        if let Some(marker) = self.permission_denial {
+            response.extensions_mut().insert(marker);
         }
+
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::to_bytes;
+
+    #[tokio::test]
+    async fn permission_denial_marker_is_internal_and_preserves_body() {
+        let problem = new(StatusCode::FORBIDDEN)
+            .with_title("Forbidden")
+            .with_value("required_permission", "users:write")
+            .with_permission_denial(
+                PermissionDenialKind::InsufficientPermission,
+                Some("users:write".to_string()),
+            );
+
+        let response = problem.into_response();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let marker = response
+            .extensions()
+            .get::<PermissionDenialMarker>()
+            .expect("guard marker should propagate through IntoResponse");
+        assert_eq!(marker.kind(), PermissionDenialKind::InsufficientPermission);
+        assert_eq!(marker.required_permission(), Some("users:write"));
+
+        let body = to_bytes(response.into_body(), 1024)
+            .await
+            .expect("problem body should be readable");
+        let json: serde_json::Value =
+            serde_json::from_slice(&body).expect("problem body should remain JSON");
+        assert_eq!(json["title"], "Forbidden");
+        assert_eq!(json["required_permission"], "users:write");
+        assert!(json.get("permission_denial").is_none());
+    }
+
+    #[test]
+    fn ordinary_problem_has_no_permission_denial_marker() {
+        let response = new(StatusCode::FORBIDDEN).into_response();
+        assert!(response
+            .extensions()
+            .get::<PermissionDenialMarker>()
+            .is_none());
     }
 }

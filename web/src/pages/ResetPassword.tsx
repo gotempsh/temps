@@ -21,28 +21,15 @@ import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation } from '@tanstack/react-query'
 import { AlertCircle, ArrowLeft, Loader2 } from 'lucide-react'
 import { useForm } from 'react-hook-form'
-import { Link, useNavigate, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { passwordSchema } from '@/lib/password-policy'
 
-// Mirrors `validate_password_complexity` in
-// temps-auth/src/auth_service.rs. Kept in sync so the user gets inline
-// feedback instead of a round-trip 400. The server remains the source
-// of truth and re-validates.
 const resetPasswordSchema = z
   .object({
-    newPassword: z
-      .string()
-      .min(8, 'Password must be at least 8 characters long')
-      .max(128, 'Password must not exceed 128 characters')
-      .regex(/[A-Z]/, 'Password must contain at least one uppercase letter')
-      .regex(/[a-z]/, 'Password must contain at least one lowercase letter')
-      .regex(/[0-9]/, 'Password must contain at least one digit')
-      .regex(
-        /[^a-zA-Z0-9]/,
-        'Password must contain at least one special character',
-      ),
+    newPassword: passwordSchema,
     confirmPassword: z.string(),
   })
   .refine((data) => data.newPassword === data.confirmPassword, {

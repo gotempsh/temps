@@ -19,16 +19,36 @@ use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
 use temps_entities::agent_runs;
 
+use crate::ai_cli::catalog::find_provider;
 use crate::error::AgentError;
 use crate::handlers::runs::AgentRunLogResponse;
 use crate::handlers::AppState;
+use crate::services::autofixer::AutofixRunConfig;
 
 // ── Request DTOs ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct StartAnalysisRequest {
     pub error_group_id: i32,
+    /// Free-text notes for the model (extra context about the error, retry
+    /// guidance, constraints). Included verbatim in the analysis prompt.
     pub user_context: Option<String>,
+    /// AI provider id ("claude_cli", "codex_cli", "opencode"). `None` uses
+    /// the platform default provider.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model id for the chosen provider. `None` uses the provider's saved
+    /// default model.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Per-run turn cap applied to every phase (1–200). Only enforced for
+    /// CLIs with a turn flag (Claude Code). `None` uses the provider's
+    /// configured defaults.
+    #[serde(default)]
+    pub max_turns: Option<i32>,
+    /// Branch to clone instead of the project's main branch.
+    #[serde(default)]
+    pub branch: Option<String>,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -53,6 +73,11 @@ pub struct AutofixerRunResponse {
     pub error_message: Option<String>,
     pub ai_output: Option<String>,
     pub ai_model: Option<String>,
+    /// AI provider slug this run executes with (e.g. claude_cli, codex_cli).
+    pub ai_provider: Option<String>,
+    /// Per-run options the run was started with; used to prefill the
+    /// retry / start-over dialog.
+    pub run_config: Option<AutofixRunConfig>,
     pub tokens_input: i32,
     pub tokens_output: i32,
     pub files_changed: i32,
@@ -77,6 +102,10 @@ impl From<agent_runs::Model> for AutofixerRunResponse {
             error_message: model.error_message,
             ai_output: model.ai_output,
             ai_model: model.ai_model,
+            ai_provider: model.ai_provider,
+            run_config: model
+                .run_config
+                .and_then(|v| serde_json::from_value(v).ok()),
             tokens_input: model.tokens_input,
             tokens_output: model.tokens_output,
             files_changed: model.files_changed,
@@ -115,8 +144,8 @@ impl AuditOperation for AutofixerStartAudit {
     fn operation_type(&self) -> String {
         "AUTOFIXER_ANALYSIS_STARTED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -141,8 +170,8 @@ impl AuditOperation for AutofixerFixAudit {
     fn operation_type(&self) -> String {
         "AUTOFIXER_FIX_STARTED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -168,8 +197,8 @@ impl AuditOperation for AutofixerPrAudit {
     fn operation_type(&self) -> String {
         "AUTOFIXER_PR_CREATED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -262,10 +291,82 @@ pub async fn start_analysis(
         }));
     }
 
+    // Validate per-run overrides before persisting anything.
+    if let Some(provider) = request.provider.as_deref().filter(|p| !p.is_empty()) {
+        if find_provider(provider).is_none() {
+            return Err(Problem::from(AgentError::Validation {
+                message: format!(
+                    "Unknown AI provider '{}' for autofix run in project {}",
+                    provider, project_id
+                ),
+            }));
+        }
+    }
+    if let Some(turns) = request.max_turns {
+        if !(1..=200).contains(&turns) {
+            return Err(Problem::from(AgentError::Validation {
+                message: format!(
+                    "max_turns must be between 1 and 200, got {} (project {})",
+                    turns, project_id
+                ),
+            }));
+        }
+    }
+    // Defense-in-depth: the model id reaches the CLI command builder, and for
+    // the opencode provider it is interpolated into a `bash -lc` string. The
+    // builder escapes it, but we also reject shell metacharacters and cap the
+    // length here so a hostile value can never reach a shell in any provider
+    // path (present or future). Real model ids are short and use only
+    // [A-Za-z0-9._/-].
+    if let Some(model) = request.model.as_deref().filter(|m| !m.is_empty()) {
+        if model.len() > 128 {
+            return Err(Problem::from(AgentError::Validation {
+                message: format!(
+                    "model id is too long ({} chars, max 128) for project {}",
+                    model.len(),
+                    project_id
+                ),
+            }));
+        }
+        if !model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | '-' | ':'))
+        {
+            return Err(Problem::from(AgentError::Validation {
+                message: format!(
+                    "model id '{}' contains invalid characters (allowed: letters, digits, . _ / - :) for project {}",
+                    model, project_id
+                ),
+            }));
+        }
+    }
+
+    let requested_provider = request.provider.clone().filter(|p| !p.is_empty());
+    let has_overrides = requested_provider.is_some()
+        || request.model.as_deref().is_some_and(|m| !m.is_empty())
+        || request.max_turns.is_some()
+        || request.branch.as_deref().is_some_and(|b| !b.is_empty());
+    let run_config = has_overrides.then(|| {
+        serde_json::to_value(AutofixRunConfig {
+            provider: requested_provider.clone(),
+            model: request.model.clone().filter(|m| !m.is_empty()),
+            max_turns: request.max_turns,
+            branch: request.branch.clone().filter(|b| !b.is_empty()),
+        })
+        .unwrap_or(serde_json::Value::Null)
+    });
+
     // Create run record
     let run = app_state
         .run_service
-        .create_autofixer_run(project_id, request.error_group_id, request.user_context)
+        .create_autofixer_run(
+            project_id,
+            request.error_group_id,
+            request.user_context,
+            requested_provider,
+            run_config,
+            Some(auth.user_id()),
+        )
         .await
         .map_err(Problem::from)?;
 
@@ -846,6 +947,8 @@ mod tests {
             ephemeral_yaml: None,
             prompt_text: None,
             workspace_volume: None,
+            run_config: None,
+            triggered_by_user_id: None,
         }
     }
 

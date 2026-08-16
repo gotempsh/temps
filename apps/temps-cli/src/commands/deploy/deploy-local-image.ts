@@ -618,7 +618,7 @@ async function dockerSaveToFile(
   })
 }
 
-function formatFileSize(bytes: number): string {
+export function formatFileSize(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
@@ -745,10 +745,11 @@ async function tryGenerateDockerfile(
 }
 
 /**
- * Detect the package manager by checking for lockfiles in the current directory.
+ * Detect the package manager by checking for lockfiles in the given directory
+ * (defaults to the current directory). Checked in priority order because a
+ * repo can accumulate more than one lockfile.
  */
-function detectLocalPackageManager(): string {
-  const cwd = process.cwd()
+export function detectLocalPackageManager(cwd: string = process.cwd()): string {
   if (existsSync(join(cwd, 'pnpm-lock.yaml'))) return 'pnpm'
   if (existsSync(join(cwd, 'yarn.lock'))) return 'yarn'
   if (existsSync(join(cwd, 'bun.lockb')) || existsSync(join(cwd, 'bun.lock'))) return 'bun'

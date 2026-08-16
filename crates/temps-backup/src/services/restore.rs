@@ -10,7 +10,7 @@ use chrono::Utc;
 use sea_orm::ActiveValue::{NotSet, Set};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder,
-    QuerySelect,
+    QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -27,6 +27,9 @@ pub enum RestoreError {
 
     #[error("Backup {backup_id} not found")]
     BackupNotFound { backup_id: i32 },
+
+    #[error("Backup {backup_id} is being deleted and cannot be restored")]
+    BackupDeleting { backup_id: i32 },
 
     #[error("External service {service_id} not found")]
     ServiceNotFound { service_id: i32 },
@@ -54,6 +57,57 @@ pub enum RestoreError {
 
     #[error("Internal error: {reason}")]
     Internal { reason: String },
+}
+
+fn selected_walg_target_user_data(
+    backup: &temps_entities::backups::Model,
+) -> Result<Option<String>, RestoreError> {
+    let metadata: serde_json::Value =
+        serde_json::from_str(&backup.metadata).map_err(|error| RestoreError::Validation {
+            message: format!(
+                "Backup {} has invalid metadata JSON: {}",
+                backup.backup_id, error
+            ),
+        })?;
+    let Some(version) = metadata.get("walg_identity_version") else {
+        return Ok(None);
+    };
+    if version.as_u64() != Some(1) {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} uses unsupported WAL-G identity version {}",
+                backup.backup_id, version
+            ),
+        });
+    }
+    let value = metadata
+        .get("walg_target_user_data")
+        .ok_or_else(|| RestoreError::Validation {
+            message: format!(
+                "Backup {} is missing its WAL-G target user data",
+                backup.backup_id
+            ),
+        })?;
+    if value
+        .get("temps_backup_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(backup.backup_id.as_str())
+    {
+        return Err(RestoreError::Validation {
+            message: format!(
+                "Backup {} has WAL-G target user data for a different backup",
+                backup.backup_id
+            ),
+        });
+    }
+    serde_json::to_string(value)
+        .map(Some)
+        .map_err(|error| RestoreError::Validation {
+            message: format!(
+                "Backup {} has invalid WAL-G target user data: {}",
+                backup.backup_id, error
+            ),
+        })
 }
 
 /// How the caller identifies which backup to restore.
@@ -294,6 +348,14 @@ impl RestoreService {
 
         let mut warnings: Vec<String> = Vec::new();
         let mut errors: Vec<String> = Vec::new();
+        if let Some(backup) = &backup_row {
+            if backup.state == "deleting" {
+                errors.push(format!(
+                    "Backup {} is being deleted and cannot be restored.",
+                    backup.id
+                ));
+            }
+        }
 
         // Engine compat.
         let engine_from_backup = backup_engine_hint.clone();
@@ -622,56 +684,74 @@ impl RestoreService {
     ) -> Result<RestoreRunView, RestoreError> {
         // Resolve the backup: either via the DB row, or synthesize one
         // from a raw S3 location (orphan from another Temps instance).
-        let (resolved_backup_id, backup_location, backup_engine_hint, s3_source_id) =
-            match &selector {
-                BackupSelector::Id(id) => {
-                    let backup = temps_entities::backups::Entity::find_by_id(*id)
+        let (
+            resolved_backup_id,
+            backup_location,
+            backup_engine_hint,
+            s3_source_id,
+            backup_started_at,
+        ) = match &selector {
+            BackupSelector::Id(id) => {
+                let backup = temps_entities::backups::Entity::find_by_id(*id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
+
+                // Try to infer the engine from the external_service_backups
+                // link OR from the metadata blob. This is advisory — used
+                // only for engine-compat checking.
+                let engine = if let Some(es_backup) =
+                    temps_entities::external_service_backups::Entity::find()
+                        .filter(temps_entities::external_service_backups::Column::BackupId.eq(*id))
                         .one(self.db.as_ref())
                         .await?
-                        .ok_or(RestoreError::BackupNotFound { backup_id: *id })?;
-
-                    // Try to infer the engine from the external_service_backups
-                    // link OR from the metadata blob. This is advisory — used
-                    // only for engine-compat checking.
-                    let engine = if let Some(es_backup) =
-                        temps_entities::external_service_backups::Entity::find()
-                            .filter(
-                                temps_entities::external_service_backups::Column::BackupId.eq(*id),
-                            )
-                            .one(self.db.as_ref())
-                            .await?
-                    {
-                        let svc = self.load_service(es_backup.service_id).await.ok();
-                        svc.map(|s| s.service_type)
-                    } else {
-                        serde_json::from_str::<serde_json::Value>(&backup.metadata)
-                            .ok()
-                            .and_then(|v| {
-                                v.get("service_type")
-                                    .and_then(|t| t.as_str())
-                                    .map(String::from)
-                            })
-                    };
-                    (
-                        Some(backup.id),
-                        backup.s3_location.clone(),
-                        engine,
-                        backup.s3_source_id,
-                    )
-                }
-                BackupSelector::Location {
-                    location,
+                {
+                    let svc = self.load_service(es_backup.service_id).await.ok();
+                    svc.map(|s| s.service_type)
+                } else {
+                    serde_json::from_str::<serde_json::Value>(&backup.metadata)
+                        .ok()
+                        .and_then(|v| {
+                            v.get("service_type")
+                                .and_then(|t| t.as_str())
+                                .map(String::from)
+                        })
+                };
+                (
+                    Some(backup.id),
+                    backup.s3_location.clone(),
                     engine,
-                    s3_source_id,
-                } => {
-                    if location.trim().is_empty() {
-                        return Err(RestoreError::Validation {
-                            message: "backup_location cannot be empty".into(),
-                        });
-                    }
-                    (None, location.clone(), Some(engine.clone()), *s3_source_id)
+                    backup.s3_source_id,
+                    Some(backup.started_at),
+                )
+            }
+            BackupSelector::Location {
+                location,
+                engine,
+                s3_source_id,
+            } => {
+                if location.trim().is_empty() {
+                    return Err(RestoreError::Validation {
+                        message: "backup_location cannot be empty".into(),
+                    });
                 }
-            };
+                // Orphan restores (backup discovered by S3 scan, produced
+                // by another Temps instance) have no DB row and thus no
+                // known `started_at` to validate a PITR target against —
+                // we can't range-check what we don't know. The engine
+                // (Postgres, via `restore_pitr`) still protects against a
+                // target the WAL can't reach: it FATALs out of recovery
+                // rather than promoting, which the container health
+                // check surfaces as a failed restore run.
+                (
+                    None,
+                    location.clone(),
+                    Some(engine.clone()),
+                    *s3_source_id,
+                    None,
+                )
+            }
+        };
 
         // Target service: where the restored data goes.
         let target = self.load_service(target_service_id).await?;
@@ -717,7 +797,7 @@ impl RestoreService {
             RestoreRequestMode::Pitr {
                 to_new_service,
                 new_service_name,
-                ..
+                target: recovery_target,
             } => {
                 if !caps.pitr {
                     return Err(RestoreError::UnsupportedMode {
@@ -743,6 +823,7 @@ impl RestoreService {
                         message: "new_service_name is required when to_new_service=true".into(),
                     });
                 }
+                validate_pitr_recovery_target(recovery_target, backup_started_at)?;
             }
         }
 
@@ -784,9 +865,11 @@ impl RestoreService {
             "s3_source_id": s3_source_id,
         });
 
-        // Insert run row.
+        // Insert the run while holding the source row lock. Deletion uses the
+        // same lock before checking restore history, so exactly one operation
+        // wins and remote data can never be removed underneath a new restore.
         let log_id = uuid::Uuid::new_v4().to_string();
-        let run = temps_entities::restore_runs::ActiveModel {
+        let run_active = temps_entities::restore_runs::ActiveModel {
             id: NotSet,
             source_backup_id: Set(resolved_backup_id.unwrap_or(0)),
             // `source_service_id` historically meant "service we're
@@ -810,9 +893,23 @@ impl RestoreService {
             created_by: Set(user_id),
             created_at: NotSet,
             updated_at: NotSet,
-        }
-        .insert(self.db.as_ref())
-        .await?;
+        };
+        let run = if let Some(backup_id) = resolved_backup_id {
+            let transaction = self.db.begin().await?;
+            let backup = temps_entities::backups::Entity::find_by_id(backup_id)
+                .lock_exclusive()
+                .one(&transaction)
+                .await?
+                .ok_or(RestoreError::BackupNotFound { backup_id })?;
+            if backup.state == "deleting" {
+                return Err(RestoreError::BackupDeleting { backup_id });
+            }
+            let run = run_active.insert(&transaction).await?;
+            transaction.commit().await?;
+            run
+        } else {
+            run_active.insert(self.db.as_ref()).await?
+        };
 
         // Spawn the worker — it owns Arc clones and updates the row as it goes.
         let run_id = run.id;
@@ -877,6 +974,60 @@ fn engines_compatible(a: &str, b: &str) -> bool {
     }
     let object_store = ["s3", "rustfs", "minio", "blob"];
     object_store.contains(&a.as_str()) && object_store.contains(&b.as_str())
+}
+
+/// Reject a PITR recovery target that's provably out of range BEFORE we
+/// ever touch the target container: nothing in a backup's WAL can predate
+/// the base backup itself starting, so a target before that can never be a
+/// real, honored recovery point.
+///
+/// Root-cause context: without this check, Postgres itself does NOT error
+/// on a too-early `recovery_target_time` — it silently stops recovery at
+/// the earliest point it CAN reach (immediately after the base backup's own
+/// consistency checkpoint) and reports success, discarding the requested
+/// target with no warning surfaced anywhere. A restore run would come back
+/// `status: "completed"` having silently ignored what the caller actually
+/// asked for. (Verified empirically against a real WAL-G backup: PostgreSQL
+/// 18's log shows `starting point-in-time recovery to <target>` /
+/// `consistent recovery state reached` / `recovery stopping before commit
+/// of transaction N` — no FATAL, no error — for a target years before the
+/// backup existed.)
+///
+/// A target in the FUTURE (past all archived WAL) is already handled safely
+/// without this check: PostgreSQL itself FATALs with "recovery ended before
+/// configured recovery target was reached" once it exhausts available WAL,
+/// which — combined with `restart_policy=always` — crash-loops the
+/// container until `wait_for_container_health`'s 90s timeout surfaces it as
+/// a failed restore run. That path is a real, if slow (up to 90s) and
+/// generically-worded, failure — not silent corruption — so it's
+/// intentionally left alone here.
+///
+/// `backup_started_at` is `None` for orphan restores (backup discovered by
+/// S3 scan, produced by another Temps instance) — there's no DB row and
+/// thus no known start time to validate against, so we can't range-check
+/// what we don't know; those still fall back on Postgres's own FATAL/crash
+/// loop for a too-early target too (untested here, but the same "PG stops
+/// at the earliest reachable point without erroring" behavior applies).
+fn validate_pitr_recovery_target(
+    target: &RecoveryTarget,
+    backup_started_at: Option<chrono::DateTime<Utc>>,
+) -> Result<(), RestoreError> {
+    if let RecoveryTarget::Time { time } = target {
+        if let Some(started_at) = backup_started_at {
+            if *time < started_at {
+                return Err(RestoreError::Validation {
+                    message: format!(
+                        "PITR recovery target {} is before this backup started ({}) — no WAL \
+                         this backup covers can satisfy it. Choose a time at or after the \
+                         backup start, or select an earlier backup.",
+                        time.to_rfc3339(),
+                        started_at.to_rfc3339(),
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Worker: marks the run through phases, dispatches to the trait, and
@@ -1274,28 +1425,23 @@ async fn run_restore_inner(
             // access to service_members or the agent protocol so it
             // can't handle clusters — same carve-out as backup.
             if target_service.topology == "cluster" && target_service.service_type == "postgres" {
+                let target_user_data = selected_walg_target_user_data(&backup_model)?;
                 mgr.restore_postgres_cluster(
                     &target_service,
                     &backup_model.s3_location,
                     &s3_credentials,
+                    target_user_data.as_deref(),
                 )
                 .await
                 .map_err(|e| RestoreError::ExternalService {
                     reason: format!("cluster in-place restore failed: {}", e),
                 })?;
             } else {
-                instance
-                    .restore_from_s3(
-                        &s3_client,
-                        &s3_credentials,
-                        &backup_model.s3_location,
-                        &s3_source_plain,
-                        source_config.clone(),
-                    )
-                    .await
-                    .map_err(|e| RestoreError::ExternalService {
+                instance.restore_in_place(ctx).await.map_err(|e| {
+                    RestoreError::ExternalService {
                         reason: format!("in-place restore failed: {}", e),
-                    })?;
+                    }
+                })?;
             }
             None
         }
@@ -1997,6 +2143,98 @@ mod tests {
         assert_eq!(slugify("My Restored DB!!"), "my-restored-db");
         assert_eq!(slugify("   leading   "), "leading");
         assert_eq!(slugify("UPPER_case"), "upper-case");
+    }
+
+    // ---- PITR out-of-range recovery target validation -------------------
+    //
+    // Regression coverage for the gap a live PITR restore against a real
+    // WAL-G backup exposed: before this validation existed, a
+    // `recovery_target_time` before the backup's own `started_at` was
+    // silently accepted by the API (202), silently accepted by PostgreSQL
+    // itself (no FATAL — recovery just stops at the earliest reachable
+    // point), and the restore run came back `status: "completed"` having
+    // silently discarded the caller's actual requested target. These tests
+    // pin the fix: `validate_pitr_recovery_target` must reject that case
+    // before the run is ever persisted or a container touched.
+
+    #[test]
+    fn pitr_target_before_backup_start_is_rejected() {
+        let backup_started_at = chrono::DateTime::parse_from_rfc3339("2026-08-09T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let target_before_backup = chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let target = RecoveryTarget::Time {
+            time: target_before_backup,
+        };
+
+        let err = validate_pitr_recovery_target(&target, Some(backup_started_at))
+            .expect_err("a target years before the backup started must be rejected");
+        match err {
+            RestoreError::Validation { message } => {
+                assert!(
+                    message.contains("before this backup started"),
+                    "got: {}",
+                    message
+                );
+            }
+            other => panic!("expected Validation error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn pitr_target_at_or_after_backup_start_is_accepted() {
+        let backup_started_at = chrono::DateTime::parse_from_rfc3339("2026-08-09T11:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Exactly at the backup start — the boundary case must NOT be
+        // rejected (nothing before it is out of range, this is in range).
+        let at_start = RecoveryTarget::Time {
+            time: backup_started_at,
+        };
+        assert!(validate_pitr_recovery_target(&at_start, Some(backup_started_at)).is_ok());
+
+        // A minute after the backup started — the ordinary in-range case.
+        let after_start = RecoveryTarget::Time {
+            time: backup_started_at + chrono::Duration::minutes(1),
+        };
+        assert!(validate_pitr_recovery_target(&after_start, Some(backup_started_at)).is_ok());
+    }
+
+    #[test]
+    fn pitr_target_validation_skipped_when_backup_start_unknown() {
+        // Orphan restores (backup discovered by S3 scan, no DB row) have no
+        // known `started_at` to range-check against — must not fail closed
+        // on missing metadata, just skip the check.
+        let target = RecoveryTarget::Time {
+            time: chrono::DateTime::parse_from_rfc3339("2020-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        };
+        assert!(validate_pitr_recovery_target(&target, None).is_ok());
+    }
+
+    #[test]
+    fn pitr_target_validation_only_applies_to_time_targets() {
+        // Xid/Lsn/Name targets have no comparable ordering against
+        // `started_at` — the check must be a no-op for them, not panic or
+        // spuriously reject.
+        let backup_started_at = Utc::now();
+        for target in [
+            RecoveryTarget::Xid {
+                xid: "12345".into(),
+            },
+            RecoveryTarget::Lsn {
+                lsn: "0/3000000".into(),
+            },
+            RecoveryTarget::Name {
+                name: "before-migration".into(),
+            },
+        ] {
+            assert!(validate_pitr_recovery_target(&target, Some(backup_started_at)).is_ok());
+        }
     }
 
     #[test]

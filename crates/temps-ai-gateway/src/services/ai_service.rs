@@ -10,15 +10,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder};
 use tracing::debug;
 
 use temps_ai::{
     AiError, AiRequest, AiResponse, AiService, ChatMessage, ChatStreamDelta, ChatTool,
-    ChatTurnRequest, ChatTurnResponse, ChatTurnStream, TokenStream, ToolCall,
+    ChatTurnRequest, ChatTurnResponse, ChatTurnStream, ProviderCapabilities, RefreshPolicy,
+    TokenStream, ToolCall,
 };
 
-use crate::services::{ByokOverride, GatewayService};
+use crate::services::{gateway_provider_capabilities, ByokOverride, GatewayService};
 use crate::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, MessageContent,
 };
@@ -34,6 +35,29 @@ impl GatewayAiService {
         Self { gateway, db }
     }
 
+    fn route_override(provider: Option<&str>, purpose: &str) -> Result<ByokOverride, AiError> {
+        let Some(provider) = provider else {
+            return Ok(ByokOverride::default());
+        };
+        if provider == "gateway" {
+            return Ok(ByokOverride::default());
+        }
+        let Some(raw_id) = provider.strip_prefix("gateway_key:") else {
+            return Err(AiError::Provider {
+                purpose: purpose.to_string(),
+                reason: format!("invalid gateway provider route '{provider}'"),
+            });
+        };
+        let key_id = raw_id.parse::<i32>().map_err(|_| AiError::Provider {
+            purpose: purpose.to_string(),
+            reason: format!("invalid gateway provider key id '{raw_id}'"),
+        })?;
+        Ok(ByokOverride {
+            system_key_id: Some(key_id),
+            ..Default::default()
+        })
+    }
+
     /// Resolve the model to use: an explicit per-call `model`, else the first
     /// entry of `allowed_models` for a `project:{id}` config if present, else the
     /// instance-scope config. `None` when nothing names a concrete model.
@@ -42,11 +66,7 @@ impl GatewayAiService {
         project_id: Option<i32>,
         explicit: Option<&str>,
     ) -> Option<String> {
-        if let Some(m) = explicit {
-            if !m.is_empty() {
-                return Some(m.to_string());
-            }
-        }
+        let explicit = explicit.filter(|model| !model.is_empty());
         let mut scopes: Vec<String> = Vec::new();
         if let Some(pid) = project_id {
             scopes.push(format!("project:{pid}"));
@@ -60,10 +80,25 @@ impl GatewayAiService {
             .ok()?;
         for scope in scopes {
             if let Some(row) = rows.iter().find(|r| r.scope == scope) {
-                if let Some(model) = first_model(row.allowed_models.as_ref()) {
-                    return Some(model);
+                if let Some(allowed_models) = row.allowed_models.as_ref() {
+                    if let Some(model) = explicit {
+                        return allowed_models
+                            .as_array()
+                            .is_some_and(|models| {
+                                models.iter().any(|allowed| allowed.as_str() == Some(model))
+                            })
+                            .then(|| model.to_string());
+                    }
+                    // An explicitly configured empty array means no model is
+                    // allowed for this scope; do not fall through to a global
+                    // provider default and bypass the policy.
+                    return first_model(Some(allowed_models));
                 }
+                break;
             }
+        }
+        if let Some(model) = explicit {
+            return Some(model.to_string());
         }
 
         // No allow-list configured (the common case). Use the first active
@@ -81,7 +116,49 @@ impl GatewayAiService {
             .map(str::trim)
             .filter(|s| !s.is_empty())
         {
-            return Some(m.to_string());
+            let catalog_is_empty = temps_entities::ai_provider_models::Entity::find()
+                .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
+                .one(self.db.as_ref())
+                .await
+                .ok()?
+                .is_none();
+            if catalog_is_empty {
+                return Some(m.to_string());
+            }
+            let pinned_is_enabled = temps_entities::ai_provider_models::Entity::find()
+                .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
+                .filter(temps_entities::ai_provider_models::Column::ModelId.eq(m))
+                .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
+                .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
+                .one(self.db.as_ref())
+                .await
+                .ok()?
+                .is_some();
+            if pinned_is_enabled {
+                return Some(m.to_string());
+            }
+        }
+        let catalog_models = temps_entities::ai_provider_models::Entity::find()
+            .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
+            .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
+            .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
+            .filter(
+                temps_entities::ai_provider_models::Column::ModelId.not_like("text-embedding-%"),
+            )
+            .order_by_asc(temps_entities::ai_provider_models::Column::ModelId)
+            .all(self.db.as_ref())
+            .await
+            .ok()?;
+        if let Some(preferred) = default_model_for_provider(&key.provider) {
+            if catalog_models
+                .iter()
+                .any(|model| model.model_id == preferred)
+            {
+                return Some(preferred);
+            }
+        }
+        if let Some(model) = catalog_models.into_iter().next() {
+            return Some(model.model_id);
         }
         default_model_for_provider(&key.provider)
     }
@@ -91,10 +168,10 @@ impl GatewayAiService {
 /// names one. The prefix routes back to the provider via `route_model_to_provider`.
 fn default_model_for_provider(provider: &str) -> Option<String> {
     let model = match provider {
-        "openai" => "gpt-4o-mini",
-        "anthropic" => "claude-3-5-haiku-latest",
-        "gemini" => "gemini-1.5-flash",
-        "xai" => "grok-2-latest",
+        "openai" => "gpt-5-nano",
+        "anthropic" => "claude-haiku-4-5",
+        "gemini" => "gemini-3.5-flash-lite",
+        "xai" => "grok-4.5",
         _ => return None,
     };
     Some(model.to_string())
@@ -118,6 +195,23 @@ fn response_format_for(schema: &serde_json::Value) -> serde_json::Value {
         "type": "json_schema",
         "json_schema": { "name": "temps_response", "schema": schema, "strict": true }
     })
+}
+
+fn system_with_response_schema(mut system: String, schema: Option<&serde_json::Value>) -> String {
+    if let Some(schema) = schema {
+        if !system.is_empty() {
+            system.push_str("\n\n");
+        }
+        system.push_str("Return only one JSON object matching this JSON Schema: ");
+        system.push_str(&schema.to_string());
+    }
+    system
+}
+
+fn apply_thinking_option(body: &mut serde_json::Value, thinking_level: Option<&str>) {
+    if let Some(level) = thinking_level.filter(|level| *level != "default") {
+        body["reasoning_effort"] = serde_json::json!(level);
+    }
 }
 
 /// Pull the assistant text out of the first choice.
@@ -249,7 +343,103 @@ impl AiService for GatewayAiService {
         self.resolve_model(None, None).await.is_some()
     }
 
+    async fn is_available_for(&self, provider: Option<&str>) -> bool {
+        let Some(provider) = provider else {
+            return self.is_available().await;
+        };
+        if provider == "gateway" {
+            return self.is_available().await;
+        }
+        let Some(raw_id) = provider.strip_prefix("gateway_key:") else {
+            return false;
+        };
+        let Ok(key_id) = raw_id.parse::<i32>() else {
+            return false;
+        };
+        matches!(
+            temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
+                .one(self.db.as_ref())
+                .await,
+            Ok(Some(key)) if key.is_active
+        )
+    }
+
+    async fn chat_capable_for(&self, provider: Option<&str>) -> bool {
+        self.is_available_for(provider).await
+    }
+
+    async fn capabilities_for(
+        &self,
+        provider: Option<&str>,
+        _refresh: RefreshPolicy,
+    ) -> Result<ProviderCapabilities, AiError> {
+        let key = match provider {
+            Some(route) if route.starts_with("gateway_key:") => {
+                let raw_id = route.trim_start_matches("gateway_key:");
+                let key_id = raw_id.parse::<i32>().map_err(|_| AiError::Provider {
+                    purpose: "provider.capabilities".to_string(),
+                    reason: format!("invalid gateway provider key id '{raw_id}'"),
+                })?;
+                temps_entities::ai_provider_keys::Entity::find_by_id(key_id)
+                    .one(self.db.as_ref())
+                    .await
+                    .map_err(|error| AiError::Provider {
+                        purpose: "provider.capabilities".to_string(),
+                        reason: error.to_string(),
+                    })?
+            }
+            Some("gateway") | None => temps_entities::ai_provider_keys::Entity::find()
+                .filter(temps_entities::ai_provider_keys::Column::IsActive.eq(true))
+                .one(self.db.as_ref())
+                .await
+                .map_err(|error| AiError::Provider {
+                    purpose: "provider.capabilities".to_string(),
+                    reason: error.to_string(),
+                })?,
+            Some(route) => {
+                return Err(AiError::Provider {
+                    purpose: "provider.capabilities".to_string(),
+                    reason: format!("invalid gateway provider route '{route}'"),
+                });
+            }
+        }
+        .filter(|key| key.is_active)
+        .ok_or(AiError::NotAvailable)?;
+        let mut model_ids: Vec<String> = temps_entities::ai_provider_models::Entity::find()
+            .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
+            .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
+            .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
+            .order_by_asc(temps_entities::ai_provider_models::Column::ModelId)
+            .all(self.db.as_ref())
+            .await
+            .map_err(|error| AiError::Provider {
+                purpose: "provider.capabilities".to_string(),
+                reason: error.to_string(),
+            })?
+            .into_iter()
+            .map(|model| model.model_id)
+            .filter(|id| !id.starts_with("text-embedding-"))
+            .collect();
+        if model_ids.is_empty() {
+            model_ids = self
+                .gateway
+                .available_models_for_provider(&key.provider)
+                .into_iter()
+                .map(|model| model.id)
+                .filter(|id| !id.starts_with("text-embedding-"))
+                .collect();
+        }
+        Ok(gateway_provider_capabilities(
+            format!("gateway_key:{}", key.id),
+            key.display_name,
+            &key.provider,
+            key.default_model,
+            model_ids,
+        ))
+    }
+
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError> {
+        let route = Self::route_override(request.provider.as_deref(), &request.purpose)?;
         let model = self
             .resolve_model(request.project_id, request.model.as_deref())
             .await
@@ -257,8 +447,12 @@ impl AiService for GatewayAiService {
                 purpose: request.purpose.clone(),
             })?;
 
+        let system = system_with_response_schema(
+            request.system.clone().unwrap_or_default(),
+            request.response_schema.as_ref(),
+        );
         let mut messages = Vec::new();
-        if let Some(system) = &request.system {
+        if !system.is_empty() {
             messages.push(serde_json::json!({"role": "system", "content": system}));
         }
         messages.push(serde_json::json!({"role": "user", "content": request.prompt}));
@@ -273,6 +467,7 @@ impl AiService for GatewayAiService {
         if let Some(t) = request.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        apply_thinking_option(&mut body, request.thinking_level.as_deref());
         let wants_json = request.response_schema.is_some();
         if let Some(schema) = &request.response_schema {
             body["response_format"] = response_format_for(schema);
@@ -286,7 +481,7 @@ impl AiService for GatewayAiService {
 
         let (resp, _cred) = self
             .gateway
-            .chat_completion(&chat_req, &ByokOverride::default())
+            .chat_completion(&chat_req, &route)
             .await
             .map_err(|e| {
                 debug!(error = %e, purpose = request.purpose, model, "AI completion failed");
@@ -309,7 +504,105 @@ impl AiService for GatewayAiService {
         })
     }
 
+    async fn complete_stream(&self, request: AiRequest) -> Result<TokenStream, AiError> {
+        let route = Self::route_override(request.provider.as_deref(), &request.purpose)?;
+        let model = self
+            .resolve_model(request.project_id, request.model.as_deref())
+            .await
+            .ok_or_else(|| AiError::NoModel {
+                purpose: request.purpose.clone(),
+            })?;
+
+        // Keep the schema in the provider-neutral message as well as the
+        // native response_format. Anthropic ignores response_format and
+        // Gemini's adapter currently maps it to JSON MIME mode only.
+        let system = system_with_response_schema(
+            request.system.clone().unwrap_or_default(),
+            request.response_schema.as_ref(),
+        );
+
+        let mut messages = Vec::new();
+        if !system.is_empty() {
+            messages.push(serde_json::json!({"role": "system", "content": system}));
+        }
+        messages.push(serde_json::json!({"role": "user", "content": request.prompt}));
+
+        let mut body = serde_json::json!({
+            "model": model,
+            "messages": messages,
+            "stream": true,
+        });
+        if let Some(max_tokens) = request.max_tokens {
+            body["max_tokens"] = serde_json::json!(max_tokens);
+        }
+        if let Some(temperature) = request.temperature {
+            body["temperature"] = serde_json::json!(temperature);
+        }
+        apply_thinking_option(&mut body, request.thinking_level.as_deref());
+        if let Some(schema) = &request.response_schema {
+            body["response_format"] = response_format_for(schema);
+        }
+
+        let chat_req: ChatCompletionRequest =
+            serde_json::from_value(body).map_err(|error| AiError::Provider {
+                purpose: request.purpose.clone(),
+                reason: format!("malformed structured stream request: {error}"),
+            })?;
+        let purpose = request.purpose.clone();
+        let (byte_stream, _credential) = self
+            .gateway
+            .chat_completion_stream(&chat_req, &route)
+            .await
+            .map_err(|error| AiError::Provider {
+                purpose: purpose.clone(),
+                reason: error.to_string(),
+            })?;
+
+        let token_stream = async_stream::stream! {
+            let mut byte_stream = byte_stream;
+            let mut buffer = String::new();
+            while let Some(item) = byte_stream.next().await {
+                match item {
+                    Ok(bytes) => {
+                        buffer.push_str(&String::from_utf8_lossy(&bytes));
+                        while let Some(newline) = buffer.find('\n') {
+                            let line: String = buffer.drain(..=newline).collect();
+                            let line = line.trim();
+                            let Some(data) = line.strip_prefix("data:") else {
+                                continue;
+                            };
+                            let data = data.trim();
+                            if data == "[DONE]" {
+                                return;
+                            }
+                            if let Ok(chunk) = serde_json::from_str::<ChatCompletionChunk>(data) {
+                                if let Some(content) = chunk
+                                    .choices
+                                    .first()
+                                    .and_then(|choice| choice.delta.content.as_ref())
+                                {
+                                    if !content.is_empty() {
+                                        yield Ok(content.clone());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        yield Err(AiError::Provider {
+                            purpose: purpose.clone(),
+                            reason: error.to_string(),
+                        });
+                        return;
+                    }
+                }
+            }
+        };
+        Ok(Box::pin(token_stream))
+    }
+
     async fn chat(&self, request: ChatTurnRequest) -> Result<ChatTurnResponse, AiError> {
+        let route = Self::route_override(request.provider.as_deref(), &request.purpose)?;
         let model = self
             .resolve_model(request.project_id, request.model.as_deref())
             .await
@@ -330,6 +623,7 @@ impl AiService for GatewayAiService {
         if let Some(t) = request.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        apply_thinking_option(&mut body, request.thinking_level.as_deref());
 
         let chat_req: ChatCompletionRequest =
             serde_json::from_value(body).map_err(|e| AiError::Provider {
@@ -339,7 +633,7 @@ impl AiService for GatewayAiService {
 
         let (resp, _cred) = self
             .gateway
-            .chat_completion(&chat_req, &ByokOverride::default())
+            .chat_completion(&chat_req, &route)
             .await
             .map_err(|e| AiError::Provider {
                 purpose: request.purpose.clone(),
@@ -374,6 +668,7 @@ impl AiService for GatewayAiService {
     }
 
     async fn chat_stream(&self, request: ChatTurnRequest) -> Result<TokenStream, AiError> {
+        let route = Self::route_override(request.provider.as_deref(), &request.purpose)?;
         let model = self
             .resolve_model(request.project_id, request.model.as_deref())
             .await
@@ -393,6 +688,7 @@ impl AiService for GatewayAiService {
         if let Some(t) = request.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        apply_thinking_option(&mut body, request.thinking_level.as_deref());
         let chat_req: ChatCompletionRequest =
             serde_json::from_value(body).map_err(|e| AiError::Provider {
                 purpose: request.purpose.clone(),
@@ -402,7 +698,7 @@ impl AiService for GatewayAiService {
         let purpose = request.purpose.clone();
         let (byte_stream, _cred) = self
             .gateway
-            .chat_completion_stream(&chat_req, &ByokOverride::default())
+            .chat_completion_stream(&chat_req, &route)
             .await
             .map_err(|e| AiError::Provider {
                 purpose: purpose.clone(),
@@ -454,6 +750,7 @@ impl AiService for GatewayAiService {
     }
 
     async fn chat_stream_turn(&self, request: ChatTurnRequest) -> Result<ChatTurnStream, AiError> {
+        let route = Self::route_override(request.provider.as_deref(), &request.purpose)?;
         let model = self
             .resolve_model(request.project_id, request.model.as_deref())
             .await
@@ -477,6 +774,7 @@ impl AiService for GatewayAiService {
         if let Some(t) = request.temperature {
             body["temperature"] = serde_json::json!(t);
         }
+        apply_thinking_option(&mut body, request.thinking_level.as_deref());
         let chat_req: ChatCompletionRequest =
             serde_json::from_value(body).map_err(|e| AiError::Provider {
                 purpose: request.purpose.clone(),
@@ -490,7 +788,7 @@ impl AiService for GatewayAiService {
         );
         let (byte_stream, _cred) = self
             .gateway
-            .chat_completion_stream(&chat_req, &ByokOverride::default())
+            .chat_completion_stream(&chat_req, &route)
             .await
             .map_err(|e| AiError::Provider {
                 purpose: purpose.clone(),
@@ -610,6 +908,12 @@ mod tests {
             max_cost_per_month_microcents: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            provider_type: "gateway".to_string(),
+            agent_cli_provider_id: None,
+            interactive_bridge_enabled: false,
+            summary_provider_id: None,
+            summary_model: None,
+            summary_thinking_level: None,
         }
     }
 
@@ -622,6 +926,23 @@ mod tests {
             base_url: None,
             default_model: None,
             is_active: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn catalog_model(model_id: &str) -> temps_entities::ai_provider_models::Model {
+        temps_entities::ai_provider_models::Model {
+            id: 1,
+            provider_key_id: 1,
+            model_id: model_id.to_string(),
+            display_name: model_id.to_string(),
+            source: "discovered".to_string(),
+            is_available: true,
+            is_enabled: true,
+            owned_by: Some("openai".to_string()),
+            metadata: None,
+            last_seen_at: Some(chrono::Utc::now()),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -651,12 +972,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_resolve_model_explicit_wins_without_db_lookup() {
-        // No query results queued: an explicit, non-empty model must short-circuit
-        // before any database access. (A DB hit here would panic the mock.)
-        let svc = service_over(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+    async fn test_resolve_model_explicit_allowed_without_scope_policy() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
+            .into_connection();
+        let svc = service_over(db);
         let model = svc.resolve_model(Some(7), Some("gpt-4.1")).await;
         assert_eq!(model, Some("gpt-4.1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_model_explicit_must_be_in_scope_allowlist() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![config_row(
+                "project:7",
+                Some(serde_json::json!(["gpt-5-nano"])),
+            )]])
+            .into_connection();
+        let svc = service_over(db);
+        assert_eq!(svc.resolve_model(Some(7), Some("gpt-5.6")).await, None);
     }
 
     #[tokio::test]
@@ -668,10 +1002,11 @@ mod tests {
             .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
             // ai_provider_keys: one active anthropic key
             .append_query_results(vec![vec![active_key("anthropic")]])
+            .append_query_results(vec![Vec::<temps_entities::ai_provider_models::Model>::new()])
             .into_connection();
         let svc = service_over(db);
         let model = svc.resolve_model(None, Some("")).await;
-        assert_eq!(model, Some("claude-3-5-haiku-latest".to_string()));
+        assert_eq!(model, Some("claude-haiku-4-5".to_string()));
     }
 
     #[tokio::test]
@@ -693,19 +1028,34 @@ mod tests {
     async fn test_resolve_model_default_for_first_active_key() {
         // No allow-list -> default model for the first active provider key.
         for (provider, expected) in [
-            ("openai", "gpt-4o-mini"),
-            ("anthropic", "claude-3-5-haiku-latest"),
-            ("gemini", "gemini-1.5-flash"),
-            ("xai", "grok-2-latest"),
+            ("openai", "gpt-5-nano"),
+            ("anthropic", "claude-haiku-4-5"),
+            ("gemini", "gemini-3.5-flash-lite"),
+            ("xai", "grok-4.5"),
         ] {
             let db = MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
                 .append_query_results(vec![vec![active_key(provider)]])
+                .append_query_results(vec![Vec::<temps_entities::ai_provider_models::Model>::new()])
                 .into_connection();
             let svc = service_over(db);
             let model = svc.resolve_model(None, None).await;
             assert_eq!(model, Some(expected.to_string()), "provider {provider}");
         }
+    }
+
+    #[tokio::test]
+    async fn test_resolve_model_prefers_live_catalog_over_bootstrap_default() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
+            .append_query_results(vec![vec![active_key("openai")]])
+            .append_query_results(vec![vec![catalog_model("gpt-5.6-terra")]])
+            .into_connection();
+        let svc = service_over(db);
+        assert_eq!(
+            svc.resolve_model(None, None).await,
+            Some("gpt-5.6-terra".to_string())
+        );
     }
 
     #[tokio::test]
@@ -717,6 +1067,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
             .append_query_results(vec![vec![key]])
+            .append_query_results(vec![Vec::<temps_entities::ai_provider_models::Model>::new()])
             .into_connection();
         let svc = service_over(db);
         assert_eq!(
@@ -733,11 +1084,12 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
             .append_query_results(vec![vec![key]])
+            .append_query_results(vec![Vec::<temps_entities::ai_provider_models::Model>::new()])
             .into_connection();
         let svc = service_over(db);
         assert_eq!(
             svc.resolve_model(None, None).await,
-            Some("gpt-4o-mini".to_string())
+            Some("gpt-5-nano".to_string())
         );
     }
 
@@ -758,6 +1110,7 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![Vec::<temps_entities::ai_gateway_config::Model>::new()])
             .append_query_results(vec![vec![active_key("custom")]])
+            .append_query_results(vec![Vec::<temps_entities::ai_provider_models::Model>::new()])
             .into_connection();
         let svc = service_over(db);
         assert_eq!(svc.resolve_model(None, None).await, None);
@@ -770,29 +1123,30 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![config_row("instance", None)]])
             .append_query_results(vec![vec![active_key("openai")]])
+            .append_query_results(vec![Vec::<temps_entities::ai_provider_models::Model>::new()])
             .into_connection();
         let svc = service_over(db);
         let model = svc.resolve_model(None, None).await;
-        assert_eq!(model, Some("gpt-4o-mini".to_string()));
+        assert_eq!(model, Some("gpt-5-nano".to_string()));
     }
 
     #[test]
     fn test_default_model_for_provider_mapping() {
         assert_eq!(
             default_model_for_provider("openai"),
-            Some("gpt-4o-mini".to_string())
+            Some("gpt-5-nano".to_string())
         );
         assert_eq!(
             default_model_for_provider("anthropic"),
-            Some("claude-3-5-haiku-latest".to_string())
+            Some("claude-haiku-4-5".to_string())
         );
         assert_eq!(
             default_model_for_provider("gemini"),
-            Some("gemini-1.5-flash".to_string())
+            Some("gemini-3.5-flash-lite".to_string())
         );
         assert_eq!(
             default_model_for_provider("xai"),
-            Some("grok-2-latest".to_string())
+            Some("grok-4.5".to_string())
         );
         // Unknown / custom providers have no built-in default.
         assert_eq!(default_model_for_provider("custom"), None);
@@ -841,6 +1195,64 @@ mod tests {
         assert_eq!(rf["type"], "json_schema");
         assert_eq!(rf["json_schema"]["schema"]["type"], "object");
         assert_eq!(rf["json_schema"]["strict"], true);
+    }
+
+    #[test]
+    fn exact_gateway_key_route_parses_and_rejects_invalid_ids() {
+        let route = GatewayAiService::route_override(Some("gateway_key:42"), "chat.test")
+            .expect("valid exact key route");
+        assert_eq!(route.system_key_id, Some(42));
+        assert!(GatewayAiService::route_override(Some("gateway_key:nope"), "chat.test").is_err());
+        assert!(GatewayAiService::route_override(Some("openai"), "chat.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn exact_gateway_key_availability_requires_that_key_to_be_active() {
+        let mut disabled = active_key("openai");
+        disabled.id = 42;
+        disabled.is_active = false;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![disabled]])
+            .into_connection();
+        let svc = service_over(db);
+        assert!(!svc.is_available_for(Some("gateway_key:42")).await);
+    }
+
+    #[tokio::test]
+    async fn exact_gateway_key_availability_accepts_the_pinned_active_key() {
+        let mut active = active_key("openai");
+        active.id = 42;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![active]])
+            .into_connection();
+        let svc = service_over(db);
+        assert!(svc.is_available_for(Some("gateway_key:42")).await);
+    }
+
+    #[test]
+    fn thinking_option_maps_to_upstream_reasoning_effort() {
+        let mut body = serde_json::json!({"model": "gpt-5.4"});
+        apply_thinking_option(&mut body, Some("high"));
+        assert_eq!(body["reasoning_effort"], "high");
+
+        let mut default_body = serde_json::json!({"model": "gpt-4.1"});
+        apply_thinking_option(&mut default_body, None);
+        assert!(default_body.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn provider_neutral_system_message_contains_the_structured_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {"headline": {"type": "string"}},
+            "required": ["headline"]
+        });
+        let system =
+            system_with_response_schema("Return concise output".to_string(), Some(&schema));
+        assert!(system.contains("Return concise output"));
+        assert!(system.contains("JSON Schema"));
+        assert!(system.contains("headline"));
+        assert!(system.contains("required"));
     }
 
     #[test]

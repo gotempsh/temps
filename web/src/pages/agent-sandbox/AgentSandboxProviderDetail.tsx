@@ -1,4 +1,4 @@
-import { Link, useParams } from 'react-router-dom'
+import { Link, useParams } from 'react-router'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import { toast } from 'sonner'
@@ -51,6 +51,10 @@ interface ProviderCatalogDto {
   current_auth_type: string | null
   models: string[]
   default_model: string | null
+  max_turns_analysis: number | null
+  max_turns_fix: number | null
+  max_turns_feedback: number | null
+  supports_max_turns: boolean
 }
 
 interface ProviderCatalogResponse {
@@ -96,7 +100,10 @@ export function AgentSandboxProviderDetail() {
     return (
       <Card>
         <CardContent className="py-8 space-y-3">
-          <p className="text-sm">Provider <code className="font-mono">{id}</code> is not in the catalog.</p>
+          <p className="text-sm">
+            Provider <code className="font-mono">{id}</code> is not in the
+            catalog.
+          </p>
           <Button asChild variant="outline" size="sm">
             <Link to="/agent-sandbox/providers">
               <ArrowLeft className="h-3.5 w-3.5 mr-1.5" />
@@ -159,7 +166,7 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
   const [modelDraft, setModelDraft] = useState(initialModel)
   const [customMode, setCustomMode] = useState(
     provider.models.length === 0 ||
-      (initialModel !== '' && !provider.models.includes(initialModel)),
+      (initialModel !== '' && !provider.models.includes(initialModel))
   )
   const [savingModel, setSavingModel] = useState(false)
 
@@ -170,14 +177,15 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       setModelDraft(fresh)
       setCustomMode(
         provider.models.length === 0 ||
-          (fresh !== '' && !provider.models.includes(fresh)),
+          (fresh !== '' && !provider.models.includes(fresh))
       )
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [provider.default_model])
 
   const selectedFlavor =
-    provider.auth_flavors.find((f) => f.id === selectedFlavorId) ?? defaultFlavor
+    provider.auth_flavors.find((f) => f.id === selectedFlavorId) ??
+    defaultFlavor
 
   const persistModel = async (next: string) => {
     if (next === serverModel) return
@@ -196,7 +204,7 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
         setModelDraft(serverModel)
         setCustomMode(
           provider.models.length === 0 ||
-            (serverModel !== '' && !provider.models.includes(serverModel)),
+            (serverModel !== '' && !provider.models.includes(serverModel))
         )
         return
       }
@@ -204,7 +212,7 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
       toast.success(
         next === ''
           ? `${provider.name} will use its default model`
-          : `${provider.name} model set to ${next}`,
+          : `${provider.name} model set to ${next}`
       )
       await queryClient.invalidateQueries({ queryKey: ['ai-provider-catalog'] })
     } catch (e) {
@@ -237,7 +245,7 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
     try {
       const res = await fetch(
         `/api/settings/ai-providers/${provider.id}/activate`,
-        { method: 'POST' },
+        { method: 'POST' }
       )
       if (!res.ok) {
         const detail = await res.text()
@@ -266,7 +274,7 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
     try {
       const res = await fetch(
         `/api/projects/0/agents/smoke-test?provider_id=${encodeURIComponent(provider.id)}`,
-        { method: 'POST' },
+        { method: 'POST' }
       )
       if (!res.ok) {
         const detail = await res.text()
@@ -310,7 +318,7 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
             auth_type: selectedFlavor.id,
             credential: credential.trim(),
           }),
-        },
+        }
       )
       if (!res.ok) {
         const detail = await res.text()
@@ -354,11 +362,15 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
               <CardDescription className="mt-1 space-y-0.5">
                 <span className="block">
                   Install:{' '}
-                  <code className="bg-muted px-1 rounded">{provider.install_command}</code>
+                  <code className="bg-muted px-1 rounded">
+                    {provider.install_command}
+                  </code>
                 </span>
                 <span className="block">
                   Auth:{' '}
-                  <code className="bg-muted px-1 rounded">{provider.auth_command}</code>
+                  <code className="bg-muted px-1 rounded">
+                    {provider.auth_command}
+                  </code>
                 </span>
               </CardDescription>
             </div>
@@ -437,7 +449,9 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
                 </span>
               )}
             </Label>
-            <p className="text-xs text-muted-foreground">{selectedFlavor.description}</p>
+            <p className="text-xs text-muted-foreground">
+              {selectedFlavor.description}
+            </p>
             {selectedFlavor.format === 'config_file' ? (
               <Textarea
                 id={`cred-${provider.id}`}
@@ -505,11 +519,15 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
               {testResult.cli_version && (
                 <p className="text-muted-foreground">
                   Version:{' '}
-                  <code className="bg-muted px-1 rounded">{testResult.cli_version}</code>
+                  <code className="bg-muted px-1 rounded">
+                    {testResult.cli_version}
+                  </code>
                 </p>
               )}
               {testResult.auth_info && (
-                <p className="text-muted-foreground">Auth: {testResult.auth_info}</p>
+                <p className="text-muted-foreground">
+                  Auth: {testResult.auth_info}
+                </p>
               )}
               {testResult.setup_hint && (
                 <p className="text-muted-foreground">{testResult.setup_hint}</p>
@@ -598,6 +616,138 @@ function ProviderEditor({ provider, isActive }: ProviderEditorProps) {
           )}
         </CardContent>
       </Card>
+
+      <TurnLimitsCard provider={provider} />
     </div>
+  )
+}
+
+// ── Autofix turn limits ─────────────────────────────────────────────────────
+// Per-provider defaults for the autofixer's turn caps. Per-run overrides in
+// the "Fix with AI" dialog take precedence; blank fields fall back to the
+// built-in defaults (10 analysis / 20 fix / 10 feedback).
+
+const TURN_FIELDS = [
+  {
+    key: 'max_turns_analysis' as const,
+    label: 'Analysis',
+    builtin: 10,
+    hint: 'Root-cause investigation',
+  },
+  {
+    key: 'max_turns_fix' as const,
+    label: 'Fix',
+    builtin: 20,
+    hint: 'Writing the fix and tests',
+  },
+  {
+    key: 'max_turns_feedback' as const,
+    label: 'Feedback',
+    builtin: 10,
+    hint: 'Follow-up conversation rounds',
+  },
+]
+
+function TurnLimitsCard({ provider }: { provider: ProviderCatalogDto }) {
+  const queryClient = useQueryClient()
+  const [drafts, setDrafts] = useState<Record<string, string>>({
+    max_turns_analysis: provider.max_turns_analysis?.toString() ?? '',
+    max_turns_fix: provider.max_turns_fix?.toString() ?? '',
+    max_turns_feedback: provider.max_turns_feedback?.toString() ?? '',
+  })
+  const [savingTurns, setSavingTurns] = useState(false)
+
+  const dirty = TURN_FIELDS.some(
+    (f) => drafts[f.key] !== (provider[f.key]?.toString() ?? '')
+  )
+
+  const handleSaveTurns = async () => {
+    const body: Record<string, number> = {}
+    for (const f of TURN_FIELDS) {
+      const raw = drafts[f.key].trim()
+      // Blank = clear back to built-in default (API: 0 clears, omitted keeps)
+      const value = raw === '' ? 0 : Number(raw)
+      if (
+        raw !== '' &&
+        (!Number.isInteger(value) || value < 1 || value > 200)
+      ) {
+        toast.error(`${f.label} turns must be a whole number between 1 and 200`)
+        return
+      }
+      body[f.key] = value
+    }
+    setSavingTurns(true)
+    try {
+      const res = await fetch(`/api/settings/ai-providers/${provider.id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+      if (!res.ok) {
+        const detail = await res.text()
+        toast.error(`Failed to save ${provider.name} turn limits`, {
+          description: detail.slice(0, 200),
+        })
+        return
+      }
+      toast.success(`${provider.name} turn limits saved`)
+      await queryClient.invalidateQueries({ queryKey: ['ai-provider-catalog'] })
+    } catch (e) {
+      toast.error(`Failed to save ${provider.name} turn limits`, {
+        description: e instanceof Error ? e.message : 'Network error',
+      })
+    } finally {
+      setSavingTurns(false)
+    }
+  }
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-base">Autofix turn limits</CardTitle>
+        <CardDescription>
+          {provider.supports_max_turns
+            ? 'Default max agent turns per autofix phase when this provider runs. Per-run overrides in the "Fix with AI" dialog take precedence. Blank = built-in default.'
+            : `${provider.name}'s CLI has no turn-limit flag, so these values are stored but not enforced — runs continue until the CLI finishes on its own.`}
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="space-y-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+          {TURN_FIELDS.map((f) => (
+            <div key={f.key} className="space-y-1.5">
+              <Label htmlFor={`${f.key}-${provider.id}`}>{f.label}</Label>
+              <Input
+                id={`${f.key}-${provider.id}`}
+                type="number"
+                min={1}
+                max={200}
+                placeholder={`${f.builtin} (default)`}
+                value={drafts[f.key]}
+                onChange={(e) =>
+                  setDrafts((d) => ({ ...d, [f.key]: e.target.value }))
+                }
+              />
+              <p className="text-xs text-muted-foreground">{f.hint}</p>
+            </div>
+          ))}
+        </div>
+        <div className="flex justify-end">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleSaveTurns}
+            disabled={savingTurns || !dirty}
+          >
+            {savingTurns ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin mr-1.5" />
+            ) : (
+              <Save className="h-3.5 w-3.5 mr-1.5" />
+            )}
+            Save turn limits
+          </Button>
+        </div>
+      </CardContent>
+    </Card>
   )
 }

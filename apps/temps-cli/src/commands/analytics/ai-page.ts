@@ -23,6 +23,76 @@ function formatNumber(n: number): string {
   return n.toLocaleString('en-US')
 }
 
+export interface AiAgentRow {
+  label: string
+  provider: string
+  agent: string
+  purpose: string
+  requestCount: number
+  uniqueIps: number
+  percentage: number
+}
+
+export interface AiAgentBreakdownItem {
+  provider: string
+  agent: string
+  purpose?: string
+  request_count: number
+  unique_ips: number
+}
+
+/**
+ * Shapes the agents-on-this-path breakdown into display rows, optionally
+ * aggregating by provider. Mirrors ai-agents.ts's buildAiAgentRows for the
+ * single-page drill-down view.
+ */
+export function buildAiAgentRows(
+  items: AiAgentBreakdownItem[],
+  groupBy: 'agent' | 'provider'
+): AiAgentRow[] {
+  const total = items.reduce((sum, r) => sum + (r.request_count ?? 0), 0)
+
+  if (groupBy === 'provider') {
+    const byProvider = new Map<string, { count: number; uniqueIps: number; sample: string }>()
+    for (const row of items) {
+      const prev = byProvider.get(row.provider)
+      if (prev) {
+        prev.count += row.request_count
+        prev.uniqueIps += row.unique_ips
+      } else {
+        byProvider.set(row.provider, {
+          count: row.request_count,
+          uniqueIps: row.unique_ips,
+          sample: row.agent,
+        })
+      }
+    }
+    return Array.from(byProvider.entries())
+      .map(([provider, v]) => ({
+        label: provider,
+        provider,
+        agent: v.sample,
+        purpose: '',
+        requestCount: v.count,
+        uniqueIps: v.uniqueIps,
+        percentage: total > 0 ? (v.count / total) * 100 : 0,
+      }))
+      .sort((a, b) => b.requestCount - a.requestCount)
+  }
+
+  return items
+    .map((row) => ({
+      label: row.agent,
+      provider: row.provider,
+      agent: row.agent,
+      purpose: row.purpose ?? '',
+      requestCount: row.request_count,
+      uniqueIps: row.unique_ips,
+      percentage: total > 0 ? (row.request_count / total) * 100 : 0,
+    }))
+    .sort((a, b) => b.requestCount - a.requestCount)
+}
+
 /**
  * `temps analytics ai-page <path>` — drill into one URL path and show the
  * agents (default) or providers that hit it. This is the CLI equivalent of
@@ -102,65 +172,12 @@ export async function aiPage(
     }
   )
 
-  type Row = {
-    label: string
-    provider: string
-    agent: string
-    purpose: string
-    requestCount: number
-    uniqueIps: number
-    percentage: number
-  }
-
   const totalRequests = agents.reduce(
     (sum: number, r: any) => sum + (r.request_count ?? 0),
     0
   )
 
-  let rows: Row[]
-  if (groupBy === 'provider') {
-    const byProvider = new Map<
-      string,
-      { count: number; uniqueIps: number; sample: string }
-    >()
-    for (const row of agents) {
-      const prev = byProvider.get(row.provider)
-      if (prev) {
-        prev.count += row.request_count
-        prev.uniqueIps += row.unique_ips
-      } else {
-        byProvider.set(row.provider, {
-          count: row.request_count,
-          uniqueIps: row.unique_ips,
-          sample: row.agent,
-        })
-      }
-    }
-    rows = Array.from(byProvider.entries())
-      .map(([provider, v]) => ({
-        label: provider,
-        provider,
-        agent: v.sample,
-        purpose: '',
-        requestCount: v.count,
-        uniqueIps: v.uniqueIps,
-        percentage: totalRequests > 0 ? (v.count / totalRequests) * 100 : 0,
-      }))
-      .sort((a, b) => b.requestCount - a.requestCount)
-  } else {
-    rows = agents
-      .map((row: any) => ({
-        label: row.agent,
-        provider: row.provider,
-        agent: row.agent,
-        purpose: row.purpose ?? '',
-        requestCount: row.request_count,
-        uniqueIps: row.unique_ips,
-        percentage:
-          totalRequests > 0 ? (row.request_count / totalRequests) * 100 : 0,
-      }))
-      .sort((a: Row, b: Row) => b.requestCount - a.requestCount)
-  }
+  const rows = buildAiAgentRows(agents, groupBy)
 
   if (options.json) {
     jsonOut({

@@ -4,6 +4,8 @@ import { colors } from './ui/output.js'
 import { setQuietMode } from './ui/spinner.js'
 import { handleError } from './utils/errors.js'
 import { createRequire } from 'module'
+import { listContexts, contextExists } from './config/contexts.js'
+import { announceCommandMaturity } from './lib/feature-maturity.js'
 
 // Import command modules
 import { registerAuthCommands } from './commands/auth/index.js'
@@ -22,13 +24,20 @@ import { registerServicesCommands } from './commands/services/index.js'
 import { registerSettingsCommands } from './commands/settings/index.js'
 import { registerUsersCommands } from './commands/users/index.js'
 import { registerApiKeysCommands } from './commands/apikeys/index.js'
+import { registerTeamsCommands } from './commands/teams/index.js'
 import { registerMonitorsCommands } from './commands/monitors/index.js'
 import { registerWebhooksCommands } from './commands/webhooks/index.js'
 import { registerContainersCommands } from './commands/containers/index.js'
 import { registerDocsCommand } from './commands/docs.js'
 import { registerTokensCommands } from './commands/tokens/index.js'
 import { registerErrorsCommands } from './commands/errors/index.js'
+import { registerMetricsCommands } from './commands/metrics/index.js'
+import { registerTracesCommands } from './commands/traces/index.js'
+import { registerFacetsCommands } from './commands/facets/index.js'
+import { registerOtelForwardCommands } from './commands/otel-forward/index.js'
 import { registerKvCommands } from './commands/kv/index.js'
+import { registerFlagsCommands } from './commands/flags/index.js'
+import { registerDataCommands } from './commands/data/index.js'
 import { registerBlobCommands } from './commands/blob/index.js'
 import { registerDsnCommands } from './commands/dsn/index.js'
 import { registerScansCommands } from './commands/scans/index.js'
@@ -43,7 +52,6 @@ import { registerIncidentsCommands } from './commands/incidents/index.js'
 import { registerEmailsCommands } from './commands/emails/index.js'
 import { registerLoadBalancerCommands } from './commands/load-balancer/index.js'
 import { registerImportsCommands } from './commands/imports/index.js'
-import { registerMigrateCommands } from './commands/migrate/index.js'
 import { registerTemplatesCommands } from './commands/templates/index.js'
 import { registerPlatformCommands } from './commands/platform/index.js'
 import { registerPresetsCommands } from './commands/presets/index.js'
@@ -63,6 +71,7 @@ import { registerInitCommand } from './commands/init/index.js'
 import { registerLinkCommand } from './commands/link/index.js'
 import { registerUpCommand } from './commands/up/index.js'
 import { registerStatusCommand } from './commands/status/index.js'
+import { registerAiCommands } from './commands/ai/index.js'
 import { registerInstancesCommands } from './commands/instances/index.js'
 import { registerEnvSyncCommands } from './commands/env-sync/index.js'
 import { registerRollbackCommand } from './commands/rollback/index.js'
@@ -92,7 +101,21 @@ export function createProgram(): Command {
     .version(VERSION, '-V, --version', 'Display version number')
     .option('--no-color', 'Disable colored output')
     .option('--debug', 'Enable debug output')
-    .hook('preAction', (thisCommand, actionCommand) => {
+    .option(
+      '--target-context <name>',
+      'Target this context for this command only, without changing the ' +
+        'active context (see `temps context list`). Prefer this over ' +
+        '`temps context use` / relying on `login`\'s side effect of ' +
+        'flipping which context is active — that shared, mutable state is ' +
+        'easy to drift out from under you (e.g. across scripts, shells, or ' +
+        'agent sessions) and a command then silently runs against the ' +
+        'wrong server. Equivalent to setting TEMPS_CONTEXT for just this ' +
+        'invocation. Named distinctly from `login`/`logout`\'s own ' +
+        '`--context <name>` (which names a context to save/remove, not ' +
+        'target) so the two never collide when both could apply to the ' +
+        'same invocation.'
+    )
+    .hook('preAction', async (thisCommand, actionCommand) => {
       const opts = thisCommand.opts()
       if (opts.debug) {
         process.env.DEBUG = '1'
@@ -100,11 +123,37 @@ export function createProgram(): Command {
       if (opts.noColor) {
         chalk.level = 0
       }
+      if (opts.targetContext) {
+        // Validate eagerly and exit rather than letting an unrecognized name
+        // silently fall through to whatever the legacy single-instance
+        // store (or on-disk `isActive` flag) happens to point at — that
+        // silent fallback is exactly the failure mode this flag exists to
+        // prevent. A typo in --target-context must be loud, not quietly wrong.
+        const contexts = await listContexts()
+        if (!contextExists(opts.targetContext, contexts)) {
+          const names = contexts.map((c) => c.name).join(', ') || '(none configured)'
+          process.stderr.write(
+            `Error: --target-context "${opts.targetContext}" does not match any configured context.\n` +
+              `Available: ${names}\n` +
+              `Run \`temps context list\` to see all contexts, or \`temps login <url>\` to add this one.\n`
+          )
+          // Hard exit — a preAction hook returning doesn't stop the action
+          // handler from still running afterward, and letting an invalid
+          // --target-context silently continue (e.g. falling back to the
+          // legacy single-instance store) is exactly the failure mode this
+          // flag exists to prevent.
+          process.exit(1)
+        }
+        process.env.TEMPS_CONTEXT = opts.targetContext
+      }
       // Any leaf command invoked with --json should render machine-readable
       // output only: suppress spinners and other terminal chrome so callers
       // can pipe stdout to `jq` or parse it directly.
       if (actionCommand?.opts().json) {
         setQuietMode(true)
+      }
+      if (actionCommand) {
+        await announceCommandMaturity(actionCommand, thisCommand)
       }
     })
 
@@ -124,13 +173,20 @@ export function createProgram(): Command {
   registerServicesCommands(program)
   registerSettingsCommands(program)
   registerUsersCommands(program)
+  registerTeamsCommands(program)
   registerApiKeysCommands(program)
   registerMonitorsCommands(program)
   registerWebhooksCommands(program)
   registerContainersCommands(program)
   registerTokensCommands(program)
   registerErrorsCommands(program)
+  registerMetricsCommands(program)
+  registerTracesCommands(program)
+  registerFacetsCommands(program)
+  registerOtelForwardCommands(program)
   registerKvCommands(program)
+  registerFlagsCommands(program)
+  registerDataCommands(program)
   registerBlobCommands(program)
   registerDsnCommands(program)
   registerScansCommands(program)
@@ -145,7 +201,6 @@ export function createProgram(): Command {
   registerEmailsCommands(program)
   registerLoadBalancerCommands(program)
   registerImportsCommands(program)
-  registerMigrateCommands(program)
   registerTemplatesCommands(program)
   registerPlatformCommands(program)
   registerPresetsCommands(program)
@@ -165,6 +220,7 @@ export function createProgram(): Command {
   registerLinkCommand(program)
   registerUpCommand(program)
   registerStatusCommand(program)
+  registerAiCommands(program)
   registerInstancesCommands(program)
   registerEnvSyncCommands(program)
   registerRollbackCommand(program)

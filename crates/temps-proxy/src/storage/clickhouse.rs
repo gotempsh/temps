@@ -44,6 +44,8 @@
 //!   strings. The known-agent IN list is server-derived from
 //!   `ai_agent_detector::known_agents()` and is bound as an array regardless.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use serde::{Deserialize, Serialize};
@@ -57,6 +59,11 @@ use crate::service::proxy_log_service::{
     AiAgentBreakdownRow, AiAgentTimelineRow, AiPageBreakdownRow, AiStatusBreakdownRow,
     AiTimelineGroupBy, CreateProxyLogRequest, ProjectHealthSummary, ProxyLogService,
     ProxyLogServiceError, StatsFilters, TimeBucketStats,
+};
+use crate::traffic_aggregation::{
+    TrafficAggregationRequest, TrafficAggregationResponse, TrafficAggregationRow, TrafficDimension,
+    TrafficDimensionValue, TrafficFilter, TrafficFilterOperator, TrafficMetric,
+    TrafficMetricValues, TrafficOrderField, TrafficSortDirection,
 };
 
 /// Maximum rows per ClickHouse HTTP insert request. Bounds peak buffer memory
@@ -162,6 +169,7 @@ fn interval_to_seconds(interval: &str) -> Option<i64> {
 /// A bind value queued while a dynamic WHERE clause is assembled, applied to
 /// the query builder in order after the SQL string is finalized. Mirrors the
 /// `Bv` pattern in `temps-otel`'s `query_spans`.
+#[derive(Clone)]
 enum Bv {
     I16(i16),
     I32(i32),
@@ -287,6 +295,13 @@ pub struct ChProxyLogRow {
     pub error_group_id: Option<i32>,
     /// _version UInt64 — Unix-ms dedup key for ReplacingMergeTree.
     pub _version: u64,
+    /// retention_days UInt16 DEFAULT 30
+    ///
+    /// Added by migration 0003_retention_days.sql — must remain the last
+    /// field so its position matches the DDL column order (positional binary
+    /// serialization). The TTL expression in 0004_retention_ttl.sql reads
+    /// this column: `toDateTime(timestamp) + toIntervalDay(retention_days)`.
+    pub retention_days: u16,
 }
 
 impl From<&CreateProxyLogRequest> for ChProxyLogRow {
@@ -351,6 +366,9 @@ impl From<&CreateProxyLogRequest> for ChProxyLogRow {
             trace_id: entry.trace_id.clone().unwrap_or_default(),
             error_group_id: entry.error_group_id,
             _version: now_ms as u64,
+            // Callers that hold a RetentionResolver should override this field
+            // after construction. The fixed default matches the DDL DEFAULT.
+            retention_days: temps_core::RetentionTable::ProxyLogs.default_days(),
         }
     }
 }
@@ -476,7 +494,11 @@ struct ChCountRow {
 struct ChTimeBucketRow {
     bucket_ms: i64,
     request_count: u64,
+    latency_count: u64,
     avg_response_time_ms: f64,
+    p50_response_time_ms: f64,
+    p95_response_time_ms: f64,
+    p99_response_time_ms: f64,
     error_count: u64,
     total_request_bytes: i64,
     total_response_bytes: i64,
@@ -524,6 +546,29 @@ struct ChAiStatusRow {
     request_count: u64,
 }
 
+#[derive(::clickhouse::Row, Deserialize, Debug)]
+struct ChTrafficAggregationRow {
+    d0: Option<String>,
+    d1: Option<String>,
+    d2: Option<String>,
+    d3: Option<String>,
+    requests: Option<u64>,
+    errors: Option<u64>,
+    error_rate: Option<f64>,
+    latency_avg_ms: Option<f64>,
+    latency_min_ms: Option<f64>,
+    latency_max_ms: Option<f64>,
+    latency_p50_ms: Option<f64>,
+    latency_p95_ms: Option<f64>,
+    latency_p99_ms: Option<f64>,
+    unique_ips: Option<u64>,
+    unique_paths: Option<u64>,
+    bot_requests: Option<u64>,
+    robots_txt_requests: Option<u64>,
+    last_seen_ms: Option<i64>,
+    total_groups: u64,
+}
+
 /// Convert a Unix-ms value to an RFC3339 string (matching the Postgres path's
 /// `to_rfc3339()`).
 fn ms_to_rfc3339(ms: i64) -> String {
@@ -542,18 +587,29 @@ fn ms_to_rfc3339(ms: i64) -> String {
 /// [`super::clickhouse_migrations::apply_migrations`].
 pub struct ClickHouseProxyLogStore {
     client: ::clickhouse::Client,
+    /// Resolves the per-project `retention_days` value stamped onto each
+    /// ingested proxy log row. The default [`temps_core::FixedRetentionResolver`]
+    /// always returns 30; a plugin can register an alternative implementation.
+    resolver: Arc<dyn temps_core::RetentionResolver>,
 }
 
 impl ClickHouseProxyLogStore {
     /// Build a store from connection configuration. Does not validate
     /// connectivity.
-    pub fn new(config: ClickHouseProxyLogConfig) -> Self {
+    ///
+    /// `resolver` is called once per row in `write_batch` to populate
+    /// `retention_days`. Pass `Arc::new(FixedRetentionResolver)` unless a
+    /// plugin has registered a project-aware implementation.
+    pub fn new(
+        config: ClickHouseProxyLogConfig,
+        resolver: Arc<dyn temps_core::RetentionResolver>,
+    ) -> Self {
         let client = ::clickhouse::Client::default()
             .with_url(&config.url)
             .with_database(&config.database)
             .with_user(&config.user)
             .with_password(&config.password);
-        Self { client }
+        Self { client, resolver }
     }
 
     /// Borrow the underlying client (for migrations / health checks).
@@ -703,8 +759,13 @@ impl ClickHouseProxyLogStore {
             binds.push(Bv::I64(start.timestamp_millis()));
         }
         if let Some(end) = end_date {
-            clauses.push("timestamp <= fromUnixTimestamp64Milli(?)".into());
+            clauses.push("timestamp < fromUnixTimestamp64Milli(?)".into());
             binds.push(Bv::I64(end.timestamp_millis()));
+        }
+
+        if filters.exclude_synthetic == Some(true) {
+            clauses.push("request_source != 'temps_monitor'".into());
+            clauses.push("ifNull(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".into());
         }
 
         // Request
@@ -719,6 +780,10 @@ impl ClickHouseProxyLogStore {
         if let Some(ref path) = filters.path {
             clauses.push("path ILIKE ?".into());
             binds.push(Bv::Str(format!("%{}%", escape_like_pattern(path))));
+        }
+        if let Some(ref path) = filters.path_exact {
+            clauses.push("path = ?".into());
+            binds.push(Bv::Str(path.clone()));
         }
         if let Some(ref ip) = filters.client_ip {
             clauses.push("client_ip = ?".into());
@@ -777,6 +842,12 @@ impl ClickHouseProxyLogStore {
             // in CH compares the Nullable(UInt8) and skips NULLs identically.
             clauses.push("is_bot = ?".into());
             binds.push(Bv::Bool(is_bot));
+        }
+        if filters.exclude_bots == Some(true) {
+            // Tri-state exclusion: drop detected bots but KEEP rows with no
+            // detection metadata (is_bot IS NULL) — mirrors the TimescaleDB
+            // `is_bot = false OR is_bot IS NULL` predicate.
+            clauses.push("(is_bot = 0 OR is_bot IS NULL)".into());
         }
         if let Some(ref bot_name) = filters.bot_name {
             clauses.push("bot_name ILIKE ?".into());
@@ -887,7 +958,16 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 })?;
 
             for entry in chunk {
-                let row = ChProxyLogRow::from(entry);
+                let mut row = ChProxyLogRow::from(entry);
+                // Unrouted requests have no project context; use the table
+                // default directly so the resolver is not called with a
+                // fabricated project ID.
+                row.retention_days = match entry.project_id {
+                    Some(pid) => self
+                        .resolver
+                        .resolve(pid, temps_core::RetentionTable::ProxyLogs),
+                    None => temps_core::RetentionTable::ProxyLogs.default_days(),
+                };
                 inserter
                     .write(&row)
                     .await
@@ -907,6 +987,53 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         }
 
         Ok(())
+    }
+
+    async fn aggregate_traffic(
+        &self,
+        project_id: i32,
+        request: TrafficAggregationRequest,
+    ) -> Result<TrafficAggregationResponse, ProxyLogServiceError> {
+        request.validate()?;
+        let (sql, binds, count_sql) = build_traffic_query(project_id, &request)?;
+        let count_binds = binds.clone();
+        let query_client = self
+            .client
+            .clone()
+            .with_setting("max_execution_time", "15")
+            .with_setting("max_rows_to_group_by", "100000")
+            .with_setting("group_by_overflow_mode", "throw")
+            .with_setting("max_bytes_before_external_group_by", "67108864")
+            // Four concurrent endpoint queries therefore reserve at most
+            // roughly 512 MiB even for exact distinct aggregate states.
+            .with_setting("max_memory_usage", "134217728");
+        let rows = apply_binds(query_client.query(&sql), binds)
+            .fetch_all::<ChTrafficAggregationRow>()
+            .await
+            .map_err(|error| ProxyLogServiceError::ClickHouse {
+                operation: "aggregate_traffic".to_string(),
+                reason: error.to_string(),
+            })?;
+        let empty_page_total = if rows.is_empty() {
+            Some(
+                apply_binds(query_client.query(&count_sql), count_binds)
+                    .fetch_one::<ChCountRow>()
+                    .await
+                    .map_err(|error| ProxyLogServiceError::ClickHouse {
+                        operation: "aggregate_traffic (empty-page count)".to_string(),
+                        reason: error.to_string(),
+                    })?
+                    .cnt,
+            )
+        } else {
+            None
+        };
+        let mut response = ch_traffic_response(&request, rows)?;
+        if let Some(total_groups) = empty_page_total {
+            response.total_groups = total_groups;
+            response.total_pages = total_groups.div_ceil(request.page_size);
+        }
+        Ok(response)
     }
 
     async fn list_with_filters(
@@ -931,13 +1058,21 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         };
 
         // ── COUNT(*) total (same WHERE) ──────────────────────────────────────
-        // FINAL: proxy_logs is a ReplacingMergeTree, and an insert retry or a
-        // re-run of the TimescaleDB→ClickHouse backfill can leave duplicate rows
-        // that ClickHouse only collapses on a later merge — and two copies in
-        // different parts may never merge together without OPTIMIZE. Without
-        // FINAL this count() over-reports the pagination total. FINAL forces
-        // merge-on-read so the total matches the deduplicated result set.
-        let count_sql = format!("SELECT count() AS cnt FROM proxy_logs FINAL {where_clause}");
+        // NO FINAL — deliberate, restoring the design stated in
+        // 0001_proxy_logs.sql: "the high-volume read paths (list + the 7
+        // aggregations) GROUP BY or LIMIT and tolerate the rare pre-merge
+        // duplicate, so they do NOT use FINAL (keeps the hot scans fast)".
+        //
+        // FINAL forces merge-on-read across every part in every partition. On
+        // an unfiltered listing that turns this count from a metadata-only
+        // lookup (1.2ms in the DDL benchmark) into a full-table merge scan —
+        // multiple seconds once the table reaches 100M+ rows, which is what
+        // made `GET /proxy-logs` unusable. proxy_logs is a ReplacingMergeTree
+        // only so a retried batch is idempotent; duplicates are rare, transient
+        // (collapsed at the next merge), and at worst inflate this total by a
+        // handful of rows out of millions. A pagination total is not worth a
+        // full merge scan for that.
+        let count_sql = format!("SELECT count() AS cnt FROM proxy_logs {where_clause}");
         let (_, count_binds, _) = Self::build_list_where(start_date, end_date, &filters);
         let count_q = apply_binds(self.client.query(&count_sql), count_binds);
         let total = count_q
@@ -952,6 +1087,11 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // ── Page fetch ───────────────────────────────────────────────────────
         // ORDER BY column is allowlist-derived; direction is a fixed enum. Both
         // are safe to interpolate (no user string reaches the SQL).
+        //
+        // NO FINAL here either (see the count note above). A LIMIT-ed page is
+        // exactly the shape the DDL calls out as duplicate-tolerant: the worst
+        // case is one retried request showing twice on a page until the next
+        // merge, versus merge-on-read over every part on every page load.
         let order_col = sort_column(filters.sort_by.as_deref());
         let order_dir = match filters.sort_order.as_deref() {
             Some("asc") => "ASC",
@@ -967,7 +1107,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_col} {order_dir} \
              LIMIT ? OFFSET ?"
@@ -992,6 +1132,64 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         Ok((models, total))
     }
 
+    async fn list_page(
+        &self,
+        start_date: Option<UtcDateTime>,
+        end_date: Option<UtcDateTime>,
+        filters: ProxyLogsQuery,
+        limit: u64,
+    ) -> Result<Vec<proxy_logs::Model>, ProxyLogServiceError> {
+        let (clauses, binds, impossible) = Self::build_list_where(start_date, end_date, &filters);
+
+        // Unknown ai_provider → guaranteed empty, no round-trip.
+        if impossible {
+            return Ok(vec![]);
+        }
+
+        let where_clause = if clauses.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", clauses.join(" AND "))
+        };
+
+        // Same page projection as `list_with_filters`, minus the count()
+        // aggregate — feed callers discard the total. ORDER BY column is
+        // allowlist-derived; direction is a fixed enum (injection-safe).
+        let order_col = sort_column(filters.sort_by.as_deref());
+        let order_dir = match filters.sort_order.as_deref() {
+            Some("asc") => "ASC",
+            _ => "DESC",
+        };
+        let select_sql = format!(
+            "SELECT \
+                toUnixTimestamp64Milli(timestamp) AS timestamp_ms, method, path, query_string, \
+                host, status_code, response_time_ms, request_source, is_system_request, \
+                routing_status, project_id, environment_id, deployment_id, session_id, visitor_id, \
+                container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
+                request_id, ip_geolocation_id, browser, browser_version, operating_system, \
+                device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
+             FROM proxy_logs \
+             {where_clause} \
+             ORDER BY {order_col} {order_dir} \
+             LIMIT ?"
+        );
+
+        let mut binds = binds;
+        binds.push(Bv::I64(limit as i64));
+        let q = apply_binds(self.client.query(&select_sql), binds);
+        let rows = q.fetch_all::<ChProxyLogReadRow>().await.map_err(|e| {
+            ProxyLogServiceError::ClickHouse {
+                operation: "list_page".to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+
+        Ok(rows
+            .into_iter()
+            .map(ChProxyLogReadRow::into_model)
+            .collect())
+    }
+
     async fn get_by_id(
         &self,
         id: i32,
@@ -1012,8 +1210,21 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
     async fn get_by_request_id(
         &self,
         request_id: &str,
+        timestamp: Option<UtcDateTime>,
     ) -> Result<Option<proxy_logs::Model>, ProxyLogServiceError> {
-        let sql = "SELECT \
+        // request_id is the 3rd ORDER BY element, so a request_id-only lookup
+        // has no sort-key prefix and scans every partition. When the caller
+        // knows the row's event time (the list endpoint returns it per row), a
+        // ±1-day timestamp bound prunes the scan to the monthly partition(s)
+        // that can contain the row.
+        let time_clause = if timestamp.is_some() {
+            " AND timestamp >= fromUnixTimestamp64Milli(?) \
+              AND timestamp <= fromUnixTimestamp64Milli(?)"
+        } else {
+            ""
+        };
+        let sql = format!(
+            "SELECT \
                 toUnixTimestamp64Milli(timestamp) AS timestamp_ms, method, path, query_string, \
                 host, status_code, response_time_ms, request_source, is_system_request, \
                 routing_status, project_id, environment_id, deployment_id, session_id, visitor_id, \
@@ -1021,20 +1232,31 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
                 device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
              FROM proxy_logs \
-             WHERE request_id = ? \
+             WHERE request_id = ?{time_clause} \
              ORDER BY timestamp DESC \
-             LIMIT 1";
+             LIMIT 1"
+        );
 
-        let row = self
-            .client
-            .query(sql)
-            .bind(request_id)
-            .fetch_optional::<ChProxyLogReadRow>()
-            .await
-            .map_err(|e| ProxyLogServiceError::ClickHouse {
+        let mut q = self.client.query(&sql).bind(request_id);
+        if let Some(ts) = timestamp {
+            // Checked arithmetic saturating at the representable range: a bare
+            // `ts + Duration::days(1)` panics on overflow, and `ts` comes from a
+            // user-supplied query parameter.
+            let day = chrono::Duration::days(1);
+            let lo = ts
+                .checked_sub_signed(day)
+                .unwrap_or(chrono::DateTime::<Utc>::MIN_UTC);
+            let hi = ts
+                .checked_add_signed(day)
+                .unwrap_or(chrono::DateTime::<Utc>::MAX_UTC);
+            q = q.bind(lo.timestamp_millis()).bind(hi.timestamp_millis());
+        }
+        let row = q.fetch_optional::<ChProxyLogReadRow>().await.map_err(|e| {
+            ProxyLogServiceError::ClickHouse {
                 operation: "get_by_request_id".to_string(),
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         Ok(row.map(ChProxyLogReadRow::into_model))
     }
@@ -1056,10 +1278,10 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             Self::append_stats_filters(f, &mut clauses, &mut binds);
         }
 
-        // FINAL: dedup ReplacingMergeTree before count() (see the list-count
-        // note above) so retried inserts / backfill re-runs don't inflate this.
+        // NO FINAL (see the list-count note above). This is one of the seven
+        // aggregations the DDL explicitly designates duplicate-tolerant.
         let sql = format!(
-            "SELECT count() AS cnt FROM proxy_logs FINAL WHERE {}",
+            "SELECT count() AS cnt FROM proxy_logs WHERE {}",
             clauses.join(" AND ")
         );
         let q = apply_binds(self.client.query(&sql), binds);
@@ -1113,22 +1335,29 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // server-derived integer (validated interval → seconds), safe to
         // interpolate; the FILL bounds are bound params. The bucket expression
         // lives in the SELECT so GROUP BY / ORDER BY / WITH FILL reference the
-        // `bucket_ms` alias.
+        // `bucket_ms` alias. ClickHouse's toUnixTimestamp returns UInt32 and
+        // multiplying by 1000 promotes it to UInt64, so cast before arithmetic
+        // to match the i64 field in ChTimeBucketRow. The FILL bounds must use
+        // the same signed type as the ORDER BY expression.
         let sql = format!(
             "SELECT \
-                toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL {step} SECOND)) * 1000 AS bucket_ms, \
+                toInt64(toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL {step} SECOND))) * 1000 AS bucket_ms, \
                 count() AS request_count, \
+                count(response_time_ms) AS latency_count, \
                 ifNull(avg(response_time_ms), 0) AS avg_response_time_ms, \
+                ifNull(quantile(0.50)(response_time_ms), 0) AS p50_response_time_ms, \
+                ifNull(quantile(0.95)(response_time_ms), 0) AS p95_response_time_ms, \
+                ifNull(quantile(0.99)(response_time_ms), 0) AS p99_response_time_ms, \
                 countIf(status_code >= 400) AS error_count, \
                 sum(ifNull(request_size_bytes, 0)) AS total_request_bytes, \
                 sum(ifNull(response_size_bytes, 0)) AS total_response_bytes \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY bucket_ms \
              ORDER BY bucket_ms ASC \
              WITH FILL \
-                FROM toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Milli(?), INTERVAL {step} SECOND)) * 1000 \
-                TO toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Milli(?), INTERVAL {step} SECOND)) * 1000 \
+                FROM toInt64(toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Milli(?), INTERVAL {step} SECOND))) * 1000 \
+                TO toInt64(toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Milli(?), INTERVAL {step} SECOND))) * 1000 \
                 STEP {step_ms}",
             where_clause = clauses.join(" AND "),
             step = step_secs,
@@ -1152,6 +1381,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             .map(|r| TimeBucketStats {
                 bucket: ms_to_rfc3339(r.bucket_ms),
                 request_count: r.request_count as i64,
+                latency_count: r.latency_count as i64,
                 // SQL already coerces avg over an empty/all-NULL bucket to 0 via
                 // ifNull (matching Postgres COALESCE(avg, 0)). The is_nan guard
                 // is a defensive belt-and-braces for any future SQL change.
@@ -1159,6 +1389,21 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                     0.0
                 } else {
                     r.avg_response_time_ms
+                },
+                p50_response_time_ms: if r.p50_response_time_ms.is_nan() {
+                    0.0
+                } else {
+                    r.p50_response_time_ms
+                },
+                p95_response_time_ms: if r.p95_response_time_ms.is_nan() {
+                    0.0
+                } else {
+                    r.p95_response_time_ms
+                },
+                p99_response_time_ms: if r.p99_response_time_ms.is_nan() {
+                    0.0
+                } else {
+                    r.p99_response_time_ms
                 },
                 error_count: r.error_count as i64,
                 total_request_bytes: r.total_request_bytes,
@@ -1201,7 +1446,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 count() AS total_requests, \
                 countIf(status_code >= 500) AS total_errors, \
                 ifNull(avg(response_time_ms), 0) AS avg_response_time_ms \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {} \
              GROUP BY project_id",
             clauses.join(" AND ")
@@ -1314,7 +1559,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 count() AS request_count, \
                 uniqExact(client_ip) AS unique_ips, \
                 toUnixTimestamp64Milli(max(timestamp)) AS last_seen_ms \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY bot_name \
              ORDER BY request_count DESC \
@@ -1392,7 +1637,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 count() AS request_count, \
                 uniqExact(bot_name) AS agent_count, \
                 toUnixTimestamp64Milli(max(timestamp)) AS last_seen_ms \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY path \
              ORDER BY request_count DESC \
@@ -1467,19 +1712,21 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         // the Postgres path builds — the frontend relies on a continuous
         // x-axis). The empty FILL buckets come back with agent='' and count 0;
         // the Rust roll-up below treats agent='' as an x-axis-only marker,
-        // exactly like the Postgres NULL-agent spine rows.
+        // exactly like the Postgres NULL-agent spine rows. Keep the bucket and
+        // FILL bounds explicitly Int64: toUnixTimestamp otherwise produces an
+        // unsigned value that cannot decode into ChAiTimelineRow::bucket_ms.
         let sql = format!(
             "SELECT \
-                toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL {step} SECOND)) * 1000 AS bucket_ms, \
+                toInt64(toUnixTimestamp(toStartOfInterval(timestamp, INTERVAL {step} SECOND))) * 1000 AS bucket_ms, \
                 bot_name AS agent, \
                 count() AS request_count \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY bucket_ms, bot_name \
              ORDER BY bucket_ms ASC \
              WITH FILL \
-                FROM toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Milli(?), INTERVAL {step} SECOND)) * 1000 \
-                TO toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Milli(?), INTERVAL {step} SECOND)) * 1000 \
+                FROM toInt64(toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Milli(?), INTERVAL {step} SECOND))) * 1000 \
+                TO toInt64(toUnixTimestamp(toStartOfInterval(fromUnixTimestamp64Milli(?), INTERVAL {step} SECOND))) * 1000 \
                 STEP {step_ms}",
             step = step_secs,
             step_ms = step_secs * 1000,
@@ -1590,7 +1837,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                     status_code >= 500 AND status_code < 600, '5xx', \
                     'other') AS status_class, \
                 count() AS request_count \
-             FROM proxy_logs FINAL \
+             FROM proxy_logs \
              WHERE {where_clause} \
              GROUP BY status_class \
              ORDER BY request_count DESC"
@@ -1615,6 +1862,359 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
 
         Ok(result)
     }
+}
+
+fn ch_dimension_expression(dimension: TrafficDimension) -> &'static str {
+    match dimension {
+        TrafficDimension::ClientIp => "nullIf(client_ip, '')",
+        TrafficDimension::Method => "method",
+        TrafficDimension::Path => "path",
+        TrafficDimension::Host => "host",
+        TrafficDimension::StatusCode => "status_code",
+        TrafficDimension::StatusClass => {
+            "if(status_code >= 100 AND status_code < 600, concat(toString(intDiv(status_code, 100)), 'xx'), 'other')"
+        }
+        TrafficDimension::EnvironmentId => "environment_id",
+        TrafficDimension::DeploymentId => "deployment_id",
+        TrafficDimension::RequestSource => "request_source",
+        TrafficDimension::IsBot => {
+            "if(isNull(is_bot), CAST(NULL AS Nullable(String)), if(assumeNotNull(is_bot) = 1, 'true', 'false'))"
+        }
+        TrafficDimension::Browser => "nullIf(browser, '')",
+        TrafficDimension::OperatingSystem => "nullIf(operating_system, '')",
+        TrafficDimension::DeviceType => "nullIf(device_type, '')",
+        TrafficDimension::CacheStatus => "nullIf(cache_status, '')",
+    }
+}
+
+fn ch_filter_expression(dimension: TrafficDimension) -> &'static str {
+    match dimension {
+        // The display expression intentionally returns "true"/"false" strings
+        // for cross-backend response parity. Filters must compare against the
+        // raw Nullable(UInt8) column because their bound values are booleans.
+        TrafficDimension::IsBot => "is_bot",
+        _ => ch_dimension_expression(dimension),
+    }
+}
+
+fn ch_metric_alias(metric: TrafficMetric) -> &'static str {
+    match metric {
+        TrafficMetric::Requests => "requests",
+        TrafficMetric::Errors => "errors",
+        TrafficMetric::ErrorRate => "error_rate",
+        TrafficMetric::LatencyAvg => "latency_avg_ms",
+        TrafficMetric::LatencyMin => "latency_min_ms",
+        TrafficMetric::LatencyMax => "latency_max_ms",
+        TrafficMetric::LatencyP50 => "latency_p50_ms",
+        TrafficMetric::LatencyP95 => "latency_p95_ms",
+        TrafficMetric::LatencyP99 => "latency_p99_ms",
+        TrafficMetric::UniqueIps => "unique_ips",
+        TrafficMetric::UniquePaths => "unique_paths",
+        TrafficMetric::BotRequests => "bot_requests",
+        TrafficMetric::RobotsTxtRequests => "robots_txt_requests",
+        TrafficMetric::LastSeen => "last_seen_ms",
+    }
+}
+
+fn ch_metric_expression(metric: TrafficMetric) -> &'static str {
+    match metric {
+        TrafficMetric::Requests => "toNullable(count())",
+        TrafficMetric::Errors => "toNullable(countIf(status_code >= 400))",
+        TrafficMetric::ErrorRate => {
+            "toNullable(toFloat64(countIf(status_code >= 400)) / nullIf(toFloat64(count()), 0.0))"
+        }
+        TrafficMetric::LatencyAvg => "avg(toFloat64(response_time_ms))",
+        TrafficMetric::LatencyMin => "min(toFloat64(response_time_ms))",
+        TrafficMetric::LatencyMax => "max(toFloat64(response_time_ms))",
+        TrafficMetric::LatencyP50 => {
+            "CAST(if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.50)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms))) AS Nullable(Float64))"
+        }
+        TrafficMetric::LatencyP95 => {
+            "CAST(if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.95)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms))) AS Nullable(Float64))"
+        }
+        TrafficMetric::LatencyP99 => {
+            "CAST(if(count(response_time_ms) = 0, NULL, quantileTDigestIf(0.99)(toFloat64(assumeNotNull(response_time_ms)), isNotNull(response_time_ms))) AS Nullable(Float64))"
+        }
+        TrafficMetric::UniqueIps => "toNullable(uniqExactIf(client_ip, client_ip != ''))",
+        TrafficMetric::UniquePaths => "toNullable(uniqExact(path))",
+        TrafficMetric::BotRequests => "toNullable(countIf(ifNull(is_bot, 0) = 1))",
+        TrafficMetric::RobotsTxtRequests => "toNullable(countIf(path = '/robots.txt'))",
+        TrafficMetric::LastSeen => "toNullable(toUnixTimestamp64Milli(max(timestamp)))",
+    }
+}
+
+fn ch_null_metric(metric: TrafficMetric) -> &'static str {
+    match metric {
+        TrafficMetric::Requests
+        | TrafficMetric::Errors
+        | TrafficMetric::UniqueIps
+        | TrafficMetric::UniquePaths
+        | TrafficMetric::BotRequests
+        | TrafficMetric::RobotsTxtRequests => "CAST(NULL AS Nullable(UInt64))",
+        TrafficMetric::LastSeen => "CAST(NULL AS Nullable(Int64))",
+        _ => "CAST(NULL AS Nullable(Float64))",
+    }
+}
+
+fn ch_filter_bind(dimension: TrafficDimension, raw: &str) -> Result<Bv, ProxyLogServiceError> {
+    match dimension {
+        TrafficDimension::StatusCode => raw.parse::<i16>().map(Bv::I16).map_err(|_| {
+            ProxyLogServiceError::InvalidFilter(format!(
+                "status_code filter value '{raw}' is not a valid HTTP status"
+            ))
+        }),
+        TrafficDimension::EnvironmentId | TrafficDimension::DeploymentId => {
+            raw.parse::<i32>().map(Bv::I32).map_err(|_| {
+                ProxyLogServiceError::InvalidFilter(format!(
+                    "{} filter value '{raw}' is not a valid integer",
+                    dimension.api_name()
+                ))
+            })
+        }
+        TrafficDimension::IsBot => raw.parse::<bool>().map(Bv::Bool).map_err(|_| {
+            ProxyLogServiceError::InvalidFilter(format!(
+                "is_bot filter value '{raw}' must be true or false"
+            ))
+        }),
+        _ => Ok(Bv::Str(raw.to_owned())),
+    }
+}
+
+fn append_ch_filter(
+    filter: &TrafficFilter,
+    conditions: &mut Vec<String>,
+    binds: &mut Vec<Bv>,
+) -> Result<(), ProxyLogServiceError> {
+    let expression = ch_filter_expression(filter.dimension);
+    let condition = match filter.operator {
+        TrafficFilterOperator::Eq | TrafficFilterOperator::NotEq => {
+            binds.push(ch_filter_bind(filter.dimension, &filter.values[0])?);
+            let operator = if filter.operator == TrafficFilterOperator::Eq {
+                "="
+            } else {
+                "!="
+            };
+            format!("{expression} {operator} ?")
+        }
+        TrafficFilterOperator::Contains => {
+            binds.push(Bv::Str(filter.values[0].clone()));
+            format!("positionCaseInsensitiveUTF8(toString({expression}), ?) > 0")
+        }
+        TrafficFilterOperator::StartsWith => {
+            binds.push(Bv::Str(filter.values[0].clone()));
+            format!("startsWith(lowerUTF8(toString({expression})), lowerUTF8(?))")
+        }
+        TrafficFilterOperator::In => {
+            for raw in &filter.values {
+                binds.push(ch_filter_bind(filter.dimension, raw)?);
+            }
+            format!(
+                "{expression} IN ({})",
+                std::iter::repeat_n("?", filter.values.len())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        }
+    };
+    conditions.push(condition);
+    Ok(())
+}
+
+fn build_traffic_query(
+    project_id: i32,
+    request: &TrafficAggregationRequest,
+) -> Result<(String, Vec<Bv>, String), ProxyLogServiceError> {
+    let mut conditions = vec![
+        "project_id = ?".to_string(),
+        "timestamp >= fromUnixTimestamp64Milli(?)".to_string(),
+        "timestamp < fromUnixTimestamp64Milli(?)".to_string(),
+    ];
+    let mut binds = vec![
+        Bv::I32(project_id),
+        Bv::I64(request.start_time.timestamp_millis()),
+        Bv::I64(request.end_time.timestamp_millis()),
+    ];
+    if let Some(environment_id) = request.environment_id {
+        conditions.push("environment_id = ?".to_string());
+        binds.push(Bv::I32(environment_id));
+    }
+    if !request.include_synthetic {
+        conditions.push("request_source != 'temps_monitor'".to_string());
+        conditions.push("ifNull(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".to_string());
+    }
+    for filter in &request.filters {
+        append_ch_filter(filter, &mut conditions, &mut binds)?;
+    }
+
+    let mut dimensions = Vec::with_capacity(4);
+    let mut groups = Vec::with_capacity(request.dimensions.len());
+    let mut count_groups = Vec::with_capacity(request.dimensions.len());
+    for index in 0..4 {
+        if let Some(dimension) = request.dimensions.get(index).copied() {
+            dimensions.push(format!(
+                "toNullable(toString({})) AS d{index}",
+                ch_dimension_expression(dimension)
+            ));
+            groups.push(format!("d{index}"));
+            count_groups.push(ch_dimension_expression(dimension));
+        } else {
+            dimensions.push(format!("CAST(NULL AS Nullable(String)) AS d{index}"));
+        }
+    }
+
+    let all_metrics = [
+        TrafficMetric::Requests,
+        TrafficMetric::Errors,
+        TrafficMetric::ErrorRate,
+        TrafficMetric::LatencyAvg,
+        TrafficMetric::LatencyMin,
+        TrafficMetric::LatencyMax,
+        TrafficMetric::LatencyP50,
+        TrafficMetric::LatencyP95,
+        TrafficMetric::LatencyP99,
+        TrafficMetric::UniqueIps,
+        TrafficMetric::UniquePaths,
+        TrafficMetric::BotRequests,
+        TrafficMetric::RobotsTxtRequests,
+        TrafficMetric::LastSeen,
+    ];
+    let metrics = all_metrics.map(|metric| {
+        let expression = if request.metrics.contains(&metric) {
+            ch_metric_expression(metric)
+        } else {
+            ch_null_metric(metric)
+        };
+        format!("{expression} AS {}", ch_metric_alias(metric))
+    });
+    let mut orders = request
+        .order_by
+        .iter()
+        .map(|order| {
+            let field = match order.field {
+                TrafficOrderField::Dimension(dimension) => {
+                    let index = request
+                        .dimensions
+                        .iter()
+                        .position(|candidate| *candidate == dimension)
+                        .unwrap_or(0);
+                    format!("d{index}")
+                }
+                TrafficOrderField::Metric(metric) => ch_metric_alias(metric).to_string(),
+            };
+            let direction = match order.direction {
+                TrafficSortDirection::Asc => "ASC",
+                TrafficSortDirection::Desc => "DESC",
+            };
+            format!("{field} {direction} NULLS LAST")
+        })
+        .collect::<Vec<_>>();
+    if orders.is_empty() {
+        let metric = request
+            .metrics
+            .first()
+            .copied()
+            .unwrap_or(TrafficMetric::Requests);
+        orders.push(format!("{} DESC NULLS LAST", ch_metric_alias(metric)));
+    }
+    for index in 0..request.dimensions.len() {
+        let prefix = format!("d{index} ");
+        if !orders.iter().any(|order| order.starts_with(&prefix)) {
+            orders.push(format!("d{index} ASC NULLS LAST"));
+        }
+    }
+    let order = orders.join(", ");
+    let offset = (request.page - 1).saturating_mul(request.page_size);
+    let selects = dimensions
+        .into_iter()
+        .chain(metrics)
+        .collect::<Vec<_>>()
+        .join(",\n                ");
+    let sql = format!(
+        "SELECT {selects}, count() OVER() AS total_groups\n\
+         FROM proxy_logs\n\
+         WHERE {conditions}\n\
+         {group_by}\n\
+         ORDER BY {order}\n\
+         LIMIT {limit} OFFSET {offset}",
+        conditions = conditions.join(" AND "),
+        group_by = if groups.is_empty() {
+            String::new()
+        } else {
+            format!("GROUP BY {}", groups.join(", "))
+        },
+        limit = request.page_size,
+    );
+    let count_sql = if groups.is_empty() {
+        "SELECT toUInt64(1) AS cnt".to_string()
+    } else {
+        format!(
+            "SELECT count() AS cnt FROM (SELECT 1 FROM proxy_logs WHERE {conditions} GROUP BY {groups})",
+            conditions = conditions.join(" AND "),
+            groups = count_groups.join(", "),
+        )
+    };
+    Ok((sql, binds, count_sql))
+}
+
+fn ch_count(value: Option<u64>, metric: &str) -> Result<Option<i64>, ProxyLogServiceError> {
+    value
+        .map(|value| {
+            i64::try_from(value).map_err(|_| {
+                ProxyLogServiceError::InvalidFilter(format!(
+                    "ClickHouse {metric} aggregate exceeded the supported i64 range"
+                ))
+            })
+        })
+        .transpose()
+}
+
+fn ch_traffic_response(
+    request: &TrafficAggregationRequest,
+    rows: Vec<ChTrafficAggregationRow>,
+) -> Result<TrafficAggregationResponse, ProxyLogServiceError> {
+    let total_groups = rows.first().map(|row| row.total_groups).unwrap_or(0);
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        let dimension_values = [row.d0, row.d1, row.d2, row.d3];
+        let dimensions = request
+            .dimensions
+            .iter()
+            .copied()
+            .zip(dimension_values)
+            .map(|(dimension, value)| TrafficDimensionValue { dimension, value })
+            .collect();
+        result.push(TrafficAggregationRow {
+            dimensions,
+            metrics: TrafficMetricValues {
+                requests: ch_count(row.requests, "requests")?,
+                errors: ch_count(row.errors, "errors")?,
+                error_rate: row.error_rate,
+                latency_avg_ms: row.latency_avg_ms,
+                latency_min_ms: row.latency_min_ms,
+                latency_max_ms: row.latency_max_ms,
+                latency_p50_ms: row.latency_p50_ms,
+                latency_p95_ms: row.latency_p95_ms,
+                latency_p99_ms: row.latency_p99_ms,
+                unique_ips: ch_count(row.unique_ips, "unique_ips")?,
+                unique_paths: ch_count(row.unique_paths, "unique_paths")?,
+                bot_requests: ch_count(row.bot_requests, "bot_requests")?,
+                robots_txt_requests: ch_count(row.robots_txt_requests, "robots_txt_requests")?,
+                last_seen: row
+                    .last_seen_ms
+                    .and_then(|millis| Utc.timestamp_millis_opt(millis).single()),
+            },
+        });
+    }
+    Ok(TrafficAggregationResponse {
+        rows: result,
+        total_groups,
+        page: request.page,
+        page_size: request.page_size,
+        total_pages: total_groups.div_ceil(request.page_size),
+        dimensions: request.dimensions.clone(),
+        metrics: request.metrics.clone(),
+        synthetic_excluded: !request.include_synthetic,
+    })
 }
 
 impl ClickHouseProxyLogStore {
@@ -1683,6 +2283,10 @@ impl ClickHouseProxyLogStore {
                 "project_id IS NULL".into()
             });
         }
+        if f.exclude_synthetic {
+            clauses.push("request_source != 'temps_monitor'".into());
+            clauses.push("ifNull(user_agent, '') NOT LIKE 'Temps-Status-Monitor/%'".into());
+        }
     }
 }
 
@@ -1702,6 +2306,82 @@ fn status_class_range(class: &str) -> Option<(i16, i16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::traffic_aggregation::TrafficOrderBy;
+
+    /// Start a real ClickHouse matching the production major version. Docker
+    /// is optional for local/unit-test environments, so startup failures skip
+    /// gracefully; once the server starts, migration/query failures are real
+    /// test failures.
+    async fn setup_clickhouse_store(
+    ) -> Option<(ClickHouseProxyLogStore, Box<dyn std::any::Any + Send>)> {
+        use testcontainers::{
+            core::{wait::HttpWaitStrategy, ContainerPort, WaitFor},
+            runners::AsyncRunner,
+            GenericImage, ImageExt,
+        };
+
+        let image = GenericImage::new("clickhouse/clickhouse-server", "26.2.5")
+            .with_exposed_port(ContainerPort::Tcp(8123))
+            .with_wait_for(WaitFor::http(
+                HttpWaitStrategy::new("/ping")
+                    .with_port(ContainerPort::Tcp(8123))
+                    .with_expected_status_code(200u16),
+            ))
+            .with_env_var("CLICKHOUSE_DB", "temps_proxy_test")
+            .with_env_var("CLICKHOUSE_PASSWORD", "test");
+
+        let container = match image.start().await {
+            Ok(container) => container,
+            Err(error) => {
+                eprintln!("Skipping ClickHouse proxy-log test: cannot start container ({error})");
+                return None;
+            }
+        };
+
+        let host_port = match container.get_host_port_ipv4(8123).await {
+            Ok(port) => port,
+            Err(error) => {
+                eprintln!("Skipping ClickHouse proxy-log test: cannot get host port ({error})");
+                return None;
+            }
+        };
+
+        let store = ClickHouseProxyLogStore::new(
+            ClickHouseProxyLogConfig::new(
+                format!("http://127.0.0.1:{host_port}"),
+                "temps_proxy_test",
+                "default",
+                "test",
+            ),
+            Arc::new(temps_core::FixedRetentionResolver),
+        );
+
+        let mut last_error = String::new();
+        for _ in 0..30 {
+            match store.client().query("SELECT 1").execute().await {
+                Ok(()) => {
+                    last_error.clear();
+                    break;
+                }
+                Err(error) => {
+                    last_error = error.to_string();
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+            }
+        }
+        if !last_error.is_empty() {
+            eprintln!(
+                "Skipping ClickHouse proxy-log test: server never became ready ({last_error})"
+            );
+            return None;
+        }
+
+        crate::storage::clickhouse_migrations::apply_migrations(store.client(), "temps_proxy_test")
+            .await
+            .expect("apply proxy-log ClickHouse migrations");
+
+        Some((store, Box::new(container)))
+    }
 
     fn make_entry(request_id: &str) -> CreateProxyLogRequest {
         CreateProxyLogRequest {
@@ -1743,6 +2423,258 @@ mod tests {
             visitor_uuid: None,
             session_uuid: None,
         }
+    }
+
+    #[tokio::test]
+    async fn clickhouse_bucket_queries_decode_signed_millisecond_timestamps() {
+        let Some((store, _container)) = setup_clickhouse_store().await else {
+            return;
+        };
+
+        let mut entry = make_entry("bucket-type-regression");
+        entry.is_bot = Some(true);
+        entry.bot_name = Some("GPTBot".to_string());
+        store
+            .write_batch(vec![entry])
+            .await
+            .expect("insert proxy-log fixture");
+
+        let start = Utc::now() - chrono::Duration::minutes(2);
+        let end = Utc::now() + chrono::Duration::minutes(2);
+        let stats = store
+            .get_time_bucket_stats(start, end, "1 minute".to_string(), None)
+            .await
+            .expect("decode time-bucket stats with signed bucket_ms");
+        assert!(
+            stats.iter().any(|bucket| bucket.request_count == 1),
+            "inserted request must appear in time-bucket stats"
+        );
+
+        let timeline = store
+            .get_ai_agent_timeline(
+                None,
+                None,
+                start,
+                end,
+                "1 minute".to_string(),
+                AiTimelineGroupBy::Agent,
+            )
+            .await
+            .expect("decode AI timeline with signed bucket_ms");
+        assert!(
+            timeline
+                .iter()
+                .any(|bucket| bucket.key == "GPTBot" && bucket.request_count == 1),
+            "inserted AI request must appear in the agent timeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn clickhouse_traffic_aggregation_returns_drilldowns_and_excludes_monitor() {
+        let Some((store, _container)) = setup_clickhouse_store().await else {
+            return;
+        };
+
+        let mut fast = make_entry("traffic-fast");
+        fast.path = "/api/users".to_string();
+        fast.client_ip = Some("203.0.113.10".to_string());
+        fast.response_time_ms = Some(10);
+
+        let mut slow_error = make_entry("traffic-slow-error");
+        slow_error.path = "/api/users".to_string();
+        slow_error.client_ip = Some("203.0.113.10".to_string());
+        slow_error.status_code = 500;
+        slow_error.response_time_ms = Some(90);
+
+        let mut monitor = make_entry("traffic-monitor");
+        monitor.path = "/api/health".to_string();
+        monitor.client_ip = Some("203.0.113.99".to_string());
+        monitor.request_source = "temps_monitor".to_string();
+        monitor.is_system_request = true;
+        monitor.user_agent = Some("Temps-Status-Monitor/1.0".to_string());
+
+        let mut crawler = make_entry("traffic-crawler-robots");
+        crawler.path = "/robots.txt".to_string();
+        crawler.client_ip = Some("203.0.113.10".to_string());
+        crawler.response_time_ms = Some(6);
+        crawler.is_bot = Some(true);
+        crawler.bot_name = Some("ExampleBot".to_string());
+
+        store
+            .write_batch(vec![fast, slow_error, monitor, crawler])
+            .await
+            .expect("insert traffic aggregation fixtures");
+
+        let list_start = Utc::now() - chrono::Duration::minutes(2);
+        let list_end = Utc::now() + chrono::Duration::minutes(2);
+        let (_, excluded_total) = store
+            .list_with_filters(
+                Some(list_start),
+                Some(list_end),
+                ProxyLogsQuery {
+                    project_id: Some(7),
+                    environment_id: Some(3),
+                    path_exact: Some("/api/health".to_string()),
+                    exclude_synthetic: Some(true),
+                    ..ProxyLogsQuery::default()
+                },
+                1,
+                20,
+            )
+            .await
+            .expect("list exact path while excluding monitor traffic");
+        assert_eq!(excluded_total, 0);
+
+        let (monitor_rows, included_total) = store
+            .list_with_filters(
+                Some(list_start),
+                Some(list_end),
+                ProxyLogsQuery {
+                    project_id: Some(7),
+                    environment_id: Some(3),
+                    path_exact: Some("/api/health".to_string()),
+                    ..ProxyLogsQuery::default()
+                },
+                1,
+                20,
+            )
+            .await
+            .expect("list exact monitor path without exclusion");
+        assert_eq!(included_total, 1);
+        assert_eq!(monitor_rows[0].request_source, "temps_monitor");
+
+        let request = TrafficAggregationRequest {
+            start_time: Utc::now() - chrono::Duration::minutes(2),
+            end_time: Utc::now() + chrono::Duration::minutes(2),
+            environment_id: Some(3),
+            dimensions: vec![
+                TrafficDimension::ClientIp,
+                TrafficDimension::Path,
+                TrafficDimension::Method,
+            ],
+            metrics: vec![
+                TrafficMetric::Requests,
+                TrafficMetric::Errors,
+                TrafficMetric::ErrorRate,
+                TrafficMetric::LatencyMin,
+                TrafficMetric::LatencyAvg,
+                TrafficMetric::LatencyMax,
+                TrafficMetric::LatencyP50,
+                TrafficMetric::LatencyP95,
+                TrafficMetric::LatencyP99,
+                TrafficMetric::BotRequests,
+                TrafficMetric::RobotsTxtRequests,
+            ],
+            filters: Vec::new(),
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::Requests),
+                direction: TrafficSortDirection::Desc,
+            }],
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let response = store
+            .aggregate_traffic(7, request.clone())
+            .await
+            .expect("aggregate ClickHouse traffic");
+
+        assert_eq!(response.total_groups, 2);
+        assert!(response.synthetic_excluded);
+        let row = response.rows.first().expect("customer traffic row");
+        assert_eq!(row.dimensions[0].value.as_deref(), Some("203.0.113.10"));
+        assert_eq!(row.dimensions[1].value.as_deref(), Some("/api/users"));
+        assert_eq!(row.dimensions[2].value.as_deref(), Some("GET"));
+        assert_eq!(row.metrics.requests, Some(2));
+        assert_eq!(row.metrics.errors, Some(1));
+        assert_eq!(row.metrics.error_rate, Some(0.5));
+        assert_eq!(row.metrics.latency_min_ms, Some(10.0));
+        assert_eq!(row.metrics.latency_avg_ms, Some(50.0));
+        assert_eq!(row.metrics.latency_max_ms, Some(90.0));
+        for (name, percentile) in [
+            ("p50", row.metrics.latency_p50_ms),
+            ("p95", row.metrics.latency_p95_ms),
+            ("p99", row.metrics.latency_p99_ms),
+        ] {
+            let percentile = percentile.unwrap_or_else(|| panic!("{name} must be returned"));
+            assert!(
+                (10.0..=90.0).contains(&percentile),
+                "{name} must remain within the observed latency range"
+            );
+        }
+        assert_eq!(row.metrics.bot_requests, Some(0));
+        assert_eq!(row.metrics.robots_txt_requests, Some(0));
+
+        let crawler = response
+            .rows
+            .iter()
+            .find(|row| row.dimensions[1].value.as_deref() == Some("/robots.txt"))
+            .expect("crawler robots.txt traffic row");
+        assert_eq!(crawler.metrics.requests, Some(1));
+        assert_eq!(crawler.metrics.bot_requests, Some(1));
+        assert_eq!(crawler.metrics.robots_txt_requests, Some(1));
+
+        let false_bot_response = store
+            .aggregate_traffic(
+                7,
+                TrafficAggregationRequest {
+                    filters: vec![TrafficFilter {
+                        dimension: TrafficDimension::IsBot,
+                        operator: TrafficFilterOperator::Eq,
+                        values: vec!["false".to_string()],
+                    }],
+                    ..request.clone()
+                },
+            )
+            .await
+            .expect("filter ClickHouse traffic by raw nullable boolean");
+        assert_eq!(false_bot_response.total_groups, 1);
+        assert_eq!(false_bot_response.rows[0].metrics.requests, Some(2));
+
+        let empty_page = store
+            .aggregate_traffic(
+                7,
+                TrafficAggregationRequest {
+                    page: 2,
+                    ..request.clone()
+                },
+            )
+            .await
+            .expect("aggregate out-of-range ClickHouse traffic page");
+        assert!(empty_page.rows.is_empty());
+        assert_eq!(empty_page.total_groups, 2);
+        assert_eq!(empty_page.total_pages, 1);
+
+        let mut no_latency = make_entry("traffic-no-latency");
+        no_latency.path = "/api/no-latency".to_string();
+        no_latency.response_time_ms = None;
+        store
+            .write_batch(vec![no_latency])
+            .await
+            .expect("insert traffic fixture without latency");
+
+        let null_percentiles = store
+            .aggregate_traffic(
+                7,
+                TrafficAggregationRequest {
+                    filters: vec![TrafficFilter {
+                        dimension: TrafficDimension::Path,
+                        operator: TrafficFilterOperator::Eq,
+                        values: vec!["/api/no-latency".to_string()],
+                    }],
+                    page: 1,
+                    ..request
+                },
+            )
+            .await
+            .expect("aggregate ClickHouse traffic without latency values");
+        let row = null_percentiles
+            .rows
+            .first()
+            .expect("traffic row without latency values");
+        assert_eq!(row.metrics.latency_p50_ms, None);
+        assert_eq!(row.metrics.latency_p95_ms, None);
+        assert_eq!(row.metrics.latency_p99_ms, None);
     }
 
     #[test]
@@ -1933,7 +2865,9 @@ mod tests {
             method: Some("GET".into()),
             host: None,
             path: Some("admin%".into()),
+            path_exact: Some("/api/users/a b?source=admin".into()),
             client_ip: Some("1.1.1.1".into()),
+            exclude_synthetic: Some(true),
             status_code: Some(200),
             response_time_min: Some(5),
             response_time_max: None,
@@ -1945,6 +2879,7 @@ mod tests {
             operating_system: None,
             device_type: None,
             is_bot: Some(true),
+            exclude_bots: None,
             bot_name: None,
             ai_provider: None,
             ai_agent: None,
@@ -1963,14 +2898,24 @@ mod tests {
             sort_order: None,
         };
 
+        let start = chrono::DateTime::parse_from_rfc3339("2026-08-15T10:00:00Z")
+            .expect("valid start")
+            .with_timezone(&chrono::Utc);
+        let end = start + chrono::Duration::hours(1);
         let (clauses, binds, impossible) =
-            ClickHouseProxyLogStore::build_list_where(None, None, &filters);
+            ClickHouseProxyLogStore::build_list_where(Some(start), Some(end), &filters);
         assert!(!impossible);
         let joined = clauses.join(" AND ");
         // Every value-carrying predicate uses a bound `?`.
         assert!(joined.contains("project_id = ?"));
+        assert!(joined.contains("timestamp >= fromUnixTimestamp64Milli(?)"));
+        assert!(joined.contains("timestamp < fromUnixTimestamp64Milli(?)"));
+        assert!(!joined.contains("timestamp <= fromUnixTimestamp64Milli(?)"));
         assert!(joined.contains("method = ?"));
         assert!(joined.contains("path ILIKE ?"));
+        assert!(joined.contains("path = ?"));
+        assert!(joined.contains("request_source != 'temps_monitor'"));
+        assert!(joined.contains("Temps-Status-Monitor/%"));
         assert!(joined.contains("client_ip = ?"));
         assert!(joined.contains("status_code = ?"));
         assert!(joined.contains("response_time_ms >= ?"));
@@ -1981,6 +2926,7 @@ mod tests {
         // The raw user path value must NOT appear in the SQL — only in the binds,
         // wrapped + escaped.
         assert!(!joined.contains("admin"));
+        assert!(!joined.contains("source=admin"));
         // The bind list carries the escaped LIKE pattern.
         let has_escaped_path = binds.iter().any(|b| match b {
             Bv::Str(s) => s == "%admin\\%%",
@@ -1990,6 +2936,31 @@ mod tests {
             has_escaped_path,
             "escaped LIKE pattern must be a bind value"
         );
+        assert!(binds.iter().any(|bind| {
+            matches!(bind, Bv::Str(value) if value == "/api/users/a b?source=admin")
+        }));
+    }
+
+    /// exclude_bots=true is the NULL-keeping bot exclusion used by the
+    /// Observe feed's hide-bots toggle: detected bots drop, rows without
+    /// detection metadata (is_bot IS NULL) stay.
+    #[test]
+    fn build_list_where_exclude_bots_keeps_null_rows() {
+        let mut filters = empty_query();
+        filters.exclude_bots = Some(true);
+        let (clauses, binds, impossible) =
+            ClickHouseProxyLogStore::build_list_where(None, None, &filters);
+        assert!(!impossible);
+        assert!(clauses
+            .iter()
+            .any(|c| c == "(is_bot = 0 OR is_bot IS NULL)"));
+        assert!(binds.is_empty(), "predicate is constant — no binds");
+
+        // exclude_bots=false must be a no-op, not `is_bot = false`.
+        let mut noop = empty_query();
+        noop.exclude_bots = Some(false);
+        let (clauses, _, _) = ClickHouseProxyLogStore::build_list_where(None, None, &noop);
+        assert!(clauses.is_empty());
     }
 
     /// Unknown ai_provider must mark the query impossible (Postgres Id.eq(-1)).
@@ -2014,56 +2985,15 @@ mod tests {
     }
 
     fn empty_query() -> ProxyLogsQuery {
-        ProxyLogsQuery {
-            project_id: None,
-            environment_id: None,
-            deployment_id: None,
-            session_id: None,
-            visitor_id: None,
-            start_date: None,
-            end_date: None,
-            method: None,
-            host: None,
-            path: None,
-            client_ip: None,
-            status_code: None,
-            response_time_min: None,
-            response_time_max: None,
-            routing_status: None,
-            request_source: None,
-            is_system_request: None,
-            user_agent: None,
-            browser: None,
-            operating_system: None,
-            device_type: None,
-            is_bot: None,
-            bot_name: None,
-            ai_provider: None,
-            ai_agent: None,
-            is_ai_agent: None,
-            request_size_min: None,
-            request_size_max: None,
-            response_size_min: None,
-            response_size_max: None,
-            cache_status: None,
-            container_id: None,
-            upstream_host: None,
-            has_error: None,
-            page: None,
-            page_size: None,
-            sort_by: None,
-            sort_order: None,
-        }
+        ProxyLogsQuery::default()
     }
 
     #[tokio::test]
     async fn write_batch_empty_is_noop() {
-        let store = ClickHouseProxyLogStore::new(ClickHouseProxyLogConfig::new(
-            "http://127.0.0.1:1",
-            "otel",
-            "temps",
-            "temps_dev",
-        ));
+        let store = ClickHouseProxyLogStore::new(
+            ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "temps_dev"),
+            Arc::new(temps_core::FixedRetentionResolver),
+        );
         assert!(store.write_batch(vec![]).await.is_ok());
     }
 
@@ -2071,12 +3001,10 @@ mod tests {
     async fn get_by_id_returns_none_under_clickhouse() {
         // No serial id in CH — get_by_id always resolves to None (404) without
         // any I/O, so an unreachable URL still succeeds.
-        let store = ClickHouseProxyLogStore::new(ClickHouseProxyLogConfig::new(
-            "http://127.0.0.1:1",
-            "otel",
-            "temps",
-            "temps_dev",
-        ));
+        let store = ClickHouseProxyLogStore::new(
+            ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "temps_dev"),
+            Arc::new(temps_core::FixedRetentionResolver),
+        );
         assert!(store
             .get_by_id(42, None)
             .await
@@ -2086,12 +3014,10 @@ mod tests {
 
     #[tokio::test]
     async fn list_unknown_provider_short_circuits_without_io() {
-        let store = ClickHouseProxyLogStore::new(ClickHouseProxyLogConfig::new(
-            "http://127.0.0.1:1",
-            "otel",
-            "temps",
-            "temps_dev",
-        ));
+        let store = ClickHouseProxyLogStore::new(
+            ClickHouseProxyLogConfig::new("http://127.0.0.1:1", "otel", "temps", "temps_dev"),
+            Arc::new(temps_core::FixedRetentionResolver),
+        );
         let mut filters = empty_query();
         filters.ai_provider = Some("NopeNotReal".into());
         let (rows, total) = store
@@ -2100,5 +3026,84 @@ mod tests {
             .expect("impossible query => empty, no round-trip");
         assert!(rows.is_empty());
         assert_eq!(total, 0);
+    }
+
+    #[test]
+    fn traffic_query_matches_timescale_shape_and_binds_filters() {
+        let mut request = TrafficAggregationRequest {
+            start_time: Utc::now() - chrono::Duration::hours(1),
+            end_time: Utc::now(),
+            environment_id: Some(3),
+            dimensions: vec![TrafficDimension::ClientIp, TrafficDimension::Path],
+            metrics: vec![
+                TrafficMetric::Requests,
+                TrafficMetric::LatencyMin,
+                TrafficMetric::LatencyMax,
+                TrafficMetric::LatencyP50,
+                TrafficMetric::LatencyP95,
+                TrafficMetric::LatencyP99,
+                TrafficMetric::BotRequests,
+                TrafficMetric::RobotsTxtRequests,
+                TrafficMetric::ErrorRate,
+            ],
+            filters: vec![TrafficFilter {
+                dimension: TrafficDimension::Path,
+                operator: TrafficFilterOperator::Eq,
+                values: vec!["/api/health' OR 1=1 --".to_string()],
+            }],
+            order_by: vec![TrafficOrderBy {
+                field: TrafficOrderField::Metric(TrafficMetric::ErrorRate),
+                direction: TrafficSortDirection::Asc,
+            }],
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let (sql, binds, _count_sql) = build_traffic_query(7, &request).expect("valid query");
+        assert!(sql.contains("AS d0"));
+        assert!(sql.contains("AS d1"));
+        assert!(sql.contains("min(toFloat64(response_time_ms))"));
+        assert!(sql.contains("max(toFloat64(response_time_ms))"));
+        for quantile in ["0.50", "0.95", "0.99"] {
+            assert!(sql.contains(&format!(
+                "CAST(if(count(response_time_ms) = 0, NULL, quantileTDigestIf({quantile})"
+            )));
+        }
+        assert!(sql.contains("countIf(ifNull(is_bot, 0) = 1)"));
+        assert!(sql.contains("countIf(path = '/robots.txt')"));
+        assert!(sql.contains("request_source != 'temps_monitor'"));
+        assert!(sql.contains("Temps-Status-Monitor/%"));
+        assert!(sql
+            .contains("ORDER BY error_rate ASC NULLS LAST, d0 ASC NULLS LAST, d1 ASC NULLS LAST"));
+        assert!(!sql.contains("OR 1=1"), "filter values must remain bound");
+        assert_eq!(binds.len(), 5);
+
+        request.order_by[0].direction = TrafficSortDirection::Desc;
+        let (sql, _, _) = build_traffic_query(7, &request).expect("valid descending query");
+        assert!(sql
+            .contains("ORDER BY error_rate DESC NULLS LAST, d0 ASC NULLS LAST, d1 ASC NULLS LAST"));
+    }
+
+    #[test]
+    fn is_bot_filter_uses_raw_boolean_expression() {
+        let request = TrafficAggregationRequest {
+            start_time: Utc::now() - chrono::Duration::hours(1),
+            end_time: Utc::now(),
+            environment_id: None,
+            dimensions: vec![TrafficDimension::IsBot],
+            metrics: vec![TrafficMetric::Requests],
+            filters: vec![TrafficFilter {
+                dimension: TrafficDimension::IsBot,
+                operator: TrafficFilterOperator::Eq,
+                values: vec!["false".to_string()],
+            }],
+            order_by: Vec::new(),
+            include_synthetic: false,
+            page: 1,
+            page_size: 20,
+        };
+        let (sql, binds, _) = build_traffic_query(7, &request).expect("valid is_bot filter");
+        assert!(sql.contains("AND is_bot = ?"));
+        assert!(matches!(binds.last(), Some(Bv::Bool(false))));
     }
 }

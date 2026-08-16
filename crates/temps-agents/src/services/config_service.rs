@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+const ENCRYPTED_AGENT_CONFIG_PREFIX: &str = "temps-encrypted-agent-config-v1:";
+
 use temps_core::AgentYamlConfig;
 use temps_entities::{project_agents, projects, settings};
 
@@ -42,26 +44,29 @@ pub struct UpsertAgentRequest {
     /// Branch of the config repo to use (default: "main").
     pub config_repo_branch: Option<String>,
     /// MCP servers config (Claude Code settings.json mcpServers format).
+    /// Credential-bearing legacy inline objects are write-only: normal reads
+    /// mask them, and updates must omit this field to preserve existing values.
     pub mcp_servers_config: Option<serde_json::Value>,
     /// Skills config as JSON array.
     pub skills_config: Option<serde_json::Value>,
-    /// Tools config as JSON array.
+    /// Tools config as JSON array. Custom-tool webhook URLs and headers are
+    /// write-only; omit this field on update to preserve them.
     pub tools_config: Option<serde_json::Value>,
 }
 
 /// Generate a short non-secret webhook ID (8 bytes = 16 hex chars) for the URL path.
 fn generate_webhook_id() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 8];
-    rand::thread_rng().fill(&mut bytes);
+    rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
 
 /// Generate a cryptographically random webhook token (32 bytes = 64 hex chars) for header auth.
 fn generate_webhook_token() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     let mut bytes = [0u8; 32];
-    rand::thread_rng().fill(&mut bytes);
+    rand::rng().fill(&mut bytes);
     hex::encode(bytes)
 }
 
@@ -87,6 +92,145 @@ impl AgentConfigService {
             db,
             encryption_service,
         }
+    }
+
+    fn encrypt_agent_config(
+        &self,
+        value: Option<serde_json::Value>,
+        field: &'static str,
+    ) -> Result<Option<serde_json::Value>, AgentError> {
+        value
+            .map(|value| {
+                let serialized =
+                    serde_json::to_string(&value).map_err(|error| AgentError::Validation {
+                        message: format!("Failed to serialize agent {field}: {error}"),
+                    })?;
+                self.encryption_service
+                    .encrypt_string(&serialized)
+                    .map(|encrypted| {
+                        serde_json::Value::String(format!(
+                            "{ENCRYPTED_AGENT_CONFIG_PREFIX}{encrypted}"
+                        ))
+                    })
+                    .map_err(|error| AgentError::EncryptionError {
+                        message: format!("Failed to encrypt agent {field}: {error}"),
+                    })
+            })
+            .transpose()
+    }
+
+    fn encrypt_legacy_agent_config(
+        &self,
+        value: Option<serde_json::Value>,
+        field: &'static str,
+    ) -> Result<Option<serde_json::Value>, AgentError> {
+        if value.as_ref().is_some_and(|value| {
+            value
+                .as_str()
+                .is_some_and(|raw| raw.starts_with(ENCRYPTED_AGENT_CONFIG_PREFIX))
+        }) {
+            self.decrypt_agent_config(value.clone(), field)?;
+            return Ok(value);
+        }
+        self.encrypt_agent_config(value, field)
+    }
+
+    fn reject_masked_agent_config(
+        value: &serde_json::Value,
+        field: &'static str,
+    ) -> Result<(), AgentError> {
+        fn contains_masked_sentinel(value: &serde_json::Value) -> bool {
+            match value {
+                serde_json::Value::String(value) => value == "***",
+                serde_json::Value::Array(values) => values.iter().any(contains_masked_sentinel),
+                serde_json::Value::Object(values) => values.values().any(contains_masked_sentinel),
+                _ => false,
+            }
+        }
+
+        if contains_masked_sentinel(value) {
+            return Err(AgentError::Validation {
+                message: format!(
+                    "Agent {field} contains the masked sentinel '***'; omit the field to preserve write-only credentials"
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn decrypt_agent_config(
+        &self,
+        value: Option<serde_json::Value>,
+        field: &'static str,
+    ) -> Result<Option<serde_json::Value>, AgentError> {
+        value
+            .map(|value| {
+                let Some(encrypted) = value
+                    .as_str()
+                    .and_then(|raw| raw.strip_prefix(ENCRYPTED_AGENT_CONFIG_PREFIX))
+                else {
+                    return Ok(value);
+                };
+                let serialized =
+                    self.encryption_service
+                        .decrypt_string(encrypted)
+                        .map_err(|error| AgentError::EncryptionError {
+                            message: format!("Failed to decrypt agent {field}: {error}"),
+                        })?;
+                serde_json::from_str(&serialized).map_err(|error| AgentError::Validation {
+                    message: format!("Failed to deserialize decrypted agent {field}: {error}"),
+                })
+            })
+            .transpose()
+    }
+
+    fn decrypt_agent_model(
+        &self,
+        mut model: project_agents::Model,
+    ) -> Result<project_agents::Model, AgentError> {
+        model.mcp_servers_config =
+            self.decrypt_agent_config(model.mcp_servers_config, "MCP configuration")?;
+        model.tools_config =
+            self.decrypt_agent_config(model.tools_config, "tools configuration")?;
+        Ok(model)
+    }
+
+    fn decrypt_agent_models(
+        &self,
+        models: Vec<project_agents::Model>,
+    ) -> Result<Vec<project_agents::Model>, AgentError> {
+        models
+            .into_iter()
+            .map(|model| self.decrypt_agent_model(model))
+            .collect()
+    }
+
+    pub async fn encrypt_legacy_inline_configs(&self) -> Result<u64, AgentError> {
+        let agents = project_agents::Entity::find()
+            .all(self.db.as_ref())
+            .await
+            .map_err(AgentError::Database)?;
+        let mut updated = 0;
+        for agent in agents {
+            let protected_mcp = self.encrypt_legacy_agent_config(
+                agent.mcp_servers_config.clone(),
+                "MCP configuration",
+            )?;
+            let protected_tools = self
+                .encrypt_legacy_agent_config(agent.tools_config.clone(), "tools configuration")?;
+            if protected_mcp == agent.mcp_servers_config && protected_tools == agent.tools_config {
+                continue;
+            }
+            let mut active: project_agents::ActiveModel = agent.into();
+            active.mcp_servers_config = Set(protected_mcp);
+            active.tools_config = Set(protected_tools);
+            active
+                .update(self.db.as_ref())
+                .await
+                .map_err(AgentError::Database)?;
+            updated += 1;
+        }
+        Ok(updated)
     }
 
     /// Read the platform's configured default AI provider from agent_sandbox settings.
@@ -119,7 +263,9 @@ impl AgentConfigService {
             .await
             .map_err(AgentError::Database)?;
 
-        Ok(config)
+        config
+            .map(|model| self.decrypt_agent_model(model))
+            .transpose()
     }
 
     /// Get a specific agent by ID
@@ -130,7 +276,9 @@ impl AgentConfigService {
         project_agents::Entity::find_by_id(agent_id)
             .one(self.db.as_ref())
             .await
-            .map_err(AgentError::Database)
+            .map_err(AgentError::Database)?
+            .map(|model| self.decrypt_agent_model(model))
+            .transpose()
     }
 
     /// List all agents for a project
@@ -138,21 +286,23 @@ impl AgentConfigService {
         &self,
         project_id: i32,
     ) -> Result<Vec<project_agents::Model>, AgentError> {
-        project_agents::Entity::find()
+        let models = project_agents::Entity::find()
             .filter(project_agents::Column::ProjectId.eq(project_id))
             .all(self.db.as_ref())
             .await
-            .map_err(AgentError::Database)
+            .map_err(AgentError::Database)?;
+        self.decrypt_agent_models(models)
     }
 
     /// List all enabled agents across all projects.
     /// Used by the cron scheduler to check schedules.
     pub async fn list_all_enabled_agents(&self) -> Result<Vec<project_agents::Model>, AgentError> {
-        project_agents::Entity::find()
+        let models = project_agents::Entity::find()
             .filter(project_agents::Column::Enabled.eq(true))
             .all(self.db.as_ref())
             .await
-            .map_err(AgentError::Database)
+            .map_err(AgentError::Database)?;
+        self.decrypt_agent_models(models)
     }
 
     /// List enabled agents that match a trigger type for a project.
@@ -444,7 +594,9 @@ impl AgentConfigService {
             .filter(project_agents::Column::WebhookId.eq(webhook_id))
             .one(self.db.as_ref())
             .await
-            .map_err(AgentError::Database)
+            .map_err(AgentError::Database)?
+            .map(|model| self.decrypt_agent_model(model))
+            .transpose()
     }
 
     /// Get a specific agent by slug for a project.
@@ -458,7 +610,9 @@ impl AgentConfigService {
             .filter(project_agents::Column::Slug.eq(slug))
             .one(self.db.as_ref())
             .await
-            .map_err(AgentError::Database)
+            .map_err(AgentError::Database)?
+            .map(|model| self.decrypt_agent_model(model))
+            .transpose()
     }
 
     /// Create a new agent for a project (dashboard source).
@@ -537,6 +691,16 @@ impl AgentConfigService {
         } else {
             (None, None)
         };
+        if let Some(value) = request.mcp_servers_config.as_ref() {
+            Self::reject_masked_agent_config(value, "MCP configuration")?;
+        }
+        if let Some(value) = request.tools_config.as_ref() {
+            Self::reject_masked_agent_config(value, "tools configuration")?;
+        }
+        let mcp_servers_config =
+            self.encrypt_agent_config(request.mcp_servers_config, "MCP configuration")?;
+        let tools_config =
+            self.encrypt_agent_config(request.tools_config, "tools configuration")?;
 
         let default_provider = self.platform_default_provider().await;
         let active = project_agents::ActiveModel {
@@ -565,9 +729,9 @@ impl AgentConfigService {
             sandbox_enabled: Set(request.sandbox_enabled),
             config_repo_url: Set(request.config_repo_url),
             config_repo_branch: Set(request.config_repo_branch),
-            mcp_servers_config: Set(request.mcp_servers_config),
+            mcp_servers_config: Set(mcp_servers_config),
             skills_config: Set(request.skills_config),
-            tools_config: Set(request.tools_config),
+            tools_config: Set(tools_config),
             webhook_id: Set(webhook_id),
             webhook_token: Set(webhook_token),
             ..Default::default()
@@ -578,7 +742,7 @@ impl AgentConfigService {
             .await
             .map_err(AgentError::Database)?;
 
-        Ok(model)
+        self.decrypt_agent_model(model)
     }
 
     /// Update an agent identified by slug for a project.
@@ -728,13 +892,17 @@ impl AgentConfigService {
             active.config_repo_branch = Set(Some(config_repo_branch.clone()));
         }
         if let Some(mcp) = request.mcp_servers_config {
-            active.mcp_servers_config = Set(Some(mcp));
+            Self::reject_masked_agent_config(&mcp, "MCP configuration")?;
+            active.mcp_servers_config =
+                Set(self.encrypt_agent_config(Some(mcp), "MCP configuration")?);
         }
         if let Some(skills) = request.skills_config {
             active.skills_config = Set(Some(skills));
         }
         if let Some(tools) = request.tools_config {
-            active.tools_config = Set(Some(tools));
+            Self::reject_masked_agent_config(&tools, "tools configuration")?;
+            active.tools_config =
+                Set(self.encrypt_agent_config(Some(tools), "tools configuration")?);
         }
 
         let model = active
@@ -742,7 +910,7 @@ impl AgentConfigService {
             .await
             .map_err(AgentError::Database)?;
 
-        Ok(model)
+        self.decrypt_agent_model(model)
     }
 
     /// Delete an agent identified by slug for a project.
@@ -825,9 +993,12 @@ impl AgentConfigService {
                 active.branch_prefix = Set(yaml_agent.branch_prefix.clone());
                 active.deliverable = Set(yaml_agent.deliverable.clone());
                 active.sandbox_enabled = Set(yaml_agent.sandbox);
-                active.mcp_servers_config = Set(yaml_agent.mcp_servers_json());
+                active.mcp_servers_config = Set(
+                    self.encrypt_agent_config(yaml_agent.mcp_servers_json(), "MCP configuration")?
+                );
                 active.skills_config = Set(yaml_agent.skills_config_json());
-                active.tools_config = Set(yaml_agent.tools_config_json());
+                active.tools_config = Set(self
+                    .encrypt_agent_config(yaml_agent.tools_config_json(), "tools configuration")?);
                 active.config_repo_url = Set(yaml_agent.config_repo.clone());
                 active.config_repo_branch = Set(yaml_agent.config_repo_branch.clone());
                 active.enabled = Set(yaml_agent.enabled);
@@ -874,9 +1045,15 @@ impl AgentConfigService {
                     branch_prefix: Set(yaml_agent.branch_prefix.clone()),
                     deliverable: Set(yaml_agent.deliverable.clone()),
                     sandbox_enabled: Set(yaml_agent.sandbox),
-                    mcp_servers_config: Set(yaml_agent.mcp_servers_json()),
+                    mcp_servers_config: Set(self.encrypt_agent_config(
+                        yaml_agent.mcp_servers_json(),
+                        "MCP configuration",
+                    )?),
                     skills_config: Set(yaml_agent.skills_config_json()),
-                    tools_config: Set(yaml_agent.tools_config_json()),
+                    tools_config: Set(self.encrypt_agent_config(
+                        yaml_agent.tools_config_json(),
+                        "tools configuration",
+                    )?),
                     config_repo_url: Set(yaml_agent.config_repo.clone()),
                     config_repo_branch: Set(yaml_agent.config_repo_branch.clone()),
                     webhook_id: Set(webhook_id),
@@ -962,6 +1139,55 @@ mod tests {
         )
     }
 
+    #[test]
+    fn agent_inline_configs_are_encrypted_at_rest_and_decrypted_for_runtime() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let svc = AgentConfigService::new(Arc::new(db), make_encryption_service());
+        let plaintext = serde_json::json!([{
+            "type": "custom",
+            "webhook_url": "https://hooks.example.test/secret",
+            "headers": {"Authorization": "Bearer secret"}
+        }]);
+
+        let protected = svc
+            .encrypt_agent_config(Some(plaintext.clone()), "tools configuration")
+            .expect("agent tools should encrypt")
+            .expect("agent tools should be present");
+
+        let stored = protected
+            .as_str()
+            .expect("encrypted JSONB value should be a string wrapper");
+        assert!(stored.starts_with(ENCRYPTED_AGENT_CONFIG_PREFIX));
+        assert!(!stored.contains("hooks.example.test"));
+        assert!(!stored.contains("Bearer secret"));
+        assert_eq!(
+            svc.decrypt_agent_config(Some(protected), "tools configuration")
+                .expect("agent tools should decrypt"),
+            Some(plaintext)
+        );
+    }
+
+    #[test]
+    fn prefix_looking_user_config_is_encrypted_as_plaintext() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let svc = AgentConfigService::new(Arc::new(db), make_encryption_service());
+        let plaintext = serde_json::Value::String(format!(
+            "{ENCRYPTED_AGENT_CONFIG_PREFIX}not-valid-ciphertext"
+        ));
+
+        let protected = svc
+            .encrypt_agent_config(Some(plaintext.clone()), "MCP configuration")
+            .expect("prefix-looking input should be encrypted")
+            .expect("encrypted input should be present");
+
+        assert_ne!(protected, plaintext);
+        assert_eq!(
+            svc.decrypt_agent_config(Some(protected), "MCP configuration")
+                .expect("encrypted input should decrypt"),
+            Some(plaintext)
+        );
+    }
+
     #[tokio::test]
     async fn test_get_config_returns_some_when_exists() {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
@@ -1014,6 +1240,7 @@ mod tests {
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
             slug: "test".into(),
+            template_slug: None,
             is_deleted: false,
             deleted_at: None,
             last_deployment: None,
@@ -1029,7 +1256,10 @@ mod tests {
             attack_mode: false,
             ai_alert_summaries_enabled: None,
             ai_debug_chat_enabled: None,
+            ai_api_traffic_summary_enabled: None,
             ai_write_actions_enabled: false,
+            error_source_context_enabled: false,
+            error_source_root: None,
             enable_preview_environments: false,
             preview_envs_on_demand: false,
             preview_envs_idle_timeout_seconds: 300,
@@ -1161,6 +1391,87 @@ mod tests {
 
         let result = svc.upsert_config(1, request).await;
         assert!(result.is_ok());
+    }
+
+    fn empty_update_request() -> UpsertAgentRequest {
+        UpsertAgentRequest {
+            slug: None,
+            name: None,
+            description: None,
+            enabled: None,
+            ai_provider: None,
+            ai_model: None,
+            api_key: None,
+            ai_provider_key_id: None,
+            daily_budget_cents: None,
+            max_turns: None,
+            cooldown_minutes: None,
+            trigger_config: None,
+            prompt: None,
+            timeout_seconds: None,
+            deliverable: None,
+            branch_prefix: None,
+            sandbox_enabled: None,
+            config_repo_url: None,
+            config_repo_branch: None,
+            mcp_servers_config: None,
+            skills_config: None,
+            tools_config: None,
+        }
+    }
+
+    #[test]
+    fn masked_legacy_inline_credentials_are_rejected_at_any_depth() {
+        for (field, value) in [
+            (
+                "MCP configuration",
+                serde_json::json!({
+                    "remote": {
+                        "url": "***",
+                        "headers": {"Authorization": "***"}
+                    }
+                }),
+            ),
+            (
+                "tools configuration",
+                serde_json::json!([{
+                    "type": "custom",
+                    "webhook_url": "***",
+                    "headers": {"X-Api-Key": "***"}
+                }]),
+            ),
+        ] {
+            let error = AgentConfigService::reject_masked_agent_config(&value, field)
+                .expect_err("masked read responses must never be persisted");
+            assert!(matches!(error, AgentError::Validation { .. }));
+            assert!(error.to_string().contains("omit the field"));
+        }
+    }
+
+    #[tokio::test]
+    async fn update_agent_rejects_masked_round_trip_before_writing() {
+        let mut existing = make_config(42);
+        existing.mcp_servers_config = Some(serde_json::json!({
+            "remote": {
+                "url": "https://mcp.example.test?token=stored-secret"
+            }
+        }));
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![existing]])
+            .into_connection();
+        let svc = AgentConfigService::new(Arc::new(db), make_encryption_service());
+        let mut request = empty_update_request();
+        request.mcp_servers_config = Some(serde_json::json!({
+            "remote": {"url": "***"}
+        }));
+
+        let error = svc
+            .update_agent(42, "default-agent", request)
+            .await
+            .expect_err("a masked GET response must not overwrite stored credentials");
+
+        assert!(matches!(error, AgentError::Validation { .. }));
+        assert!(error.to_string().contains("omit the field"));
     }
 
     // ---------------------------------------------------------------------------

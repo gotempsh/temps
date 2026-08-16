@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio_stream::Stream;
 
 use crate::error::AiGatewayError;
-use crate::providers::{AiProvider, ProviderCapability, ProviderInfo};
+use crate::providers::{external_http_client, AiProvider, ProviderCapability, ProviderInfo};
 use crate::types::*;
 
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
@@ -24,11 +24,7 @@ impl Default for AnthropicProvider {
 
 impl AnthropicProvider {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to build HTTP client");
+        let client = external_http_client(Duration::from_secs(300));
 
         Self {
             info: ProviderInfo {
@@ -224,13 +220,30 @@ impl AnthropicProvider {
             }
         });
 
+        let effort = request
+            .extra
+            .as_ref()
+            .and_then(|extra| extra.get("reasoning_effort"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string);
+        let adaptive_model = request.model.starts_with("claude-sonnet-5")
+            || request.model.starts_with("claude-opus-5")
+            || request.model.starts_with("claude-fable-5");
+
         AnthropicRequest {
             model: request.model.clone(),
             messages,
             system,
             max_tokens: request.max_tokens.unwrap_or(4096),
-            temperature: request.temperature,
-            top_p: request.top_p,
+            temperature: (!adaptive_model).then_some(request.temperature).flatten(),
+            top_p: (!adaptive_model).then_some(request.top_p).flatten(),
+            thinking: effort
+                .as_ref()
+                .filter(|_| adaptive_model)
+                .map(|_| AnthropicThinking { r#type: "adaptive" }),
+            output_config: effort
+                .filter(|_| adaptive_model)
+                .map(|effort| AnthropicOutputConfig { effort }),
             stream: request.stream,
             stop_sequences: request.stop.as_ref().map(|s| match s {
                 StopSequence::Single(s) => vec![s.clone()],
@@ -289,7 +302,10 @@ impl AnthropicProvider {
                         }
                     }));
                 }
-                AnthropicContentBlock::Image { .. } | AnthropicContentBlock::ToolResult { .. } => {
+                AnthropicContentBlock::Image { .. }
+                | AnthropicContentBlock::ToolResult { .. }
+                | AnthropicContentBlock::Thinking { .. }
+                | AnthropicContentBlock::RedactedThinking { .. } => {
                     // Not expected in assistant responses
                 }
             }
@@ -519,12 +535,17 @@ impl AiProvider for AnthropicProvider {
     fn available_models(&self) -> Vec<ModelInfo> {
         vec![
             ModelInfo {
-                id: "claude-opus-4-6".to_string(),
+                id: "claude-opus-5".to_string(),
                 object: "model".to_string(),
                 owned_by: "anthropic".to_string(),
             },
             ModelInfo {
-                id: "claude-sonnet-4-6".to_string(),
+                id: "claude-sonnet-5".to_string(),
+                object: "model".to_string(),
+                owned_by: "anthropic".to_string(),
+            },
+            ModelInfo {
+                id: "claude-fable-5".to_string(),
                 object: "model".to_string(),
                 owned_by: "anthropic".to_string(),
             },
@@ -674,6 +695,10 @@ struct AnthropicRequest {
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<AnthropicThinking>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_config: Option<AnthropicOutputConfig>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -682,6 +707,16 @@ struct AnthropicRequest {
     tools: Option<Vec<AnthropicTool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<AnthropicToolChoice>,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicThinking {
+    r#type: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct AnthropicOutputConfig {
+    effort: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -730,6 +765,18 @@ enum AnthropicContentBlock {
         tool_use_id: String,
         content: String,
     },
+    #[serde(rename = "thinking")]
+    Thinking {
+        #[serde(default)]
+        thinking: String,
+        #[serde(default)]
+        signature: String,
+    },
+    #[serde(rename = "redacted_thinking")]
+    RedactedThinking {
+        #[serde(default)]
+        data: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -756,6 +803,33 @@ struct AnthropicUsage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_request(model: &str) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: model.to_string(),
+            messages: vec![ChatMessage {
+                role: "user".to_string(),
+                content: Some(MessageContent::Text("Hello".to_string())),
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            stream: false,
+            temperature: None,
+            max_tokens: None,
+            top_p: None,
+            stop: None,
+            n: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            user: None,
+            extra: None,
+        }
+    }
 
     #[test]
     fn test_anthropic_provider_info() {
@@ -810,6 +884,25 @@ mod tests {
         assert_eq!(translated.max_tokens, 500);
         assert_eq!(translated.temperature, Some(0.7));
         assert!(translated.tools.is_none());
+    }
+
+    #[test]
+    fn test_translate_request_maps_claude_5_effort_and_omits_sampling() {
+        let mut request = test_request("claude-sonnet-5");
+        request.temperature = Some(0.2);
+        request.top_p = Some(0.9);
+        request.extra = Some(serde_json::Map::from_iter([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("medium"),
+        )]));
+
+        let translated = AnthropicProvider::translate_request(&request);
+        let value = serde_json::to_value(translated).expect("request serializes");
+
+        assert_eq!(value["thinking"]["type"], "adaptive");
+        assert_eq!(value["output_config"]["effort"], "medium");
+        assert!(value.get("temperature").is_none());
+        assert!(value.get("top_p").is_none());
     }
 
     #[test]
@@ -1074,6 +1167,27 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 10);
         assert_eq!(usage.completion_tokens, 8);
         assert_eq!(usage.total_tokens, 18);
+    }
+
+    #[test]
+    fn response_with_thinking_blocks_deserializes_and_returns_visible_text() {
+        let response: AnthropicResponse = serde_json::from_value(serde_json::json!({
+            "id": "msg_thinking",
+            "content": [
+                {"type": "thinking", "thinking": "private reasoning", "signature": "sig"},
+                {"type": "redacted_thinking", "data": "encrypted"},
+                {"type": "text", "text": "Visible answer"}
+            ],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 4, "output_tokens": 9}
+        }))
+        .expect("Claude thinking blocks must be accepted");
+
+        let translated = AnthropicProvider::translate_response(response, "claude-sonnet-5");
+        assert_eq!(
+            translated.choices[0].message.content,
+            Some(MessageContent::Text("Visible answer".to_string()))
+        );
     }
 
     #[test]

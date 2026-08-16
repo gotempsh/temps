@@ -268,6 +268,10 @@ pub struct PropertyBreakdownQuery {
     pub filter_channel: Option<String>,
     /// Filter by referrer hostname (for referrer -> pages drill-downs)
     pub filter_referrer: Option<String>,
+    /// Include crawler/bot traffic (default: false). Off by default so the
+    /// breakdown percentages share a denominator with the headline counts,
+    /// which always exclude crawlers.
+    pub include_crawlers: Option<bool>,
 }
 
 /// Optional filters for property breakdown drill-downs.
@@ -308,6 +312,9 @@ pub struct PropertyTimelineQuery {
     pub aggregation_level: AggregationLevel,
     /// Time bucket size: "hour", "day", "week", "month" (default: auto-detect)
     pub bucket_size: Option<String>,
+    /// Include crawler/bot traffic (default: false). See
+    /// [`PropertyBreakdownQuery::include_crawlers`].
+    pub include_crawlers: Option<bool>,
 }
 
 /// Query parameters for unique counts over time frame
@@ -321,7 +328,9 @@ pub struct UniqueCountsQuery {
     pub environment_id: Option<i32>,
     /// Optional deployment filter
     pub deployment_id: Option<i32>,
-    /// Metric to count: "sessions" (unique sessions), "visitors" (unique visitors), or "page_views" (total page views) (default: "sessions")
+    /// Metric to count: "sessions" (unique sessions), "visitors" (unique visitors),
+    /// "returning_visitors" (visitors seen before the range), or "page_views"
+    /// (total page views) (default: "sessions")
     #[serde(default = "default_metric")]
     pub metric: String,
 }

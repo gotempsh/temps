@@ -122,6 +122,7 @@ mod m20260618_000001_create_on_demand_cert_attempts;
 mod m20260618_000002_add_domains_on_demand_backoff;
 mod m20260619_000001_add_settings_change_trigger;
 mod m20260621_000001_create_telemetry_milestones;
+mod m20260622_000001_managed_domain_hostnames;
 mod m20260623_000001_add_external_services_default_backup_provisioned;
 mod m20260626_000001_create_metric_dashboards;
 mod m20260626_000002_create_metric_alert_rules;
@@ -144,6 +145,52 @@ mod m20260705_000001_add_visitor_unique_index;
 mod m20260707_000001_add_external_service_to_logs;
 mod m20260707_000002_add_external_services_container_name;
 mod m20260708_000001_add_node_id_to_monitoring_alert_rules;
+mod m20260711_000001_add_proxy_logs_stats_cagg;
+mod m20260711_000001_normalize_email_event_types;
+mod m20260711_000002_add_ip_geolocations_hosting_provider;
+mod m20260711_000002_create_suppressed_recipients;
+mod m20260711_000003_add_visitor_non_crawler_partial_index;
+mod m20260713_000001_add_mfa_pending_to_sessions;
+mod m20260714_000001_fix_otel_spans_compression_segmentby;
+mod m20260714_000001_secure_sns_email_events;
+mod m20260716_000001_observability_compression_24h;
+mod m20260717_000001_drop_magic_link_tokens;
+mod m20260720_000001_add_backend_to_sandboxes;
+mod m20260720_000001_audit_logs_keep_history_on_user_delete;
+mod m20260720_000002_create_sandbox_events;
+mod m20260722_000001_create_source_files;
+mod m20260722_000002_add_source_context_enabled_to_projects;
+mod m20260723_000001_add_error_source_root_to_projects;
+mod m20260724_000001_add_run_config_to_agent_runs;
+mod m20260725_000001_sandboxes_agent_run_link;
+mod m20260728_000001_add_environment_id_to_metric_alert_rules;
+mod m20260730_000001_add_architecture_to_nodes;
+mod m20260730_000001_create_teams_rbac;
+mod m20260731_000001_create_source_bundles;
+mod m20260802_000001_add_environment_force_https;
+mod m20260802_000002_create_feature_flags;
+mod m20260803_000001_add_flag_last_evaluated_at;
+mod m20260803_000001_add_template_slug_to_projects;
+mod m20260803_000002_add_step_up_expires_at_to_sessions;
+mod m20260804_000001_add_ai_data_access_to_external_services;
+mod m20260804_000001_add_must_change_password_to_users;
+pub mod m20260805_000001_index_normalized_managed_domains;
+mod m20260806_000001_index_permission_denied_retention;
+pub mod m20260806_000001_sandbox_workspace_lifecycle;
+mod m20260809_000001_ai_gateway_config_provider_type;
+mod m20260810_000001_add_cli_session_id_to_ai_conversations;
+pub mod m20260810_000001_create_sandbox_snapshots;
+mod m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config;
+mod m20260810_000003_pin_ai_provider_to_conversations;
+mod m20260810_000004_add_ai_conversation_runtime_options;
+mod m20260811_000001_add_cli_session_fingerprint;
+mod m20260811_000001_create_renewal_attempts;
+mod m20260813_000001_add_ai_api_traffic_summary_enabled;
+mod m20260814_000001_create_ai_provider_models;
+mod m20260814_000001_create_otel_span_facets;
+mod m20260814_000002_add_ai_summary_preference;
+mod m20260815_000001_add_facet_attr_columns_to_otel_spans;
+mod m20260815_000001_default_preview_inclusion_off;
 
 pub struct Migrator;
 
@@ -269,6 +316,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260618_000002_add_domains_on_demand_backoff::Migration),
             Box::new(m20260619_000001_add_settings_change_trigger::Migration),
             Box::new(m20260621_000001_create_telemetry_milestones::Migration),
+            Box::new(m20260622_000001_managed_domain_hostnames::Migration),
             Box::new(m20260623_000001_add_external_services_default_backup_provisioned::Migration),
             Box::new(m20260626_000001_create_metric_dashboards::Migration),
             Box::new(m20260626_000002_create_metric_alert_rules::Migration),
@@ -293,6 +341,129 @@ impl MigratorTrait for Migrator {
             Box::new(m20260707_000001_add_external_service_to_logs::Migration),
             Box::new(m20260707_000002_add_external_services_container_name::Migration),
             Box::new(m20260708_000001_add_node_id_to_monitoring_alert_rules::Migration),
+            Box::new(m20260711_000001_add_proxy_logs_stats_cagg::Migration),
+            Box::new(m20260711_000001_normalize_email_event_types::Migration),
+            Box::new(m20260711_000002_add_ip_geolocations_hosting_provider::Migration),
+            Box::new(m20260711_000002_create_suppressed_recipients::Migration),
+            Box::new(m20260711_000003_add_visitor_non_crawler_partial_index::Migration),
+            Box::new(m20260713_000001_add_mfa_pending_to_sessions::Migration),
+            Box::new(m20260714_000001_fix_otel_spans_compression_segmentby::Migration),
+            Box::new(m20260714_000001_secure_sns_email_events::Migration),
+            Box::new(m20260716_000001_observability_compression_24h::Migration),
+            Box::new(m20260717_000001_drop_magic_link_tokens::Migration),
+            Box::new(m20260720_000001_add_backend_to_sandboxes::Migration),
+            Box::new(m20260720_000002_create_sandbox_events::Migration),
+            Box::new(m20260720_000001_audit_logs_keep_history_on_user_delete::Migration),
+            Box::new(m20260722_000001_create_source_files::Migration),
+            Box::new(m20260722_000002_add_source_context_enabled_to_projects::Migration),
+            Box::new(m20260723_000001_add_error_source_root_to_projects::Migration),
+            Box::new(m20260724_000001_add_run_config_to_agent_runs::Migration),
+            Box::new(m20260725_000001_sandboxes_agent_run_link::Migration),
+            Box::new(
+                m20260728_000001_add_environment_id_to_metric_alert_rules::Migration,
+            ),
+            Box::new(m20260730_000001_add_architecture_to_nodes::Migration),
+            Box::new(m20260730_000001_create_teams_rbac::Migration),
+            Box::new(m20260731_000001_create_source_bundles::Migration),
+            Box::new(m20260802_000001_add_environment_force_https::Migration),
+            Box::new(m20260802_000002_create_feature_flags::Migration),
+            Box::new(m20260803_000001_add_flag_last_evaluated_at::Migration),
+            Box::new(m20260803_000001_add_template_slug_to_projects::Migration),
+            Box::new(m20260803_000002_add_step_up_expires_at_to_sessions::Migration),
+            // Both carry the 20260804_000001 stamp (independently authored on
+            // two branches). They touch different tables, so the order between
+            // them is arbitrary — but main's shipped first, so it runs first
+            // and this branch's is appended rather than inserted ahead of it.
+            // `DeriveMigrationName` keys on the full module name, so the shared
+            // timestamp is not a collision in `seaql_migrations`.
+            Box::new(m20260804_000001_add_must_change_password_to_users::Migration),
+            Box::new(
+                m20260804_000001_add_ai_data_access_to_external_services::Migration,
+            ),
+            Box::new(m20260805_000001_index_normalized_managed_domains::Migration),
+            Box::new(m20260806_000001_sandbox_workspace_lifecycle::Migration),
+            Box::new(m20260806_000001_index_permission_denied_retention::Migration),
+            Box::new(m20260809_000001_ai_gateway_config_provider_type::Migration),
+            // Main shipped the sandbox migration first. Keep it ahead of this
+            // branch's independently authored migration with the same date and
+            // sequence stamp; DeriveMigrationName uses the full module name, so
+            // the two records remain distinct in seaql_migrations.
+            Box::new(m20260810_000001_create_sandbox_snapshots::Migration),
+            Box::new(
+                m20260810_000001_add_cli_session_id_to_ai_conversations::Migration,
+            ),
+            Box::new(
+                m20260810_000002_add_interactive_bridge_enabled_to_ai_gateway_config::Migration,
+            ),
+            Box::new(m20260810_000003_pin_ai_provider_to_conversations::Migration),
+            Box::new(m20260810_000004_add_ai_conversation_runtime_options::Migration),
+            // Main shipped the renewal-attempts migration first. Preserve
+            // that upgrade history before this branch's independently named
+            // migration with the same date and sequence stamp.
+            Box::new(m20260811_000001_create_renewal_attempts::Migration),
+            Box::new(m20260811_000001_add_cli_session_fingerprint::Migration),
+            Box::new(m20260813_000001_add_ai_api_traffic_summary_enabled::Migration),
+            // Main shipped m20260814_000001_create_ai_provider_models first.
+            // Keep it ahead of this branch's independently authored migration
+            // with the same date and sequence stamp; DeriveMigrationName uses
+            // the full module name, so the two records remain distinct in
+            // seaql_migrations.
+            Box::new(m20260814_000001_create_ai_provider_models::Migration),
+            Box::new(m20260814_000001_create_otel_span_facets::Migration),
+            Box::new(m20260814_000002_add_ai_summary_preference::Migration),
+            // Main shipped the facet-attribute migration first. Preserve that
+            // order before this branch's independently named migration with
+            // the same date and sequence stamp.
+            Box::new(m20260815_000001_add_facet_attr_columns_to_otel_spans::Migration),
+            Box::new(m20260815_000001_default_preview_inclusion_off::Migration),
         ]
+    }
+}
+
+#[cfg(test)]
+mod registry_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn migration_names_are_unique_and_same_stamp_upgrade_history_stays_main_first() {
+        let names = Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+            .collect::<Vec<_>>();
+        let unique = names.iter().collect::<HashSet<_>>();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "every registry entry must have a unique persisted migration name"
+        );
+
+        for (shipped, added) in [
+            (
+                "m20260810_000001_create_sandbox_snapshots",
+                "m20260810_000001_add_cli_session_id_to_ai_conversations",
+            ),
+            (
+                "m20260811_000001_create_renewal_attempts",
+                "m20260811_000001_add_cli_session_fingerprint",
+            ),
+            (
+                "m20260815_000001_add_facet_attr_columns_to_otel_spans",
+                "m20260815_000001_default_preview_inclusion_off",
+            ),
+        ] {
+            let shipped_position = names
+                .iter()
+                .position(|name| name == shipped)
+                .unwrap_or_else(|| panic!("shipped migration '{shipped}' is missing"));
+            let added_position = names
+                .iter()
+                .position(|name| name == added)
+                .unwrap_or_else(|| panic!("added migration '{added}' is missing"));
+            assert!(
+                shipped_position < added_position,
+                "shipped migration '{shipped}' must precede '{added}'"
+            );
+        }
     }
 }

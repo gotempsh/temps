@@ -34,7 +34,6 @@ bun.lockb
 
 # Docs and examples
 docs/
-examples/
 README.md
 CHANGELOG.md
 LICENSE
@@ -44,6 +43,7 @@ LICENSE
 .env
 .env.local
 .env.*.local
+/secrets/
 docker-compose.dev.yml
 .pre-commit-config.yaml
 
@@ -81,3 +81,11 @@ docker-compose.*.yml
 .eslintrc*
 .stylelintrc*
 thoughts/
+
+# CI compose-security prebuilt-binary pipeline
+ci-build-cache/
+**/node_modules/
+
+# CI compose-security prebuilt-binary pipeline
+ci-build-cache/
+**/node_modules/

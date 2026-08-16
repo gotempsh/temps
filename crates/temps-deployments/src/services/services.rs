@@ -1,13 +1,14 @@
 use futures::Stream;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
+    QuerySelect, Set,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 use temps_entities::{
     deployment_container_logs, deployment_containers, deployment_domains, deployments,
-    environments, projects,
+    environments, nodes, projects,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -28,6 +29,7 @@ use crate::services::types::{
     Deployment, DeploymentDomain, DeploymentEnvironment, DeploymentListResponse,
 };
 use crate::UpdateDeploymentSettingsRequest;
+use temps_core::PublicHostnameStrategy;
 use temps_core::WorkflowTask;
 
 /// Parameters for container log retrieval
@@ -37,6 +39,23 @@ pub struct ContainerLogParams {
     pub tail: Option<String>,
     pub timestamps: bool,
     pub follow: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ResolvedContainerResourceLimits {
+    pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContainerPresentationContext {
+    pub node_names: HashMap<i32, String>,
+    pub app_settings: temps_core::AppSettings,
+    pub environment_subdomain: String,
+    pub public_ports: Vec<temps_entities::preset::ComposePublicPort>,
+    pub resource_limits: ResolvedContainerResourceLimits,
 }
 
 #[derive(Error, Debug)]
@@ -86,6 +105,38 @@ impl From<sea_orm::DbErr> for DeploymentError {
     }
 }
 
+fn confined_archive_path(
+    data_dir: &std::path::Path,
+    stored_path: &str,
+) -> Result<std::path::PathBuf, DeploymentError> {
+    let relative = std::path::Path::new(stored_path);
+    if relative.is_absolute()
+        || relative.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(DeploymentError::InvalidBundlePath {
+            path: stored_path.to_string(),
+            reason: "stored archive path escapes the Temps data directory".to_string(),
+        });
+    }
+    Ok(data_dir.join(relative))
+}
+
+/// A public git repository + branch, returned only for projects whose repo
+/// is actually public -- see [`DeploymentService::get_public_repo_reference`].
+#[derive(Clone, Debug)]
+pub struct RepoReference {
+    pub owner: String,
+    pub repo: String,
+    pub branch: String,
+}
+
 #[derive(Clone)]
 pub struct DeploymentService {
     db: Arc<temps_database::DbConnection>,
@@ -105,9 +156,389 @@ pub struct DeploymentService {
     /// SAME resolved env (user vars, external-service vars, Sentry/OTel, API
     /// token) as a normal deploy — see [`crate::services::env_resolver`].
     env_resolver: std::sync::OnceLock<Arc<crate::services::env_resolver::DeploymentEnvResolver>>,
+    /// Late-bound Compose executor (the `Arc<bollard::Docker>` client it needs
+    /// is only constructed later in plugin init, after `DeploymentService`
+    /// itself). Set via [`Self::set_compose_executor`]. Used by
+    /// `cleanup_containers` to sweep Compose-managed volumes/networks -- which
+    /// individual `deployer.remove_container` calls never touch -- when a
+    /// project/environment that deployed via Docker Compose is deleted.
+    compose_executor: std::sync::OnceLock<Arc<temps_deployer::compose::ComposeExecutor>>,
 }
 
 impl DeploymentService {
+    pub async fn container_presentation_context(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        node_ids: &[i32],
+    ) -> Result<ContainerPresentationContext, DeploymentError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Project {project_id} not found while resolving container presentation"
+                ))
+            })?;
+        let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Environment {environment_id} not found in project {project_id} while resolving container presentation"
+                ))
+            })?;
+        let app_settings = self.config_service.get_settings().await.map_err(|error| {
+            DeploymentError::Other(format!(
+                "Failed to load application settings for containers in project {project_id}, environment {environment_id}: {error}"
+            ))
+        })?;
+        let node_names = if node_ids.is_empty() {
+            HashMap::new()
+        } else {
+            nodes::Entity::find()
+                .filter(nodes::Column::Id.is_in(node_ids.iter().copied()))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|node| (node.id, node.name))
+                .collect()
+        };
+        let public_ports = match project.preset_config.as_ref() {
+            Some(temps_entities::preset::PresetConfig::DockerCompose(config)) => {
+                config.public_ports.clone()
+            }
+            _ => Vec::new(),
+        };
+        let environment_config = environment.deployment_config.as_ref();
+        let project_config = project.deployment_config.as_ref();
+        let resolve =
+            |get: fn(&temps_entities::deployment_config::DeploymentConfig) -> Option<i32>| {
+                environment_config
+                    .and_then(get)
+                    .or_else(|| project_config.and_then(get))
+            };
+
+        Ok(ContainerPresentationContext {
+            node_names,
+            app_settings,
+            environment_subdomain: environment.subdomain,
+            public_ports,
+            resource_limits: ResolvedContainerResourceLimits {
+                cpu_request: resolve(|config| config.cpu_request),
+                cpu_limit: resolve(|config| config.cpu_limit),
+                memory_request: resolve(|config| config.memory_request),
+                memory_limit: resolve(|config| config.memory_limit),
+            },
+        })
+    }
+
+    async fn cleanup_containers(
+        &self,
+        project_id: i32,
+        environment_id: Option<i32>,
+    ) -> Result<u64, temps_core::ContainerCleanupError> {
+        let mut query = deployment_containers::Entity::find()
+            .inner_join(deployments::Entity)
+            .filter(deployments::Column::ProjectId.eq(project_id));
+        if let Some(environment_id) = environment_id {
+            query = query.filter(deployments::Column::EnvironmentId.eq(environment_id));
+        }
+
+        let containers = query.all(self.db.as_ref()).await.map_err(|error| {
+            temps_core::ContainerCleanupError::Discovery {
+                project_id,
+                environment_id,
+                reason: error.to_string(),
+            }
+        })?;
+
+        let recorded_container_ids: std::collections::HashSet<String> = containers
+            .iter()
+            .map(|container| container.container_id.clone())
+            .collect();
+
+        let deployment_ids: Vec<i32> = containers
+            .iter()
+            .map(|container| container.deployment_id)
+            .collect();
+        let deployment_environment_ids: HashMap<i32, i32> = deployments::Entity::find()
+            .filter(deployments::Column::Id.is_in(deployment_ids))
+            .all(self.db.as_ref())
+            .await
+            .map_err(|error| temps_core::ContainerCleanupError::Discovery {
+                project_id,
+                environment_id,
+                reason: format!("failed to resolve container environments: {error}"),
+            })?
+            .into_iter()
+            .map(|deployment| (deployment.id, deployment.environment_id))
+            .collect();
+
+        let mut removed = 0_u64;
+        for original in containers {
+            let container_id = original.container_id.clone();
+            let node_id = original.node_id;
+            let container_environment_id = deployment_environment_ids
+                .get(&original.deployment_id)
+                .copied()
+                .ok_or_else(|| temps_core::ContainerCleanupError::Discovery {
+                    project_id,
+                    environment_id,
+                    reason: format!(
+                        "deployment {} disappeared while preparing container '{}' for cleanup",
+                        original.deployment_id, container_id
+                    ),
+                })?;
+
+            // Hide intentional teardown from routing and health monitoring before
+            // Docker observes the removal. The distinct `removing` state makes a
+            // process crash retryable instead of turning the row into a false
+            // completed cleanup.
+            let already_prepared = original.status.as_deref() == Some("removing");
+            let prepared = if already_prepared {
+                original.clone()
+            } else {
+                let mut active: deployment_containers::ActiveModel = original.clone().into();
+                active.deleted_at = Set(Some(chrono::Utc::now()));
+                active.status = Set(Some("removing".to_string()));
+                active.update(self.db.as_ref()).await.map_err(|error| {
+                    temps_core::ContainerCleanupError::Prepare {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id: container_id.clone(),
+                        node_id,
+                        reason: error.to_string(),
+                    }
+                })?
+            };
+
+            let deployer = match self.deployer_for_node(node_id).await {
+                Ok(deployer) => deployer,
+                Err(error) => {
+                    let reason = self
+                        .restore_cleanup_marker(&original, already_prepared)
+                        .await
+                        .map_or_else(
+                            |restore_error| {
+                                format!(
+                                    "{error}; additionally failed to restore the container record: {restore_error}"
+                                )
+                            },
+                            |()| error.to_string(),
+                        );
+                    return Err(temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id,
+                        node_id,
+                        reason,
+                    });
+                }
+            };
+
+            match deployer.get_container_info(&container_id).await {
+                Ok(info) => {
+                    let expected_project = project_id.to_string();
+                    let expected_environment = container_environment_id.to_string();
+                    if info.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
+                        || info.labels.get("sh.temps.project_id") != Some(&expected_project)
+                        || info.labels.get("sh.temps.environment") != Some(&expected_environment)
+                    {
+                        let reason = "runtime container labels do not match the project and environment being deleted".to_string();
+                        let _ = self
+                            .restore_cleanup_marker(&original, already_prepared)
+                            .await;
+                        return Err(temps_core::ContainerCleanupError::Removal {
+                            project_id,
+                            environment_id: container_environment_id,
+                            container_id,
+                            node_id,
+                            reason,
+                        });
+                    }
+                }
+                Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {}
+                Err(error) => {
+                    let _ = self
+                        .restore_cleanup_marker(&original, already_prepared)
+                        .await;
+                    return Err(temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id,
+                        node_id,
+                        reason: format!("failed to verify runtime container ownership: {error}"),
+                    });
+                }
+            }
+
+            let removal_error = match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                deployer.remove_container(&container_id),
+            )
+            .await
+            {
+                Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => None,
+                Ok(Err(error)) => Some(error.to_string()),
+                Err(_) => Some("container removal timed out after 30 seconds".to_string()),
+            };
+            if let Some(reason) = removal_error {
+                // Once a request may have reached Docker/the agent, its result is
+                // ambiguous. Keep the durable `removing` marker so routing stays
+                // fenced and a retry converges idempotently.
+                return Err(temps_core::ContainerCleanupError::Removal {
+                    project_id,
+                    environment_id: container_environment_id,
+                    container_id,
+                    node_id,
+                    reason,
+                });
+            }
+
+            let mut active: deployment_containers::ActiveModel = prepared.into();
+            active.status = Set(Some("removed".to_string()));
+            active.update(self.db.as_ref()).await.map_err(|error| {
+                temps_core::ContainerCleanupError::Finalize {
+                    project_id,
+                    environment_id: container_environment_id,
+                    container_id: container_id.clone(),
+                    node_id,
+                    reason: error.to_string(),
+                }
+            })?;
+
+            removed += 1;
+            info!(
+                project_id,
+                environment_id = container_environment_id,
+                container_id,
+                ?node_id,
+                "Removed application container before owner deletion"
+            );
+        }
+
+        // Compose can create labeled containers before the deployment rows are
+        // registered. Discover those runtime-owned containers as well so a
+        // concurrent cancellation/deletion cannot orphan an unrecorded stack.
+        let runtime_containers = self.deployer.list_containers().await.map_err(|error| {
+            temps_core::ContainerCleanupError::Discovery {
+                project_id,
+                environment_id,
+                reason: format!("failed to discover labeled runtime containers: {error}"),
+            }
+        })?;
+        let expected_project = project_id.to_string();
+        let expected_environment = environment_id.map(|id| id.to_string());
+        for container in runtime_containers {
+            if recorded_container_ids.contains(&container.container_id)
+                || container.labels.get("sh.temps.managed").map(String::as_str) != Some("true")
+                || container.labels.get("sh.temps.project_id") != Some(&expected_project)
+                || expected_environment.as_ref().is_some_and(|expected| {
+                    container.labels.get("sh.temps.environment") != Some(expected)
+                })
+            {
+                continue;
+            }
+            let container_environment_id = container
+                .labels
+                .get("sh.temps.environment")
+                .and_then(|value| value.parse::<i32>().ok())
+                .ok_or_else(|| temps_core::ContainerCleanupError::Discovery {
+                    project_id,
+                    environment_id,
+                    reason: format!(
+                        "managed container '{}' has an invalid environment label",
+                        container.container_id
+                    ),
+                })?;
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                self.deployer.remove_container(&container.container_id),
+            )
+            .await
+            {
+                Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => {
+                    removed += 1;
+                }
+                Ok(Err(error)) => {
+                    return Err(temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id: container.container_id,
+                        node_id: None,
+                        reason: error.to_string(),
+                    });
+                }
+                Err(_) => {
+                    return Err(temps_core::ContainerCleanupError::Removal {
+                        project_id,
+                        environment_id: container_environment_id,
+                        container_id: container.container_id,
+                        node_id: None,
+                        reason: "runtime container removal timed out after 30 seconds".to_string(),
+                    });
+                }
+            }
+        }
+
+        // Individual `deployer.remove_container` calls above remove Compose
+        // containers themselves, but never the volumes/networks `docker
+        // compose up` also creates for the stack -- those only carry the
+        // `com.docker.compose.project` label. Sweep them per environment
+        // (compose project names are `temps-{project_id}-{environment_id}`,
+        // see `DeployComposeJob`). Best-effort: a stuck volume/network must
+        // not block the deletion the caller is otherwise done with.
+        if let Some(compose_executor) = self.compose_executor.get() {
+            let compose_environment_ids: Vec<i32> = match environment_id {
+                Some(id) => vec![id],
+                None => environments::Entity::find()
+                    .filter(environments::Column::ProjectId.eq(project_id))
+                    .select_only()
+                    .column(environments::Column::Id)
+                    .into_tuple()
+                    .all(self.db.as_ref())
+                    .await
+                    .map_err(|error| temps_core::ContainerCleanupError::Discovery {
+                        project_id,
+                        environment_id,
+                        reason: format!(
+                            "failed to enumerate environments for Compose resource cleanup: {error}"
+                        ),
+                    })?,
+            };
+            for env_id in compose_environment_ids {
+                let compose_project_name = format!("temps-{project_id}-{env_id}");
+                if let Err(error) = compose_executor.destroy(&compose_project_name).await {
+                    warn!(
+                        project_id,
+                        environment_id = env_id,
+                        compose_project = %compose_project_name,
+                        %error,
+                        "Failed to clean up Compose-managed volumes/networks (best-effort)"
+                    );
+                }
+            }
+        }
+
+        Ok(removed)
+    }
+
+    async fn restore_cleanup_marker(
+        &self,
+        original: &deployment_containers::Model,
+        already_prepared: bool,
+    ) -> Result<(), sea_orm::DbErr> {
+        if already_prepared {
+            return Ok(());
+        }
+        let mut active: deployment_containers::ActiveModel = original.clone().into();
+        active.status = Set(original.status.clone());
+        active.deleted_at = Set(original.deleted_at);
+        active.update(self.db.as_ref()).await.map(|_| ())
+    }
+
     /// Resolve CPU/memory limits + requests for a deploy from the environment
     /// config first, then the project config, leaving each field unset when
     /// neither configures it (→ no Docker limit = uncapped). Mirrors the
@@ -155,6 +586,7 @@ impl DeploymentService {
             encryption_service,
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -165,6 +597,12 @@ impl DeploymentService {
         resolver: Arc<crate::services::env_resolver::DeploymentEnvResolver>,
     ) {
         let _ = self.env_resolver.set(resolver);
+    }
+
+    /// Late-bind the Compose executor (see the field docs). Called once
+    /// during plugin init after the `Arc<bollard::Docker>` client exists.
+    pub fn set_compose_executor(&self, executor: Arc<temps_deployer::compose::ComposeExecutor>) {
+        let _ = self.compose_executor.set(executor);
     }
 
     /// Set the anonymous telemetry reporter used to emit deploy-funnel events
@@ -189,6 +627,7 @@ impl DeploymentService {
     ) -> Result<ContainerLogStream, DeploymentError> {
         use temps_entities::{deployment_containers, projects};
         let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
@@ -258,6 +697,7 @@ impl DeploymentService {
 
         // Verify project exists and is a server-type project
         let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
@@ -1044,6 +1484,7 @@ impl DeploymentService {
     ) -> Result<(), DeploymentError> {
         info!("Triggering pipeline for project_id: {}", project_id);
         let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
             .await
             .map_err(|e| DeploymentError::Other(e.to_string()))?;
@@ -1051,7 +1492,10 @@ impl DeploymentService {
         let project = project.ok_or_else(|| {
             DeploymentError::NotFound(format!("project {} not found", project_id))
         })?;
-        debug!("Project found: {:?}", project);
+        debug!(
+            "Project found id={} slug={} preset={}",
+            project.id, project.slug, project.preset
+        );
 
         debug!(
             "Before invoking pipeline service project_id: {}, environment_id: {}",
@@ -1105,43 +1549,98 @@ impl DeploymentService {
         Ok(())
     }
 
-    /// Redeploy an environment using the context (branch, tag, commit) from its
-    /// latest successful deployment.  Used by node drain and failover — these
-    /// operations need to reschedule existing workloads, not start a fresh
-    /// deployment from scratch.
+    /// Trigger a real deployment of a pre-built Docker image, with no build
+    /// step. This is the DockerImage-source counterpart to `trigger_pipeline`
+    /// (which is Git-only and requires `repo_owner`/`repo_name`) — used to
+    /// deploy projects that have no git repository at all, e.g. imports from
+    /// Portainer, Kubernetes, or Kamal.
     ///
-    /// Falls back to the environment's configured branch when no prior
-    /// deployment exists.
+    /// Reuses the `DeployImageRequested` job already driven by the template
+    /// one-click-deploy flow (see `job_processor::process_deploy_image_requested_job`),
+    /// which creates the deployment row itself (with `external_image_ref` in
+    /// its metadata) and plans a pull+run pipeline for the project's
+    /// non-preview environment(s).
+    pub async fn trigger_image_deployment(
+        &self,
+        project_id: i32,
+        target_environment_id: Option<i32>,
+        image_ref: String,
+        health_check_path: Option<String>,
+    ) -> Result<(), DeploymentError> {
+        if image_ref.is_empty() {
+            return Err(DeploymentError::InvalidInput(
+                "Image reference is missing".to_string(),
+            ));
+        }
+
+        info!(
+            "Triggering image deployment for project_id: {} (image: {})",
+            project_id, image_ref
+        );
+
+        self.queue_service
+            .send(temps_core::Job::DeployImageRequested(
+                temps_core::DeployImageRequestedJob {
+                    project_id,
+                    target_environment_id,
+                    image_ref,
+                    health_check_path,
+                },
+            ))
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to send DeployImageRequested to queue: {}", e);
+                DeploymentError::QueueError(e.to_string())
+            })?;
+
+        tracing::debug!("DeployImageRequested successfully sent to queue");
+        Ok(())
+    }
+
+    /// Redeploy the exact workload affected by node drain or failover.
     pub async fn redeploy_environment(
         &self,
         project_id: i32,
         environment_id: i32,
+        deployment_id: i32,
     ) -> Result<(), DeploymentError> {
-        // Find the latest successful deployment for this environment
-        let latest = deployments::Entity::find()
+        // Use the deployment that owns the affected containers. Selecting the
+        // newest row can race a concurrent failed/cancelled deploy and restore
+        // the wrong workload during failover.
+        let deploy = deployments::Entity::find_by_id(deployment_id)
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::State.is_in(vec!["deployed", "completed", "ready"]))
-            .order_by_desc(deployments::Column::CreatedAt)
             .one(self.db.as_ref())
             .await
-            .map_err(|e| DeploymentError::Other(e.to_string()))?;
+            .map_err(|e| DeploymentError::Other(format!(
+                "Failed to load deployment {deployment_id} for project {project_id}, environment {environment_id}: {e}"
+            )))?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "Deployment {deployment_id} was not found in project {project_id}, environment {environment_id}"
+                ))
+            })?;
 
-        let (branch, tag, commit) = if let Some(ref deploy) = latest {
-            (
-                deploy.branch_ref.clone(),
-                deploy.tag_ref.clone(),
-                deploy.commit_sha.clone(),
-            )
-        } else {
-            // No prior deployment — fall back to environment's branch
-            let env = temps_entities::environments::Entity::find_by_id(environment_id)
-                .one(self.db.as_ref())
-                .await
-                .map_err(|e| DeploymentError::Other(e.to_string()))?;
-            let branch = env.and_then(|e| e.branch.filter(|b| !b.is_empty()));
-            (branch, None, None)
-        };
+        // Git-less deployments (docker_image source, e.g. imports or
+        // `deployFromImage`) have no branch/tag/commit to rebuild from —
+        // `trigger_pipeline` requires `repo_owner`/`repo_name` and fails with
+        // "Project repo_owner is missing" for these. Redeploy them from the
+        // same image instead, mirroring `trigger_image_deployment`.
+        if let Some(image_ref) = deploy
+            .metadata
+            .as_ref()
+            .and_then(|m| m.external_image_ref.clone())
+        {
+            return self
+                .trigger_image_deployment(project_id, Some(environment_id), image_ref, None)
+                .await;
+        }
+
+        let (branch, tag, commit) = (
+            deploy.branch_ref.clone(),
+            deploy.tag_ref.clone(),
+            deploy.commit_sha.clone(),
+        );
 
         self.trigger_pipeline(project_id, environment_id, branch, tag, commit)
             .await
@@ -1161,11 +1660,28 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Target deployment not found".to_string()))?;
 
-        // Validate that the deployment is in a valid state for rollback
-        let valid_rollback_states = ["deployed", "completed"];
+        // Validate that the deployment is in a valid state for rollback.
+        //
+        // "stopped" belongs here alongside "completed": once a LATER
+        // deployment supersedes this one, `cancel_previous_deployments`
+        // stops its containers and flips its state to "stopped" (see that
+        // function and `teardown_deployment`) -- that is the terminal state
+        // every successful-but-no-longer-current deployment actually ends up
+        // in. Rollback's whole purpose is reverting to an older deployment,
+        // so its target is virtually always going to be "stopped" in
+        // practice; excluding it made rollback reject its own primary use
+        // case ("Cannot rollback to deployment in 'stopped' state") for any
+        // deployment that had already been superseded -- which is every
+        // deployment a real user would ever actually want to roll back to.
+        // "deployed" is kept for the one other live path that sets it
+        // (`resume_deployment`); "failed"/"cancelled"/"paused" stay excluded
+        // -- a failed/cancelled deployment has no reliable image to reuse,
+        // and rolling back TO a paused deployment is a distinct, not yet
+        // supported, operation.
+        let valid_rollback_states = ["deployed", "completed", "stopped"];
         if !valid_rollback_states.contains(&target_deployment.state.as_str()) {
             return Err(DeploymentError::InvalidDeploymentState(format!(
-                "Cannot rollback to deployment in '{}' state. Only deployed or completed deployments can be rolled back to.",
+                "Cannot rollback to deployment in '{}' state. Only deployed, completed, or stopped (superseded) deployments can be rolled back to.",
                 target_deployment.state
             )));
         }
@@ -1173,12 +1689,15 @@ impl DeploymentService {
         let environment_id = target_deployment.environment_id;
 
         let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
 
-        let preset = temps_presets::get_preset_by_slug(project.preset.as_str())
-            .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        let preset =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
+                .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
+                .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
 
         // --- Git projects: rebuild from source when the image isn't reusable ---
         //
@@ -1296,6 +1815,7 @@ impl DeploymentService {
         })?;
 
         let environment = environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
@@ -1330,7 +1850,7 @@ impl DeploymentService {
             project_id: Set(project_id),
             environment_id: Set(environment_id),
             slug: Set(rollback_slug.clone()),
-            state: Set("running".to_string()),
+            state: Set("pending".to_string()),
             metadata: Set(Some(rollback_metadata)),
             branch_ref: Set(target_deployment.branch_ref.clone()),
             tag_ref: Set(target_deployment.tag_ref.clone()),
@@ -1365,6 +1885,23 @@ impl DeploymentService {
             "Created rollback deployment #{} (rolling back to #{}, image: {})",
             rollback_deployment_id, deployment_id, image_name
         );
+
+        if !super::job_processor::JobProcessorService::try_admit_deployment(
+            self.db.as_ref(),
+            rollback_deployment_id,
+        )
+        .await
+        .map_err(|error| DeploymentError::DatabaseError {
+            reason: format!(
+                "Failed to admit rollback deployment {}: {}",
+                rollback_deployment_id, error
+            ),
+        })? {
+            return Err(DeploymentError::InvalidDeploymentState(format!(
+                "Rollback deployment {} was not admitted because its owner is being deleted",
+                rollback_deployment_id
+            )));
+        }
 
         // Anonymous telemetry: a rollback was initiated. No identifying props.
         self.telemetry()
@@ -1624,25 +2161,39 @@ impl DeploymentService {
                 mock_log_writer,
             );
 
-            match deploy_job.execute(rollback_context.clone()).await {
+            let cancellation_provider =
+                super::workflow_execution_service::DatabaseCancellationProvider::new(
+                    self.db.clone(),
+                    rollback_deployment_id,
+                );
+            match deploy_job
+                .execute_with_cancellation(rollback_context.clone(), &cancellation_provider)
+                .await
+            {
                 Ok(job_result) => {
                     info!("Rollback: Deploy job completed successfully");
                     rollback_context = job_result.context;
 
                     // Update deploy job record to Success
                     let mut active_job: deployment_jobs::ActiveModel = deploy_job_model.into();
-                    active_job.status = Set(JobStatus::Success);
+                    active_job.status = Set(temps_entities::types::JobStatus::Success);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     let _ = active_job.update(self.db.as_ref()).await;
                 }
                 Err(e) => {
                     error!("Rollback: Deploy job failed: {}", e);
+                    let failure_message = match deploy_job.cleanup(&rollback_context).await {
+                        Ok(()) => format!("Deploy failed: {e}"),
+                        Err(cleanup_error) => format!(
+                            "Deploy failed: {e}; rollback container cleanup also failed: {cleanup_error}"
+                        ),
+                    };
 
                     // Update deploy job record to Failure
                     let mut active_job: deployment_jobs::ActiveModel = deploy_job_model.into();
-                    active_job.status = Set(JobStatus::Failure);
+                    active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
-                    active_job.error_message = Set(Some(format!("Deploy failed: {}", e)));
+                    active_job.error_message = Set(Some(failure_message.clone()));
                     let _ = active_job.update(self.db.as_ref()).await;
 
                     // Cancel the pending complete job
@@ -1657,12 +2208,11 @@ impl DeploymentService {
                         rollback_deployment.clone().into();
                     active_dep.state = Set("failed".to_string());
                     active_dep.finished_at = Set(Some(chrono::Utc::now()));
-                    active_dep.cancelled_reason = Set(Some(format!("Deploy failed: {}", e)));
+                    active_dep.cancelled_reason = Set(Some(failure_message.clone()));
                     let _ = active_dep.update(self.db.as_ref()).await;
 
                     return Err(DeploymentError::Other(format!(
-                        "Failed to deploy image during rollback: {}",
-                        e
+                        "Failed to deploy image during rollback: {failure_message}"
                     )));
                 }
             }
@@ -1709,7 +2259,7 @@ impl DeploymentService {
 
                     // Update complete job record to Success
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
-                    active_job.status = Set(JobStatus::Success);
+                    active_job.status = Set(temps_entities::types::JobStatus::Success);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     let _ = active_job.update(self.db.as_ref()).await;
                 }
@@ -1718,7 +2268,7 @@ impl DeploymentService {
 
                     // Update complete job record to Failure
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
-                    active_job.status = Set(JobStatus::Failure);
+                    active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     active_job.error_message = Set(Some(format!("Mark complete failed: {}", e)));
                     let _ = active_job.update(self.db.as_ref()).await;
@@ -1786,6 +2336,24 @@ impl DeploymentService {
 
             for container in containers {
                 let container_id = container.container_id.clone();
+
+                // Mark the row deleted *before* stopping the container in Docker
+                // (see the identical race explained in
+                // WorkflowExecutionService::teardown_previous_deployment):
+                // ContainerHealthMonitor polls on its own schedule and would
+                // otherwise observe this container mid-exit with no signal that
+                // the exit is an intentional pre-rollback cleanup, firing a
+                // false ContainerCrash alarm.
+                let mut active_container: deployment_containers::ActiveModel = container.into();
+                active_container.deleted_at = Set(Some(chrono::Utc::now()));
+                active_container.status = Set(Some("removed".to_string()));
+                if let Err(e) = active_container.update(self.db.as_ref()).await {
+                    warn!(
+                        "Failed to mark container {} deleted before pre-rollback stop: {}",
+                        container_id, e
+                    );
+                }
+
                 if let Err(e) = self.deployer.stop_container(&container_id).await {
                     warn!(
                         "Failed to stop container {} during pre-rollback cleanup: {}",
@@ -1799,16 +2367,56 @@ impl DeploymentService {
                     );
                 }
 
-                // Mark container as deleted
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("removed".to_string()));
-                let _ = active_container.update(self.db.as_ref()).await;
-
                 info!(
                     "Pre-rollback: stopped and removed container {}",
                     container_id
                 );
+            }
+
+            // If this deployment is currently in-flight (state = "running"),
+            // its MarkDeploymentCompleteJob may still be executing — in
+            // particular, it may be waiting inside Phase 2.75 (public
+            // readiness check). We have just killed all of its containers, so
+            // Phase 2.75 will fail, causing reject_unusable_deployment to mark
+            // this deployment "failed" even though it was intentionally
+            // superseded by the incoming rollback. Atomically flip it to
+            // "stopped" here (CAS: only transitions from "running") so that
+            // the staleness check added to mark_complete_inner can detect the
+            // supersession and abort cleanly without calling
+            // reject_unusable_deployment, preserving "stopped" for
+            // promote/rollback reuse.
+            if dep.state == "running" {
+                use sea_orm::sea_query::Expr;
+                match deployments::Entity::update_many()
+                    .col_expr(deployments::Column::State, Expr::value("stopped"))
+                    .col_expr(
+                        deployments::Column::UpdatedAt,
+                        Expr::value(chrono::Utc::now()),
+                    )
+                    .filter(deployments::Column::Id.eq(dep.id))
+                    .filter(deployments::Column::State.eq("running"))
+                    .exec(self.db.as_ref())
+                    .await
+                {
+                    Ok(res) if res.rows_affected > 0 => {
+                        info!(
+                            "Pre-rollback: marked in-flight deployment {} as stopped \
+                             to prevent spurious 'failed' state from concurrent Phase 2.75",
+                            dep.id
+                        );
+                    }
+                    Ok(_) => {
+                        // 0 rows affected: deployment already left "running"
+                        // (e.g., completed between the container kill and this
+                        // update) — nothing to do.
+                    }
+                    Err(e) => {
+                        warn!(
+                            "Pre-rollback: failed to mark in-flight deployment {} as stopped: {}",
+                            dep.id, e
+                        );
+                    }
+                }
             }
         }
     }
@@ -1836,11 +2444,18 @@ impl DeploymentService {
                 ))
             })?;
 
-        // Validate state — only successful deployments can be promoted
-        let valid_states = ["deployed", "completed", "ready"];
+        // Validate state — only successful deployments can be promoted.
+        // "stopped" is included for the same reason `rollback_to_deployment`
+        // includes it (see the comment there): a source deployment that has
+        // since been superseded by a newer one in ITS OWN environment is
+        // "stopped", not "completed" -- and promoting an older, already-
+        // superseded deployment's image into a different environment is
+        // exactly the kind of thing a real user does (e.g. re-promote a
+        // known-good build after a bad one shipped on top of it).
+        let valid_states = ["deployed", "completed", "ready", "stopped"];
         if !valid_states.contains(&source.state.as_str()) {
             return Err(DeploymentError::InvalidDeploymentState(format!(
-                "Cannot promote deployment in '{}' state. Only deployed/completed/ready deployments can be promoted.",
+                "Cannot promote deployment in '{}' state. Only deployed/completed/ready/stopped deployments can be promoted.",
                 source.state
             )));
         }
@@ -1867,6 +2482,7 @@ impl DeploymentService {
             })?;
 
         let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Project not found".to_string()))?;
@@ -1876,8 +2492,10 @@ impl DeploymentService {
             source_deployment_id, target_env.name, project_id, image_name
         );
 
-        let preset = temps_presets::get_preset_by_slug(project.preset.as_str())
-            .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
+        let preset =
+            temps_presets::get_preset_for_storage(project.preset, project.preset_config.as_ref())
+                .map_err(|error| DeploymentError::InvalidInput(error.to_string()))?
+                .ok_or_else(|| DeploymentError::NotFound("Preset not found".to_string()))?;
 
         let now = chrono::Utc::now();
 
@@ -1921,7 +2539,7 @@ impl DeploymentService {
             project_id: Set(project_id),
             environment_id: Set(target_environment_id),
             slug: Set(promote_slug.clone()),
-            state: Set("running".to_string()),
+            state: Set("pending".to_string()),
             metadata: Set(Some(promote_metadata)),
             branch_ref: Set(source.branch_ref.clone()),
             tag_ref: Set(source.tag_ref.clone()),
@@ -1957,6 +2575,23 @@ impl DeploymentService {
             "Created promoted deployment #{} (from #{} to environment '{}')",
             promoted_id, source_deployment_id, target_env.name
         );
+
+        if !super::job_processor::JobProcessorService::try_admit_deployment(
+            self.db.as_ref(),
+            promoted_id,
+        )
+        .await
+        .map_err(|error| DeploymentError::DatabaseError {
+            reason: format!(
+                "Failed to admit promoted deployment {}: {}",
+                promoted_id, error
+            ),
+        })? {
+            return Err(DeploymentError::InvalidDeploymentState(format!(
+                "Promoted deployment {} was not admitted because its owner is being deleted",
+                promoted_id
+            )));
+        }
 
         // Same logic as rollback — for static presets, just update env pointer
         if preset.project_type() == temps_presets::ProjectType::Static {
@@ -2193,23 +2828,37 @@ impl DeploymentService {
                 mock_log_writer,
             );
 
-            match deploy_job.execute(promote_context.clone()).await {
+            let cancellation_provider =
+                super::workflow_execution_service::DatabaseCancellationProvider::new(
+                    self.db.clone(),
+                    promoted_id,
+                );
+            match deploy_job
+                .execute_with_cancellation(promote_context.clone(), &cancellation_provider)
+                .await
+            {
                 Ok(job_result) => {
                     info!("Promotion: Deploy job completed successfully");
                     promote_context = job_result.context;
 
                     let mut active_job: deployment_jobs::ActiveModel = deploy_job_model.into();
-                    active_job.status = Set(JobStatus::Success);
+                    active_job.status = Set(temps_entities::types::JobStatus::Success);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     let _ = active_job.update(self.db.as_ref()).await;
                 }
                 Err(e) => {
                     error!("Promotion: Deploy job failed: {}", e);
+                    let failure_message = match deploy_job.cleanup(&promote_context).await {
+                        Ok(()) => format!("Deploy failed: {e}"),
+                        Err(cleanup_error) => format!(
+                            "Deploy failed: {e}; promoted container cleanup also failed: {cleanup_error}"
+                        ),
+                    };
 
                     let mut active_job: deployment_jobs::ActiveModel = deploy_job_model.into();
-                    active_job.status = Set(JobStatus::Failure);
+                    active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
-                    active_job.error_message = Set(Some(format!("Deploy failed: {}", e)));
+                    active_job.error_message = Set(Some(failure_message.clone()));
                     let _ = active_job.update(self.db.as_ref()).await;
 
                     let mut active_complete: deployment_jobs::ActiveModel =
@@ -2222,12 +2871,11 @@ impl DeploymentService {
                         promoted_deployment.clone().into();
                     active_dep.state = Set("failed".to_string());
                     active_dep.finished_at = Set(Some(chrono::Utc::now()));
-                    active_dep.cancelled_reason = Set(Some(format!("Deploy failed: {}", e)));
+                    active_dep.cancelled_reason = Set(Some(failure_message.clone()));
                     let _ = active_dep.update(self.db.as_ref()).await;
 
                     return Err(DeploymentError::Other(format!(
-                        "Failed to deploy image during promotion: {}",
-                        e
+                        "Failed to deploy image during promotion: {failure_message}"
                     )));
                 }
             }
@@ -2269,7 +2917,7 @@ impl DeploymentService {
                     info!("Promotion: Mark complete job executed successfully");
 
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
-                    active_job.status = Set(JobStatus::Success);
+                    active_job.status = Set(temps_entities::types::JobStatus::Success);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     let _ = active_job.update(self.db.as_ref()).await;
                 }
@@ -2277,7 +2925,7 @@ impl DeploymentService {
                     error!("Promotion: Mark complete job failed: {}", e);
 
                     let mut active_job: deployment_jobs::ActiveModel = complete_job_model.into();
-                    active_job.status = Set(JobStatus::Failure);
+                    active_job.status = Set(temps_entities::types::JobStatus::Failure);
                     active_job.finished_at = Set(Some(chrono::Utc::now()));
                     active_job.error_message = Set(Some(format!("Mark complete failed: {}", e)));
                     let _ = active_job.update(self.db.as_ref()).await;
@@ -2435,8 +3083,17 @@ impl DeploymentService {
             .all(self.db.as_ref())
             .await?;
 
+        // Stop (but do not remove) each container. Keeping the Docker
+        // container object around — rather than force-removing it, as this
+        // used to do — is what makes `resume_deployment` able to bring the
+        // exact same containers back with a plain `docker start` instead of
+        // trying to "unpause" containers that no longer exist (see the fix
+        // note on `resume_deployment` below). The route table additionally
+        // stops sending live traffic to any container whose `status` isn't
+        // "running" (see `route_table::load_routes`), so a stopped-but-not-
+        // removed container is just as inert from the outside as a removed
+        // one, without sacrificing resumability.
         for container in containers {
-            // Stop the container first
             if let Err(e) = self.deployer.stop_container(&container.container_id).await {
                 warn!(
                     "Failed to stop container {} during deployment pause: {}",
@@ -2444,31 +3101,50 @@ impl DeploymentService {
                 );
             }
 
-            // Remove the container
-            if let Err(e) = self
-                .deployer
-                .remove_container(&container.container_id)
-                .await
-            {
-                warn!(
-                    "Failed to remove container {} during deployment pause: {}",
-                    container.container_id, e
-                );
-            }
-
-            // Update container status to removed
             let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("removed".to_string()));
+            active_container.status = Set(Some("stopped".to_string()));
             active_container.update(self.db.as_ref()).await?;
         }
+
+        let environment_id = deployment.environment_id;
 
         // Update deployment state to "paused"
         let mut active_deployment: deployments::ActiveModel = deployment.into();
         active_deployment.state = Set("paused".to_string());
         active_deployment.update(self.db.as_ref()).await?;
 
+        // Force an in-process route-table reload (same mechanism
+        // `mark_deployment_complete.rs` uses after a normal deploy — see its
+        // comment for why this is needed in addition to PG NOTIFY). Nothing
+        // else about a pause touches `environments` or `projects`, which are
+        // the only tables with a NOTIFY trigger wired up (see
+        // `m20251209_000001_add_environments_route_trigger.rs` /
+        // `m20250205_000003_add_projects_route_trigger.rs`) — a bare
+        // `deployment_containers` status UPDATE fires no trigger at all. So
+        // without this, the proxy's cached peer table keeps the container's
+        // OLD (still "valid-looking") address indefinitely and only
+        // discovers the pause when the next unrelated route change happens
+        // to reload it, in the meantime returning "upstream connection
+        // refused" instead of the intended "not currently serving" state.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after pausing deployment {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                deployment_id, e
+            );
+        }
+
         info!(
-            "Successfully paused deployment {}: removed all containers",
+            "Successfully paused deployment {}: stopped all containers",
             deployment_id
         );
         Ok(())
@@ -2496,9 +3172,17 @@ impl DeploymentService {
             .all(self.db.as_ref())
             .await?;
 
+        // `pause_deployment` stops (not removes) containers, so bring them
+        // back with a plain `docker start` on the same container id/name —
+        // not `resume_container` (Docker's `unpause`/cgroup-freeze reverse).
+        // `unpause` only undoes a genuine `docker pause`, which nothing in
+        // this codebase's real pause path ever calls; using it here against
+        // a merely-stopped container always failed ("container is not
+        // paused"), so resume could never actually succeed after a real
+        // pause.
         for container in containers {
             self.deployer
-                .resume_container(&container.container_id)
+                .start_container(&container.container_id)
                 .await
                 .map_err(|e| {
                     DeploymentError::Other(format!("Failed to resume container: {}", e))
@@ -2510,10 +3194,33 @@ impl DeploymentService {
             active_container.update(self.db.as_ref()).await?;
         }
 
+        let environment_id = deployment.environment_id;
+
         // Update deployment state to "deployed"
         let mut active_deployment: deployments::ActiveModel = deployment.into();
         active_deployment.state = Set("deployed".to_string());
         active_deployment.update(self.db.as_ref()).await?;
+
+        // See the matching comment in `pause_deployment`: a container-status
+        // UPDATE fires no DB trigger, so force an in-process reload rather
+        // than leaving the proxy's cached peer table to notice the resume
+        // only whenever some unrelated route change happens to trigger one.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after resuming deployment {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                deployment_id, e
+            );
+        }
 
         info!("Successfully resumed deployment: {}", deployment_id);
         Ok(())
@@ -2584,8 +3291,8 @@ impl DeploymentService {
     async fn compute_deployment_url(&self, deployment_slug: &str) -> anyhow::Result<String> {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
-        let base_domain = settings.preview_domain;
-        let domain = format!("{}.{}", deployment_slug, base_domain);
+        let domain = PublicHostnameStrategy::Standard
+            .deployment_hostname(&settings.preview_domain, deployment_slug);
 
         // Determine protocol and port from external_url if set, otherwise default to http
         let (protocol, port) = if let Some(ref url) = settings.external_url {
@@ -2630,11 +3337,11 @@ impl DeploymentService {
         Ok(url)
     }
 
-    async fn compute_environment_url(&self, env_subdomain: &str) -> anyhow::Result<String> {
+    pub async fn compute_environment_url(&self, env_subdomain: &str) -> anyhow::Result<String> {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
 
-        let base_domain = settings.preview_domain;
-        let domain = format!("{}.{}", env_subdomain, base_domain);
+        let domain = PublicHostnameStrategy::Standard
+            .environment_hostname(&settings.preview_domain, env_subdomain);
 
         // Determine protocol and port from external_url if set, otherwise default to http
         let (protocol, port) = if let Some(ref url) = settings.external_url {
@@ -2795,8 +3502,6 @@ impl DeploymentService {
             .await
             .map_err(|e| DeploymentError::Other(format!("Failed to get settings: {}", e)))?;
 
-        let base_domain = settings.preview_domain.trim_start_matches("*.").to_string();
-
         // Get pipeline id from deployment
         let deployment = deployments::Entity::find_by_id(deployment_id)
             .one(self.db.as_ref())
@@ -2805,9 +3510,12 @@ impl DeploymentService {
                 DeploymentError::NotFound(format!("Deployment {} not found", deployment_id))
             })?;
 
-        let domain = format!(
-            "{}-{}-{}.{}",
-            project.slug, environment.slug, deployment.id, base_domain
+        let deployment_label = deployment.id.to_string();
+        let domain = PublicHostnameStrategy::Standard.project_deployment_hostname(
+            &settings.preview_domain,
+            &project.slug,
+            &environment.slug,
+            &deployment_label,
         );
 
         // Remove any existing domains for this deployment
@@ -2877,12 +3585,33 @@ impl DeploymentService {
         Ok(())
     }
 
-    /// Get all jobs for a deployment
+    /// Get all jobs for a deployment owned by the requested project.
+    ///
+    /// The project constraint is part of this service method rather than only
+    /// an HTTP guard because deployment IDs are globally enumerable and this
+    /// result includes sensitive workflow metadata.
     pub async fn get_deployment_jobs(
         &self,
+        project_id: i32,
         deployment_id: i32,
     ) -> Result<Vec<temps_entities::deployment_jobs::Model>, DeploymentError> {
         use temps_entities::deployment_jobs;
+
+        let deployment_exists = deployments::Entity::find_by_id(deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .is_some();
+
+        if !deployment_exists {
+            return Err(DeploymentError::NotFound(format!(
+                "deployment {} for project {} not found",
+                deployment_id, project_id
+            )));
+        }
 
         let jobs = deployment_jobs::Entity::find()
             .filter(deployment_jobs::Column::DeploymentId.eq(deployment_id))
@@ -2894,6 +3623,53 @@ impl DeploymentService {
             })?;
 
         Ok(jobs)
+    }
+
+    /// The project's git host reference (owner/repo + branch) for a
+    /// deployment, but ONLY when the repo is public -- returns `None` for a
+    /// private repo or a project with no git connection at all (e.g. a
+    /// manual/CLI upload). Callers that surface this externally (e.g. in a
+    /// GitHub issue template on a public repo) must never see a private
+    /// repo's URL, so the `is_public_repo` check happens here rather than
+    /// being left to each caller to remember.
+    pub async fn get_public_repo_reference(
+        &self,
+        project_id: i32,
+        deployment_id: i32,
+    ) -> Result<Option<RepoReference>, DeploymentError> {
+        use temps_entities::projects;
+
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .ok_or_else(|| {
+                DeploymentError::NotFound(format!(
+                    "deployment {} for project {} not found",
+                    deployment_id, project_id
+                ))
+            })?;
+
+        let project = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| DeploymentError::DatabaseError {
+                reason: e.to_string(),
+            })?
+            .ok_or_else(|| DeploymentError::NotFound(format!("project {project_id} not found")))?;
+
+        if !project.is_public_repo {
+            return Ok(None);
+        }
+
+        Ok(Some(RepoReference {
+            owner: project.repo_owner,
+            repo: project.repo_name,
+            branch: deployment.branch_ref.unwrap_or(project.main_branch),
+        }))
     }
 
     /// Cancel all running deployments with a given reason
@@ -2943,123 +3719,52 @@ impl DeploymentService {
         Ok(count)
     }
 
-    /// Cancel all active deployments for an environment
-    ///
-    /// Used when deleting an environment to ensure no deployments are left running
-    /// This method:
-    /// 1. Stops and removes all running containers
-    /// 2. Writes cancellation messages to job logs
-    /// 3. Updates deployment states to cancelled
+    /// Cancel all active deployments for an environment before its containers
+    /// are removed by `DeploymentContainerCleaner`.
     pub async fn cancel_all_environment_deployments(
         &self,
         environment_id: i32,
     ) -> Result<u64, DeploymentError> {
+        self.cancel_deployments_for_deletion(None, Some(environment_id), "Environment deleted")
+            .await
+    }
+
+    pub async fn cancel_all_project_deployments(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, DeploymentError> {
+        self.cancel_deployments_for_deletion(Some(project_id), None, "Project deleted")
+            .await
+    }
+
+    async fn cancel_deployments_for_deletion(
+        &self,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+        reason: &str,
+    ) -> Result<u64, DeploymentError> {
         use temps_entities::{deployment_jobs, types::JobStatus};
 
-        info!(
-            "Cancelling all active deployments for environment {}",
-            environment_id
+        let mut query = deployments::Entity::find().filter(
+            Condition::all()
+                .add(deployments::Column::State.ne("cancelled"))
+                .add(deployments::Column::State.ne("completed"))
+                .add(deployments::Column::State.ne("deployed"))
+                .add(deployments::Column::State.ne("failed"))
+                .add(deployments::Column::State.ne("paused"))
+                .add(deployments::Column::State.ne("stopped")),
         );
-
-        // First, stop and remove all containers for this environment
-        info!(
-            "Stopping and removing all containers for environment {}",
-            environment_id
-        );
-
-        let containers = deployment_containers::Entity::find()
-            .inner_join(deployments::Entity)
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployment_containers::Column::DeletedAt.is_null())
-            .all(self.db.as_ref())
-            .await?;
-
-        for container in containers {
-            info!(
-                "Stopping and removing container {} for environment {}",
-                container.container_id, environment_id
-            );
-
-            // Stop the container with a 30-second timeout to prevent hanging
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                self.deployer.stop_container(&container.container_id),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(
-                        "Failed to stop container {}: {} (continuing anyway)",
-                        container.container_id, e
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "Timed out stopping container {} after 30s (continuing anyway)",
-                        container.container_id
-                    );
-                }
-            }
-
-            // Remove the container with a 15-second timeout
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(15),
-                self.deployer.remove_container(&container.container_id),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    warn!(
-                        "Failed to remove container {}: {} (continuing anyway)",
-                        container.container_id, e
-                    );
-                }
-                Err(_) => {
-                    warn!(
-                        "Timed out removing container {} after 15s (continuing anyway)",
-                        container.container_id
-                    );
-                }
-            }
-
-            // Update container status to stopped
-            let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("stopped".to_string()));
-            active_container.deleted_at = Set(Some(chrono::Utc::now()));
-            let _ = active_container.update(self.db.as_ref()).await;
+        if let Some(project_id) = project_id {
+            query = query.filter(deployments::Column::ProjectId.eq(project_id));
+        }
+        if let Some(environment_id) = environment_id {
+            query = query.filter(deployments::Column::EnvironmentId.eq(environment_id));
         }
 
-        // Find all active deployments for this environment
-        let active_deployments = deployments::Entity::find()
-            .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::State.is_in(vec![
-                "pending",
-                "running",
-                "deploying",
-                "ready",
-            ]))
-            .all(self.db.as_ref())
-            .await?;
-
+        let active_deployments = query.all(self.db.as_ref()).await?;
         let count = active_deployments.len() as u64;
 
-        if count == 0 {
-            info!(
-                "No active deployments found for environment {}",
-                environment_id
-            );
-            return Ok(0);
-        }
-
-        info!(
-            "Found {} active deployment(s) for environment {} - cancelling",
-            count, environment_id
-        );
-
         for deployment in active_deployments {
-            // Find currently running jobs and write cancellation message to their logs
             let running_jobs = deployment_jobs::Entity::find()
                 .filter(deployment_jobs::Column::DeploymentId.eq(deployment.id))
                 .filter(deployment_jobs::Column::Status.eq(JobStatus::Running))
@@ -3067,42 +3772,94 @@ impl DeploymentService {
                 .await?;
 
             for job in running_jobs {
-                info!(
-                    "📝 Writing cancellation message to running job: {} ({})",
-                    job.name, job.log_id
-                );
-
-                let cancel_msg = format!(
-                    "DEPLOYMENT CANCELLED DUE TO ENVIRONMENT DELETION - Job '{}' is being terminated",
+                let message = format!(
+                    "DEPLOYMENT CANCELLED: {reason} - Job '{}' is being terminated",
                     job.name
                 );
-                if let Err(e) = self
+                if let Err(error) = self
                     .log_service
-                    .append_structured_log(&job.log_id, temps_logs::LogLevel::Error, &cancel_msg)
+                    .append_structured_log(&job.log_id, temps_logs::LogLevel::Error, &message)
                     .await
                 {
                     warn!(
-                        "Failed to write cancellation message to job log {}: {}",
-                        job.log_id, e
+                        deployment_id = deployment.id,
+                        job_log_id = %job.log_id,
+                        %error,
+                        "Failed to append deletion cancellation to deployment job log"
                     );
                 }
             }
 
-            // Update deployment to cancelled state
+            let deployment_id = deployment.id;
             let mut active_deployment: deployments::ActiveModel = deployment.into();
             active_deployment.state = Set("cancelled".to_string());
-            active_deployment.cancelled_reason = Set(Some("Environment deleted".to_string()));
+            active_deployment.cancelled_reason = Set(Some(reason.to_string()));
             active_deployment.finished_at = Set(Some(chrono::Utc::now()));
             active_deployment.updated_at = Set(chrono::Utc::now());
-            active_deployment.update(self.db.as_ref()).await?;
+            active_deployment
+                .update(self.db.as_ref())
+                .await
+                .map_err(|error| DeploymentError::DatabaseError {
+                    reason: format!(
+                        "Failed to cancel deployment {deployment_id} before owner deletion: {error}"
+                    ),
+                })?;
         }
 
         info!(
-            "Successfully cancelled {} deployment(s) and cleaned up containers for environment {}",
-            count, environment_id
+            ?project_id,
+            ?environment_id,
+            count,
+            "Cancelled deployments before owner deletion"
         );
-
         Ok(count)
+    }
+
+    /// Remove every uploaded archive recorded for a project before deletion.
+    /// Runtime containers are handled by `DeploymentContainerCleaner`.
+    pub async fn cleanup_project_archives(&self, project_id: i32) -> Result<u64, DeploymentError> {
+        let data_dir = self.config_service.data_dir();
+        let source_archives = temps_entities::source_bundles::Entity::find()
+            .filter(temps_entities::source_bundles::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await?;
+        let static_archives = temps_entities::static_bundles::Entity::find()
+            .filter(temps_entities::static_bundles::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await?;
+        let archive_paths: Vec<String> = source_archives
+            .into_iter()
+            .map(|bundle| bundle.archive_path)
+            .chain(static_archives.into_iter().map(|bundle| bundle.blob_path))
+            .collect();
+        let removed = archive_paths.len() as u64;
+        for relative_path in archive_paths {
+            let archive_path =
+                confined_archive_path(&data_dir, &relative_path).map_err(|error| {
+                    DeploymentError::InvalidBundlePath {
+                        path: relative_path.clone(),
+                        reason: format!("stored path for project {project_id} is invalid: {error}"),
+                    }
+                })?;
+            match tokio::fs::remove_file(&archive_path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(DeploymentError::Other(format!(
+                        "Failed to remove archive '{}' for project {}: {}",
+                        archive_path.display(),
+                        project_id,
+                        error
+                    )));
+                }
+            }
+        }
+
+        info!(
+            "Removed {} uploaded archive(s) before deleting project {}",
+            removed, project_id
+        );
+        Ok(removed)
     }
 
     /// Cancel a specific deployment
@@ -3213,6 +3970,22 @@ impl DeploymentService {
                 deployment_id, e
             );
         }
+
+        // Anonymous telemetry: this is the explicit "user clicked Cancel"
+        // path (the other emission site, in WorkflowExecutionService, only
+        // fires as a fallback when the executor detects a "cancelled" error
+        // without this method having already set the state — see that
+        // file's comment). Deliberately NOT emitted from the supersede
+        // (cancel_in_flight_deployments) or bulk-shutdown
+        // (cancel_running_deployments) paths, since those fire automatically
+        // on every push / restart and would swamp the funnel signal with
+        // non-user-initiated noise.
+        self.telemetry().report(
+            temps_core::telemetry::TelemetryEvent::new(
+                temps_core::telemetry::TelemetryEventKind::DeployCancelled,
+            )
+            .with("trigger", "user"),
+        );
 
         info!(
             "Successfully cancelled deployment {} for project {} - workflow will stop at next checkpoint",
@@ -3329,6 +4102,7 @@ impl DeploymentService {
         let (container, _) = self
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
+        let deployment_id = container.deployment_id;
 
         // Route to the worker that owns this container — calling the local
         // CP dockerd for a remote container would 404 silently, leaving the
@@ -3344,6 +4118,27 @@ impl DeploymentService {
         active_container.status = Set(Some("stopped".to_string()));
         active_container.update(self.db.as_ref()).await?;
 
+        // Same reasoning as `pause_deployment`: this status UPDATE fires no
+        // DB trigger, so force an in-process route-table reload or the
+        // proxy keeps routing to a container we just told the UI is
+        // stopped until some unrelated route change happens to reload it.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after stopping container {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                container_id, e
+            );
+        }
+
         info!("Successfully stopped container: {}", container_id);
         Ok(())
     }
@@ -3358,6 +4153,7 @@ impl DeploymentService {
         let (container, _) = self
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
+        let deployment_id = container.deployment_id;
 
         let deployer = self.deployer_for_node(container.node_id).await?;
         deployer
@@ -3369,6 +4165,27 @@ impl DeploymentService {
         let mut active_container: deployment_containers::ActiveModel = container.into();
         active_container.status = Set(Some("running".to_string()));
         active_container.update(self.db.as_ref()).await?;
+
+        // Same reasoning as `resume_deployment`: this status UPDATE fires no
+        // DB trigger, so force an in-process route-table reload or the
+        // proxy keeps treating this container as not-routable until some
+        // unrelated route change happens to reload it.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after starting container {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                container_id, e
+            );
+        }
 
         info!("Successfully started container: {}", container_id);
         Ok(())
@@ -3384,6 +4201,7 @@ impl DeploymentService {
         let (container, _) = self
             .get_container_detail(project_id, environment_id, container_id.clone())
             .await?;
+        let deployment_id = container.deployment_id;
 
         let deployer = self.deployer_for_node(container.node_id).await?;
         deployer
@@ -3400,6 +4218,27 @@ impl DeploymentService {
         let mut active_container: deployment_containers::ActiveModel = container.into();
         active_container.status = Set(Some("running".to_string()));
         active_container.update(self.db.as_ref()).await?;
+
+        // Same reasoning as `pause_deployment`/`resume_deployment`: this
+        // status UPDATE fires no DB trigger, so force an in-process
+        // route-table reload or the proxy's cached peer table doesn't
+        // notice the restart until some unrelated route change reloads it.
+        if let Err(e) = self
+            .queue_service
+            .send(temps_core::Job::ForceRouteReload(
+                temps_core::ForceRouteReloadJob {
+                    environment_id: Some(environment_id),
+                    deployment_id: Some(deployment_id),
+                },
+            ))
+            .await
+        {
+            warn!(
+                "Failed to publish in-process ForceRouteReload after restarting container {}: {} \
+                 — falling back to the next PG NOTIFY-triggered reload",
+                container_id, e
+            );
+        }
 
         info!("Successfully restarted container: {}", container_id);
         Ok(())
@@ -3657,6 +4496,15 @@ impl DeploymentService {
 // Implement DeploymentCanceller trait from temps-core
 #[async_trait::async_trait]
 impl temps_core::DeploymentCanceller for DeploymentService {
+    async fn cancel_all_project_deployments(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.cancel_all_project_deployments(project_id)
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
     async fn cancel_all_environment_deployments(
         &self,
         environment_id: i32,
@@ -3664,6 +4512,37 @@ impl temps_core::DeploymentCanceller for DeploymentService {
         self.cancel_all_environment_deployments(environment_id)
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
+#[async_trait::async_trait]
+impl temps_core::ProjectArchiveCleaner for DeploymentService {
+    async fn cleanup_project_archives(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+        self.cleanup_project_archives(project_id)
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+}
+
+#[async_trait::async_trait]
+impl temps_core::DeploymentContainerCleaner for DeploymentService {
+    async fn cleanup_project_containers(
+        &self,
+        project_id: i32,
+    ) -> Result<u64, temps_core::ContainerCleanupError> {
+        self.cleanup_containers(project_id, None).await
+    }
+
+    async fn cleanup_environment_containers(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<u64, temps_core::ContainerCleanupError> {
+        self.cleanup_containers(project_id, Some(environment_id))
+            .await
     }
 }
 
@@ -3677,6 +4556,25 @@ mod tests {
 
     use std::sync::Arc;
     use temps_core::EncryptionService;
+
+    #[test]
+    fn archive_cleanup_paths_are_lexically_confined() {
+        let root = std::path::Path::new("/var/lib/temps");
+        assert_eq!(
+            confined_archive_path(root, "source-bundles/archive.zip").unwrap(),
+            root.join("source-bundles/archive.zip")
+        );
+        for path in [
+            "../archive.zip",
+            "source-bundles/../../archive.zip",
+            "/tmp/archive.zip",
+        ] {
+            assert!(matches!(
+                confined_archive_path(root, path),
+                Err(DeploymentError::InvalidBundlePath { .. })
+            ));
+        }
+    }
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployment_config::DeploymentConfig, deployments, env_vars, environments,
@@ -3890,6 +4788,35 @@ mod tests {
         Ok(())
     }
 
+    fn spawn_test_readiness_proxy() -> String {
+        let listener =
+            std::net::TcpListener::bind("127.0.0.1:0").expect("bind rollback readiness proxy");
+        listener
+            .set_nonblocking(true)
+            .expect("make rollback readiness proxy nonblocking");
+        let address = listener.local_addr().expect("read readiness proxy address");
+        let listener = tokio::net::TcpListener::from_std(listener)
+            .expect("create async rollback readiness proxy");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut request = [0_u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let _ = stream
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                });
+            }
+        });
+        address.to_string()
+    }
+
     fn create_deployment_service_for_test(
         db: Arc<temps_database::DbConnection>,
     ) -> DeploymentService {
@@ -3899,12 +4826,13 @@ mod tests {
         // Create a minimal real config service for testing
         // We need to provide the database URL that the test database is using
         let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
+        let proxy_address = spawn_test_readiness_proxy();
         let server_config = Arc::new(
             temps_config::ServerConfig::new(
-                "127.0.0.1:8080".to_string(),
+                proxy_address,
                 test_db_url.to_string(),
                 None,
-                None,
+                Some("127.0.0.1:3001".to_string()),
             )
             .expect("Failed to create test server config"),
         );
@@ -4054,7 +4982,375 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
+    }
+
+    async fn configure_test_service_for_http_readiness(
+        service: &DeploymentService,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut settings = service.config_service.get_settings().await?;
+        settings.external_url = Some("http://temps-test.local".to_string());
+        service.config_service.update_settings(settings).await?;
+        Ok(())
+    }
+
+    /// Stub `get_container_info` so the runtime ownership check in
+    /// `cleanup_project_containers` sees a container whose labels match the
+    /// project/environment being deleted.
+    ///
+    /// Cleanup refuses to remove a container that is not provably ours, so
+    /// every cleanup test has to present the labels a real managed container
+    /// would carry — otherwise the test fails on the guard rather than on the
+    /// behaviour it is actually asserting.
+    fn expect_owned_container_info(
+        deployer: &mut MockContainerDeployer,
+        project_id: i32,
+        environment_id: i32,
+    ) {
+        deployer.expect_get_container_info().returning(move |id| {
+            Ok(temps_deployer::ContainerInfo {
+                container_id: id.to_string(),
+                container_name: id.to_string(),
+                image_name: "nginx:latest".to_string(),
+                created_at: Utc::now(),
+                ports: vec![],
+                environment_vars: std::collections::HashMap::new(),
+                status: temps_deployer::ContainerStatus::Running,
+                restart_count: Some(0),
+                labels: std::collections::HashMap::from([
+                    ("sh.temps.managed".to_string(), "true".to_string()),
+                    ("sh.temps.project_id".to_string(), project_id.to_string()),
+                    (
+                        "sh.temps.environment".to_string(),
+                        environment_id.to_string(),
+                    ),
+                ]),
+                ..Default::default()
+            })
+        });
+    }
+
+    fn create_cleanup_service_for_test(
+        db: Arc<temps_database::DbConnection>,
+        deployer: Arc<dyn temps_deployer::ContainerDeployer>,
+    ) -> DeploymentService {
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:8080".to_string(),
+                "postgresql://test_user:test_password@localhost:5432/test_db".to_string(),
+                None,
+                None,
+            )
+            .expect("create test server config"),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
+        let (queue_service, _receiver) =
+            temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(8);
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults().expect("create Docker client config"),
+        );
+
+        DeploymentService {
+            db,
+            log_service: Arc::new(temps_logs::LogService::new(std::env::temp_dir())),
+            config_service,
+            queue_service,
+            docker_log_service: Arc::new(temps_logs::DockerLogService::new(docker)),
+            deployer,
+            encryption_service: create_test_encryption_service(),
+            telemetry: std::sync::OnceLock::new(),
+            env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
+        }
+    }
+
+    async fn database_integration_tests_available() -> bool {
+        std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some()
+            || tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+    }
+
+    #[tokio::test]
+    async fn cleanup_project_containers_removes_container_before_database_cascade(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping project container cleanup integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let expected_container_id = container.container_id.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
+        deployer
+            .expect_remove_container()
+            .withf(move |container_id| container_id == expected_container_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+
+        let cleaned = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container cleanup record remains until project cascade");
+        assert_eq!(cleaned.status.as_deref(), Some("removed"));
+        assert!(cleaned.deleted_at.is_some());
+
+        projects::Entity::delete_by_id(project.id)
+            .exec(db.as_ref())
+            .await?;
+        assert!(
+            deployment_containers::Entity::find_by_id(container.id)
+                .one(db.as_ref())
+                .await?
+                .is_none(),
+            "the database cascade must happen only after external cleanup succeeds"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ambiguous_cleanup_failure_keeps_container_fenced_for_retry(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping cleanup failure integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
+        deployer.expect_remove_container().times(1).returning(|_| {
+            Err(temps_deployer::DeployerError::NetworkError(
+                "worker unavailable".to_string(),
+            ))
+        });
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+        assert!(matches!(
+            result,
+            Err(temps_core::ContainerCleanupError::Removal { .. })
+        ));
+
+        let fenced = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("failed cleanup must preserve the container record");
+        assert_eq!(fenced.status.as_deref(), Some("removing"));
+        assert!(fenced.deleted_at.is_some());
+        assert!(
+            projects::Entity::find_by_id(project.id)
+                .one(db.as_ref())
+                .await?
+                .is_some(),
+            "the project must remain recoverable after container cleanup fails"
+        );
+
+        Ok(())
+    }
+
+    /// The runtime ownership guard is the last line of defence against
+    /// deleting a container that merely *recorded* a matching id: if the
+    /// container Docker actually has under that id belongs to someone else,
+    /// cleanup must refuse to touch it rather than remove another tenant's
+    /// workload.
+    #[tokio::test]
+    async fn cleanup_refuses_to_remove_a_container_owned_by_another_project(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping cleanup ownership integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        // Same container id, but the running container claims a different project.
+        expect_owned_container_info(&mut deployer, project.id + 1, environment.id);
+        // The whole point: removal must never be attempted.
+        deployer.expect_remove_container().never();
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let result = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await;
+        assert!(
+            matches!(
+                result,
+                Err(temps_core::ContainerCleanupError::Removal { .. })
+            ),
+            "cleanup must fail closed when runtime labels do not match, got {result:?}"
+        );
+
+        let preserved = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("a refused cleanup must preserve the container record");
+        assert!(
+            preserved.deleted_at.is_none(),
+            "a container we refused to touch must not be marked deleted"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn interrupted_cleanup_is_idempotent_when_container_is_already_absent(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping interrupted cleanup integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+
+        let mut interrupted: deployment_containers::ActiveModel = container.clone().into();
+        interrupted.status = Set(Some("removing".to_string()));
+        interrupted.deleted_at = Set(Some(Utc::now()));
+        interrupted.update(db.as_ref()).await?;
+
+        let mut deployer = MockContainerDeployer::new();
+        deployer.expect_list_containers().returning(|| Ok(vec![]));
+        expect_owned_container_info(&mut deployer, project.id, environment.id);
+        deployer.expect_remove_container().times(1).returning(|_| {
+            Err(temps_deployer::DeployerError::ContainerNotFound(
+                "already removed".to_string(),
+            ))
+        });
+        let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
+
+        let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
+            &service, project.id,
+        )
+        .await?;
+        assert_eq!(removed, 1);
+
+        let finalized = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("cleanup record remains until project cascade");
+        assert_eq!(finalized.status.as_deref(), Some("removed"));
+        assert!(finalized.deleted_at.is_some());
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancel_all_project_deployments_is_project_scoped(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping project cancellation integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, deployment, _container) = setup_test_deployment(&db).await?;
+        let mut active: deployments::ActiveModel = deployment.clone().into();
+        active.state = Set("running".to_string());
+        active.update(db.as_ref()).await?;
+        let stopped_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(deployment.environment_id),
+            state: Set("stopped".to_string()),
+            slug: Set("stopped-deployment".to_string()),
+            metadata: Set(Some(Default::default())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let other_project = projects::ActiveModel {
+            name: Set("Other Project".to_string()),
+            slug: Set("other-project".to_string()),
+            repo_name: Set("other-repo".to_string()),
+            repo_owner: Set("other-owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let other_environment = environments::ActiveModel {
+            project_id: Set(other_project.id),
+            name: Set("Production".to_string()),
+            slug: Set("other-prod".to_string()),
+            host: Set("other.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("other.example.com".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let other_deployment = deployments::ActiveModel {
+            project_id: Set(other_project.id),
+            environment_id: Set(other_environment.id),
+            state: Set("running".to_string()),
+            slug: Set("other-deployment".to_string()),
+            metadata: Set(Some(Default::default())),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let cancelled = service.cancel_all_project_deployments(project.id).await?;
+        assert_eq!(cancelled, 1);
+
+        let cancelled_deployment = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("target deployment remains for history");
+        assert_eq!(cancelled_deployment.state, "cancelled");
+        assert_eq!(
+            cancelled_deployment.cancelled_reason.as_deref(),
+            Some("Project deleted")
+        );
+
+        let untouched = deployments::Entity::find_by_id(other_deployment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("other project deployment remains");
+        assert_eq!(untouched.state, "running");
+        let stopped = deployments::Entity::find_by_id(stopped_deployment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("stopped deployment remains for history");
+        assert_eq!(stopped.state, "stopped");
+        assert_ne!(project.id, other_project.id);
+
+        Ok(())
     }
 
     #[tokio::test]
@@ -4109,6 +5405,113 @@ mod tests {
             .await?
             .unwrap();
         assert_eq!(updated_deployment.state, "deployed");
+
+        Ok(())
+    }
+
+    // Regression coverage for the pause/resume Docker-op mismatch bug: the
+    // two tests above use `setup_test_data`, which never inserts a
+    // `deployment_containers` row, so the container loop inside
+    // `pause_deployment`/`resume_deployment` never actually executes and
+    // neither test can observe which Docker operation gets called. These
+    // two variants use `setup_test_deployment` (which inserts one real
+    // container) and pin down the *exact* deployer method invoked via a
+    // narrowly-scoped mock, so a regression back to `pause_container`/
+    // `resume_container` (the old, broken ops) — or simply forgetting to
+    // touch the container at all — fails the test instead of passing it
+    // silently.
+    #[tokio::test]
+    async fn test_pause_deployment_stops_real_container() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+        assert_eq!(container.status.as_deref(), Some("running"));
+
+        // Only `stop_container` is wired up on this mock. If pause
+        // regressed to calling `pause_container`/`resume_container`
+        // instead, the mock has no expectation for that method and panics.
+        let expected_container_id = container.container_id.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer
+            .expect_stop_container()
+            .withf(move |id| id == expected_container_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
+
+        let deployment_service = create_cleanup_service_for_test(db.clone(), deployer);
+
+        deployment_service
+            .pause_deployment(deployment.project_id, deployment.id)
+            .await?;
+
+        let updated_deployment = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_deployment.state, "paused");
+
+        let updated_container = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_container.status.as_deref(), Some("stopped"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_resume_deployment_starts_real_container() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (_project, _environment, deployment, container) = setup_test_deployment(&db).await?;
+
+        // Simulate the post-pause state: deployment "paused", container
+        // "stopped" but not removed (pause_deployment keeps the Docker
+        // container object around rather than force-removing it).
+        let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
+        active_deployment.state = Set("paused".to_string());
+        let deployment = active_deployment.update(db.as_ref()).await?;
+
+        let mut active_container: deployment_containers::ActiveModel = container.clone().into();
+        active_container.status = Set(Some("stopped".to_string()));
+        let container = active_container.update(db.as_ref()).await?;
+
+        // Only `start_container` (a plain `docker start`) is wired up. If
+        // resume regressed to calling `resume_container` (Docker's
+        // unpause/cgroup-freeze reverse, which always fails against a
+        // container that was merely stopped, not paused), the mock has no
+        // expectation for that method and panics.
+        let expected_container_id = container.container_id.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer
+            .expect_start_container()
+            .withf(move |id| id == expected_container_id)
+            .times(1)
+            .returning(|_| Ok(()));
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
+
+        let deployment_service = create_cleanup_service_for_test(db.clone(), deployer);
+
+        deployment_service
+            .resume_deployment(deployment.project_id, deployment.id)
+            .await?;
+
+        let updated_deployment = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_deployment.state, "deployed");
+
+        let updated_container = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_container.status.as_deref(), Some("running"));
 
         Ok(())
     }
@@ -4173,6 +5576,7 @@ mod tests {
         environment = active_environment.update(db.as_ref()).await?;
 
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         // Test rollback
         let result = deployment_service
@@ -4289,6 +5693,7 @@ mod tests {
 
         // Default test service: image_exists -> true (image present locally).
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         let result = deployment_service
             .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
@@ -4321,7 +5726,7 @@ mod tests {
         let db = test_db.connection_arc();
 
         // Setup test data
-        let (_project, _environment, mut target_deployment) = setup_test_data(&db).await?;
+        let (_project, environment, mut target_deployment) = setup_test_data(&db).await?;
 
         // Update the deployment state to "failed" to make it invalid for rollback
         let mut active_deployment: deployments::ActiveModel = target_deployment.into();
@@ -4344,6 +5749,133 @@ mod tests {
             }
             e => panic!("Expected InvalidDeploymentState error, got: {:?}", e),
         }
+
+        // A second, distinct invalid state must still be rejected too --
+        // this isn't just re-asserting "failed" from above. Reuse the same
+        // project/environment (rather than calling `setup_test_data` again,
+        // which would collide on its hard-coded project slug) with a fresh
+        // deployment row.
+        let other_target = deployments::ActiveModel {
+            project_id: Set(target_deployment.project_id),
+            environment_id: Set(environment.id),
+            slug: Set("test-deployment-creating".to_string()),
+            state: Set("creating".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let other_target = other_target.insert(db.as_ref()).await?;
+
+        let result = deployment_service
+            .rollback_to_deployment(other_target.project_id, other_target.id)
+            .await;
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            DeploymentError::InvalidDeploymentState(msg) => {
+                assert!(msg.contains("creating"));
+            }
+            e => panic!("Expected InvalidDeploymentState error, got: {:?}", e),
+        }
+
+        Ok(())
+    }
+
+    // Regression coverage for `valid_rollback_states` gaining "stopped":
+    // the only pre-existing invalid-state test above only ever asserted on
+    // "failed" being rejected, so a regression that dropped "stopped" from
+    // the allow-list (reintroducing "Cannot rollback to deployment in
+    // 'stopped' state" for the primary real-world rollback target -- a
+    // superseded, previously-successful deployment) would pass every
+    // existing test in this file.
+    #[tokio::test]
+    async fn test_rollback_to_deployment_accepts_stopped_state(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // Setup test data
+        let (_project, mut environment, target_deployment) = setup_test_data(&db).await?;
+        setup_test_environment_variables(&db, target_deployment.project_id, environment.id).await?;
+
+        // Create container for target deployment (required for rollback)
+        let now = Utc::now();
+        let target_container = deployment_containers::ActiveModel {
+            deployment_id: Set(target_deployment.id),
+            container_id: Set("container-rollback-stopped-target".to_string()),
+            container_name: Set("app-rollback-stopped-target".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:target".to_string())),
+            status: Set(Some("stopped".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        target_container.insert(db.as_ref()).await?;
+
+        // This is the state `cancel_previous_deployments`/`teardown_deployment`
+        // actually leave a superseded-but-successful deployment in -- the
+        // primary real-world rollback target.
+        let mut active_target: deployments::ActiveModel = target_deployment.into();
+        active_target.state = Set("stopped".to_string());
+        let target_deployment = active_target.update(db.as_ref()).await?;
+
+        // Create current deployment that will be stopped by the rollback
+        let current_deployment = deployments::ActiveModel {
+            project_id: Set(target_deployment.project_id),
+            environment_id: Set(environment.id),
+            slug: Set("current-deployment-for-stopped-rollback".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            image_name: Set(Some("nginx:current".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let current_deployment = current_deployment.insert(db.as_ref()).await?;
+
+        let current_container = deployment_containers::ActiveModel {
+            deployment_id: Set(current_deployment.id),
+            container_id: Set("container-rollback-stopped-current".to_string()),
+            container_name: Set("app-rollback-stopped-current".to_string()),
+            container_port: Set(8080),
+            image_name: Set(Some("nginx:current".to_string())),
+            status: Set(Some("running".to_string())),
+            created_at: Set(now),
+            deployed_at: Set(now),
+            ..Default::default()
+        };
+        current_container.insert(db.as_ref()).await?;
+
+        let mut active_environment: environments::ActiveModel = environment.into();
+        active_environment.current_deployment_id = Set(Some(current_deployment.id));
+        environment = active_environment.update(db.as_ref()).await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        // Phase 2.75 probes the public URL over HTTP via the test proxy.
+        // Without this the URL scheme defaults to "https", which causes the
+        // TLS handshake to fail against the plain-HTTP test proxy and the
+        // readiness gate times out rather than succeeding.
+        configure_test_service_for_http_readiness(&deployment_service).await?;
+
+        // Rollback to a "stopped" target must succeed, not bounce off the
+        // InvalidDeploymentState guard.
+        let result = deployment_service
+            .rollback_to_deployment(target_deployment.project_id, target_deployment.id)
+            .await?;
+
+        assert_ne!(result.id, target_deployment.id);
+        assert!(result.is_current);
+
+        let updated_environment = environments::Entity::find_by_id(environment.id)
+            .one(db.as_ref())
+            .await?
+            .unwrap();
+        assert_eq!(updated_environment.current_deployment_id, Some(result.id));
 
         Ok(())
     }
@@ -4401,6 +5933,7 @@ mod tests {
             encryption_service: create_test_encryption_service(),
             telemetry: std::sync::OnceLock::new(),
             env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
         }
     }
 
@@ -5424,6 +6957,7 @@ mod tests {
         let environment = active_environment.update(db.as_ref()).await?;
 
         let deployment_service = create_deployment_service_for_test(db.clone());
+        configure_test_service_for_http_readiness(&deployment_service).await?;
 
         // Test 1: Rollback to deployment2
         // Rollback now creates a NEW deployment record with is_rollback metadata
@@ -5608,6 +7142,211 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_get_deployment_jobs_enforces_project_ownership(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping deployment ownership test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let job = temps_entities::deployment_jobs::ActiveModel {
+            deployment_id: Set(deployment.id),
+            job_id: Set("sensitive-build".to_string()),
+            job_type: Set("BuildImageJob".to_string()),
+            name: Set("Sensitive Build".to_string()),
+            log_id: Set("sensitive-build-log".to_string()),
+            status: Set(temps_entities::types::JobStatus::Success),
+            job_config: Set(Some(serde_json::json!({
+                "build_args": {"DATABASE_PASSWORD": "must-not-cross-projects"}
+            }))),
+            ..Default::default()
+        };
+        job.insert(db.as_ref()).await?;
+
+        let service = create_deployment_service_for_test(db.clone());
+        let own_jobs = service
+            .get_deployment_jobs(deployment.project_id, deployment.id)
+            .await?;
+        assert_eq!(own_jobs.len(), 1);
+
+        let foreign_result = service
+            .get_deployment_jobs(deployment.project_id + 999, deployment.id)
+            .await;
+        assert!(matches!(foreign_result, Err(DeploymentError::NotFound(_))));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_failure_report_preview_stops_at_failed_job_and_redacts_secrets(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if std::env::var_os("TEMPS_TEST_DATABASE_URL").is_none()
+            && !tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+        {
+            eprintln!("Docker unavailable; skipping failure-report preview test");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (_project, _environment, deployment) = setup_test_data(&db).await?;
+
+        let enc = create_test_encryption_service();
+        let log_base = std::env::temp_dir();
+        let log_service = Arc::new(temps_logs::LogService::new(log_base.clone()));
+
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let mut secrets_config = serde_json::Map::new();
+        let mut secret_map = std::collections::HashMap::new();
+        secret_map.insert("DB_PASSWORD".to_string(), "super-secret-value".to_string());
+        crate::services::sensitive_envelope::write_sealed(
+            &mut secrets_config,
+            enc.as_ref(),
+            "secrets",
+            &secret_map,
+        )?;
+
+        let jobs = [
+            (
+                "download_repo",
+                "Download Repo",
+                0,
+                temps_entities::types::JobStatus::Success,
+                None,
+                None,
+            ),
+            (
+                "build_image",
+                "Build Image",
+                1,
+                temps_entities::types::JobStatus::Failure,
+                Some("build failed: exit code 1".to_string()),
+                Some(serde_json::Value::Object(secrets_config)),
+            ),
+            (
+                "deploy_container",
+                "Deploy Container",
+                2,
+                temps_entities::types::JobStatus::Skipped,
+                None,
+                None,
+            ),
+        ];
+
+        for (job_id, name, order, status, error_message, job_config) in jobs {
+            let log_id = format!("{unique}-{job_id}");
+            // `download_repo` deliberately never writes its log file, to
+            // exercise a job that finished too fast to log anything (e.g.
+            // PrepareSourceBundleJob) -- the preview must still succeed.
+            if job_id != "download_repo" {
+                tokio::fs::write(
+                    log_base.join(format!("{log_id}.log")),
+                    format!("log output for {job_id}, secret is super-secret-value\n"),
+                )
+                .await?;
+            }
+
+            temps_entities::deployment_jobs::ActiveModel {
+                deployment_id: Set(deployment.id),
+                job_id: Set(job_id.to_string()),
+                job_type: Set(format!("{job_id}Job")),
+                name: Set(name.to_string()),
+                log_id: Set(log_id),
+                status: Set(status),
+                error_message: Set(error_message),
+                job_config: Set(job_config),
+                execution_order: Set(Some(order)),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        let deployment_service = Arc::new(create_deployment_service_for_test(db.clone()));
+        let failure_service =
+            crate::services::FailureReportService::new(deployment_service, log_service, enc)?;
+
+        let preview = failure_service
+            .build_preview(deployment.project_id, deployment.id, "build_image")
+            .await?;
+
+        assert_eq!(
+            preview.error_message.as_deref(),
+            Some("build failed: exit code 1")
+        );
+        assert!(preview.redacted_log.contains("download_repo"));
+        assert!(
+            preview
+                .redacted_log
+                .contains("no log output for this stage"),
+            "a job with no log file must degrade to a placeholder, not fail the whole preview"
+        );
+        assert!(preview.redacted_log.contains("build_image"));
+        assert!(
+            !preview.redacted_log.contains("deploy_container"),
+            "trace must stop at the failed job, not include later jobs"
+        );
+        assert!(
+            !preview.redacted_log.contains("super-secret-value"),
+            "known secret value must be redacted from the trace"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_public_repo_reference_none_for_private_none_for_public(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        // setup_test_data's project doesn't set is_public_repo, so it defaults
+        // to private -- must never leak repo_owner/repo_name into a public
+        // GitHub issue template.
+        let (project, _environment, deployment) = setup_test_data(&db).await?;
+        let service = create_deployment_service_for_test(db.clone());
+
+        let private_result = service
+            .get_public_repo_reference(project.id, deployment.id)
+            .await?;
+        assert!(
+            private_result.is_none(),
+            "a private (or unlinked) repo must never be surfaced"
+        );
+
+        let mut project_update: projects::ActiveModel = project.clone().into();
+        project_update.is_public_repo = Set(true);
+        project_update.update(db.as_ref()).await?;
+
+        let mut deployment_update: deployments::ActiveModel = deployment.clone().into();
+        deployment_update.branch_ref = Set(Some("feat/some-branch".to_string()));
+        deployment_update.update(db.as_ref()).await?;
+
+        let public_result = service
+            .get_public_repo_reference(project.id, deployment.id)
+            .await?
+            .expect("public repo must return a reference");
+        assert_eq!(public_result.owner, "test-owner");
+        assert_eq!(public_result.repo, "test-repo");
+        assert_eq!(public_result.branch, "feat/some-branch");
+
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_list_deployment_container_logs_returns_captured_rows(
     ) -> Result<(), Box<dyn std::error::Error>> {
         let test_db = TestDatabase::with_migrations().await?;
@@ -5723,5 +7462,231 @@ mod tests {
             DeploymentService::resolve_resource_usage(Some(&empty_env), Some(&cfg(None, None)));
         assert_eq!(still_none.cpu_limit, None);
         assert_eq!(still_none.memory_limit, None);
+    }
+
+    /// `stop_environment_containers` (pre-rollback cleanup) has the same
+    /// deleted-before-stopped ordering requirement as
+    /// `WorkflowExecutionService::teardown_previous_deployment`. Uses
+    /// `block_in_place` to run a real DB check from inside the mock's
+    /// `stop_container` expectation, which requires the multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_stop_environment_containers_marks_deleted_before_stopping_container(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (_project, environment, old_deployment) = setup_test_data(&db).await?;
+
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(old_deployment.id),
+            container_id: Set("old-env-container-1".to_string()),
+            container_name: Set("old-env-container-1".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Deployment state must be one of the active states
+        // `stop_environment_containers` scans for; a nonexistent id is enough
+        // for the "exclude current deployment" filter.
+        let exclude_deployment_id = old_deployment.id + 1_000_000;
+
+        let log_service = Arc::new(temps_logs::LogService::new(std::env::temp_dir()));
+        let test_db_url = "postgresql://test_user:test_password@localhost:5432/test_db";
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:8080".to_string(),
+                test_db_url.to_string(),
+                None,
+                None,
+            )
+            .expect("Failed to create test server config"),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
+
+        let mut queue_service = MockQueueService::new();
+        queue_service.expect_send().returning(|_| Ok(()));
+        queue_service
+            .expect_subscribe()
+            .returning(|| Box::new(MockJobReceiver::new()));
+        let queue_service: Arc<dyn temps_core::JobQueue> = Arc::new(queue_service);
+
+        let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
+        let docker_log_service = Arc::new(temps_logs::DockerLogService::new(docker));
+
+        let db_for_check = db.clone();
+        let mut deployer = MockContainerDeployer::new();
+        deployer
+            .expect_stop_container()
+            .returning(move |container_id| {
+                let db_for_check = db_for_check.clone();
+                let container_id = container_id.to_string();
+                let refreshed = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(async {
+                        deployment_containers::Entity::find()
+                            .filter(deployment_containers::Column::ContainerId.eq(container_id))
+                            .one(db_for_check.as_ref())
+                            .await
+                    })
+                })
+                .expect("query deployment_containers row")
+                .expect("deployment_containers row exists");
+                assert!(
+                    refreshed.deleted_at.is_some(),
+                    "container must be marked deleted before stop_container() is called \
+                     during pre-rollback cleanup — otherwise ContainerHealthMonitor's \
+                     concurrent poll can observe it mid-exit with no signal the exit is \
+                     intentional, and fires a false ContainerCrash alarm"
+                );
+                Ok(())
+            });
+        deployer.expect_remove_container().returning(|_| Ok(()));
+        let deployer: Arc<dyn temps_deployer::ContainerDeployer> = Arc::new(deployer);
+
+        let service = DeploymentService {
+            db: db.clone(),
+            log_service,
+            config_service,
+            queue_service,
+            docker_log_service,
+            deployer,
+            encryption_service: create_test_encryption_service(),
+            telemetry: std::sync::OnceLock::new(),
+            env_resolver: std::sync::OnceLock::new(),
+            compose_executor: std::sync::OnceLock::new(),
+        };
+
+        service
+            .stop_environment_containers(environment.id, exclude_deployment_id)
+            .await;
+
+        let refreshed = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container row still exists");
+        assert!(refreshed.deleted_at.is_some());
+        assert_eq!(refreshed.status.as_deref(), Some("removed"));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_image_deployment_rejects_empty_image_ref(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let deployment_service = create_deployment_service_for_test(db);
+
+        let result = deployment_service
+            .trigger_image_deployment(1, None, String::new(), None)
+            .await;
+
+        assert!(matches!(result, Err(DeploymentError::InvalidInput(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_trigger_image_deployment_sends_deploy_image_requested_job(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        let mut receiver = deployment_service.queue_service.subscribe();
+
+        deployment_service
+            .trigger_image_deployment(
+                42,
+                Some(7),
+                "ghcr.io/org/app:latest".to_string(),
+                Some("/healthz".to_string()),
+            )
+            .await?;
+
+        // The auto-responder spawned in create_deployment_service_for_test also
+        // listens on this queue (to keep RouteTableUpdated flowing) — drain past
+        // whatever else it produces until our own job shows up.
+        let job = loop {
+            match receiver.recv().await {
+                Ok(temps_core::Job::DeployImageRequested(job)) => break job,
+                Ok(_) => continue,
+                Err(e) => panic!("queue closed before DeployImageRequested arrived: {}", e),
+            }
+        };
+
+        assert_eq!(job.project_id, 42);
+        assert_eq!(job.target_environment_id, Some(7));
+        assert_eq!(job.image_ref, "ghcr.io/org/app:latest");
+        assert_eq!(job.health_check_path.as_deref(), Some("/healthz"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeploy_environment_uses_affected_deployment_and_target_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, affected, _) = setup_test_deployment(&db).await?;
+
+        let mut affected_active: deployments::ActiveModel = affected.clone().into();
+        affected_active.metadata = Set(Some(temps_entities::deployments::DeploymentMetadata {
+            external_image_ref: Some("registry.example/app:known-good".to_string()),
+            ..Default::default()
+        }));
+        affected_active.update(db.as_ref()).await?;
+
+        // A newer failed deployment must never supersede the workload whose
+        // container is actually being migrated.
+        deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            state: Set("failed".to_string()),
+            slug: Set("failed-newer-deployment".to_string()),
+            metadata: Set(Some(temps_entities::deployments::DeploymentMetadata {
+                external_image_ref: Some("registry.example/app:failed".to_string()),
+                ..Default::default()
+            })),
+            created_at: Set(Utc::now() + chrono::Duration::seconds(1)),
+            updated_at: Set(Utc::now() + chrono::Duration::seconds(1)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let service = create_deployment_service_for_test(db);
+        let mut receiver = service.queue_service.subscribe();
+        service
+            .redeploy_environment(project.id, environment.id, affected.id)
+            .await?;
+
+        let job = loop {
+            match receiver.recv().await {
+                Ok(temps_core::Job::DeployImageRequested(job)) => break job,
+                Ok(_) => continue,
+                Err(e) => panic!("queue closed before DeployImageRequested arrived: {}", e),
+            }
+        };
+        assert_eq!(job.project_id, project.id);
+        assert_eq!(job.target_environment_id, Some(environment.id));
+        assert_eq!(job.image_ref, "registry.example/app:known-good");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redeploy_environment_rejects_deployment_from_another_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, deployment, _) = setup_test_deployment(&db).await?;
+        let service = create_deployment_service_for_test(db);
+
+        let result = service
+            .redeploy_environment(project.id, environment.id + 1, deployment.id)
+            .await;
+
+        assert!(matches!(result, Err(DeploymentError::NotFound(_))));
+        Ok(())
     }
 }

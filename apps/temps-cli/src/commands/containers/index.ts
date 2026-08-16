@@ -168,7 +168,7 @@ async function listContainersAction(
   }
   baseColumns.push(
     { header: 'Image', key: 'image_name', color: (v) => colors.muted(v.length > 40 ? v.slice(0, 40) + '...' : v) },
-    { header: 'Status', key: 'status', color: (v) => statusBadge(v.toLowerCase().includes('running') ? 'active' : 'inactive') },
+    { header: 'Status', key: 'status', color: (v) => statusBadge(containerStatusVariant(v)) },
     { header: 'Created', key: 'created_at', color: (v) => colors.muted(new Date(v).toLocaleDateString()) },
   )
 
@@ -209,7 +209,7 @@ async function showContainer(
   header(`${icons.info} ${container.container_name}`)
   keyValue('Container ID', container.container_id)
   keyValue('Image', container.image_name)
-  keyValue('Status', statusBadge(container.status.toLowerCase().includes('running') ? 'active' : 'inactive'))
+  keyValue('Status', statusBadge(containerStatusVariant(container.status)))
   keyValue('Container Port', container.container_port)
   if (container.host_port) {
     keyValue('Host Port', container.host_port)
@@ -548,14 +548,19 @@ function displayAllContainerMetrics(allMetrics: ContainerMetrics[]): void {
   newline()
 }
 
-function formatBytes(bytes: number): string {
+/** Maps the free-text status the API returns to the two badge variants `statusBadge` understands. */
+export function containerStatusVariant(status: string): 'active' | 'inactive' {
+  return status.toLowerCase().includes('running') ? 'active' : 'inactive'
+}
+
+export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
   if (bytes < 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`
   return `${(bytes / 1024 / 1024 / 1024).toFixed(2)} GB`
 }
 
-function createProgressBar(percent: number, width: number = 30): string {
+export function createProgressBar(percent: number, width: number = 30): string {
   const filled = Math.round((percent / 100) * width)
   const empty = width - filled
   const bar = '█'.repeat(filled) + '░'.repeat(empty)

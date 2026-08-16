@@ -46,8 +46,8 @@ impl AuditOperation for AgentRunTriggeredAudit {
     fn operation_type(&self) -> String {
         "AGENT_RUN_TRIGGERED".to_string()
     }
-    fn user_id(&self) -> i32 {
-        self.context.user_id
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
     }
     fn ip_address(&self) -> Option<String> {
         self.context.ip_address.clone()
@@ -248,6 +248,18 @@ pub struct WebhookTriggerResponse {
     pub status: String,
 }
 
+/// Constant-time byte comparison to prevent timing attacks on webhook tokens.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
 /// Public webhook endpoint. Authenticated via `X-Webhook-Token` header.
 ///
 /// `POST /api/agents/webhook/{webhook_id}`
@@ -307,15 +319,7 @@ pub async fn webhook_trigger(
             .with_detail("This agent does not have webhook triggers enabled")
     })?;
 
-    // Constant-time comparison to prevent timing attacks
-    if provided_token.len() != expected_token.len()
-        || !provided_token
-            .as_bytes()
-            .iter()
-            .zip(expected_token.as_bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-            == 0
-    {
+    if !constant_time_eq(provided_token.as_bytes(), expected_token.as_bytes()) {
         return Err(problemdetails::new(StatusCode::UNAUTHORIZED)
             .with_title("Invalid Webhook Token")
             .with_detail("The provided X-Webhook-Token does not match"));
@@ -430,6 +434,7 @@ pub struct SandboxStatusResponse {
     pub image_ready: bool,
     pub image_name: String,
     pub error: Option<String>,
+    pub firecracker_available: bool,
 }
 
 #[utoipa::path(
@@ -479,6 +484,7 @@ pub async fn get_sandbox_status(
         image_ready,
         image_name,
         error,
+        firecracker_available: false,
     }))
 }
 
@@ -515,11 +521,21 @@ pub async fn get_global_sandbox_status(
         )
     };
 
+    let data_dir = std::env::var("TEMPS_DATA_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| {
+            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| ".".into()))
+                .join(".temps")
+        });
+    let firecracker_available =
+        crate::sandbox::firecracker::is_firecracker_available(&data_dir).await;
+
     Ok(Json(SandboxStatusResponse {
         docker_available,
         image_ready,
         image_name,
         error,
+        firecracker_available,
     }))
 }
 
@@ -764,9 +780,12 @@ pub async fn smoke_test_agent(
             }
         }
 
-        let image = format!("temps-sandbox-{}:latest", global_sandbox.runtime);
+        // Same image the real runs and the status check use — an unqualified
+        // `temps-sandbox-<runtime>:latest` resolves to Docker Hub and 404s.
+        let image = crate::sandbox::docker::image_name_for_runtime(&global_sandbox.runtime);
         let sandbox_config = crate::sandbox::SandboxCreateConfig {
             run_id: test_run_id,
+            owner_user_id: Some(auth.user_id()),
             container_name_override: None,
             host_work_dir: work_dir.clone(),
             workspace_volume: None,
@@ -774,6 +793,7 @@ pub async fn smoke_test_agent(
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(512),
             pids_limit: None,
+            disk_size_mb: None,
             // Use the default egress-filtered bridge network (same as production
             // sandboxes).  The old "host" override was a security hole: it gave
             // the smoke-test container unrestricted access to all host-network
@@ -784,6 +804,7 @@ pub async fn smoke_test_agent(
             network_mode: None,
             env_vars: test_env,
             idle_timeout: std::time::Duration::from_secs(60),
+            backend: None,
         };
 
         let _handle = match registry.get_or_create(sandbox_config).await {
@@ -983,6 +1004,41 @@ pub async fn save_agent_token(
         .map_err(|e| Problem::from(AgentError::Database(e)))?;
 
     Ok(Json(SaveAgentTokenResponse { saved: true }))
+}
+
+#[cfg(test)]
+mod webhook_token_tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn accepts_matching_tokens() {
+        assert!(constant_time_eq(b"whsec_abc123", b"whsec_abc123"));
+    }
+
+    #[test]
+    fn rejects_mismatched_tokens_of_equal_length() {
+        // Regression test: an earlier version of this check used
+        // `!fold(..) == 0`, which parses as `(!fold(..)) == 0` due to Rust's
+        // precedence rules (`!` on a `u8` is bitwise NOT, not logical NOT).
+        // That accepted every wrong token whose XOR-accumulation wasn't
+        // exactly 255, i.e. almost all wrong tokens. Every case below must
+        // be rejected.
+        assert!(!constant_time_eq(b"whsec_abc123", b"whsec_abc124"));
+        assert!(!constant_time_eq(b"whsec_abc123", b"whsec_xyz123"));
+        assert!(!constant_time_eq(b"aaaaaaaaaaaa", b"bbbbbbbbbbbb"));
+        assert!(!constant_time_eq(b"\0\0\0\0", b"\x01\x01\x01\x01"));
+    }
+
+    #[test]
+    fn rejects_different_length_tokens() {
+        assert!(!constant_time_eq(b"short", b"much_longer_token"));
+        assert!(!constant_time_eq(b"", b"nonempty"));
+    }
+
+    #[test]
+    fn empty_tokens_are_equal() {
+        assert!(constant_time_eq(b"", b""));
+    }
 }
 
 // `list_available_models` was retired in favour of the per-provider

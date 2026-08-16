@@ -19,7 +19,37 @@ use temps_entities::{deployments, environments, projects};
 use tracing::{debug, info};
 
 use super::deployment_token_service::DeploymentTokenService;
-use super::workflow_planner::public_sentry_dsn_var;
+use super::workflow_planner::{public_sentry_dsn_var, public_sentry_tunnel_var};
+
+/// Build the OpenTelemetry SDK header-list value for a deployed project.
+///
+/// Header values in `OTEL_EXPORTER_OTLP_HEADERS` use URL encoding, so the
+/// space in the Bearer scheme must be encoded. The diagnostic slug uses an
+/// explicit hex transport header so Unicode and delimiter characters cannot
+/// corrupt the header-list grammar. Authentication still relies only on the
+/// token.
+pub(super) fn otel_exporter_headers(
+    token: Option<&str>,
+    existing_headers: Option<&str>,
+    project_slug: &str,
+) -> String {
+    let slug_header = format!(
+        "X-Temps-Project-Slug-Hex={}",
+        hex::encode(project_slug.as_bytes())
+    );
+    match token {
+        Some(token) => format!(
+            "Authorization=Bearer%20{},{slug_header}",
+            urlencoding::encode(token),
+        ),
+        None => existing_headers
+            .map(str::trim)
+            .map(|headers| headers.trim_end_matches(',').trim_end())
+            .filter(|headers| !headers.is_empty())
+            .map(|headers| format!("{headers},{slug_header}"))
+            .unwrap_or(slug_header),
+    }
+}
 
 /// Resolves the full environment-variable map for a `(project, environment,
 /// deployment)`. Holds the six services the resolution needs; cheap to clone
@@ -211,6 +241,19 @@ impl DeploymentEnvResolver {
                         if let Some(public_var) = public_sentry_dsn_var(project.preset) {
                             env_vars_map.insert(public_var.to_string(), project_dsn.dsn);
                         }
+
+                        // Add the same-origin tunnel path browser SDKs should pass as
+                        // `Sentry.init({ tunnel })`. The value is a constant (not
+                        // project-specific), but injecting it as an env var — rather
+                        // than hardcoding it in every framework's setup snippet — means
+                        // the path can change in one place (here) without touching
+                        // deployed apps' source or docs.
+                        if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
+                            env_vars_map.insert(
+                                tunnel_var.to_string(),
+                                format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH),
+                            );
+                        }
                     }
                     Err(e) => {
                         // Warn about Sentry DSN failure but don't fail the deployment
@@ -313,13 +356,15 @@ impl DeploymentEnvResolver {
                 "http/protobuf".to_string(),
             );
 
-            // Auth header using the deployment token (already in TEMPS_API_TOKEN)
-            if let Some(token) = env_vars_map.get("TEMPS_API_TOKEN").cloned() {
-                env_vars_map.insert(
-                    "OTEL_EXPORTER_OTLP_HEADERS".to_string(),
-                    format!("Authorization=Bearer {}", token),
-                );
-            }
+            // Always include the project slug so authentication failures retain
+            // project context. Authorization is added when token provisioning
+            // succeeded (the token is already in TEMPS_API_TOKEN).
+            let token = env_vars_map.get("TEMPS_API_TOKEN").map(String::as_str);
+            let existing_headers = env_vars_map
+                .get("OTEL_EXPORTER_OTLP_HEADERS")
+                .map(String::as_str);
+            let otel_headers = otel_exporter_headers(token, existing_headers, &project.slug);
+            env_vars_map.insert("OTEL_EXPORTER_OTLP_HEADERS".to_string(), otel_headers);
 
             env_vars_map.insert("OTEL_SERVICE_NAME".to_string(), project.name.clone());
 
@@ -340,5 +385,46 @@ impl DeploymentEnvResolver {
             env_vars_map.keys().cloned().collect::<Vec<_>>().join(", ")
         );
         Ok(env_vars_map)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::otel_exporter_headers;
+
+    #[test]
+    fn otel_headers_include_encoded_token_and_project_slug() {
+        assert_eq!(
+            otel_exporter_headers(Some("dt_example"), None, "example-project"),
+            "Authorization=Bearer%20dt_example,X-Temps-Project-Slug-Hex=6578616d706c652d70726f6a656374"
+        );
+    }
+
+    #[test]
+    fn otel_headers_preserve_project_slug_without_token() {
+        assert_eq!(
+            otel_exporter_headers(None, None, "example-project"),
+            "X-Temps-Project-Slug-Hex=6578616d706c652d70726f6a656374"
+        );
+    }
+
+    #[test]
+    fn otel_headers_hex_encode_unicode_and_delimiters_in_project_slug() {
+        assert_eq!(
+            otel_exporter_headers(None, None, "café,slug=value"),
+            "X-Temps-Project-Slug-Hex=636166c3a92c736c75673d76616c7565"
+        );
+    }
+
+    #[test]
+    fn otel_headers_preserve_manual_auth_when_platform_token_is_missing() {
+        assert_eq!(
+            otel_exporter_headers(
+                None,
+                Some("Authorization=Bearer%20manual-token"),
+                "example-project"
+            ),
+            "Authorization=Bearer%20manual-token,X-Temps-Project-Slug-Hex=6578616d706c652d70726f6a656374"
+        );
     }
 }

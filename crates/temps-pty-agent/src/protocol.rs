@@ -11,9 +11,14 @@
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-/// Hard cap on a single frame, matches the websocket frame cap in the
-/// terminal handler. Prevents a malicious or buggy client from asking the
-/// agent to allocate gigabytes before we know what's in the frame.
+/// Hard cap on a single frame. Prevents a malicious or buggy peer from asking
+/// the agent to allocate gigabytes before we know what's in the frame.
+///
+/// This bounds the *agent* side only, and it is checked after the length
+/// header rather than after buffering. It is deliberately **not** the bound on
+/// what a browser can send: the terminal handler caps WebSocket messages
+/// separately and far lower (`MAX_WS_MESSAGE_BYTES`), because a message is
+/// fully buffered before any agent-side check can see it.
 pub const MAX_FRAME_BYTES: usize = 4 * 1024 * 1024;
 
 // Client → Agent
@@ -188,6 +193,52 @@ pub fn encode_resize(cols: u16, rows: u16) -> [u8; 4] {
     out
 }
 
+/// A cancellation-safe decoder for the frame format above.
+///
+/// [`read_frame`] is built on two sequential `read_exact` calls, which are
+/// **not** cancellation-safe: dropping the future mid-call discards the bytes
+/// it already consumed. That is fine for a caller that awaits it to
+/// completion, but fatal inside a `tokio::select!` — the reader loses the
+/// length header it just read, then parses payload bytes as the next header
+/// and the stream desynchronises for good.
+///
+/// A [`Decoder`] has no such problem: `FramedRead` owns a buffer that
+/// survives across polls, so a cancelled `next()` leaves the bytes in place
+/// for the following one. Any consumer that multiplexes this stream against
+/// other events — the sandbox terminal handler multiplexes it against client
+/// input and an activity heartbeat — must use this rather than `read_frame`.
+pub struct FrameCodec;
+
+impl tokio_util::codec::Decoder for FrameCodec {
+    /// `(type_byte, payload)` — the same tuple `read_frame` yields.
+    type Item = (u8, Vec<u8>);
+    type Error = FrameError;
+
+    fn decode(&mut self, src: &mut bytes::BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        // Not enough for the length header yet — ask for more.
+        if src.len() < 4 {
+            return Ok(None);
+        }
+        let len = u32::from_be_bytes([src[0], src[1], src[2], src[3]]) as usize;
+        if len == 0 {
+            return Err(FrameError::Empty);
+        }
+        if len > MAX_FRAME_BYTES {
+            return Err(FrameError::Oversized { size: len });
+        }
+        // Whole frame not buffered yet. Reserve so the read side can fill it
+        // in one go instead of growing the buffer repeatedly on big output.
+        if src.len() < 4 + len {
+            src.reserve(4 + len - src.len());
+            return Ok(None);
+        }
+        let _ = src.split_to(4);
+        let mut payload = src.split_to(len);
+        let type_byte = payload[0];
+        Ok(Some((type_byte, payload.split_off(1).to_vec())))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,6 +306,109 @@ mod tests {
             // Never send the body; reader must reject on header alone.
         });
         let err = read_frame(&mut b).await.unwrap_err();
+        assert!(matches!(err, FrameError::Oversized { .. }));
+    }
+
+    // ── FrameCodec ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn codec_reassembles_frames_split_across_reads() {
+        use futures::StreamExt;
+        use tokio_util::codec::FramedRead;
+
+        let (mut a, b) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            // Write one frame in three pieces, straddling both the length
+            // header and the payload — the shape a socat relay produces.
+            let _ = a.write_all(&[0, 0, 0, 6]).await;
+            let _ = a.write_all(&[OP_OUTPUT, b'h', b'e']).await;
+            let _ = a.write_all(b"llo").await;
+            let _ = a.shutdown().await;
+        });
+
+        let mut framed = FramedRead::new(b, FrameCodec);
+        let (op, payload) = framed
+            .next()
+            .await
+            .expect("a frame")
+            .expect("decode succeeds");
+        assert_eq!(op, OP_OUTPUT);
+        assert_eq!(payload, b"hello");
+    }
+
+    /// The regression guard for the bug this codec exists to prevent.
+    ///
+    /// Repeatedly cancelling the read — exactly what `tokio::select!` does
+    /// when a sibling branch fires — must not lose or reorder bytes. With
+    /// `read_frame` this test corrupts the stream; with the codec the
+    /// buffered bytes survive the cancellation.
+    #[tokio::test]
+    async fn codec_survives_repeated_cancellation_mid_frame() {
+        use futures::StreamExt;
+        use tokio_util::codec::FramedRead;
+
+        let (mut a, b) = duplex(64 * 1024);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            for i in 0..20u8 {
+                let body = vec![b'a' + (i % 26); 64];
+                let mut frame = ((1 + body.len()) as u32).to_be_bytes().to_vec();
+                frame.push(OP_OUTPUT);
+                frame.extend_from_slice(&body);
+                // Dribble each frame out in two writes so a cancellation has
+                // a real chance of landing between them.
+                let (head, tail) = frame.split_at(3);
+                let _ = a.write_all(head).await;
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                let _ = a.write_all(tail).await;
+            }
+            let _ = a.shutdown().await;
+        });
+
+        let mut framed = FramedRead::new(b, FrameCodec);
+        let mut got = Vec::new();
+        while got.len() < 20 {
+            tokio::select! {
+                frame = framed.next() => {
+                    match frame {
+                        Some(Ok((op, payload))) => {
+                            assert_eq!(op, OP_OUTPUT, "frame type corrupted");
+                            assert_eq!(payload.len(), 64, "payload length corrupted");
+                            got.push(payload);
+                        }
+                        Some(Err(e)) => panic!("decode failed — stream desynchronised: {e}"),
+                        None => break,
+                    }
+                }
+                // The adversary: a timer that keeps cancelling the read.
+                _ = tokio::time::sleep(std::time::Duration::from_micros(200)) => {}
+            }
+        }
+        assert_eq!(got.len(), 20, "lost frames across cancellations");
+        for (i, payload) in got.iter().enumerate() {
+            let expected = b'a' + (i as u8 % 26);
+            assert!(
+                payload.iter().all(|b| *b == expected),
+                "frame {i} corrupted — bytes from an adjacent frame leaked in"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn codec_rejects_oversized_length_header() {
+        use futures::StreamExt;
+        use tokio_util::codec::FramedRead;
+
+        let (mut a, b) = duplex(1024);
+        tokio::spawn(async move {
+            use tokio::io::AsyncWriteExt;
+            let _ = a
+                .write_all(&((MAX_FRAME_BYTES + 1) as u32).to_be_bytes())
+                .await;
+        });
+        let mut framed = FramedRead::new(b, FrameCodec);
+        let err = framed.next().await.expect("a result").unwrap_err();
         assert!(matches!(err, FrameError::Oversized { .. }));
     }
 }

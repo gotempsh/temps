@@ -87,6 +87,15 @@ interface SmartCellProps {
   fieldName?: string
   /** If provided, rendering a foreign-key-shaped value can offer click-through. */
   onForeignKeyClick?: (value: string) => void
+  /**
+   * Expand handler for structured values.
+   *
+   * When supplied, the cell delegates instead of opening its own sheet. The
+   * caller can then show the whole row rather than a single decontextualised
+   * value — which was the complaint: you'd open a JSON blob and no longer know
+   * which row it belonged to.
+   */
+  onExpand?: () => void
 }
 
 export function SmartCell({
@@ -94,6 +103,7 @@ export function SmartCell({
   fieldType,
   fieldName,
   onForeignKeyClick,
+  onExpand,
 }: SmartCellProps) {
   const [jsonOpen, setJsonOpen] = useState(false)
 
@@ -147,7 +157,11 @@ export function SmartCell({
           type="button"
           onClick={(e) => {
             e.stopPropagation()
-            setJsonOpen(true)
+            if (onExpand) {
+              onExpand()
+            } else {
+              setJsonOpen(true)
+            }
           }}
           className="group inline-flex items-center gap-1.5 rounded-sm border border-dashed border-border/80 bg-muted/40 px-1.5 py-0.5 text-[11px] font-mono hover:bg-muted hover:border-border transition-colors"
         >

@@ -25,7 +25,7 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 function createFormToRequest(form: OidcProviderFormValues) {
@@ -101,7 +101,7 @@ export function CreateOidcProviderPage() {
   }
 
   return (
-    <div className="mx-auto max-w-3xl space-y-6 py-2">
+    <div className="w-full space-y-6 py-2">
       <div className="flex items-start gap-4">
         <Button
           variant="ghost"

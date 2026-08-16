@@ -12,7 +12,7 @@ use aws_sdk_s3::Client;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use futures::TryStreamExt;
-use rand::Rng;
+use rand::RngExt;
 use schemars::JsonSchema;
 use sea_orm::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -56,36 +56,36 @@ pub const DEFAULT_RUSTFS_PASSWORD: &str = "rustfsadmin";
 )]
 pub struct RustfsInputConfig {
     /// RustFS API port (auto-assigned if not provided)
-    #[schemars(example = "example_port")]
+    #[schemars(example = example_port())]
     pub port: Option<String>,
 
     /// RustFS console port (auto-assigned if not provided)
-    #[schemars(example = "example_console_port")]
+    #[schemars(example = example_console_port())]
     pub console_port: Option<String>,
 
     /// Access key (auto-generated if not provided or empty)
     #[serde(default, deserialize_with = "deserialize_optional_key")]
-    #[schemars(with = "Option<String>", example = "example_access_key")]
+    #[schemars(with = "Option<String>", example = example_access_key())]
     pub access_key: Option<String>,
 
     /// Secret key (auto-generated if not provided or empty)
     #[serde(default, deserialize_with = "deserialize_optional_key")]
-    #[schemars(with = "Option<String>", example = "example_secret_key")]
+    #[schemars(with = "Option<String>", example = example_secret_key())]
     pub secret_key: Option<String>,
 
     /// Host address
     #[serde(default = "default_host")]
-    #[schemars(example = "example_host", default = "default_host")]
+    #[schemars(example = example_host(), default = "default_host")]
     pub host: String,
 
     /// S3 region
     #[serde(default = "default_region")]
-    #[schemars(example = "example_region", default = "default_region")]
+    #[schemars(example = example_region(), default = "default_region")]
     pub region: String,
 
     /// Docker image to use for RustFS
     #[serde(default = "default_image")]
-    #[schemars(example = "example_image", default = "default_image")]
+    #[schemars(example = example_image(), default = "default_image")]
     pub docker_image: String,
 
     /// Metrics ingest key (`si_` prefix). Populated automatically when metrics
@@ -237,11 +237,11 @@ fn default_host() -> String {
 
 fn default_access_key() -> String {
     // AWS Access Key format: AKIA + 16 uppercase alphanumeric characters = 20 chars total
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     let random_part: String = (0..16)
         .map(|_| {
             let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-            charset[rng.gen_range(0..charset.len())] as char
+            charset[rng.random_range(0..charset.len())] as char
         })
         .collect();
     format!("AKIA{}", random_part)
@@ -249,13 +249,98 @@ fn default_access_key() -> String {
 
 fn default_secret_key() -> String {
     // AWS Secret Key format: 40 characters of base64-like characters (alphanumeric + / +)
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..40)
         .map(|_| {
             let charset = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789/+";
-            charset[rng.gen_range(0..charset.len())] as char
+            charset[rng.random_range(0..charset.len())] as char
         })
         .collect()
+}
+
+/// Build the `mc mirror` command used by RustFS restores.
+///
+/// In-place restores must exactly reproduce every bucket present in the
+/// backup: objects created later inside those buckets are removed and any
+/// mirror error fails the restore. Destination-only buckets are intentionally
+/// retained to avoid deleting an entire bucket outside the selected backup's
+/// scope. A newly provisioned target is empty, so it does not need `--remove`.
+fn restore_mirror_command<'a>(
+    source: &'a str,
+    destination: &'a str,
+    remove_extraneous: bool,
+) -> Vec<&'a str> {
+    let mut command = vec!["mc", "mirror", "--overwrite"];
+    if remove_extraneous {
+        command.push("--remove");
+    }
+    command.extend([source, destination]);
+    command
+}
+
+/// Remove credentials from external-client output before it reaches logs,
+/// persisted restore errors, or API responses. Replacing the individual key
+/// values also redacts them when `mc` echoes a credential-bearing URL.
+fn redact_sensitive_output(output: &str, sensitive_values: &[&str]) -> String {
+    sensitive_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .fold(output.to_string(), |redacted, value| {
+            redacted.replace(value, "***")
+        })
+}
+
+fn docker_error_is_not_found(error: &bollard::errors::Error) -> bool {
+    matches!(
+        error,
+        bollard::errors::Error::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+/// Best-effort cleanup for a restore target that has no database owner yet.
+/// `remove_container` must only be true after this invocation successfully
+/// created that exact container; this prevents a name collision from deleting
+/// another service's data.
+async fn cleanup_unowned_rustfs_resources(
+    docker: &Docker,
+    container_name: &str,
+    volume_names: &[&str],
+    remove_container: bool,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    if remove_container {
+        if let Err(error) = docker
+            .remove_container(
+                container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+        {
+            if !docker_error_is_not_found(&error) {
+                errors.push(format!("container '{}': {}", container_name, error));
+            }
+        }
+    }
+    for volume_name in volume_names {
+        if let Err(error) = docker
+            .remove_volume(
+                volume_name,
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await
+        {
+            if !docker_error_is_not_found(&error) {
+                errors.push(format!("volume '{}': {}", volume_name, error));
+            }
+        }
+    }
+    errors
 }
 
 // Schema example functions
@@ -305,6 +390,51 @@ pub struct RustfsService {
     encryption_service: Arc<EncryptionService>,
 }
 
+/// Host ports to adopt from an already-running container, if any.
+///
+/// Split out of [`RustfsService::running_container_ports`] so the decision can
+/// be tested without a Docker daemon. Returns `Some((api, console))` only when
+/// the container is running the exact image we're about to ask for — anything
+/// else means `create_container` recreates it and the caller's freshly probed
+/// ports are the right ones.
+fn adopted_ports_from_inspect(
+    info: &bollard::models::ContainerInspectResponse,
+    docker_image: &str,
+) -> Option<(String, String)> {
+    let running = info
+        .state
+        .as_ref()
+        .and_then(|state| state.status)
+        .is_some_and(|status| status == bollard::models::ContainerStateStatusEnum::RUNNING);
+    if !running {
+        return None;
+    }
+
+    // Same image check as `create_container` — a mismatch means the container
+    // is about to be replaced, ports and all.
+    let image_matches = info
+        .config
+        .as_ref()
+        .and_then(|config| config.image.as_deref())
+        .is_some_and(|image| image == docker_image);
+    if !image_matches {
+        return None;
+    }
+
+    let ports = info.network_settings.as_ref()?.ports.as_ref()?;
+    let host_port = |internal: &str| -> Option<String> {
+        ports
+            .get(internal)?
+            .as_ref()?
+            .first()?
+            .host_port
+            .clone()
+            .filter(|port| !port.is_empty())
+    };
+
+    Some((host_port("9000/tcp")?, host_port("9001/tcp")?))
+}
+
 impl RustfsService {
     /// MinIO Client (mc) utility image - used for backup/restore operations via mc mirror
     const MC_IMAGE: &'static str = "minio/mc:RELEASE.2025-08-13T08-35-41Z";
@@ -324,8 +454,39 @@ impl RustfsService {
         }
     }
 
-    fn get_container_name(&self) -> String {
+    /// The Docker container this instance owns.
+    ///
+    /// Public so callers that need to reason about the container — the blob
+    /// plugin checking for a duplicate left by the pre-#495 naming split, for
+    /// one — can ask instead of re-deriving `rustfs-{name}` themselves.
+    pub fn get_container_name(&self) -> String {
         format!("rustfs-{}", self.name)
+    }
+
+    /// Host ports this service's container already publishes, when it is
+    /// running the image we're about to ask for.
+    ///
+    /// `RustfsConfig::from_input_async` probes each configured port and
+    /// relocates off anything already bound. On the second and every later
+    /// `init()` — re-enabling a running service, or the blob plugin loading
+    /// its config on boot — the process holding those ports *is this
+    /// service's own container*, so the probe hands back a free port nothing
+    /// is listening on. `create_container` then sees a healthy container on
+    /// the right image and returns early without applying the new ports, and
+    /// the S3 client below gets built against a dead endpoint: every blob
+    /// request fails with a dispatch error while the container sits there
+    /// healthy.
+    ///
+    /// Returns `None` when the container is absent, stopped, or on a
+    /// different image — all cases where `create_container` recreates it and
+    /// the freshly probed ports are the correct ones to use.
+    async fn running_container_ports(&self, docker_image: &str) -> Option<(String, String)> {
+        let info = self
+            .docker
+            .inspect_container(&self.get_container_name(), None::<InspectContainerOptions>)
+            .await
+            .ok()?;
+        adopted_ports_from_inspect(&info, docker_image)
     }
 
     /// Pull the MinIO Client (mc) image used for backup/restore operations
@@ -389,14 +550,10 @@ impl RustfsService {
             while let Ok(Some(output)) = output.try_next().await {
                 match output {
                     bollard::container::LogOutput::StdOut { message } => {
-                        let msg = String::from_utf8_lossy(&message);
-                        info!("stdout: {}", msg);
-                        stdout.push_str(&msg);
+                        stdout.push_str(&String::from_utf8_lossy(&message));
                     }
                     bollard::container::LogOutput::StdErr { message } => {
-                        let msg = String::from_utf8_lossy(&message);
-                        error!("stderr: {}", msg);
-                        stderr.push_str(&msg);
+                        stderr.push_str(&String::from_utf8_lossy(&message));
                     }
                     _ => {}
                 }
@@ -413,6 +570,7 @@ impl RustfsService {
         docker: &Docker,
         config: &RustfsConfig,
         resource_limits: &ServiceResourceLimits,
+        require_new: bool,
     ) -> Result<()> {
         // Pull the image first
         info!("Pulling RustFS image {}", config.docker_image);
@@ -442,21 +600,6 @@ impl RustfsService {
         let data_volume_name = format!("rustfs_{}_data", self.name);
         let logs_volume_name = format!("rustfs_{}_logs", self.name);
 
-        // Create volumes if they don't exist
-        docker
-            .create_volume(bollard::models::VolumeCreateRequest {
-                name: Some(data_volume_name.clone()),
-                ..Default::default()
-            })
-            .await?;
-
-        docker
-            .create_volume(bollard::models::VolumeCreateRequest {
-                name: Some(logs_volume_name.clone()),
-                ..Default::default()
-            })
-            .await?;
-
         // Check if container already exists
         let containers = docker
             .list_containers(Some(bollard::query_parameters::ListContainersOptions {
@@ -470,7 +613,19 @@ impl RustfsService {
             .await?;
 
         if !containers.is_empty() {
-            let container = containers.first().unwrap();
+            if require_new {
+                return Err(anyhow::anyhow!(
+                    "Cannot create restored RustFS service '{}': Docker container '{}' already exists",
+                    self.name,
+                    container_name
+                ));
+            }
+            let container = containers.first().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Docker reported a RustFS container collision for '{}' without container details",
+                    container_name
+                )
+            })?;
             let existing_image = container.image.as_deref().unwrap_or("");
             let is_running =
                 container.state == Some(bollard::models::ContainerSummaryStateEnum::RUNNING);
@@ -505,6 +660,70 @@ impl RustfsService {
                     }),
                 )
                 .await?;
+        }
+
+        if require_new {
+            for volume_name in [&data_volume_name, &logs_volume_name] {
+                match docker.inspect_volume(volume_name).await {
+                    Ok(_) => {
+                        return Err(anyhow::anyhow!(
+                            "Cannot create restored RustFS service '{}': derived Docker volume '{}' already exists",
+                            self.name,
+                            volume_name
+                        ));
+                    }
+                    Err(error) if docker_error_is_not_found(&error) => {}
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "Cannot verify Docker volume '{}' is available for restored RustFS service '{}': {}",
+                            volume_name,
+                            self.name,
+                            error
+                        ));
+                    }
+                }
+            }
+        }
+
+        ensure_network_exists(docker)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
+
+        docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(data_volume_name.clone()),
+                ..Default::default()
+            })
+            .await?;
+
+        if let Err(error) = docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(logs_volume_name.clone()),
+                ..Default::default()
+            })
+            .await
+        {
+            let cleanup_errors = if require_new {
+                cleanup_unowned_rustfs_resources(
+                    docker,
+                    &container_name,
+                    &[&data_volume_name],
+                    false,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            return Err(anyhow::anyhow!(
+                "Failed to create RustFS logs volume '{}': {}{}",
+                logs_volume_name,
+                error,
+                if cleanup_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                }
+            ));
         }
 
         let service_label_key = format!("{}service_type", temps_core::DOCKER_LABEL_PREFIX);
@@ -552,10 +771,6 @@ impl RustfsService {
             env_vars.push("RUSTFS_OBS_TRACES_EXPORT_ENABLED=false".to_string());
             env_vars.push("RUSTFS_OBS_LOGS_EXPORT_ENABLED=false".to_string());
         }
-
-        ensure_network_exists(docker)
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to ensure network exists: {:?}", e))?;
 
         let networking_config = Some(bollard::models::NetworkingConfig {
             endpoints_config: Some(HashMap::from([(
@@ -630,7 +845,7 @@ impl RustfsService {
             ..Default::default()
         };
 
-        let container = docker
+        let container = match docker
             .create_container(
                 Some(
                     bollard::query_parameters::CreateContainerOptionsBuilder::new()
@@ -640,15 +855,62 @@ impl RustfsService {
                 container_config,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to create RustFS container: {}", e))?;
+        {
+            Ok(container) => container,
+            Err(error) => {
+                let cleanup_errors = if require_new {
+                    cleanup_unowned_rustfs_resources(
+                        docker,
+                        &container_name,
+                        &[&data_volume_name, &logs_volume_name],
+                        false,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                };
+                return Err(anyhow::anyhow!(
+                    "Failed to create RustFS container '{}': {}{}",
+                    container_name,
+                    error,
+                    if cleanup_errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                    }
+                ));
+            }
+        };
 
-        docker
+        if let Err(error) = docker
             .start_container(
                 &container.id,
                 None::<bollard::query_parameters::StartContainerOptions>,
             )
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to start RustFS container: {}", e))?;
+        {
+            let cleanup_errors = if require_new {
+                cleanup_unowned_rustfs_resources(
+                    docker,
+                    &container_name,
+                    &[&data_volume_name, &logs_volume_name],
+                    true,
+                )
+                .await
+            } else {
+                Vec::new()
+            };
+            return Err(anyhow::anyhow!(
+                "Failed to start RustFS container '{}': {}{}",
+                container_name,
+                error,
+                if cleanup_errors.is_empty() {
+                    String::new()
+                } else {
+                    format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                }
+            ));
+        }
 
         // Spawn health check as background task (non-blocking)
         let container_id = container.id.clone();
@@ -840,7 +1102,7 @@ impl ExternalService for RustfsService {
             )
             .await;
 
-        self.create_container(&self.docker, &config, &resource_limits)
+        self.create_container(&self.docker, &config, &resource_limits, false)
             .await
     }
 
@@ -878,7 +1140,7 @@ impl ExternalService for RustfsService {
             .await;
 
         // create_container pulls the new image and mounts the existing volume.
-        self.create_container(&self.docker, &new_cfg, &resource_limits)
+        self.create_container(&self.docker, &new_cfg, &resource_limits, false)
             .await?;
 
         info!(
@@ -903,10 +1165,33 @@ impl ExternalService for RustfsService {
             .context("Failed to parse RustFS configuration")?;
 
         // Convert to runtime config using async Docker-aware port finding
-        let runtime_config = RustfsConfig::from_input_async(input_config, &self.docker).await;
+        let mut runtime_config = RustfsConfig::from_input_async(input_config, &self.docker).await;
+
+        // If our container is already up on this image, it owns its ports and
+        // `create_container` below will leave it alone — so the freshly probed
+        // ports above are fiction. Adopt what the container actually
+        // publishes. See `running_container_ports`.
+        if let Some((api_port, console_port)) = self
+            .running_container_ports(&runtime_config.docker_image)
+            .await
+        {
+            if api_port != runtime_config.port || console_port != runtime_config.console_port {
+                info!(
+                    "Adopting ports {}/{} already published by running container {} \
+                     (probe suggested {}/{})",
+                    api_port,
+                    console_port,
+                    self.get_container_name(),
+                    runtime_config.port,
+                    runtime_config.console_port
+                );
+            }
+            runtime_config.port = api_port;
+            runtime_config.console_port = console_port;
+        }
 
         // Create container
-        self.create_container(&self.docker, &runtime_config, &resource_limits)
+        self.create_container(&self.docker, &runtime_config, &resource_limits, false)
             .await?;
 
         // Create S3 client
@@ -1455,6 +1740,12 @@ impl ExternalService for RustfsService {
 
         let mut success = true;
         let mut error_logs = Vec::new();
+        let sensitive_values = [
+            rustfs_config.access_key.as_str(),
+            rustfs_config.secret_key.as_str(),
+            decrypted_access_key.as_str(),
+            decrypted_secret_key.as_str(),
+        ];
 
         for cmd in commands {
             // Log only the subcommand — args may contain credentials (e.g. `mc alias set`).
@@ -1468,7 +1759,7 @@ impl ExternalService for RustfsService {
                 .await?;
 
             if !ok {
-                error_logs.push(stderr);
+                error_logs.push(redact_sensitive_output(&stderr, &sensitive_values));
                 success = false;
                 break;
             }
@@ -1633,6 +1924,12 @@ impl ExternalService for RustfsService {
                 &rustfs_config.secret_key,
             ],
         ];
+        let sensitive_values = [
+            source_access_key,
+            source_secret_key,
+            rustfs_config.access_key.as_str(),
+            rustfs_config.secret_key.as_str(),
+        ];
 
         for cmd in setup_commands {
             let (ok, _stdout, stderr) = self.exec_in_container(docker, &container.id, cmd).await?;
@@ -1649,7 +1946,7 @@ impl ExternalService for RustfsService {
                     .await?;
                 return Err(anyhow::anyhow!(
                     "Failed to set up mc aliases for RustFS restore: {}",
-                    stderr
+                    redact_sensitive_output(&stderr, &sensitive_values)
                 ));
             }
         }
@@ -1661,9 +1958,25 @@ impl ExternalService for RustfsService {
         );
         let list_command = vec!["mc", "ls", "--json", &source_backup_location];
 
-        let (_, list_stdout, _) = self
+        let (list_ok, list_stdout, list_stderr) = self
             .exec_in_container(docker, &container.id, list_command)
             .await?;
+        if !list_ok {
+            let _ = docker
+                .remove_container(
+                    &container.id,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await;
+            return Err(anyhow::anyhow!(
+                "RustFS in-place restore could not list backup location '{}': {}",
+                source_backup_location,
+                redact_sensitive_output(&list_stderr, &sensitive_values).trim()
+            ));
+        }
 
         // Parse bucket listing from JSON output
         let mut buckets = Vec::new();
@@ -1698,20 +2011,15 @@ impl ExternalService for RustfsService {
                 );
             }
 
-            // Mirror the bucket contents
+            // An in-place restore must reproduce the selected backup exactly.
+            // Do not use --skip-errors: a partial mirror cannot be reported as
+            // a completed restore.
             let source_bucket_loc = format!(
                 "backup-source/{}/{}/{}",
                 s3_source.bucket_name, backup_location, bucket_name
             );
             let dest_bucket_loc = format!("dest/{}", bucket_name);
-            let mirror_cmd = vec![
-                "mc",
-                "mirror",
-                "--skip-errors",
-                "--overwrite",
-                &source_bucket_loc,
-                &dest_bucket_loc,
-            ];
+            let mirror_cmd = restore_mirror_command(&source_bucket_loc, &dest_bucket_loc, true);
 
             info!(
                 "Executing mirror command for bucket {}: {:?}",
@@ -1723,8 +2031,22 @@ impl ExternalService for RustfsService {
                 .await?;
 
             if !ok {
-                error!("Mirror failed for bucket {}: {}", bucket_name, stderr);
-                // Continue with other buckets rather than failing entirely
+                let safe_stderr = redact_sensitive_output(&stderr, &sensitive_values);
+                error!("Mirror failed for bucket {}: {}", bucket_name, safe_stderr);
+                let _ = docker
+                    .remove_container(
+                        &container.id,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "RustFS in-place restore failed while mirroring bucket '{}': {}",
+                    bucket_name,
+                    safe_stderr.trim()
+                ));
             }
         }
 
@@ -1822,190 +2144,281 @@ impl ExternalService for RustfsService {
         *new_service.config.write().await = Some(new_config.clone());
         *new_service.resource_limits.write().await = cloned_limits.clone();
 
+        if temps_entities::external_services::Entity::find()
+            .filter(temps_entities::external_services::Column::Name.eq(&new_service_name))
+            .one(ctx.pool)
+            .await?
+            .is_some()
+        {
+            return Err(anyhow::anyhow!(
+                "Cannot restore to new RustFS service '{}': a service with that name already exists",
+                new_service_name
+            ));
+        }
+
         new_service
-            .create_container(&self.docker, &new_config, &cloned_limits)
+            .create_container(&self.docker, &new_config, &cloned_limits, true)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to create new RustFS container: {}", e))?;
 
-        // Orchestrator already decrypted into the plaintext s3_source copy.
-        // Re-decrypting would fail because these are no longer ciphertext.
-        let source_access_key = ctx.s3_source.access_key_id.clone();
-        let source_secret_key = ctx.s3_source.secret_key.clone();
-        let source_endpoint = ctx
-            .s3_source
-            .endpoint
-            .as_deref()
-            .unwrap_or("s3.amazonaws.com");
-
-        self.pull_mc_image(&self.docker).await?;
-
-        let mc_container_name = format!("mc-restore-new-{}", uuid::Uuid::new_v4());
-        let env_vars = [
-            format!(
-                "MC_HOST_source=http://{}:{}@{}",
-                source_access_key, source_secret_key, source_endpoint
-            ),
-            format!(
-                "MC_HOST_dest=http://{}:{}@localhost:{}",
-                new_config.access_key, new_config.secret_key, new_config.port
-            ),
-        ];
-
-        let mc_config = bollard::models::ContainerCreateBody {
-            image: Some(Self::MC_IMAGE.to_string()),
-            env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
-            entrypoint: Some(vec!["sh".to_string()]),
-            tty: Some(true),
-            attach_stdin: Some(true),
-            attach_stdout: Some(true),
-            attach_stderr: Some(true),
-            host_config: Some(bollard::models::HostConfig {
-                network_mode: Some("host".to_string()),
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        let container = self
-            .docker
-            .create_container(
-                Some(
-                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
-                        .name(&mc_container_name)
-                        .build(),
-                ),
-                mc_config,
-            )
-            .await?;
-
-        self.docker
-            .start_container(
-                &container.id,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await?;
-
-        let dest_endpoint = format!("http://localhost:{}", new_config.port);
-        let setup_commands: Vec<Vec<&str>> = vec![
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "backup-source",
-                source_endpoint,
-                &source_access_key,
-                &source_secret_key,
-            ],
-            vec![
-                "mc",
-                "alias",
-                "set",
-                "dest",
-                &dest_endpoint,
-                &new_config.access_key,
-                &new_config.secret_key,
-            ],
-        ];
-
-        for cmd in setup_commands {
-            let (ok, _stdout, stderr) = self
-                .exec_in_container(&self.docker, &container.id, cmd)
-                .await?;
-            if !ok {
-                let _ = self
-                    .docker
-                    .remove_container(
-                        &container.id,
-                        Some(bollard::query_parameters::RemoveContainerOptions {
-                            force: true,
-                            ..Default::default()
-                        }),
-                    )
-                    .await;
-                return Err(anyhow::anyhow!(
-                    "Failed to set up mc aliases for new RustFS restore: {}",
-                    stderr
-                ));
-            }
-        }
-
-        // List buckets at the backup prefix.
-        let source_backup_location = format!(
-            "backup-source/{}/{}",
-            ctx.s3_source.bucket_name, ctx.backup_location
-        );
-        let list_command = vec!["mc", "ls", "--json", &source_backup_location];
-        let (_, list_stdout, _) = self
-            .exec_in_container(&self.docker, &container.id, list_command)
-            .await?;
-
-        let mut buckets: Vec<String> = Vec::new();
-        let json_objects = parse_multiline_json_output(&list_stdout)?;
-        for listing in json_objects {
-            if let (Some("folder"), Some(key)) = (
-                listing.get("type").and_then(|t| t.as_str()),
-                listing.get("key").and_then(|k| k.as_str()),
-            ) {
-                buckets.push(key.to_string());
-            }
-        }
-
-        info!(
-            "Restoring {} bucket(s) into new RustFS service '{}'",
-            buckets.len(),
-            new_service_name
-        );
-
-        for bucket in buckets {
-            let bucket_name = bucket.trim_end_matches('/');
-            let dest_location = format!("dest/{}", bucket_name);
-
-            let mb_cmd = vec!["mc", "mb", &dest_location];
-            let (ok, stdout_mb, _) = self
-                .exec_in_container(&self.docker, &container.id, mb_cmd)
-                .await?;
-            if !ok && !stdout_mb.contains("already") {
-                info!(
-                    "mc mb returned non-zero for bucket {}, continuing: {}",
-                    bucket_name, stdout_mb
-                );
-            }
-
-            let source_bucket_loc = format!(
-                "backup-source/{}/{}/{}",
-                ctx.s3_source.bucket_name, ctx.backup_location, bucket_name
-            );
-            let mirror_cmd = vec![
-                "mc",
-                "mirror",
-                "--skip-errors",
-                "--overwrite",
-                &source_bucket_loc,
-                &dest_location,
+        let mut mc_container_id: Option<String> = None;
+        let restore_result: Result<()> = async {
+            // Orchestrator already decrypted into the plaintext s3_source copy.
+            // Re-decrypting would fail because these are no longer ciphertext.
+            let source_access_key = ctx.s3_source.access_key_id.clone();
+            let source_secret_key = ctx.s3_source.secret_key.clone();
+            let source_endpoint = ctx
+                .s3_source
+                .endpoint
+                .as_deref()
+                .unwrap_or("s3.amazonaws.com");
+            let sensitive_values = [
+                source_access_key.as_str(),
+                source_secret_key.as_str(),
+                new_config.access_key.as_str(),
+                new_config.secret_key.as_str(),
             ];
 
-            info!("Mirroring bucket {} -> new RustFS service", bucket_name);
-            let (ok, _stdout, stderr) = self
-                .exec_in_container(&self.docker, &container.id, mirror_cmd)
-                .await?;
-            if !ok {
-                error!("Mirror failed for bucket {}: {}", bucket_name, stderr);
-            }
-        }
+            self.pull_mc_image(&self.docker).await?;
 
-        let _ = self
-            .docker
-            .remove_container(
-                &container.id,
-                Some(bollard::query_parameters::RemoveContainerOptions {
-                    force: true,
+            let mc_container_name = format!("mc-restore-new-{}", uuid::Uuid::new_v4());
+            let env_vars = [
+                format!(
+                    "MC_HOST_source=http://{}:{}@{}",
+                    source_access_key, source_secret_key, source_endpoint
+                ),
+                format!(
+                    "MC_HOST_dest=http://{}:{}@localhost:{}",
+                    new_config.access_key, new_config.secret_key, new_config.port
+                ),
+            ];
+
+            let mc_config = bollard::models::ContainerCreateBody {
+                image: Some(Self::MC_IMAGE.to_string()),
+                env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
+                entrypoint: Some(vec!["sh".to_string()]),
+                tty: Some(true),
+                attach_stdin: Some(true),
+                attach_stdout: Some(true),
+                attach_stderr: Some(true),
+                host_config: Some(bollard::models::HostConfig {
+                    network_mode: Some("host".to_string()),
                     ..Default::default()
                 }),
+                ..Default::default()
+            };
+
+            let container = self
+                .docker
+                .create_container(
+                    Some(
+                        bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                            .name(&mc_container_name)
+                            .build(),
+                    ),
+                    mc_config,
+                )
+                .await?;
+            mc_container_id = Some(container.id.clone());
+
+            self.docker
+                .start_container(
+                    &container.id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await?;
+
+            let dest_endpoint = format!("http://localhost:{}", new_config.port);
+            let setup_commands: Vec<Vec<&str>> = vec![
+                vec![
+                    "mc",
+                    "alias",
+                    "set",
+                    "backup-source",
+                    source_endpoint,
+                    &source_access_key,
+                    &source_secret_key,
+                ],
+                vec![
+                    "mc",
+                    "alias",
+                    "set",
+                    "dest",
+                    &dest_endpoint,
+                    &new_config.access_key,
+                    &new_config.secret_key,
+                ],
+            ];
+
+            for cmd in setup_commands {
+                let (ok, _stdout, stderr) = self
+                    .exec_in_container(&self.docker, &container.id, cmd)
+                    .await?;
+                if !ok {
+                    Err(anyhow::anyhow!(
+                        "Failed to set up mc aliases for new RustFS restore: {}",
+                        redact_sensitive_output(&stderr, &sensitive_values)
+                    ))?;
+                }
+            }
+
+            // List buckets at the backup prefix.
+            let source_backup_location = format!(
+                "backup-source/{}/{}",
+                ctx.s3_source.bucket_name, ctx.backup_location
+            );
+            let list_command = vec!["mc", "ls", "--json", &source_backup_location];
+            let (list_ok, list_stdout, list_stderr) = self
+                .exec_in_container(&self.docker, &container.id, list_command)
+                .await?;
+            if !list_ok {
+                Err(anyhow::anyhow!(
+                    "RustFS restore to new service '{}' could not list backup location '{}': {}",
+                    new_service_name,
+                    source_backup_location,
+                    redact_sensitive_output(&list_stderr, &sensitive_values).trim()
+                ))?;
+            }
+
+            let mut buckets: Vec<String> = Vec::new();
+            let json_objects = parse_multiline_json_output(&list_stdout)?;
+            for listing in json_objects {
+                if let (Some("folder"), Some(key)) = (
+                    listing.get("type").and_then(|t| t.as_str()),
+                    listing.get("key").and_then(|k| k.as_str()),
+                ) {
+                    buckets.push(key.to_string());
+                }
+            }
+
+            info!(
+                "Restoring {} bucket(s) into new RustFS service '{}'",
+                buckets.len(),
+                new_service_name
+            );
+
+            for bucket in buckets {
+                let bucket_name = bucket.trim_end_matches('/');
+                let dest_location = format!("dest/{}", bucket_name);
+
+                let mb_cmd = vec!["mc", "mb", &dest_location];
+                let (ok, stdout_mb, _) = self
+                    .exec_in_container(&self.docker, &container.id, mb_cmd)
+                    .await?;
+                if !ok && !stdout_mb.contains("already") {
+                    info!(
+                        "mc mb returned non-zero for bucket {}, continuing: {}",
+                        bucket_name, stdout_mb
+                    );
+                }
+
+                let source_bucket_loc = format!(
+                    "backup-source/{}/{}/{}",
+                    ctx.s3_source.bucket_name, ctx.backup_location, bucket_name
+                );
+                let mirror_cmd = restore_mirror_command(&source_bucket_loc, &dest_location, false);
+
+                info!("Mirroring bucket {} -> new RustFS service", bucket_name);
+                let (ok, _stdout, stderr) = self
+                    .exec_in_container(&self.docker, &container.id, mirror_cmd)
+                    .await?;
+                if !ok {
+                    let safe_stderr = redact_sensitive_output(&stderr, &sensitive_values);
+                    error!("Mirror failed for bucket {}: {}", bucket_name, safe_stderr);
+                    Err(anyhow::anyhow!(
+                        "RustFS restore to new service '{}' failed while mirroring bucket '{}': {}",
+                        new_service_name,
+                        bucket_name,
+                        safe_stderr.trim()
+                    ))?;
+                }
+            }
+
+            Ok(())
+        }
+        .await;
+
+        // Always remove the credential-bearing helper. On failure, also remove
+        // the not-yet-owned target container and volumes: the orchestrator only
+        // creates its service row after this method succeeds.
+        let helper_cleanup_error = if let Some(container_id) = mc_container_id {
+            match self
+                .docker
+                .remove_container(
+                    &container_id,
+                    Some(bollard::query_parameters::RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(()) => None,
+                Err(error) if docker_error_is_not_found(&error) => None,
+                Err(error) => Some(anyhow::anyhow!(
+                    "failed to remove credential-bearing mc helper container '{}': {}",
+                    container_id,
+                    error
+                )),
+            }
+        } else {
+            None
+        };
+        let restore_result = match (restore_result, helper_cleanup_error) {
+            (Ok(()), None) => Ok(()),
+            (Err(error), None) => Err(error),
+            (Ok(()), Some(cleanup_error)) => Err(cleanup_error),
+            (Err(error), Some(cleanup_error)) => Err(anyhow::anyhow!(
+                "{}. Credential-helper cleanup also failed: {}",
+                error,
+                cleanup_error
+            )),
+        };
+        if let Err(error) = restore_result {
+            let data_volume_name = format!("rustfs_{}_data", new_service_name);
+            let logs_volume_name = format!("rustfs_{}_logs", new_service_name);
+            let cleanup_errors = cleanup_unowned_rustfs_resources(
+                &self.docker,
+                &new_service.get_container_name(),
+                &[&data_volume_name, &logs_volume_name],
+                true,
             )
             .await;
+            if !cleanup_errors.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "RustFS restore to new service '{}' failed: {}. Cleanup of the unowned target also failed: {}",
+                    new_service_name,
+                    error,
+                    cleanup_errors.join("; ")
+                ));
+            }
+            return Err(error);
+        }
 
-        let runtime_json = serde_json::to_value(&new_config)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize runtime config: {}", e))?;
+        let runtime_json = match serde_json::to_value(&new_config) {
+            Ok(runtime_json) => runtime_json,
+            Err(error) => {
+                let data_volume_name = format!("rustfs_{}_data", new_service_name);
+                let logs_volume_name = format!("rustfs_{}_logs", new_service_name);
+                let cleanup_errors = cleanup_unowned_rustfs_resources(
+                    &self.docker,
+                    &new_service.get_container_name(),
+                    &[&data_volume_name, &logs_volume_name],
+                    true,
+                )
+                .await;
+                return Err(anyhow::anyhow!(
+                    "Failed to serialize restored RustFS service '{}' configuration: {}{}",
+                    new_service_name,
+                    error,
+                    if cleanup_errors.is_empty() {
+                        String::new()
+                    } else {
+                        format!(". Cleanup also failed: {}", cleanup_errors.join("; "))
+                    }
+                ));
+            }
+        };
         let mut parameters = HashMap::new();
         if let Some(obj) = runtime_json.as_object() {
             for (k, v) in obj {
@@ -2054,6 +2467,151 @@ fn parse_multiline_json_output(output: &str) -> Result<Vec<serde_json::Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const TEST_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.98";
+
+    #[test]
+    fn external_client_output_redacts_keys_and_credential_urls() {
+        let output =
+            "request to http://access-key:secret-key@backup.internal failed for access-key";
+
+        let redacted = redact_sensitive_output(output, &["access-key", "secret-key"]);
+
+        assert_eq!(
+            redacted,
+            "request to http://***:***@backup.internal failed for ***"
+        );
+        assert!(!redacted.contains("access-key"));
+        assert!(!redacted.contains("secret-key"));
+    }
+
+    #[test]
+    fn in_place_restore_mirror_is_exact_and_does_not_hide_errors() {
+        assert_eq!(
+            restore_mirror_command("backup/bucket", "live/bucket", true),
+            vec![
+                "mc",
+                "mirror",
+                "--overwrite",
+                "--remove",
+                "backup/bucket",
+                "live/bucket",
+            ]
+        );
+    }
+
+    #[test]
+    fn new_service_restore_does_not_remove_concurrent_writes() {
+        assert_eq!(
+            restore_mirror_command("backup/bucket", "new/bucket", false),
+            vec!["mc", "mirror", "--overwrite", "backup/bucket", "new/bucket"]
+        );
+    }
+
+    fn inspect_response(
+        status: bollard::models::ContainerStateStatusEnum,
+        image: &str,
+        ports: Vec<(&str, Option<&str>)>,
+    ) -> bollard::models::ContainerInspectResponse {
+        let port_map = ports
+            .into_iter()
+            .map(|(internal, host_port)| {
+                let bindings = host_port.map(|port| {
+                    vec![bollard::models::PortBinding {
+                        host_ip: Some("127.0.0.1".to_string()),
+                        host_port: Some(port.to_string()),
+                    }]
+                });
+                (internal.to_string(), bindings)
+            })
+            .collect();
+
+        bollard::models::ContainerInspectResponse {
+            state: Some(bollard::models::ContainerState {
+                status: Some(status),
+                ..Default::default()
+            }),
+            config: Some(bollard::models::ContainerConfig {
+                image: Some(image.to_string()),
+                ..Default::default()
+            }),
+            network_settings: Some(bollard::models::NetworkSettings {
+                ports: Some(port_map),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn running_on(ports: Vec<(&str, Option<&str>)>) -> bollard::models::ContainerInspectResponse {
+        inspect_response(
+            bollard::models::ContainerStateStatusEnum::RUNNING,
+            TEST_IMAGE,
+            ports,
+        )
+    }
+
+    /// The regression behind the "dispatch failure" on every blob request.
+    ///
+    /// On any `init()` after the first, `from_input_async` probes the
+    /// persisted port, finds it bound — by this service's *own* container —
+    /// and relocates. `create_container` then sees a healthy container on the
+    /// right image and returns without applying the move, so the S3 client
+    /// ends up pointed at a port nothing serves. Adopting the ports the
+    /// container actually publishes is what keeps the two in agreement.
+    #[test]
+    fn adopts_ports_published_by_the_running_container() {
+        let info = running_on(vec![("9000/tcp", Some("9000")), ("9001/tcp", Some("9002"))]);
+
+        assert_eq!(
+            adopted_ports_from_inspect(&info, TEST_IMAGE),
+            Some(("9000".to_string(), "9002".to_string())),
+            "must return the container's real published ports, not a re-probed guess"
+        );
+    }
+
+    /// A stopped container is about to be removed and recreated by
+    /// `create_container`, so its old bindings must not be adopted.
+    #[test]
+    fn ignores_a_stopped_container() {
+        let info = inspect_response(
+            bollard::models::ContainerStateStatusEnum::EXITED,
+            TEST_IMAGE,
+            vec![("9000/tcp", Some("9000")), ("9001/tcp", Some("9002"))],
+        );
+
+        assert_eq!(adopted_ports_from_inspect(&info, TEST_IMAGE), None);
+    }
+
+    /// An image change also forces a recreate, which re-binds the ports —
+    /// adopting the outgoing container's would pin the new one to stale values.
+    #[test]
+    fn ignores_a_container_running_a_different_image() {
+        let info = running_on(vec![("9000/tcp", Some("9000")), ("9001/tcp", Some("9002"))]);
+
+        assert_eq!(
+            adopted_ports_from_inspect(&info, "rustfs/rustfs:1.0.0-alpha.99"),
+            None
+        );
+    }
+
+    /// Partially-published containers must not yield a half-adopted config:
+    /// a missing console binding with an adopted API port would silently keep
+    /// the probed console port, which is exactly the mismatch being fixed.
+    #[test]
+    fn ignores_a_container_missing_a_published_port() {
+        for ports in [
+            vec![("9000/tcp", Some("9000")), ("9001/tcp", None)],
+            vec![("9000/tcp", None), ("9001/tcp", Some("9002"))],
+            vec![("9000/tcp", Some("9000"))],
+        ] {
+            assert_eq!(
+                adopted_ports_from_inspect(&running_on(ports), TEST_IMAGE),
+                None,
+                "an incomplete port map must fall back to the probed config wholesale"
+            );
+        }
+    }
 
     #[test]
     fn test_rustfs_config_defaults() {

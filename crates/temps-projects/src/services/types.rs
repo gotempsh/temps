@@ -66,6 +66,11 @@ pub struct Project {
     pub ai_alert_summaries_enabled: Option<bool>,
     pub ai_debug_chat_enabled: Option<bool>,
     pub ai_write_actions_enabled: bool,
+    pub ai_api_traffic_summary_enabled: Option<bool>,
+    /// Opt-in for native error-tracking source context.
+    pub error_source_context_enabled: bool,
+    /// Auto-capture source root (relative to the checkout); None = build context.
+    pub error_source_root: Option<String>,
     pub enable_preview_environments: bool,
     /// When true, newly-created preview environments default to on-demand mode.
     pub preview_envs_on_demand: bool,
@@ -84,6 +89,69 @@ pub struct Project {
     pub cross_project_trace_sharing: bool,
 }
 
+/// One environment variable supplied while creating a project.
+///
+/// Deserializes from either shape so clients written before `is_secret`
+/// existed keep working unchanged:
+///
+/// * object — `{"key": "API_KEY", "value": "sk-...", "is_secret": true}`
+/// * legacy tuple — `["API_KEY", "sk-..."]` (implies `is_secret: false`)
+#[derive(Debug, Clone, Serialize)]
+pub struct CreateProjectEnvVar {
+    pub key: String,
+    pub value: String,
+    /// When true the value is write-only: it is encrypted at rest and the API
+    /// never returns the plaintext again.
+    pub is_secret: bool,
+}
+
+impl<'de> Deserialize<'de> for CreateProjectEnvVar {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Object {
+                key: String,
+                value: String,
+                #[serde(default)]
+                is_secret: bool,
+            },
+            Tuple(String, String),
+        }
+
+        Ok(match Repr::deserialize(deserializer)? {
+            Repr::Object {
+                key,
+                value,
+                is_secret,
+            } => CreateProjectEnvVar {
+                key,
+                value,
+                is_secret,
+            },
+            Repr::Tuple(key, value) => CreateProjectEnvVar {
+                key,
+                value,
+                is_secret: false,
+            },
+        })
+    }
+}
+
+impl CreateProjectEnvVar {
+    /// Non-secret variable, the shape most callers want.
+    pub fn plain(key: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            key: key.into(),
+            value: value.into(),
+            is_secret: false,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct CreateProjectRequest {
     pub name: String,
@@ -94,7 +162,7 @@ pub struct CreateProjectRequest {
     pub preset: String,
     /// Preset-specific configuration (for Dockerfile preset, Nixpacks, etc.)
     pub preset_config: Option<serde_json::Value>,
-    pub environment_variables: Option<Vec<(String, String)>>,
+    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
     pub automatic_deploy: bool,
     pub storage_service_ids: Vec<i32>,
     pub is_public_repo: Option<bool>,
@@ -104,6 +172,11 @@ pub struct CreateProjectRequest {
     /// Source type for deployments (git, docker_image, or static_files)
     #[serde(default)]
     pub source_type: SourceType,
+    /// Bounded template provenance: a reviewed bundled slug or the fixed
+    /// `custom` marker. Internal only; normal project-creation paths leave it
+    /// unset and operator-defined slugs are never persisted here.
+    #[serde(default)]
+    pub template_slug: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -112,7 +185,7 @@ pub struct CreateProjectFromTemplateRequest {
     pub github_owner: String,
     pub github_name: String,
     pub template_name: String,
-    pub environment_variables: Option<Vec<(String, String)>>,
+    pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
     pub automatic_deploy: Option<bool>,
     pub performance_metrics_enabled: Option<bool>,
     pub storage_service_ids: Vec<i32>,
@@ -135,6 +208,9 @@ pub enum ProjectError {
 
     #[error("Project not found")]
     NotFound(String),
+
+    #[error("Git provider connection {connection_id} not found or not accessible")]
+    GitProviderConnectionNotFound { connection_id: i32 },
 
     #[error("Template not found")]
     TemplateNotFound,
@@ -173,6 +249,18 @@ pub enum ProjectError {
 
     #[error("Deployment error: {0}")]
     DeploymentError(String),
+
+    #[error("Failed to remove deployment containers for project {project_id}: {reason}")]
+    DeploymentCleanupFailed { project_id: i32, reason: String },
+
+    #[error(
+        "Project {project_id} was saved, but its proxy routes could not be reloaded (queue: {queue_reason}; database notification: {database_reason})"
+    )]
+    RouteReloadFailed {
+        project_id: i32,
+        queue_reason: String,
+        database_reason: String,
+    },
 
     #[error("Other error: {0}")]
     Other(String),
@@ -216,5 +304,86 @@ impl From<sea_orm::DbErr> for ProjectError {
                 reason: error.to_string(),
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_project_env_var_accepts_object_form_with_secret_flag() {
+        let parsed: CreateProjectEnvVar =
+            serde_json::from_str(r#"{"key":"API_KEY","value":"sk-live","is_secret":true}"#)
+                .expect("object form should deserialize");
+
+        assert_eq!(parsed.key, "API_KEY");
+        assert_eq!(parsed.value, "sk-live");
+        assert!(parsed.is_secret);
+    }
+
+    #[test]
+    fn create_project_env_var_object_form_defaults_is_secret_to_false() {
+        let parsed: CreateProjectEnvVar = serde_json::from_str(r#"{"key":"PORT","value":"8080"}"#)
+            .expect("is_secret should be optional");
+
+        assert_eq!(parsed.key, "PORT");
+        assert!(!parsed.is_secret);
+    }
+
+    #[test]
+    fn create_project_env_var_accepts_legacy_tuple_form() {
+        // Clients written before `is_secret` existed send `["KEY", "value"]`.
+        let parsed: Vec<CreateProjectEnvVar> =
+            serde_json::from_str(r#"[["PORT","8080"],["DEBUG","1"]]"#)
+                .expect("legacy tuple form must keep working");
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].key, "PORT");
+        assert_eq!(parsed[0].value, "8080");
+        assert!(!parsed[0].is_secret);
+        assert_eq!(parsed[1].key, "DEBUG");
+        assert!(!parsed[1].is_secret);
+    }
+
+    #[test]
+    fn create_project_env_var_mixes_both_forms_in_one_list() {
+        let parsed: Vec<CreateProjectEnvVar> = serde_json::from_str(
+            r#"[["PORT","8080"],{"key":"API_KEY","value":"sk","is_secret":true}]"#,
+        )
+        .expect("both forms should coexist");
+
+        assert!(!parsed[0].is_secret);
+        assert!(parsed[1].is_secret);
+    }
+
+    #[test]
+    fn create_project_env_var_rejects_malformed_entries() {
+        assert!(serde_json::from_str::<CreateProjectEnvVar>(r#"["ONLY_KEY"]"#).is_err());
+        assert!(serde_json::from_str::<CreateProjectEnvVar>(r#"{"key":"K"}"#).is_err());
+    }
+
+    #[test]
+    fn create_project_request_parses_env_vars_with_secrets() {
+        let request: CreateProjectRequest = serde_json::from_str(
+            r#"{
+                "name": "api",
+                "directory": ".",
+                "main_branch": "main",
+                "preset": "dockerfile",
+                "environment_variables": [
+                    {"key": "DATABASE_URL", "value": "postgres://x", "is_secret": true},
+                    ["LOG_LEVEL", "info"]
+                ],
+                "automatic_deploy": true,
+                "storage_service_ids": []
+            }"#,
+        )
+        .expect("request should deserialize");
+
+        let env_vars = request.environment_variables.expect("env vars present");
+        assert_eq!(env_vars.len(), 2);
+        assert!(env_vars[0].is_secret);
+        assert!(!env_vars[1].is_secret);
     }
 }

@@ -87,8 +87,34 @@ export function registerNotificationPreferencesCommands(program: Command): void 
     .action(resetPreferencesAction)
 }
 
-function formatBooleanValue(value: boolean): string {
+export function formatBooleanValue(value: boolean): string {
   return value ? colors.success('enabled') : colors.muted('disabled')
+}
+
+export function isKnownPreferenceKey(key: string): key is keyof NotificationPreferencesResponse {
+  return ALL_KEYS.includes(key as keyof NotificationPreferencesResponse)
+}
+
+export function parsePreferenceValue(
+  key: keyof NotificationPreferencesResponse,
+  value: string,
+): boolean | number | string {
+  if (BOOLEAN_KEYS.includes(key)) {
+    if (value !== 'true' && value !== 'false') {
+      throw new Error(`Invalid value for "${key}". Expected "true" or "false"`)
+    }
+    return value === 'true'
+  }
+
+  if (NUMBER_KEYS.includes(key)) {
+    const parsed = parseInt(value, 10)
+    if (isNaN(parsed)) {
+      throw new Error(`Invalid value for "${key}". Expected a number`)
+    }
+    return parsed
+  }
+
+  return value
 }
 
 async function showPreferencesAction(options: ShowOptions): Promise<void> {
@@ -184,7 +210,7 @@ async function updatePreferencesAction(options: UpdateOptions): Promise<void> {
   const { key, value } = options
 
   // Validate the key
-  if (!ALL_KEYS.includes(key as keyof NotificationPreferencesResponse)) {
+  if (!isKnownPreferenceKey(key)) {
     warning(`Unknown preference key: ${key}`)
     info(`Available keys: ${ALL_KEYS.join(', ')}`)
     return
@@ -206,21 +232,11 @@ async function updatePreferencesAction(options: UpdateOptions): Promise<void> {
 
   // Parse the value based on key type
   let parsedValue: boolean | number | string
-
-  if (BOOLEAN_KEYS.includes(key as keyof NotificationPreferencesResponse)) {
-    if (value !== 'true' && value !== 'false') {
-      warning(`Invalid value for "${key}". Expected "true" or "false"`)
-      return
-    }
-    parsedValue = value === 'true'
-  } else if (NUMBER_KEYS.includes(key as keyof NotificationPreferencesResponse)) {
-    parsedValue = parseInt(value, 10)
-    if (isNaN(parsedValue)) {
-      warning(`Invalid value for "${key}". Expected a number`)
-      return
-    }
-  } else {
-    parsedValue = value
+  try {
+    parsedValue = parsePreferenceValue(key, value)
+  } catch (e) {
+    warning((e as Error).message)
+    return
   }
 
   // Build the updated preferences object

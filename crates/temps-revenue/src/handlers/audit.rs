@@ -72,8 +72,8 @@ macro_rules! impl_audit_operation {
                 $op.to_string()
             }
 
-            fn user_id(&self) -> i32 {
-                self.context.user_id
+            fn user_id(&self) -> Option<i32> {
+                Some(self.context.user_id)
             }
 
             fn ip_address(&self) -> Option<String> {

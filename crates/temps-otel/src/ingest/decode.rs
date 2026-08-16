@@ -13,8 +13,14 @@ use crate::error::OtelError;
 use crate::proto;
 use crate::types::*;
 
-/// Maximum decompressed size to prevent decompression bombs (10 MB)
-const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
+/// Maximum decompressed size to prevent decompression bombs (10 MB).
+/// `pub(crate)` so the ingest router can derive its compressed-body cap from
+/// the same number — see `crate::handlers::INGEST_BODY_LIMIT`.
+pub(crate) const MAX_DECOMPRESSED_SIZE: usize = 10 * 1024 * 1024;
+/// Maximum zstd history window (2^24 = 16 MiB). This is large enough for the
+/// accepted 10 MiB payload while preventing attacker-controlled frame headers
+/// from allocating an unbounded decoder window before output is produced.
+const MAX_ZSTD_WINDOW_LOG: u32 = 24;
 
 /// Decompress a request body based on Content-Encoding header.
 ///
@@ -44,11 +50,26 @@ pub fn decompress(body: &Bytes, encoding: Option<&str>) -> Result<Bytes, OtelErr
             Ok(Bytes::from(decompressed))
         }
         Some("zstd") => {
-            let decompressed =
-                zstd::decode_all(&body[..]).map_err(|e| OtelError::DecompressionFailed {
+            let mut decoder = zstd::stream::read::Decoder::new(&body[..]).map_err(|e| {
+                OtelError::DecompressionFailed {
                     encoding: "zstd".into(),
                     reason: e.to_string(),
-                })?;
+                }
+            })?;
+            decoder.window_log_max(MAX_ZSTD_WINDOW_LOG).map_err(|e| {
+                OtelError::DecompressionFailed {
+                    encoding: "zstd".into(),
+                    reason: format!("Failed to enforce zstd window limit: {e}"),
+                }
+            })?;
+            let mut limited_reader = decoder.take(MAX_DECOMPRESSED_SIZE as u64 + 1);
+            let mut decompressed = Vec::new();
+            limited_reader.read_to_end(&mut decompressed).map_err(|e| {
+                OtelError::DecompressionFailed {
+                    encoding: "zstd".into(),
+                    reason: e.to_string(),
+                }
+            })?;
             if decompressed.len() > MAX_DECOMPRESSED_SIZE {
                 return Err(OtelError::DecompressionFailed {
                     encoding: "zstd".into(),
@@ -692,6 +713,34 @@ mod tests {
 
         let result = decompress(&Bytes::from(compressed), Some("zstd")).unwrap();
         assert_eq!(&result[..], original);
+    }
+
+    #[test]
+    fn test_decompress_zstd_rejects_payload_over_limit() {
+        let original = vec![0_u8; MAX_DECOMPRESSED_SIZE + 1];
+        let compressed = zstd::encode_all(&original[..], 3).unwrap();
+
+        let result = decompress(&Bytes::from(compressed), Some("zstd"));
+
+        assert!(matches!(
+            result,
+            Err(OtelError::DecompressionFailed { encoding, reason })
+                if encoding == "zstd" && reason.contains("exceeds maximum allowed size")
+        ));
+    }
+
+    #[test]
+    fn test_decompress_zstd_rejects_oversized_history_window() {
+        use std::io::Write;
+
+        let mut encoder = zstd::stream::write::Encoder::new(Vec::new(), 3).unwrap();
+        encoder.window_log(MAX_ZSTD_WINDOW_LOG + 1).unwrap();
+        encoder.write_all(b"small payload").unwrap();
+        let compressed = encoder.finish().unwrap();
+
+        let result = decompress(&Bytes::from(compressed), Some("zstd"));
+
+        assert!(matches!(result, Err(OtelError::DecompressionFailed { .. })));
     }
 
     #[test]

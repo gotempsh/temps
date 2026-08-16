@@ -56,6 +56,20 @@ impl StandaloneSandboxRegistry {
         Ok(handle)
     }
 
+    /// Create a sandbox from a snapshot artifact (ADR-037). Registers the
+    /// handle identically to `create` — the difference is only at the
+    /// provider level (image is loaded from the tarball if not present).
+    pub async fn create_from_snapshot(
+        &self,
+        artifact: &temps_agents::sandbox::SnapshotArtifact,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        let id = config.run_id;
+        let handle = self.provider.create_from_snapshot(artifact, config).await?;
+        self.handles.write().await.insert(id, handle.clone());
+        Ok(handle)
+    }
+
     /// Strip the `sbx_` prefix from a public ID to get the container
     /// label the provider indexes by. Docker-side container names are
     /// `temps-sandbox-<hex>` where `<hex>` is the label returned here.
@@ -166,6 +180,17 @@ impl StandaloneSandboxRegistry {
         self.provider.restart(&handle).await
     }
 
+    /// Grow the sandbox's root disk (Firecracker only). Same recovery.
+    pub async fn resize_disk(
+        &self,
+        id: i32,
+        public_id: &str,
+        new_size_mb: u64,
+    ) -> Result<(), AgentError> {
+        let handle = self.get_or_recover(id, public_id).await?;
+        self.provider.resize_disk(&handle, new_size_mb).await
+    }
+
     /// Recover handles for sandboxes that were running when the server
     /// last stopped. Called on startup. Unlike `StandaloneSandboxRegistry::get`,
     /// this doesn't error on missing containers — it just skips them and
@@ -260,6 +285,8 @@ mod tests {
                 sandbox_id: format!("docker-id-{}", config.run_id),
                 sandbox_name: format!("temps-sandbox-{}", config.run_id),
                 work_dir: PathBuf::from("/workspace"),
+                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                image: String::new(),
             })
         }
 
@@ -353,6 +380,8 @@ mod tests {
                 sandbox_id: id.clone(),
                 sandbox_name: format!("temps-sandbox-{}", container_name),
                 work_dir: PathBuf::from("/workspace"),
+                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                image: String::new(),
             }))
         }
 
@@ -487,6 +516,8 @@ mod tests {
                 sandbox_id: "docker-id-42".to_string(),
                 sandbox_name: "temps-sandbox-abc123".to_string(),
                 work_dir: PathBuf::from("/workspace"),
+                backend: temps_agents::sandbox::SandboxBackend::Docker,
+                image: String::new(),
             },
         );
 

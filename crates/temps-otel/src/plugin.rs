@@ -8,19 +8,22 @@ use std::time::Duration;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
 use crate::anomaly::detector::{AnomalyDetector, AnomalyDetectorConfig};
 use crate::handlers;
 use crate::handlers::dashboard_handler;
+use crate::handlers::facet_handler;
 use crate::handlers::ingest_handler;
 use crate::handlers::metric_alert_handler;
 use crate::handlers::query_handler;
 use crate::ingest::auth::OtelAuthService;
 use crate::ingest::rate_limit::RateLimiter;
+use crate::relay::OtelRelay;
 use crate::services::cross_project::{prune_stale_hints, CrossProjectTraceService, TraceHintMsg};
+use crate::services::facet_service::FacetService;
 use crate::services::health_service::HealthComputeService;
 use crate::services::OtelService;
 use crate::storage::clickhouse::{ClickHouseOtelConfig, ClickHouseOtelStorage};
@@ -51,12 +54,18 @@ pub struct OtelConfig {
     pub rate_limit_requests: u32,
     pub rate_limit_window_secs: u64,
 
-    // Quota
-    pub quota_bytes_per_project: u64,
+    // Quota. `None` (the default) disables per-project storage quotas
+    // entirely — ingest skips the quota check and its expensive per-project
+    // usage estimate. Set `TEMPS_OTEL_QUOTA_GB` to opt in.
+    pub quota_bytes_per_project: Option<u64>,
 
     // Background tasks
     pub enable_health_compute: bool,
     pub enable_anomaly_detection: bool,
+
+    // Ingest backpressure. Process-wide operational tuning knob (not
+    // per-tenant config) — see `crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS`.
+    pub max_concurrent_ingest_requests: usize,
 }
 
 impl Default for OtelConfig {
@@ -72,9 +81,11 @@ impl Default for OtelConfig {
             retention_check_interval_secs: 3600, // 1 hour
             rate_limit_requests: 1000,
             rate_limit_window_secs: 60,
-            quota_bytes_per_project: 10 * 1024 * 1024 * 1024, // 10 GB
+            quota_bytes_per_project: None, // quota disabled unless configured
             enable_health_compute: true,
             enable_anomaly_detection: true,
+            max_concurrent_ingest_requests:
+                crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
         }
     }
 }
@@ -118,8 +129,16 @@ impl OtelConfig {
             }
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_QUOTA_GB") {
-            if let Ok(gb) = v.parse::<u64>() {
-                config.quota_bytes_per_project = gb * 1024 * 1024 * 1024;
+            match v.parse::<u64>() {
+                // 0 keeps quotas disabled, same as leaving the var unset.
+                Ok(gb) => {
+                    config.quota_bytes_per_project = (gb > 0).then(|| gb * 1024 * 1024 * 1024)
+                }
+                Err(_) => warn!(
+                    value = %v,
+                    "TEMPS_OTEL_QUOTA_GB is set but is not a non-negative integer; \
+                     storage quota stays disabled"
+                ),
             }
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_HEALTH_COMPUTE") {
@@ -127,6 +146,17 @@ impl OtelConfig {
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_ENABLE_ANOMALY_DETECTION") {
             config.enable_anomaly_detection = v != "0" && v != "false";
+        }
+        if let Ok(v) = std::env::var("TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS") {
+            match parse_max_concurrent_ingest_requests(&v) {
+                Some(limit) => config.max_concurrent_ingest_requests = limit,
+                None => warn!(
+                    value = %v,
+                    "TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS is set but is not a positive \
+                     integer within the supported range; keeping the default ingest \
+                     concurrency ceiling"
+                ),
+            }
         }
 
         config
@@ -139,6 +169,19 @@ impl OtelConfig {
             && self.s3_secret_key.is_some()
             && self.s3_bucket.is_some()
     }
+}
+
+/// Parses `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`. Returns `None` (caller
+/// keeps the default) for anything that isn't a positive integer within
+/// `Semaphore::MAX_PERMITS` — `Semaphore::new` asserts on that bound and would
+/// otherwise panic the process at startup on a mistyped value.
+///
+/// A free function (rather than inline in `from_env`) so this parsing/bounds
+/// logic is unit-testable without mutating process-global environment
+/// variables, which the other `TEMPS_OTEL_*` fields in this file don't do.
+fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
+    let limit = v.parse::<usize>().ok()?;
+    (limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS).then_some(limit)
 }
 
 // ── OpenAPI Schema ──────────────────────────────────────────────────
@@ -158,16 +201,22 @@ impl OtelConfig {
         query_handler::list_metric_label_values,
         query_handler::query_traces,
         query_handler::query_trace_summaries,
+        query_handler::query_span_stats,
         query_handler::get_trace,
         query_handler::query_logs,
         query_handler::list_insights,
         query_handler::get_health,
         query_handler::get_quota,
+        query_handler::has_traces,
         query_handler::get_pipeline_stats,
         query_handler::query_genai_traces,
         query_handler::get_genai_trace,
         query_handler::get_cross_project_trace_siblings,
         query_handler::get_unified_trace,
+        facet_handler::list_facets,
+        facet_handler::create_facet,
+        facet_handler::delete_facet,
+        facet_handler::retry_facet_backfill,
         dashboard_handler::list_dashboards,
         dashboard_handler::create_dashboard,
         dashboard_handler::get_dashboard,
@@ -189,10 +238,13 @@ impl OtelConfig {
             query_handler::TracesResponse,
             query_handler::TraceSummariesResponse,
             crate::types::TraceSummary,
+            query_handler::SpanStatsResponse,
+            crate::types::SpanStats,
             query_handler::LogsResponse,
             query_handler::InsightsResponse,
             query_handler::HealthResponse,
             query_handler::QuotaResponse,
+            query_handler::HasTracesResponse,
             query_handler::PipelineStatsResponse,
             crate::types::MetricBucket,
             crate::types::HistogramSummary,
@@ -225,6 +277,11 @@ impl OtelConfig {
             crate::services::cross_project::ProjectRef,
             crate::services::cross_project::SiblingRef,
             crate::services::cross_project::TraceProjectRef,
+            facet_handler::CreateFacetRequest,
+            facet_handler::FacetsResponse,
+            crate::services::FacetInfo,
+            crate::services::FacetStatus,
+            crate::services::FacetBackendKind,
             dashboard_handler::CreateDashboardRequest,
             dashboard_handler::UpdateDashboardRequest,
             dashboard_handler::OtelDashboardResponse,
@@ -262,6 +319,7 @@ impl OtelConfig {
     tags(
         (name = "OTel Ingest", description = "OTLP/HTTP ingest endpoints (protobuf)"),
         (name = "OTel", description = "Query endpoints for the monitoring UI"),
+        (name = "OTel Facets", description = "Span attribute facet registration (fast-filter slots)"),
         (name = "GenAI", description = "GenAI agent activity tracing endpoints")
     )
 )]
@@ -270,11 +328,32 @@ pub struct OtelApiDoc;
 // ── Plugin ──────────────────────────────────────────────────────────
 
 /// OTel Plugin for Temps.
-pub struct OtelPlugin;
+pub struct OtelPlugin {
+    /// Handle to the ClickHouse storage's `RetentionResolver` slot, captured
+    /// in `register_services` (before the storage is moved into `Arc<dyn
+    /// OtelStorage>`) and written into from `initialize_plugin_services`,
+    /// which runs only after every plugin has registered its services.
+    /// `register_services` runs in plugin-registration order and this plugin
+    /// registers before any later-registered plugin (e.g. one implementing
+    /// per-project retention) gets a chance to provide a resolver — same
+    /// two-phase handoff `DeploymentsPlugin` uses for `DeploymentGate`.
+    retention_resolver_slot: tokio::sync::OnceCell<Arc<temps_core::RetentionResolverSlot>>,
+    /// Handle to the `OtelRelaySlot` captured in `register_services` and
+    /// written into from `initialize_plugin_services` — same two-phase
+    /// handoff as `retention_resolver_slot`. The background relay consumer
+    /// (spawned in `register_services`) holds its own `Arc` clone and calls
+    /// `relay_slot.relay(msg)` for each batch received from `otel_relay_tx`.
+    /// When no plugin provides an `Arc<dyn OtelRelay>`, the slot stays loaded
+    /// with `NoopOtelRelay` and the relay loop is a cheap no-op.
+    relay_slot: tokio::sync::OnceCell<Arc<crate::relay::OtelRelaySlot>>,
+}
 
 impl OtelPlugin {
     pub fn new() -> Self {
-        Self
+        Self {
+            retention_resolver_slot: tokio::sync::OnceCell::new(),
+            relay_slot: tokio::sync::OnceCell::new(),
+        }
     }
 }
 
@@ -341,14 +420,27 @@ impl TempsPlugin for OtelPlugin {
             // used for everything — the default, unchanged path.
             let ch_config = read_clickhouse_otel_config_from_env();
 
+            // ── Facet cache ──────────────────────────────────────────────────
+            //
+            // Created before both storage backends so ClickHouse, TimescaleDB
+            // (whichever is the ingest/query fast-path) and FacetService
+            // (create/delete) all share the same Arc. The cache starts empty;
+            // FacetService loads initial data from Postgres below.
+            let facet_cache: crate::services::FacetCache = Arc::new(
+                arc_swap::ArcSwap::from_pointee(std::collections::HashMap::new()),
+            );
+
             // TimescaleDbStorage is always constructed: it is the sole
             // backend when CH is disabled, and the inner delegate when
-            // CH is enabled.
+            // CH is enabled. It also needs the facet cache directly since
+            // it's the default backend and handles its own slot-column
+            // ingest/query when ClickHouse isn't configured.
             let timescale_storage = Arc::new(TimescaleDbStorage::with_config(
                 db.clone(),
                 s3_client,
                 config.retention_days,
                 config.quota_bytes_per_project,
+                Some(facet_cache.clone()),
             ));
 
             let storage: Arc<dyn crate::storage::OtelStorage> = if let Some(ch_cfg) = ch_config {
@@ -357,9 +449,18 @@ impl TempsPlugin for OtelPlugin {
                     database = %ch_cfg.database,
                     "ClickHouse OTel backend enabled (ADR-016) — applying migrations"
                 );
+                // Slot defaults to FixedRetentionResolver; a plugin (e.g. one
+                // implementing per-project data retention policies) is wired
+                // in later from `initialize_plugin_services` — see the
+                // `retention_resolver_slot` field doc for why a direct
+                // `get_service` call here would never find it.
+                let retention_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
+                let _ = self.retention_resolver_slot.set(retention_slot.clone());
                 let ch_storage = Arc::new(ClickHouseOtelStorage::new(
                     ch_cfg.clone(),
                     timescale_storage,
+                    retention_slot as Arc<dyn temps_core::RetentionResolver>,
+                    Some(facet_cache.clone()),
                 ));
                 // Run migrations in a background task so plugin init
                 // returns promptly. If migrations fail, the first
@@ -403,8 +504,11 @@ impl TempsPlugin for OtelPlugin {
             };
             context.register_service(storage.clone());
 
-            // Create auth service
+            // Create auth service. Also registered in the context so
+            // `configure_routes` can inject the ADR-028 ProjectAccessChecker
+            // (registered by a later plugin) into the `tk_`-key ingest path.
             let auth_service = Arc::new(OtelAuthService::new(db.clone()));
+            context.register_service(auth_service.clone());
 
             // Create rate limiter
             let rate_limiter = Arc::new(RateLimiter::new(
@@ -417,6 +521,7 @@ impl TempsPlugin for OtelPlugin {
                 storage.clone(),
                 auth_service,
                 rate_limiter,
+                config.max_concurrent_ingest_requests,
             ));
             context.register_service(otel_service.clone());
             // Also expose the same service behind the storage-agnostic read
@@ -444,13 +549,31 @@ impl TempsPlugin for OtelPlugin {
             // ── ADR-027 Phase 0: Cross-project trace hint pipeline ───────────
             //
             // A bounded mpsc channel (capacity 1,000) decouples span ingest
-            // latency from the Postgres hint write.  When the channel is full,
+            // latency from the hint write.  When the channel is full,
             // `do_ingest_traces` drops the hint (non-blocking try_send) and
             // warns.  The background consumer below drains the channel and
-            // calls `record_hint`, which issues a single multi-row
-            // `INSERT … ON CONFLICT DO NOTHING`.
+            // calls `record_hint`, which routes through the active storage
+            // backend: a multi-row `INSERT … ON CONFLICT DO NOTHING` into the
+            // Postgres control table, or a batched insert into the compressed
+            // ClickHouse `cross_project_trace_refs` table when CH is enabled.
             let (trace_hint_tx, mut trace_hint_rx) =
                 tokio::sync::mpsc::channel::<TraceHintMsg>(1000);
+
+            // ── OtelRelay extension point ────────────────────────────────────
+            //
+            // Slot defaults to NoopOtelRelay; a plugin (e.g. one implementing
+            // OTLP batch forwarding) is wired in later from
+            // `initialize_plugin_services` — see `relay_slot` field doc for
+            // why a direct `get_service` call here would never find it.
+            let relay_slot = Arc::new(crate::relay::OtelRelaySlot::new_default());
+            let _ = self.relay_slot.set(relay_slot.clone());
+
+            // Bounded channel (capacity 1 000 messages) for fire-and-forget
+            // relay of decoded OTLP batches. Ingest handlers call `try_send`
+            // (non-blocking); when the channel is full the batch is dropped
+            // and a warning is emitted — relay loss is non-fatal.
+            let (otel_relay_tx, mut otel_relay_rx) =
+                tokio::sync::mpsc::channel::<crate::relay::OtelRelayMessage>(1000);
 
             let cross_project_service =
                 Arc::new(CrossProjectTraceService::new(db.clone(), storage.clone()));
@@ -463,6 +586,39 @@ impl TempsPlugin for OtelPlugin {
             let metric_alert_service =
                 Arc::new(crate::services::MetricAlertService::new(db.clone()));
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+
+            // ── Facet service ────────────────────────────────────────────────
+            //
+            // Obtain a ClickHouse client for DDL mutations (backfill/clear).
+            // When CH is not configured, `ch_client_for_facets` is None and
+            // create/delete operations warn and skip the mutation step.
+            let ch_client_for_facets: Option<::clickhouse::Client> = {
+                let ch_cfg = read_clickhouse_otel_config_from_env();
+                ch_cfg.map(|cfg| {
+                    ::clickhouse::Client::default()
+                        .with_url(&cfg.url)
+                        .with_database(&cfg.database)
+                        .with_user(&cfg.user)
+                        .with_password(&cfg.password)
+                })
+            };
+            let facet_service = Arc::new(FacetService::new(
+                db.clone(),
+                ch_client_for_facets,
+                facet_cache.clone(),
+            ));
+            // Load initial facet→slot mapping from Postgres into the shared cache.
+            // Non-fatal: if Postgres is unavailable at startup, the cache stays
+            // empty and facet filtering falls back to JSONExtractString.
+            if let Err(e) = facet_service.refresh_cache().await {
+                warn!(
+                    error = %e,
+                    "Failed to load initial OTel facet cache from Postgres; \
+                     facet-accelerated filtering will not be available until the next successful \
+                     create/delete or server restart"
+                );
+            }
+            context.register_service(facet_service.clone());
 
             // 5. Metric alert evaluator
             //
@@ -513,12 +669,14 @@ impl TempsPlugin for OtelPlugin {
                 otel_service: otel_service.clone(),
                 metrics_store: Some(metrics_store.clone()),
                 metrics_write_tx: Some(metrics_write_tx),
+                facet_service: facet_service.clone(),
                 dashboard_service: dashboard_service.clone(),
                 metric_alert_service: metric_alert_service.clone(),
                 metric_alert_evaluator: metric_alert_evaluator.clone(),
                 audit_service: audit_service.clone(),
                 trace_hint_tx: Some(trace_hint_tx),
                 cross_project_service: cross_project_service.clone(),
+                otel_relay_tx: Some(otel_relay_tx),
                 project_access_checker: None,
             };
             context.register_service(Arc::new(app_state.clone()));
@@ -550,6 +708,34 @@ impl TempsPlugin for OtelPlugin {
                     if let Err(e) = apply_retention_all(&retention_storage, retention_days).await {
                         error!(error = %e, "OTel retention cleanup failed");
                     }
+                }
+            });
+
+            // 1a2. Facet backfill/clear poller.
+            //
+            // Advances every non-terminal facet (pending/running/deleting) by
+            // one bounded unit of work per tick — see
+            // `FacetService::advance_pending_facets` for why this is a poller
+            // rather than a task spawned from the create/delete HTTP handlers
+            // (a handler-spawned task's progress would be lost on a process
+            // restart; this poller's progress lives entirely in the
+            // `otel_span_facets` row, so a restart just resumes).
+            //
+            // 5s keeps facet creation feeling responsive (an admin pinning an
+            // attribute sees `running` within a few seconds) without adding
+            // meaningful load: each tick is a handful of cheap Postgres/CH
+            // status queries plus at most one bounded batch/mutation per
+            // in-flight facet, and there are at most 20 facets ever (one per
+            // slot).
+            const FACET_POLL_INTERVAL_SECS: u64 = 5;
+            let facet_poller_service = facet_service.clone();
+            tokio::spawn(async move {
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(FACET_POLL_INTERVAL_SECS));
+                interval.tick().await; // discard the immediate first tick
+                loop {
+                    interval.tick().await;
+                    facet_poller_service.advance_pending_facets().await;
                 }
             });
 
@@ -594,8 +780,30 @@ impl TempsPlugin for OtelPlugin {
                 });
             }
 
-            // 1d. ADR-027 Phase 0: daily prune of cross_project_trace_refs rows
-            //     older than 90 days (matching the OTel span TTL on both backends).
+            // 1c-relay. Background consumer for the OtelRelay extension point.
+            //
+            // Drains `otel_relay_rx` and calls `relay_slot.relay(msg)` for
+            // each batch, dispatching to whichever `OtelRelay` implementation
+            // was registered by a plugin (NoopOtelRelay when none registered).
+            // Errors are not possible here (relay is infallible by contract).
+            // The task exits cleanly when all senders drop.
+            {
+                tokio::spawn(async move {
+                    info!("OTel relay consumer started");
+                    while let Some(msg) = otel_relay_rx.recv().await {
+                        relay_slot.relay(msg).await;
+                    }
+                    info!("OTel relay consumer stopped (channel closed)");
+                });
+            }
+
+            // 1d. ADR-027 Phase 0: daily prune of POSTGRES cross_project_trace_refs
+            //     rows older than 90 days (matching the OTel span TTL on both
+            //     backends). Runs unconditionally: on the TimescaleDB backend it
+            //     is the retention mechanism; on the ClickHouse backend (where
+            //     new refs expire via native per-row TTL) it drains the legacy
+            //     Postgres rows written before the cutover and becomes a no-op
+            //     after one retention window.
             //
             // Deliberately uses a periodic tokio::spawn loop rather than a
             // Job enum variant to keep the scheduler dependency minimal.
@@ -664,11 +872,63 @@ impl TempsPlugin for OtelPlugin {
         })
     }
 
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            // Runs after every plugin has registered its services, so this is
+            // the first point at which an optional plugin-provided
+            // RetentionResolver (e.g. from a plugin implementing per-project
+            // retention) can actually be found.
+            if let Some(slot) = self.retention_resolver_slot.get() {
+                if let Some(resolver) = context.get_service::<dyn temps_core::RetentionResolver>() {
+                    if slot.set(resolver) {
+                        debug!("otel: RetentionResolver wired in from a registered plugin");
+                    } else {
+                        tracing::warn!(
+                            "otel: RetentionResolver slot was already claimed; \
+                             this plugin's resolver was NOT installed. \
+                             Check plugin registration order."
+                        );
+                    }
+                }
+            }
+
+            // Wire in an optional OtelRelay implementation registered by a
+            // plugin. When no plugin registers one, the slot stays loaded with
+            // NoopOtelRelay and the relay background consumer is a cheap no-op.
+            if let Some(slot) = self.relay_slot.get() {
+                if let Some(relay) = context.get_service::<dyn crate::relay::OtelRelay>() {
+                    if slot.set(relay) {
+                        debug!("otel: OtelRelay wired in from a registered plugin");
+                    } else {
+                        tracing::warn!(
+                            "otel: OtelRelay slot was already claimed; \
+                             this plugin's relay was NOT installed. \
+                             Check plugin registration order."
+                        );
+                    }
+                }
+            }
+
+            Ok(())
+        })
+    }
+
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let app_state_arc = context.require_service::<OtelAppState>();
         let mut app_state: OtelAppState = app_state_arc.as_ref().clone();
         app_state.project_access_checker =
             context.get_service::<dyn temps_core::ProjectAccessChecker>();
+
+        // Same checker feeds the `tk_`-key ingest auth path, so team-based
+        // project access is enforced on writes exactly as on reads.
+        if let Some(checker) = app_state.project_access_checker.clone() {
+            context
+                .require_service::<OtelAuthService>()
+                .set_project_access_checker(checker);
+        }
 
         let router = handlers::configure_routes().with_state(app_state);
 
@@ -734,7 +994,7 @@ mod tests {
 
     #[test]
     fn test_otel_plugin_default() {
-        let plugin = OtelPlugin;
+        let plugin = OtelPlugin::default();
         assert_eq!(plugin.name(), "otel");
     }
 
@@ -744,10 +1004,45 @@ mod tests {
         assert_eq!(config.retention_days, 7);
         assert_eq!(config.rate_limit_requests, 1000);
         assert_eq!(config.rate_limit_window_secs, 60);
-        assert_eq!(config.quota_bytes_per_project, 10 * 1024 * 1024 * 1024);
+        assert_eq!(config.quota_bytes_per_project, None);
         assert!(!config.has_s3_config());
         assert!(config.enable_health_compute);
         assert!(config.enable_anomaly_detection);
+        assert_eq!(
+            config.max_concurrent_ingest_requests,
+            crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS
+        );
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_accepts_positive_integers() {
+        assert_eq!(parse_max_concurrent_ingest_requests("1"), Some(1));
+        assert_eq!(parse_max_concurrent_ingest_requests("128"), Some(128));
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_rejects_zero_and_garbage() {
+        assert_eq!(parse_max_concurrent_ingest_requests("0"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests("-1"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests("not-a-number"), None);
+        assert_eq!(parse_max_concurrent_ingest_requests(""), None);
+    }
+
+    #[test]
+    fn test_parse_max_concurrent_ingest_requests_rejects_values_above_semaphore_max() {
+        // A value that parses as `usize` but exceeds `Semaphore::MAX_PERMITS`
+        // must fall back to the default rather than panicking `Semaphore::new`
+        // at startup — the regression this fix targets.
+        let too_large = (tokio::sync::Semaphore::MAX_PERMITS as u128 + 1).to_string();
+        assert_eq!(parse_max_concurrent_ingest_requests(&too_large), None);
+        assert_eq!(
+            parse_max_concurrent_ingest_requests(&usize::MAX.to_string()),
+            None
+        );
+        assert_eq!(
+            parse_max_concurrent_ingest_requests(&tokio::sync::Semaphore::MAX_PERMITS.to_string()),
+            Some(tokio::sync::Semaphore::MAX_PERMITS)
+        );
     }
 
     #[test]

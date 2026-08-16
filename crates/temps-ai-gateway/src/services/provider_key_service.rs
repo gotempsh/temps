@@ -1,9 +1,11 @@
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
+    QueryOrder, Set,
 };
 use std::sync::Arc;
 use temps_core::EncryptionService;
 use temps_entities::ai_provider_keys;
+use temps_entities::ai_provider_models;
 
 use crate::error::AiGatewayError;
 
@@ -37,6 +39,9 @@ impl ProviderKeyService {
             return Err(AiGatewayError::Validation {
                 message: "API key cannot be empty".to_string(),
             });
+        }
+        if let Some(url) = base_url {
+            validate_provider_url(url).await?;
         }
 
         let encrypted_key = self
@@ -98,6 +103,45 @@ impl ProviderKeyService {
         Ok(key)
     }
 
+    /// Enforce the operator-managed catalog for a system key. Legacy keys
+    /// created before the catalog migration remain usable until their first
+    /// bootstrap/refresh; once any catalog row exists, only enabled and
+    /// currently available models may execute.
+    pub async fn ensure_model_selectable(
+        &self,
+        key_id: i32,
+        model_id: &str,
+    ) -> Result<(), AiGatewayError> {
+        if let Some(model) = ai_provider_models::Entity::find()
+            .filter(ai_provider_models::Column::ProviderKeyId.eq(key_id))
+            .filter(ai_provider_models::Column::ModelId.eq(model_id))
+            .one(self.db.as_ref())
+            .await?
+        {
+            if model.is_enabled && model.is_available {
+                return Ok(());
+            }
+            return Err(AiGatewayError::Validation {
+                message: format!(
+                    "Model '{model_id}' is disabled or unavailable for provider key {key_id}"
+                ),
+            });
+        }
+
+        let catalog_count = ai_provider_models::Entity::find()
+            .filter(ai_provider_models::Column::ProviderKeyId.eq(key_id))
+            .count(self.db.as_ref())
+            .await?;
+        if catalog_count > 0 {
+            return Err(AiGatewayError::Validation {
+                message: format!(
+                    "Model '{model_id}' is not in the enabled catalog for provider key {key_id}"
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Decrypt the API key from the stored encrypted value
     pub fn decrypt_api_key(&self, encrypted: &str) -> Result<String, AiGatewayError> {
         self.encryption_service
@@ -131,6 +175,9 @@ impl ProviderKeyService {
         }
 
         if let Some(url) = base_url {
+            if let Some(url) = url {
+                validate_provider_url(url).await?;
+            }
             active.base_url = Set(url.map(|s| s.to_string()));
         }
 
@@ -154,6 +201,31 @@ impl ProviderKeyService {
             .await?;
         Ok(())
     }
+}
+
+async fn validate_provider_url(url: &str) -> Result<(), AiGatewayError> {
+    let parsed = temps_core::url_validation::validate_external_url(url).map_err(|error| {
+        AiGatewayError::InvalidProviderUrl {
+            reason: error.to_string(),
+        }
+    })?;
+    if let Some(domain) = parsed
+        .host_str()
+        .filter(|host| host.parse::<std::net::IpAddr>().is_err())
+    {
+        let port =
+            parsed
+                .port_or_known_default()
+                .ok_or_else(|| AiGatewayError::InvalidProviderUrl {
+                    reason: "provider URL has no resolvable port".to_string(),
+                })?;
+        temps_core::url_validation::resolve_and_validate_domain(domain, port)
+            .await
+            .map_err(|error| AiGatewayError::InvalidProviderUrl {
+                reason: error.to_string(),
+            })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

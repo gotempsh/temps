@@ -7,7 +7,7 @@ import {
   TooltipProvider,
   TooltipTrigger,
 } from '@/components/ui/tooltip'
-import type { SpanTreeNode } from '../../utils/spanTree'
+import { spanDurationMs, type SpanTreeNode } from '../../utils/spanTree'
 
 // ── Shared span display helpers ─────────────────────────────────────
 // Extracted alongside the waterfall so both the single-project
@@ -146,25 +146,45 @@ export function SpanWaterfall({
 
   return (
     <div className={cn('overflow-auto', className)}>
-      <div className="sticky top-0 z-10 flex min-w-[420px] items-center border-b bg-background px-4 py-2 text-xs text-muted-foreground sm:min-w-[500px]">
-        <div className="w-[120px] shrink-0 sm:w-[180px] md:w-[280px] lg:w-[340px]">Span Name</div>
-        <div className="flex flex-1 justify-between">
-          <span>{formatTimestamp(new Date(traceStart).toISOString())}</span>
-          <span>{formatDuration(traceDuration)}</span>
-          <span>{formatTimestamp(new Date(traceEnd).toISOString())}</span>
+      <div className="sticky top-0 z-10 flex min-w-[360px] items-center border-b bg-background px-3 py-2 text-xs text-muted-foreground sm:min-w-[560px] sm:px-4">
+        {/* The name column takes every pixel the timeline does not need. Span
+            names are the part you read — deep trees indent them 16px per level
+            and the interesting detail sits at the end of a long, qualified
+            name — while the timeline is mostly empty space once a trace has
+            one dominant span.
+            So the timeline gets a fixed, modest width and the names get the
+            rest, instead of the other way round. */}
+        <div className="min-w-[90px] flex-1">Span Name</div>
+        <div className="flex w-[110px] shrink-0 justify-between sm:w-[230px] lg:w-[360px]">
+          <span className="truncate">
+            {formatTimestamp(new Date(traceStart).toISOString())}
+          </span>
+          <span className="hidden truncate sm:inline">
+            {formatDuration(traceDuration)}
+          </span>
+          <span className="truncate">
+            {formatTimestamp(new Date(traceEnd).toISOString())}
+          </span>
         </div>
+        {/* Durations live in their own column rather than floating after each
+            bar. A label positioned past the bar's right edge has to reserve
+            slack inside the timeline for the longest span, which is exactly
+            the space the names needed. */}
+        <div className="w-[56px] shrink-0 text-right sm:w-[62px]">Duration</div>
       </div>
       {visibleSpans.map((node) => {
         const spanStart = new Date(node.span.start_time).getTime() - traceStart
-        const spanDuration =
-          new Date(node.span.end_time).getTime() -
-          new Date(node.span.start_time).getTime()
-        const maxBarPct = 92
-        const leftPct = traceDuration > 0 ? (spanStart / traceDuration) * maxBarPct : 0
+        const spanDuration = spanDurationMs(node.span)
+        // The bar owns the full track now that the duration has its own
+        // column, so nothing has to be reserved for a floating label.
+        const leftPct = traceDuration > 0 ? (spanStart / traceDuration) * 100 : 0
         const widthPct =
           traceDuration > 0
-            ? Math.max((spanDuration / traceDuration) * maxBarPct, 0.5)
-            : maxBarPct
+            ? Math.max(
+                Math.min((spanDuration / traceDuration) * 100, 100 - leftPct),
+                0.5
+              )
+            : 100
         const isError = node.span.status_code?.toUpperCase() === 'ERROR'
         const isSelected = selectedSpanId === node.span.span_id
         const isCollapsed = collapsedIds.has(node.span.span_id)
@@ -179,13 +199,13 @@ export function SpanWaterfall({
                   type="button"
                   onClick={() => onSelect(isSelected ? null : node.span.span_id)}
                   className={cn(
-                    'flex w-full min-w-[420px] items-center border-b px-4 py-1.5 text-left transition-colors hover:bg-accent/50 sm:min-w-[500px]',
+                    'flex w-full min-w-[360px] items-center border-b px-3 py-1.5 text-left transition-colors hover:bg-accent/50 sm:min-w-[560px] sm:px-4',
                     rowClassName?.(node.span),
                     isSelected && 'bg-accent'
                   )}
                 >
                   <div
-                    className="flex w-[120px] shrink-0 items-center gap-1.5 sm:w-[180px] md:w-[280px] lg:w-[340px]"
+                    className="flex min-w-[90px] flex-1 items-center gap-1.5 pr-2 sm:pr-3"
                     style={{ paddingLeft: `${node.depth * 16}px` }}
                   >
                     {node.children.length > 0 ? (
@@ -233,7 +253,7 @@ export function SpanWaterfall({
                       </span>
                     )}
                   </div>
-                  <div className="relative h-6 flex-1">
+                  <div className="relative h-6 w-[110px] shrink-0 sm:w-[230px] lg:w-[360px]">
                     <div
                       className={cn(
                         'absolute top-1 h-4 min-w-[2px] rounded-sm',
@@ -245,13 +265,10 @@ export function SpanWaterfall({
                         backgroundColor: barColor,
                       }}
                     />
-                    <span
-                      className="absolute top-0.5 whitespace-nowrap text-[10px] text-muted-foreground"
-                      style={{ left: `${leftPct + widthPct + 0.5}%` }}
-                    >
-                      {formatDuration(spanDuration)}
-                    </span>
                   </div>
+                  <span className="w-[56px] shrink-0 whitespace-nowrap text-right text-[10px] tabular-nums text-muted-foreground sm:w-[62px]">
+                    {formatDuration(spanDuration)}
+                  </span>
                 </button>
               </TooltipTrigger>
               <TooltipContent side="top" className="max-w-xs">

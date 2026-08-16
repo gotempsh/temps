@@ -60,6 +60,30 @@ interface ShowBackupOptions {
   json?: boolean
 }
 
+interface DeleteBackupOptions {
+  id: string
+  force?: boolean
+  yes?: boolean
+}
+
+export interface RetentionCleanupReport {
+  dry_run: boolean
+  schedule_id: number | null
+  expired: number
+  deleted: number
+  failed: number
+  failures: Array<{ backup_id: string; reason: string }>
+  candidate_backup_ids: string[]
+  candidate_backup_ids_truncated: boolean
+}
+
+interface CleanupBackupsOptions {
+  dryRun?: boolean
+  scheduleId?: string
+  yes?: boolean
+  json?: boolean
+}
+
 interface CreateSourceOptions {
   name?: string
   bucket?: string
@@ -106,6 +130,35 @@ interface RunServiceBackupOptions {
   id: string
   s3SourceId: string
   type?: string
+}
+
+type ScheduleAutomationInput = {
+  type: string
+  retention: string
+  s3SourceId: string
+}
+
+type ScheduleAutomationResult =
+  | { ok: true; backupType: string; retentionDays: number; s3SourceId: number }
+  | { ok: false; error: string }
+
+export function validateCreateScheduleAutomation(options: ScheduleAutomationInput): ScheduleAutomationResult {
+  const backupType = options.type
+  if (backupType !== 'full' && backupType !== 'incremental') {
+    return { ok: false, error: `Invalid backup type: ${backupType}. Supported: full, incremental` }
+  }
+
+  const retentionDays = parseInt(options.retention, 10)
+  if (isNaN(retentionDays) || retentionDays <= 0) {
+    return { ok: false, error: 'Invalid retention period' }
+  }
+
+  const s3SourceId = parseInt(options.s3SourceId, 10)
+  if (isNaN(s3SourceId)) {
+    return { ok: false, error: 'Invalid S3 Source ID' }
+  }
+
+  return { ok: true, backupType, retentionDays, s3SourceId }
 }
 
 export function registerBackupsCommands(program: Command): void {
@@ -251,6 +304,24 @@ export function registerBackupsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .action(showBackup)
 
+  backups
+    .command('delete')
+    .alias('rm')
+    .description('Permanently delete one terminal backup')
+    .requiredOption('--id <id>', 'Backup UUID')
+    .option('-f, --force', 'Skip confirmation')
+    .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
+    .action(deleteBackup)
+
+  backups
+    .command('cleanup')
+    .description('Delete backups expired by their schedule retention policy')
+    .option('--dry-run', 'Preview expired backups without deleting them')
+    .option('--schedule-id <id>', 'Limit cleanup to one schedule')
+    .option('-y, --yes', 'Skip confirmation prompt')
+    .option('--json', 'Output the cleanup report as JSON')
+    .action(cleanupBackups)
+
   // Run backup for external service
   backups
     .command('run-service')
@@ -316,27 +387,22 @@ async function createSchedule(options: CreateScheduleOptions): Promise<void> {
   const isAutomation = options.yes && options.name && options.type && options.schedule && options.retention && options.s3SourceId
 
   if (isAutomation) {
+    const validated = validateCreateScheduleAutomation({
+      type: options.type!,
+      retention: options.retention!,
+      s3SourceId: options.s3SourceId!,
+    })
+    if (!validated.ok) {
+      warning(validated.error)
+      return
+    }
+
     name = options.name!
-    backupType = options.type!
+    backupType = validated.backupType
     scheduleExpression = options.schedule!
-    retentionDays = parseInt(options.retention!, 10)
+    retentionDays = validated.retentionDays
     description = options.description || null
-    s3SourceId = parseInt(options.s3SourceId!, 10)
-
-    if (backupType !== 'full' && backupType !== 'incremental') {
-      warning(`Invalid backup type: ${backupType}. Supported: full, incremental`)
-      return
-    }
-
-    if (isNaN(retentionDays) || retentionDays <= 0) {
-      warning('Invalid retention period')
-      return
-    }
-
-    if (isNaN(s3SourceId)) {
-      warning('Invalid S3 Source ID')
-      return
-    }
+    s3SourceId = validated.s3SourceId
   } else {
     // Interactive mode
     name = options.name || await promptText({
@@ -985,9 +1051,155 @@ async function showBackup(options: ShowBackupOptions): Promise<void> {
   newline()
 }
 
+async function deleteBackup(options: DeleteBackupOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  if (!options.force && !options.yes) {
+    const confirmed = await promptConfirm({
+      message: `Permanently delete backup ${options.id} from object storage?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  await withSpinner('Deleting backup...', async () => {
+    const { error } = await client.delete({
+      url: '/backups/{id}',
+      path: { id: options.id },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+  })
+  success(`Backup ${options.id} deleted`)
+}
+
+async function cleanupBackups(options: CleanupBackupsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const scheduleId = parseCleanupScheduleId(options.scheduleId)
+
+  const preview = await withSpinner('Previewing expired backups...', async () => {
+    const { data, error } = await client.post<RetentionCleanupReport>({
+      url: '/backups/cleanup',
+      query: { dry_run: true, schedule_id: scheduleId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    if (!data) throw new Error('Cleanup preview returned no report')
+    return data
+  })
+
+  if (options.dryRun) {
+    if (options.json) {
+      json(preview)
+      return
+    }
+    info(`Dry run: ${preview.expired} backup${preview.expired === 1 ? '' : 's'} would be deleted`)
+    for (const backupId of preview.candidate_backup_ids) info(backupId)
+    if (preview.candidate_backup_ids_truncated) warning('More candidates remain beyond this 100-backup batch')
+    return
+  }
+
+  if (preview.candidate_backup_ids.length === 0) {
+    info('No expired backups found')
+    return
+  }
+
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message: scheduleId
+        ? `Delete ${preview.expired} backup(s) expired by schedule ${scheduleId}'s retention policy?`
+        : `Delete ${preview.expired} backup(s) older than their schedule retention periods?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  const report: RetentionCleanupReport = {
+    ...preview,
+    dry_run: false,
+    expired: 0,
+    deleted: 0,
+    failed: 0,
+    failures: [],
+    candidate_backup_ids: [],
+    candidate_backup_ids_truncated: false,
+  }
+  let batch = preview
+  while (batch.candidate_backup_ids.length > 0) {
+    const current = batch
+    const result = await withSpinner(
+      `Deleting ${current.candidate_backup_ids.length} previewed backup(s)...`,
+      async () => {
+        const { data, error } = await client.post<RetentionCleanupReport>({
+          url: '/backups/cleanup',
+          query: { schedule_id: scheduleId },
+          body: { expected_backup_ids: current.candidate_backup_ids },
+        })
+        if (error) throw new Error(getErrorMessage(error))
+        if (!data) throw new Error('Cleanup returned no report')
+        return data
+      },
+    )
+    accumulateCleanupBatch(report, result)
+    if (!current.candidate_backup_ids_truncated || result.failed > 0) break
+    batch = await withSpinner('Previewing the next cleanup batch...', async () => {
+      const { data, error } = await client.post<RetentionCleanupReport>({
+        url: '/backups/cleanup',
+        query: { dry_run: true, schedule_id: scheduleId },
+      })
+      if (error) throw new Error(getErrorMessage(error))
+      if (!data) throw new Error('Cleanup preview returned no report')
+      return data
+    })
+  }
+
+  if (options.json) {
+    json(report)
+    return
+  }
+  success(`Cleanup finished: ${report.deleted} deleted, ${report.failed} failed`)
+  if (report.failed > 0) {
+    for (const failure of report.failures) {
+      warning(`${failure.backup_id}: ${failure.reason}`)
+    }
+  }
+}
+
 // Helpers
 
-function formatBytes(bytes?: number | null): string {
+export function parseCleanupScheduleId(value?: string): number | undefined {
+  if (!value) return undefined
+  const scheduleId = Number.parseInt(value, 10)
+  if (!Number.isInteger(scheduleId) || scheduleId <= 0) {
+    throw new Error('--schedule-id must be a positive integer')
+  }
+  return scheduleId
+}
+
+/**
+ * Merges one cleanup batch's report into the running total, capping the
+ * sampled `candidate_backup_ids` at 100 entries (mirrors the server's own
+ * cap) and flagging truncation whenever a batch had more ids than fit.
+ */
+export function accumulateCleanupBatch(report: RetentionCleanupReport, result: RetentionCleanupReport): void {
+  report.expired += result.expired
+  report.deleted += result.deleted
+  report.failed += result.failed
+  report.failures.push(...result.failures)
+  const remainingSampleSlots = Math.max(0, 100 - report.candidate_backup_ids.length)
+  report.candidate_backup_ids.push(...result.candidate_backup_ids.slice(0, remainingSampleSlots))
+  report.candidate_backup_ids_truncated ||=
+    result.candidate_backup_ids_truncated || result.candidate_backup_ids.length > remainingSampleSlots
+}
+
+export function formatBytes(bytes?: number | null): string {
   if (bytes === undefined || bytes === null) return '-'
   if (bytes === 0) return '0 B'
 
@@ -998,7 +1210,7 @@ function formatBytes(bytes?: number | null): string {
   return `${size.toFixed(1)} ${units[i]}`
 }
 
-function maskSecret(value: string): string {
+export function maskSecret(value: string): string {
   if (value.length <= 4) return '***'
   return value.slice(0, 4) + '***' + value.slice(-2)
 }

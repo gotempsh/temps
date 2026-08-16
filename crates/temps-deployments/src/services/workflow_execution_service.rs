@@ -2,7 +2,7 @@
 //!
 //! Executes deployment jobs as workflows using the WorkflowExecutor
 
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
+use sea_orm::{ColumnTrait, Condition, EntityTrait, QueryFilter, QueryOrder, QuerySelect};
 use std::sync::Arc;
 use temps_core::{
     Job, JobQueue, WorkflowBuilder, WorkflowCancellationProvider, WorkflowError, WorkflowExecutor,
@@ -18,48 +18,557 @@ use tracing::{debug, error, info, warn};
 
 use crate::jobs::{
     AgentSyncService, BuildImageJobBuilder, ConfigureAgentsJobBuilder, ConfigureCronsJobBuilder,
-    CronConfigService, DeployImageJobBuilder, DeployStaticBundleJob, DeployStaticJob,
-    DeploymentTarget, DownloadRepoBuilder, PullExternalImageJob, ResourceUsage,
+    ConfigureMetricAlertsJobBuilder, CronConfigService, DeployImageJobBuilder,
+    DeployStaticBundleJob, DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
+    MetricAlertConfigService, PrepareSourceBundleJob, PullExternalImageJob, ResourceUsage,
     VerifyLocalImageJob,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
 
-/// Map a deployment's free-form failure reason to a coarse, NON-identifying
-/// category for telemetry. The raw reason can contain build logs, file paths,
-/// or repo names, so it is never sent verbatim — only one of these stable
-/// labels (or `unknown`). Matching is on lowercased substrings.
-fn categorize_failure_reason(reason: Option<&str>) -> &'static str {
+/// Version of the allowlisted failure taxonomy emitted in deployment telemetry.
+/// Increment this when matching semantics or wire labels change.
+const FAILURE_CLASSIFIER_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeploymentFailureStage {
+    Source,
+    Configuration,
+    DependencyInstall,
+    Build,
+    Image,
+    Deploy,
+    Runtime,
+    HealthCheck,
+    Resource,
+    Platform,
+    Unknown,
+}
+
+/// Read all per-service Compose runtime selections together so a new setting
+/// cannot be persisted successfully and then be silently omitted by the
+/// deployment workflow.
+fn compose_service_security_settings(
+    preset_config: Option<&temps_entities::preset::PresetConfig>,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    match preset_config {
+        Some(temps_entities::preset::PresetConfig::DockerCompose(config)) => (
+            config.excluded_services.clone(),
+            config.relaxed_capability_services.clone(),
+            config.unsandboxed_services.clone(),
+        ),
+        _ => (Vec::new(), Vec::new(), Vec::new()),
+    }
+}
+
+impl DeploymentFailureStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Configuration => "configuration",
+            Self::DependencyInstall => "dependency_install",
+            Self::Build => "build",
+            Self::Image => "image",
+            Self::Deploy => "deploy",
+            Self::Runtime => "runtime",
+            Self::HealthCheck => "health_check",
+            Self::Resource => "resource",
+            Self::Platform => "platform",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeploymentFailureCode {
+    OutOfMemory,
+    DiskExhausted,
+    Timeout,
+    HealthCheckFailed,
+    RepositoryAuthentication,
+    RepositoryNotFound,
+    RepositoryClone,
+    DnsResolution,
+    NetworkConnection,
+    DependencyLockfileOutOfSync,
+    DependencyResolution,
+    DependencyDownload,
+    RuntimeVersionUnsupported,
+    MissingBuildScript,
+    CompileError,
+    DockerfileInvalid,
+    BaseImagePull,
+    ImageMissing,
+    StaticOutputMissing,
+    PortUnavailable,
+    PermissionDenied,
+    InvalidConfiguration,
+    ContainerStart,
+    BuildError,
+    PlatformInternal,
+    Cancelled,
+    Unknown,
+}
+
+impl DeploymentFailureCode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::OutOfMemory => "out_of_memory",
+            Self::DiskExhausted => "disk_exhausted",
+            Self::Timeout => "timeout",
+            Self::HealthCheckFailed => "health_check_failed",
+            Self::RepositoryAuthentication => "repository_authentication",
+            Self::RepositoryNotFound => "repository_not_found",
+            Self::RepositoryClone => "repository_clone",
+            Self::DnsResolution => "dns_resolution",
+            Self::NetworkConnection => "network_connection",
+            Self::DependencyLockfileOutOfSync => "dependency_lockfile_out_of_sync",
+            Self::DependencyResolution => "dependency_resolution",
+            Self::DependencyDownload => "dependency_download",
+            Self::RuntimeVersionUnsupported => "runtime_version_unsupported",
+            Self::MissingBuildScript => "missing_build_script",
+            Self::CompileError => "compile_error",
+            Self::DockerfileInvalid => "dockerfile_invalid",
+            Self::BaseImagePull => "base_image_pull",
+            Self::ImageMissing => "image_missing",
+            Self::StaticOutputMissing => "static_output_missing",
+            Self::PortUnavailable => "port_unavailable",
+            Self::PermissionDenied => "permission_denied",
+            Self::InvalidConfiguration => "invalid_configuration",
+            Self::ContainerStart => "container_start",
+            Self::BuildError => "build_error",
+            Self::PlatformInternal => "platform_internal",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DeploymentFailureClassification {
+    stage: DeploymentFailureStage,
+    code: DeploymentFailureCode,
+    /// Coarse pre-taxonomy value retained for telemetry consumers that already
+    /// group by `reason`.
+    legacy_reason: &'static str,
+}
+
+impl DeploymentFailureClassification {
+    const fn new(
+        stage: DeploymentFailureStage,
+        code: DeploymentFailureCode,
+        legacy_reason: &'static str,
+    ) -> Self {
+        Self {
+            stage,
+            code,
+            legacy_reason,
+        }
+    }
+}
+
+fn contains_any(reason: &str, signals: &[&str]) -> bool {
+    signals.iter().any(|signal| reason.contains(signal))
+}
+
+/// Add bounded template context without allowing operator-defined template
+/// slugs to become identifying or high-cardinality outbound telemetry.
+fn with_template_telemetry(
+    event: temps_core::telemetry::TelemetryEvent,
+    template_slug: Option<&str>,
+) -> temps_core::telemetry::TelemetryEvent {
+    let safe_slug = template_slug.and_then(temps_core::templates::telemetry_safe_template_slug);
+    let template_source = match (template_slug, safe_slug) {
+        (None, _) => "none",
+        (Some(_), Some(_)) => "bundled",
+        (Some(_), None) => "custom",
+    };
+
+    event
+        .with("is_template", template_slug.is_some())
+        .with("template_source", template_source)
+        .with_opt("template_slug", safe_slug.map(str::to_string))
+}
+
+/// Preserve the pre-taxonomy `reason` wire value exactly for existing
+/// telemetry consumers. New stage/code matching may be more specific, but it
+/// must not silently change this compatibility dimension.
+fn legacy_failure_reason(reason: Option<&str>) -> &'static str {
     let Some(reason) = reason else {
         return "unknown";
     };
-    let r = reason.to_lowercase();
+    let reason = reason.to_lowercase();
 
-    // Order matters: check the most specific signals first.
-    if r.contains("out of memory") || r.contains("oom") || r.contains("exit code 137") {
+    if reason.contains("out of memory")
+        || reason.contains("oom")
+        || reason.contains("exit code 137")
+    {
         "oom"
-    } else if r.contains("timeout") || r.contains("timed out") || r.contains("deadline") {
+    } else if reason.contains("timeout")
+        || reason.contains("timed out")
+        || reason.contains("deadline")
+    {
         "timeout"
-    } else if r.contains("health check") || r.contains("healthcheck") || r.contains("unhealthy") {
+    } else if reason.contains("health check")
+        || reason.contains("healthcheck")
+        || reason.contains("unhealthy")
+    {
         "health_check"
-    } else if r.contains("build") || r.contains("compile") || r.contains("nixpacks") {
+    } else if reason.contains("build") || reason.contains("compile") || reason.contains("nixpacks")
+    {
         "build_error"
-    } else if r.contains("clone")
-        || r.contains("network")
-        || r.contains("connection")
-        || r.contains("download")
-        || r.contains("dns")
+    } else if reason.contains("clone")
+        || reason.contains("network")
+        || reason.contains("connection")
+        || reason.contains("download")
+        || reason.contains("dns")
     {
         "network"
-    } else if r.contains("image")
-        && (r.contains("not found") || r.contains("missing") || r.contains("no such"))
+    } else if reason.contains("image")
+        && (reason.contains("not found")
+            || reason.contains("missing")
+            || reason.contains("no such"))
     {
         "image_missing"
-    } else if r.contains("cancel") {
+    } else if reason.contains("cancel") {
         "cancelled"
     } else {
         "unknown"
     }
+}
+
+/// Classify a deployment's free-form failure reason locally into fixed,
+/// NON-identifying labels. The raw reason can contain secrets, source code,
+/// paths, repository names, and dependency names, so it must never leave the
+/// instance. Matching order is deliberately most-specific-first.
+fn classify_failure_reason(reason: Option<&str>) -> DeploymentFailureClassification {
+    let Some(reason) = reason else {
+        return DeploymentFailureClassification::new(
+            DeploymentFailureStage::Unknown,
+            DeploymentFailureCode::Unknown,
+            "unknown",
+        );
+    };
+    let r = reason.to_lowercase();
+
+    let classification =
+        if contains_any(&r, &["out of memory", "oom", "oomkilled", "exit code 137"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::OutOfMemory,
+                "oom",
+            )
+        } else if contains_any(
+            &r,
+            &["no space left on device", "disk quota exceeded", "enospc"],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::DiskExhausted,
+                "unknown",
+            )
+        } else if contains_any(&r, &["health check", "healthcheck", "unhealthy"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::HealthCheck,
+                DeploymentFailureCode::HealthCheckFailed,
+                "health_check",
+            )
+        } else if contains_any(&r, &["timeout", "timed out", "deadline"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::Timeout,
+                "timeout",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "authentication failed",
+                "could not read username",
+                "permission denied (publickey)",
+                "invalid credentials",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryAuthentication,
+                "network",
+            )
+        } else if contains_any(&r, &["repository not found", "remote ref does not exist"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryNotFound,
+                "network",
+            )
+        } else if contains_any(&r, &["failed to clone", "git clone", "clone task failed"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryClone,
+                "network",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "could not resolve host",
+                "name or service not known",
+                "dns lookup failed",
+                "dns resolution",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::DnsResolution,
+                "network",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "err_pnpm_outdated_lockfile",
+                "frozen lockfile",
+                "lockfile is out of date",
+                "package-lock.json is not in sync",
+                "yarn.lock needs to be updated",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyLockfileOutOfSync,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "eresolve",
+                "could not resolve dependency",
+                "unable to resolve dependency tree",
+                "version solving failed",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyResolution,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "failed to download",
+                "error fetching packages",
+                "package download failed",
+                "registry request failed",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyDownload,
+                "network",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "ebadengine",
+                "unsupported engine",
+                "unsupported runtime",
+                "runtime version not found",
+                "no matching version found",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::RuntimeVersionUnsupported,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "missing script: build",
+                "command \"build\" not found",
+                "couldn't find a script named \"build\"",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::MissingBuildScript,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "compilation failed",
+                "failed to compile",
+                "syntax error",
+                "type error",
+                "typescript error",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::CompileError,
+                "build_error",
+            )
+        } else if r.contains("dockerfile")
+            && contains_any(
+                &r,
+                &["parse error", "invalid", "failed to read", "not found"],
+            )
+        {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::DockerfileInvalid,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "failed to pull image",
+                "pull access denied",
+                "manifest unknown",
+                "failed to resolve source metadata",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Image,
+                DeploymentFailureCode::BaseImagePull,
+                "network",
+            )
+        } else if r.contains("image")
+            && contains_any(&r, &["not found", "missing", "no such image"])
+        {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Image,
+                DeploymentFailureCode::ImageMissing,
+                "image_missing",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "static output directory not found",
+                "index.html not found",
+                "build output not found",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::StaticOutputMissing,
+                "build_error",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "address already in use",
+                "failed to find available port",
+                "no available port",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Deploy,
+                DeploymentFailureCode::PortUnavailable,
+                "unknown",
+            )
+        } else if contains_any(&r, &["permission denied", "operation not permitted"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::PermissionDenied,
+                "unknown",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "failed to parse .temps.yaml",
+                "invalid configuration",
+                "configuration validation failed",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::InvalidConfiguration,
+                "unknown",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "failed to start container",
+                "container failed to start",
+                "container exited before",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Runtime,
+                DeploymentFailureCode::ContainerStart,
+                "unknown",
+            )
+        } else if contains_any(
+            &r,
+            &["connection refused", "connection reset", "network error"],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::NetworkConnection,
+                "network",
+            )
+        } else if contains_any(&r, &["build", "compile", "nixpacks"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::BuildError,
+                "build_error",
+            )
+        } else if contains_any(&r, &["clone", "network", "connection", "download", "dns"]) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::NetworkConnection,
+                "network",
+            )
+        } else if r.contains("cancel") {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::Cancelled,
+                "cancelled",
+            )
+        } else if contains_any(
+            &r,
+            &[
+                "workflow execution failed",
+                "internal error",
+                "job validation failed",
+            ],
+        ) {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::PlatformInternal,
+                "unknown",
+            )
+        } else {
+            DeploymentFailureClassification::new(
+                DeploymentFailureStage::Unknown,
+                DeploymentFailureCode::Unknown,
+                "unknown",
+            )
+        };
+
+    DeploymentFailureClassification {
+        legacy_reason: legacy_failure_reason(Some(reason)),
+        ..classification
+    }
+}
+
+fn deploy_failed_telemetry_event(
+    reason: Option<&str>,
+    source_type: Option<String>,
+    preset: Option<String>,
+    template_slug: Option<String>,
+) -> temps_core::telemetry::TelemetryEvent {
+    let failure = classify_failure_reason(reason);
+    with_template_telemetry(
+        temps_core::telemetry::TelemetryEvent::new(
+            temps_core::telemetry::TelemetryEventKind::DeployFailed,
+        )
+        .with("reason", failure.legacy_reason)
+        .with("failure_stage", failure.stage.as_str())
+        .with("failure_code", failure.code.as_str())
+        .with("classifier_version", FAILURE_CLASSIFIER_VERSION)
+        .with_opt("source_type", source_type)
+        .with_opt("preset", preset),
+        template_slug.as_deref(),
+    )
 }
 
 /// Service for executing deployment workflows
@@ -72,6 +581,7 @@ pub struct WorkflowExecutionService {
     static_deployer: Arc<dyn StaticDeployer>,
     log_service: Arc<LogService>,
     cron_service: Arc<dyn CronConfigService>,
+    alert_service: Arc<dyn MetricAlertConfigService>,
     agent_sync_service: Arc<dyn AgentSyncService>,
     config_service: Arc<temps_config::ConfigService>,
     screenshot_service: Arc<ScreenshotService>,
@@ -97,6 +607,7 @@ impl WorkflowExecutionService {
         static_deployer: Arc<dyn StaticDeployer>,
         log_service: Arc<LogService>,
         cron_service: Arc<dyn CronConfigService>,
+        alert_service: Arc<dyn MetricAlertConfigService>,
         agent_sync_service: Arc<dyn AgentSyncService>,
         config_service: Arc<temps_config::ConfigService>,
         screenshot_service: Arc<ScreenshotService>,
@@ -111,6 +622,7 @@ impl WorkflowExecutionService {
             static_deployer,
             log_service,
             cron_service,
+            alert_service,
             agent_sync_service,
             config_service,
             screenshot_service,
@@ -180,14 +692,18 @@ impl WorkflowExecutionService {
         // Anonymous telemetry: a deploy is now being attempted. This runs once
         // per deployment workflow. Properties are non-identifying enum labels
         // (source type, build preset) plus whether this is a preview env.
-        self.telemetry().report(
+        self.telemetry().report(with_template_telemetry(
             temps_core::telemetry::TelemetryEvent::new(
                 temps_core::telemetry::TelemetryEventKind::DeployAttempted,
             )
             .with("source_type", project.source_type.to_string())
-            .with("preset", project.preset.to_string())
+            .with(
+                "preset",
+                temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
+            )
             .with("is_preview", environment.is_preview),
-        );
+            project.template_slug.as_deref(),
+        ));
 
         // Load all jobs for this deployment
         let db_jobs = self.get_deployment_jobs(deployment_id).await?;
@@ -299,6 +815,45 @@ impl WorkflowExecutionService {
                 // is now handled by the MarkDeploymentCompleteJob that runs as part of the workflow.
                 // We don't perform any additional updates here to avoid duplicate database writes.
 
+                // Anonymous telemetry: the executor only returns Ok once every
+                // required job — including MarkDeploymentCompleteJob, which
+                // flips the deployment to "completed" — has succeeded, so this
+                // is the canonical terminal success point. The Completed arm in
+                // update_deployment_status_with_reason is NOT reached on this
+                // path (finalization bypasses it), so success must be emitted
+                // here to pair with the deploy_attempted event above.
+                let telemetry = self.telemetry();
+                telemetry.report(with_template_telemetry(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::DeploySucceeded,
+                    )
+                    .with("source_type", project.source_type.to_string())
+                    .with(
+                        "preset",
+                        temps_presets::runtime_slug(project.preset, project.preset_config.as_ref()),
+                    )
+                    .with("is_preview", environment.is_preview),
+                    project.template_slug.as_deref(),
+                ));
+                // Once-per-instance: "this instance shipped its first deploy".
+                telemetry.report_once(
+                    "first_deploy_succeeded",
+                    with_template_telemetry(
+                        temps_core::telemetry::TelemetryEvent::new(
+                            temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
+                        )
+                        .with("source_type", project.source_type.to_string())
+                        .with(
+                            "preset",
+                            temps_presets::runtime_slug(
+                                project.preset,
+                                project.preset_config.as_ref(),
+                            ),
+                        ),
+                        project.template_slug.as_deref(),
+                    ),
+                );
+
                 // NOW teardown previous deployment for zero-downtime deployment
                 // This happens AFTER the new deployment is fully running
                 info!("Checking for previous deployments to teardown after successful deployment");
@@ -306,7 +861,7 @@ impl WorkflowExecutionService {
                     .teardown_previous_deployment(
                         deployment.project_id,
                         deployment.environment_id,
-                        deployment_id,
+                        &deployment,
                     )
                     .await
                 {
@@ -363,13 +918,35 @@ impl WorkflowExecutionService {
                         deployment_id, e
                     );
 
-                    // Update deployment status to failed with reason
-                    self.update_deployment_status_with_reason(
-                        deployment_id,
-                        temps_entities::types::PipelineStatus::Failed,
-                        Some(error_message),
-                    )
-                    .await?;
+                    // Re-read the deployment state before writing "failed".
+                    // A concurrent rollback may have called
+                    // stop_environment_containers which atomically flips a
+                    // mid-flight deployment from "running" to "stopped" to
+                    // signal supersession. Overwriting "stopped" with "failed"
+                    // here would prevent promote/rollback from reusing this
+                    // deployment's image later. Skip the write when already
+                    // in a stable terminal state set by the control plane.
+                    let current_state = self
+                        .get_deployment(deployment_id)
+                        .await
+                        .map(|d| d.state)
+                        .unwrap_or_default();
+                    if current_state == "stopped" {
+                        info!(
+                            "Workflow for deployment {} ended with an error but \
+                             the deployment was already marked 'stopped' by a \
+                             concurrent rollback — preserving 'stopped'",
+                            deployment_id
+                        );
+                    } else {
+                        // Update deployment status to failed with reason
+                        self.update_deployment_status_with_reason(
+                            deployment_id,
+                            temps_entities::types::PipelineStatus::Failed,
+                            Some(error_message),
+                        )
+                        .await?;
+                    }
                 }
 
                 Err(WorkflowExecutionError::WorkflowFailed(e))
@@ -415,6 +992,7 @@ impl WorkflowExecutionService {
         project_id: i32,
     ) -> Result<projects::Model, WorkflowExecutionError> {
         projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| WorkflowExecutionError::ProjectNotFound(project_id))
@@ -425,6 +1003,7 @@ impl WorkflowExecutionService {
         environment_id: i32,
     ) -> Result<environments::Model, WorkflowExecutionError> {
         environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| WorkflowExecutionError::EnvironmentNotFound(environment_id))
@@ -518,10 +1097,13 @@ impl WorkflowExecutionService {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
 
-                // Get commit_sha from job config (for specific commit deployments)
+                // Get commit_sha from job config (for specific commit
+                // deployments). An empty string is "no commit", never a ref —
+                // older deployments stored '' for manual triggers.
                 let commit_sha = config
                     .get("commit_sha")
                     .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
 
                 let mut builder = DownloadRepoBuilder::new()
@@ -598,10 +1180,9 @@ impl WorkflowExecutionService {
                     .log_id(db_job.log_id.clone())
                     .log_service(self.log_service.clone());
 
-                // Pass preset (always available since it's required)
-                // Convert preset enum to string for builder
-                let preset_str = format!("{:?}", project.preset).to_lowercase();
-                builder = builder.preset(preset_str);
+                builder = builder
+                    .preset(project.preset)
+                    .preset_config(project.preset_config.clone());
 
                 // Unseal build args from job_config. The planner derives build
                 // args from env vars and stores them encrypted (build_args
@@ -625,6 +1206,94 @@ impl WorkflowExecutionService {
                     if let Some(build_context_str) = build_context_value.as_str() {
                         if !build_context_str.is_empty() && build_context_str != "." {
                             builder = builder.build_context(build_context_str.to_string());
+                        }
+                    }
+                }
+
+                // Cross-build for any worker architecture this deployment could
+                // be scheduled onto. Empty on a homogeneous cluster, which is
+                // the single native build every deployment does today.
+                //
+                // This runs at build time even though placement happens later,
+                // because the build job precedes scheduling in the workflow;
+                // the node selectors below are the same ones the scheduler will
+                // apply, so we never build for an architecture this deployment
+                // cannot land on.
+                //
+                // Off unless the operator asked for it. Cross-builds are
+                // emulated and slow, and deriving them from cluster topology
+                // would let one node joining change build behaviour for every
+                // deployment — including breaking builds outright on a control
+                // plane without the matching QEMU binfmt handlers. Environment
+                // setting wins, inheriting the project's when unset.
+                let cross_builds_enabled = environment
+                    .deployment_config
+                    .as_ref()
+                    .and_then(|c| c.cross_architecture_builds)
+                    .or_else(|| {
+                        project
+                            .deployment_config
+                            .as_ref()
+                            .and_then(|c| c.cross_architecture_builds)
+                    })
+                    .unwrap_or(false);
+
+                if !cross_builds_enabled {
+                    debug!(
+                        deployment_id = db_job.deployment_id,
+                        "Cross-architecture builds disabled; building for the control plane's \
+                         platform only"
+                    );
+                }
+
+                if let (true, Some(scheduler)) = (cross_builds_enabled, self.node_scheduler.get()) {
+                    let target_nodes = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
+                        .or_else(|| {
+                            project
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
+                        });
+                    let target_labels = environment
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|c| c.configured_target_labels().cloned())
+                        .or_else(|| {
+                            project
+                                .deployment_config
+                                .as_ref()
+                                .and_then(|c| c.configured_target_labels().cloned())
+                        });
+
+                    match scheduler
+                        .required_build_platforms(target_labels.as_ref(), target_nodes.as_deref())
+                        .await
+                    {
+                        Ok(platforms) if !platforms.is_empty() => {
+                            info!(
+                                deployment_id = db_job.deployment_id,
+                                platforms = ?platforms,
+                                "Cluster spans multiple architectures — building one image per platform"
+                            );
+                            builder = builder.target_platforms(platforms);
+                        }
+                        Ok(_) => {}
+                        Err(crate::services::node_service::NodeError::Validation { message }) => {
+                            return Err(WorkflowExecutionError::InvalidJobConfig(message));
+                        }
+                        // Not being able to enumerate nodes must not block a
+                        // build: fall back to the native-only build and let the
+                        // deploy path's architecture check catch a mismatch.
+                        Err(e) => {
+                            warn!(
+                                deployment_id = db_job.deployment_id,
+                                "Could not determine cluster architectures ({}); \
+                                 building for the control plane's platform only",
+                                e
+                            );
                         }
                     }
                 }
@@ -748,24 +1417,24 @@ impl WorkflowExecutionService {
                 let target_nodes = environment
                     .deployment_config
                     .as_ref()
-                    .and_then(|c| c.target_nodes.clone())
+                    .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                     .or_else(|| {
                         project
                             .deployment_config
                             .as_ref()
-                            .and_then(|c| c.target_nodes.clone())
+                            .and_then(|c| c.configured_target_nodes().map(<[i32]>::to_vec))
                     });
 
                 // Resolve target_labels from environment or project config
                 let target_labels = environment
                     .deployment_config
                     .as_ref()
-                    .and_then(|c| c.target_labels.clone())
+                    .and_then(|c| c.configured_target_labels().cloned())
                     .or_else(|| {
                         project
                             .deployment_config
                             .as_ref()
-                            .and_then(|c| c.target_labels.clone())
+                            .and_then(|c| c.configured_target_labels().cloned())
                     });
 
                 // Resolve CPU/memory limits + requests from environment first,
@@ -975,6 +1644,43 @@ impl WorkflowExecutionService {
                 Ok(Arc::new(job))
             }
 
+            "ConfigureMetricAlertsJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                let download_job_id = config
+                    .get("download_job_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("download_repo")
+                    .to_string();
+
+                let dependencies: Vec<String> = db_job
+                    .dependencies
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                let deploy_container_job_id = dependencies
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "mark_deployment_complete".to_string());
+
+                let alert_service = self.alert_service.clone();
+
+                let job = ConfigureMetricAlertsJobBuilder::new()
+                    .job_id(db_job.job_id.clone())
+                    .download_job_id(download_job_id)
+                    .deploy_container_job_id(deploy_container_job_id)
+                    .project_id(project.id)
+                    .environment_id(environment.id)
+                    .log_id(db_job.log_id.clone())
+                    .log_service(self.log_service.clone())
+                    .build(self.db.clone(), alert_service)?;
+
+                Ok(Arc::new(job))
+            }
+
             "ConfigureAgentsJob" => {
                 let config = db_job.job_config.as_ref().ok_or_else(|| {
                     WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
@@ -1117,14 +1823,13 @@ impl WorkflowExecutionService {
                     })?
                     .to_string();
 
+                // Manual triggers (redeploy, import) have no commit — the
+                // scan still runs against the built image; the commit is
+                // only recorded as scan metadata when known.
                 let commit_hash = config
                     .get("commit_hash")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        WorkflowExecutionError::InvalidJobConfig(
-                            "commit_hash is required".to_string(),
-                        )
-                    })?
+                    .unwrap_or_default()
                     .to_string();
 
                 let download_job_id = config
@@ -1230,6 +1935,77 @@ impl WorkflowExecutionService {
                     search_paths,
                     path_rewrites,
                     self.image_builder.clone(),
+                    source_map_service,
+                )
+                .with_log_id(db_job.log_id.clone())
+                .with_log_service(self.log_service.clone());
+
+                Ok(Arc::new(job))
+            }
+
+            "CaptureSourceFilesJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                let project_id = config
+                    .get("project_id")
+                    .and_then(|v| v.as_i64())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "project_id is required".to_string(),
+                        )
+                    })? as i32;
+
+                let release = config
+                    .get("release")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig("release is required".to_string())
+                    })?
+                    .to_string();
+
+                let download_job_id = config
+                    .get("download_job_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("download_repo")
+                    .to_string();
+
+                let build_job_id = config
+                    .get("build_job_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("build_image")
+                    .to_string();
+
+                // None (or null) = default to the Docker build context.
+                let error_source_root = config
+                    .get("error_source_root")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                let extensions: Vec<String> = config
+                    .get("extensions")
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                let source_map_service = self
+                    .source_map_service
+                    .get()
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "SourceMapService not configured".to_string(),
+                        )
+                    })?
+                    .clone();
+
+                let job = crate::jobs::CaptureSourceFilesJob::new(
+                    db_job.job_id.clone(),
+                    project_id,
+                    release,
+                    download_job_id,
+                    build_job_id,
+                    error_source_root,
+                    extensions,
                     source_map_service,
                 )
                 .with_log_id(db_job.log_id.clone())
@@ -1399,6 +2175,8 @@ impl WorkflowExecutionService {
                     .and_then(|v| v.as_i64())
                     .map(|id| id as i32);
 
+                let image_registry = PullExternalImageJob::registry_from_image_ref(&image_ref);
+
                 let mut job = PullExternalImageJob::new(
                     db_job.job_id.clone(),
                     image_ref,
@@ -1407,19 +2185,37 @@ impl WorkflowExecutionService {
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
-                // Pass private registry credentials when configured
+                // Pass private registry credentials only to the configured registry.
                 if let Ok(settings) = self.config_service.get_settings().await {
                     let reg = &settings.docker_registry;
                     if reg.enabled {
-                        if let (Some(username), Some(password)) =
-                            (reg.username.clone(), reg.password.clone())
-                        {
-                            job = job.with_registry_credentials(bollard::auth::DockerCredentials {
-                                username: Some(username),
-                                password: Some(password),
-                                serveraddress: reg.registry_url.clone(),
-                                ..Default::default()
-                            });
+                        if let (Some(username), Some(password), Some(registry_url)) = (
+                            reg.username.clone(),
+                            reg.password.clone(),
+                            reg.registry_url.clone(),
+                        ) {
+                            let configured_registry =
+                                PullExternalImageJob::registry_host_from_url(&registry_url);
+                            if matches!(
+                                (&image_registry, &configured_registry),
+                                (Some(image_registry), Some(configured_registry))
+                                    if image_registry == configured_registry
+                            ) {
+                                job = job.with_registry_credentials(
+                                    bollard::auth::DockerCredentials {
+                                        username: Some(username),
+                                        password: Some(password),
+                                        serveraddress: Some(registry_url),
+                                        ..Default::default()
+                                    },
+                                );
+                            } else {
+                                warn!(
+                                    image_registry = ?image_registry,
+                                    configured_registry = ?configured_registry,
+                                    "Skipping Docker registry credentials because the image registry does not match"
+                                );
+                            }
                         }
                     }
                 }
@@ -1483,6 +2279,11 @@ impl WorkflowExecutionService {
                     .get("static_bundle_id")
                     .and_then(|v| v.as_i64())
                     .map(|id| id as i32);
+                let source_directory = config
+                    .get("source_directory")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or(".")
+                    .to_string();
 
                 // Get data directory from config service for local storage
                 let data_dir = self.config_service.data_dir();
@@ -1496,12 +2297,49 @@ impl WorkflowExecutionService {
                     project.slug.clone(),
                     environment.slug.clone(),
                     deployment.slug.clone(),
+                    source_directory,
                     data_dir,
                     self.static_deployer.clone(),
                 )
                 .with_log_service(self.log_service.clone(), db_job.log_id.clone());
 
                 Ok(Arc::new(job))
+            }
+
+            "PrepareSourceBundleJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+                let archive_path = config
+                    .get("archive_path")
+                    .and_then(|value| value.as_str())
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::InvalidJobConfig(
+                            "archive_path is required".to_string(),
+                        )
+                    })?;
+                let archive_path = std::path::Path::new(archive_path);
+                if archive_path.is_absolute()
+                    || archive_path.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(WorkflowExecutionError::InvalidJobConfig(
+                        "source archive path must remain inside the Temps data directory"
+                            .to_string(),
+                    ));
+                }
+                let absolute_path = self.config_service.data_dir().join(archive_path);
+                Ok(Arc::new(PrepareSourceBundleJob::new(
+                    db_job.job_id.clone(),
+                    absolute_path,
+                    project.slug.clone(),
+                )))
             }
 
             // Unsupported job types - log warning but don't fail the entire workflow
@@ -1532,11 +2370,23 @@ impl WorkflowExecutionService {
                     "environment_vars",
                 )
                 .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                let build_args = crate::services::sensitive_envelope::read_sealed(
+                    config,
+                    self.encryption_service.get(),
+                    "build_args",
+                )
+                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
 
+                // Projects created before directory normalization was applied on
+                // every write path can hold "" or "/" here. Both are rejected by
+                // the job's path confinement, so normalize to the repo root
+                // marker instead of failing the deployment.
                 let directory = config
                     .get("directory")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("./")
+                    .map(|d| d.trim().trim_start_matches('/'))
+                    .filter(|d| !d.is_empty())
+                    .unwrap_or(".")
                     .to_string();
 
                 // Get dependencies to find the download job ID
@@ -1566,6 +2416,21 @@ impl WorkflowExecutionService {
                     }
                 });
 
+                // Services the user opted to exclude from this project's compose
+                // stack (e.g. an unmanaged database in favor of a Temps-managed one).
+                let (excluded_services, relaxed_capability_services, unsandboxed_services) =
+                    compose_service_security_settings(project.preset_config.as_ref());
+                let public_ports = project
+                    .preset_config
+                    .as_ref()
+                    .and_then(|config| match config {
+                        temps_entities::preset::PresetConfig::DockerCompose(config) => {
+                            Some(config.public_ports.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_default();
+
                 let compose_executor = Arc::new(temps_deployer::compose::ComposeExecutor::new(
                     self.docker.clone(),
                     self.config_service.data_dir(),
@@ -1581,8 +2446,13 @@ impl WorkflowExecutionService {
                     .directory(directory)
                     .compose_content(compose_content)
                     .compose_override(compose_override)
+                    .excluded_services(excluded_services)
+                    .relaxed_capability_services(relaxed_capability_services)
+                    .unsandboxed_services(unsandboxed_services)
+                    .public_ports(public_ports)
                     .download_job_id(download_job_id)
                     .environment_vars(env_vars)
+                    .build_args(build_args)
                     .log_id(Some(db_job.log_id.clone()))
                     .log_service(self.log_service.clone())
                     .build()?;
@@ -1663,19 +2533,6 @@ impl WorkflowExecutionService {
                 ))
             })?;
 
-        // Non-identifying deploy labels for telemetry (best-effort). Looked up
-        // once here so both the success and failure telemetry below can report
-        // which preset / source type the deploy used — that's what lets us see
-        // *which* presets fail most, not just the overall failure rate.
-        let (telemetry_source_type, telemetry_preset) =
-            match projects::Entity::find_by_id(updated_deployment.project_id)
-                .one(self.db.as_ref())
-                .await
-            {
-                Ok(Some(p)) => (Some(p.source_type.to_string()), Some(p.preset.to_string())),
-                _ => (None, None),
-            };
-
         match status {
             temps_entities::types::PipelineStatus::Completed => {
                 // Get deployment URL from environment: prefer custom host, fall back to preview domain
@@ -1725,33 +2582,35 @@ impl WorkflowExecutionService {
                     );
                 }
 
-                // Anonymous telemetry: this is the single canonical terminal
-                // success point for a deployment. `first_deploy_succeeded` is
-                // emitted alongside; the central API dedupes it per instance.
-                // Both carry the non-identifying preset/source_type so success
-                // rates can be sliced by build type.
-                let telemetry = self.telemetry();
-                telemetry.report(
-                    temps_core::telemetry::TelemetryEvent::new(
-                        temps_core::telemetry::TelemetryEventKind::DeploySucceeded,
-                    )
-                    .with_opt("source_type", telemetry_source_type.clone())
-                    .with_opt("preset", telemetry_preset.clone()),
-                );
-                // Once-per-instance: "this instance shipped its first deploy".
-                // Guard so it fires once (the central API previously deduped
-                // this; report_once makes the binary itself emit exactly once),
-                // not on every successful deploy.
-                telemetry.report_once(
-                    "first_deploy_succeeded",
-                    temps_core::telemetry::TelemetryEvent::new(
-                        temps_core::telemetry::TelemetryEventKind::FirstDeploySucceeded,
-                    )
-                    .with_opt("source_type", telemetry_source_type.clone())
-                    .with_opt("preset", telemetry_preset.clone()),
-                );
+                // Anonymous telemetry for deploy success is NOT emitted here.
+                // On the real success path, finalization is done by
+                // MarkDeploymentCompleteJob (which writes state="completed"
+                // directly), so this Completed arm is never reached for a
+                // normal deploy. `deploy_succeeded` / `first_deploy_succeeded`
+                // are emitted in execute_deployment_workflow's Ok arm instead —
+                // emitting here as well would double-count if this arm ever
+                // gains a caller.
             }
             temps_entities::types::PipelineStatus::Failed => {
+                // Best-effort labels used only for failure telemetry. Keep the
+                // lookup inside this arm so other status transitions do not pay
+                // for an unrelated project query.
+                let (telemetry_source_type, telemetry_preset, telemetry_template_slug) =
+                    match projects::Entity::find_by_id(updated_deployment.project_id)
+                        .one(self.db.as_ref())
+                        .await
+                    {
+                        Ok(Some(project)) => (
+                            Some(project.source_type.to_string()),
+                            Some(temps_presets::runtime_slug(
+                                project.preset,
+                                project.preset_config.as_ref(),
+                            )),
+                            project.template_slug,
+                        ),
+                        _ => (None, None, None),
+                    };
+
                 let event = Job::DeploymentFailed(temps_core::DeploymentFailedJob {
                     deployment_id: updated_deployment.id,
                     project_id: updated_deployment.project_id,
@@ -1770,20 +2629,15 @@ impl WorkflowExecutionService {
 
                 // Anonymous telemetry: terminal failure point. The raw
                 // `cancelled_reason` may contain build logs / paths / repo
-                // names, so it is NEVER sent — only a coarse category label.
-                // preset/source_type are included so we can see which build
-                // types fail most (e.g. "nixpacks deploys OOM 3x more often").
-                self.telemetry().report(
-                    temps_core::telemetry::TelemetryEvent::new(
-                        temps_core::telemetry::TelemetryEventKind::DeployFailed,
-                    )
-                    .with(
-                        "reason",
-                        categorize_failure_reason(cancelled_reason.as_deref()),
-                    )
-                    .with_opt("source_type", telemetry_source_type.clone())
-                    .with_opt("preset", telemetry_preset.clone()),
-                );
+                // names, so it is NEVER sent — only fixed allowlisted stage,
+                // code, and legacy category labels. preset/source_type are
+                // included so we can compare failure rates by build type.
+                self.telemetry().report(deploy_failed_telemetry_event(
+                    cancelled_reason.as_deref(),
+                    telemetry_source_type.clone(),
+                    telemetry_preset.clone(),
+                    telemetry_template_slug.clone(),
+                ));
             }
             temps_entities::types::PipelineStatus::Cancelled => {
                 let event = Job::DeploymentCancelled(temps_core::DeploymentCancelledJob {
@@ -1800,6 +2654,23 @@ impl WorkflowExecutionService {
                         deployment_id
                     );
                 }
+
+                // Anonymous telemetry: this arm only runs when the workflow
+                // executor itself detected a "cancelled" error and the
+                // deployment wasn't already marked cancelled (see the
+                // `deployment.state != "cancelled"` guard in
+                // execute_deployment_workflow's Err arm above) — i.e. a
+                // cancellation whose origin wasn't the explicit user-cancel
+                // path in DeploymentService::cancel_deployment (which emits
+                // its own `deploy_cancelled` with trigger="user"). Tagging
+                // this one "workflow" keeps the two mutually exclusive so
+                // the funnel is never double-counted.
+                self.telemetry().report(
+                    temps_core::telemetry::TelemetryEvent::new(
+                        temps_core::telemetry::TelemetryEventKind::DeployCancelled,
+                    )
+                    .with("trigger", "workflow"),
+                );
             }
             _ => {}
         }
@@ -1939,11 +2810,13 @@ impl WorkflowExecutionService {
         &self,
         project_id: i32,
         environment_id: i32,
-        current_deployment_id: i32,
+        current_deployment: &deployments::Model,
     ) -> Result<Option<String>, WorkflowExecutionError> {
         use temps_entities::deployment_containers;
 
-        // Find previous deployments in this environment (excluding the current one).
+        // Find active deployments that are chronologically older than the
+        // current one. An older workflow can finish after a newer workflow;
+        // `id != current` would let it tear the newer deployment back down.
         //
         // Scope this to active states and cap the result, newest-first. This is a
         // safety net that runs in addition to MarkDeploymentCompleteJob's own
@@ -1958,7 +2831,15 @@ impl WorkflowExecutionService {
         let previous_deployments = deployments::Entity::find()
             .filter(deployments::Column::ProjectId.eq(project_id))
             .filter(deployments::Column::EnvironmentId.eq(environment_id))
-            .filter(deployments::Column::Id.ne(current_deployment_id)) // Exclude current deployment
+            .filter(
+                Condition::any()
+                    .add(deployments::Column::CreatedAt.lt(current_deployment.created_at))
+                    .add(
+                        Condition::all()
+                            .add(deployments::Column::CreatedAt.eq(current_deployment.created_at))
+                            .add(deployments::Column::Id.lt(current_deployment.id)),
+                    ),
+            )
             .filter(deployments::Column::State.is_in(vec![
                 "pending",
                 "running",
@@ -1994,6 +2875,22 @@ impl WorkflowExecutionService {
             for container in containers {
                 let container_id = container.container_id.clone();
 
+                // Mark the row deleted *before* stopping the container in Docker.
+                // ContainerHealthMonitor (temps-monitoring) polls
+                // `deployment_containers` filtered on `DeletedAt.is_null()` on its
+                // own independent schedule. If that poll lands between
+                // `stop_container()` below (which puts Docker's container state
+                // into `Exited`) and this row being marked deleted, it has no way
+                // to tell the exit was an intentional teardown and fires a false
+                // ContainerCrash alarm. Writing `deleted_at` first closes that
+                // window: once this update commits, the health monitor's next
+                // query no longer returns this row at all.
+                use sea_orm::{ActiveModelTrait, Set};
+                let mut active_container: deployment_containers::ActiveModel = container.into();
+                active_container.deleted_at = Set(Some(chrono::Utc::now()));
+                active_container.status = Set(Some("deleted".to_string()));
+                active_container.update(self.db.as_ref()).await?;
+
                 // Stop and remove the container
                 match self.container_deployer.stop_container(&container_id).await {
                     Ok(_) => {
@@ -2016,13 +2913,6 @@ impl WorkflowExecutionService {
                         warn!("Failed to remove container {}: {}", container_id, e);
                     }
                 }
-
-                // Mark container as deleted
-                use sea_orm::{ActiveModelTrait, Set};
-                let mut active_container: deployment_containers::ActiveModel = container.into();
-                active_container.deleted_at = Set(Some(chrono::Utc::now()));
-                active_container.status = Set(Some("deleted".to_string()));
-                active_container.update(self.db.as_ref()).await?;
 
                 if first_stopped_container_id.is_none() {
                     first_stopped_container_id = Some(container_id);
@@ -2058,13 +2948,13 @@ impl temps_core::LogWriter for NoOpLogWriter {
 }
 
 /// Database-backed cancellation provider that checks deployment state
-struct DatabaseCancellationProvider {
+pub(crate) struct DatabaseCancellationProvider {
     db: Arc<DbConnection>,
     deployment_id: i32,
 }
 
 impl DatabaseCancellationProvider {
-    fn new(db: Arc<DbConnection>, deployment_id: i32) -> Self {
+    pub(crate) fn new(db: Arc<DbConnection>, deployment_id: i32) -> Self {
         Self { db, deployment_id }
     }
 }
@@ -2072,16 +2962,6 @@ impl DatabaseCancellationProvider {
 #[async_trait::async_trait]
 impl WorkflowCancellationProvider for DatabaseCancellationProvider {
     async fn is_cancelled(&self, workflow_run_id: &str) -> Result<bool, WorkflowError> {
-        // Extract deployment_id from workflow_run_id (format: "deployment-{id}")
-        let expected_prefix = format!("deployment-{}", self.deployment_id);
-        if !workflow_run_id.starts_with(&expected_prefix) {
-            warn!(
-                "Workflow run ID '{}' doesn't match expected deployment ID {}",
-                workflow_run_id, self.deployment_id
-            );
-            return Ok(false);
-        }
-
         // Check deployment state in database
         match deployments::Entity::find_by_id(self.deployment_id)
             .one(self.db.as_ref())
@@ -2099,10 +2979,10 @@ impl WorkflowCancellationProvider for DatabaseCancellationProvider {
             }
             Ok(None) => {
                 warn!(
-                    "Deployment {} not found during cancellation check",
+                    "Deployment {} not found during cancellation check; treating it as cancelled",
                     self.deployment_id
                 );
-                Ok(false)
+                Ok(true)
             }
             Err(e) => {
                 error!(
@@ -2163,11 +3043,270 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use chrono::Utc;
-    use sea_orm::{ActiveModelTrait, Set};
+    use sea_orm::{ActiveModelTrait, DatabaseBackend, MockDatabase, Set};
     use std::collections::HashMap;
 
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, types::JobStatus, upstream_config::UpstreamList};
+
+    async fn docker_available() -> bool {
+        match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker.ping().await.is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    #[test]
+    fn compose_runtime_settings_flow_from_persisted_preset_config() {
+        let preset_config = temps_entities::preset::PresetConfig::DockerCompose(
+            temps_entities::preset::DockerComposeConfig {
+                excluded_services: vec!["managed-db".to_string()],
+                relaxed_capability_services: vec!["postgres".to_string()],
+                unsandboxed_services: vec!["webserver".to_string()],
+                ..Default::default()
+            },
+        );
+
+        let (excluded, relaxed, unsandboxed) =
+            compose_service_security_settings(Some(&preset_config));
+
+        assert_eq!(excluded, ["managed-db"]);
+        assert_eq!(relaxed, ["postgres"]);
+        assert_eq!(unsandboxed, ["webserver"]);
+    }
+
+    #[test]
+    fn failure_classifier_maps_specific_errors_to_allowlisted_stage_and_code() {
+        let cases = [
+            (
+                "process was OOMKilled (exit code 137)",
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::OutOfMemory,
+            ),
+            (
+                "write failed: no space left on device",
+                DeploymentFailureStage::Resource,
+                DeploymentFailureCode::DiskExhausted,
+            ),
+            (
+                "workflow deadline exceeded",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::Timeout,
+            ),
+            (
+                "application health check timed out",
+                DeploymentFailureStage::HealthCheck,
+                DeploymentFailureCode::HealthCheckFailed,
+            ),
+            (
+                "authentication failed while fetching repository",
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryAuthentication,
+            ),
+            (
+                "repository not found",
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryNotFound,
+            ),
+            (
+                "Git clone task failed",
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::RepositoryClone,
+            ),
+            (
+                "could not resolve host: example.invalid",
+                DeploymentFailureStage::Source,
+                DeploymentFailureCode::DnsResolution,
+            ),
+            (
+                "connection refused by build service",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::NetworkConnection,
+            ),
+            (
+                "ERR_PNPM_OUTDATED_LOCKFILE Cannot install with frozen lockfile",
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyLockfileOutOfSync,
+            ),
+            (
+                "npm ERR! ERESOLVE unable to resolve dependency tree",
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyResolution,
+            ),
+            (
+                "registry request failed while fetching packages",
+                DeploymentFailureStage::DependencyInstall,
+                DeploymentFailureCode::DependencyDownload,
+            ),
+            (
+                "npm ERR! code EBADENGINE Unsupported engine",
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::RuntimeVersionUnsupported,
+            ),
+            (
+                "npm error Missing script: build",
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::MissingBuildScript,
+            ),
+            (
+                "TypeScript error: failed to compile",
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::CompileError,
+            ),
+            (
+                "Dockerfile parse error on line 4",
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::DockerfileInvalid,
+            ),
+            (
+                "pull access denied for private/base-image",
+                DeploymentFailureStage::Image,
+                DeploymentFailureCode::BaseImagePull,
+            ),
+            (
+                "built image not found",
+                DeploymentFailureStage::Image,
+                DeploymentFailureCode::ImageMissing,
+            ),
+            (
+                "static output directory not found",
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::StaticOutputMissing,
+            ),
+            (
+                "failed to find available port",
+                DeploymentFailureStage::Deploy,
+                DeploymentFailureCode::PortUnavailable,
+            ),
+            (
+                "operation not permitted while creating build directory",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::PermissionDenied,
+            ),
+            (
+                "failed to parse .temps.yaml: invalid field",
+                DeploymentFailureStage::Configuration,
+                DeploymentFailureCode::InvalidConfiguration,
+            ),
+            (
+                "failed to start container",
+                DeploymentFailureStage::Runtime,
+                DeploymentFailureCode::ContainerStart,
+            ),
+            (
+                "Nixpacks build failed",
+                DeploymentFailureStage::Build,
+                DeploymentFailureCode::BuildError,
+            ),
+            (
+                "workflow execution failed before scheduling",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::PlatformInternal,
+            ),
+            (
+                "deployment cancelled by workflow",
+                DeploymentFailureStage::Platform,
+                DeploymentFailureCode::Cancelled,
+            ),
+        ];
+
+        for (message, expected_stage, expected_code) in cases {
+            let classification = classify_failure_reason(Some(message));
+            assert_eq!(classification.stage, expected_stage, "message: {message}");
+            assert_eq!(classification.code, expected_code, "message: {message}");
+        }
+    }
+
+    #[test]
+    fn deploy_failed_telemetry_never_copies_sensitive_failure_input() {
+        let sensitive = "Build failed in /srv/repos/acme-secret with token ghp_private123";
+        let event = deploy_failed_telemetry_event(
+            Some(sensitive),
+            Some("git".to_string()),
+            Some("nextjs".to_string()),
+            Some("observability-starter".to_string()),
+        );
+        let serialized = serde_json::to_string(&event).expect("telemetry event serializes");
+
+        assert_eq!(event.event_type, "deploy_failed");
+        assert_eq!(event.properties["failure_stage"], "build");
+        assert_eq!(event.properties["failure_code"], "build_error");
+        assert_eq!(event.properties["classifier_version"], 1);
+        assert_eq!(event.properties["is_template"], true);
+        assert_eq!(event.properties["template_source"], "bundled");
+        assert_eq!(event.properties["template_slug"], "observability-starter");
+        assert!(!serialized.contains("acme-secret"));
+        assert!(!serialized.contains("ghp_private123"));
+        assert!(!serialized.contains("/srv/repos"));
+
+        let regular_project_event = deploy_failed_telemetry_event(
+            Some("build failed"),
+            Some("git".to_string()),
+            Some("nextjs".to_string()),
+            None,
+        );
+        assert_eq!(regular_project_event.properties["is_template"], false);
+        assert_eq!(regular_project_event.properties["template_source"], "none");
+        assert!(!regular_project_event
+            .properties
+            .contains_key("template_slug"));
+
+        let private_slug = "customer-acme-private-ghp_secret456";
+        let custom_template_event = deploy_failed_telemetry_event(
+            Some("build failed"),
+            Some("git".to_string()),
+            Some("nextjs".to_string()),
+            Some(private_slug.to_string()),
+        );
+        let serialized =
+            serde_json::to_string(&custom_template_event).expect("telemetry event serializes");
+        assert_eq!(custom_template_event.properties["is_template"], true);
+        assert_eq!(
+            custom_template_event.properties["template_source"],
+            "custom"
+        );
+        assert!(!custom_template_event
+            .properties
+            .contains_key("template_slug"));
+        assert!(!serialized.contains(private_slug));
+    }
+
+    #[test]
+    fn failure_classifier_preserves_legacy_reason_wire_values() {
+        let cases = [
+            ("OOM", "oom"),
+            ("deadline reached", "timeout"),
+            ("health check timed out", "timeout"),
+            ("healthcheck failed", "health_check"),
+            ("build command exited", "build_error"),
+            ("DNS error", "network"),
+            ("image not found", "image_missing"),
+            ("deployment cancelled", "cancelled"),
+            ("novel error", "unknown"),
+        ];
+
+        for (message, expected) in cases {
+            assert_eq!(legacy_failure_reason(Some(message)), expected);
+            assert_eq!(
+                classify_failure_reason(Some(message)).legacy_reason,
+                expected,
+                "message: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_classifier_handles_missing_and_unrecognized_reasons() {
+        for reason in [
+            None,
+            Some("an entirely novel failure containing customer-data"),
+        ] {
+            let classification = classify_failure_reason(reason);
+            assert_eq!(classification.stage, DeploymentFailureStage::Unknown);
+            assert_eq!(classification.code, DeploymentFailureCode::Unknown);
+            assert_eq!(classification.legacy_reason, "unknown");
+        }
+    }
 
     // Mock services for testing
     struct MockGitProvider;
@@ -2186,9 +3325,15 @@ mod tests {
             _connection_id: i32,
             _repo_owner: &str,
             _repo_name: &str,
-            _target_dir: &std::path::Path,
+            target_dir: &std::path::Path,
             _branch_or_ref: Option<&str>,
         ) -> Result<(), temps_git::GitProviderManagerError> {
+            tokio::fs::create_dir_all(target_dir)
+                .await
+                .map_err(|error| temps_git::GitProviderManagerError::Other(error.to_string()))?;
+            tokio::fs::write(target_dir.join("package.json"), b"{}")
+                .await
+                .map_err(|error| temps_git::GitProviderManagerError::Other(error.to_string()))?;
             Ok(())
         }
 
@@ -2530,6 +3675,7 @@ mod tests {
             repo_name: Set("test-repo".to_string()),
             git_provider_connection_id: Set(Some(1)),
             preset: Set(Preset::NextJs),
+            template_slug: Set(Some("observability-starter".to_string())),
             directory: Set("/".to_string()),
             main_branch: Set("main".to_string()),
             created_at: Set(Utc::now()),
@@ -2613,6 +3759,8 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
@@ -2655,6 +3803,8 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
@@ -2678,6 +3828,10 @@ mod tests {
     #[tokio::test]
     async fn test_execute_deployment_workflow_with_jobs() -> Result<(), Box<dyn std::error::Error>>
     {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
 
@@ -2703,41 +3857,6 @@ mod tests {
         };
         download_job.insert(db.as_ref()).await?;
 
-        let build_job = deployment_jobs::ActiveModel {
-            deployment_id: Set(deployment.id),
-            job_id: Set("build_image".to_string()),
-            job_type: Set("BuildImageJob".to_string()),
-            name: Set("Build Image".to_string()),
-            description: Set(Some("Build Docker image".to_string())),
-            status: Set(JobStatus::Pending),
-            log_id: Set(format!("deployment-{}-job-build_image", deployment.id)),
-            job_config: Set(Some(serde_json::json!({
-                "dockerfile_path": "Dockerfile"
-            }))),
-            dependencies: Set(Some(serde_json::json!(["download_repo"]))),
-            execution_order: Set(Some(1)),
-            ..Default::default()
-        };
-        build_job.insert(db.as_ref()).await?;
-
-        let deploy_job = deployment_jobs::ActiveModel {
-            deployment_id: Set(deployment.id),
-            job_id: Set("deploy_container".to_string()),
-            job_type: Set("DeployContainerJob".to_string()),
-            name: Set("Deploy Container".to_string()),
-            description: Set(Some("Deploy container".to_string())),
-            status: Set(JobStatus::Pending),
-            log_id: Set(format!("deployment-{}-job-deploy_container", deployment.id)),
-            job_config: Set(Some(serde_json::json!({
-                "port": 3000,
-                "replicas": 1
-            }))),
-            dependencies: Set(Some(serde_json::json!(["build_image"]))),
-            execution_order: Set(Some(2)),
-            ..Default::default()
-        };
-        deploy_job.insert(db.as_ref()).await?;
-
         let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
         let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
         let git_provider = Arc::new(MockGitProvider);
@@ -2762,35 +3881,446 @@ mod tests {
             static_deployer,
             log_service,
             cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
             Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
             config_service,
             screenshot_service,
             docker,
         );
 
-        // Execute workflow - this will use mock services so should succeed
-        let result = service.execute_deployment_workflow(deployment.id).await;
+        // Capture telemetry so we can assert the deploy funnel events fire at
+        // the right points (attempted always; succeeded/failed on the matching
+        // terminal outcome).
+        let telemetry = Arc::new(CapturingTelemetryReporter::default());
+        service.set_telemetry(telemetry.clone());
 
-        // Note: This might fail due to the mock implementations not being complete enough
-        // But the structure should be correct
-        match result {
-            Ok(_) => {
-                // Success - verify deployment was updated
-                let updated_deployment = deployments::Entity::find_by_id(deployment.id)
-                    .one(db.as_ref())
-                    .await?
-                    .unwrap();
+        // Execute workflow. This test is the terminal-success proof, so an
+        // unexpected mock failure must fail the test rather than being accepted.
+        service
+            .execute_deployment_workflow(deployment.id)
+            .await
+            .expect("mock deployment workflow must complete successfully");
 
-                assert_eq!(updated_deployment.state, "deployed");
-                // Note: container_id field removed after workflow refactoring
-            }
-            Err(e) => {
-                // Log error for debugging
-                eprintln!("Workflow execution error (expected in unit test): {}", e);
-                // In unit tests with mocks, some failures are expected
-            }
+        // deploy_attempted fires unconditionally once jobs are loaded.
+        assert!(
+            telemetry.has_event("deploy_attempted"),
+            "deploy_attempted telemetry must fire for every workflow execution"
+        );
+        let attempted = telemetry
+            .event("deploy_attempted")
+            .expect("deploy_attempted event must be captured");
+        assert_eq!(attempted.properties["is_template"], true);
+        assert_eq!(attempted.properties["template_source"], "bundled");
+        assert_eq!(
+            attempted.properties["template_slug"],
+            "observability-starter"
+        );
+
+        for event_type in ["deploy_succeeded", "first_deploy_succeeded"] {
+            let event = telemetry
+                .event(event_type)
+                .unwrap_or_else(|| panic!("{event_type} event must be captured"));
+            assert_eq!(event.properties["is_template"], true);
+            assert_eq!(event.properties["template_source"], "bundled");
+            assert_eq!(event.properties["template_slug"], "observability-starter");
         }
 
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_status_path_sanitizes_operator_template_and_raw_reason(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return Ok(());
+        }
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, _environment, deployment) = create_test_data(&db).await?;
+
+        let private_slug = "customer-acme-private-ghp_secret789";
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.template_slug = Set(Some(private_slug.to_string()));
+        active_project.update(db.as_ref()).await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            queue,
+            Arc::new(MockGitProvider),
+            Arc::new(MockImageBuilder { should_fail: false }),
+            Arc::new(MockContainerDeployer { should_fail: false }),
+            Arc::new(MockStaticDeployer),
+            Arc::new(LogService::new(std::env::temp_dir())),
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            Arc::new(bollard::Docker::connect_with_local_defaults()?),
+        );
+        let telemetry = Arc::new(CapturingTelemetryReporter::default());
+        service.set_telemetry(telemetry.clone());
+
+        let sensitive_reason =
+            "Build failed in /srv/repos/acme-secret with token ghp_private_failure123";
+        service
+            .update_deployment_status_with_reason(
+                deployment.id,
+                temps_entities::types::PipelineStatus::Failed,
+                Some(sensitive_reason.to_string()),
+            )
+            .await?;
+
+        let event = telemetry
+            .event("deploy_failed")
+            .expect("real failed status path must report deploy_failed");
+        let serialized = serde_json::to_string(&event)?;
+        assert_eq!(event.properties["failure_stage"], "build");
+        assert_eq!(event.properties["failure_code"], "build_error");
+        assert_eq!(event.properties["is_template"], true);
+        assert_eq!(event.properties["template_source"], "custom");
+        assert!(!event.properties.contains_key("template_slug"));
+        for sensitive in [
+            private_slug,
+            "/srv/repos/acme-secret",
+            "ghp_private_failure123",
+        ] {
+            assert!(!serialized.contains(sensitive));
+        }
+
+        let failed_deployment = deployments::Entity::find_by_id(deployment.id)
+            .one(db.as_ref())
+            .await?
+            .expect("deployment row must exist");
+        assert_eq!(failed_deployment.state, "failed");
+
+        Ok(())
+    }
+
+    /// Telemetry reporter that records every event so tests can assert which
+    /// deploy-funnel events fired.
+    #[derive(Default)]
+    struct CapturingTelemetryReporter {
+        events: std::sync::Mutex<Vec<temps_core::telemetry::TelemetryEvent>>,
+    }
+
+    impl CapturingTelemetryReporter {
+        fn has_event(&self, event_type: &str) -> bool {
+            self.events
+                .lock()
+                .expect("telemetry capture lock poisoned")
+                .iter()
+                .any(|e| e.event_type == event_type)
+        }
+
+        fn event(&self, event_type: &str) -> Option<temps_core::telemetry::TelemetryEvent> {
+            self.events
+                .lock()
+                .expect("telemetry capture lock poisoned")
+                .iter()
+                .find(|event| event.event_type == event_type)
+                .cloned()
+        }
+    }
+
+    impl temps_core::telemetry::TelemetryReporter for CapturingTelemetryReporter {
+        fn report(&self, event: temps_core::telemetry::TelemetryEvent) {
+            self.events
+                .lock()
+                .expect("telemetry capture lock poisoned")
+                .push(event);
+        }
+
+        fn is_enabled(&self) -> bool {
+            true
+        }
+    }
+
+    /// Deployer used only by
+    /// `test_teardown_previous_deployment_marks_deleted_before_stopping_container`.
+    /// Asserts that by the time Docker is asked to stop a container, its
+    /// `deployment_containers` row is already marked deleted in the database —
+    /// the invariant that closes the race with `ContainerHealthMonitor`'s
+    /// independent poll loop (see the comment in `teardown_previous_deployment`).
+    struct AssertDeletedBeforeStopDeployer {
+        db: Arc<DbConnection>,
+    }
+
+    #[async_trait]
+    impl ContainerDeployer for AssertDeletedBeforeStopDeployer {
+        async fn deploy_container(
+            &self,
+            _request: temps_deployer::DeployRequest,
+        ) -> Result<temps_deployer::DeployResult, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn start_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn stop_container(
+            &self,
+            container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            let container = temps_entities::deployment_containers::Entity::find()
+                .filter(temps_entities::deployment_containers::Column::ContainerId.eq(container_id))
+                .one(self.db.as_ref())
+                .await
+                .expect("query deployment_containers row")
+                .expect("deployment_containers row exists");
+            assert!(
+                container.deleted_at.is_some(),
+                "container {container_id} must be marked deleted before stop_container() \
+                 is called — otherwise ContainerHealthMonitor's concurrent poll can \
+                 observe an Exited container with no signal that the exit is an \
+                 intentional teardown, and fires a false ContainerCrash alarm"
+            );
+            Ok(())
+        }
+
+        async fn pause_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn resume_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn remove_container(
+            &self,
+            _container_id: &str,
+        ) -> Result<(), temps_deployer::DeployerError> {
+            Ok(())
+        }
+
+        async fn get_container_info(
+            &self,
+            _container_id: &str,
+        ) -> Result<temps_deployer::ContainerInfo, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn get_container_stats(
+            &self,
+            _container_id: &str,
+        ) -> Result<temps_deployer::ContainerStats, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn list_containers(
+            &self,
+        ) -> Result<Vec<temps_deployer::ContainerInfo>, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn get_container_logs(
+            &self,
+            _container_id: &str,
+        ) -> Result<String, temps_deployer::DeployerError> {
+            unimplemented!("not exercised by this test")
+        }
+
+        async fn stream_container_logs(
+            &self,
+            _container_id: &str,
+        ) -> Result<
+            Box<dyn futures::Stream<Item = String> + Unpin + Send>,
+            temps_deployer::DeployerError,
+        > {
+            unimplemented!("not exercised by this test")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_teardown_previous_deployment_marks_deleted_before_stopping_container(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        let (project, environment, current_deployment) = create_test_data(&db).await?;
+
+        // A previous deployment in the same environment, still active, whose
+        // container should be torn down now that `current_deployment` is live.
+        let previous_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("previous-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() - chrono::Duration::minutes(5)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let container = deployment_containers::ActiveModel {
+            deployment_id: Set(previous_deployment.id),
+            container_id: Set("old-container-1".to_string()),
+            container_name: Set("old-container-1".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Simulate a newer deployment completing while this older workflow is
+        // still in its post-success cleanup. It must not be selected as a
+        // "previous" deployment merely because its ID differs.
+        let newer_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("newer-deployment".to_string()),
+            state: Set("completed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now() + chrono::Duration::minutes(5)),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        let newer_container = deployment_containers::ActiveModel {
+            deployment_id: Set(newer_deployment.id),
+            container_id: Set("newer-container-1".to_string()),
+            container_name: Set("newer-container-1".to_string()),
+            container_port: Set(3000),
+            deployed_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let (queue, _receiver) = temps_queue::BroadcastQueueService::create_broadcast_channel(100);
+        let queue = Arc::new(queue) as Arc<dyn temps_core::JobQueue>;
+        let git_provider = Arc::new(MockGitProvider);
+        let image_builder = Arc::new(MockImageBuilder { should_fail: false });
+        let container_deployer = Arc::new(AssertDeletedBeforeStopDeployer { db: db.clone() });
+        let static_deployer = Arc::new(MockStaticDeployer);
+        let log_service = Arc::new(LogService::new(std::env::temp_dir()));
+        let cron_service =
+            Arc::new(crate::jobs::NoOpCronConfigService) as Arc<dyn crate::jobs::CronConfigService>;
+        let config_service = create_mock_config_service(db.clone());
+        let screenshot_service = Arc::new(ScreenshotService::new(config_service.clone()).await?);
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .unwrap_or_else(|_| panic!("Failed to connect to Docker")),
+        );
+
+        let service = WorkflowExecutionService::new(
+            db.clone(),
+            queue,
+            git_provider,
+            image_builder,
+            container_deployer,
+            static_deployer,
+            log_service,
+            cron_service,
+            Arc::new(crate::jobs::NoOpMetricAlertConfigService)
+                as Arc<dyn crate::jobs::MetricAlertConfigService>,
+            Arc::new(crate::jobs::NoOpAgentSyncService) as Arc<dyn crate::jobs::AgentSyncService>,
+            config_service,
+            screenshot_service,
+            docker,
+        );
+
+        let stopped_container_id = service
+            .teardown_previous_deployment(project.id, environment.id, &current_deployment)
+            .await?;
+
+        assert_eq!(stopped_container_id, Some("old-container-1".to_string()));
+
+        let refreshed = deployment_containers::Entity::find_by_id(container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("container row still exists");
+        assert!(refreshed.deleted_at.is_some());
+        assert_eq!(refreshed.status.as_deref(), Some("deleted"));
+
+        let newer_refreshed = deployment_containers::Entity::find_by_id(newer_container.id)
+            .one(db.as_ref())
+            .await?
+            .expect("newer container row still exists");
+        assert!(
+            newer_refreshed.deleted_at.is_none(),
+            "an older workflow cleanup must not remove a newer deployment's container"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn missing_deployment_is_terminal_cancellation() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<deployments::Model>::new()])
+                .into_connection(),
+        );
+        let provider = DatabaseCancellationProvider::new(db, 42);
+
+        assert!(provider.is_cancelled("deployment-42").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn cancellation_provider_supports_inline_workflow_names() {
+        let cancelled = deployments::Model {
+            id: 42,
+            project_id: 7,
+            environment_id: 8,
+            slug: "cancelled-inline-deployment".to_string(),
+            state: "cancelled".to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: Some(chrono::Utc::now()),
+            context_vars: None,
+            branch_ref: None,
+            tag_ref: None,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: Some("Project deleted".to_string()),
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![cancelled.clone()], vec![cancelled]])
+                .into_connection(),
+        );
+        let provider = DatabaseCancellationProvider::new(db, 42);
+
+        assert!(provider.is_cancelled("rollback-42").await.unwrap());
+        assert!(provider.is_cancelled("promote-42").await.unwrap());
     }
 }

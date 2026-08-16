@@ -1,6 +1,9 @@
 use crate::services::workflow_execution_service::WorkflowExecutionService;
 use crate::services::workflow_planner::WorkflowPlanner;
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{
+    sea_query::{Expr, Query},
+    ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait,
+};
 use serde_json;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,6 +75,79 @@ pub struct JobProcessorService {
 }
 
 impl JobProcessorService {
+    async fn resolve_image_target_environments(
+        db: &DbConnection,
+        project_id: i32,
+        target_environment_id: Option<i32>,
+    ) -> Result<Vec<temps_entities::environments::Model>, sea_orm::DbErr> {
+        let mut query = temps_entities::environments::Entity::find()
+            .filter(temps_entities::environments::Column::ProjectId.eq(project_id))
+            .filter(temps_entities::environments::Column::DeletedAt.is_null());
+        query = if let Some(environment_id) = target_environment_id {
+            query.filter(temps_entities::environments::Column::Id.eq(environment_id))
+        } else {
+            query.filter(temps_entities::environments::Column::IsPreview.eq(false))
+        };
+        query.all(db).await
+    }
+
+    /// Atomically admit a pending deployment only while both owners are active.
+    pub(crate) async fn try_admit_deployment(
+        db: &DbConnection,
+        deployment_id: i32,
+    ) -> Result<bool, JobProcessorError> {
+        let active_projects = Query::select()
+            .column(temps_entities::projects::Column::Id)
+            .from(temps_entities::projects::Entity)
+            .and_where(temps_entities::projects::Column::IsDeleted.eq(false))
+            .to_owned();
+        let active_environments = Query::select()
+            .column(temps_entities::environments::Column::Id)
+            .from(temps_entities::environments::Entity)
+            .and_where(temps_entities::environments::Column::DeletedAt.is_null())
+            .to_owned();
+        let admitted_at = chrono::Utc::now();
+
+        let admitted = deployments::Entity::update_many()
+            .col_expr(deployments::Column::State, Expr::value("running"))
+            .col_expr(deployments::Column::StartedAt, Expr::value(admitted_at))
+            .col_expr(deployments::Column::UpdatedAt, Expr::value(admitted_at))
+            .filter(deployments::Column::Id.eq(deployment_id))
+            .filter(deployments::Column::State.eq("pending"))
+            .filter(deployments::Column::ProjectId.in_subquery(active_projects))
+            .filter(deployments::Column::EnvironmentId.in_subquery(active_environments))
+            .exec(db)
+            .await
+            .map(|result| result.rows_affected == 1)
+            .map_err(|error| JobProcessorError::DatabaseError(error.to_string()))?;
+
+        if !admitted {
+            // A deployment may be inserted after deletion took its cancellation
+            // snapshot. Do not leave that denied row pending forever.
+            deployments::Entity::update_many()
+                .col_expr(deployments::Column::State, Expr::value("cancelled"))
+                .col_expr(
+                    deployments::Column::CancelledReason,
+                    Expr::value("Deployment owner is being deleted"),
+                )
+                .col_expr(
+                    deployments::Column::FinishedAt,
+                    Expr::value(chrono::Utc::now()),
+                )
+                .col_expr(
+                    deployments::Column::UpdatedAt,
+                    Expr::value(chrono::Utc::now()),
+                )
+                .filter(deployments::Column::Id.eq(deployment_id))
+                .filter(deployments::Column::State.eq("pending"))
+                .exec(db)
+                .await
+                .map_err(|error| JobProcessorError::DatabaseError(error.to_string()))?;
+        }
+
+        Ok(admitted)
+    }
+
     pub fn new(
         db: Arc<DbConnection>,
         job_receiver: Box<dyn JobReceiver>,
@@ -243,6 +319,7 @@ impl JobProcessorService {
 
         // Resolve the project.
         let project = match temps_entities::projects::Entity::find_by_id(job.project_id)
+            .filter(temps_entities::projects::Column::IsDeleted.eq(false))
             .one(db.as_ref())
             .await
         {
@@ -260,14 +337,15 @@ impl JobProcessorService {
             }
         };
 
-        // Target the project's non-preview (production) environment(s). A fresh
-        // template project has exactly one.
-        let environments = match temps_entities::environments::Entity::find()
-            .filter(temps_entities::environments::Column::ProjectId.eq(job.project_id))
-            .filter(temps_entities::environments::Column::DeletedAt.is_null())
-            .filter(temps_entities::environments::Column::IsPreview.eq(false))
-            .all(db.as_ref())
-            .await
+        // A drain/failover job names the exact affected environment. Legacy
+        // project-wide template/import jobs continue targeting non-preview
+        // environments.
+        let environments = match Self::resolve_image_target_environments(
+            db.as_ref(),
+            job.project_id,
+            job.target_environment_id,
+        )
+        .await
         {
             Ok(envs) => envs,
             Err(e) => {
@@ -281,8 +359,9 @@ impl JobProcessorService {
 
         if environments.is_empty() {
             error!(
-                "DeployImageRequested: project {} has no deployable (non-preview) environment",
-                job.project_id
+                "DeployImageRequested: project {} has no matching deployable environment (target_environment_id={:?})",
+                job.project_id,
+                job.target_environment_id
             );
             return;
         }
@@ -552,18 +631,25 @@ impl JobProcessorService {
             }
         }
 
-        if let Err(e) = JobProcessorService::update_deployment_status(
-            db,
-            deployment_id,
-            PipelineStatus::Running,
-        )
-        .await
-        {
-            error!(
-                "Failed to update deployment {} status to Running: {}",
-                deployment_id, e
-            );
-            return;
+        // This is the deployment admission boundary. Keep the pending-state
+        // and owner-fence checks in the same UPDATE so a concurrent deletion
+        // cannot resurrect a cancelled deployment after the gate returns.
+        match Self::try_admit_deployment(db.as_ref(), deployment_id).await {
+            Ok(true) => {}
+            Ok(false) => {
+                info!(
+                    "Deployment {} was not admitted because it is no longer pending or its owner is being deleted",
+                    deployment_id
+                );
+                return;
+            }
+            Err(e) => {
+                error!(
+                    "Failed to atomically admit deployment {}: {}",
+                    deployment_id, e
+                );
+                return;
+            }
         }
         info!("Updated deployment {} status to Running", deployment_id);
 
@@ -577,13 +663,37 @@ impl JobProcessorService {
                 "Workflow execution failed for deployment {}: {}",
                 deployment_id, error_message
             );
-            if let Err(update_err) = JobProcessorService::update_deployment_status_with_message(
-                db,
-                deployment_id,
-                PipelineStatus::Failed,
-                Some(error_message),
-            )
-            .await
+
+            // Re-read the current deployment state before writing "failed".
+            // execute_deployment_workflow already skips its own "failed" write
+            // when the deployment is "stopped" (superseded by a concurrent
+            // rollback), but this is a second write on the same error path
+            // that must honour the same invariant. Without this guard,
+            // "stopped" set by stop_environment_containers would be silently
+            // overwritten here, making the deployment unavailable for
+            // promote/rollback even though it was successfully superseded.
+            let already_stopped = deployments::Entity::find_by_id(deployment_id)
+                .one(db.as_ref())
+                .await
+                .ok()
+                .flatten()
+                .map(|d| d.state == "stopped")
+                .unwrap_or(false);
+
+            if already_stopped {
+                info!(
+                    "Deployment {} already marked 'stopped' by a concurrent \
+                     rollback — not overwriting with 'failed'",
+                    deployment_id
+                );
+            } else if let Err(update_err) =
+                JobProcessorService::update_deployment_status_with_message(
+                    db,
+                    deployment_id,
+                    PipelineStatus::Failed,
+                    Some(error_message),
+                )
+                .await
             {
                 error!("Failed to update deployment status: {}", update_err);
             }
@@ -833,14 +943,30 @@ async fn find_environments_for_branch(
                 "Restoring soft-deleted preview environment {} for branch '{}'",
                 deleted_preview.id, branch_name
             );
+            let deleted_preview_id = deleted_preview.id;
+            let subdomain = deleted_preview.subdomain.clone();
+            let txn = db
+                .begin()
+                .await
+                .map_err(|error| format!("Failed to begin preview restore: {error}"))?;
+            if environments::claim_subdomain(&txn, &subdomain, &[deleted_preview_id])
+                .await
+                .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
+                .is_some()
+            {
+                return Err(format!("Preview subdomain '{subdomain}' is already in use"));
+            }
             let mut active_env: environments::ActiveModel = deleted_preview.into();
             active_env.deleted_at = Set(None);
             active_env.updated_at = Set(chrono::Utc::now());
             active_env.current_deployment_id = Set(None);
             let restored = active_env
-                .update(db.as_ref())
+                .update(&txn)
                 .await
                 .map_err(|e| format!("Failed to restore preview environment: {}", e))?;
+            txn.commit()
+                .await
+                .map_err(|error| format!("Failed to commit preview restore: {error}"))?;
             return Ok(vec![restored]);
         }
 
@@ -880,10 +1006,11 @@ async fn find_environments_for_branch(
     use chrono::Utc;
     use temps_entities::upstream_config::UpstreamList;
 
+    let subdomain = format!("{}-preview", project.slug).to_ascii_lowercase();
     let preview_env = environments::ActiveModel {
         name: Set("preview".to_string()),
         slug: Set("preview".to_string()),
-        subdomain: Set(format!("{}-preview", project.slug)),
+        subdomain: Set(subdomain.clone()),
         host: Set(String::new()),
         branch: Set(None), // No specific branch - matches all unmatched branches
         project_id: Set(project.id),
@@ -898,10 +1025,24 @@ async fn find_environments_for_branch(
         ..Default::default()
     };
 
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("Failed to begin preview creation: {error}"))?;
+    if environments::claim_subdomain(&txn, &subdomain, &[])
+        .await
+        .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
+        .is_some()
+    {
+        return Err(format!("Preview subdomain '{subdomain}' is already in use"));
+    }
     let created_env = preview_env
-        .insert(db.as_ref())
+        .insert(&txn)
         .await
         .map_err(|e| format!("Failed to create preview environment: {}", e))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("Failed to commit preview creation: {error}"))?;
 
     info!(
         "Created generic preview environment '{}' for project {}",
@@ -944,10 +1085,11 @@ async fn create_preview_environment(
         None
     };
 
+    let subdomain = format!("{}-{}", project.slug, slugified_branch).to_ascii_lowercase();
     let preview_env = environments::ActiveModel {
         name: Set(slugified_branch.to_string()),
         slug: Set(slugified_branch.to_string()),
-        subdomain: Set(format!("{}-{}", project.slug, slugified_branch)),
+        subdomain: Set(subdomain.clone()),
         host: Set(String::new()),
         branch: Set(Some(branch_name.to_string())), // Link to specific branch (used for both deployment and tracking)
         project_id: Set(project.id),
@@ -962,10 +1104,24 @@ async fn create_preview_environment(
         ..Default::default()
     };
 
+    let txn = db
+        .begin()
+        .await
+        .map_err(|error| format!("Failed to begin preview creation: {error}"))?;
+    if environments::claim_subdomain(&txn, &subdomain, &[])
+        .await
+        .map_err(|error| format!("Failed to claim preview subdomain: {error}"))?
+        .is_some()
+    {
+        return Err(format!("Preview subdomain '{subdomain}' is already in use"));
+    }
     let created_env = preview_env
-        .insert(db.as_ref())
+        .insert(&txn)
         .await
         .map_err(|e| format!("Failed to create preview environment: {}", e))?;
+    txn.commit()
+        .await
+        .map_err(|error| format!("Failed to commit preview creation: {error}"))?;
 
     info!(
         "Created preview environment '{}' (ID: {}) for branch '{}'",
@@ -1083,6 +1239,10 @@ fn is_automatic_deploy_enabled(
     effective.unwrap_or(false)
 }
 
+fn should_skip_git_push_for_auto_deploy(auto_deploy_enabled: bool, manual_trigger: bool) -> bool {
+    !auto_deploy_enabled && !manual_trigger
+}
+
 // Extracted free function for testing
 async fn process_git_push_event(
     workflow_planner: Arc<WorkflowPlanner>,
@@ -1105,6 +1265,7 @@ async fn process_git_push_event(
     // Find the project matching this git repository
     let project = match temps_entities::projects::Entity::find()
         .filter(temps_entities::projects::Column::Id.eq(job.project_id))
+        .filter(temps_entities::projects::Column::IsDeleted.eq(false))
         .one(db.as_ref())
         .await
     {
@@ -1184,40 +1345,16 @@ async fn process_git_push_event(
         // the answer is false (opt-in, not opt-out). Manual triggers bypass this
         // gate entirely — the user clicked deploy, so they unambiguously want one.
         //
-        // Exception: the FIRST deployment for an environment always runs even when
-        // automatic_deploy=false, so a freshly-created opt-out env still boots.
         let auto_deploy_enabled = is_automatic_deploy_enabled(
             project.deployment_config.as_ref(),
             environment.deployment_config.as_ref(),
         );
-        if !auto_deploy_enabled && !job.manual_trigger {
-            let existing_count = match deployments::Entity::find()
-                .filter(deployments::Column::EnvironmentId.eq(environment.id))
-                .count(db.as_ref())
-                .await
-            {
-                Ok(n) => n,
-                Err(e) => {
-                    error!(
-                        "Failed to count existing deployments for environment {}: {}",
-                        environment.id, e
-                    );
-                    continue;
-                }
-            };
-
-            if existing_count > 0 {
-                info!(
-                    "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
-                    project.id, environment.id, environment.name
-                );
-                continue;
-            }
-
+        if should_skip_git_push_for_auto_deploy(auto_deploy_enabled, job.manual_trigger) {
             info!(
-                "Allowing initial deployment for project {} environment {} ({}) despite automatic_deploy=false (no prior deployments)",
+                "Skipping push event for project {} environment {} ({}): automatic_deploy is disabled",
                 project.id, environment.id, environment.name
             );
+            continue;
         } else if job.manual_trigger && !auto_deploy_enabled {
             info!(
                 "Manual trigger for project {} environment {} ({}) — bypassing automatic_deploy=false",
@@ -1332,7 +1469,9 @@ async fn process_git_push_event(
             metadata: sea_orm::Set(Some(deployment_metadata)),
             branch_ref: sea_orm::Set(job.branch.clone()),
             tag_ref: sea_orm::Set(job.tag.clone()),
-            commit_sha: sea_orm::Set(Some(job.commit.clone())),
+            // Manual triggers (redeploy, import) carry no commit — an empty
+            // string must not be stored, or checkout would use '' as a ref.
+            commit_sha: sea_orm::Set((!job.commit.is_empty()).then(|| job.commit.clone())),
             commit_message: sea_orm::Set(commit_info.as_ref().map(|c| c.message.clone())),
             commit_author: sea_orm::Set(commit_info.as_ref().map(|c| c.author.clone())),
             promoted_from_deployment_id: sea_orm::Set(None),
@@ -1373,7 +1512,7 @@ async fn process_git_push_event(
             environment_id: environment.id,
             environment_name: environment.name.clone(),
             branch: job.branch.clone(),
-            commit_sha: Some(job.commit.clone()),
+            commit_sha: (!job.commit.is_empty()).then(|| job.commit.clone()),
         });
         if let Err(e) = queue.send(deployment_created_event).await {
             error!("Failed to send DeploymentCreated event: {}", e);
@@ -1554,6 +1693,16 @@ mod tests {
         Arc::new(temps_error_tracking::DSNService::new(db))
     }
 
+    async fn database_integration_tests_available() -> bool {
+        std::env::var_os("TEMPS_TEST_DATABASE_URL").is_some()
+            || tokio::process::Command::new("docker")
+                .arg("info")
+                .output()
+                .await
+                .map(|output| output.status.success())
+                .unwrap_or(false)
+    }
+
     mock! {
         JobReceiver {}
 
@@ -1616,6 +1765,148 @@ mod tests {
         let deployment = deployment.insert(db).await?;
 
         Ok((deployment.id, deployment.id))
+    }
+
+    #[tokio::test]
+    async fn deployment_admission_is_atomic_with_owner_and_state_fences(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping deployment admission integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (deployment_id, _) = setup_test_data(db.as_ref()).await?;
+
+        assert!(JobProcessorService::try_admit_deployment(db.as_ref(), deployment_id).await?);
+
+        let deployment = deployments::Entity::find_by_id(deployment_id)
+            .one(db.as_ref())
+            .await?
+            .expect("deployment should exist");
+        assert_eq!(deployment.state, "running");
+        assert!(
+            deployment.started_at.is_some(),
+            "admitting a deployment must record when it started"
+        );
+        assert_eq!(
+            deployment.started_at,
+            Some(deployment.updated_at),
+            "the running transition timestamps must come from the same atomic update"
+        );
+
+        let mut cancelled: deployments::ActiveModel = deployment.into();
+        cancelled.state = Set("cancelled".to_string());
+        let cancelled = cancelled.update(db.as_ref()).await?;
+        assert!(
+            !JobProcessorService::try_admit_deployment(db.as_ref(), cancelled.id).await?,
+            "a gate recheck must not resurrect a cancelled deployment"
+        );
+
+        let pending = deployments::ActiveModel {
+            project_id: Set(cancelled.project_id),
+            environment_id: Set(cancelled.environment_id),
+            slug: Set("owner-fenced-deployment".to_string()),
+            state: Set("pending".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let project = temps_entities::projects::Entity::find_by_id(cancelled.project_id)
+            .one(db.as_ref())
+            .await?
+            .expect("project should exist");
+        let mut deleting: temps_entities::projects::ActiveModel = project.into();
+        deleting.is_deleted = Set(true);
+        deleting.update(db.as_ref()).await?;
+
+        assert!(
+            !JobProcessorService::try_admit_deployment(db.as_ref(), pending.id).await?,
+            "a deployment owned by a deleting project must not be admitted"
+        );
+        let denied = deployments::Entity::find_by_id(pending.id)
+            .one(db.as_ref())
+            .await?
+            .expect("denied deployment should remain for history");
+        assert_eq!(denied.state, "cancelled");
+        assert_eq!(
+            denied.cancelled_reason.as_deref(),
+            Some("Deployment owner is being deleted")
+        );
+        assert!(
+            denied.started_at.is_none(),
+            "a deployment denied admission must not receive a start timestamp"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn image_deployment_target_is_scoped_to_one_environment(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if !database_integration_tests_available().await {
+            eprintln!("Docker unavailable; skipping image target integration test");
+            return Ok(());
+        }
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Image Target Project".to_string()),
+            slug: Set("image-target-project".to_string()),
+            repo_owner: Set("temps-e2e".to_string()),
+            repo_name: Set("image-target-project".to_string()),
+            preset: Set(Preset::Dockerfile),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let make_environment = |name: &str, slug: &str| temps_entities::environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set(name.to_string()),
+            slug: Set(slug.to_string()),
+            host: Set(format!("{slug}.example.com")),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set(format!("{slug}.example.com")),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let production = make_environment("Production", "production")
+            .insert(db.as_ref())
+            .await?;
+        let staging = make_environment("Staging", "staging")
+            .insert(db.as_ref())
+            .await?;
+
+        let targeted = JobProcessorService::resolve_image_target_environments(
+            db.as_ref(),
+            project.id,
+            Some(staging.id),
+        )
+        .await?;
+        assert_eq!(targeted.len(), 1);
+        assert_eq!(targeted[0].id, staging.id);
+
+        let project_wide =
+            JobProcessorService::resolve_image_target_environments(db.as_ref(), project.id, None)
+                .await?;
+        assert_eq!(project_wide.len(), 2);
+        assert!(project_wide.iter().any(|env| env.id == production.id));
+        assert!(project_wide.iter().any(|env| env.id == staging.id));
+        Ok(())
     }
 
     async fn setup_git_push_test_data(
@@ -1792,13 +2083,14 @@ mod tests {
             .create_deployment_jobs(deployment.id)
             .await?;
 
-        // Verify jobs were created (nextjs project should create 9 jobs including
-        // persist_static_assets, configure_crons, configure_agents, scan_vulnerabilities, and capture_source_maps)
+        // Verify jobs were created (nextjs project should create 10 jobs including
+        // persist_static_assets, configure_crons, configure_metric_alerts,
+        // configure_agents, scan_vulnerabilities, and capture_source_maps)
         let job_ids: Vec<String> = jobs.iter().map(|j| j.job_id.clone()).collect();
         assert_eq!(
             jobs.len(),
-            9,
-            "Expected 9 jobs but got {}: {:?}",
+            10,
+            "Expected 10 jobs but got {}: {:?}",
             jobs.len(),
             job_ids
         );
@@ -1810,6 +2102,7 @@ mod tests {
         assert!(job_ids.contains(&"persist_static_assets".to_string()));
         assert!(job_ids.contains(&"mark_deployment_complete".to_string()));
         assert!(job_ids.contains(&"configure_crons".to_string()));
+        assert!(job_ids.contains(&"configure_metric_alerts".to_string()));
         assert!(job_ids.contains(&"scan_vulnerabilities".to_string()));
         assert!(job_ids.contains(&"capture_source_maps".to_string()));
 
@@ -2076,6 +2369,8 @@ mod tests {
             is_public_repo: Set(false),
             main_branch: Set("main".to_string()),
             // Preview envs disabled — the legacy "named preview" fallback path.
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
             enable_preview_environments: Set(false),
             ..Default::default()
         };
@@ -2582,6 +2877,21 @@ mod tests {
             Some(&project_cfg),
             Some(&env_cfg)
         ));
+    }
+
+    #[test]
+    fn webhook_push_is_skipped_when_auto_deploy_disabled_even_for_first_deploy() {
+        assert!(should_skip_git_push_for_auto_deploy(false, false));
+    }
+
+    #[test]
+    fn manual_trigger_bypasses_auto_deploy_disabled() {
+        assert!(!should_skip_git_push_for_auto_deploy(false, true));
+    }
+
+    #[test]
+    fn auto_deploy_enabled_allows_webhook_push() {
+        assert!(!should_skip_git_push_for_auto_deploy(true, false));
     }
 
     #[test]

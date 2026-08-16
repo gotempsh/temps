@@ -13,7 +13,7 @@ export default function ProxyLogs() {
   usePageTitle('Proxy Logs')
 
   return (
-    <div className="container max-w-7xl mx-auto py-8">
+    <div className="w-full py-8">
       <div className="space-y-6">
         <div>
           <h2 className="text-2xl font-bold tracking-tight">Proxy Logs</h2>

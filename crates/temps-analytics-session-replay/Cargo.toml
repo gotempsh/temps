@@ -47,4 +47,4 @@ chrono = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
-axum-test = "18.1.0"
+axum-test = "21.0.0"

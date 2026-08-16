@@ -164,17 +164,17 @@ impl TempsPlugin for StatusPagePlugin {
             let config_service = context.require_service::<temps_config::ConfigService>();
             let queue_service = context.require_service::<dyn JobQueue>();
 
-            // Register status page service
-            let status_page_service =
-                Arc::new(StatusPageService::new(db.clone(), config_service.clone()));
-            context.register_service(status_page_service.clone());
-
-            // Create monitor service with job queue support for realtime event emission
-            let monitor_service = Arc::new(MonitorService::with_job_queue(
+            // Register status page service. ONE MonitorService instance (with a
+            // job queue) backs both this and the job-listener loop below via
+            // monitor_service_arc() -- see StatusPageService::with_job_queue's
+            // doc comment for the bug two separate instances caused.
+            let status_page_service = Arc::new(StatusPageService::with_job_queue(
                 db.clone(),
                 config_service.clone(),
                 queue_service.clone(),
             ));
+            context.register_service(status_page_service.clone());
+            let monitor_service = status_page_service.monitor_service_arc();
 
             // Create health check service with mandatory ConfigService and JobQueue
             // The service will emit StatusCheckCompleted jobs for outage detection

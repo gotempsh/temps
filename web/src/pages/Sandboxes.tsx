@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate } from 'react-router-dom'
+import { Link, useNavigate } from 'react-router'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
   Box,
@@ -46,7 +46,11 @@ import {
   resumeSandboxMutation,
   stopSandboxMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { toSandboxView, type SandboxView } from '@/components/sandboxes/helpers'
+import {
+  toSandboxView,
+  isWorkspace,
+  type SandboxView,
+} from '@/components/sandboxes/helpers'
 import { CreateSandboxDocs } from '@/components/sandboxes/CreateSandboxDocs'
 
 function statusVariant(
@@ -197,7 +201,7 @@ export default function Sandboxes() {
   })
 
   return (
-    <div className="mx-auto w-full max-w-7xl p-4 sm:p-6 lg:p-8 space-y-6">
+    <div className="w-full p-4 sm:p-6 lg:p-8 space-y-6">
       {/* Page header — canonical pattern from DESIGN.md §4.4 */}
       <div className="flex flex-col gap-4 sm:flex-row sm:items-end sm:justify-between">
         <div className="space-y-1">
@@ -472,6 +476,7 @@ function SandboxRow({
 
   const timeLeft = !destroyed ? formatCountdown(sandbox.expires_at, now) : '—'
   const expired = !destroyed && new Date(sandbox.expires_at).getTime() <= now
+  const workspace = isWorkspace(sandbox)
 
   const openPort = (port: number) => {
     if (!sandbox.preview_url_template || port < 1 || port > 65535) return
@@ -513,6 +518,14 @@ function SandboxRow({
               <Badge variant={statusVariant(sandbox.status)}>
                 {sandbox.status}
               </Badge>
+              {/* A workspace behaves differently from an ephemeral sandbox —
+                  it wakes on access instead of erroring — so it has to look
+                  different, or "stopped" reads as broken rather than idle. */}
+              {isWorkspace(sandbox) && (
+                <Badge variant="outline" title="Persistent workspace: suspends when idle, wakes on the next command">
+                  workspace
+                </Badge>
+              )}
               {sandbox.image && (
                 <span className="font-mono text-xs text-muted-foreground truncate">
                   {sandbox.image}
@@ -656,18 +669,27 @@ function SandboxRow({
           >
             <div className="flex items-center gap-4 flex-wrap pt-2">
               <div className="flex items-center gap-2">
+                {/* For a workspace this clock counts down to *suspension*,
+                    not destruction, and a suspended one wakes on the next
+                    command — so it is never shown in destructive red. */}
                 <Timer
                   className={`h-4 w-4 ${
-                    expired ? 'text-destructive' : 'text-muted-foreground'
+                    expired && !workspace
+                      ? 'text-destructive'
+                      : 'text-muted-foreground'
                   }`}
                 />
                 <div className="leading-tight">
                   <div
                     className={`font-mono text-xs tabular-nums ${
-                      expired ? 'text-destructive' : ''
+                      expired && !workspace ? 'text-destructive' : ''
                     }`}
                   >
-                    {expired ? 'expired' : `${timeLeft} left`}
+                    {expired
+                      ? workspace
+                        ? 'suspended — wakes on next use'
+                        : 'expired'
+                      : `${timeLeft} ${workspace ? 'to suspend' : 'left'}`}
                   </div>
                   <div className="text-xs text-muted-foreground">
                     created {formatAge(sandbox.created_at, now)}

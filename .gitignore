@@ -3,6 +3,11 @@
 *.local
 *.log*
 
+# Local dev-instance data dirs (encryption keys, auth secrets, tokens) --
+# created ad-hoc for manual testing, e.g. temps_data_pgstat_wt, temps_data_*
+temps_data
+temps_data_*
+
 # Dist
 node_modules
 dist/
@@ -32,6 +37,12 @@ target_old
 
 .env
 .env.local
+/secrets/
+
+# Promptfoo eval results may contain project metadata and AI transcripts.
+.promptfoo/
+promptfoo.db
+promptfoo-output/
 
 # Content / blog drafts
 content/
@@ -39,7 +50,13 @@ content/
 __pycache__
 
 .claude
-.agents
+.agents/*
+!.agents/skills
+.agents/skills/*
+# First-party contributor-facing dev skills that ship with the repo (for
+# Claude Code / Codex / etc.) live here and are tracked; everything else
+# under .agents (personal marketplace-installed skills) stays ignored.
+!.agents/skills/start-temps
 skills-lock.json
 
 # MaxMind GeoLite2 database — has restrictive license, do not commit.
@@ -61,3 +78,11 @@ GeoLite2-*.mmdb
 # what "good" looks like) and must NOT be open-sourced. See telemetry-api/ for
 # the public, auditable side.
 /telemetry-dashboard/
+
+# CI compose-security prebuilt-binary pipeline
+ci-prebuilt/
+ci-build-cache/
+
+# CI compose-security prebuilt-binary pipeline
+ci-prebuilt/
+ci-build-cache/

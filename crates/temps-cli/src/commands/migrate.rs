@@ -34,7 +34,9 @@
 
 use clap::Args;
 use colored::Colorize;
+use std::future::Future;
 use std::io::{IsTerminal, Write};
+use std::sync::Arc;
 use tracing::info;
 
 #[derive(Args)]
@@ -58,12 +60,119 @@ pub struct MigrateCommand {
     /// Log format: compact, full
     #[arg(long, env = "TEMPS_LOG_FORMAT", default_value = "compact")]
     pub log_format: String,
+
+    /// Progress output format.
+    ///
+    /// When set to `json`, one NDJSON line is written to stdout per migration
+    /// event instead of the human-readable text output. Designed for use by a
+    /// parent process (e.g. the "Update Now" orchestration worker) that spawns
+    /// `temps migrate --progress-format=json` as a child and parses its output
+    /// line-by-line to track progress. The human-readable format remains the
+    /// default for interactive use.
+    ///
+    /// JSON line shapes:
+    ///
+    /// ```json
+    /// {"event":"started","index":1,"total":5,"name":"m20260811_..."}
+    /// {"event":"finished","index":1,"total":5,"name":"...","success":true,"elapsed_ms":123}
+    /// {"event":"finished","index":1,"total":5,"name":"...","success":false,"elapsed_ms":123,"error":"..."}
+    /// ```
+    #[arg(long, value_name = "FORMAT")]
+    pub progress_format: Option<String>,
+}
+
+enum MaintenanceRace<T> {
+    Completed(T),
+    Interrupted,
+}
+
+async fn race_maintenance<M, I, T>(maintenance: M, interrupt: I) -> MaintenanceRace<T>
+where
+    M: Future<Output = T>,
+    I: Future,
+{
+    tokio::select! {
+        result = maintenance => MaintenanceRace::Completed(result),
+        _ = interrupt => MaintenanceRace::Interrupted,
+    }
+}
+
+async fn interrupted_maintenance_error(
+    database_url: &str,
+    backend_pid: i32,
+    phase: &str,
+) -> anyhow::Error {
+    println!();
+    println!("{}", format!("Interrupted — cancelling {phase}…").yellow());
+    match temps_database::cancel_migration_backend(database_url, backend_pid).await {
+        Ok(()) => anyhow::anyhow!(
+            "{phase} was interrupted and PostgreSQL confirmed the statement on backend \
+             {backend_pid} is no longer active. \
+             Re-run `temps migrate` to repair any invalid concurrent index and continue."
+        ),
+        Err(error) => anyhow::anyhow!(
+            "{phase} was interrupted, but PostgreSQL did not confirm that backend {backend_pid} \
+             stopped: {error}. Do not rerun migrations until that PID is no longer active; check \
+             `SELECT pid, state, query FROM pg_stat_activity WHERE pid = {backend_pid}`."
+        ),
+    }
+}
+
+async fn run_post_migration_maintenance(
+    db: &Arc<temps_database::DbConnection>,
+    database_url: &str,
+    backend_pid: i32,
+) -> anyhow::Result<()> {
+    match race_maintenance(
+        temps_database::run_post_migration_indexes(db),
+        tokio::signal::ctrl_c(),
+    )
+    .await
+    {
+        MaintenanceRace::Completed(result) => result?,
+        MaintenanceRace::Interrupted => {
+            return Err(interrupted_maintenance_error(
+                database_url,
+                backend_pid,
+                "post-migration index creation",
+            )
+            .await)
+        }
+    }
+
+    match race_maintenance(
+        temps_database::run_post_migration_backfill(db),
+        tokio::signal::ctrl_c(),
+    )
+    .await
+    {
+        MaintenanceRace::Completed(Ok(())) => {}
+        MaintenanceRace::Completed(Err(error)) => {
+            info!("Post-migration backfill skipped/failed (refresh policy will catch up): {error}");
+        }
+        MaintenanceRace::Interrupted => {
+            return Err(interrupted_maintenance_error(
+                database_url,
+                backend_pid,
+                "post-migration backfill",
+            )
+            .await)
+        }
+    }
+
+    Ok(())
 }
 
 impl MigrateCommand {
     pub fn execute(self) -> anyhow::Result<()> {
         // Local runtime — keep execute() synchronous (pingora compatibility).
         let rt = tokio::runtime::Runtime::new()?;
+
+        let use_json = self
+            .progress_format
+            .as_deref()
+            .map(|f| f.eq_ignore_ascii_case("json"))
+            .unwrap_or(false);
 
         rt.block_on(async {
             // Connect WITHOUT auto-migrating; we run migrations explicitly so
@@ -86,14 +195,35 @@ impl MigrateCommand {
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
 
             if pending.is_empty() {
-                println!(
-                    "{}",
-                    "✓ Database already up to date — no migrations to apply.".green()
-                );
+                if use_json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "up_to_date",
+                            "message": "Database already up to date — no migrations to apply."
+                        })
+                    );
+                    let _ = std::io::stdout().flush();
+                } else {
+                    println!(
+                        "{}",
+                        "✓ Database already up to date — no migrations to apply.".green()
+                    );
+                }
+                if !self.dry_run {
+                    // Non-transactional maintenance must remain retryable even
+                    // after every schema migration is already recorded.
+                    run_post_migration_maintenance(&db, &self.database_url, backend_pid).await?;
+                    if !use_json {
+                        println!("{}", "✓ Post-migration maintenance complete.".green());
+                    }
+                }
                 return Ok(());
             }
 
-            print_pending_plan(&pending);
+            if !use_json {
+                print_pending_plan(&pending);
+            }
 
             // --dry-run: stop here, never touch the schema.
             if self.dry_run {
@@ -109,15 +239,22 @@ impl MigrateCommand {
                 return Ok(());
             }
 
-            // Confirmation gate. Skipped with --yes, or when stdin is not a TTY
-            // (piped/CI/systemd) so existing automation never hangs on a prompt.
-            if !self.yes && std::io::stdin().is_terminal() && !confirm_apply(pending.len())? {
+            // Confirmation gate. Skipped with --yes, in JSON mode (machine-driven),
+            // or when stdin is not a TTY (piped/CI/systemd) so existing automation
+            // never hangs on a prompt.
+            if !self.yes
+                && !use_json
+                && std::io::stdin().is_terminal()
+                && !confirm_apply(pending.len())?
+            {
                 println!("{}", "Migration cancelled. Nothing was changed.".dimmed());
                 return Ok(());
             }
 
-            println!();
-            println!("{}", "Applying…".bold());
+            if !use_json {
+                println!();
+                println!("{}", "Applying…".bold());
+            }
 
             // Stream progress so each migration is reported the moment it starts
             // and finishes — a slow index build shows as the in-flight line
@@ -128,36 +265,39 @@ impl MigrateCommand {
             // alone would leave Postgres running the DDL, so a re-run could put a
             // second backend on the same schema. The cancelled statement's
             // transaction rolls back, leaving the DB at the last applied step.
-            let report = tokio::select! {
-                res = temps_database::run_migrations_streaming(&db, print_progress) => {
-                    res.map_err(|e| anyhow::anyhow!("{}", e))?
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    println!();
-                    println!(
-                        "{}",
-                        "Interrupted — cancelling the running migration…".yellow()
-                    );
-                    if let Err(e) =
-                        temps_database::cancel_migration_backend(&self.database_url, backend_pid)
-                            .await
-                    {
-                        eprintln!("  could not cancel the database backend: {e}");
-                        eprintln!(
-                            "  check manually: SELECT pg_cancel_backend({backend_pid});"
-                        );
+            let report = if use_json {
+                tokio::select! {
+                    res = temps_database::run_migrations_streaming(&db, print_progress_json) => {
+                        res.map_err(|e| anyhow::anyhow!("{}", e))?
                     }
-                    anyhow::bail!(
-                        "Migration interrupted. The in-flight migration was cancelled and \
-                         rolled back; the database is at the last successfully-applied \
-                         migration. Re-run `temps migrate` to continue."
-                    );
+                    _ = tokio::signal::ctrl_c() => {
+                        return Err(interrupted_maintenance_error(
+                            &self.database_url,
+                            backend_pid,
+                            "migration execution",
+                        ).await);
+                    }
+                }
+            } else {
+                tokio::select! {
+                    res = temps_database::run_migrations_streaming(&db, print_progress) => {
+                        res.map_err(|e| anyhow::anyhow!("{}", e))?
+                    }
+                    _ = tokio::signal::ctrl_c() => {
+                        return Err(interrupted_maintenance_error(
+                            &self.database_url,
+                            backend_pid,
+                            "migration execution",
+                        ).await);
+                    }
                 }
             };
 
             // Surface anything planned but not attempted (everything after a
             // failure) so the operator knows the set is incomplete.
-            print_unattempted(&report);
+            if !use_json {
+                print_unattempted(&report);
+            }
 
             // Stop here if a migration failed — do not run the backfill or
             // claim success. Surface which migration failed and why.
@@ -173,22 +313,34 @@ impl MigrateCommand {
                 );
             }
 
-            // Continuous-aggregate backfill is idempotent and safe to run here
-            // (the operator is already waiting on this command).
-            if let Err(e) = temps_database::run_post_migration_backfill(&db).await {
-                info!("Post-migration backfill skipped/failed (refresh policy will catch up): {e}");
-            }
+            // Keep Ctrl+C active through non-transactional maintenance too.
+            // Tokio's process-wide signal handler remains installed after the
+            // migration select above, so awaiting these phases directly would
+            // swallow a later SIGINT and leave the operator unable to cancel.
+            run_post_migration_maintenance(&db, &self.database_url, backend_pid).await?;
 
             let total: std::time::Duration = report.results.iter().map(|r| r.elapsed).sum();
-            println!(
-                "{}",
-                format!(
-                    "✓ {} migration(s) applied in {}. Safe to restart the server.",
-                    report.results.len(),
-                    format_elapsed(total)
-                )
-                .green()
-            );
+            if use_json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "event": "complete",
+                        "migrations_applied": report.results.len(),
+                        "elapsed_ms": total.as_millis() as u64,
+                    })
+                );
+                let _ = std::io::stdout().flush();
+            } else {
+                println!(
+                    "{}",
+                    format!(
+                        "✓ {} migration(s) applied in {}. Safe to restart the server.",
+                        report.results.len(),
+                        format_elapsed(total)
+                    )
+                    .green()
+                );
+            }
             Ok::<(), anyhow::Error>(())
         })
     }
@@ -268,6 +420,56 @@ fn print_progress(progress: temps_database::MigrationProgress<'_>) {
     }
 }
 
+/// Machine-readable progress callback for `--progress-format=json`.
+///
+/// Emits one NDJSON line per event to stdout so a parent process can parse
+/// migration progress without screen-scraping human text. Each line is a
+/// self-contained JSON object terminated by `\n`.
+///
+/// Line shapes:
+/// ```json
+/// {"event":"started","index":1,"total":5,"name":"m20260811_..."}
+/// {"event":"finished","index":1,"total":5,"name":"...","success":true,"elapsed_ms":123}
+/// {"event":"finished","index":1,"total":5,"name":"...","success":false,"elapsed_ms":123,"error":"..."}
+/// ```
+fn print_progress_json(progress: temps_database::MigrationProgress<'_>) {
+    use temps_database::MigrationProgress;
+    match progress {
+        MigrationProgress::Started { index, total, name } => {
+            // Use serde_json::json! to avoid any escaping bugs in hand-rolled JSON.
+            let line = serde_json::json!({
+                "event": "started",
+                "index": index,
+                "total": total,
+                "name": name,
+            });
+            println!("{line}");
+        }
+        MigrationProgress::Finished {
+            index,
+            total,
+            result,
+        } => {
+            let elapsed_ms = result.elapsed.as_millis() as u64;
+            let mut obj = serde_json::json!({
+                "event": "finished",
+                "index": index,
+                "total": total,
+                "name": result.name,
+                "success": result.success,
+                "elapsed_ms": elapsed_ms,
+            });
+            if let Some(err) = &result.error {
+                obj["error"] = serde_json::Value::String(err.clone());
+            }
+            println!("{obj}");
+        }
+    }
+    // Flush so the parent sees the line immediately — unbuffered stdout is
+    // not guaranteed inside `tokio::spawn`, and the parent blocks on each line.
+    let _ = std::io::stdout().flush();
+}
+
 /// After a streaming apply, surface any planned migrations that were never
 /// attempted (everything after a failure) so the operator knows the set is
 /// incomplete. No-op on a fully successful run.
@@ -299,5 +501,22 @@ fn format_elapsed(d: std::time::Duration) -> String {
     } else {
         let secs = d.as_secs();
         format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{race_maintenance, MaintenanceRace};
+
+    #[tokio::test]
+    async fn maintenance_race_observes_interrupts_after_migrations_finish() {
+        let result = race_maintenance(std::future::pending::<()>(), std::future::ready(())).await;
+        assert!(matches!(result, MaintenanceRace::Interrupted));
+    }
+
+    #[tokio::test]
+    async fn maintenance_race_returns_completed_work() {
+        let result = race_maintenance(std::future::ready(42), std::future::pending::<()>()).await;
+        assert!(matches!(result, MaintenanceRace::Completed(42)));
     }
 }

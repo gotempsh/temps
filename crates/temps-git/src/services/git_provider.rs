@@ -20,8 +20,23 @@ pub enum GitProviderError {
     #[error("Authentication failed: {0}")]
     AuthenticationFailed(String),
 
+    #[error(
+        "Permission denied while trying to {operation}. Required permission: {required_permission}. Git provider response: {provider_message}"
+    )]
+    PermissionDenied {
+        operation: String,
+        required_permission: String,
+        provider_message: String,
+    },
+
     #[error("API error: {0}")]
     ApiError(String),
+
+    #[error("Commit '{commit_sha}' not found in repository '{repository}'")]
+    CommitNotFound {
+        repository: String,
+        commit_sha: String,
+    },
 
     #[error("A repository named '{name}' already exists on this account")]
     RepositoryAlreadyExists { name: String },

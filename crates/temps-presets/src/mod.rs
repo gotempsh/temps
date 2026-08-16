@@ -1,54 +1,91 @@
-use std::{fmt, path::Path};
 use async_trait::async_trait;
+use std::{fmt, path::Path};
 
+mod autopack_preset;
+mod build_system;
 mod docker;
-mod docker_compose;
+pub mod docker_compose;
+mod docker_custom;
 mod docusaurus;
+pub mod env_example;
+mod framework_detector;
+mod go_preset;
+mod java_preset;
 mod nextjs;
 mod nixpacks_preset;
+mod preset_config;
+mod python_preset;
 mod react_app;
 mod rsbuild;
-mod vite;
-mod build_system;
-mod docker_custom;
-mod preset_config;
-mod framework_detector;
 mod rust_preset;
-mod go_preset;
-mod python_preset;
-mod java_preset;
+mod vite;
 
 // Preset configuration schemas
 // Source abstraction for file access
-pub mod source;
 pub mod preset_config_schema;
+pub mod source;
 
 // New preset provider system
 pub mod preset_provider;
 pub mod providers;
 
 // Re-export Preset enum from temps-entities
-pub use temps_entities::preset::Preset as PresetType;
+pub use autopack_preset::AutopackPreset;
 use build_system::BuildSystem;
-use docusaurus::Docusaurus;
+pub use build_system::MonorepoTool;
 use docker::DockerfilePreset;
+use docker_custom::DockerCustomPreset;
+use docusaurus::Docusaurus;
+pub use framework_detector::{
+    detect_node_framework, detect_node_framework_from_package_json, NodeFramework,
+};
+pub use go_preset::GoPreset;
+pub use java_preset::JavaPreset;
 pub use nextjs::NextJs;
 pub use nixpacks_preset::{NixpacksPreset, NixpacksProvider};
+pub use preset_config::PresetConfig;
+pub use python_preset::PythonPreset;
 pub use react_app::CreateReactApp;
 use rsbuild::Rsbuild;
-pub use vite::Vite;
-pub use build_system::MonorepoTool;
-pub use preset_config::PresetConfig;
-pub use framework_detector::{detect_node_framework, NodeFramework};
 pub use rust_preset::RustPreset;
-pub use go_preset::GoPreset;
-pub use python_preset::PythonPreset;
-pub use java_preset::JavaPreset;
+pub use temps_entities::preset::Preset as PresetType;
+use temps_entities::preset::{
+    DockerfileVariant, NixpacksConfig, PresetConfig as StoredPresetConfig,
+};
+pub use vite::Vite;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProjectType {
     Server,
     Static,
+}
+
+/// Canonical representation of a selectable catalog preset.
+///
+/// Catalog slugs are presentation-level variants such as `nixpacks-node` or
+/// `react-app`. Projects persist the canonical preset plus its typed config.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredPreset {
+    pub preset: PresetType,
+    pub config: Option<StoredPresetConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PresetResolutionError {
+    #[error("Unknown preset: {slug}")]
+    UnknownSlug { slug: String },
+
+    #[error("Preset '{slug}' cannot be persisted")]
+    NotPersistable { slug: String },
+
+    #[error("Preset config for '{config_preset}' cannot be used with '{slug}'")]
+    ConfigMismatch {
+        config_preset: PresetType,
+        slug: String,
+    },
+
+    #[error("Invalid config for preset '{slug}': {reason}")]
+    InvalidConfig { slug: String, reason: String },
 }
 
 impl std::fmt::Display for ProjectType {
@@ -136,11 +173,7 @@ pub struct DockerfileConfig<'a> {
 
 impl<'a> DockerfileConfig<'a> {
     /// Create a new DockerfileConfig with default values (BuildKit disabled)
-    pub fn new(
-        root_local_path: &'a Path,
-        local_path: &'a Path,
-        project_slug: &'a str,
-    ) -> Self {
+    pub fn new(root_local_path: &'a Path, local_path: &'a Path, project_slug: &'a str) -> Self {
         Self {
             root_local_path,
             local_path,
@@ -204,7 +237,10 @@ impl DockerfileWithArgs {
     }
 
     /// Create a new DockerfileWithArgs with content and build args
-    pub fn with_args(content: String, build_args: std::collections::HashMap<String, String>) -> Self {
+    pub fn with_args(
+        content: String,
+        build_args: std::collections::HashMap<String, String>,
+    ) -> Self {
         Self {
             content,
             build_args,
@@ -240,6 +276,30 @@ pub trait Preset: fmt::Display + Send + Sync {
     fn dirs_to_upload(&self) -> Vec<String>;
     fn slug(&self) -> String;
 
+    /// Canonical database preset represented by this catalog entry.
+    ///
+    /// Most presets have identical catalog and storage slugs. Variants override
+    /// this method. Entries without a persistable identity return `None`.
+    fn stored_preset(&self) -> Option<PresetType> {
+        self.slug().parse().ok()
+    }
+
+    /// Resolve this catalog entry with optional user configuration.
+    fn resolve_storage(
+        &self,
+        config: Option<StoredPresetConfig>,
+    ) -> Result<StoredPreset, PresetResolutionError> {
+        let preset = self
+            .stored_preset()
+            .ok_or_else(|| PresetResolutionError::NotPersistable { slug: self.slug() })?;
+
+        if let Some(config) = config.as_ref() {
+            validate_preset_config(preset, config)?;
+        }
+
+        Ok(StoredPreset { preset, config })
+    }
+
     /// Returns the default exposed port for this preset
     /// This is the port the application listens on inside the container
     fn default_port(&self) -> u16 {
@@ -270,8 +330,9 @@ pub fn all_presets() -> Vec<Box<dyn Preset>> {
         // Generic presets
         Box::new(docker_compose::DockerComposePreset),
         Box::new(DockerfilePreset),
-        Box::new(docker_custom::DockerCustomPreset),
+        Box::new(DockerCustomPreset),
         // Nixpacks auto-detect
+        Box::new(AutopackPreset::new()),
         Box::new(NixpacksPreset::auto()),
         // Nixpacks provider-specific variants
         Box::new(NixpacksPreset::new(NixpacksProvider::Node)),
@@ -293,6 +354,88 @@ pub fn get_preset_by_slug(slug: &str) -> Option<Box<dyn Preset>> {
     all_presets()
         .into_iter()
         .find(|preset| preset.slug() == slug)
+}
+
+/// Resolve a public catalog slug to its canonical persisted representation.
+pub fn resolve_preset_slug(
+    slug: &str,
+    config: Option<StoredPresetConfig>,
+) -> Result<StoredPreset, PresetResolutionError> {
+    let preset = get_preset_by_slug(slug).ok_or_else(|| PresetResolutionError::UnknownSlug {
+        slug: slug.to_string(),
+    })?;
+    preset.resolve_storage(config)
+}
+
+/// Validate typed configuration for its canonical stored preset.
+///
+/// This is intentionally public so create, full-update, and config-only patch
+/// paths share the same validation boundary.
+pub fn validate_preset_config(
+    preset: PresetType,
+    config: &StoredPresetConfig,
+) -> Result<(), PresetResolutionError> {
+    if config.preset_type() != preset {
+        return Err(PresetResolutionError::ConfigMismatch {
+            config_preset: config.preset_type(),
+            slug: preset.as_str().to_string(),
+        });
+    }
+
+    if let StoredPresetConfig::Nixpacks(config) = config {
+        NixpacksPreset::validate_config(config)?;
+    }
+
+    Ok(())
+}
+
+/// Instantiate the build preset for a canonical stored project configuration.
+pub fn get_preset_for_storage(
+    preset: PresetType,
+    config: Option<&StoredPresetConfig>,
+) -> Result<Option<Box<dyn Preset>>, PresetResolutionError> {
+    if let Some(config) = config {
+        validate_preset_config(preset, config)?;
+    }
+
+    if preset == PresetType::Nixpacks {
+        let nixpacks_config = match config {
+            Some(StoredPresetConfig::Nixpacks(config)) => config.clone(),
+            _ => NixpacksConfig::default(),
+        };
+        return Ok(Some(Box::new(NixpacksPreset::from_config(nixpacks_config))));
+    }
+
+    if preset == PresetType::Dockerfile {
+        let is_custom = matches!(
+            config,
+            Some(StoredPresetConfig::Dockerfile(config))
+                if config.variant == DockerfileVariant::Custom
+        );
+        let runtime_preset: Box<dyn Preset> = if is_custom {
+            Box::new(DockerCustomPreset)
+        } else {
+            Box::new(DockerfilePreset)
+        };
+        return Ok(Some(runtime_preset));
+    }
+
+    Ok(all_presets()
+        .into_iter()
+        .find(|candidate| candidate.stored_preset() == Some(preset)))
+}
+
+/// Public catalog slug corresponding to a stored project.
+///
+/// Multi-provider Nixpacks configurations intentionally use the canonical
+/// `nixpacks` slug because no single catalog variant can represent them.
+pub fn runtime_slug(preset: PresetType, config: Option<&StoredPresetConfig>) -> String {
+    get_preset_for_storage(preset, config)
+        .ok()
+        .flatten()
+        .map(|runtime_preset| runtime_preset.slug())
+        .filter(|slug| get_preset_by_slug(slug).is_some())
+        .unwrap_or_else(|| preset.as_str().to_string())
 }
 
 pub fn detect_preset_from_files(files: &[String]) -> Option<Box<dyn Preset>> {
@@ -409,6 +552,234 @@ pub struct DetectedPreset {
     pub exposed_port: Option<u16>,
     /// Compose file paths found in the repository (only for docker-compose preset)
     pub compose_files: Option<Vec<String>>,
+}
+
+/// Detection result with the evidence that selected the preset. This is used
+/// by archive uploads where file contents (especially package.json) are
+/// available without a Git checkout.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProjectCandidate {
+    pub path: String,
+    pub preset: PresetType,
+    pub confidence: &'static str,
+    pub reason: String,
+}
+
+impl ProjectCandidate {
+    /// Return the public preset catalog slug that can be passed to project
+    /// creation for this detected candidate.
+    ///
+    /// Some canonical framework identifiers do not have a dedicated build
+    /// preset yet. Those projects are still zero-config deployable through
+    /// the matching Nixpacks provider.
+    pub fn catalog_slug(&self) -> &'static str {
+        match self.preset {
+            PresetType::Astro
+            | PresetType::Nuxt
+            | PresetType::Remix
+            | PresetType::SvelteKit
+            | PresetType::SolidStart
+            | PresetType::Angular
+            | PresetType::Vue
+            | PresetType::NodeJs => "nixpacks-node",
+            PresetType::Static => "nixpacks-static",
+            _ => self.preset.as_str(),
+        }
+    }
+}
+
+/// Detect deployable project roots from normalized archive entries.
+///
+/// `files` maps slash-separated relative paths to the contents of small text
+/// manifests. Binary and large files may be represented by an empty string.
+pub fn detect_project_candidates(
+    files: &std::collections::BTreeMap<String, String>,
+) -> Vec<ProjectCandidate> {
+    use std::collections::{BTreeMap, BTreeSet};
+
+    /// Directories that never contain a *deployable* root — they hold
+    /// dependencies, build output, or VCS metadata. Without this a ZIP that
+    /// shipped its `node_modules` offers thousands of bogus candidates.
+    const SKIP_SEGMENTS: [&str; 8] = [
+        "node_modules",
+        ".git",
+        "dist",
+        "build",
+        "vendor",
+        "target",
+        ".next",
+        "__pycache__",
+    ];
+    /// Deployable roots live near the top of an archive. Bounding depth keeps
+    /// a pathological archive from turning detection into an O(n^2) walk.
+    const MAX_ROOT_DEPTH: usize = 4;
+
+    // Index every path by its directory ONCE. The previous implementation
+    // rescanned all of `files` for each root, which is O(roots x files) — a
+    // 20k-entry archive turned into ~4x10^8 string comparisons per request.
+    let mut by_directory: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    for path in files.keys() {
+        let (directory, name) = match path.rsplit_once('/') {
+            Some((directory, name)) => (directory, name),
+            None => (".", path.as_str()),
+        };
+        if directory
+            .split('/')
+            .any(|segment| SKIP_SEGMENTS.contains(&segment))
+        {
+            continue;
+        }
+        if directory != "." && directory.split('/').count() > MAX_ROOT_DEPTH {
+            continue;
+        }
+        by_directory.entry(directory).or_default().push(name);
+    }
+
+    let mut roots = BTreeSet::new();
+    for (directory, names) in &by_directory {
+        if names.iter().any(|name| {
+            matches!(
+                *name,
+                "package.json"
+                    | "Dockerfile"
+                    | "docker-compose.yml"
+                    | "docker-compose.yaml"
+                    | "compose.yml"
+                    | "compose.yaml"
+                    | "Cargo.toml"
+                    | "go.mod"
+                    | "requirements.txt"
+                    | "pyproject.toml"
+                    | "pom.xml"
+                    | "build.gradle"
+                    | "index.html"
+            ) || name.ends_with(".csproj")
+                || name.starts_with("next.config.")
+                || name.starts_with("vite.config.")
+                || name.starts_with("astro.config.")
+        }) {
+            roots.insert(*directory);
+        }
+    }
+
+    let mut candidates = Vec::new();
+    for root in roots {
+        let at_root = |name: &str| {
+            if root == "." {
+                name.to_string()
+            } else {
+                format!("{root}/{name}")
+            }
+        };
+        let names = by_directory.get(root).map(Vec::as_slice).unwrap_or(&[]);
+        let has = |name: &str| names.contains(&name);
+        let has_extension =
+            |extension: &str| names.iter().any(|name| name.ends_with(extension));
+
+        let detected = if has("docker-compose.yml")
+            || has("docker-compose.yaml")
+            || has("compose.yml")
+            || has("compose.yaml")
+        {
+            Some((
+                PresetType::DockerCompose,
+                "high",
+                "Docker Compose file found".to_string(),
+            ))
+        } else if has("Dockerfile") {
+            Some((
+                PresetType::Dockerfile,
+                "high",
+                "Dockerfile found".to_string(),
+            ))
+        } else if let Some(package_json) = files.get(&at_root("package.json")) {
+            detect_package_json_preset(package_json)
+        } else if has("Cargo.toml") {
+            Some((PresetType::Rust, "high", "Cargo.toml found".to_string()))
+        } else if has("go.mod") {
+            Some((PresetType::Go, "high", "go.mod found".to_string()))
+        } else if has("requirements.txt") || has("pyproject.toml") {
+            Some((
+                PresetType::Python,
+                "medium",
+                "Python manifest found".to_string(),
+            ))
+        } else if has("pom.xml") || has("build.gradle") {
+            Some((
+                PresetType::Java,
+                "high",
+                "Java build manifest found".to_string(),
+            ))
+        } else if has_extension(".csproj") {
+            Some((
+                PresetType::Nixpacks,
+                "high",
+                ".NET project file found".to_string(),
+            ))
+        } else if has("index.html") {
+            Some((PresetType::Static, "medium", "index.html found".to_string()))
+        } else {
+            None
+        };
+
+        if let Some((preset, confidence, reason)) = detected {
+            candidates.push(ProjectCandidate {
+                path: root.to_string(),
+                preset,
+                confidence,
+                reason,
+            });
+        }
+    }
+
+    candidates.sort_by(|left, right| {
+        let left_root = left.path == ".";
+        let right_root = right.path == ".";
+        right_root
+            .cmp(&left_root)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    candidates
+}
+
+fn detect_package_json_preset(content: &str) -> Option<(PresetType, &'static str, String)> {
+    let package: serde_json::Value = serde_json::from_str(content).ok()?;
+    let has_dependency = |name: &str| {
+        package
+            .get("dependencies")
+            .and_then(|value| value.get(name))
+            .is_some()
+            || package
+                .get("devDependencies")
+                .and_then(|value| value.get(name))
+                .is_some()
+    };
+
+    let (preset, label) = if has_dependency("next") {
+        (PresetType::NextJs, "next")
+    } else if has_dependency("astro") {
+        (PresetType::Astro, "astro")
+    } else if has_dependency("nuxt") {
+        (PresetType::Nuxt, "nuxt")
+    } else if has_dependency("@remix-run/react") {
+        (PresetType::Remix, "@remix-run/react")
+    } else if has_dependency("@sveltejs/kit") {
+        (PresetType::SvelteKit, "@sveltejs/kit")
+    } else if has_dependency("vite") {
+        (PresetType::Vite, "vite")
+    } else {
+        return Some((
+            PresetType::NodeJs,
+            "medium",
+            "package.json found".to_string(),
+        ));
+    };
+
+    Some((
+        preset,
+        "high",
+        format!("{label} dependency found in package.json"),
+    ))
 }
 
 /// Detect all presets in a file tree
@@ -539,4 +910,200 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
     });
 
     presets
+}
+
+#[cfg(test)]
+mod uploaded_source_detection_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn detects_next_without_a_next_config_file() {
+        let files = BTreeMap::from([(
+            "package.json".to_string(),
+            r#"{"dependencies":{"next":"15.0.0","react":"19.0.0"}}"#.to_string(),
+        )]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].preset, PresetType::NextJs);
+        assert_eq!(candidates[0].path, ".");
+        assert_eq!(candidates[0].confidence, "high");
+    }
+
+    #[test]
+    fn detects_nested_node_and_vite_projects_in_stable_order() {
+        let files = BTreeMap::from([
+            (
+                "apps/api/package.json".to_string(),
+                r#"{"dependencies":{"express":"5.0.0"}}"#.to_string(),
+            ),
+            (
+                "apps/web/package.json".to_string(),
+                r#"{"devDependencies":{"vite":"7.0.0"}}"#.to_string(),
+            ),
+        ]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0].path, "apps/api");
+        assert_eq!(candidates[0].preset, PresetType::NodeJs);
+        assert_eq!(candidates[1].path, "apps/web");
+        assert_eq!(candidates[1].preset, PresetType::Vite);
+    }
+
+    #[test]
+    fn dockerfile_takes_priority_over_package_json() {
+        let files = BTreeMap::from([
+            ("Dockerfile".to_string(), "FROM node:22".to_string()),
+            ("package.json".to_string(), "{}".to_string()),
+        ]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(candidates[0].preset, PresetType::Dockerfile);
+    }
+
+    #[test]
+    fn detects_dotnet_project_in_nested_directory() {
+        let files = BTreeMap::from([(
+            "services/api/Api.csproj".to_string(),
+            r#"<Project Sdk="Microsoft.NET.Sdk.Web" />"#.to_string(),
+        )]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, "services/api");
+        assert_eq!(candidates[0].preset, PresetType::Nixpacks);
+        assert!(candidates[0].reason.contains(".NET"));
+    }
+
+    #[test]
+    fn every_detected_candidate_exposes_a_resolvable_catalog_slug() {
+        let fixtures = [
+            BTreeMap::from([(
+                "package.json".to_string(),
+                r#"{"dependencies":{"express":"5.0.0"}}"#.to_string(),
+            )]),
+            BTreeMap::from([(
+                "package.json".to_string(),
+                r#"{"dependencies":{"astro":"5.0.0"}}"#.to_string(),
+            )]),
+            BTreeMap::from([("index.html".to_string(), "<!doctype html>".to_string())]),
+        ];
+
+        for files in fixtures {
+            let candidate = detect_project_candidates(&files)
+                .into_iter()
+                .next()
+                .expect("fixture should produce a candidate");
+
+            resolve_preset_slug(candidate.catalog_slug(), None).unwrap_or_else(|error| {
+                panic!(
+                    "detected {:?} emitted invalid catalog slug '{}': {error}",
+                    candidate.preset,
+                    candidate.catalog_slug()
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn detects_docker_compose_at_the_archive_root() {
+        for name in [
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
+        ] {
+            let files = BTreeMap::from([
+                (name.to_string(), "services:\n  web:\n    image: nginx".to_string()),
+                ("package.json".to_string(), "{}".to_string()),
+            ]);
+
+            let candidates = detect_project_candidates(&files);
+
+            assert_eq!(candidates.len(), 1, "{name} should yield one candidate");
+            assert_eq!(
+                candidates[0].preset,
+                PresetType::DockerCompose,
+                "{name} should win over package.json"
+            );
+            assert_eq!(candidates[0].path, ".");
+        }
+    }
+
+    #[test]
+    fn detects_project_wrapped_in_a_single_top_level_directory() {
+        // GitHub-style archives wrap everything in `<repo>-<ref>/`.
+        let files = BTreeMap::from([(
+            "my-app-main/package.json".to_string(),
+            r#"{"dependencies":{"next":"15.0.0"}}"#.to_string(),
+        )]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, "my-app-main");
+        assert_eq!(candidates[0].preset, PresetType::NextJs);
+    }
+
+    #[test]
+    fn ignores_dependency_and_build_output_directories() {
+        let files = BTreeMap::from([
+            (
+                "package.json".to_string(),
+                r#"{"dependencies":{"vite":"7.0.0"}}"#.to_string(),
+            ),
+            ("node_modules/left-pad/package.json".to_string(), "{}".to_string()),
+            ("dist/index.html".to_string(), "<!doctype html>".to_string()),
+            ("vendor/thing/go.mod".to_string(), "module thing".to_string()),
+            ("target/debug/Cargo.toml".to_string(), "[package]".to_string()),
+            (".git/config".to_string(), String::new()),
+        ]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(
+            candidates.len(),
+            1,
+            "only the real root is deployable, got {candidates:?}"
+        );
+        assert_eq!(candidates[0].path, ".");
+        assert_eq!(candidates[0].preset, PresetType::Vite);
+    }
+
+    #[test]
+    fn deeply_nested_directories_do_not_become_candidates() {
+        let files = BTreeMap::from([(
+            "a/b/c/d/e/package.json".to_string(),
+            r#"{"dependencies":{"express":"5.0.0"}}"#.to_string(),
+        )]);
+
+        assert!(detect_project_candidates(&files).is_empty());
+    }
+
+    /// Regression guard for the O(roots x files) scan: this fixture used to
+    /// cost ~4x10^8 string comparisons. It must now stay linear enough to
+    /// finish effectively instantly.
+    #[test]
+    fn wide_archives_do_not_blow_up_detection() {
+        let mut files = BTreeMap::new();
+        for i in 0..5_000 {
+            files.insert(format!("site{i}/index.html"), "<!doctype html>".to_string());
+        }
+
+        let started = std::time::Instant::now();
+        let candidates = detect_project_candidates(&files);
+        let elapsed = started.elapsed();
+
+        assert_eq!(candidates.len(), 5_000);
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "detection took {elapsed:?} — the per-root full scan is back"
+        );
+    }
 }

@@ -11,7 +11,7 @@ use argon2::{Argon2, PasswordHasher};
 use clap::Args;
 use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
-use rand::Rng;
+use rand::RngExt;
 use rustls::crypto::CryptoProvider;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::fs;
@@ -237,10 +237,10 @@ pub struct SetupCommand {
 fn generate_secure_password() -> String {
     const CHARSET: &[u8] =
         b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..16)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect()
@@ -265,7 +265,8 @@ fn setup_encryption_key(data_dir: &Path) -> anyhow::Result<String> {
         Ok(key.trim().to_string())
     } else {
         // Generate new encryption key
-        let key = EncryptionService::generate_raw_key();
+        let key = EncryptionService::generate_raw_key()
+            .map_err(|e| anyhow::anyhow!("Failed to generate encryption key: {}", e))?;
         fs::write(&encryption_key_path, &key)
             .map_err(|e| anyhow::anyhow!("Failed to write encryption key: {}", e))?;
         debug!(
@@ -298,6 +299,7 @@ async fn ensure_system_user(db: &sea_orm::DatabaseConnection) -> anyhow::Result<
             email_verification_expires: Set(None),
             password_reset_token: Set(None),
             password_reset_expires: Set(None),
+            must_change_password: Set(false),
             deleted_at: Set(None),
             mfa_enabled: Set(false),
             mfa_secret: Set(None),
@@ -501,6 +503,7 @@ async fn create_git_provider(
     encryption_service: &EncryptionService,
     token: &str,
     github_username: &str,
+    admin_user_id: i32,
 ) -> anyhow::Result<GitProviderCreationResult> {
     // Check if GitHub provider already exists
     let existing = git_providers::Entity::find()
@@ -521,7 +524,7 @@ async fn create_git_provider(
 
         // Generate webhook secret
         let mut webhook_secret_bytes = [0u8; 32];
-        rand::thread_rng().fill(&mut webhook_secret_bytes);
+        rand::rng().fill(&mut webhook_secret_bytes);
         let webhook_secret = hex::encode(webhook_secret_bytes);
 
         // Create provider
@@ -551,8 +554,19 @@ async fn create_git_provider(
         .await?;
 
     let connection = if let Some(connection) = existing_connection {
-        debug!("GitHub connection for '{}' already exists", github_username);
-        connection
+        if connection.user_id != Some(admin_user_id) {
+            let mut active: git_provider_connections::ActiveModel = connection.into();
+            active.user_id = Set(Some(admin_user_id));
+            let connection = active.update(conn).await?;
+            debug!(
+                "Assigned existing GitHub connection for '{}' to admin user {}",
+                github_username, admin_user_id
+            );
+            connection
+        } else {
+            debug!("GitHub connection for '{}' already exists", github_username);
+            connection
+        }
     } else {
         // Encrypt the PAT token for the connection
         let encrypted_token = encryption_service
@@ -562,7 +576,7 @@ async fn create_git_provider(
         // Create connection
         let new_connection = git_provider_connections::ActiveModel {
             provider_id: Set(provider.id),
-            user_id: Set(None), // No user in CLI setup
+            user_id: Set(Some(admin_user_id)),
             account_name: Set(github_username.to_string()),
             account_type: Set("User".to_string()),
             access_token: Set(Some(encrypted_token)),
@@ -606,40 +620,164 @@ async fn verify_cloudflare_token(token: &str) -> anyhow::Result<bool> {
 #[derive(Debug, Clone)]
 pub struct GitHubUserInfo {
     pub username: String,
+    pub identity_warning: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum GitHubTokenVerificationError {
+    #[error(
+        "GitHub rejected the credential as invalid or expired. GitHub said: {provider_message}"
+    )]
+    InvalidCredential { provider_message: String },
+    #[error(
+        "GitHub denied permission to {capability}. Grant '{required_permission}' to the token or GitHub App. GitHub said: {provider_message}"
+    )]
+    PermissionDenied {
+        capability: String,
+        required_permission: String,
+        provider_message: String,
+    },
+    #[error("GitHub API rate limit exhausted while validating the credential. Retry after the limit resets or use a different credential.")]
+    RateLimited,
+    #[error("Could not contact GitHub while validating the credential: {reason}")]
+    RequestFailed { reason: String },
+    #[error("GitHub returned an unexpected response while validating the credential: HTTP {status}. GitHub said: {provider_message}")]
+    Upstream {
+        status: reqwest::StatusCode,
+        provider_message: String,
+    },
+}
+
+fn github_error_message(body: &serde_json::Value) -> String {
+    body.get("message")
+        .and_then(|message| message.as_str())
+        .unwrap_or("no additional details")
+        .to_string()
+}
+
+fn validate_github_token_probe(
+    status: reqwest::StatusCode,
+    rate_limit_remaining: Option<u64>,
+    provider_message: String,
+) -> Result<(), GitHubTokenVerificationError> {
+    match status {
+        status if status.is_success() => Ok(()),
+        reqwest::StatusCode::UNAUTHORIZED => {
+            Err(GitHubTokenVerificationError::InvalidCredential { provider_message })
+        }
+        reqwest::StatusCode::FORBIDDEN if rate_limit_remaining == Some(0) => {
+            Err(GitHubTokenVerificationError::RateLimited)
+        }
+        reqwest::StatusCode::FORBIDDEN => Err(GitHubTokenVerificationError::PermissionDenied {
+            capability: "validate the credential".to_string(),
+            required_permission: "Metadata: read".to_string(),
+            provider_message,
+        }),
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Err(GitHubTokenVerificationError::RateLimited),
+        status => Err(GitHubTokenVerificationError::Upstream {
+            status,
+            provider_message,
+        }),
+    }
+}
+
+fn github_identity_from_response(
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+    account_hint: Option<&str>,
+) -> Result<GitHubUserInfo, GitHubTokenVerificationError> {
+    if status.is_success() {
+        let username = body
+            .get("login")
+            .and_then(|value| value.as_str())
+            .ok_or_else(|| GitHubTokenVerificationError::Upstream {
+                status,
+                provider_message: "successful /user response did not contain a login".to_string(),
+            })?;
+        return Ok(GitHubUserInfo {
+            username: username.to_string(),
+            identity_warning: None,
+        });
+    }
+
+    match status {
+        reqwest::StatusCode::UNAUTHORIZED => Err(GitHubTokenVerificationError::InvalidCredential {
+            provider_message: github_error_message(body),
+        }),
+        reqwest::StatusCode::FORBIDDEN => {
+            // Repository-scoped and GitHub Actions installation tokens are
+            // valid credentials but cannot call the user-identity endpoint.
+            let username = account_hint
+                .filter(|hint| !hint.trim().is_empty())
+                .unwrap_or("repository-scoped-token")
+                .to_string();
+            Ok(GitHubUserInfo {
+                username,
+                identity_warning: Some(
+                    "GitHub user identity is unavailable for this repository-scoped credential. Repository permissions will be checked per operation."
+                        .to_string(),
+                ),
+            })
+        }
+        reqwest::StatusCode::TOO_MANY_REQUESTS => Err(GitHubTokenVerificationError::RateLimited),
+        status => Err(GitHubTokenVerificationError::Upstream {
+            status,
+            provider_message: github_error_message(body),
+        }),
+    }
 }
 
 async fn verify_github_token(token: &str) -> anyhow::Result<GitHubUserInfo> {
     let client = reqwest::Client::new();
-    let response = client
+    let probe_response = client
+        .get("https://api.github.com/rate_limit")
+        .header("Authorization", format!("Bearer {}", token))
+        .header("User-Agent", "temps-setup")
+        .header("Accept", "application/vnd.github+json")
+        .send()
+        .await
+        .map_err(|error| GitHubTokenVerificationError::RequestFailed {
+            reason: error.to_string(),
+        })?;
+
+    let probe_status = probe_response.status();
+    let rate_limit_remaining = probe_response
+        .headers()
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let probe_body = probe_response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    validate_github_token_probe(
+        probe_status,
+        rate_limit_remaining,
+        github_error_message(&probe_body),
+    )?;
+
+    let identity_response = client
         .get("https://api.github.com/user")
         .header("Authorization", format!("Bearer {}", token))
         .header("User-Agent", "temps-setup")
         .header("Accept", "application/vnd.github+json")
         .send()
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to verify GitHub token: {}", e))?;
+        .map_err(|error| GitHubTokenVerificationError::RequestFailed {
+            reason: error.to_string(),
+        })?;
+    let identity_status = identity_response.status();
+    let identity_body = identity_response
+        .json::<serde_json::Value>()
+        .await
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let account_hint = std::env::var("GITHUB_ACTOR").ok();
 
-    if response.status().is_success() {
-        let json: serde_json::Value = response
-            .json()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to parse GitHub user response: {}", e))?;
-
-        let username = json
-            .get("login")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow::anyhow!("GitHub response missing 'login' field"))?
-            .to_string();
-
-        Ok(GitHubUserInfo { username })
-    } else {
-        Err(anyhow::anyhow!(
-            "GitHub token is invalid or does not have required permissions (HTTP {}).\n\
-             Required scopes: 'repo' (full access) and 'read:user'.\n\
-             Create a token at: https://github.com/settings/tokens/new",
-            response.status()
-        ))
-    }
+    Ok(github_identity_from_response(
+        identity_status,
+        &identity_body,
+        account_hint.as_deref(),
+    )?)
 }
 
 /// Auto-detect the server's public IP address using external services
@@ -1240,10 +1378,15 @@ async fn update_app_settings(
     app_settings.setup_complete = true;
 
     let now = Utc::now();
-    let settings_json = app_settings.to_json();
+    let settings_json = existing
+        .as_ref()
+        .map(|r| app_settings.to_json_merged(&r.data))
+        .unwrap_or_else(|| app_settings.to_json());
 
     if let Some(existing_model) = existing {
-        // Update existing settings
+        // Update existing settings. Merge, don't replace — re-running `temps
+        // setup` on a configured install must not drop sub-documents owned by
+        // other subsystems (`admin_gate`). See `AppSettings::to_json_merged`.
         let mut active_model: settings::ActiveModel = existing_model.into();
         active_model.data = Set(settings_json);
         active_model.updated_at = Set(now);
@@ -1273,12 +1416,50 @@ fn extract_preview_domain(wildcard_domain: &str) -> String {
 /// challenge, so on-demand TLS would never fire. This is the only condition
 /// that gates ADR-018 §6 on-demand-TLS auto-enablement; any other (non-empty,
 /// non-loopback) base domain qualifies, regardless of whether it is sslip.io.
+/// Build the wildcard-DNS base domain for `ip`, using the **dashed** spelling.
+///
+/// Wildcard-DNS services (sslip.io and friends) locate the target address by
+/// scanning the hostname for four numeric components joined by a *single*
+/// separator style, taking the leftmost match — and that match is not anchored
+/// to the base domain. With a dotted base, any generated label ending in a
+/// number donates it to the front of the IP and the name resolves elsewhere:
+///
+/// ```text
+/// observability-starter-1.127.0.0.1.sslip.io  ->  1.127.0.0
+/// pr-42.127.0.0.1.sslip.io                    ->  42.127.0.0
+/// ```
+///
+/// Deployment slugs are `{project}-{n}` and preview environments are
+/// `pr-{number}`, so on a dotted base that is *every* generated hostname. The
+/// dashed spelling makes the separator styles disagree (`1.127-0-0` mixes a dot
+/// and dashes, so it is rejected) and the real `127-0-0-1` wins.
+///
+/// The published installer emits the same dashed form and passes it via
+/// `--wildcard-domain`; this covers `temps setup --auto` generating its own.
+///
+/// Note: IPv4 only. sslip.io spells IPv6 with dashes for `:` and this does not
+/// handle that — pre-existing, and `--wildcard-domain` remains the escape hatch.
+fn sslip_domain_for(ip: &str) -> String {
+    format!("{}.sslip.io", ip.replace('.', "-"))
+}
+
 fn is_loopback_zone(zone: &str) -> bool {
     let z = zone.trim().trim_end_matches('.').to_ascii_lowercase();
     z == "localhost"
         || z.ends_with(".localhost")
         || z.starts_with("127.0.0.1")
         || z.contains("127-0-0-1")
+        // `localho.st` is a real public DNS name that resolves to 127.0.0.1 --
+        // used throughout this codebase as the local/loopback dev domain
+        // (see doctor.rs's "default - configure a real domain for
+        // production" warning and the proxy's SameSite-safe cookie tests)
+        // specifically so browsers treat it as a normal internet host. It is
+        // still loopback for ACME purposes: Let's Encrypt's HTTP-01/on-demand
+        // validators cannot reach a box whose public DNS answer is its own
+        // loopback address, so issuance can never succeed and on-demand TLS
+        // must stay off here exactly as it does for `localhost`/`127.0.0.1`.
+        || z == "localho.st"
+        || z.ends_with(".localho.st")
 }
 
 impl SetupCommand {
@@ -1316,7 +1497,7 @@ impl SetupCommand {
                         ip
                     }
                 };
-                let sslip_domain = format!("{}.sslip.io", ip);
+                let sslip_domain = sslip_domain_for(&ip);
                 print_success(&format!(
                     "Using sslip.io domain: {}",
                     format!("*.{}", sslip_domain).bright_cyan()
@@ -1630,16 +1811,17 @@ impl SetupCommand {
 
             println!("   Verifying GitHub token...");
             let github_user = rt.block_on(verify_github_token(github_token))?;
-            print_success(&format!(
-                "GitHub token verified (user: {})",
-                github_user.username
-            ));
+            print_success(&format!("GitHub token verified ({})", github_user.username));
+            if let Some(warning) = github_user.identity_warning.as_deref() {
+                print_warning(warning);
+            }
 
             let git_result = rt.block_on(create_git_provider(
                 db.as_ref(),
                 &encryption_service,
                 github_token,
                 &github_user.username,
+                user.id,
             ))?;
             print_success("GitHub provider configured");
             print_success(&format!(
@@ -2822,6 +3004,103 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repository_scoped_github_token_does_not_require_user_identity() {
+        validate_github_token_probe(
+            reqwest::StatusCode::OK,
+            Some(4_999),
+            "no additional details".to_string(),
+        )
+        .expect("the token-compatible probe should accept the credential");
+
+        let identity = github_identity_from_response(
+            reqwest::StatusCode::FORBIDDEN,
+            &serde_json::json!({"message": "Resource not accessible by integration"}),
+            Some("ci-actor"),
+        )
+        .expect("missing user identity must not invalidate a repository-scoped token");
+
+        assert_eq!(identity.username, "ci-actor");
+        assert!(identity
+            .identity_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("Repository permissions will be checked")));
+    }
+
+    #[test]
+    fn github_token_probe_distinguishes_permission_and_rate_limit_failures() {
+        let denied = validate_github_token_probe(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(4_999),
+            "Resource not accessible by integration".to_string(),
+        )
+        .expect_err("a non-rate-limited 403 must be a permission error");
+        assert!(matches!(
+            denied,
+            GitHubTokenVerificationError::PermissionDenied { .. }
+        ));
+        assert!(denied.to_string().contains("Metadata: read"));
+
+        let limited = validate_github_token_probe(
+            reqwest::StatusCode::FORBIDDEN,
+            Some(0),
+            "API rate limit exceeded".to_string(),
+        )
+        .expect_err("an exhausted rate-limit response must stay distinct");
+        assert!(matches!(limited, GitHubTokenVerificationError::RateLimited));
+    }
+
+    #[test]
+    fn github_token_probe_reports_invalid_credentials_without_scope_claims() {
+        let error = validate_github_token_probe(
+            reqwest::StatusCode::UNAUTHORIZED,
+            None,
+            "Bad credentials".to_string(),
+        )
+        .expect_err("401 must reject the credential");
+
+        let message = error.to_string();
+        assert!(message.contains("invalid or expired"));
+        assert!(message.contains("Bad credentials"));
+        assert!(!message.contains("repo' (full access)"));
+    }
+
+    #[test]
+    fn github_identity_probe_does_not_hide_upstream_or_rate_limit_failures() {
+        let upstream = github_identity_from_response(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::json!({"message": "server error"}),
+            Some("ci-actor"),
+        )
+        .expect_err("an upstream failure must not be presented as verified identity metadata");
+        assert!(matches!(
+            upstream,
+            GitHubTokenVerificationError::Upstream { .. }
+        ));
+
+        let limited = github_identity_from_response(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            &serde_json::json!({"message": "rate limit"}),
+            Some("ci-actor"),
+        )
+        .expect_err("a rate-limit failure must remain actionable");
+        assert!(matches!(limited, GitHubTokenVerificationError::RateLimited));
+    }
+
+    /// Pins the dashed spelling. Reverting this to the dotted form still
+    /// compiles and passes every other check, while silently making every
+    /// generated app hostname on a quick-start install resolve to a third
+    /// party — so the behaviour needs an assertion, not just a comment.
+    #[test]
+    fn sslip_domain_uses_the_dashed_ip_spelling() {
+        assert_eq!(sslip_domain_for("127.0.0.1"), "127-0-0-1.sslip.io");
+        assert_eq!(sslip_domain_for("203.0.113.42"), "203-0-113-42.sslip.io");
+        // The generated base must stay loopback-detectable, or `temps setup`
+        // would advertise on-demand TLS for a zone Let's Encrypt can't reach.
+        assert!(is_loopback_zone(&sslip_domain_for("127.0.0.1")));
+        assert!(!is_loopback_zone(&sslip_domain_for("203.0.113.42")));
+    }
+
+    #[test]
     fn test_is_loopback_zone() {
         assert!(is_loopback_zone("127.0.0.1.sslip.io"));
         assert!(is_loopback_zone("localhost"));
@@ -2829,6 +3108,10 @@ mod tests {
         assert!(is_loopback_zone("127-0-0-1.sslip.io"));
         assert!(!is_loopback_zone("1.2.3.4.sslip.io"));
         assert!(!is_loopback_zone("example.com"));
+        assert!(is_loopback_zone("localho.st"));
+        assert!(is_loopback_zone("*.localho.st"));
+        assert!(is_loopback_zone("app.localho.st"));
+        assert!(!is_loopback_zone("localho.st.example.com"));
     }
 
     #[test]
@@ -2843,6 +3126,7 @@ mod tests {
         assert!(!should_enable("localhost")); // local mode
         assert!(!should_enable("")); // no domain
         assert!(!should_enable("   ")); // whitespace-only
+        assert!(!should_enable("localho.st")); // local/dev-cluster loopback domain
     }
 
     #[test]

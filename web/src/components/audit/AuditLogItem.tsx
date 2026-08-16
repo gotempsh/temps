@@ -2,6 +2,7 @@ import { AuditLogIpInfo, AuditLogUserInfo } from '@/api/client'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { TableCell, TableRow } from '@/components/ui/table'
+import { describePermissionDenial } from '@/lib/permission-denial-display'
 import { cn } from '@/lib/utils'
 import { format } from 'date-fns'
 import {
@@ -30,7 +31,7 @@ import {
   Workflow,
 } from 'lucide-react'
 import { ReactNode, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 
 interface AuditLogItemProps {
   id: number
@@ -74,13 +75,18 @@ function humanize(op: string): string {
     .join(' ')
 }
 
+function truncateDisplay(value: string, maxLength = 80): string {
+  return value.length > maxLength ? `${value.slice(0, maxLength - 1)}…` : value
+}
+
 function categorize(op: string): Category {
   if (
     op.startsWith('LOGIN_') ||
     op.startsWith('AUTH_') ||
     op === 'USER_LOGOUT' ||
     op === 'PASSWORD_RESET' ||
-    op === 'EMAIL_VERIFIED'
+    op === 'EMAIL_VERIFIED' ||
+    op === 'PERMISSION_DENIED'
   )
     return 'auth'
   if (op.startsWith('USER_') || op.startsWith('ROLE_')) return 'user'
@@ -115,10 +121,7 @@ function categorize(op: string): Category {
   if (op.startsWith('DOMAIN_') || op === 'DNS_CHALLENGE_SETUP') return 'domain'
   if (op.startsWith('EMAIL_')) return 'email'
   if (op.startsWith('WEBHOOK_')) return 'webhook'
-  if (
-    op.startsWith('NOTIFICATION_') ||
-    op === 'WEEKLY_DIGEST_TRIGGERED'
-  )
+  if (op.startsWith('NOTIFICATION_') || op === 'WEEKLY_DIGEST_TRIGGERED')
     return 'notification'
   if (op.startsWith('BLOB_SERVICE_') || op.startsWith('KV_SERVICE_'))
     return 'storage'
@@ -243,7 +246,10 @@ const CATEGORY_META: Record<
   },
 }
 
-function get<T>(data: Record<string, unknown> | undefined, key: string): T | undefined {
+function get<T>(
+  data: Record<string, unknown> | undefined,
+  key: string
+): T | undefined {
   return data?.[key] as T | undefined
 }
 
@@ -279,13 +285,20 @@ function describe(
   const webhookName = get<string>(data, 'webhook_name')
   const providerName = get<string>(data, 'provider_name')
   const sessionId = get<string | number>(data, 'session_id')
+  const attemptedEmail = get<string>(data, 'attempted_email')
+  const displayedAttemptedEmail = attemptedEmail
+    ? truncateDisplay(attemptedEmail)
+    : undefined
+  const failureReason = get<string>(data, 'reason')
 
   switch (op) {
     // Auth
     case 'LOGIN_SUCCESS':
       return 'Logged in successfully'
     case 'LOGIN_FAILURE':
-      return 'Failed login attempt'
+      return `Failed login attempt${displayedAttemptedEmail ? ` for ${displayedAttemptedEmail}` : ''}${failureReason ? ` (${humanize(failureReason).toLowerCase()})` : ''}`
+    case 'PERMISSION_DENIED':
+      return describePermissionDenial(data)
     case 'USER_LOGOUT':
       return 'Logged out'
     case 'AUTH_INITIATED':
@@ -316,6 +329,8 @@ function describe(
       return `${user?.name ?? 'User'} disabled multi-factor authentication`
     case 'MFA_VERIFIED':
       return `${user?.name ?? 'User'} verified multi-factor authentication`
+    case 'MFA_VERIFICATION_FAILED':
+      return 'Rejected an MFA verification attempt'
 
     // External services
     case 'EXTERNAL_SERVICE_CREATED':
@@ -472,7 +487,9 @@ function describe(
     // Containers
     case 'CONTAINER_ACTION': {
       const verb = action ?? 'action'
-      const tail = containerId ? ` on container ${containerId.slice(0, 12)}` : ''
+      const tail = containerId
+        ? ` on container ${containerId.slice(0, 12)}`
+        : ''
       return `Performed ${verb}${tail}`
     }
 
@@ -586,7 +603,9 @@ function describe(
       // Graceful fallback: turn UNKNOWN_OP into "Unknown Op"
       const pretty = humanize(op)
       const target = name || slug || serviceName || sourceName
-      return target ? `${pretty}: ${target}` : pretty || 'Performed an operation'
+      return target
+        ? `${pretty}: ${target}`
+        : pretty || 'Performed an operation'
     }
   }
 }

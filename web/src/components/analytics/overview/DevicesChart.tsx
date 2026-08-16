@@ -14,7 +14,7 @@ import { format } from 'date-fns'
 import type { LucideIcon } from 'lucide-react'
 import { BarChart3, Monitor, Smartphone, Tablet } from 'lucide-react'
 import * as React from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 
 const DEVICE_ICONS: Record<string, LucideIcon> = {

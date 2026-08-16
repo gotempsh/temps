@@ -1,14 +1,14 @@
-//! Python preset implementation using Nixpacks
+//! Python preset implementation using autopack
 //!
 //! This preset detects Python projects (requirements.txt, pyproject.toml, etc.)
-//! and uses Nixpacks for building.
+//! and uses autopack for building.
 
 use crate::{DockerfileConfig, DockerfileWithArgs, NixpacksPreset, NixpacksProvider, Preset, ProjectType};
 use async_trait::async_trait;
 use std::fmt;
 use std::path::Path;
 
-/// Python preset - delegates to Nixpacks with Python provider
+/// Python preset - delegates to autopack with the Python provider
 #[derive(Debug, Clone, Copy)]
 pub struct PythonPreset;
 
@@ -44,15 +44,15 @@ impl Preset for PythonPreset {
     }
 
     async fn dockerfile(&self, config: DockerfileConfig<'_>) -> DockerfileWithArgs {
-        // Delegate to Nixpacks with Python provider
-        let nixpacks = NixpacksPreset::new(NixpacksProvider::Python);
-        nixpacks.dockerfile(config).await
+        // Delegate to autopack with the Python provider
+        let builder = NixpacksPreset::new(NixpacksProvider::Python);
+        builder.dockerfile(config).await
     }
 
     async fn dockerfile_with_build_dir(&self, local_path: &Path) -> DockerfileWithArgs {
-        // Delegate to Nixpacks with Python provider
-        let nixpacks = NixpacksPreset::new(NixpacksProvider::Python);
-        nixpacks.dockerfile_with_build_dir(local_path).await
+        // Delegate to autopack with the Python provider
+        let builder = NixpacksPreset::new(NixpacksProvider::Python);
+        builder.dockerfile_with_build_dir(local_path).await
     }
 
     fn install_command(&self, _local_path: &Path) -> String {

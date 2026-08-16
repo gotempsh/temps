@@ -439,6 +439,7 @@ pub async fn get_hourly_visits(
         ("event_name" = Option<String>, Query, description = "Filter by event name"),
         ("aggregation_level" = Option<String>, Query, description = "Aggregation level: events, sessions, or visitors - default: events"),
         ("limit" = Option<i32>, Query, description = "Maximum number of results (default: 20, max: 100)"),
+        ("include_crawlers" = Option<bool>, Query, description = "Include crawler/bot traffic (default: false)"),
         ("filter_country" = Option<String>, Query, description = "Filter by country (for region/city drill-downs)"),
         ("filter_region" = Option<String>, Query, description = "Filter by region (for city drill-downs)"),
         ("filter_browser" = Option<String>, Query, description = "Filter by browser name (for version drill-downs)"),
@@ -491,7 +492,8 @@ pub async fn get_property_breakdown(
         aggregation_level,
         query.limit,
         Some(filters),
-    );
+    )
+    .with_crawlers(query.include_crawlers.unwrap_or(false));
     let breakdown = state
         .events_service
         .query_property_breakdown(spec)
@@ -520,7 +522,8 @@ pub async fn get_property_breakdown(
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
         ("event_name" = Option<String>, Query, description = "Filter by event name"),
         ("aggregation_level" = Option<String>, Query, description = "Aggregation level: events, sessions, or visitors - default: events"),
-        ("bucket_size" = Option<String>, Query, description = "Time bucket: hour, day, week, month (default: auto-detect)")
+        ("bucket_size" = Option<String>, Query, description = "Time bucket: hour, day, week, month (default: auto-detect)"),
+        ("include_crawlers" = Option<bool>, Query, description = "Include crawler/bot traffic (default: false)")
     ),
     responses(
         (status = 200, description = "Successfully retrieved property timeline", body = PropertyTimelineResponse),
@@ -557,6 +560,7 @@ pub async fn get_property_timeline(
         group_by_column: query.group_by.clone(),
         aggregation_level: aggregation_level.to_string(),
         bucket_size: query.bucket_size,
+        include_crawlers: query.include_crawlers.unwrap_or(false),
     };
     let timeline = state
         .events_service
@@ -583,7 +587,7 @@ pub async fn get_property_timeline(
         ("end_date" = String, Query, description = "End date in '%Y-%m-%d %H:%M:%S' format"),
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
-        ("metric" = String, Query, description = "Metric to count: 'sessions' (unique sessions), 'visitors' (unique visitors), or 'page_views' (total page views) (default: 'sessions')")
+        ("metric" = String, Query, description = "Metric to count: 'sessions' (unique sessions), 'visitors' (unique visitors), 'returning_visitors' (visitors seen before the range), or 'page_views' (total page views) (default: 'sessions')")
     ),
     responses(
         (status = 200, description = "Successfully retrieved count", body = UniqueCountsResponse),
@@ -629,6 +633,68 @@ pub async fn get_unique_counts(
         })?;
 
     Ok(Json(counts))
+}
+
+/// Longest BCP-47 tag we will store. Real tags are short ("en", "pt-BR",
+/// "zh-Hant-TW"); anything longer is a client sending junk.
+const MAX_LANGUAGE_TAG_LEN: usize = 35;
+
+/// Extract the highest-priority language tag from an `Accept-Language` header
+/// (or from an SDK-supplied `language` field, which has the same shape).
+///
+/// Picks the entry with the highest `q` weight rather than simply the first:
+/// browsers do send preference order, but the ordering is a convention, not a
+/// guarantee, and `de;q=0.1,en;q=0.9` must resolve to `en`. Ties keep the
+/// earlier entry, matching RFC 9110.
+///
+/// The result is **validated and normalised, not merely truncated**. Every
+/// source of this value is attacker-controlled (`/_temps/event` is
+/// unauthenticated) and `language` is a `GROUP BY` dimension, so unvalidated
+/// input is an unbounded-cardinality hazard — worse on ClickHouse, where the
+/// column is `LowCardinality(String)`. Anything that isn't a plausible BCP-47
+/// tag is dropped rather than stored, and casing is normalised so `en-US`,
+/// `en-us` and `EN-US` collapse to one dimension value instead of three.
+fn primary_accept_language(header: &str) -> Option<String> {
+    let mut best: Option<(f32, &str)> = None;
+
+    for entry in header.split(',') {
+        let mut parts = entry.split(';');
+        let tag = parts.next().unwrap_or("").trim().trim_matches('"');
+        if tag.is_empty() {
+            continue;
+        }
+        // q-weight defaults to 1.0 when absent or unparsable.
+        let q = parts
+            .find_map(|p| {
+                let p = p.trim();
+                p.strip_prefix("q=").or_else(|| p.strip_prefix("Q="))
+            })
+            .and_then(|v| v.trim().parse::<f32>().ok())
+            .unwrap_or(1.0);
+
+        if best.is_none_or(|(best_q, _)| q > best_q) {
+            best = Some((q, tag));
+        }
+    }
+
+    let tag = best.map(|(_, t)| t)?;
+
+    if tag.len() > MAX_LANGUAGE_TAG_LEN {
+        return None;
+    }
+    // "*" is a valid Accept-Language value but carries no information.
+    if tag == "*" {
+        return None;
+    }
+    // Subtags are alphanumeric, separated by "-". Reject anything else.
+    if !tag
+        .split('-')
+        .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_alphanumeric()))
+    {
+        return None;
+    }
+
+    Some(tag.to_ascii_lowercase())
 }
 
 /// Record analytics event
@@ -724,14 +790,36 @@ pub async fn record_event_metrics(
         .or(payload.referrer.clone())
         .or(referrer_header);
 
-    // Extract language from event_data if not provided in payload
-    let language = payload.language.or_else(|| {
-        payload
-            .event_data
-            .get("language")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    // Resolve the visitor's language from the payload, then event_data, then
+    // the Accept-Language header — and validate whichever one wins.
+    //
+    // The header fallback exists because older SDKs send no `language` at all,
+    // which left this column NULL on every event and the breakdown 100%
+    // "Unknown". Newer SDKs do send it on the payload.
+    //
+    // Validation is applied to the RESOLVED value rather than to any single
+    // branch. All three sources are attacker-controlled — `/_temps/event` is
+    // unauthenticated, so `payload.language` and `event_data.language` are just
+    // as forgeable as the header — and `language` is a GROUP BY dimension, so
+    // an unvalidated value here is an unbounded-cardinality hazard on a box we
+    // expect to run in 4 GB. Validating only the header would have left the
+    // guard covering the branch least likely to be taken.
+    let language = payload
+        .language
+        .or_else(|| {
+            payload
+                .event_data
+                .get("language")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .or_else(|| {
+            headers
+                .get("accept-language")
+                .and_then(|h| h.to_str().ok())
+                .map(|h| h.to_string())
+        })
+        .and_then(|raw| primary_accept_language(&raw));
 
     // Lookup IP geolocation
     let ip_geolocation_id = if !metadata.ip_address.is_empty() {
@@ -771,6 +859,9 @@ pub async fn record_event_metrics(
             payload.event_data,
             &payload.request_path,
             &payload.request_query,
+            // The tracked site's own host, already resolved against the route
+            // table above — lets the service detect self-referrals.
+            Some(host.as_str()),
             payload.screen_width,
             payload.screen_height,
             payload.viewport_width,
@@ -900,6 +991,10 @@ pub async fn record_console_event(
             payload.event_data,
             &payload.request_path,
             &payload.request_query,
+            // No site hostname on the server-side path: the caller is the app
+            // backend, not the browser, and it sends no referrer either — so
+            // there is no self-referral to detect.
+            None, // site_hostname
             None, // screen_width
             None, // screen_height
             None, // viewport_width
@@ -1209,6 +1304,58 @@ mod tests {
     use temps_entities::projects;
     use tower::ServiceExt;
 
+    #[test]
+    fn test_primary_accept_language_takes_highest_priority_tag() {
+        // Browsers send preference order already, so the first entry wins and
+        // the q-weight is dropped.
+        assert_eq!(
+            primary_accept_language("en-US,en;q=0.9,es;q=0.8").as_deref(),
+            Some("en-us")
+        );
+        // Highest q wins even when it is not first — browser ordering is a
+        // convention, not a guarantee.
+        assert_eq!(
+            primary_accept_language("de;q=0.1,en;q=0.9").as_deref(),
+            Some("en")
+        );
+        // Ties keep the earlier entry (RFC 9110).
+        assert_eq!(primary_accept_language("fr,de").as_deref(), Some("fr"));
+        // Casing is normalised so one language is one dimension value.
+        assert_eq!(primary_accept_language("EN-US").as_deref(), Some("en-us"));
+        assert_eq!(
+            primary_accept_language("en-us").as_deref(),
+            primary_accept_language("EN-us").as_deref()
+        );
+        assert_eq!(primary_accept_language("fr").as_deref(), Some("fr"));
+        assert_eq!(
+            primary_accept_language("  pt-BR ;q=1.0 ").as_deref(),
+            Some("pt-br")
+        );
+        assert_eq!(
+            primary_accept_language("zh-Hant-TW,zh;q=0.9").as_deref(),
+            Some("zh-hant-tw")
+        );
+    }
+
+    #[test]
+    fn test_primary_accept_language_rejects_junk() {
+        // `language` is a GROUP BY dimension — unvalidated input is a
+        // cardinality bomb, so anything implausible is dropped, not stored.
+        assert_eq!(primary_accept_language(""), None);
+        assert_eq!(primary_accept_language("   "), None);
+        assert_eq!(primary_accept_language("*"), None);
+        assert_eq!(primary_accept_language(";q=0.9"), None);
+        assert_eq!(primary_accept_language("en_US"), None); // underscore, not BCP-47
+        assert_eq!(primary_accept_language("en-"), None); // empty subtag
+        assert_eq!(primary_accept_language("<script>"), None);
+        assert_eq!(primary_accept_language("'; DROP TABLE events--"), None);
+        assert_eq!(primary_accept_language(&"a".repeat(36)), None); // over the cap
+        assert_eq!(
+            primary_accept_language(&"a".repeat(35)).as_deref(),
+            Some("a".repeat(35).as_str())
+        );
+    }
+
     fn create_test_auth_context() -> temps_auth::AuthContext {
         let user = temps_entities::users::Model {
             id: 1,
@@ -1220,6 +1367,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,
@@ -1355,6 +1503,8 @@ mod tests {
             git_url: Set(None),
             git_provider_connection_id: Set(None),
             attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
             enable_preview_environments: Set(false),
             source_type: Set(temps_entities::source_type::SourceType::Git),
             created_at: Set(chrono::Utc::now()),

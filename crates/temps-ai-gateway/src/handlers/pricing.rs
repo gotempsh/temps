@@ -148,6 +148,19 @@ impl PricingBuilder {
 fn build_pricing() -> Vec<ModelPricing> {
     vec![
         // ── Anthropic ───────────────────────────────────────────────────
+        PricingBuilder::new("anthropic", "claude-opus-5", "Claude Opus 5", 5.0, 25.0)
+            .cache(6.25, 10.0, 0.50)
+            .batch(2.50, 12.50)
+            .build(),
+        // Introductory Sonnet 5 pricing through 2026-08-31.
+        PricingBuilder::new("anthropic", "claude-sonnet-5", "Claude Sonnet 5", 2.0, 10.0)
+            .cache(2.50, 4.0, 0.20)
+            .batch(1.0, 5.0)
+            .build(),
+        PricingBuilder::new("anthropic", "claude-fable-5", "Claude Fable 5", 10.0, 50.0)
+            .cache(12.50, 20.0, 1.0)
+            .batch(5.0, 25.0)
+            .build(),
         PricingBuilder::new("anthropic", "claude-opus-4-6", "Claude Opus 4.6", 5.0, 25.0)
             .cache(6.25, 10.0, 0.50)
             .batch(2.50, 12.50)
@@ -173,6 +186,18 @@ fn build_pricing() -> Vec<ModelPricing> {
         .batch(0.50, 2.50)
         .build(),
         // ── OpenAI ──────────────────────────────────────────────────────
+        PricingBuilder::new("openai", "gpt-5.6-sol", "GPT-5.6 Sol", 5.0, 30.0)
+            .cache(0.0, 0.0, 0.50)
+            .build(),
+        PricingBuilder::new("openai", "gpt-5.6", "GPT-5.6", 5.0, 30.0)
+            .cache(0.0, 0.0, 0.50)
+            .build(),
+        PricingBuilder::new("openai", "gpt-5.6-terra", "GPT-5.6 Terra", 2.50, 15.0)
+            .cache(0.0, 0.0, 0.25)
+            .build(),
+        PricingBuilder::new("openai", "gpt-5.6-luna", "GPT-5.6 Luna", 1.0, 6.0)
+            .cache(0.0, 0.0, 0.10)
+            .build(),
         PricingBuilder::new("openai", "gpt-5.4", "GPT-5.4", 2.50, 10.0)
             .cache(0.0, 0.0, 1.25)
             .batch(1.25, 5.0)
@@ -224,6 +249,21 @@ fn build_pricing() -> Vec<ModelPricing> {
             .batch(0.075, 0.30)
             .build(),
         // ── xAI ─────────────────────────────────────────────────────────
+        PricingBuilder::new("xai", "grok-4.5", "Grok 4.5", 2.0, 6.0)
+            .cache(0.0, 0.0, 0.30)
+            .build(),
+        PricingBuilder::new("xai", "grok-4.20", "Grok 4.20", 1.25, 2.50)
+            .cache(0.0, 0.0, 0.20)
+            .build(),
+        PricingBuilder::new(
+            "xai",
+            "grok-4.20-0309-reasoning",
+            "Grok 4.20 Reasoning",
+            1.25,
+            2.50,
+        )
+        .cache(0.0, 0.0, 0.20)
+        .build(),
         PricingBuilder::new(
             "xai",
             "grok-4-1-fast-reasoning",
@@ -261,6 +301,18 @@ fn build_pricing() -> Vec<ModelPricing> {
         PricingBuilder::new("xai", "grok-3", "Grok 3", 3.0, 15.0).build(),
         PricingBuilder::new("xai", "grok-3-mini", "Grok 3 Mini", 0.30, 0.50).build(),
         // ── Gemini ──────────────────────────────────────────────────────
+        PricingBuilder::new("gemini", "gemini-3.6-flash", "Gemini 3.6 Flash", 1.50, 7.50).build(),
+        PricingBuilder::new("gemini", "gemini-3.5-flash", "Gemini 3.5 Flash", 1.50, 9.0)
+            .cache(0.0, 0.0, 0.15)
+            .build(),
+        PricingBuilder::new(
+            "gemini",
+            "gemini-3.5-flash-lite",
+            "Gemini 3.5 Flash-Lite",
+            0.30,
+            2.50,
+        )
+        .build(),
         PricingBuilder::new("gemini", "gemini-3.1-pro", "Gemini 3.1 Pro", 1.25, 5.0)
             .cache(0.0, 0.0, 0.315)
             .build(),

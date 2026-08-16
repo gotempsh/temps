@@ -37,12 +37,21 @@ import {
 } from '@/utils/errorHandling'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { useState, useCallback, useEffect, useRef } from 'react'
-import { Link, useSearchParams } from 'react-router-dom'
+import { Link, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
-import { ArrowUpRight, ChevronLeft, ChevronRight, Loader2, PlusIcon, RefreshCw, Upload } from 'lucide-react'
+import {
+  ArrowUpRight,
+  ChevronLeft,
+  ChevronRight,
+  Loader2,
+  PlusIcon,
+  RefreshCw,
+  Upload,
+  UploadCloud,
+} from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
 
 const ITEMS_PER_PAGE = 10
@@ -52,7 +61,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
   const [selectedDeployment, setSelectedDeployment] = useState<number | null>(
     null
   )
-  const [promoteDeploymentId, setPromoteDeploymentId] = useState<number | null>(null)
+  const [promoteDeploymentId, setPromoteDeploymentId] = useState<number | null>(
+    null
+  )
   const [promoteTargetEnv, setPromoteTargetEnv] = useState<string>('')
   // Static-files deploy: upload a bundle, then deploy it to an environment.
   const [staticDialogOpen, setStaticDialogOpen] = useState(false)
@@ -252,6 +263,35 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
 
   const imageRef = resolveImageRef()
 
+  /* eslint-disable react-hooks/set-state-in-effect -- the query parameter is
+     an external navigation intent that must open the matching controlled dialog. */
+  useEffect(() => {
+    if (searchParams.get('deploy') !== 'true') return
+
+    const nextSearchParams = new URLSearchParams(searchParams)
+    nextSearchParams.delete('deploy')
+    setSearchParams(nextSearchParams, { replace: true })
+
+    if (project.source_type === 'static_files') {
+      setStaticDialogOpen(true)
+      return
+    }
+    if (project.source_type === 'docker_image') {
+      setImageRefInput(imageRef ?? '')
+      setImageDialogOpen(true)
+      return
+    }
+
+    handleOpenNewDeployment()
+  }, [
+    handleOpenNewDeployment,
+    imageRef,
+    project.source_type,
+    searchParams,
+    setSearchParams,
+  ])
+  /* eslint-enable react-hooks/set-state-in-effect */
+
   const handleRedeploy = async ({
     branch,
     commit,
@@ -402,7 +442,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
       const fd = new FormData()
       fd.append('file', staticFile)
       const uploadRes = await fetch(
-        `/api/projects/${project.id}/static-bundles`,
+        `/api/projects/${project.id}/upload/static`,
         { method: 'POST', credentials: 'include', body: fd }
       )
       if (!uploadRes.ok) {
@@ -542,8 +582,8 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             Deploy static files
           </DialogTitle>
           <DialogDescription>
-            Upload a .zip or .tar.gz of your built static site and deploy it to an
-            environment.
+            Upload a .zip or .tar.gz of your built static site and deploy it to
+            an environment.
           </DialogDescription>
         </DialogHeader>
         <div className="space-y-4 py-4">
@@ -558,7 +598,8 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             />
             {staticFile && (
               <p className="text-xs text-muted-foreground">
-                {staticFile.name} ({(staticFile.size / 1024 / 1024).toFixed(1)} MB)
+                {staticFile.name} ({(staticFile.size / 1024 / 1024).toFixed(1)}{' '}
+                MB)
               </p>
             )}
           </div>
@@ -596,7 +637,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             onClick={handleDeployStatic}
             disabled={!staticFile || !staticEnv || staticUploading}
           >
-            {staticUploading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            {staticUploading && (
+              <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+            )}
             {staticUploading ? 'Deploying...' : 'Upload & deploy'}
           </Button>
         </DialogFooter>
@@ -658,6 +701,13 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
                 <Upload className="h-4 w-4 mr-2" />
                 Deploy static files
               </Button>
+            ) : project.source_type === 'uploaded_source' ? (
+              <Button asChild>
+                <Link to={`/projects/${project.slug}/drop`}>
+                  <UploadCloud className="h-4 w-4 mr-2" />
+                  Upload new source
+                </Link>
+              </Button>
             ) : project.source_type === 'docker_image' ? (
               <Button
                 onClick={() => {
@@ -708,7 +758,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           }
           defaultType={(() => {
             const deployment = deploymentsData?.deployments.find(
-              (d) => d.id === selectedDeployment,
+              (d) => d.id === selectedDeployment
             )
             if (!deployment) return 'branch' // Default to branch for new deployments
             if (deployment?.tag) return 'tag'
@@ -729,7 +779,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
 
   return (
     <>
-      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between mb-4">
+      <div className="mb-4 flex items-center gap-2">
         <div className="flex items-center gap-2">
           <h2 className="text-lg font-semibold">Deployments</h2>
           <Button
@@ -739,35 +789,13 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             onClick={() => refetch()}
             disabled={isFetching}
           >
-            {isFetching ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+            {isFetching ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-3.5 w-3.5" />
+            )}
           </Button>
         </div>
-        {project.source_type === 'static_files' ? (
-          <Button
-            onClick={() => setStaticDialogOpen(true)}
-            className="w-full sm:w-auto"
-          >
-            <Upload className="h-4 w-4 mr-2" />
-            Deploy static files
-          </Button>
-        ) : project.source_type === 'docker_image' ? (
-          <Button
-            onClick={() => {
-              setImageRefInput(imageRef ?? '')
-              setImageDialogOpen(true)
-            }}
-            className="w-full sm:w-auto"
-          >
-            <PlusIcon className="h-4 w-4 mr-2" />
-            New Deployment
-          </Button>
-        ) : (
-          <Button onClick={handleOpenNewDeployment} className="w-full sm:w-auto">
-            <PlusIcon className="h-4 w-4 mr-2" />
-            New Deployment
-            <KeyboardShortcut shortcut="N" onTrigger={handleOpenNewDeployment} />
-          </Button>
-        )}
       </div>
 
       <Card>
@@ -780,6 +808,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
             >
               <DeploymentCompactRow
                 deployment={deployment}
+                projectSourceType={project.source_type}
                 onRedeploy={() => {
                   setSelectedDeployment(deployment.id)
                   setIsRedeployModalOpen(true)
@@ -801,7 +830,9 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         <div className="flex items-center justify-between mt-4">
           <p className="text-sm text-muted-foreground">
             <span className="hidden sm:inline">
-              Showing {(currentPage - 1) * ITEMS_PER_PAGE + 1}–{Math.min(currentPage * ITEMS_PER_PAGE, deploymentsData.total)} of {deploymentsData.total}
+              Showing {(currentPage - 1) * ITEMS_PER_PAGE + 1}–
+              {Math.min(currentPage * ITEMS_PER_PAGE, deploymentsData.total)} of{' '}
+              {deploymentsData.total}
             </span>
             <span className="sm:hidden">
               {currentPage} / {totalPages}
@@ -853,7 +884,7 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         }
         defaultType={(() => {
           const deployment = deploymentsData?.deployments.find(
-            (d) => d.id === selectedDeployment,
+            (d) => d.id === selectedDeployment
           )
           if (!deployment) return 'branch' // Default to branch for new deployments
           if (deployment?.tag) return 'tag'
@@ -892,7 +923,10 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           <div className="space-y-4 py-4">
             <div className="space-y-2">
               <Label>Target Environment</Label>
-              <Select value={promoteTargetEnv} onValueChange={setPromoteTargetEnv}>
+              <Select
+                value={promoteTargetEnv}
+                onValueChange={setPromoteTargetEnv}
+              >
                 <SelectTrigger>
                   <SelectValue placeholder="Select environment..." />
                 </SelectTrigger>

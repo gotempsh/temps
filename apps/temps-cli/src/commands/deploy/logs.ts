@@ -31,7 +31,7 @@ interface LogEntry {
  * The API returns raw file content where each line is a JSON object.
  * Falls back to treating each line as a plain-text message if parsing fails.
  */
-function parseLogEntries(data: unknown): LogEntry[] {
+export function parseLogEntries(data: unknown): LogEntry[] {
   if (Array.isArray(data)) {
     return data as LogEntry[]
   }
@@ -226,7 +226,7 @@ function printLogLine(log: LogEntry): void {
   console.log(formatLogMessage(log))
 }
 
-function formatLogMessage(log: LogEntry): string {
+export function formatLogMessage(log: LogEntry): string {
   const levelColors: Record<string, (s: string) => string> = {
     info: colors.info,
     success: colors.success,

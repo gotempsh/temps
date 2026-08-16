@@ -26,6 +26,8 @@ pub enum StatusPageError {
 /// - Must not contain `@` (prevents userinfo injection turning the probe
 ///   into a request against a different host)
 /// - Must not contain `://` (prevents scheme injection)
+/// - Must not contain query parameters or fragments (prevents credentials in
+///   the path from being copied into logs and persisted check errors)
 /// - Must not contain CR, LF, NUL, or tab (prevents request smuggling)
 /// - Capped at 2048 bytes
 pub fn validate_check_path(path: &str) -> Result<(), StatusPageError> {
@@ -48,6 +50,12 @@ pub fn validate_check_path(path: &str) -> Result<(), StatusPageError> {
     if path.contains("://") {
         return Err(StatusPageError::Validation(
             "check_path must not contain '://' (scheme injection)".to_string(),
+        ));
+    }
+    if path.contains('?') || path.contains('#') {
+        return Err(StatusPageError::Validation(
+            "check_path must not contain query parameters or fragments; use a secret-free path"
+                .to_string(),
         ));
     }
     if path
@@ -97,8 +105,9 @@ mod check_path_tests {
     }
 
     #[test]
-    fn accepts_path_with_query_chars() {
-        assert!(validate_check_path("/api/v1/health?check=1&deep=true").is_ok());
+    fn rejects_path_with_query_or_fragment() {
+        assert!(validate_check_path("/api/v1/health?token=secret").is_err());
+        assert!(validate_check_path("/api/v1/health#details").is_err());
     }
 }
 

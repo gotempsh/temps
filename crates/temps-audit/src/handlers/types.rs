@@ -15,8 +15,9 @@ pub struct AuditLogResponse {
     /// The type of action that was performed
     #[schema(example = "USER_LOGIN")]
     pub operation_type: String,
-    /// The user who performed the action
-    pub user_id: i32,
+    /// The user who performed the action (`null` when that account has
+    /// since been deleted; `data` retains the original actor context)
+    pub user_id: Option<i32>,
     /// User details who performed the action
     pub user: Option<AuditLogUserInfo>,
     /// IP address details
@@ -78,11 +79,11 @@ pub struct ListAuditLogsQuery {
     /// Filter logs by user ID (omit for all users)
     #[param(example = 1)]
     pub user_id: Option<i32>,
-    /// Start timestamp (milliseconds since epoch)
-    #[param(example = 1)]
+    /// Start timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
+    #[param(example = "2024-01-15T14:30:00Z")]
     pub from: Option<DateTime>,
-    /// End timestamp (milliseconds since epoch)
-    #[param(example = 1)]
+    /// End timestamp, ISO 8601 (e.g. "2024-01-15T14:30:00Z")
+    #[param(example = "2024-01-15T14:30:00Z")]
     pub to: Option<DateTime>,
     /// Maximum number of logs to return
     #[param(example = 100)]

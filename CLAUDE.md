@@ -6,6 +6,11 @@ Guidance for Claude Code when working with the Temps codebase.
 ## Critical Rules
 
 ### NEVER
+- Put a real user's, customer's, or third party's identity into anything that leaves this machine. This repository is **public**. Company names, product names, internal hostnames, account names, contract/method names, real trace/span/request IDs, and any other detail that identifies whose system produced a payload must never appear in code, comments, test fixtures, commit messages, branch names, file names, PR titles, PR descriptions, PR comments, or issue text. This applies with full force to bug reports: a customer sends you a captured payload to get it fixed, not to have it published, and "it is just a fixture" is exactly how it gets published
+  - **Reproducing a reported bug**: keep the *shape* that makes the payload valuable (timings, ordering, precision, nesting, sizes, edge cases) and replace everything that names anyone. Rename services, operations, and hosts to generic equivalents, and regenerate every identifier. A fixture that reproduces the bug and identifies nobody is strictly better -- it is also readable by someone who has never heard of the reporter
+  - **Describing the bug**: say "a reported cross-project trace", never who reported it. The fix is reviewed on its merits; the reporter's identity adds nothing to a reviewer and cannot be taken back once pushed
+  - **Before pushing**: grep the diff for the reporter's names and identifiers. Once it reaches GitHub it is effectively permanent -- force-pushing does not remove a pull request's recorded commits or its Files-changed diff, pull requests cannot be deleted, and forks may retain the objects. Removal at that point requires GitHub Support
+- Commit `.env` files, credentials, or secrets -- this includes local dev-instance artifacts (encryption keys, auth secrets, generated tokens, `temps_data`-style data directories) created while running a local server for manual testing/verification. Before staging changes, run `git status` and scrutinize every path outside the files you intentionally edited -- a broad `git add` after spinning up a local test instance is the most common way this happens. If a secret is committed, treat it as compromised: remove it from tracking going forward at minimum, and flag to the user whether history needs rewriting (don't force-push without asking)
 - Access database directly from HTTP handlers -- ALWAYS use services
 - Return untyped JSON (`serde_json::Value`) -- ALWAYS use typed structs
 - Use `.context()` from anyhow -- ALWAYS use `.map_err()` with typed errors
@@ -16,6 +21,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Leave the project in non-compilable state
 - Use `#[tokio::main]` when integrating with pingora
 - Use plain text logging -- ALWAYS use structured JSONL logging
+- Overwrite `apps/temps-cli/openapi.json` with the raw server response (`curl ... > openapi.json`) -- the committed file is ~92,000 lines of sorted, indented JSON and the server serves it minified on one line, so a direct write reports **-92,000 deletions** and buries the real change. ALWAYS use `cd apps/temps-cli && bun run spec:update` (see [Regenerating the OpenAPI clients](#regenerating-the-openapi-clients))
 - Create markdown documentation files unless explicitly requested
 - Mark Docker tests with `#[ignore]` -- they MUST skip gracefully at runtime instead
 - Create error types with generic messages -- ALWAYS include IDs, names, and operation context
@@ -43,6 +49,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Use `require_service` in plugins for dependencies the app can't function without
 - Let the user configure and control their setup -- show status, give instructions, don't do things silently on their behalf
 - Design new features to be scalable on a small resource footprint -- see [Scalability & Efficiency](#scalability--efficiency)
+- Give every new feature a visible surface, and make unconfigured features onboard rather than disappear -- see [Feature Discoverability](#feature-discoverability)
 
 ---
 
@@ -271,6 +278,58 @@ Classify every piece of new code. The bar differs by an order of magnitude:
 - **Pull over push for telemetry.** Prefer scrape/interval collection (existing `MetricsScraper` pattern) over per-event emission.
 - **Background loops must be O(changes), not O(total).** Reconciliation/polling loops should query deltas (updated_at cursors, NOTIFY) rather than rescanning entire tables each tick.
 - **Justify it in the PR.** For any feature touching the hot path or a high-volume data flow, the PR description must state the expected load, the memory bound, and what happens at saturation (drop, degrade, backpressure).
+
+---
+
+## Feature Discoverability
+
+A feature the user cannot find does not exist. Self-hosted operators debug alone — there is no support channel to ask "does temps do X?". Every capability must therefore announce itself in the UI at the point where the user would want it.
+
+### Always give a feature a visible surface
+
+- A keyboard shortcut is an accelerator, never the only entry point. If `⌘.` opens a palette, there must also be a visible control that does the same thing.
+- Put the entry point where the task happens, not in a settings page the user visits once.
+- Name the outcome, not the mechanism: "Ask a question about this data", not "LLM query interface".
+
+### Unconfigured features onboard — they never disappear
+
+Many features depend on optional operator configuration: an AI provider, S3 credentials, an SMTP server, a DNS API token. **Never gate the UI surface on that configuration being present.** Conditionally rendering nothing means the user never learns the feature exists and concludes temps can't do it.
+
+Render the surface unconditionally and switch it into an onboarding state that:
+
+1. **Shows what it would do** — with a concrete example, not an abstract description.
+2. **States precisely what is missing** — "No AI provider is configured", never a bare disabled control.
+3. **Links directly to the fix** — deep-link into the settings page/section that configures it, not to documentation.
+4. **Never silently no-ops** — if the user triggers it anyway, explain the gap; don't fail quietly or hang in a loading state.
+
+```tsx
+// BAD -- the feature vanishes; the user never learns it exists
+{aiConfigured && <AiQueryBar />}
+
+// GOOD -- always visible, onboards when unconfigured
+<AiQueryBar
+  configured={aiConfigured}
+  onboardingHref="/settings/ai"
+  example="show me the users created last week"
+/>
+```
+
+### Expose configuration state through the API
+
+Back the UI with a typed capability/status endpoint rather than letting the client infer availability from errors:
+
+```rust
+pub struct AiCapabilityResponse {
+    /// Whether a usable provider is configured
+    pub configured: bool,
+    /// Why it is unavailable, when `configured` is false
+    pub reason: Option<String>,
+    /// Console path the operator should visit to configure it
+    pub setup_path: Option<String>,
+}
+```
+
+A `404`/`500` leaves the client unable to distinguish "this feature does not exist" from "this feature is not set up yet" — and those need completely different UI. Returning `configured: false` with a reason and a setup path makes the onboarding state renderable without guesswork.
 
 ---
 
@@ -673,6 +732,60 @@ async fn create_backup(
 - Convert entities to response DTOs via `From` trait
 - Register all handlers in `ApiDoc` with `#[openapi(...)]`
 
+### Regenerating the OpenAPI clients
+
+Two generated clients consume the spec, and they are refreshed differently:
+
+| Client | Source of truth | Refresh with |
+|---|---|---|
+| `web/src/api/client/` | the **live server** | `cd web && bun run openapi-ts` |
+| `apps/temps-cli/src/api/` | the **committed** `apps/temps-cli/openapi.json` | `cd apps/temps-cli && bun run spec:update && bun run generate:api` |
+
+After any change to handlers, request/response shapes, schemas or routes:
+restart `temps serve`, then refresh both. Commit the regenerated files --
+they are tracked so reviewers see the API delta.
+
+`apps/temps-cli/openapi.json` must stay in its canonical shape: **keys sorted
+recursively, two-space indent, trailing newline**. `bun run spec:update` is the
+only supported way to write it. Sorting is what keeps a diff proportional to
+the API change instead of to serde's iteration order, which is not stable
+between builds.
+
+This is enforced, not just documented. `bun run spec:check` verifies the
+committed file -- it reads only what is on disk, so it needs no server and no
+`bun install`, and it runs both as a pre-commit hook and as the
+**OpenAPI Spec Format** job on every pull request:
+
+```bash
+cd apps/temps-cli
+bun run spec:check          # verify; exits 1 with the reason
+bun run spec:check --fix    # reformat what is already committed (does not fetch)
+```
+
+`--fix` only reformats. When the API itself changed you still need
+`bun run spec:update` against a running server, then `bun run generate:api`.
+
+Sanity-check the size before committing -- adding a few endpoints is a few
+hundred changed lines, never tens of thousands:
+
+```bash
+git diff --numstat -- apps/temps-cli/openapi.json
+```
+
+Merge conflicts in either client are conflicts in build output. Never
+hand-merge them: take one side to clear the conflict, then regenerate from a
+server built off the merged source and typecheck both packages.
+
+**Never add a plugin-only route or schema to `apps/temps-cli/openapi.json`.**
+Some backend endpoints are served by a plugin crate that isn't part of this
+repository, so their schema doesn't exist in the spec this file's generated
+client is built from, and it must stay that way. For CLI parity on those
+endpoints, hand-write local request/response interfaces mirroring the
+plugin's shapes and call the shared `client` object directly via its generic
+`.get/.post/.patch/.delete` methods — same call shape every generated SDK
+function already uses, just without codegen. See
+`apps/temps-cli/src/commands/otel-forward/index.ts` for the pattern.
+
 ### Permission System
 
 ```rust
@@ -954,6 +1067,12 @@ All use `TEMPS_` prefix:
 | `TEMPS_CONSOLE_ADDRESS` | -- | No |
 | `TEMPS_DATA_DIR` | `~/.temps` | No |
 | `TEMPS_LOG_LEVEL` | -- | No |
+
+Process-wide ops/debug toggles (not bootstrap config, not per-tenant -- see the admin-tuning-knob exception to the "no env vars" rule above):
+
+| Variable | Default | Required |
+|---|---|---|
+| `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` | unset (clean up) | No -- set to any value to keep `/tmp/temps-deployments/deployment-*` directories after a deployment finishes or fails, for inspecting a build/download issue. Restart the server to change. |
 
 ---
 

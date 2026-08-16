@@ -51,6 +51,18 @@ pub struct Model {
     /// (the default), the AI may only read data; write-action proposals are
     /// suppressed. Operators enable this per-project via the UI.
     pub ai_write_actions_enabled: bool,
+    /// Opt-in for native error-tracking source context. When true, Temps
+    /// accepts raw source-file uploads for this project and resolves native
+    /// (Go/Rust/etc.) stack frames against them so the error UI shows the
+    /// actual source code around each frame. Off by default — uploading
+    /// application source is always a deliberate choice.
+    #[sea_orm(default_value = "false")]
+    pub error_source_context_enabled: bool,
+    /// Where the auto-capture job reads source from, relative to the git
+    /// checkout. NULL = default to the deployment's Docker build context (the
+    /// directory the image was built from) — the correct root for Dockerfile
+    /// deploys and monorepos. Set it to narrow/override that default.
+    pub error_source_root: Option<String>,
     /// Enable automatic preview environment creation for each branch
     pub enable_preview_environments: bool,
     /// When true, preview environments auto-created for branches are
@@ -71,6 +83,11 @@ pub struct Model {
     /// Defaults to 'git' for backward compatibility
     #[sea_orm(default_value = "git")]
     pub source_type: SourceType,
+    /// Bounded template provenance: a reviewed bundled slug or `custom`.
+    /// NULL means the project was not created through the template catalog;
+    /// operator-defined slugs are never stored in this field.
+    #[serde(skip_serializing)]
+    pub template_slug: Option<String>,
     /// GitLab webhook ID returned by POST /projects/:id/hooks when we auto-install
     /// the webhook on repo connect. NULL when not connected to a GitLab repository.
     pub gitlab_webhook_id: Option<i32>,
@@ -107,6 +124,11 @@ pub struct Model {
     /// to FALSE; cross-project links to this project will then be suppressed.
     #[sea_orm(default_value = "true")]
     pub cross_project_trace_sharing: bool,
+    /// Opt-in for AI summarization of API traffic analytics for this project.
+    /// NULL/false = off; true = generate an AI summary when AI is configured
+    /// and the project calls `GET /projects/{id}/api-analytics/summary`.
+    /// Falls back to `null` summary gracefully when no AI provider is configured.
+    pub ai_api_traffic_summary_enabled: Option<bool>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -70,6 +70,9 @@ impl TempsPlugin for DomainsPlugin {
             // wired into the TLS service so DNS-01 background renewals can auto-publish
             // the challenge TXT record when a DNS provider manages the domain's zone.
             let dns_provider_service = context.require_service::<DnsProviderService>();
+            let dns_automation_gate =
+                context.require_service::<temps_core::DnsAutomationGateSlot>();
+            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
             // Create domain service first so the TLS service can drive the order-based
             // ACME flow during background HTTP-01 renewals (keeps auto-renewals
@@ -93,7 +96,9 @@ impl TempsPlugin for DomainsPlugin {
                 })?
                 .with_domain_service(domain_service.clone())
                 .with_config_service(config_service.clone())
-                .with_dns_provider_service(dns_provider_service.clone());
+                .with_dns_provider_service(dns_provider_service.clone())
+                .with_dns_automation_gate(dns_automation_gate)
+                .with_audit_logger(audit_service.clone());
 
             // Add notification service if available
             if let Some(notif_service) = notification_service {
@@ -112,8 +117,6 @@ impl TempsPlugin for DomainsPlugin {
             // The scheduler handles both initial check and daily scheduled checks
 
             // Get audit service
-            let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
-
             // Get telemetry reporter (optional — default to noop so domains never hard-fail
             // if the telemetry plugin isn't registered)
             let telemetry = context

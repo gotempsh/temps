@@ -121,7 +121,11 @@ impl EventKind {
 
 #[derive(Clone, Debug, Serialize, Deserialize, ToSchema, PartialEq)]
 pub struct RequestRow {
-    pub id: i64,
+    /// The request's unique `request_id` (assigned by the proxy). Used as the
+    /// row identity instead of the storage PK because the ClickHouse backend
+    /// has no serial id (rows come back with `id = 0`) while `request_id` is
+    /// unique and present on both backends.
+    pub id: String,
     pub ts: DateTime<Utc>,
     pub deployment_id: Option<i32>,
     pub environment_id: Option<i32>,
@@ -269,7 +273,7 @@ mod tests {
     #[test]
     fn request_event_serializes_with_type_tag() {
         let ev = ObservabilityEvent::Request(RequestRow {
-            id: 7,
+            id: "req-7".into(),
             ts: ts(),
             deployment_id: None,
             environment_id: None,

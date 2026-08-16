@@ -1,3 +1,12 @@
+[files]
+# Translated READMEs (README.es.md, README.de.md, ...) are not English —
+# the checker "corrects" valid foreign words (oder→order, Cliente→Client).
+# The English README.md itself is still checked.
+# Captured-payload fixtures: real trace/span ids are hex, and the checker
+# "corrects" letter runs inside them, silently corrupting the very data the
+# fixture exists to preserve.
+extend-exclude = ["README.*.md", "**/__fixtures__/**"]
+
 [default.extend-words]
 # Bollard (Docker API client) uses "vertexes" as the field name,
 # matching the upstream Go/BuildKit API naming convention.
@@ -9,6 +18,9 @@ unions = "unions"
 # AIMD = Additive Increase / Multiplicative Decrease (congestion-control term,
 # ADR-021). typos mis-corrects it to "AIMED".
 AIMD = "AIMD"
+# MongoDB query operator `$nin` ("not in"), in the data browser's filter
+# allowlist. typos reads it as a misspelling of "nine"/"min".
+nin = "nin"
 
 [default.extend-identifiers]
 # W3C traceparent spec example span-id used in test fixtures

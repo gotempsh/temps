@@ -28,6 +28,11 @@ on:
     - cron: "0 6 * * 1"
   workflow_dispatch:
 
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
@@ -42,15 +47,27 @@ jobs:
       checks: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
 
       - name: Cache dependencies
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: dependency-scan-cargo-audit
+          # Save from `main` only -- writes are scoped to the producing ref,
+          # so without this every open PR held its own ~340MB copy under this
+          # key (9 simultaneous copies measured = ~2.9GB, more than a quarter
+          # of the repo's 10GB cache pool). That's what was evicting
+          # `temps-musl-fast-*` -- the much larger, much more valuable shared
+          # musl build cache in rust-tests.yml -- turning its restore-keys
+          # fallback into a full ~80min cold compile on every workflow run.
+          # See the matching `save-if` note on the `test-build`/
+          # `nextest-archive` caches in rust-tests.yml for the same lesson.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Runs `cargo audit` against Cargo.lock and fails the job if any
       # RUSTSEC advisory matches a resolved dependency (all advisories, not
@@ -90,12 +107,25 @@ jobs:
       #   signed payload isn't attacker-controlled). Keys are per-customer,
       #   not a shared temps secret. No fixed `rsa` release exists upstream
       #   yet -- tracked for a ring/aws-lc-rs-backed signing migration.
+      # - RUSTSEC-2026-0235 (rkyv 0.7.46 via rust_decimal <- sea-orm):
+      #   out-of-bounds read when validating archives containing Rc/Arc.
+      #   rkyv is an OPTIONAL feature of rust_decimal that nothing in this
+      #   workspace enables -- it is in Cargo.lock (which cargo resolves over
+      #   the maximal feature set) but has zero occurrences in
+      #   `cargo tree --target all -e normal`, i.e. it is never compiled, let
+      #   alone fed an archive. No fix is reachable from here: the patch is
+      #   in 0.8.17, upstream dropped the 0.7 series, and rust_decimal 1.42.1
+      #   (latest) still declares `rkyv ^0.7.46`.
+      #   NOTE: this entry exists only because cargo-audit reads Cargo.lock
+      #   rather than what is built. Switching this gate to cargo-auditable
+      #   (`cargo audit bin` against the compiled binary) would drop it
+      #   without an exception -- see the PR that added this line.
       # Remove an entry once its upstream is fixed/replaced.
       - name: Run cargo-audit
-        uses: rustsec/audit-check@v2.0.0
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071
+          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071,RUSTSEC-2026-0235
 
   web-audit:
     name: Web Dependency Audit (bun audit)
@@ -104,15 +134,15 @@ jobs:
       contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Install Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
       - name: Cache Bun dependencies
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: web/node_modules
           key: ${{ runner.os }}-bun-${{ hashFiles('web/bun.lock') }}
@@ -150,10 +180,10 @@ jobs:
       security-events: write
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       - name: Run Trivy vulnerability scanner on published image
-        uses: aquasecurity/trivy-action@v0.36.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           # Matches the tag naming release.yml publishes for stable releases
           # (ghcr.io/${{ github.repository_owner }}/temps:<channel_tag>) --
@@ -175,6 +205,6 @@ jobs:
       - name: Upload Trivy results to GitHub code scanning
         if: always()
         continue-on-error: true
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@adfda868f108ac4222129de456ea554034a27db7 # v4
         with:
           sarif_file: trivy-results.sarif

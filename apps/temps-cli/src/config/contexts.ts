@@ -137,6 +137,18 @@ function warnMissingContext(name: string, available: CliContext[]): void {
  * return it; when it names a missing one we return null (and warn once);
  * with no env var we fall back to the `isActive` flag, then the first entry.
  */
+/**
+ * Whether `name` matches a configured context. Used by the CLI's global
+ * `--context` flag to fail loudly (exit 1, no command run) on a typo,
+ * instead of letting resolution silently fall through to
+ * `TEMPS_CONTEXT`/the on-disk `isActive` flag/the legacy single-instance
+ * store — any of which could point at a different server than the one the
+ * caller explicitly named.
+ */
+export function contextExists(name: string, contexts: CliContext[]): boolean {
+  return contexts.some((c) => c.name === name)
+}
+
 export function pickActiveContext(contexts: CliContext[]): CliContext | null {
   if (contexts.length === 0) return null
   const envName = envContextName()

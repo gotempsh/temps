@@ -5,7 +5,6 @@ import {
   listUsers,
   createUser,
   deleteUser,
-  updateUser,
   restoreUser,
   assignRole,
   removeRole,
@@ -17,7 +16,12 @@ import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptText, promptPassword, promptConfirm, promptSelect } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
 
-const AVAILABLE_ROLES = ['admin', 'developer', 'viewer']
+// Matches crates/temps-entities/src/types.rs's RoleType enum exactly --
+// the backend's FromStr only ever accepts "admin"/"user" and 400s
+// ("Unsupported role") on anything else, including the "developer"/"viewer"
+// values this list previously offered (those are TEAM roles, a distinct
+// concept -- see registerTeamsCommands -- not instance-wide user roles).
+const AVAILABLE_ROLES = ['admin', 'user']
 
 interface CreateOptions {
   username?: string
@@ -43,6 +47,27 @@ interface RoleOptions {
   remove?: string
 }
 
+type RolesInputResult = { roles: string[] } | { error: string }
+
+export function parseRolesInput(rolesOption: string | undefined): RolesInputResult {
+  let selectedRoles: string[] = []
+
+  if (rolesOption) {
+    selectedRoles = rolesOption.split(',').map(r => r.trim().toLowerCase())
+    for (const role of selectedRoles) {
+      if (!AVAILABLE_ROLES.includes(role)) {
+        return { error: `Invalid role: ${role}. Available roles: ${AVAILABLE_ROLES.join(', ')}` }
+      }
+    }
+  }
+
+  if (selectedRoles.length === 0) {
+    selectedRoles = ['user'] // Default role
+  }
+
+  return { roles: selectedRoles }
+}
+
 export function registerUsersCommands(program: Command): void {
   const users = program
     .command('users')
@@ -62,7 +87,7 @@ export function registerUsersCommands(program: Command): void {
     .option('-u, --username <username>', 'Username')
     .option('-e, --email <email>', 'Email address')
     .option('-p, --password <password>', 'Password (if not provided, invite email will be sent)')
-    .option('-r, --roles <roles>', 'Comma-separated roles (admin, developer, viewer)')
+    .option('-r, --roles <roles>', 'Comma-separated roles (admin, user)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createUserAction)
 
@@ -157,20 +182,12 @@ async function createUserAction(options: CreateOptions): Promise<void> {
     email = options.email || null
     password = options.password || null
 
-    if (options.roles) {
-      selectedRoles = options.roles.split(',').map(r => r.trim().toLowerCase())
-      // Validate roles
-      for (const role of selectedRoles) {
-        if (!AVAILABLE_ROLES.includes(role)) {
-          warning(`Invalid role: ${role}. Available roles: ${AVAILABLE_ROLES.join(', ')}`)
-          return
-        }
-      }
+    const rolesResult = parseRolesInput(options.roles)
+    if ('error' in rolesResult) {
+      warning(rolesResult.error)
+      return
     }
-
-    if (selectedRoles.length === 0) {
-      selectedRoles = ['viewer'] // Default role
-    }
+    selectedRoles = rolesResult.roles
   } else {
     // Interactive mode
     username = options.username || await promptText({

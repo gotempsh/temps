@@ -32,8 +32,26 @@ static NEXT_OFFSET: AtomicU16 = AtomicU16::new(0);
 
 /// Returns `true` if the OS will let us bind the port right now. This does not
 /// reserve the port — see the module docs for why that matters.
+///
+/// Both the wildcard address and loopback are probed, because these containers
+/// publish to `127.0.0.1` (see `utils::local_port_binding`) and a successful
+/// `0.0.0.0` bind is not evidence that `127.0.0.1` is free. `TcpListener::bind`
+/// sets `SO_REUSEADDR` on Unix, so binding the wildcard address can succeed
+/// while another process already holds the same port on loopback — an SSH
+/// tunnel forwarding it, for example. Checking only `0.0.0.0` therefore hands
+/// back a port Docker then fails to bind when the container starts:
+/// `ports are not available: exposing port TCP 127.0.0.1:<port>`.
 pub fn is_port_available(port: u16) -> bool {
-    TcpListener::bind(("0.0.0.0", port)).is_ok()
+    // Probe one address at a time and release each listener before the next:
+    // holding the wildcard binding open while testing loopback would collide
+    // with ourselves and report every port as taken.
+    for addr in ["0.0.0.0", "127.0.0.1"] {
+        match TcpListener::bind((addr, port)) {
+            Ok(listener) => drop(listener),
+            Err(_) => return false,
+        }
+    }
+    true
 }
 
 /// Find an OS-bindable host port at or after `start_port`.
@@ -117,6 +135,39 @@ mod tests {
         let port = find_available_port(28000).expect("a port should be free");
         assert!(port >= 28000, "port {} must be >= base 28000", port);
         assert!(is_port_available(port), "returned port must be bindable");
+    }
+
+    /// A port held on loopback only — an SSH tunnel forwarding it, say — must
+    /// read as unavailable. Probing just `0.0.0.0` misses this, because
+    /// `TcpListener::bind` sets `SO_REUSEADDR` on Unix and the wildcard bind
+    /// succeeds anyway; the finder then returns a port Docker cannot publish
+    /// to `127.0.0.1`, and container creation dies at start with
+    /// `ports are not available`.
+    #[test]
+    fn loopback_only_listener_makes_a_port_unavailable() {
+        let held = TcpListener::bind(("127.0.0.1", 0)).expect("bind an ephemeral loopback port");
+        let port = held.local_addr().expect("local addr").port();
+
+        assert!(
+            !is_port_available(port),
+            "port {port} is held on 127.0.0.1, which is exactly where containers publish"
+        );
+    }
+
+    /// The loopback probe must not reject ports that are genuinely free —
+    /// otherwise the fix above would starve every allocation.
+    #[test]
+    fn a_free_port_is_still_reported_available() {
+        let port = {
+            let probe = TcpListener::bind(("127.0.0.1", 0)).expect("bind ephemeral");
+            probe.local_addr().expect("local addr").port()
+            // listener dropped here, so the port is free again
+        };
+
+        assert!(
+            is_port_available(port),
+            "port {port} was released and should be usable"
+        );
     }
 
     #[test]

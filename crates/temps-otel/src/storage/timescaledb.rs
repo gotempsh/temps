@@ -119,7 +119,14 @@ pub struct TimescaleDbStorage {
     /// rationale.
     #[allow(dead_code)]
     retention_days: u32,
-    quota_bytes_per_project: u64,
+    /// Per-project storage quota. `None` disables quota enforcement: ingest
+    /// never runs the per-project usage estimate (see `get_storage_quota`).
+    quota_bytes_per_project: Option<u64>,
+    /// Shared attribute-key -> slot mapping, populated by `FacetService`.
+    /// `None` when facets aren't wired up (e.g. some test harnesses); ingest
+    /// and query both fall back to unfaceted behavior in that case, same as
+    /// the ClickHouse backend.
+    facet_cache: Option<crate::services::FacetCache>,
 }
 
 /// S3 log archiver configuration.
@@ -235,22 +242,26 @@ impl TimescaleDbStorage {
             db,
             s3_client,
             retention_days: 7,
-            quota_bytes_per_project: 10 * 1024 * 1024 * 1024,
+            quota_bytes_per_project: None,
+            facet_cache: None,
         }
     }
 
-    /// Create a new storage backend with custom retention and quota settings.
+    /// Create a new storage backend with custom retention, quota, and facet
+    /// settings.
     pub fn with_config(
         db: Arc<DatabaseConnection>,
         s3_client: Option<Arc<S3LogArchiver>>,
         retention_days: u32,
-        quota_bytes_per_project: u64,
+        quota_bytes_per_project: Option<u64>,
+        facet_cache: Option<crate::services::FacetCache>,
     ) -> Self {
         Self {
             db,
             s3_client,
             retention_days,
             quota_bytes_per_project,
+            facet_cache,
         }
     }
 
@@ -398,15 +409,31 @@ impl TimescaleDbStorage {
             return Ok(0);
         }
 
+        // Load the facet cache once for this batch (lock-free ArcSwap read),
+        // same pattern as ClickHouseOtelStorage's ingest path.
+        let facet_snapshot = self
+            .facet_cache
+            .as_ref()
+            .map(|c| c.load_full())
+            .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+        // Invert key->slot into slot->key once per batch, not once per span
+        // per slot — see `invert_facet_slots` doc for why.
+        let facet_slots = crate::services::facet_service::invert_facet_slots(&facet_snapshot);
+
         let mut sql = String::from(
             "INSERT INTO otel_spans (
                 project_id, deployment_id, service_name, service_version,
                 deployment_environment, trace_id, span_id, parent_span_id,
                 name, kind, start_time, end_time, duration_ms,
-                status_code, status_message, attributes, events
+                status_code, status_message, attributes, events,
+                facet_attr_1, facet_attr_2, facet_attr_3, facet_attr_4, facet_attr_5,
+                facet_attr_6, facet_attr_7, facet_attr_8, facet_attr_9, facet_attr_10,
+                facet_attr_11, facet_attr_12, facet_attr_13, facet_attr_14, facet_attr_15,
+                facet_attr_16, facet_attr_17, facet_attr_18, facet_attr_19, facet_attr_20
             ) VALUES ",
         );
 
+        const COLS_PER_ROW: u32 = 37;
         let mut values: Vec<sea_orm::Value> = Vec::new();
         let mut param_idx = 1u32;
 
@@ -414,15 +441,15 @@ impl TimescaleDbStorage {
             if i > 0 {
                 sql.push_str(", ");
             }
-            sql.push_str(&format!(
-                "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${})",
-                param_idx, param_idx + 1, param_idx + 2, param_idx + 3,
-                param_idx + 4, param_idx + 5, param_idx + 6, param_idx + 7,
-                param_idx + 8, param_idx + 9, param_idx + 10, param_idx + 11,
-                param_idx + 12, param_idx + 13, param_idx + 14, param_idx + 15,
-                param_idx + 16
-            ));
-            param_idx += 17;
+            sql.push('(');
+            for col in 0..COLS_PER_ROW {
+                if col > 0 {
+                    sql.push(',');
+                }
+                sql.push_str(&format!("${}", param_idx + col));
+            }
+            sql.push(')');
+            param_idx += COLS_PER_ROW;
 
             let attrs_json = serde_json::to_value(&s.attributes).unwrap_or_default();
             let events_json = serde_json::to_value(&s.events).unwrap_or_default();
@@ -446,6 +473,10 @@ impl TimescaleDbStorage {
                 attrs_json.into(),
                 events_json.into(),
             ]);
+            for key in &facet_slots {
+                let value: Option<String> = key.and_then(|k| s.attributes.get(k).cloned());
+                values.push(value.into());
+            }
         }
 
         let result = self
@@ -1409,21 +1440,46 @@ impl OtelStorage for TimescaleDbStorage {
             param_idx += 1;
         }
         if let Some(ref attrs) = query.attributes {
+            // Load the facet cache once for this query (lock-free ArcSwap
+            // read), same pattern as ClickHouseOtelStorage::query_spans.
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                where_clauses.push(format!(
-                    "attributes->>${}::text = ${}",
-                    param_idx,
-                    param_idx + 1
-                ));
-                values.push(key.clone().into());
-                values.push(value.clone().into());
-                param_idx += 2;
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    // Faceted key: use the pre-populated slot column + its
+                    // B-tree index (full index speed on uncompressed chunks;
+                    // see storage::timescaledb module docs for the
+                    // compressed-chunk caveat).
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_clauses.push(format!("{column} = ${param_idx}"));
+                    values.push(value.clone().into());
+                    param_idx += 1;
+                } else {
+                    // Unfaceted key: fall back to JSON extraction.
+                    where_clauses.push(format!(
+                        "attributes->>${}::text = ${}",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    values.push(key.clone().into());
+                    values.push(value.clone().into());
+                    param_idx += 2;
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {
             where_clauses.push(format!("name ILIKE ${}", param_idx));
             values.push(format!("%{}%", escape_like_pattern(pattern)).into());
             param_idx += 1;
+        }
+        if query.root_only {
+            // Root spans are stored with a NULL parent (see otel decode);
+            // backed by the partial index idx_otel_spans_root_project_start.
+            where_clauses.push("parent_span_id IS NULL".to_string());
         }
 
         let where_sql = where_clauses.join(" AND ");
@@ -1484,7 +1540,81 @@ impl OtelStorage for TimescaleDbStorage {
         }
         self.count_traces_from_table(query).await
     }
+
+    /// Whether `project_id` has ever received at least one span. See the
+    /// ClickHouse implementation's doc comment for why this stays a plain
+    /// existence probe rather than `count_traces(..) > 0`: the caller (the
+    /// project-setup checklist) only needs yes/no, and `otel_trace_summaries`
+    /// is indexed on `project_id`, so `EXISTS (... LIMIT 1)` is an index
+    /// lookup regardless of how many traces the project has accumulated.
+    async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT EXISTS(SELECT 1 FROM otel_trace_summaries WHERE project_id = $1 LIMIT 1) AS has_traces",
+                vec![project_id.into()],
+            ))
+            .await?;
+
+        if let Some(row) = result {
+            Ok(row.try_get("", "has_traces").unwrap_or(false))
+        } else {
+            Ok(false)
+        }
+    }
+
     async fn get_trace(&self, project_id: i32, trace_id: &str) -> StorageResult<Vec<SpanRecord>> {
+        // Two-phase lookup. Phase 1: fetch the trace's time window from
+        // otel_trace_summaries (PK lookup, O(1)). Phase 2: scan otel_spans
+        // bounded to that window so hypertable chunk exclusion prunes the
+        // scan to 1-2 chunks. Without the bound, this query touches every
+        // chunk in the retention window — and on compressed chunks (which
+        // have no B-tree indexes, and no trace_id segmentby since
+        // m20260714_000001) that means decompressing the project's entire
+        // history for one trace.
+        //
+        // The window is padded generously: spans of a trace can start before
+        // the summary's recorded start (late/out-of-order batches update it,
+        // but a reader can race the update) and child spans can outlive the
+        // root. A day of slack is negligible for chunk exclusion (chunks are
+        // 1 day) and safe for any realistic trace duration.
+        let window = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT start_time, duration_ms FROM otel_trace_summaries
+                 WHERE project_id = $1 AND trace_id = $2",
+                vec![project_id.into(), trace_id.to_string().into()],
+            ))
+            .await?
+            .and_then(|row| {
+                let start: chrono::DateTime<chrono::Utc> = row.try_get("", "start_time").ok()?;
+                let duration_ms: f64 = row.try_get("", "duration_ms").unwrap_or(0.0);
+                let end = start + chrono::Duration::milliseconds(duration_ms.ceil() as i64);
+                Some((
+                    start - chrono::Duration::days(1),
+                    end + chrono::Duration::days(1),
+                ))
+            });
+
+        // No summary row means the trace is invisible in every list view (the
+        // list reads from otel_trace_summaries), so it can only be requested
+        // via a direct link. That happens for (a) an ingest race — the summary
+        // upsert in store_spans runs just after the span insert, (b) a
+        // transient, fail-soft summary upsert failure, or (c) legacy spans
+        // predating the summaries table. (a) and (b) are recent by nature, so
+        // fall back to a scan bounded to the last 7 days — the window in which
+        // chunks are still uncompressed and carry the trace_id B-tree index.
+        // Never scan unbounded: on compressed chunks a trace_id lookup has no
+        // index and no segmentby to seek on, so an unbounded fallback would
+        // decompress the project's entire history for any unknown trace_id
+        // (stale links, cross-project probes, or abuse).
+        let (from, to) = window.unwrap_or_else(|| {
+            let now = chrono::Utc::now();
+            (now - chrono::Duration::days(7), now)
+        });
+
         let sql = r#"
             SELECT project_id, deployment_id, service_name, service_version,
                    deployment_environment, trace_id, span_id, parent_span_id,
@@ -1492,15 +1622,22 @@ impl OtelStorage for TimescaleDbStorage {
                    status_code, status_message, attributes, events
             FROM otel_spans
             WHERE project_id = $1 AND trace_id = $2
+              AND start_time >= $3 AND start_time <= $4
             ORDER BY start_time ASC
         "#;
+        let values: Vec<sea_orm::Value> = vec![
+            project_id.into(),
+            trace_id.to_string().into(),
+            from.into(),
+            to.into(),
+        ];
 
         let results = self
             .db
             .query_all(Statement::from_sql_and_values(
                 DatabaseBackend::Postgres,
                 sql,
-                vec![project_id.into(), trace_id.to_string().into()],
+                values,
             ))
             .await?;
 
@@ -1510,6 +1647,105 @@ impl OtelStorage for TimescaleDbStorage {
             .collect();
 
         Ok(spans)
+    }
+
+    async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>> {
+        let (where_sql, mut values, param_idx) = build_span_stats_filters(&query);
+        let limit = query.effective_limit();
+        let offset = query.effective_offset();
+
+        // sort_by/sort_order come from fixed enums, never user strings, so
+        // interpolating them into SQL is injection-safe. The tie-breaker keeps
+        // pagination deterministic when two operations score identically.
+        let order_dir = query.sort_order.as_sql();
+        let order_expr = span_stats_order_expr(query.sort_by);
+
+        // `min_count` is bound rather than interpolated even though it is a
+        // u64, so a future change to its type can't become an injection.
+        let min_count_param = param_idx;
+        let limit_param = param_idx + 1;
+        let offset_param = param_idx + 2;
+        values.push((query.min_count as i64).into());
+        values.push((limit as i64).into());
+        values.push((offset as i64).into());
+
+        // The percentiles use `percentile_cont`, which is exact rather than
+        // approximate: the window is bounded and the result is grouped, so the
+        // set being sorted per group stays small enough that exactness is
+        // cheaper than explaining an approximation's error bars to an operator
+        // staring at a latency number.
+        let sql = format!(
+            r#"
+            SELECT
+                s.project_id,
+                s.service_name,
+                s.name AS span_name,
+                (array_agg(s.kind ORDER BY s.start_time DESC))[1] AS kind,
+                COUNT(*)::bigint AS span_count,
+                COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::bigint AS error_count,
+                SUM(s.duration_ms)::double precision AS total_duration_ms,
+                MIN(s.duration_ms)::double precision AS min_duration_ms,
+                MAX(s.duration_ms)::double precision AS max_duration_ms,
+                AVG(s.duration_ms)::double precision AS avg_duration_ms,
+                COALESCE(STDDEV_SAMP(s.duration_ms), 0)::double precision AS stddev_duration_ms,
+                percentile_cont(0.50) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p50_duration_ms,
+                percentile_cont(0.95) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p95_duration_ms,
+                percentile_cont(0.99) WITHIN GROUP (ORDER BY s.duration_ms)::double precision AS p99_duration_ms,
+                MAX(s.start_time) AS last_seen
+            FROM otel_spans s
+            WHERE {where_sql}
+            GROUP BY s.project_id, s.service_name, s.name
+            HAVING COUNT(*) >= ${min_count_param}
+            ORDER BY {order_expr} {order_dir} NULLS LAST, s.project_id, s.service_name, s.name
+            LIMIT ${limit_param} OFFSET ${offset_param}
+            "#
+        );
+
+        let results = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        Ok(results.iter().filter_map(parse_span_stats_row).collect())
+    }
+
+    async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {
+        let (where_sql, mut values, param_idx) = build_span_stats_filters(&query);
+        values.push((query.min_count as i64).into());
+
+        // Counting groups needs the grouping to actually happen, so the inner
+        // query mirrors the list query's GROUP BY/HAVING exactly. It selects a
+        // constant rather than the aggregates: the row count is identical and
+        // the percentile sorts are skipped entirely.
+        let sql = format!(
+            r#"
+            SELECT COUNT(*)::bigint AS cnt FROM (
+                SELECT 1
+                FROM otel_spans s
+                WHERE {where_sql}
+                GROUP BY s.project_id, s.service_name, s.name
+                HAVING COUNT(*) >= ${param_idx}
+            ) grouped
+            "#
+        );
+
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        Ok(result
+            .and_then(|row| row.try_get::<i64>("", "cnt").ok())
+            .unwrap_or(0)
+            .max(0) as u64)
     }
 
     async fn query_genai_trace_summaries(
@@ -1977,6 +2213,73 @@ impl OtelStorage for TimescaleDbStorage {
         Ok(records)
     }
 
+    // ── Cross-project trace refs (ADR-027 Phase 0) ──────────────────────────
+
+    /// Single multi-row `INSERT … ON CONFLICT DO NOTHING` into the
+    /// `cross_project_trace_refs` control table. The `(trace_id, project_id)`
+    /// primary key discards re-recordings cheaply, so `first_seen` (DEFAULT
+    /// NOW()) keeps the earliest observation.
+    async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
+        if trace_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Parameterized multi-row VALUES: ($1, $2), ($3, $4), … where odd
+        // params are trace_id and even are project_id.
+        let mut sql =
+            String::from("INSERT INTO cross_project_trace_refs (trace_id, project_id) VALUES ");
+        let mut param_idx = 1u32;
+        for i in 0..trace_ids.len() {
+            if i > 0 {
+                sql.push_str(", ");
+            }
+            sql.push_str(&format!("(${param_idx}, ${})", param_idx + 1));
+            param_idx += 2;
+        }
+        sql.push_str(" ON CONFLICT DO NOTHING");
+
+        let mut values: Vec<sea_orm::Value> = Vec::with_capacity(trace_ids.len() * 2);
+        for tid in trace_ids {
+            values.push(tid.clone().into());
+            values.push(project_id.into());
+        }
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                &sql,
+                values,
+            ))
+            .await?;
+
+        Ok(trace_ids.len() as u64)
+    }
+
+    async fn get_trace_ref_projects(
+        &self,
+        trace_id: &str,
+    ) -> StorageResult<Vec<super::TraceRefProject>> {
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT project_id, first_seen FROM cross_project_trace_refs \
+                 WHERE trace_id = $1",
+                [trace_id.into()],
+            ))
+            .await?;
+
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                Some(super::TraceRefProject {
+                    project_id: row.try_get("", "project_id").ok()?,
+                    first_seen: row.try_get("", "first_seen").ok()?,
+                })
+            })
+            .collect())
+    }
+
     async fn upsert_insight(&self, insight: &Insight) -> StorageResult<i64> {
         let anomaly_ids_json = serde_json::to_value(&insight.anomaly_ids).unwrap_or_default();
 
@@ -2217,6 +2520,23 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn get_storage_quota(&self, project_id: i32) -> StorageResult<StorageQuota> {
+        // Quota is opt-in. With no limit configured, skip the usage estimate
+        // entirely and report zeros: this method sits on the ingest hot path
+        // (`OtelService::check_quota` calls it on every quota-cache miss), and
+        // its three per-project COUNT(*) hypertable scans are far too
+        // expensive to pay for a limit that is never enforced.
+        let Some(limit_bytes) = self.quota_bytes_per_project else {
+            return Ok(StorageQuota {
+                project_id,
+                metrics_bytes: 0,
+                traces_bytes: 0,
+                logs_bytes: 0,
+                total_bytes: 0,
+                limit_bytes: 0,
+                usage_pct: 0.0,
+            });
+        };
+
         // Per-project storage is estimated as
         //   table_size * (rows for project / total rows in table).
         // The per-project numerator must be exact, but the whole-table
@@ -2225,21 +2545,45 @@ impl OtelStorage for TimescaleDbStorage {
         // `COUNT(*)` scans every chunk, and this runs three times per call on
         // the ingest hot path (`check_quota`), so the denominator uses
         // TimescaleDB's `approximate_row_count` (planner stats, microseconds).
-        // `GREATEST(.., 1)` still guards against a zero/negative estimate on a
-        // freshly-created, never-analyzed table.
+        // `GREATEST(.., 1)` guards against a zero/negative estimate on a
+        // freshly-created, never-analyzed table; `LEAST(1.0, ..)` around the
+        // ratio guards the other direction -- a project's share of a table
+        // can never exceed 100% of that table, but `approximate_row_count`
+        // can UNDER-count right after a write burst (autovacuum/ANALYZE
+        // hasn't caught up yet -- the exact scenario this quota exists to
+        // catch), which without the clamp would inflate the computed
+        // `total_bytes` past what `table_size` itself reports. With the
+        // clamp, a lagging denominator can only make the estimate MORE
+        // conservative (trip earlier), never silently let a flood through.
+        //
+        // CORRECTNESS: `table_size` MUST be the whole hypertable's storage,
+        // not just its root. A hypertable's "root" relation (the name you
+        // create it under, e.g. `otel_spans`) holds no rows and almost no
+        // bytes itself -- TimescaleDB partitions all actual data into child
+        // "chunk" tables under `_timescaledb_internal`. `pg_total_relation_size`
+        // on the root name (the previous query here) therefore measures only
+        // the root's own tiny catalog/index footprint and NEVER grows with
+        // real ingest volume, so `total_bytes` stayed near-zero regardless of
+        // how much data a project actually stored and `usage_pct` could
+        // never reach 100 -- quota enforcement was silently inert for every
+        // project, the exact 160GB/day-flood failure mode this quota exists
+        // to prevent. `hypertable_size()` is TimescaleDB's chunk-aware
+        // equivalent: it sums every chunk's `pg_total_relation_size` (plus
+        // the negligible root), which is still cheap (proportional to chunk
+        // count, not row count) and gives the real total.
         let sql = r#"
             SELECT
-                COALESCE((SELECT pg_total_relation_size('otel_metrics') *
-                    (SELECT COUNT(*) FROM otel_metrics WHERE project_id = $1)::float /
-                    GREATEST(approximate_row_count('otel_metrics'::regclass), 1)::float
+                COALESCE((SELECT hypertable_size('otel_metrics'::regclass) *
+                    LEAST(1.0, (SELECT COUNT(*) FROM otel_metrics WHERE project_id = $1)::float /
+                    GREATEST(approximate_row_count('otel_metrics'::regclass), 1)::float)
                 ), 0)::bigint +
-                COALESCE((SELECT pg_total_relation_size('otel_spans') *
-                    (SELECT COUNT(*) FROM otel_spans WHERE project_id = $1)::float /
-                    GREATEST(approximate_row_count('otel_spans'::regclass), 1)::float
+                COALESCE((SELECT hypertable_size('otel_spans'::regclass) *
+                    LEAST(1.0, (SELECT COUNT(*) FROM otel_spans WHERE project_id = $1)::float /
+                    GREATEST(approximate_row_count('otel_spans'::regclass), 1)::float)
                 ), 0)::bigint +
-                COALESCE((SELECT pg_total_relation_size('otel_log_events') *
-                    (SELECT COUNT(*) FROM otel_log_events WHERE project_id = $1)::float /
-                    GREATEST(approximate_row_count('otel_log_events'::regclass), 1)::float
+                COALESCE((SELECT hypertable_size('otel_log_events'::regclass) *
+                    LEAST(1.0, (SELECT COUNT(*) FROM otel_log_events WHERE project_id = $1)::float /
+                    GREATEST(approximate_row_count('otel_log_events'::regclass), 1)::float)
                 ), 0)::bigint as total_bytes
         "#;
 
@@ -2257,7 +2601,6 @@ impl OtelStorage for TimescaleDbStorage {
             None => 0,
         };
 
-        let limit_bytes: u64 = self.quota_bytes_per_project;
         let usage_pct = if limit_bytes > 0 {
             (total_bytes as f64 / limit_bytes as f64) * 100.0
         } else {
@@ -2276,6 +2619,8 @@ impl OtelStorage for TimescaleDbStorage {
     }
 
     async fn check_quota(&self, project_id: i32) -> StorageResult<bool> {
+        // With no quota configured, get_storage_quota short-circuits to zeros
+        // without touching the database, so this is always "not exceeded".
         let quota = self.get_storage_quota(project_id).await?;
         Ok(quota.usage_pct >= 100.0)
     }
@@ -2583,15 +2928,32 @@ impl TimescaleDbStorage {
             param_idx += 1;
         }
         if let Some(ref attrs) = query.attributes {
+            // Same facet-routing as `query_spans`: a faceted key gets the
+            // index-backed slot column, everything else falls back to JSON
+            // extraction. See storage::timescaledb module docs for the
+            // compressed-chunk caveat.
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                where_clauses.push(format!(
-                    "s.attributes->>${}::text = ${}",
-                    param_idx,
-                    param_idx + 1
-                ));
-                values.push(key.clone().into());
-                values.push(value.clone().into());
-                param_idx += 2;
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_clauses.push(format!("s.{column} = ${param_idx}"));
+                    values.push(value.clone().into());
+                    param_idx += 1;
+                } else {
+                    where_clauses.push(format!(
+                        "s.attributes->>${}::text = ${}",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    values.push(key.clone().into());
+                    values.push(value.clone().into());
+                    param_idx += 2;
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {
@@ -2773,15 +3135,28 @@ impl TimescaleDbStorage {
             param_idx += 1;
         }
         if let Some(ref attrs) = query.attributes {
+            let facet_snapshot = self
+                .facet_cache
+                .as_ref()
+                .map(|c| c.load_full())
+                .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new()));
+
             for (key, value) in attrs {
-                where_clauses.push(format!(
-                    "s.attributes->>${}::text = ${}",
-                    param_idx,
-                    param_idx + 1
-                ));
-                values.push(key.clone().into());
-                values.push(value.clone().into());
-                param_idx += 2;
+                if let Some(&slot) = facet_snapshot.get(key.as_str()) {
+                    let column = crate::services::facet_service::facet_column_name(slot);
+                    where_clauses.push(format!("s.{column} = ${param_idx}"));
+                    values.push(value.clone().into());
+                    param_idx += 1;
+                } else {
+                    where_clauses.push(format!(
+                        "s.attributes->>${}::text = ${}",
+                        param_idx,
+                        param_idx + 1
+                    ));
+                    values.push(key.clone().into());
+                    values.push(value.clone().into());
+                    param_idx += 2;
+                }
             }
         }
         if let Some(ref pattern) = query.name_pattern {
@@ -3035,6 +3410,67 @@ impl TimescaleDbStorage {
 
         (where_clauses.join(" AND "), values, param_idx)
     }
+
+    // ── Cross-backend quota helpers ──────────────────────────────────────
+    //
+    // Used by `ClickHouseOtelStorage::get_storage_quota`
+    // (`storage/clickhouse/mod.rs`) to combine ClickHouse-native span/metric
+    // byte accounting with the Postgres-native log volume it still
+    // delegates here. Kept separate from `get_storage_quota` above (which
+    // stays a single three-table round trip, unchanged) so the all-Postgres
+    // path taken by every non-ClickHouse install pays no extra query.
+
+    /// Compute the proportional byte estimate for a single OTel hypertable
+    /// attributed to `project_id`, using the same chunk-aware
+    /// `hypertable_size()` formula as `get_storage_quota` — see that
+    /// method's CORRECTNESS comment for why `pg_total_relation_size` on the
+    /// hypertable root would be wrong here.
+    ///
+    /// `table` must be a fixed, code-controlled literal — one of
+    /// `"otel_metrics"`, `"otel_spans"`, `"otel_log_events"` — never
+    /// request/user input. Postgres cannot bind identifiers as query
+    /// parameters (only values), so it is interpolated via `format!`; every
+    /// call site in this crate passes a hardcoded string, so this is safe.
+    pub(crate) async fn hypertable_bytes_for_project(
+        &self,
+        table: &str,
+        project_id: i32,
+    ) -> StorageResult<u64> {
+        let sql = format!(
+            r#"
+            SELECT COALESCE((SELECT hypertable_size('{table}'::regclass) *
+                LEAST(1.0, (SELECT COUNT(*) FROM {table} WHERE project_id = $1)::float /
+                GREATEST(approximate_row_count('{table}'::regclass), 1)::float)
+            ), 0)::bigint as total_bytes
+            "#
+        );
+
+        let result = self
+            .db
+            .query_one(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                sql,
+                vec![project_id.into()],
+            ))
+            .await?;
+
+        Ok(match result {
+            Some(row) => row.try_get::<i64>("", "total_bytes").unwrap_or(0) as u64,
+            None => 0,
+        })
+    }
+
+    /// The configured per-project quota limit in bytes, if quota
+    /// enforcement is enabled (`TEMPS_OTEL_QUOTA_GB` set). `None` means
+    /// quota enforcement is off.
+    ///
+    /// Exposed so `ClickHouseOtelStorage` — which shares this same
+    /// `TimescaleDbStorage` as its inner delegate — reads the one
+    /// configured limit instead of parsing `TEMPS_OTEL_QUOTA_GB` a second
+    /// time in a second place.
+    pub(crate) fn quota_bytes_per_project(&self) -> Option<u64> {
+        self.quota_bytes_per_project
+    }
 }
 
 // ── LIKE pattern helpers ─────────────────────────────────────────────
@@ -3250,6 +3686,167 @@ fn parse_span_kind(kind_str: &str) -> crate::types::SpanKind {
         "UNSPECIFIED" => crate::types::SpanKind::Unspecified,
         _ => crate::types::SpanKind::Internal,
     }
+}
+
+// ── Span-stats helpers ──────────────────────────────────────────────────────
+
+/// Build the shared WHERE clause and bound parameters for the span-stats
+/// list/count queries. Returns `(where_sql, values, next_param_idx)`.
+///
+/// The list and count queries MUST use this same builder: a filter applied to
+/// one but not the other produces a total that disagrees with the rows, and
+/// pagination silently loses or repeats operations.
+fn build_span_stats_filters(query: &SpanStatsQuery) -> (String, Vec<sea_orm::Value>, u32) {
+    // `= ANY($1)` keeps the (project_id, start_time) index usable for the
+    // multi-project case instead of degenerating into a sequential scan.
+    let project_ids: Vec<i32> = query.project_ids.clone();
+    let mut where_clauses = vec![
+        "s.project_id = ANY($1)".to_string(),
+        "s.start_time >= $2".to_string(),
+        "s.start_time <= $3".to_string(),
+    ];
+    let mut values: Vec<sea_orm::Value> = vec![
+        project_ids.into(),
+        query.start_time.into(),
+        query.end_time.into(),
+    ];
+    let mut param_idx = 4u32;
+
+    if let Some(ref svc) = query.service_name {
+        where_clauses.push(format!("s.service_name = ${param_idx}"));
+        values.push(svc.clone().into());
+        param_idx += 1;
+    }
+    if let Some(ref name) = query.span_name {
+        where_clauses.push(format!("s.name = ${param_idx}"));
+        values.push(name.clone().into());
+        param_idx += 1;
+    }
+    if let Some(ref pattern) = query.name_pattern {
+        where_clauses.push(format!("s.name ILIKE ${param_idx}"));
+        values.push(format!("%{}%", escape_like_pattern(pattern)).into());
+        param_idx += 1;
+    }
+    if let Some(kind) = query.kind {
+        where_clauses.push(format!("s.kind = ${param_idx}"));
+        values.push(kind.to_string().into());
+        param_idx += 1;
+    }
+    if let Some(status) = query.status {
+        where_clauses.push(format!("s.status_code = ${param_idx}"));
+        values.push(status.to_string().into());
+        param_idx += 1;
+    }
+    if let Some(min_dur) = query.min_duration_ms {
+        where_clauses.push(format!("s.duration_ms >= ${param_idx}"));
+        values.push(min_dur.into());
+        param_idx += 1;
+    }
+    if let Some(deployment_id) = query.deployment_id {
+        where_clauses.push(format!("s.deployment_id = ${param_idx}"));
+        values.push(deployment_id.into());
+        param_idx += 1;
+    }
+    if let Some(environment_id) = query.environment_id {
+        // A subquery rather than a JOIN: joining `deployments` before the
+        // GROUP BY would multiply span rows and corrupt every aggregate.
+        where_clauses.push(format!(
+            "s.deployment_id IN (SELECT id FROM deployments WHERE environment_id = ${param_idx})"
+        ));
+        values.push(environment_id.into());
+        param_idx += 1;
+    }
+    if let Some(ref attrs) = query.attributes {
+        for (key, value) in attrs {
+            where_clauses.push(format!(
+                "s.attributes->>${}::text = ${}",
+                param_idx,
+                param_idx + 1
+            ));
+            values.push(key.clone().into());
+            values.push(value.clone().into());
+            param_idx += 2;
+        }
+    }
+
+    (where_clauses.join(" AND "), values, param_idx)
+}
+
+/// The SQL expression a span-stats sort field orders by.
+///
+/// Written as aggregate expressions rather than SELECT aliases so PostgreSQL
+/// resolves them against the grouped set regardless of the projection. The
+/// ratio fields guard their denominators: an operation whose spans all record
+/// 0ms would otherwise divide by zero and abort the whole query.
+fn span_stats_order_expr(field: crate::types::SpanStatsSortField) -> &'static str {
+    use crate::types::SpanStatsSortField as F;
+    match field {
+        F::TotalDurationMs => "SUM(s.duration_ms)",
+        F::P50DurationMs => "percentile_cont(0.50) WITHIN GROUP (ORDER BY s.duration_ms)",
+        F::P95DurationMs => "percentile_cont(0.95) WITHIN GROUP (ORDER BY s.duration_ms)",
+        F::P99DurationMs => "percentile_cont(0.99) WITHIN GROUP (ORDER BY s.duration_ms)",
+        F::MaxDurationMs => "MAX(s.duration_ms)",
+        F::AvgDurationMs => "AVG(s.duration_ms)",
+        F::StddevDurationMs => "COALESCE(STDDEV_SAMP(s.duration_ms), 0)",
+        F::Count => "COUNT(*)",
+        F::ErrorCount => "COUNT(*) FILTER (WHERE s.status_code = 'ERROR')",
+        F::ErrorRate => {
+            "COUNT(*) FILTER (WHERE s.status_code = 'ERROR')::double precision \
+                         / NULLIF(COUNT(*), 0)"
+        }
+        F::CoefficientOfVariation => {
+            "COALESCE(STDDEV_SAMP(s.duration_ms), 0) / NULLIF(AVG(s.duration_ms), 0)"
+        }
+        F::TailRatio => {
+            "percentile_cont(0.99) WITHIN GROUP (ORDER BY s.duration_ms) \
+             / NULLIF(percentile_cont(0.50) WITHIN GROUP (ORDER BY s.duration_ms), 0)"
+        }
+    }
+}
+
+/// Convert one span-stats result row into a [`SpanStats`].
+///
+/// Returns `None` for a row missing a required column, matching the read paths
+/// elsewhere in this backend: one malformed row is skipped rather than failing
+/// the whole report.
+fn parse_span_stats_row(row: &sea_orm::QueryResult) -> Option<SpanStats> {
+    let project_id: i32 = row.try_get("", "project_id").ok()?;
+    let service_name: String = row.try_get("", "service_name").ok()?;
+    let span_name: String = row.try_get("", "span_name").ok()?;
+    let kind_str: String = row.try_get("", "kind").ok()?;
+    let count: i64 = row.try_get("", "span_count").ok()?;
+    let error_count: i64 = row.try_get("", "error_count").ok()?;
+    let total_duration_ms: f64 = row.try_get("", "total_duration_ms").unwrap_or(0.0);
+    let min_duration_ms: f64 = row.try_get("", "min_duration_ms").unwrap_or(0.0);
+    let max_duration_ms: f64 = row.try_get("", "max_duration_ms").unwrap_or(0.0);
+    let avg_duration_ms: f64 = row.try_get("", "avg_duration_ms").unwrap_or(0.0);
+    let stddev_duration_ms: f64 = row.try_get("", "stddev_duration_ms").unwrap_or(0.0);
+    let p50_duration_ms: f64 = row.try_get("", "p50_duration_ms").unwrap_or(0.0);
+    let p95_duration_ms: f64 = row.try_get("", "p95_duration_ms").unwrap_or(0.0);
+    let p99_duration_ms: f64 = row.try_get("", "p99_duration_ms").unwrap_or(0.0);
+    let last_seen: DateTime<Utc> = row.try_get("", "last_seen").ok()?;
+
+    Some(crate::types::build_span_stats(
+        crate::types::SpanStatsGroup {
+            project_id,
+            service_name,
+            span_name,
+            kind: parse_span_kind(&kind_str),
+            count,
+            error_count,
+        },
+        crate::types::SpanDurationStats {
+            total_ms: total_duration_ms,
+            min_ms: min_duration_ms,
+            max_ms: max_duration_ms,
+            avg_ms: avg_duration_ms,
+            stddev_ms: stddev_duration_ms,
+            p50_ms: p50_duration_ms,
+            p95_ms: p95_duration_ms,
+            p99_ms: p99_duration_ms,
+        },
+        last_seen,
+    ))
 }
 
 /// One trace's worth of aggregates folded from a span batch, ready to upsert
@@ -3553,6 +4150,7 @@ mod tests {
             deployment_id: None,
             attributes: None,
             name_pattern: None,
+            root_only: false,
             sort_by: TraceSortField::StartTime,
             sort_order: Default::default(),
             limit: None,
@@ -3941,5 +4539,83 @@ mod tests {
         // project_id(1) + k1(1) + v1(1) + k2(1) + v2(1) = 5 values
         assert_eq!(values.len(), 5);
         assert_eq!(next, 6);
+    }
+
+    /// When otel_trace_summaries has a row for the trace, the span scan must
+    /// be bounded by the trace's time window so hypertable chunk exclusion
+    /// applies (compressed chunks have no trace_id B-tree index).
+    #[tokio::test]
+    async fn get_trace_bounds_span_scan_when_summary_exists() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use std::collections::BTreeMap;
+
+        let start = chrono::Utc.with_ymd_and_hms(2026, 7, 10, 10, 0, 0).unwrap();
+        let summary_row: BTreeMap<&str, sea_orm::Value> = BTreeMap::from([
+            ("start_time", start.into()),
+            ("duration_ms", 1500.0_f64.into()),
+        ]);
+
+        let conn = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![summary_row]])
+                .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
+                .into_connection(),
+        );
+        let storage = TimescaleDbStorage::new(conn.clone(), None);
+
+        let spans = storage.get_trace(7, "abc123").await.unwrap();
+        assert!(spans.is_empty());
+
+        drop(storage);
+        let log = Arc::try_unwrap(conn)
+            .unwrap_or_else(|_| panic!("connection still shared"))
+            .into_transaction_log();
+        assert_eq!(log.len(), 2, "summary lookup + bounded span query");
+        let span_query = format!("{:?}", log[1]);
+        assert!(
+            span_query.contains("start_time >= $3"),
+            "span query must be time-bounded, got: {span_query}"
+        );
+        assert!(span_query.contains("start_time <= $4"));
+        // Window derived from the summary: start - 1 day .. start + duration + 1 day.
+        assert!(
+            span_query.contains("2026-07-09"),
+            "lower bound must come from the summary window, got: {span_query}"
+        );
+        assert!(span_query.contains("2026-07-11"));
+    }
+
+    /// Without a summary row (ingest race, fail-soft summary upsert failure,
+    /// or legacy spans predating summaries), get_trace must still bound the
+    /// scan — to the recent hot window — and never scan the full retention
+    /// range: on compressed chunks a trace_id lookup has no index to seek on,
+    /// so an unbounded fallback would decompress the project's entire history
+    /// for any unknown trace_id.
+    #[tokio::test]
+    async fn get_trace_falls_back_to_recent_window_without_summary() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
+        use std::collections::BTreeMap;
+
+        let conn = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
+                .append_query_results([Vec::<BTreeMap<&str, sea_orm::Value>>::new()])
+                .into_connection(),
+        );
+        let storage = TimescaleDbStorage::new(conn.clone(), None);
+
+        let spans = storage.get_trace(7, "abc123").await.unwrap();
+        assert!(spans.is_empty());
+
+        drop(storage);
+        let log = Arc::try_unwrap(conn)
+            .unwrap_or_else(|_| panic!("connection still shared"))
+            .into_transaction_log();
+        assert_eq!(log.len(), 2, "summary lookup + fallback span query");
+        let span_query = format!("{:?}", log[1]);
+        assert!(
+            span_query.contains("start_time >= $3") && span_query.contains("start_time <= $4"),
+            "fallback query must be bounded to the recent window, got: {span_query}"
+        );
     }
 }

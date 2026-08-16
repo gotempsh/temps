@@ -9,8 +9,8 @@ impl MigrationTrait for Migration {
         // Backfill `owner` for GitLab repositories whose `full_name` contains
         // a nested group path. Prior to this migration the GitLab provider
         // stored only the first path segment in `owner`, so a project like
-        // `gala-games/chain/platform/operation-api-next` was saved with
-        // `owner = 'gala-games'` and `name = 'operation-api-next'`, which
+        // `acme/infra/platform/orders-api` was saved with
+        // `owner = 'acme'` and `name = 'orders-api'`, which
         // breaks `owner/name` lookups.
         //
         // After: `owner` = everything in `full_name` before the last `/`.

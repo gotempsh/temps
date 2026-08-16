@@ -6,7 +6,7 @@ use std::time::Duration;
 use tokio_stream::Stream;
 
 use crate::error::AiGatewayError;
-use crate::providers::{AiProvider, ProviderCapability, ProviderInfo};
+use crate::providers::{external_http_client, AiProvider, ProviderCapability, ProviderInfo};
 use crate::types::*;
 
 pub struct GeminiProvider {
@@ -22,11 +22,7 @@ impl Default for GeminiProvider {
 
 impl GeminiProvider {
     pub fn new() -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .expect("Failed to build HTTP client");
+        let client = external_http_client(Duration::from_secs(300));
 
         Self {
             info: ProviderInfo {
@@ -177,8 +173,21 @@ impl GeminiProvider {
 
         let generation_config = GeminiGenerationConfig {
             max_output_tokens: request.max_tokens,
-            temperature: request.temperature,
-            top_p: request.top_p,
+            temperature: (!request.model.starts_with("gemini-3"))
+                .then_some(request.temperature)
+                .flatten(),
+            top_p: (!request.model.starts_with("gemini-3"))
+                .then_some(request.top_p)
+                .flatten(),
+            thinking_config: request
+                .extra
+                .as_ref()
+                .and_then(|extra| extra.get("reasoning_effort"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|_| request.model.starts_with("gemini-3"))
+                .map(|level| GeminiThinkingConfig {
+                    thinking_level: level.to_string(),
+                }),
             stop_sequences: request.stop.as_ref().map(|s| match s {
                 StopSequence::Single(s) => vec![s.clone()],
                 StopSequence::Multiple(v) => v.clone(),
@@ -554,6 +563,9 @@ impl AiProvider for GeminiProvider {
 
     fn available_models(&self) -> Vec<ModelInfo> {
         let models = [
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemini-3.5-flash-lite",
             "gemini-3.1-pro",
             "gemini-3.1-flash-lite",
             "gemini-3-flash",
@@ -845,9 +857,17 @@ struct GeminiGenerationConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    thinking_config: Option<GeminiThinkingConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stop_sequences: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_mime_type: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GeminiThinkingConfig {
+    thinking_level: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -978,6 +998,28 @@ mod tests {
         let config = translated.generation_config.unwrap();
         assert_eq!(config.max_output_tokens, Some(1000));
         assert_eq!(config.temperature, Some(0.5));
+    }
+
+    #[test]
+    fn test_translate_request_maps_gemini_3_thinking_and_omits_sampling() {
+        let mut request = make_request(Vec::new());
+        request.model = "gemini-3.6-flash".to_string();
+        request.temperature = Some(0.2);
+        request.top_p = Some(0.9);
+        request.extra = Some(serde_json::Map::from_iter([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("low"),
+        )]));
+
+        let translated = GeminiProvider::translate_request(&request);
+        let value = serde_json::to_value(translated).expect("request serializes");
+
+        assert_eq!(
+            value["generationConfig"]["thinkingConfig"]["thinkingLevel"],
+            "low"
+        );
+        assert!(value["generationConfig"].get("temperature").is_none());
+        assert!(value["generationConfig"].get("topP").is_none());
     }
 
     #[test]

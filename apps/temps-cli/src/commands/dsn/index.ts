@@ -392,7 +392,7 @@ function displayDsnDetails(dsn: ProjectDsnResponse): void {
   newline()
 }
 
-function truncateKey(key: string): string {
+export function truncateKey(key: string): string {
   if (key.length <= 12) return key
   return `${key.substring(0, 8)}...${key.substring(key.length - 4)}`
 }

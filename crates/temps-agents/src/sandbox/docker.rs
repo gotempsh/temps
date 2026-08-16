@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use super::user::{SANDBOX_CHOWN, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER, SANDBOX_WORK_DIR};
 use super::{
-    ExecStream, OnStreamEventCallback, SandboxCreateConfig, SandboxExecResult, SandboxHandle,
-    SandboxProvider,
+    ExecStream, OnStreamEventCallback, PtyAttachment, SandboxCreateConfig, SandboxExecResult,
+    SandboxHandle, SandboxProvider, PTY_AGENT_SOCKET,
 };
 use crate::ai_cli::OnEventCallback;
 use crate::error::AgentError;
@@ -18,11 +18,180 @@ use crate::error::AgentError;
 /// Container naming prefix — used for recovery after server restarts.
 const SANDBOX_NAME_PREFIX: &str = "temps-sandbox-";
 
+/// Naming prefix for the named volume backing a sandbox's `/home/temps`.
+pub(crate) const HOME_VOLUME_PREFIX: &str = "temps-sandbox-home-";
+
+/// Scheme marker in every home volume name this build generates.
+///
+/// This exists to make one specific attack impossible. Before the naming
+/// fix, standalone sandboxes keyed their home volume on `sandboxes.id` and
+/// agent runs keyed theirs on `agent_runs.id` — two independent sequences
+/// sharing one namespace. On an upgraded host the standalone ones are
+/// stranded (destroy no longer computes their name), and Docker attaches an
+/// existing volume by name, so a later agent run whose id happened to match
+/// would silently mount a *different user's* `/home/temps` — their Claude
+/// credentials, shell history, and project state, read-write.
+///
+/// Every name we generate now carries this infix, so no name this build
+/// produces can ever collide with a pre-fix volume. Stranded legacy volumes
+/// become inert: nothing mounts them again, and the operator removes them
+/// (see `HOME_VOLUME_LABEL`).
+///
+/// Cost of the change: a sandbox whose container is recreated across the
+/// upgrade gets a fresh home once. Agent-run homes are ephemeral (purged on
+/// destroy) and standalone containers are not recreated in place — stop,
+/// start, and restart all reuse the existing container and its mounts — so
+/// nothing a user is actively relying on is lost.
+pub(crate) const HOME_VOLUME_SCHEME: &str = "v2-";
+
+/// Label stamped on every home volume this provider creates.
+///
+/// Nothing in the server reads it — volumes are removed only by an explicit
+/// sandbox destroy, which knows the exact name. It exists so an operator
+/// can reclaim volumes this build strands (a destroy that failed to reach
+/// the daemon, or a create that failed after the volume was made):
+///
+/// ```text
+/// docker volume prune --filter label=sh.temps.sandbox.home
+/// ```
+///
+/// That command does NOT cover volumes created before this build — those
+/// were auto-created by the bind mount and carry no label. They are the
+/// `v2-`-less numeric names, and are removed with:
+///
+/// ```text
+/// docker volume ls -q --filter dangling=true \
+///   | grep -E '^temps-sandbox-home-[0-9]+$' \
+///   | xargs -r docker volume rm
+/// ```
+///
+/// `dangling=true` is what makes that safe to run on a live host: a volume
+/// still attached to a container is not listed.
+const HOME_VOLUME_LABEL: &str = "sh.temps.sandbox.home";
+
 /// Single-quote a string for safe embedding in a `sh -c` command line.
 /// Handles embedded single quotes via the `'\''` idiom.
 fn shell_quote(s: &str) -> String {
     let escaped = s.replace('\'', "'\\''");
     format!("'{}'", escaped)
+}
+
+// ── Credential-scrubbing helpers (ADR-037 §4) ─────────────────────────────────
+//
+// These are module-level so they can be unit-tested without a Docker daemon.
+// The production path in `take_snapshot` calls them; the test suite verifies
+// the pattern list and the scrubbing logic independently.
+
+/// Known-sensitive env-var key patterns from ADR-013 + ADR-037.
+///
+/// Matching is case-insensitive substring: a key is considered sensitive when
+/// its uppercased form **contains** any of these patterns. This deliberately
+/// catches variants like `MY_ANTHROPIC_API_KEY` and `GITHUB_TOKEN_READONLY`
+/// without requiring an exhaustive allowlist.
+///
+/// **Security invariant**: this list is the single source of truth for which
+/// env vars the scrubber strips. Adding a new secret kind to the sandbox API
+/// must be accompanied by adding its pattern here. Keep this in sync with
+/// every env var injected at sandbox creation time in:
+///   - `crates/temps-agents/src/services/executor.rs`  (CLAUDE_CODE_OAUTH_TOKEN)
+///   - `crates/temps-agents/src/handlers/trigger.rs`   (CLAUDE_CODE_OAUTH_TOKEN)
+///   - `crates/temps-agents/src/services/sandbox_injector.rs`
+pub(crate) const SENSITIVE_ENV_PATTERNS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "GITHUB_TOKEN",
+    "GITLAB_TOKEN",
+    "BITBUCKET_TOKEN",
+    "GIT_TOKEN",
+    "API_KEY",
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "CREDENTIAL",
+    "AWS_SECRET",
+    "AWS_ACCESS_KEY",
+    "AZURE_CLIENT_SECRET",
+    "GOOGLE_APPLICATION_CREDENTIALS",
+    "CODEX_API_KEY",
+    "OPENCODE_API_KEY",
+    // OAuth tokens — covers CLAUDE_CODE_OAUTH_TOKEN injected by executor.rs
+    // and trigger.rs for Claude subscription auth, and any future OAuth tokens.
+    "OAUTH_TOKEN",
+    "TEMPS_",
+];
+
+/// Returns `true` if `key` (case-insensitive) matches any sensitive pattern.
+///
+/// Called by `take_snapshot` for both the scrubbing step (zero-out the value)
+/// and the verification step (reject if a non-empty value survives).
+pub(crate) fn is_sensitive_env_key(key: &str) -> bool {
+    let key_upper = key.to_uppercase();
+    SENSITIVE_ENV_PATTERNS
+        .iter()
+        .any(|pat| key_upper.contains(pat))
+}
+
+/// Build Dockerfile-style `ENV KEY=` change instructions for every sensitive
+/// entry found in a `KEY=VALUE` env list.
+///
+/// For each entry whose key matches [`is_sensitive_env_key`], produces a
+/// `"ENV KEY="` string (empty value). These strings are passed to
+/// `CommitContainerOptionsBuilder::changes()`, which maps to Docker's
+/// `changes` query parameter — the **only** mechanism that actually overwrites
+/// env-var values in the committed image's `Config.Env`.
+///
+/// **Why zeroing rather than removal:** Docker's commit API has no mechanism
+/// to delete an env entry; it can only overwrite the value. `ENV KEY=` sets
+/// the key to an empty string in the committed image. This was verified
+/// against a real Docker daemon using `docker commit --change 'ENV KEY='`.
+/// The `ContainerConfig` body's `env` field (the previous approach) is
+/// silently ignored by the Docker Engine and has zero effect on the committed
+/// image — a confirmed no-op, not a design choice.
+///
+/// Non-sensitive entries are not included in the result — only the change
+/// instructions for the keys that need scrubbing are returned.
+pub(crate) fn build_env_scrub_changes(env: &[String]) -> Vec<String> {
+    env.iter()
+        .filter_map(|kv| {
+            let key = kv.split('=').next().unwrap_or("");
+            if is_sensitive_env_key(key) {
+                Some(format!("ENV {}=", key))
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+/// Returns the keys of any env entries that are sensitive AND have a non-empty
+/// value after `=` (i.e. were not successfully zeroed by the scrubbing step).
+///
+/// A sensitive key with an **empty** value (`KEY=`) has been successfully
+/// zeroed by `docker commit --change 'ENV KEY='` and is NOT a survivor.
+/// A sensitive key with a **non-empty** value (`KEY=actual-secret`) means
+/// the Docker `changes` mechanism was bypassed or failed and the value leaked
+/// into the committed image — this is the real failure condition.
+///
+/// Called after `docker commit` to verify the scrubbing worked. An empty
+/// return means the image config is clean. A non-empty return triggers an
+/// abort: the staged image is removed and `take_snapshot` returns an error.
+pub(crate) fn find_surviving_sensitive_keys(env: &[String]) -> Vec<String> {
+    env.iter()
+        .filter_map(|kv| {
+            let mut parts = kv.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            let value = parts.next().unwrap_or("");
+            // A sensitive key with an empty value has been zeroed by the
+            // `ENV KEY=` change instruction — that is the expected post-commit
+            // state and is NOT a failure. Only a non-empty value means the
+            // secret survived into the committed image.
+            if is_sensitive_env_key(key) && !value.is_empty() {
+                Some(key.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Shared Docker network for all workspace/agent sandboxes AND the preview
@@ -1055,6 +1224,67 @@ impl DockerSandboxProvider {
         format!("{}{}", SANDBOX_NAME_PREFIX, run_id)
     }
 
+    /// The container name and home-volume name for a create request.
+    ///
+    /// `create` must take both from here rather than computing either
+    /// itself. The leak this replaced came from exactly that: create
+    /// derived the volume from `config.run_id` while destroy derived it
+    /// from the container name, and nothing forced the two to agree. With
+    /// one function owning the pair, a future change to either name has to
+    /// go through a single place, and `sandbox_names_agree_for_*` fails if
+    /// they ever diverge again — without needing a Docker daemon.
+    fn sandbox_names(config: &SandboxCreateConfig) -> (String, String) {
+        let container_name = config
+            .container_name_override
+            .clone()
+            .map(|id| format!("{}{}", SANDBOX_NAME_PREFIX, id))
+            .unwrap_or_else(|| Self::container_name(config.run_id));
+        let home_volume_name = Self::home_volume_name(&container_name);
+        (container_name, home_volume_name)
+    }
+
+    /// The `HostConfig.binds` for a sandbox container: the host work dir at
+    /// `/workspace`, and the home volume at `/home/temps`.
+    ///
+    /// Pure, and separate from `create`, so a test can assert that the
+    /// volume the container actually mounts is the one `destroy` will
+    /// remove — without needing a Docker daemon. The original leak lived
+    /// exactly here: `create` built this bind from one name while `destroy`
+    /// computed another, and only an e2e could see it.
+    fn container_binds(host_work_dir: &str, home_volume_name: &str) -> Vec<String> {
+        vec![
+            format!("{}:{}", host_work_dir, CONTAINER_WORK_DIR),
+            format!("{}:{}", home_volume_name, SANDBOX_HOME),
+        ]
+    }
+
+    /// Name of the named volume holding a sandbox's `/home/temps`.
+    ///
+    /// Derived from the **container** name, never from `run_id` directly.
+    /// That distinction is the whole point: agent runs are named
+    /// `temps-sandbox-<run_id>` while standalone sandboxes override the
+    /// suffix with their opaque `public_id` label, so keying the volume on
+    /// `run_id` made create and destroy disagree for every standalone
+    /// sandbox — create made `temps-sandbox-home-<row.id>`, destroy tried
+    /// to remove `temps-sandbox-home-<hex>`, and the real volume leaked on
+    /// the host forever. Both sides now go through this one function, so
+    /// they cannot drift again.
+    ///
+    /// Deriving from the container name also removes a cross-tenant
+    /// collision: standalone sandbox row 5 and agent run 5 used to share
+    /// `temps-sandbox-home-5`, i.e. one user's `~/.claude` credentials and
+    /// shell history mounted into another user's sandbox. `HOME_VOLUME_SCHEME`
+    /// is what makes that unreachable rather than merely unlikely — it keeps
+    /// every generated name out of the pre-fix namespace, so a stranded
+    /// legacy volume can never be picked up by a new sandbox either.
+    fn home_volume_name(container_name: &str) -> String {
+        super::home_volume_name_for_label(
+            container_name
+                .strip_prefix(SANDBOX_NAME_PREFIX)
+                .unwrap_or(container_name),
+        )
+    }
+
     /// Shared recovery by absolute container name — looks up the container
     /// and returns a handle for it regardless of whether it's currently
     /// running or stopped. Only returns `None` when the container has been
@@ -1117,6 +1347,8 @@ impl DockerSandboxProvider {
                     sandbox_id: container_id,
                     sandbox_name: container_name.to_string(),
                     work_dir: PathBuf::from(CONTAINER_WORK_DIR),
+                    backend: super::SandboxBackend::Docker,
+                    image: String::new(),
                 }))
             }
             Err(_) => Ok(None),
@@ -1285,11 +1517,7 @@ impl SandboxProvider for DockerSandboxProvider {
     async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
         self.ensure_network().await?;
 
-        let container_name = config
-            .container_name_override
-            .clone()
-            .map(|id| format!("{}{}", SANDBOX_NAME_PREFIX, id))
-            .unwrap_or_else(|| Self::container_name(config.run_id));
+        let (container_name, home_volume_name) = Self::sandbox_names(&config);
 
         // Remove existing container with the same name if any (leftover from crash)
         let _ = self
@@ -1385,13 +1613,10 @@ impl SandboxProvider for DockerSandboxProvider {
         // the sandbox would lose all conversation continuity even though the
         // work_dir survives via the bind mount above.
         //
-        // The volume name is keyed on run_id so each session keeps its own
-        // home isolated, and the volume is auto-created on first mount.
-        let home_volume_name = format!("temps-sandbox-home-{}", config.run_id);
-        let binds = vec![
-            format!("{}:{}", host_work_dir, CONTAINER_WORK_DIR),
-            format!("{}:{}", home_volume_name, SANDBOX_HOME),
-        ];
+        // `home_volume_name` came from `sandbox_names` above, alongside the
+        // container name — `destroy` re-derives it from the container name
+        // via `home_volume_name`, which is what keeps the two in sync.
+        let binds = Self::container_binds(&host_work_dir, &home_volume_name);
 
         // tmpfs mount for secrets — in-memory only, never written to disk
         let mut tmpfs = HashMap::new();
@@ -1478,6 +1703,40 @@ impl SandboxProvider for DockerSandboxProvider {
             labels: Some(labels),
             ..Default::default()
         };
+
+        // Create the home volume explicitly, labelled, rather than letting
+        // the bind auto-create it unlabelled — see HOME_VOLUME_LABEL for why
+        // the label earns its extra call. Idempotent: Docker returns an
+        // existing volume unchanged, which is what recreating a sandbox over
+        // a surviving home relies on.
+        //
+        // Deliberately here rather than at the top of `create`: everything
+        // that can fail cheaply and repeatedly (image resolution, a cold
+        // pull of a caller-supplied image) has already happened, so a caller
+        // looping failed creates can't mint a volume per attempt. A failure
+        // after this point still strands an empty one, which is what the
+        // label-filtered prune is for.
+        if let Err(e) = self
+            .docker
+            .create_volume(bollard::models::VolumeCreateRequest {
+                name: Some(home_volume_name.clone()),
+                labels: Some(HashMap::from([(
+                    HOME_VOLUME_LABEL.to_string(),
+                    "true".to_string(),
+                )])),
+                ..Default::default()
+            })
+            .await
+        {
+            // Non-fatal: the bind still auto-creates the volume. The only
+            // loss is the label, i.e. this one volume won't appear in an
+            // operator's label-filtered prune.
+            tracing::warn!(
+                "Could not pre-create labelled home volume {}: {} — continuing",
+                home_volume_name,
+                e
+            );
+        }
 
         let container = self
             .docker
@@ -1586,6 +1845,8 @@ impl SandboxProvider for DockerSandboxProvider {
             sandbox_id: container.id,
             sandbox_name: container_name,
             work_dir: PathBuf::from(CONTAINER_WORK_DIR),
+            backend: super::SandboxBackend::Docker,
+            image: image.to_string(),
         })
     }
 
@@ -1722,22 +1983,24 @@ impl SandboxProvider for DockerSandboxProvider {
         // shell history, and ~/.claude/projects are preserved when the
         // session is reopened.
         if purge_volumes {
-            if let Some(run_id_str) = handle.sandbox_name.strip_prefix(SANDBOX_NAME_PREFIX) {
-                let home_volume_name = format!("temps-sandbox-home-{}", run_id_str);
-                if let Err(e) = self
-                    .docker
-                    .remove_volume(
-                        &home_volume_name,
-                        None::<bollard::query_parameters::RemoveVolumeOptions>,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "Failed to remove sandbox home volume {} (may not exist): {}",
-                        home_volume_name,
-                        e
-                    );
-                }
+            let home_volume_name = Self::home_volume_name(&handle.sandbox_name);
+            if let Err(e) = self
+                .docker
+                .remove_volume(
+                    &home_volume_name,
+                    None::<bollard::query_parameters::RemoveVolumeOptions>,
+                )
+                .await
+            {
+                // Not fatal — the container is already gone, so the sandbox
+                // is destroyed either way. Nothing sweeps up afterwards, so
+                // the volume is stranded until an operator reclaims it; it
+                // carries HOME_VOLUME_LABEL for exactly that.
+                tracing::warn!(
+                    "Failed to remove sandbox home volume {} (may not exist): {}",
+                    home_volume_name,
+                    e
+                );
             }
         }
 
@@ -2170,6 +2433,97 @@ impl SandboxProvider for DockerSandboxProvider {
         }
     }
 
+    /// Bridge to the in-sandbox PTY agent, exactly as ADR-008 §Host-side
+    /// Bridge specifies: a `docker exec` running `socat` that relays the
+    /// exec's stdio to the agent's unix socket.
+    ///
+    /// Nothing long-lived runs inside this exec — `socat` exits when its
+    /// stdin closes, and the exec dies with it. The only persistent
+    /// in-container process is the agent itself, which is what keeps a
+    /// `claude` session alive across a dropped connection.
+    ///
+    /// Runs as `SANDBOX_USER` because the socket is mode 0600 owned by that
+    /// user. Executing as root would work but would break the "same trust
+    /// boundary as the sandbox user" property the ADR relies on.
+    async fn attach_pty(&self, handle: &SandboxHandle) -> Result<PtyAttachment, AgentError> {
+        let exec_failed = |reason: String| AgentError::SandboxExecFailed {
+            run_id: 0,
+            sandbox_id: handle.sandbox_id.clone(),
+            reason,
+        };
+
+        let exec_config = bollard::models::ExecConfig {
+            attach_stdin: Some(true),
+            attach_stdout: Some(true),
+            attach_stderr: Some(true),
+            // No `tty: true` here. The PTY lives *inside* the agent; this
+            // exec is a plain binary pipe carrying framed protocol bytes.
+            // Asking Docker for a TTY would mangle them with ONLCR.
+            tty: Some(false),
+            cmd: Some(vec![
+                "socat".to_string(),
+                "-".to_string(),
+                format!("UNIX-CONNECT:{}", PTY_AGENT_SOCKET),
+            ]),
+            user: Some(SANDBOX_USER.to_string()),
+            ..Default::default()
+        };
+
+        let exec = self
+            .docker
+            .create_exec(&handle.sandbox_id, exec_config)
+            .await
+            .map_err(|e| exec_failed(format!("failed to create PTY attach exec: {}", e)))?;
+
+        let started = self
+            .docker
+            .start_exec(
+                &exec.id,
+                Some(bollard::exec::StartExecOptions {
+                    detach: false,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .map_err(|e| exec_failed(format!("failed to start PTY attach exec: {}", e)))?;
+
+        match started {
+            StartExecResults::Attached { output, input } => {
+                let sandbox_id = handle.sandbox_id.clone();
+                // Docker frames the exec's stdout/stderr; the agent's bytes
+                // arrive as StdOut. StdErr here is socat complaining (e.g.
+                // the socket is missing because the image predates the
+                // agent), which must surface as an error rather than be
+                // silently mixed into the protocol stream.
+                let output = output.map(move |chunk| match chunk {
+                    Ok(LogOutput::StdOut { message }) => Ok(message),
+                    Ok(LogOutput::Console { message }) => Ok(message),
+                    Ok(LogOutput::StdErr { message }) => Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: sandbox_id.clone(),
+                        reason: format!(
+                            "PTY agent relay error: {}",
+                            String::from_utf8_lossy(&message).trim()
+                        ),
+                    }),
+                    Ok(LogOutput::StdIn { .. }) => Ok(bytes::Bytes::new()),
+                    Err(e) => Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: sandbox_id.clone(),
+                        reason: format!("PTY attach stream failed: {}", e),
+                    }),
+                });
+                Ok(PtyAttachment {
+                    output: Box::pin(output),
+                    input,
+                })
+            }
+            StartExecResults::Detached => Err(exec_failed(
+                "PTY attach exec returned detached; expected an attached stream".to_string(),
+            )),
+        }
+    }
+
     async fn recover(&self, run_id: i32) -> Result<Option<SandboxHandle>, AgentError> {
         let container_name = Self::container_name(run_id);
         self.recover_container(&container_name).await
@@ -2181,6 +2535,10 @@ impl SandboxProvider for DockerSandboxProvider {
     ) -> Result<Option<SandboxHandle>, AgentError> {
         let full_name = format!("{}{}", SANDBOX_NAME_PREFIX, container_name);
         self.recover_container(&full_name).await
+    }
+
+    fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
+        matches!(backend, super::SandboxBackend::Docker)
     }
 
     fn name(&self) -> &str {
@@ -2246,6 +2604,613 @@ impl SandboxProvider for DockerSandboxProvider {
             .await?;
 
         Ok(image_name)
+    }
+
+    // ── Snapshot: take ────────────────────────────────────────────────────────
+
+    /// Capture the current state of `handle` as a content-addressed tarball.
+    ///
+    /// **Security contract (ADR-037 §4):** The caller (`SnapshotService`) is
+    /// responsible for shredding `/etc/temps/credential-daemon.env` via
+    /// `exec_as_root` **before** stopping the sandbox and calling this method.
+    /// Any failure in that step must abort the snapshot at the service layer.
+    ///
+    /// This method then executes two additional scrubbing steps:
+    ///
+    /// 1. Inspect the stopped container's `Config.Env` and zero every
+    ///    known-sensitive env-var value in the committed image config via
+    ///    Docker's `--change "ENV KEY="` mechanism. Each sensitive key is set
+    ///    to an empty value (`KEY=`) — this is the only mechanism the Docker
+    ///    commit API actually supports; deletion is not possible. Verified
+    ///    against a real Docker daemon. The `ContainerConfig` body's `env`
+    ///    field (the previous approach) is silently ignored by the Docker
+    ///    Engine and has no effect on the committed image — confirmed no-op.
+    /// 2. Inspect the committed image's `Config.Env` and reject the snapshot —
+    ///    removing the committed image and returning `SandboxExecFailed` — if
+    ///    any known-sensitive key has a non-empty value (i.e. the zeroing
+    ///    did not take effect for that key).
+    ///
+    /// The sandbox must be stopped by the caller before this is called for
+    /// filesystem consistency.
+    async fn take_snapshot(
+        &self,
+        handle: &SandboxHandle,
+        label: Option<String>,
+    ) -> Result<super::SnapshotArtifact, AgentError> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncWriteExt;
+
+        let container_id = &handle.sandbox_id;
+
+        // ── Validate label early, before any file I/O ─────────────────────────
+        // An empty label after sanitization produces an invalid Docker tag.
+        // Validate here so the rename to the final path never orphans a tarball
+        // because a later tag call fails.
+        if let Some(ref lbl) = label {
+            if lbl.trim().is_empty() {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: "snapshot: label must not be empty when provided \
+                             (empty label produces an invalid Docker image tag; \
+                             omit the label field to use the content digest instead)"
+                        .to_string(),
+                });
+            }
+        }
+
+        // ── Step 1: collect and scrub known-sensitive env vars ────────────────
+        // Inspect the stopped container's Config.Env to find injected vars.
+        // The sensitive-pattern list and scrubbing helpers are module-level
+        // functions (see `SENSITIVE_ENV_PATTERNS`, `scrub_env_vars`, and
+        // `find_surviving_sensitive_keys`) so they are unit-testable without
+        // a live Docker daemon.
+        let container_inspect = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: failed to inspect container: {}", e),
+            })?;
+
+        // Collect env vars set on the container (from the original create call
+        // via ContainerCreateBody.env).
+        let container_env: Vec<String> = container_inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .map(|env| env.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        // Build Dockerfile-style "ENV KEY=" change instructions for each
+        // sensitive key, then count for telemetry.
+        //
+        // IMPORTANT: The ContainerConfig body's `env` field is NOT used for
+        // scrubbing. Live testing against a real Docker daemon confirmed that
+        // passing `ContainerConfig { env: Some(scrubbed_env), .. }` to
+        // `commit_container` has zero effect — the Docker Engine silently
+        // ignores/merges the body's Env field rather than replacing the
+        // committed image's Config.Env. The `changes` query parameter (i.e.
+        // `docker commit --change 'ENV KEY='`) is the only mechanism that
+        // actually zeroes values in the committed image, verified directly.
+        let scrub_changes = build_env_scrub_changes(&container_env);
+        let scrubbed_key_count = scrub_changes.len();
+
+        // ── Step 1b: commit the container with sensitive env vars zeroed ───────
+        // The snapshot image tag is `temps-snapshot/<container_id_short>:latest`
+        // during the commit phase; we rename it to the public_id tag after
+        // digest verification. Using the container_id avoids a race if two
+        // snapshots are taken concurrently.
+        let short_id = &container_id[..container_id.len().min(12)];
+        let commit_tag = format!("temps-snapshot-staging/{}", short_id);
+
+        tracing::info!(
+            container_id = %container_id,
+            commit_tag = %commit_tag,
+            scrubbed_key_count = %scrubbed_key_count,
+            "snapshot: committing container image"
+        );
+
+        // Pass `ENV KEY=` change instructions via the `changes` parameter —
+        // this is Docker's `--change` flag, which is the only API mechanism
+        // that actually overwrites env-var values in the committed image's
+        // Config.Env. Each sensitive key is set to an empty value; Docker's
+        // commit API cannot delete entries, only overwrite them.
+        //
+        // bollard's `CommitContainerOptionsBuilder::changes()` takes a single
+        // `&str`; multiple Dockerfile instructions are separated by newlines.
+        let changes_str = scrub_changes.join("\n");
+        let mut commit_opts_builder =
+            bollard::query_parameters::CommitContainerOptionsBuilder::new()
+                .container(container_id.as_str())
+                .repo(commit_tag.as_str())
+                .tag("latest");
+        if !changes_str.is_empty() {
+            commit_opts_builder = commit_opts_builder.changes(&changes_str);
+        }
+        let commit_opts = commit_opts_builder.build();
+
+        // The ContainerConfig body is passed as required by bollard's API
+        // signature but left at defaults — its `env` field does nothing (the
+        // Docker Engine ignores it; only the `changes` query parameter above
+        // is effective, as confirmed against a live Docker daemon).
+        let config_override = bollard::models::ContainerConfig::default();
+
+        let commit_resp = self
+            .docker
+            .commit_container(commit_opts, config_override)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: docker commit failed: {}", e),
+            })?;
+
+        // IdResponse.id is a plain String (not Option<String>) in bollard 0.20.
+        let committed_image_id = commit_resp.id;
+
+        // ── Step 3: verify no sensitive key survived in the committed image ───
+        let committed_inspect = self
+            .docker
+            .inspect_image(&committed_image_id)
+            .await
+            .map_err(|e| {
+                // Clean up the staged image before returning the error
+                let docker = self.docker.clone();
+                let img = committed_image_id.clone();
+                tokio::spawn(async move {
+                    let _ = docker
+                        .remove_image(
+                            &img,
+                            Some(
+                                bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                                    .force(true)
+                                    .build(),
+                            ),
+                            None,
+                        )
+                        .await;
+                });
+                AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!(
+                        "snapshot: failed to inspect committed image for scrub verification: {}",
+                        e
+                    ),
+                }
+            })?;
+
+        let committed_env: Vec<String> = committed_inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .map(|env| env.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        // Use the module-level helper to find any sensitive keys that survived.
+        // An empty list means the image is clean; any key triggers an abort.
+        let survivors = find_surviving_sensitive_keys(&committed_env);
+        if let Some(key) = survivors.first() {
+            // Scrub verification failed — remove the staged image and abort.
+            let docker = self.docker.clone();
+            let img = committed_image_id.clone();
+            tokio::spawn(async move {
+                let _ = docker
+                    .remove_image(
+                        &img,
+                        Some(
+                            bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                                .force(true)
+                                .build(),
+                        ),
+                        None,
+                    )
+                    .await;
+            });
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!(
+                    "snapshot: scrub verification failed — sensitive key '{}' survived in committed image config; snapshot aborted and staged image removed",
+                    key
+                ),
+            });
+        }
+
+        // ── Export to content-addressed tarball ───────────────────────────────
+        let data_dir = std::env::var("TEMPS_DATA_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::env::var("HOME")
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    .join(".temps")
+            });
+        let snapshots_dir = data_dir.join("snapshots");
+        tokio::fs::create_dir_all(&snapshots_dir)
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!(
+                    "snapshot: failed to create snapshots directory {}: {}",
+                    snapshots_dir.display(),
+                    e
+                ),
+            })?;
+
+        // Stream the export through a Sha256 hasher while writing to a temp
+        // file, then rename atomically. All file I/O uses tokio::fs so we
+        // never block the async runtime on a potentially multi-GB write.
+        let tmp_path = snapshots_dir.join(format!(".tmp-{}", short_id));
+
+        // Helper: best-effort cleanup on failure — remove the staged Docker
+        // image (same pattern the earlier branches use) and unlink the temp
+        // file if it was created. Both are best-effort: a cleanup failure
+        // should not mask the original error.
+        let cleanup_on_err = {
+            let docker = self.docker.clone();
+            let img = committed_image_id.clone();
+            let tmp = tmp_path.clone();
+            move || {
+                tokio::spawn(async move {
+                    let _ = docker
+                        .remove_image(
+                            &img,
+                            Some(
+                                bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                                    .force(true)
+                                    .build(),
+                            ),
+                            None,
+                        )
+                        .await;
+                    // Best-effort unlink of the partially-written temp file.
+                    let _ = tokio::fs::remove_file(&tmp).await;
+                });
+            }
+        };
+
+        let mut tmp_file = match tokio::fs::File::create(&tmp_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                cleanup_on_err();
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: failed to create temp file: {}", e),
+                });
+            }
+        };
+
+        let mut hasher = Sha256::new();
+        let mut size_bytes: u64 = 0;
+
+        {
+            let mut export_stream = self.docker.export_image(&committed_image_id);
+            while let Some(chunk) = futures::StreamExt::next(&mut export_stream).await {
+                let chunk = match chunk {
+                    Ok(c) => c,
+                    Err(e) => {
+                        drop(tmp_file);
+                        cleanup_on_err();
+                        return Err(AgentError::SandboxExecFailed {
+                            run_id: 0,
+                            sandbox_id: container_id.clone(),
+                            reason: format!("snapshot: image export stream error: {}", e),
+                        });
+                    }
+                };
+                hasher.update(&chunk);
+                size_bytes += chunk.len() as u64;
+                if let Err(e) = tmp_file.write_all(&chunk).await {
+                    drop(tmp_file);
+                    cleanup_on_err();
+                    return Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: container_id.clone(),
+                        reason: format!("snapshot: failed to write to temp file: {}", e),
+                    });
+                }
+            }
+        }
+
+        if let Err(e) = tmp_file.flush().await {
+            drop(tmp_file);
+            cleanup_on_err();
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: failed to flush temp file: {}", e),
+            });
+        }
+        drop(tmp_file);
+
+        let digest_hex = hex::encode(hasher.finalize());
+        let final_path = snapshots_dir.join(format!("{}.tar", digest_hex));
+
+        // Atomic rename — the file is only visible at the final path once
+        // fully written, so a concurrent reader never sees a partial write.
+        if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
+            cleanup_on_err();
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: atomic rename failed: {}", e),
+            });
+        }
+
+        // ── Tag the committed image with the public-facing name ───────────────
+        // Derive an image_ref from the label if provided, otherwise use digest.
+        let image_label = label
+            .as_deref()
+            .map(|l| {
+                // Sanitize: lowercase, replace non-alphanumeric with '-'
+                l.chars()
+                    .map(|c| {
+                        if c.is_alphanumeric() {
+                            c.to_ascii_lowercase()
+                        } else {
+                            '-'
+                        }
+                    })
+                    .collect::<String>()
+            })
+            .unwrap_or_else(|| digest_hex[..16].to_string());
+        let image_ref = format!("temps-snapshot/{}:latest", image_label);
+
+        // Re-tag the committed image to the canonical snapshot name.
+        self.docker
+            .tag_image(
+                &committed_image_id,
+                Some(
+                    bollard::query_parameters::TagImageOptionsBuilder::new()
+                        .repo(format!("temps-snapshot/{}", image_label).as_str())
+                        .tag("latest")
+                        .build(),
+                ),
+            )
+            .await
+            .map_err(|e| {
+                tracing::warn!(
+                    "snapshot: failed to tag committed image as {}: {}",
+                    image_ref,
+                    e
+                );
+                // Non-fatal: the tarball is written; the image can be re-imported
+                // from the tarball on restore.
+                AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: failed to tag image {}: {}", image_ref, e),
+                }
+            })?;
+
+        // Remove the staging tag now that the canonical tag is in place.
+        let _ = self
+            .docker
+            .remove_image(
+                &format!("{}:latest", commit_tag),
+                Some(
+                    bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                        .noprune(true) // keep the layers — only untag
+                        .build(),
+                ),
+                None,
+            )
+            .await;
+
+        tracing::info!(
+            container_id = %container_id,
+            digest = %digest_hex,
+            size_bytes = %size_bytes,
+            path = %final_path.display(),
+            image_ref = %image_ref,
+            "snapshot: completed successfully"
+        );
+
+        Ok(super::SnapshotArtifact {
+            content_path: final_path,
+            content_digest: digest_hex,
+            size_bytes,
+            backend: super::SandboxBackend::Docker,
+            image_ref: Some(image_ref),
+        })
+    }
+
+    // ── Snapshot: restore ─────────────────────────────────────────────────────
+
+    /// Create a new sandbox seeded from a snapshot artifact.
+    ///
+    /// Ensures the snapshot image is present in the Docker daemon (loading
+    /// from the tarball if the tag is absent or stale), then delegates to
+    /// `create` with the image override set to `artifact.image_ref`.
+    async fn create_from_snapshot(
+        &self,
+        artifact: &super::SnapshotArtifact,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        let image_ref =
+            artifact
+                .image_ref
+                .as_deref()
+                .ok_or_else(|| AgentError::SandboxExecFailed {
+                    run_id: config.run_id,
+                    sandbox_id: String::new(),
+                    reason: "snapshot: artifact has no image_ref (non-Docker snapshot?)"
+                        .to_string(),
+                })?;
+
+        // Check if the image is already present in the daemon.
+        let image_present = self.docker.inspect_image(image_ref).await.is_ok();
+
+        if !image_present {
+            // Load from the tarball. `docker load` imports all tags embedded
+            // in the tarball — the image will re-appear under `image_ref`.
+            tracing::info!(
+                image_ref = %image_ref,
+                path = %artifact.content_path.display(),
+                "snapshot: image not in daemon — loading from tarball"
+            );
+
+            // Hard cap: reject tarballs larger than 20 GiB before reading
+            // anything into memory. This prevents an unbounded Vec allocation
+            // on a 4 GB reference host. The cap is intentionally generous
+            // (a typical sandbox image is 2–4 GB) while still bounding risk.
+            const MAX_SNAPSHOT_BYTES: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
+
+            let path = artifact.content_path.clone();
+            let file_size = tokio::fs::metadata(&path)
+                .await
+                .map_err(|e| AgentError::SandboxExecFailed {
+                    run_id: config.run_id,
+                    sandbox_id: String::new(),
+                    reason: format!("snapshot: failed to stat tarball: {}", e),
+                })?
+                .len();
+
+            if file_size > MAX_SNAPSHOT_BYTES {
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: config.run_id,
+                    sandbox_id: String::new(),
+                    reason: format!(
+                        "snapshot: tarball too large to import: {} bytes exceeds \
+                         maximum {} bytes (20 GiB); \
+                         contact support if you need to restore a larger snapshot",
+                        file_size, MAX_SNAPSHOT_BYTES,
+                    ),
+                });
+            }
+
+            // Read the tarball via spawn_blocking so the async runtime is not
+            // stalled on a potentially multi-GB disk read. The bollard
+            // `import_image_stream` API requires the full bytes upfront
+            // (it does not accept an async reader); the cap above bounds
+            // the worst-case allocation.
+            let buf = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+                use std::io::Read;
+                let mut f = std::fs::File::open(&path)?;
+                let mut buf = Vec::with_capacity(file_size as usize);
+                f.read_to_end(&mut buf)?;
+                Ok(buf)
+            })
+            .await
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: config.run_id,
+                sandbox_id: String::new(),
+                reason: format!("snapshot: spawn_blocking join error reading tarball: {}", e),
+            })?
+            .map_err(|e| AgentError::SandboxExecFailed {
+                run_id: config.run_id,
+                sandbox_id: String::new(),
+                reason: format!(
+                    "snapshot: failed to read tarball {}: {}",
+                    artifact.content_path.display(),
+                    e
+                ),
+            })?;
+
+            let mut load_stream = self.docker.import_image_stream(
+                bollard::query_parameters::ImportImageOptionsBuilder::new()
+                    .quiet(true)
+                    .build(),
+                futures::stream::once(async move {
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(buf))
+                }),
+                None,
+            );
+
+            while let Some(result) = futures::StreamExt::next(&mut load_stream).await {
+                match result {
+                    Ok(info) => {
+                        if let Some(ref detail) = info.error_detail {
+                            let msg = detail
+                                .message
+                                .as_deref()
+                                .unwrap_or("unknown docker load error");
+                            return Err(AgentError::SandboxExecFailed {
+                                run_id: config.run_id,
+                                sandbox_id: String::new(),
+                                reason: format!("snapshot: docker load error: {}", msg),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        return Err(AgentError::SandboxExecFailed {
+                            run_id: config.run_id,
+                            sandbox_id: String::new(),
+                            reason: format!("snapshot: docker load stream error: {}", e),
+                        });
+                    }
+                }
+            }
+
+            tracing::info!(
+                image_ref = %image_ref,
+                "snapshot: image loaded from tarball"
+            );
+        }
+
+        // Delegate to the normal create path with the snapshot image.
+        let mut config = config;
+        config.image = Some(image_ref.to_string());
+        self.create(config).await
+    }
+
+    // ── Snapshot: delete image ────────────────────────────────────────────────
+
+    /// Remove the Docker image tag for a deleted snapshot.
+    ///
+    /// Called by `SnapshotService::delete_snapshot` after the DB row is
+    /// soft-deleted and the tarball has been removed. This cleans up the
+    /// Docker daemon's image store so it doesn't accumulate stale snapshot
+    /// images indefinitely.
+    ///
+    /// Uses `noprune: false` (default) so untagged intermediate layers are
+    /// also reclaimed. `force: false` so an image referenced by a running
+    /// container isn't deleted — that's a bug, not a normal condition.
+    async fn delete_image(&self, image_ref: &str) -> Result<(), AgentError> {
+        tracing::debug!(image_ref = %image_ref, "snapshot: removing Docker image");
+        match self
+            .docker
+            .remove_image(
+                image_ref,
+                Some(
+                    bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                        .force(false)
+                        .noprune(false)
+                        .build(),
+                ),
+                None,
+            )
+            .await
+        {
+            Ok(_) => {
+                tracing::debug!(image_ref = %image_ref, "snapshot: Docker image removed");
+                Ok(())
+            }
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404, ..
+            }) => {
+                // Image already absent — idempotent.
+                tracing::debug!(
+                    image_ref = %image_ref,
+                    "snapshot: Docker image not found during delete (already removed)"
+                );
+                Ok(())
+            }
+            Err(e) => Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: String::new(),
+                reason: format!(
+                    "snapshot: failed to remove Docker image '{}': {}",
+                    image_ref, e
+                ),
+            }),
+        }
     }
 }
 
@@ -2541,6 +3506,175 @@ mod tests {
         );
     }
 
+    /// Regression: the home volume name must be derivable from the
+    /// container name alone.
+    ///
+    /// The leak this replaced: `create` built the volume name from
+    /// `config.run_id` while `destroy` rebuilt it by stripping the prefix
+    /// off `handle.sandbox_name`. For agent runs both produce the same
+    /// string, so the bug was invisible there — but standalone sandboxes
+    /// override the container suffix with their `public_id` label, so
+    /// destroy asked Docker to remove a volume that had never existed and
+    /// the real one stayed on disk for good.
+    #[test]
+    fn home_volume_name_round_trips_through_container_name() {
+        // Agent-run style: numeric suffix.
+        assert_eq!(
+            DockerSandboxProvider::home_volume_name(&DockerSandboxProvider::container_name(42)),
+            "temps-sandbox-home-v2-42"
+        );
+        // Standalone style: opaque public_id label suffix. This is the
+        // case that used to leak.
+        assert_eq!(
+            DockerSandboxProvider::home_volume_name("temps-sandbox-a1b2c3d4e5f60718"),
+            "temps-sandbox-home-v2-a1b2c3d4e5f60718"
+        );
+    }
+
+    /// A standalone sandbox (`container_name_override`) and an agent run
+    /// that happen to share a numeric id must not share a home volume.
+    /// Keying on `run_id` meant sandbox row 5 and agent run 5 both mounted
+    /// `temps-sandbox-home-5` — one sandbox reading another's shell
+    /// history, `~/.claude` credentials, and project files.
+    #[test]
+    fn home_volume_name_does_not_collide_across_naming_schemes() {
+        let agent_run =
+            DockerSandboxProvider::home_volume_name(&DockerSandboxProvider::container_name(5));
+        let standalone = DockerSandboxProvider::home_volume_name("temps-sandbox-abc123");
+        assert_ne!(agent_run, standalone);
+    }
+
+    fn create_config_for(run_id: i32, override_label: Option<&str>) -> SandboxCreateConfig {
+        SandboxCreateConfig {
+            owner_user_id: None,
+            run_id,
+            container_name_override: override_label.map(|s| s.to_string()),
+            host_work_dir: std::path::PathBuf::from("/tmp/does-not-matter"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: None,
+        }
+    }
+
+    /// The Docker-less guard for the leak. `create` takes both names from
+    /// `sandbox_names`, and `destroy` re-derives the volume from the
+    /// container name — so asserting the pair agrees here catches a
+    /// reintroduction of the original bug on any machine, including CI
+    /// runners with no Docker daemon (where the e2e below skips).
+    #[test]
+    fn sandbox_names_agree_for_standalone_and_agent_run() {
+        // Standalone: opaque public_id label. The old code derived the
+        // volume from run_id instead, producing temps-sandbox-home-7 here
+        // while destroy looked for temps-sandbox-home-a1b2c3d4e5f60718.
+        let (container, volume) =
+            DockerSandboxProvider::sandbox_names(&create_config_for(7, Some("a1b2c3d4e5f60718")));
+        assert_eq!(container, "temps-sandbox-a1b2c3d4e5f60718");
+        assert_eq!(volume, "temps-sandbox-home-v2-a1b2c3d4e5f60718");
+        assert_eq!(volume, DockerSandboxProvider::home_volume_name(&container));
+        assert_ne!(volume, "temps-sandbox-home-7");
+        assert_ne!(volume, "temps-sandbox-home-v2-7");
+
+        // Agent run: numeric naming, no override.
+        let (container, volume) =
+            DockerSandboxProvider::sandbox_names(&create_config_for(42, None));
+        assert_eq!(container, "temps-sandbox-42");
+        assert_eq!(volume, "temps-sandbox-home-v2-42");
+        assert_eq!(volume, DockerSandboxProvider::home_volume_name(&container));
+    }
+
+    /// The bind the container actually gets must mount the volume `destroy`
+    /// will remove.
+    ///
+    /// This is the Docker-less guard for the original bug's *call site*.
+    /// The naming tests above only prove the helpers agree with each other;
+    /// re-inlining `format!("temps-sandbox-home-{}", config.run_id)` into
+    /// `create`'s binds would leave every one of them green and re-ship the
+    /// leak on any CI runner without a daemon. Asserting on the bind string
+    /// closes that, because the bind is what `create` actually hands Docker.
+    #[test]
+    fn create_binds_mount_the_volume_destroy_will_remove() {
+        let cfg = create_config_for(7, Some("a1b2c3d4e5f60718"));
+        let (container, volume) = DockerSandboxProvider::sandbox_names(&cfg);
+        let binds = DockerSandboxProvider::container_binds("/host/work", &volume);
+
+        // The home bind must name the volume destroy re-derives from the
+        // container name — not anything keyed on run_id.
+        let home_bind = format!(
+            "{}:{}",
+            DockerSandboxProvider::home_volume_name(&container),
+            SANDBOX_HOME
+        );
+        assert!(
+            binds.contains(&home_bind),
+            "binds {:?} must mount {} — otherwise create and destroy \
+             disagree about which volume belongs to this sandbox",
+            binds,
+            home_bind
+        );
+        assert!(
+            !binds.iter().any(|b| b.starts_with("temps-sandbox-home-7:")),
+            "binds {:?} must not key the home volume on run_id",
+            binds
+        );
+        // And the work dir is still mounted where the sandbox expects it.
+        assert!(binds.contains(&format!("/host/work:{}", CONTAINER_WORK_DIR)));
+    }
+
+    /// No name this build generates may land in the pre-fix namespace.
+    ///
+    /// Legacy volumes are `temps-sandbox-home-<digits>`. On an upgraded host
+    /// they are stranded but still present, and Docker attaches an existing
+    /// volume by name — so if we could still generate one of those names, an
+    /// agent run would mount a previous standalone sandbox's `/home/temps`,
+    /// i.e. another user's credentials and shell history.
+    #[test]
+    fn generated_names_never_reenter_the_pre_fix_namespace() {
+        let legacy_shaped = |name: &str| {
+            name.strip_prefix(HOME_VOLUME_PREFIX)
+                .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+                .unwrap_or(false)
+        };
+        // Sanity: the predicate really does describe the legacy shape.
+        assert!(legacy_shaped("temps-sandbox-home-5"));
+
+        for container in [
+            DockerSandboxProvider::container_name(5),
+            DockerSandboxProvider::container_name(1),
+            DockerSandboxProvider::container_name(i32::MAX),
+            "temps-sandbox-0123456789012345".to_string(), // all-digit hex label
+        ] {
+            let volume = DockerSandboxProvider::home_volume_name(&container);
+            assert!(
+                !legacy_shaped(&volume),
+                "{} produced {}, which collides with a pre-fix volume and \
+                 could mount another tenant's home",
+                container,
+                volume
+            );
+        }
+    }
+
+    /// Every home volume must carry the prefix an operator filters on when
+    /// reclaiming stranded volumes by hand — a naming change on the create
+    /// side would otherwise leave volumes nothing can find.
+    #[test]
+    fn home_volume_names_carry_the_documented_prefix() {
+        for container in ["temps-sandbox-1", "temps-sandbox-deadbeef", "no-prefix"] {
+            assert!(
+                DockerSandboxProvider::home_volume_name(container).starts_with(HOME_VOLUME_PREFIX),
+                "{} produced a volume outside the documented prefix",
+                container
+            );
+        }
+    }
+
     #[test]
     fn test_default_config() {
         let config = DockerSandboxConfig::default();
@@ -2750,6 +3884,7 @@ mod tests {
 
         // 1. Create sandbox
         let create_config = SandboxCreateConfig {
+            owner_user_id: None,
             run_id,
             container_name_override: None,
             host_work_dir: work_dir.clone(),
@@ -2758,9 +3893,11 @@ mod tests {
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(512),
             pids_limit: None,
+            disk_size_mb: None,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::from([("TEST_VAR".to_string(), "test_value".to_string())]),
             idle_timeout: Duration::from_secs(120),
+            backend: None,
         };
 
         // Some dev environments (macOS Docker Desktop's virtiofs / userns-remap
@@ -3094,6 +4231,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&work_dir);
 
         let create_config = SandboxCreateConfig {
+            owner_user_id: None,
             run_id,
             container_name_override: None,
             host_work_dir: work_dir.clone(),
@@ -3102,9 +4240,11 @@ mod tests {
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(256),
             pids_limit: None,
+            disk_size_mb: None,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
+            backend: None,
         };
 
         let handle = provider.create(create_config).await.unwrap();
@@ -3313,6 +4453,7 @@ mod tests {
         let _ = std::fs::create_dir_all(&work_dir);
 
         let create_config = SandboxCreateConfig {
+            owner_user_id: None,
             run_id,
             container_name_override: Some(label.to_string()),
             host_work_dir: work_dir.clone(),
@@ -3321,9 +4462,11 @@ mod tests {
             cpu_limit: Some(1.0),
             memory_limit_mb: Some(256),
             pids_limit: None,
+            disk_size_mb: None,
             network_mode: Some("none".to_string()),
             env_vars: HashMap::new(),
             idle_timeout: Duration::from_secs(60),
+            backend: None,
         };
 
         let handle = provider
@@ -3386,6 +4529,166 @@ mod tests {
         let _ = std::fs::remove_dir_all(&work_dir);
     }
 
+    /// Docker-level proof that destroying a *standalone* sandbox actually
+    /// frees its home volume.
+    ///
+    /// This is the disk-fill regression: standalone sandboxes name their
+    /// container after the `public_id` label, and destroy used to
+    /// reconstruct the volume name from that label while create had named
+    /// it after the numeric `run_id`. Every create/destroy cycle therefore
+    /// stranded one volume — with `~/.npm`, `~/.cache`, and the sandbox
+    /// home in it — and a host churning sandboxes filled its disk with
+    /// storage no API could reach. Asserting on the volume (not the
+    /// container) is the point: the container was always removed correctly,
+    /// which is exactly why this went unnoticed.
+    #[tokio::test]
+    async fn destroy_frees_the_home_volume_of_a_standalone_sandbox() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping volume purge test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping volume purge test");
+            return;
+        }
+
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+        if provider.ensure_image().await.is_err() {
+            println!("Cannot build sandbox image, skipping volume purge test");
+            return;
+        }
+
+        // Standalone naming: opaque label suffix, numeric run_id. The two
+        // deliberately disagree — that divergence is what the bug rode on.
+        let label = "purgetestc0ffee01";
+        let run_id = 99993;
+        let work_dir = std::env::temp_dir().join(format!("sandbox-purge-test-{}", run_id));
+        let _ = std::fs::create_dir_all(&work_dir);
+
+        // A `temps serve` on this host reaps sandbox containers whose run
+        // isn't in its DB, which would kill this test mid-flight. Same guard
+        // the sibling e2e tests use — and this repo's dev workflow runs
+        // several slots, so it fires in practice.
+        let existing = docker
+            .list_containers(Some(bollard::query_parameters::ListContainersOptions {
+                all: false,
+                filters: Some(HashMap::from([(
+                    "name".to_string(),
+                    vec!["temps-sandbox-".to_string()],
+                )])),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_or_default();
+        if !existing.is_empty() {
+            println!(
+                "temps serve is managing {} sandbox(es) — skipping volume purge test",
+                existing.len()
+            );
+            return;
+        }
+
+        let volume_name = format!("{}{}{}", HOME_VOLUME_PREFIX, HOME_VOLUME_SCHEME, label);
+        let legacy_volume_name = format!("{}{}", HOME_VOLUME_PREFIX, run_id);
+        // Clear both names first: a leftover from an older build would make
+        // the label assertion below fail for a reason that isn't this code.
+        for name in [&volume_name, &legacy_volume_name] {
+            let _ = docker
+                .remove_volume(name, None::<bollard::query_parameters::RemoveVolumeOptions>)
+                .await;
+        }
+
+        let handle = provider
+            .create(SandboxCreateConfig {
+                owner_user_id: None,
+                run_id,
+                container_name_override: Some(label.to_string()),
+                host_work_dir: work_dir.clone(),
+                workspace_volume: None,
+                image: None,
+                cpu_limit: Some(1.0),
+                memory_limit_mb: Some(256),
+                pids_limit: None,
+                disk_size_mb: None,
+                network_mode: Some("none".to_string()),
+                env_vars: HashMap::new(),
+                idle_timeout: Duration::from_secs(60),
+                backend: None,
+            })
+            .await
+            .expect("create sandbox");
+
+        // Gather every observation BEFORE tearing down, then assert after —
+        // an assertion that fires between create and destroy would leak the
+        // container, its volume, and the work dir onto the host.
+        let volume = docker.inspect_volume(&volume_name).await;
+        let legacy_volume = docker.inspect_volume(&legacy_volume_name).await;
+        let container = docker
+            .inspect_container(
+                &handle.sandbox_name,
+                None::<bollard::query_parameters::InspectContainerOptions>,
+            )
+            .await;
+
+        provider.destroy(&handle, true).await.expect("destroy");
+
+        let after_destroy = docker.inspect_volume(&volume_name).await;
+        let _ = std::fs::remove_dir_all(&work_dir);
+
+        // 1. The volume exists while the sandbox does, and is labelled so an
+        //    operator can find it if a later destroy ever fails to.
+        let volume = volume.expect("home volume should exist while the sandbox does");
+        assert!(
+            volume.labels.contains_key(HOME_VOLUME_LABEL),
+            "home volume {} must carry {} — it is the only handle an \
+             operator has for reclaiming stranded volumes; labels were {:?}",
+            volume_name,
+            HOME_VOLUME_LABEL,
+            volume.labels
+        );
+
+        // 2. The container actually mounts that volume at /home/temps.
+        //    Without this, the assertion above passes on its own merits —
+        //    `create` pre-creates the volume, so its existence no longer
+        //    proves the bind exists, and dropping the bind entirely would
+        //    go unnoticed.
+        let mounts = container
+            .expect("container should exist")
+            .mounts
+            .unwrap_or_default();
+        assert!(
+            mounts.iter().any(|m| {
+                m.name.as_deref() == Some(volume_name.as_str())
+                    && m.destination.as_deref() == Some(SANDBOX_HOME)
+            }),
+            "container must mount {} at {} — mounts were {:?}",
+            volume_name,
+            SANDBOX_HOME,
+            mounts
+        );
+
+        // 3. The run_id-keyed name is the one the old code would have made.
+        //    Assert it was never created, so this test cannot pass by
+        //    accident on a host where both happen to exist.
+        assert!(
+            legacy_volume.is_err(),
+            "home volume must be keyed on the container label, not run_id"
+        );
+
+        // 4. And destroy actually frees it — the leak this PR exists for.
+        assert!(
+            after_destroy.is_err(),
+            "destroy must remove the sandbox home volume {} — leaving it \
+             behind is the leak that fills the host disk after enough \
+             create/destroy cycles",
+            volume_name
+        );
+    }
+
     // ---- egress filter tests (no Docker / iptables required) ----------------
 
     /// Verify the DROP-range list covers all five required CIDR blocks.
@@ -3441,5 +4744,578 @@ mod tests {
                 cidr, chain
             );
         }
+    }
+
+    // ── Credential-scrubbing tests (ADR-037 §4) ───────────────────────────────
+    //
+    // These tests verify the scrubbing helpers in isolation — no Docker daemon
+    // is required. The security invariant is: after applying the change
+    // instructions produced by `build_env_scrub_changes`, every sensitive key
+    // in the committed image has an empty value, and
+    // `find_surviving_sensitive_keys` returns an empty list.
+
+    #[test]
+    fn is_sensitive_env_key_detects_anthropic_api_key() {
+        assert!(is_sensitive_env_key("ANTHROPIC_API_KEY"));
+        assert!(is_sensitive_env_key("anthropic_api_key")); // case-insensitive
+        assert!(is_sensitive_env_key("MY_ANTHROPIC_API_KEY")); // substring match
+    }
+
+    #[test]
+    fn is_sensitive_env_key_detects_github_token() {
+        assert!(is_sensitive_env_key("GITHUB_TOKEN"));
+        assert!(is_sensitive_env_key("GITHUB_TOKEN_READONLY")); // variant
+    }
+
+    #[test]
+    fn is_sensitive_env_key_detects_temps_prefix() {
+        // Every TEMPS_ var is treated as potentially sensitive — the daemon
+        // env file, internal tokens, and credential paths all use this namespace.
+        assert!(is_sensitive_env_key("TEMPS_DATA_DIR"));
+        assert!(is_sensitive_env_key("TEMPS_CREDENTIAL_TOKEN"));
+    }
+
+    #[test]
+    fn is_sensitive_env_key_passes_safe_keys() {
+        assert!(!is_sensitive_env_key("PATH"));
+        assert!(!is_sensitive_env_key("HOME"));
+        assert!(!is_sensitive_env_key("USER"));
+        assert!(!is_sensitive_env_key("LANG"));
+        assert!(!is_sensitive_env_key("DEBIAN_FRONTEND"));
+        assert!(!is_sensitive_env_key("NODE_VERSION"));
+    }
+
+    #[test]
+    fn build_env_scrub_changes_returns_change_instructions_for_sensitive_keys() {
+        // build_env_scrub_changes must produce `ENV KEY=` Dockerfile-style
+        // change instructions for each sensitive key — these are passed to
+        // `docker commit --change` which zeroes the values in the committed
+        // image. Non-sensitive keys must not appear in the output.
+        let env = vec![
+            "PATH=/usr/bin:/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
+            "HOME=/home/temps".to_string(),
+            "GITHUB_TOKEN=ghp_supersecret".to_string(),
+            "NODE_VERSION=20".to_string(),
+        ];
+
+        let changes = build_env_scrub_changes(&env);
+
+        // Must produce exactly one change instruction per sensitive key.
+        assert!(
+            changes.contains(&"ENV ANTHROPIC_API_KEY=".to_string()),
+            "expected ENV ANTHROPIC_API_KEY= change instruction; got: {:?}",
+            changes
+        );
+        assert!(
+            changes.contains(&"ENV GITHUB_TOKEN=".to_string()),
+            "expected ENV GITHUB_TOKEN= change instruction; got: {:?}",
+            changes
+        );
+
+        // Safe keys must NOT appear in the changes list.
+        assert!(
+            !changes.iter().any(|c| c.contains("PATH")),
+            "PATH must not appear in change instructions: {:?}",
+            changes
+        );
+        assert!(
+            !changes.iter().any(|c| c.contains("HOME")),
+            "HOME must not appear in change instructions: {:?}",
+            changes
+        );
+        assert!(
+            !changes.iter().any(|c| c.contains("NODE_VERSION")),
+            "NODE_VERSION must not appear in change instructions: {:?}",
+            changes
+        );
+
+        // Exactly 2 sensitive keys → 2 change instructions.
+        assert_eq!(
+            changes.len(),
+            2,
+            "expected 2 change instructions; got {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn build_env_scrub_changes_empty_env_returns_no_changes() {
+        let changes = build_env_scrub_changes(&[]);
+        assert!(changes.is_empty());
+    }
+
+    #[test]
+    fn build_env_scrub_changes_no_sensitive_keys_returns_no_changes() {
+        let env = vec!["PATH=/usr/bin".to_string(), "HOME=/home/temps".to_string()];
+        let changes = build_env_scrub_changes(&env);
+        assert!(
+            changes.is_empty(),
+            "no sensitive keys → no change instructions; got: {:?}",
+            changes
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_returns_empty_for_clean_env() {
+        // A committed image with no sensitive keys at all — clean.
+        let env = vec![
+            "PATH=/usr/bin:/bin".to_string(),
+            "HOME=/home/temps".to_string(),
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert!(
+            survivors.is_empty(),
+            "expected no surviving keys, got: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_zeroed_key_is_not_a_survivor() {
+        // A zeroed entry (KEY=) has been successfully scrubbed by the Docker
+        // `--change "ENV KEY="` mechanism. An empty value is the expected
+        // post-commit state and must NOT be flagged as a survivor.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "GITHUB_TOKEN=".to_string(), // zeroed — successfully scrubbed
+            "ANTHROPIC_API_KEY=".to_string(), // zeroed — successfully scrubbed
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert!(
+            survivors.is_empty(),
+            "zeroed sensitive keys (KEY=) must not be flagged as survivors; got: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_catches_non_empty_secret_value() {
+        // A committed image where scrubbing failed — the key has a real value.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // not zeroed
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert_eq!(
+            survivors,
+            vec!["ANTHROPIC_API_KEY"],
+            "a sensitive key with a non-empty value must be flagged as a survivor"
+        );
+    }
+
+    #[test]
+    fn find_surviving_sensitive_keys_mixed_zeroed_and_live() {
+        // Mix of zeroed (scrubbed) and still-live (failure case) sensitive keys.
+        let env = vec![
+            "PATH=/usr/bin".to_string(),
+            "GITHUB_TOKEN=".to_string(),                   // zeroed — OK
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(), // live — failure
+        ];
+
+        let survivors = find_surviving_sensitive_keys(&env);
+        assert!(
+            survivors.contains(&"ANTHROPIC_API_KEY".to_string()),
+            "live sensitive key must be flagged; got: {:?}",
+            survivors
+        );
+        assert!(
+            !survivors.contains(&"GITHUB_TOKEN".to_string()),
+            "zeroed sensitive key must not be flagged; got: {:?}",
+            survivors
+        );
+    }
+
+    #[test]
+    fn scrub_then_verify_leaves_no_survivors() {
+        // End-to-end property: after applying the change instructions produced
+        // by `build_env_scrub_changes`, simulating Docker zeroing the values,
+        // `find_surviving_sensitive_keys` must return an empty list.
+        let env = vec![
+            "PATH=/usr/bin:/bin".to_string(),
+            "ANTHROPIC_API_KEY=sk-ant-secret".to_string(),
+            "OPENAI_API_KEY=sk-openai-value".to_string(),
+            "GITHUB_TOKEN=ghp_supersecret".to_string(),
+            "MY_DB_PASSWORD=hunter2".to_string(),
+            "HOME=/home/temps".to_string(),
+            "TEMPS_CREDENTIAL_TOKEN=tok_internal".to_string(),
+        ];
+
+        // Get the change instructions that would be passed to docker commit.
+        let changes = build_env_scrub_changes(&env);
+
+        // Simulate what Docker does when applying `ENV KEY=` change instructions:
+        // it overwrites the matching env entry's value to an empty string.
+        let mut simulated_env = env.clone();
+        for change in &changes {
+            // Each change is "ENV KEY=" — strip the "ENV " prefix and the
+            // trailing "=" to get the key name.
+            if let Some(rest) = change.strip_prefix("ENV ") {
+                let key = rest.trim_end_matches('=');
+                for entry in simulated_env.iter_mut() {
+                    if entry.starts_with(&format!("{}=", key)) {
+                        *entry = format!("{}=", key);
+                    }
+                }
+            }
+        }
+
+        let survivors = find_surviving_sensitive_keys(&simulated_env);
+        assert!(
+            survivors.is_empty(),
+            "after applying change instructions, find_surviving_sensitive_keys \
+             must return empty; found survivors: {:?}",
+            survivors
+        );
+    }
+
+    // ── C2 regression: CLAUDE_CODE_OAUTH_TOKEN coverage ──────────────────────
+
+    /// Regression test for C2: CLAUDE_CODE_OAUTH_TOKEN must be classified
+    /// sensitive. It is injected by executor.rs (~line 470) and trigger.rs
+    /// (~line 768) for Claude subscription auth and would have been committed
+    /// into every subscription user's snapshot without this fix.
+    #[test]
+    fn is_sensitive_env_key_detects_claude_code_oauth_token() {
+        assert!(
+            is_sensitive_env_key("CLAUDE_CODE_OAUTH_TOKEN"),
+            "CLAUDE_CODE_OAUTH_TOKEN must be classified sensitive (regression for C2)"
+        );
+    }
+
+    #[test]
+    fn is_sensitive_env_key_detects_oauth_token_variants() {
+        // The pattern "OAUTH_TOKEN" catches any OAuth token variant.
+        assert!(is_sensitive_env_key("CLAUDE_CODE_OAUTH_TOKEN"));
+        assert!(is_sensitive_env_key("MY_OAUTH_TOKEN"));
+        assert!(is_sensitive_env_key("oauth_token")); // case-insensitive
+    }
+
+    /// Regression: all env var names that are known to be injected into sandboxes
+    /// at create time must be classified as sensitive. Keep this list in sync with:
+    ///   - crates/temps-agents/src/services/executor.rs  (CLAUDE_CODE_OAUTH_TOKEN)
+    ///   - crates/temps-agents/src/handlers/trigger.rs   (CLAUDE_CODE_OAUTH_TOKEN)
+    ///
+    /// If a new credential injection site is added without updating
+    /// SENSITIVE_ENV_PATTERNS, this test fails and blocks the merge.
+    #[test]
+    fn all_known_injected_credential_env_vars_are_classified_sensitive() {
+        let injected_credentials = [
+            // Injected by executor.rs for Claude subscription auth
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            // Injected by executor.rs / sandbox_injector for API keys
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "OPENCODE_API_KEY",
+            // Injected for git provider tokens
+            "GITHUB_TOKEN",
+            "GITLAB_TOKEN",
+            "BITBUCKET_TOKEN",
+            // Injected via TEMPS_ prefix (credential daemon, internal tokens)
+            "TEMPS_GIT_CREDENTIAL_TOKEN",
+        ];
+
+        for key in &injected_credentials {
+            assert!(
+                is_sensitive_env_key(key),
+                "injected credential env var '{}' is NOT classified as sensitive — \
+                 add a matching pattern to SENSITIVE_ENV_PATTERNS",
+                key
+            );
+        }
+    }
+
+    #[test]
+    fn sensitive_patterns_list_covers_required_keys() {
+        // Ensure the pattern list includes every key the ADR explicitly names.
+        // This is a static test — adding a required pattern to the ADR but
+        // forgetting to add it to the list will fail here.
+        let required = [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "GITLAB_TOKEN",
+            "BITBUCKET_TOKEN",
+            "API_KEY",
+            "SECRET",
+            "PASSWORD",
+            "CREDENTIAL",
+            "AWS_SECRET",
+            "AWS_ACCESS_KEY",
+            "AZURE_CLIENT_SECRET",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "OAUTH_TOKEN", // catches CLAUDE_CODE_OAUTH_TOKEN and any future OAuth tokens
+            "TEMPS_",
+        ];
+        for required_key in required {
+            assert!(
+                SENSITIVE_ENV_PATTERNS.contains(&required_key),
+                "SENSITIVE_ENV_PATTERNS is missing required key '{}'",
+                required_key
+            );
+        }
+    }
+
+    // ── Real-Docker regression: credential-scrub mechanism ────────────────────
+    //
+    // This test exercises `take_snapshot` end-to-end against a real running
+    // Docker daemon. It would have caught the bug that shipped undetected
+    // through multiple review rounds: the old implementation passed sensitive
+    // env vars to `docker commit` via the `ContainerConfig` body's `env`
+    // field, which the Docker Engine silently ignores — the committed image
+    // retained the original secret values unchanged. The fix switches to
+    // `CommitContainerOptionsBuilder::changes()` ("ENV KEY=" Dockerfile
+    // instructions), which is the only API mechanism that actually zeroes
+    // values in the committed image's `Config.Env`.
+    //
+    // The absence of this test (only unit tests on standalone functions, no
+    // real Docker integration) was the root reason the bug shipped.
+
+    /// Regression test: `take_snapshot` must zero all sensitive env-var values
+    /// in the committed Docker image via `--change 'ENV KEY='`.
+    ///
+    /// This test creates a real container with credential-shaped env vars
+    /// (`ANTHROPIC_API_KEY`, `CLAUDE_CODE_OAUTH_TOKEN`, `SAFE_VAR`), calls
+    /// the real `DockerSandboxProvider::take_snapshot`, then inspects the
+    /// committed image's `Config.Env` to assert that sensitive keys are
+    /// present with an **empty** value (`KEY=`) and the safe key survived
+    /// unchanged.
+    ///
+    /// The exact assertion (`ANTHROPIC_API_KEY=`) is what the old broken code
+    /// failed: it produced `ANTHROPIC_API_KEY=sk-ant-...` in the committed
+    /// image, meaning the secret was baked into every snapshot. A test that
+    /// only checked "the key isn't present at all" would have missed the bug
+    /// because Docker's commit never removes keys — it can only overwrite them.
+    ///
+    /// Skips gracefully (prints a message and returns) when Docker is not
+    /// available in the test environment, per CLAUDE.md convention.
+    #[tokio::test]
+    async fn test_take_snapshot_scrubs_credentials_against_real_docker() {
+        // Connect to Docker — skip gracefully if unavailable (CI without Docker,
+        // macOS without Docker Desktop running, etc.).
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(_) => {
+                println!("Docker not available, skipping test");
+                return;
+            }
+        };
+        let docker = Arc::new(docker);
+        if docker.ping().await.is_err() {
+            println!("Docker not responding, skipping test");
+            return;
+        }
+
+        // alpine:3.20 — small image that is always available. No provisioned
+        // `temps` user or AI CLI needed: this test only exercises the env-var
+        // scrubbing path, not the full workspace boot sequence.
+        let base_image = "alpine:3.20";
+        if docker.inspect_image(base_image).await.is_err() {
+            let options = bollard::query_parameters::CreateImageOptionsBuilder::new()
+                .from_image(base_image)
+                .build();
+            let mut stream = docker.create_image(Some(options), None, None);
+            while let Some(result) = stream.next().await {
+                if let Err(e) = result {
+                    println!("Cannot pull {}, skipping test: {}", base_image, e);
+                    return;
+                }
+            }
+        }
+
+        // Use a fixed container name so stale containers from a previous
+        // interrupted run are cleaned up automatically.
+        let container_name = "temps-snapshot-scrub-regression-test";
+
+        // Best-effort removal of any leftover from a previous test run.
+        let _ = docker
+            .remove_container(
+                container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        // Create a container with env vars that mimic real injected credentials.
+        // The values are synthetic but structurally real: the assertion below
+        // checks that these specific non-empty values are replaced with "".
+        let container_config = bollard::models::ContainerCreateBody {
+            image: Some(base_image.to_string()),
+            cmd: Some(vec!["sleep".to_string(), "60".to_string()]),
+            env: Some(vec![
+                // Sensitive: injected by executor.rs for Anthropic API auth
+                "ANTHROPIC_API_KEY=sk-ant-real-secret-must-be-scrubbed".to_string(),
+                // Sensitive: injected by executor.rs/trigger.rs for Claude subscription auth
+                "CLAUDE_CODE_OAUTH_TOKEN=tok-oauth-real-secret-must-be-scrubbed".to_string(),
+                // Non-sensitive: must survive in the snapshot unchanged
+                "SAFE_VAR=keep-me".to_string(),
+            ]),
+            ..Default::default()
+        };
+
+        let container = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(container_name)
+                        .build(),
+                ),
+                container_config,
+            )
+            .await
+            .expect("failed to create regression test container");
+
+        let container_id = container.id.clone();
+
+        // Start the container so it has a fully-initialized state that Docker
+        // can commit (an un-started container has no `Config.Env` snapshot).
+        docker
+            .start_container(
+                &container_id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("failed to start regression test container");
+
+        // Stop it — take_snapshot documents that the container must be stopped
+        // before commit so the filesystem is in a consistent state.
+        docker
+            .stop_container(
+                &container_id,
+                Some(bollard::query_parameters::StopContainerOptions {
+                    t: Some(5),
+                    signal: None,
+                }),
+            )
+            .await
+            .expect("failed to stop regression test container");
+
+        // Construct a SandboxHandle pointing at the container.
+        // The same construction the throwaway harness used (which caught the
+        // original bug on first manual run and motivated this permanent test).
+        let handle = SandboxHandle {
+            sandbox_id: container_id.clone(),
+            sandbox_name: container_name.to_string(),
+            work_dir: "/home/temps/workspace".into(),
+            backend: crate::sandbox::SandboxBackend::Docker,
+            image: base_image.to_string(),
+        };
+
+        let provider = DockerSandboxProvider::new(docker.clone(), DockerSandboxConfig::default());
+
+        // Call the real take_snapshot — the path that was broken by the
+        // ContainerConfig.env body (silently ignored by the Docker Engine)
+        // and fixed by switching to CommitContainerOptionsBuilder::changes().
+        let artifact = provider
+            .take_snapshot(&handle, Some("scrub-regression-test".to_string()))
+            .await
+            .expect("take_snapshot failed");
+
+        // Capture what we need to clean up before asserting, so we know what
+        // to remove even if an assertion panics.
+        let snapshot_image_ref = artifact.image_ref.clone();
+        let snapshot_path = artifact.content_path.clone();
+
+        // ── Core assertion: inspect the committed image's Config.Env ─────────
+        // This is the exact check that would have caught the bug. The old
+        // code using ContainerConfig.env left ANTHROPIC_API_KEY with its
+        // original "sk-ant-..." value. The fix produces "ANTHROPIC_API_KEY="
+        // (zeroed, empty value) via `ENV KEY=` Dockerfile change instructions.
+
+        let image_ref_str = snapshot_image_ref
+            .as_deref()
+            .expect("take_snapshot must populate image_ref for Docker backend");
+
+        let inspect = docker
+            .inspect_image(image_ref_str)
+            .await
+            .expect("failed to inspect committed snapshot image");
+
+        let committed_env: Vec<String> = inspect
+            .config
+            .as_ref()
+            .and_then(|c| c.env.as_ref())
+            .map(|env| env.iter().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+
+        // ANTHROPIC_API_KEY must be present with an EMPTY value — this is
+        // the "zeroed" post-commit state that the `--change 'ENV KEY='`
+        // mechanism produces. The original value must not appear anywhere.
+        assert!(
+            committed_env.contains(&"ANTHROPIC_API_KEY=".to_string()),
+            "ANTHROPIC_API_KEY must be zeroed ('KEY=') in the committed image — \
+             the old ContainerConfig.env path left the original secret intact. \
+             committed_env = {:?}",
+            committed_env
+        );
+
+        // CLAUDE_CODE_OAUTH_TOKEN must be zeroed — this key is what subscription
+        // users have injected, making the scrub coverage especially critical.
+        assert!(
+            committed_env.contains(&"CLAUDE_CODE_OAUTH_TOKEN=".to_string()),
+            "CLAUDE_CODE_OAUTH_TOKEN must be zeroed ('KEY=') in the committed image. \
+             committed_env = {:?}",
+            committed_env
+        );
+
+        // SAFE_VAR must survive unchanged — the scrubber must not strip safe keys.
+        assert!(
+            committed_env.contains(&"SAFE_VAR=keep-me".to_string()),
+            "SAFE_VAR=keep-me must survive in the committed image unchanged. \
+             committed_env = {:?}",
+            committed_env
+        );
+
+        // Belt-and-suspenders: the literal original secret values must not
+        // appear anywhere in the committed env (as a substring of any entry).
+        let leaked: Vec<_> = committed_env
+            .iter()
+            .filter(|e| {
+                e.contains("sk-ant-real-secret-must-be-scrubbed")
+                    || e.contains("tok-oauth-real-secret-must-be-scrubbed")
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "original secret values must not appear in the committed image; leaked: {:?}",
+            leaked
+        );
+
+        // ── Cleanup ───────────────────────────────────────────────────────────
+        // Best-effort: don't panic on cleanup failure, but do attempt it so
+        // repeated test runs don't accumulate test images and containers.
+        let _ = docker
+            .remove_container(
+                &container_id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        if let Some(ref img) = snapshot_image_ref {
+            let _ = docker
+                .remove_image(
+                    img,
+                    Some(
+                        bollard::query_parameters::RemoveImageOptionsBuilder::new()
+                            .force(true)
+                            .build(),
+                    ),
+                    None,
+                )
+                .await;
+        }
+
+        // Remove the snapshot tarball written by take_snapshot to avoid
+        // accumulating test artifacts in ~/.temps/snapshots/.
+        let _ = tokio::fs::remove_file(&snapshot_path).await;
     }
 }

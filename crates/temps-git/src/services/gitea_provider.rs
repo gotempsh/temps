@@ -945,6 +945,13 @@ impl GitProviderService for GiteaProvider {
             .send_with_retry(|| client.get(&url).headers(headers.clone()))
             .await?;
 
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(GitProviderError::CommitNotFound {
+                repository: format!("{}/{}", owner, repo),
+                commit_sha: reference.to_string(),
+            });
+        }
+
         if !response.status().is_success() {
             return Err(GitProviderError::ApiError(format!(
                 "Failed to get commit {} for {}/{}: {}",
@@ -1667,16 +1674,14 @@ impl GitProviderService for GiteaProvider {
 
 /// Generate a random 32-byte hex signing secret for a Gitea webhook.
 ///
-/// Uses `rand::rngs::OsRng` (MUST-FIX 1 — not `thread_rng`, which is
-/// deprecated in rand 0.9 and uses a weaker source).
+/// Uses `rand::rngs::SysRng` (MUST-FIX 1 — not the thread-local RNG).
 ///
 /// The hex string is what Gitea stores and uses as the HMAC key for
 /// `X-Gitea-Signature: hex(HMAC-SHA256(key=secret, msg=body))`.
-pub fn generate_gitea_signing_token() -> String {
-    use rand::RngCore;
+pub fn generate_gitea_signing_token() -> Result<String, rand::rngs::SysError> {
     let mut bytes = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    rand::TryRng::try_fill_bytes(&mut rand::rngs::SysRng, &mut bytes)?;
+    Ok(hex::encode(bytes))
 }
 
 #[cfg(test)]
@@ -1834,7 +1839,7 @@ mod tests {
 
     #[test]
     fn test_generate_gitea_signing_token_is_32_byte_hex() {
-        let tok = generate_gitea_signing_token();
+        let tok = generate_gitea_signing_token().unwrap();
         // 32 bytes → 64 hex chars
         assert_eq!(tok.len(), 64);
         assert!(tok.chars().all(|c| c.is_ascii_hexdigit()));
@@ -1842,8 +1847,8 @@ mod tests {
 
     #[test]
     fn test_generate_gitea_signing_token_is_unique() {
-        let t1 = generate_gitea_signing_token();
-        let t2 = generate_gitea_signing_token();
+        let t1 = generate_gitea_signing_token().unwrap();
+        let t2 = generate_gitea_signing_token().unwrap();
         assert_ne!(t1, t2);
     }
 }

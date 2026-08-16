@@ -429,9 +429,15 @@ pub struct SpanRecord {
     pub start_time: DateTime<Utc>,
     #[schema(value_type = String, format = DateTime)]
     pub end_time: DateTime<Utc>,
+    /// Span duration in milliseconds. The only field on this struct guaranteed
+    /// to be in milliseconds.
     pub duration_ms: f64,
     pub status_code: SpanStatusCode,
     pub status_message: String,
+    /// Raw key/value pairs exactly as reported by the instrumenting library.
+    /// Numeric values are NOT guaranteed to share `duration_ms`'s unit — they
+    /// may be seconds, milliseconds, microseconds, or nanoseconds depending on
+    /// the exporter's own convention, and the unit is not labeled here.
     pub attributes: BTreeMap<String, String>,
     pub events: Vec<SpanEvent>,
 }
@@ -634,6 +640,13 @@ pub struct TraceQuery {
     pub attributes: Option<BTreeMap<String, String>>,
     /// Filter by span name pattern (ILIKE).
     pub name_pattern: Option<String>,
+    /// When `true`, only return ROOT spans (no parent) — one row per trace.
+    /// Roots are `parent_span_id IS NULL` on TimescaleDB and the `''`
+    /// sentinel on ClickHouse; each backend applies its own form. Used by
+    /// high-level activity feeds (unified Observe page) that would drown in
+    /// child spans otherwise.
+    #[serde(default)]
+    pub root_only: bool,
     /// Field to sort the trace-summaries list by. Defaults to start time.
     #[serde(default)]
     pub sort_by: TraceSortField,
@@ -689,6 +702,257 @@ impl SortOrder {
             SortOrder::Asc => "ASC",
             SortOrder::Desc => "DESC",
         }
+    }
+}
+
+// ── Span (operation) latency statistics ─────────────────────────────
+
+/// Sortable fields for the span-stats report.
+///
+/// Each answers a different operational question, which is the whole point of
+/// making the sort explicit rather than always ranking by one number:
+/// `TotalDurationMs` finds where the wall-clock actually goes, `P95`/`P99` find
+/// what users feel, and the two ratio fields find operations whose *spread* is
+/// the problem rather than their typical cost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SpanStatsSortField {
+    /// `SUM(duration_ms)` — total wall-clock burned by this operation. The
+    /// default: it is the only ranking that accounts for both cost and volume,
+    /// so a 1ms call made a million times outranks a 2s call made twice.
+    #[default]
+    TotalDurationMs,
+    P50DurationMs,
+    P95DurationMs,
+    P99DurationMs,
+    MaxDurationMs,
+    AvgDurationMs,
+    StddevDurationMs,
+    Count,
+    ErrorCount,
+    ErrorRate,
+    /// `stddev / avg`. Dimensionless, so a slow-but-steady 2s operation does
+    /// not outrank a 40ms one that occasionally takes 4s.
+    CoefficientOfVariation,
+    /// `p99 / p50` — "the bad case is N× the typical case". Less sensitive than
+    /// the coefficient of variation to a single extreme outlier.
+    TailRatio,
+}
+
+impl SpanStatsSortField {
+    /// Parse a query-string value, defaulting to total duration.
+    pub fn parse(s: &str) -> Self {
+        match s.to_ascii_lowercase().as_str() {
+            "p50" | "p50_duration_ms" | "median" => SpanStatsSortField::P50DurationMs,
+            "p95" | "p95_duration_ms" => SpanStatsSortField::P95DurationMs,
+            "p99" | "p99_duration_ms" => SpanStatsSortField::P99DurationMs,
+            "max" | "max_duration_ms" => SpanStatsSortField::MaxDurationMs,
+            "avg" | "avg_duration_ms" | "mean" => SpanStatsSortField::AvgDurationMs,
+            "stddev" | "stddev_duration_ms" => SpanStatsSortField::StddevDurationMs,
+            "count" | "calls" => SpanStatsSortField::Count,
+            "error_count" | "errors" => SpanStatsSortField::ErrorCount,
+            "error_rate" => SpanStatsSortField::ErrorRate,
+            "cv" | "coefficient_of_variation" | "variability" => {
+                SpanStatsSortField::CoefficientOfVariation
+            }
+            "tail_ratio" | "tail" | "inconsistency" => SpanStatsSortField::TailRatio,
+            _ => SpanStatsSortField::TotalDurationMs,
+        }
+    }
+}
+
+/// Default number of rows returned by a span-stats query.
+pub const SPAN_STATS_DEFAULT_LIMIT: u64 = 20;
+/// Hard cap on span-stats rows per page.
+pub const SPAN_STATS_MAX_LIMIT: u64 = 100;
+
+/// Hard cap on how many projects one span-stats query may aggregate.
+///
+/// Bounds two costs that scale with the list. The handler runs a project-access
+/// check per id, and the ClickHouse backend renders one bind placeholder per id
+/// — an instance admin skips the access checks entirely, so without a cap a
+/// single request could hand storage an arbitrarily long id list. Ranking
+/// across more than a few dozen projects is not a real workflow; ranking across
+/// ten thousand is a typo or an attack.
+pub const SPAN_STATS_MAX_PROJECTS: usize = 50;
+
+/// Hard cap on the span-stats time window.
+///
+/// Unlike the trace list, this report has no early exit: it aggregates every
+/// span in the window before it can rank anything, so cost grows with the
+/// window rather than with the page size. A month covers "how did last month
+/// look"; a full 90-day retention scan on a busy project is the query that
+/// takes the instance down, and the reference deployment is a 3 vCPU / 4 GB
+/// box.
+pub const SPAN_STATS_MAX_WINDOW_DAYS: i64 = 31;
+
+/// Filter for the span-stats (per-operation latency) report.
+///
+/// Unlike [`TraceQuery`], the time window is **not** optional. Every backend
+/// aggregates over raw spans, and an unbounded aggregate on the `otel_spans`
+/// hypertable defeats chunk exclusion — on compressed chunks that means
+/// decompressing a project's entire retention window for one report. Handlers
+/// default the window rather than letting it be absent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpanStatsQuery {
+    /// Projects to aggregate over. Every entry must already have passed the
+    /// caller's project-access checks — storage does not re-authorize.
+    pub project_ids: Vec<i32>,
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    /// Restrict to one service.
+    pub service_name: Option<String>,
+    /// Restrict to one operation by exact span name — the "how slow did
+    /// `payments.charge` ever get?" case.
+    pub span_name: Option<String>,
+    /// Restrict to operations whose name contains this substring (ILIKE).
+    pub name_pattern: Option<String>,
+    /// Restrict to one span kind (server, client, internal, …).
+    pub kind: Option<SpanKind>,
+    /// Restrict to spans with this status. `Error` is the useful one: it turns
+    /// the report into "how slow are the failures?".
+    pub status: Option<SpanStatusCode>,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
+    /// Exact-match span attribute filters.
+    pub attributes: Option<BTreeMap<String, String>>,
+    /// Ignore spans faster than this, before aggregating.
+    pub min_duration_ms: Option<f64>,
+    /// Drop operations with fewer than this many samples. Percentiles and
+    /// especially the variability ratios are noise on a handful of calls, so
+    /// ranking by them without a floor surfaces one-off spans.
+    pub min_count: u64,
+    pub sort_by: SpanStatsSortField,
+    pub sort_order: SortOrder,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+impl SpanStatsQuery {
+    /// The effective page size, clamped to [`SPAN_STATS_MAX_LIMIT`].
+    pub fn effective_limit(&self) -> u64 {
+        self.limit
+            .unwrap_or(SPAN_STATS_DEFAULT_LIMIT)
+            .clamp(1, SPAN_STATS_MAX_LIMIT)
+    }
+
+    pub fn effective_offset(&self) -> u64 {
+        self.offset.unwrap_or(0)
+    }
+}
+
+/// Latency and error statistics for one operation, i.e. one
+/// `(project, service, span name)` triple over the queried window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct SpanStats {
+    pub project_id: i32,
+    pub service_name: String,
+    /// The span name, which is the operation identity: `GET /api/checkout`,
+    /// `SELECT carts`, `payments.charge`.
+    pub span_name: String,
+    /// The most common span kind for this operation.
+    pub kind: SpanKind,
+    /// Number of spans aggregated.
+    pub count: i64,
+    pub error_count: i64,
+    /// `error_count / count`, in `[0, 1]`.
+    pub error_rate: f64,
+    /// `SUM(duration_ms)` — total wall-clock attributable to this operation.
+    pub total_duration_ms: f64,
+    pub min_duration_ms: f64,
+    pub max_duration_ms: f64,
+    pub avg_duration_ms: f64,
+    /// Sample standard deviation. `0` when the operation has a single sample.
+    pub stddev_duration_ms: f64,
+    pub p50_duration_ms: f64,
+    pub p95_duration_ms: f64,
+    pub p99_duration_ms: f64,
+    /// `stddev / avg`, or `0` when `avg` is zero.
+    pub coefficient_of_variation: f64,
+    /// `p99 / p50`, or `0` when `p50` is zero.
+    pub tail_ratio: f64,
+    /// Start time of the most recent span in this group.
+    #[schema(value_type = String, format = DateTime)]
+    pub last_seen: DateTime<Utc>,
+}
+
+/// The raw duration aggregates a storage backend computes for one operation,
+/// before the derived ratios are added.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpanDurationStats {
+    pub total_ms: f64,
+    pub min_ms: f64,
+    pub max_ms: f64,
+    pub avg_ms: f64,
+    pub stddev_ms: f64,
+    pub p50_ms: f64,
+    pub p95_ms: f64,
+    pub p99_ms: f64,
+}
+
+/// The grouping key of one span-stats row: which operation these aggregates
+/// describe, and how many times it ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpanStatsGroup {
+    pub project_id: i32,
+    pub service_name: String,
+    pub span_name: String,
+    pub kind: SpanKind,
+    pub count: i64,
+    pub error_count: i64,
+}
+
+/// Assemble a [`SpanStats`] from a backend's raw aggregates, deriving
+/// `error_rate`, `coefficient_of_variation` and `tail_ratio`.
+///
+/// Both storage backends funnel through here so the derived ratios are defined
+/// in exactly one place. Computing them in SQL would mean writing the same
+/// division — and the same zero-denominator guard — twice in two dialects, and
+/// the two would drift.
+pub fn build_span_stats(
+    group: SpanStatsGroup,
+    durations: SpanDurationStats,
+    last_seen: DateTime<Utc>,
+) -> SpanStats {
+    let SpanStatsGroup {
+        project_id,
+        service_name,
+        span_name,
+        kind,
+        count,
+        error_count,
+    } = group;
+    // A zero denominator is not an error condition, it's an operation whose
+    // spans all recorded 0ms (or, for `count`, an impossible empty group).
+    // Report 0 rather than NaN/inf, which serialize to `null` in JSON and make
+    // every downstream sort and format branch on it.
+    let ratio = |numerator: f64, denominator: f64| {
+        if denominator > 0.0 {
+            numerator / denominator
+        } else {
+            0.0
+        }
+    };
+
+    SpanStats {
+        project_id,
+        service_name,
+        span_name,
+        kind,
+        count,
+        error_count,
+        error_rate: ratio(error_count as f64, count as f64),
+        total_duration_ms: durations.total_ms,
+        min_duration_ms: durations.min_ms,
+        max_duration_ms: durations.max_ms,
+        avg_duration_ms: durations.avg_ms,
+        stddev_duration_ms: durations.stddev_ms,
+        p50_duration_ms: durations.p50_ms,
+        p95_duration_ms: durations.p95_ms,
+        p99_duration_ms: durations.p99_ms,
+        coefficient_of_variation: ratio(durations.stddev_ms, durations.avg_ms),
+        tail_ratio: ratio(durations.p99_ms, durations.p50_ms),
+        last_seen,
     }
 }
 
@@ -2118,6 +2382,154 @@ mod tests {
         assert_eq!(
             parsed.attributes.get("gen_ai.usage.input_tokens").unwrap(),
             "100"
+        );
+    }
+
+    // ── Span stats ──────────────────────────────────────────────────
+
+    fn durations(avg: f64, stddev: f64, p50: f64, p99: f64) -> SpanDurationStats {
+        SpanDurationStats {
+            total_ms: avg * 10.0,
+            min_ms: 0.0,
+            max_ms: p99,
+            avg_ms: avg,
+            stddev_ms: stddev,
+            p50_ms: p50,
+            p95_ms: p99,
+            p99_ms: p99,
+        }
+    }
+
+    fn stats_with(count: i64, error_count: i64, d: SpanDurationStats) -> SpanStats {
+        build_span_stats(
+            SpanStatsGroup {
+                project_id: 1,
+                service_name: "svc".into(),
+                span_name: "op".into(),
+                kind: SpanKind::Server,
+                count,
+                error_count,
+            },
+            d,
+            chrono::Utc::now(),
+        )
+    }
+
+    #[test]
+    fn build_span_stats_derives_error_rate_and_ratios() {
+        let stats = stats_with(200, 20, durations(100.0, 50.0, 80.0, 400.0));
+
+        assert!((stats.error_rate - 0.1).abs() < f64::EPSILON);
+        // stddev / avg
+        assert!((stats.coefficient_of_variation - 0.5).abs() < f64::EPSILON);
+        // p99 / p50
+        assert!((stats.tail_ratio - 5.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn build_span_stats_returns_zero_ratios_instead_of_nan_or_inf() {
+        // An operation whose spans all recorded 0ms must not produce NaN (which
+        // serializes to JSON `null`) or inf (which sorts above every real value
+        // and would top an "inconsistency" ranking with meaningless rows).
+        let stats = stats_with(5, 0, durations(0.0, 0.0, 0.0, 0.0));
+
+        assert_eq!(stats.coefficient_of_variation, 0.0);
+        assert_eq!(stats.tail_ratio, 0.0);
+        assert!(stats.coefficient_of_variation.is_finite());
+        assert!(stats.tail_ratio.is_finite());
+
+        // An empty group is impossible from SQL, but the guard must hold anyway.
+        let empty = stats_with(0, 0, durations(0.0, 0.0, 0.0, 0.0));
+        assert_eq!(empty.error_rate, 0.0);
+    }
+
+    #[test]
+    fn build_span_stats_flags_bimodal_operations_over_uniformly_slow_ones() {
+        // The whole point of the ratio fields: a uniformly slow operation must
+        // NOT outrank an erratic fast one on variability, even though it is
+        // slower by every absolute measure.
+        let uniformly_slow = stats_with(100, 0, durations(2000.0, 100.0, 2000.0, 2200.0));
+        let erratic_fast = stats_with(100, 0, durations(500.0, 1200.0, 40.0, 4000.0));
+
+        assert!(uniformly_slow.avg_duration_ms > erratic_fast.avg_duration_ms);
+        assert!(erratic_fast.coefficient_of_variation > uniformly_slow.coefficient_of_variation);
+        assert!(erratic_fast.tail_ratio > uniformly_slow.tail_ratio);
+    }
+
+    #[test]
+    fn span_stats_sort_field_parses_aliases_and_defaults() {
+        assert_eq!(
+            SpanStatsSortField::parse("p95"),
+            SpanStatsSortField::P95DurationMs
+        );
+        assert_eq!(
+            SpanStatsSortField::parse("P99"),
+            SpanStatsSortField::P99DurationMs
+        );
+        assert_eq!(
+            SpanStatsSortField::parse("variability"),
+            SpanStatsSortField::CoefficientOfVariation
+        );
+        assert_eq!(
+            SpanStatsSortField::parse("inconsistency"),
+            SpanStatsSortField::TailRatio
+        );
+        assert_eq!(
+            SpanStatsSortField::parse("count"),
+            SpanStatsSortField::Count
+        );
+        // Unknown falls back to the default ranking rather than erroring, so a
+        // typo shows a useful report instead of a 400.
+        assert_eq!(
+            SpanStatsSortField::parse("bogus"),
+            SpanStatsSortField::TotalDurationMs
+        );
+        assert_eq!(
+            SpanStatsSortField::default(),
+            SpanStatsSortField::TotalDurationMs
+        );
+    }
+
+    #[test]
+    fn span_stats_query_clamps_limit_to_the_documented_bounds() {
+        let base = SpanStatsQuery {
+            project_ids: vec![1],
+            start_time: chrono::Utc::now() - chrono::Duration::hours(1),
+            end_time: chrono::Utc::now(),
+            service_name: None,
+            span_name: None,
+            name_pattern: None,
+            kind: None,
+            status: None,
+            environment_id: None,
+            deployment_id: None,
+            attributes: None,
+            min_duration_ms: None,
+            min_count: 1,
+            sort_by: SpanStatsSortField::default(),
+            sort_order: SortOrder::default(),
+            limit: None,
+            offset: None,
+        };
+
+        assert_eq!(base.effective_limit(), SPAN_STATS_DEFAULT_LIMIT);
+        assert_eq!(base.effective_offset(), 0);
+        assert_eq!(
+            SpanStatsQuery {
+                limit: Some(5_000),
+                ..base.clone()
+            }
+            .effective_limit(),
+            SPAN_STATS_MAX_LIMIT
+        );
+        // A zero limit would return an empty page forever; clamp it to 1.
+        assert_eq!(
+            SpanStatsQuery {
+                limit: Some(0),
+                ..base
+            }
+            .effective_limit(),
+            1
         );
     }
 }

@@ -29,6 +29,7 @@ const PROVIDER_TYPES: { name: string; value: DnsProviderType }[] = [
   { name: 'Google Cloud DNS', value: 'gcp' },
   { name: 'Azure DNS', value: 'azure' },
   { name: 'Manual', value: 'manual' },
+  { name: 'Pebble (local ACME test server only)', value: 'pebble' },
 ]
 
 // --- Option interfaces ---
@@ -59,6 +60,7 @@ interface CreateOptions {
   clientSecret?: string
   subscriptionId?: string
   resourceGroup?: string
+  managementUrl?: string
   yes?: boolean
 }
 
@@ -118,6 +120,124 @@ interface LookupOptions {
   json?: boolean
 }
 
+// --- Credential resolution ---
+
+// Maps flags already supplied on the command line to the credentials payload
+// the API expects. Returns undefined when required flags are missing, which
+// tells the caller to fall back to interactive prompts — unless --yes was
+// passed, in which case automation has no prompts to fall back to and this
+// throws the same actionable error the interactive path would have avoided.
+export function resolveDnsProviderCredentials(
+  providerType: DnsProviderType,
+  options: CreateOptions,
+): Record<string, unknown> | undefined {
+  switch (providerType) {
+    case 'cloudflare': {
+      if (options.apiToken) {
+        return {
+          type: 'cloudflare',
+          api_token: options.apiToken,
+          ...(options.accountId && { account_id: options.accountId }),
+        }
+      }
+      if (options.yes) {
+        throw new Error('--api-token is required for Cloudflare when using --yes flag')
+      }
+      return undefined
+    }
+
+    case 'route53': {
+      if (options.accessKeyId && options.secretAccessKey) {
+        return {
+          type: 'route53',
+          access_key_id: options.accessKeyId,
+          secret_access_key: options.secretAccessKey,
+          region: options.region || 'us-east-1',
+        }
+      }
+      if (options.yes) {
+        throw new Error('--access-key-id and --secret-access-key are required for Route53 when using --yes flag')
+      }
+      return undefined
+    }
+
+    case 'digitalocean': {
+      if (options.apiToken) {
+        return { type: 'digitalocean', api_token: options.apiToken }
+      }
+      if (options.yes) {
+        throw new Error('--api-token is required for DigitalOcean when using --yes flag')
+      }
+      return undefined
+    }
+
+    case 'namecheap': {
+      if (options.apiUser && options.apiKey && options.username && options.clientIp) {
+        return {
+          type: 'namecheap',
+          api_user: options.apiUser,
+          api_key: options.apiKey,
+          username: options.username,
+          client_ip: options.clientIp,
+        }
+      }
+      if (options.yes) {
+        throw new Error('--api-user, --api-key, --username, and --client-ip are required for Namecheap when using --yes flag')
+      }
+      return undefined
+    }
+
+    case 'gcp': {
+      if (options.projectId && options.serviceAccountEmail && options.privateKeyId && options.privateKey) {
+        return {
+          type: 'gcp',
+          project_id: options.projectId,
+          service_account_email: options.serviceAccountEmail,
+          private_key_id: options.privateKeyId,
+          private_key: options.privateKey,
+        }
+      }
+      if (options.yes) {
+        throw new Error('--project-id, --service-account-email, --private-key-id, and --private-key are required for GCP when using --yes flag')
+      }
+      return undefined
+    }
+
+    case 'azure': {
+      if (options.tenantId && options.clientId && options.clientSecret && options.subscriptionId && options.resourceGroup) {
+        return {
+          type: 'azure',
+          tenant_id: options.tenantId,
+          client_id: options.clientId,
+          client_secret: options.clientSecret,
+          subscription_id: options.subscriptionId,
+          resource_group: options.resourceGroup,
+        }
+      }
+      if (options.yes) {
+        throw new Error('--tenant-id, --client-id, --client-secret, --subscription-id, and --resource-group are required for Azure when using --yes flag')
+      }
+      return undefined
+    }
+
+    case 'manual':
+      return { type: 'manual' }
+
+    case 'pebble': {
+      if (options.managementUrl) {
+        return { type: 'pebble', management_url: options.managementUrl }
+      }
+      if (options.yes) {
+        throw new Error('--management-url is required for Pebble when using --yes flag')
+      }
+      return undefined
+    }
+
+    default:
+      throw new Error(`Unsupported provider type: ${providerType}`)
+  }
+}
+
 // --- Command registration ---
 
 export function registerDnsProvidersCommands(program: Command): void {
@@ -138,7 +258,7 @@ export function registerDnsProvidersCommands(program: Command): void {
     .alias('add')
     .description('Create a new DNS provider')
     .option('-n, --name <name>', 'Provider name')
-    .option('-t, --type <type>', 'Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual)')
+    .option('-t, --type <type>', 'Provider type (cloudflare, route53, digitalocean, namecheap, gcp, azure, manual, pebble)')
     .option('-d, --description <description>', 'Provider description')
     .option('--api-token <token>', 'API token (Cloudflare, DigitalOcean)')
     .option('--account-id <id>', 'Cloudflare account ID (optional)')
@@ -158,6 +278,7 @@ export function registerDnsProvidersCommands(program: Command): void {
     .option('--client-secret <secret>', 'Azure client secret')
     .option('--subscription-id <id>', 'Azure subscription ID')
     .option('--resource-group <name>', 'Azure resource group')
+    .option('--management-url <url>', 'pebble-challtestsrv management API URL (local ACME test server only)')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(createAction)
 
@@ -329,266 +450,208 @@ async function createAction(options: CreateOptions): Promise<void> {
     })
   }
 
-  let credentials: Record<string, unknown>
+  if (providerType === 'manual' && !options.yes) {
+    info('\nManual mode: You will need to create DNS records manually.')
+  }
+  if (providerType === 'pebble' && !options.yes) {
+    info(
+      '\nPebble is a local ACME test server (pebble-challtestsrv) — never point this at a real DNS provider.',
+    )
+  }
 
-  switch (providerType) {
-    case 'cloudflare': {
-      let cfApiToken: string
-      let cfAccountId: string | undefined
+  let credentials: Record<string, unknown> | undefined = resolveDnsProviderCredentials(providerType, options)
 
-      if (options.apiToken) {
-        cfApiToken = options.apiToken
-        cfAccountId = options.accountId
-      } else if (options.yes) {
-        throw new Error('--api-token is required for Cloudflare when using --yes flag')
-      } else {
+  if (!credentials) {
+    switch (providerType) {
+      case 'cloudflare': {
         info('\nCloudflare DNS requires an API token with DNS:Edit permissions.')
         info('Create one at: https://dash.cloudflare.com/profile/api-tokens')
         newline()
 
-        cfApiToken = await promptPassword({
+        const cfApiToken = await promptPassword({
           message: 'API Token',
         })
 
-        cfAccountId = await promptText({
+        const cfAccountId = await promptText({
           message: 'Account ID (optional, for zone scoping)',
           default: '',
         })
+
+        credentials = {
+          type: 'cloudflare',
+          api_token: cfApiToken,
+          ...(cfAccountId && { account_id: cfAccountId }),
+        }
+        break
       }
 
-      credentials = {
-        type: 'cloudflare',
-        api_token: cfApiToken,
-        ...(cfAccountId && { account_id: cfAccountId }),
-      }
-      break
-    }
-
-    case 'route53': {
-      let awsAccessKey: string
-      let awsSecretKey: string
-      let awsRegion: string
-
-      if (options.accessKeyId && options.secretAccessKey) {
-        awsAccessKey = options.accessKeyId
-        awsSecretKey = options.secretAccessKey
-        awsRegion = options.region || 'us-east-1'
-      } else if (options.yes) {
-        throw new Error('--access-key-id and --secret-access-key are required for Route53 when using --yes flag')
-      } else {
+      case 'route53': {
         info('\nAWS Route53 requires IAM credentials with Route53 permissions.')
         newline()
 
-        awsAccessKey = await promptPassword({
+        const awsAccessKey = await promptPassword({
           message: 'AWS Access Key ID',
         })
 
-        awsSecretKey = await promptPassword({
+        const awsSecretKey = await promptPassword({
           message: 'AWS Secret Access Key',
         })
 
-        awsRegion = await promptText({
+        const awsRegion = await promptText({
           message: 'AWS Region',
           default: 'us-east-1',
         })
+
+        credentials = {
+          type: 'route53',
+          access_key_id: awsAccessKey,
+          secret_access_key: awsSecretKey,
+          region: awsRegion,
+        }
+        break
       }
 
-      credentials = {
-        type: 'route53',
-        access_key_id: awsAccessKey,
-        secret_access_key: awsSecretKey,
-        region: awsRegion,
-      }
-      break
-    }
-
-    case 'digitalocean': {
-      let doApiToken: string
-
-      if (options.apiToken) {
-        doApiToken = options.apiToken
-      } else if (options.yes) {
-        throw new Error('--api-token is required for DigitalOcean when using --yes flag')
-      } else {
+      case 'digitalocean': {
         info('\nDigitalOcean requires a Personal Access Token.')
         info('Create one at: https://cloud.digitalocean.com/account/api/tokens')
         newline()
 
-        doApiToken = await promptPassword({
+        const doApiToken = await promptPassword({
           message: 'API Token',
         })
+
+        credentials = {
+          type: 'digitalocean',
+          api_token: doApiToken,
+        }
+        break
       }
 
-      credentials = {
-        type: 'digitalocean',
-        api_token: doApiToken,
-      }
-      break
-    }
-
-    case 'namecheap': {
-      let ncApiUser: string
-      let ncApiKey: string
-      let ncUsername: string
-      let ncClientIp: string
-
-      if (options.apiUser && options.apiKey && options.username && options.clientIp) {
-        ncApiUser = options.apiUser
-        ncApiKey = options.apiKey
-        ncUsername = options.username
-        ncClientIp = options.clientIp
-      } else if (options.yes) {
-        throw new Error('--api-user, --api-key, --username, and --client-ip are required for Namecheap when using --yes flag')
-      } else {
+      case 'namecheap': {
         info('\nNamecheap requires API credentials.')
         info('Enable API access at: https://ap.www.namecheap.com/settings/tools/apiaccess/')
         newline()
 
-        ncApiUser = await promptText({
+        const ncApiUser = await promptText({
           message: 'API User',
           required: true,
         })
 
-        ncApiKey = await promptPassword({
+        const ncApiKey = await promptPassword({
           message: 'API Key',
         })
 
-        ncUsername = await promptText({
+        const ncUsername = await promptText({
           message: 'Username',
           required: true,
         })
 
-        ncClientIp = await promptText({
+        const ncClientIp = await promptText({
           message: 'Client IP (whitelisted IP)',
           required: true,
         })
+
+        credentials = {
+          type: 'namecheap',
+          api_user: ncApiUser,
+          api_key: ncApiKey,
+          username: ncUsername,
+          client_ip: ncClientIp,
+        }
+        break
       }
 
-      credentials = {
-        type: 'namecheap',
-        api_user: ncApiUser,
-        api_key: ncApiKey,
-        username: ncUsername,
-        client_ip: ncClientIp,
-      }
-      break
-    }
-
-    case 'gcp': {
-      let gcpProject: string
-      let gcpServiceAccountEmail: string
-      let gcpPrivateKeyId: string
-      let gcpPrivateKey: string
-
-      if (options.projectId && options.serviceAccountEmail && options.privateKeyId && options.privateKey) {
-        gcpProject = options.projectId
-        gcpServiceAccountEmail = options.serviceAccountEmail
-        gcpPrivateKeyId = options.privateKeyId
-        gcpPrivateKey = options.privateKey
-      } else if (options.yes) {
-        throw new Error('--project-id, --service-account-email, --private-key-id, and --private-key are required for GCP when using --yes flag')
-      } else {
+      case 'gcp': {
         info('\nGoogle Cloud DNS requires a service account JSON key.')
         info('Create one at: https://console.cloud.google.com/iam-admin/serviceaccounts')
         newline()
 
-        gcpProject = await promptText({
+        const gcpProject = await promptText({
           message: 'Project ID',
           required: true,
         })
 
-        gcpServiceAccountEmail = await promptText({
+        const gcpServiceAccountEmail = await promptText({
           message: 'Service Account Email',
           required: true,
         })
 
-        gcpPrivateKeyId = await promptText({
+        const gcpPrivateKeyId = await promptText({
           message: 'Private Key ID',
           required: true,
         })
 
-        gcpPrivateKey = await promptPassword({
+        const gcpPrivateKey = await promptPassword({
           message: 'Private Key (paste full key including BEGIN/END)',
         })
+
+        credentials = {
+          type: 'gcp',
+          project_id: gcpProject,
+          service_account_email: gcpServiceAccountEmail,
+          private_key_id: gcpPrivateKeyId,
+          private_key: gcpPrivateKey,
+        }
+        break
       }
 
-      credentials = {
-        type: 'gcp',
-        project_id: gcpProject,
-        service_account_email: gcpServiceAccountEmail,
-        private_key_id: gcpPrivateKeyId,
-        private_key: gcpPrivateKey,
-      }
-      break
-    }
-
-    case 'azure': {
-      let azTenantId: string
-      let azClientId: string
-      let azClientSecret: string
-      let azSubscriptionId: string
-      let azResourceGroup: string
-
-      if (options.tenantId && options.clientId && options.clientSecret && options.subscriptionId && options.resourceGroup) {
-        azTenantId = options.tenantId
-        azClientId = options.clientId
-        azClientSecret = options.clientSecret
-        azSubscriptionId = options.subscriptionId
-        azResourceGroup = options.resourceGroup
-      } else if (options.yes) {
-        throw new Error('--tenant-id, --client-id, --client-secret, --subscription-id, and --resource-group are required for Azure when using --yes flag')
-      } else {
+      case 'azure': {
         info('\nAzure DNS requires a service principal.')
         info('Create one with: az ad sp create-for-rbac --name "dns-provider"')
         newline()
 
-        azTenantId = await promptText({
+        const azTenantId = await promptText({
           message: 'Tenant ID',
           required: true,
         })
 
-        azClientId = await promptText({
+        const azClientId = await promptText({
           message: 'Client ID',
           required: true,
         })
 
-        azClientSecret = await promptPassword({
+        const azClientSecret = await promptPassword({
           message: 'Client Secret',
         })
 
-        azSubscriptionId = await promptText({
+        const azSubscriptionId = await promptText({
           message: 'Subscription ID',
           required: true,
         })
 
-        azResourceGroup = await promptText({
+        const azResourceGroup = await promptText({
           message: 'Resource Group',
           required: true,
         })
+
+        credentials = {
+          type: 'azure',
+          tenant_id: azTenantId,
+          client_id: azClientId,
+          client_secret: azClientSecret,
+          subscription_id: azSubscriptionId,
+          resource_group: azResourceGroup,
+        }
+        break
       }
 
-      credentials = {
-        type: 'azure',
-        tenant_id: azTenantId,
-        client_id: azClientId,
-        client_secret: azClientSecret,
-        subscription_id: azSubscriptionId,
-        resource_group: azResourceGroup,
+      case 'pebble': {
+        const pebbleManagementUrl = await promptText({
+          message: 'pebble-challtestsrv management API URL',
+          required: true,
+          default: 'http://localhost:8055',
+        })
+
+        credentials = {
+          type: 'pebble',
+          management_url: pebbleManagementUrl,
+        }
+        break
       }
-      break
+
+      default:
+        throw new Error(`Unsupported provider type: ${providerType}`)
     }
-
-    case 'manual':
-      if (!options.yes) {
-        info('\nManual mode: You will need to create DNS records manually.')
-      }
-      credentials = {
-        type: 'manual',
-      }
-      break
-
-    default:
-      throw new Error(`Unsupported provider type: ${providerType}`)
   }
 
   await withSpinner(`Creating ${providerType} DNS provider...`, async () => {

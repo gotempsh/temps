@@ -24,7 +24,7 @@ interface LoginOptions {
  * Whether verbose request/response logging is enabled for this invocation.
  * Activated by `--debug` on the command or `TEMPS_DEBUG=1` in the environment.
  */
-function debugEnabled(opts: { debug?: boolean } = {}): boolean {
+export function debugEnabled(opts: { debug?: boolean } = {}): boolean {
   if (opts.debug) return true
   const env = process.env.TEMPS_DEBUG
   return env === '1' || env === 'true' || env === 'yes'
@@ -102,7 +102,7 @@ async function debugFetch(
  *
  * Returns the `/api`-suffixed base, with no trailing slash.
  */
-function serverBaseUrl(rawApiUrl: string): string {
+export function serverBaseUrl(rawApiUrl: string): string {
   const trimmed = rawApiUrl.replace(/\/+$/, '')
   return /\/api$/.test(trimmed) ? trimmed : `${trimmed}/api`
 }
@@ -332,7 +332,7 @@ export async function loginWithDevice(
   })
 }
 
-interface DeviceStartResponse {
+export interface DeviceStartResponse {
   device_code: string
   user_code: string
   verification_uri: string
@@ -357,7 +357,7 @@ type DevicePollResponse =
     }
 
 /** Resolve a possibly-relative `verification_uri_complete` against the base URL. */
-function absoluteVerificationUri(
+export function absoluteVerificationUri(
   baseUrl: string,
   start: DeviceStartResponse,
 ): string {

@@ -12,7 +12,7 @@ import {
 } from '@/components/ui/card'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useNavigate, useSearchParams } from 'react-router'
 import { buildAnalyticsDimensionUrl } from './viewAllUrl'
 import type { LucideIcon } from 'lucide-react'
 import {

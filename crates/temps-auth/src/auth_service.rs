@@ -4,16 +4,15 @@ use axum::http::header::SET_COOKIE;
 use axum::http::HeaderMap;
 use chrono::{Duration, Utc};
 use cookie::Cookie;
-use rand::Rng;
+use rand::RngExt;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    Set, TransactionTrait,
+    QuerySelect, Set, TransactionTrait,
 };
 use serde::Serialize;
 use std::sync::Arc;
 use temps_core::notifications::DynNotificationService;
 use thiserror::Error;
-use totp_rs::Secret;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 const DEFAULT_EXTERNAL_URL: &str = "http://localhost:8000";
@@ -21,6 +20,12 @@ const DEFAULT_EXTERNAL_URL: &str = "http://localhost:8000";
 pub struct AuthStatusResponse {
     pub status: String,
     pub cli_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct VerifiedSession {
+    pub user: temps_entities::users::Model,
+    pub session_id: i32,
 }
 
 #[derive(Error, Debug)]
@@ -65,8 +70,31 @@ pub enum AuthError {
     SamePassword,
     #[error("Password complexity check failed: {0}")]
     WeakPassword(String),
-    #[error("Account has no password set (likely a SSO/magic-link-only user)")]
+    #[error("Account has no password set (likely an SSO-only user)")]
     NoPasswordSet,
+    #[error("User {user_id} must change their password before a session can be created")]
+    PasswordChangeRequired { user_id: i32 },
+}
+
+#[derive(Error, Debug)]
+pub enum MfaChallengeError {
+    #[error("MFA challenge session is invalid or expired")]
+    InvalidOrExpiredSession,
+    #[error("MFA challenge references missing user {user_id}")]
+    UserNotFound { user_id: i32 },
+    #[error("MFA code is invalid for user {user_id}")]
+    InvalidCode { user_id: i32 },
+    #[error("MFA verifier configuration is invalid for user {user_id}: {reason}")]
+    VerifierConfiguration { user_id: i32, reason: String },
+    #[error("MFA verification clock failed for user {user_id}: {reason}")]
+    VerificationClock { user_id: i32, reason: String },
+    #[error("Failed to {operation} for MFA challenge (user {user_id:?}): {source}")]
+    Database {
+        operation: &'static str,
+        user_id: Option<i32>,
+        #[source]
+        source: sea_orm::DbErr,
+    },
 }
 
 impl From<sea_orm::DbErr> for AuthError {
@@ -94,6 +122,15 @@ impl AuthService {
     }
 
     pub async fn create_session(&self, user_id: i32) -> Result<String, AuthError> {
+        let user = temps_entities::users::Entity::find_by_id(user_id)
+            .filter(temps_entities::users::Column::DeletedAt.is_null())
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| AuthError::NotFound(format!("User {user_id} not found or deleted")))?;
+        if user.must_change_password {
+            return Err(AuthError::PasswordChangeRequired { user_id });
+        }
+
         let session_token = self.generate_session_token();
         let expires_at = Utc::now() + Duration::days(7);
 
@@ -101,6 +138,8 @@ impl AuthService {
             user_id: Set(user_id),
             session_token: Set(session_token.clone()),
             expires_at: Set(expires_at),
+            // Fully authenticated session, not an MFA challenge.
+            mfa_pending: Set(false),
             ..Default::default()
         };
 
@@ -122,6 +161,9 @@ impl AuthService {
         let count = temps_entities::sessions::Entity::find()
             .filter(temps_entities::sessions::Column::UserId.eq(user_id))
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+            // Pending MFA challenge rows are not real sessions -- excluding
+            // them keeps the concurrent-login audit signal honest.
+            .filter(temps_entities::sessions::Column::MfaPending.eq(false))
             .count(self.db.as_ref())
             .await?;
         Ok(count)
@@ -131,9 +173,21 @@ impl AuthService {
         &self,
         session_token: &str,
     ) -> Result<temps_entities::users::Model, AuthError> {
+        Ok(self.verify_session_details(session_token).await?.user)
+    }
+
+    /// Verify a fully authenticated session and retain its database identity
+    /// for session-scoped authorization such as short-lived step-up access.
+    pub async fn verify_session_details(
+        &self,
+        session_token: &str,
+    ) -> Result<VerifiedSession, AuthError> {
         let session = temps_entities::sessions::Entity::find()
             .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
             .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+            // A first-factor-only MFA challenge row must never authenticate a
+            // real request. Only `verify_mfa_challenge` may consume those.
+            .filter(temps_entities::sessions::Column::MfaPending.eq(false))
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| AuthError::NotFound("Session not found or expired".to_string()))?;
@@ -144,13 +198,16 @@ impl AuthService {
             .await?
             .ok_or_else(|| AuthError::NotFound("User not found or deleted".to_string()))?;
 
-        Ok(user)
+        Ok(VerifiedSession {
+            user,
+            session_id: session.id,
+        })
     }
 
     fn generate_session_token(&self) -> String {
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         (0..64)
-            .map(|_| rng.sample(rand::distributions::Alphanumeric) as char)
+            .map(|_| rng.sample(rand::distr::Alphanumeric) as char)
             .collect()
     }
 
@@ -225,6 +282,9 @@ impl AuthService {
             user_id: Set(user_id),
             session_token: Set(session_token.clone()),
             expires_at: Set(expires_at),
+            // Mark this as a pending MFA challenge so it can never be replayed
+            // as a real session cookie -- `verify_session` rejects such rows.
+            mfa_pending: Set(true),
             ..Default::default()
         };
 
@@ -238,78 +298,131 @@ impl AuthService {
         &self,
         session_token: &str,
         code: &str,
-    ) -> Result<temps_entities::users::Model, AuthError> {
-        // Get the user from the temporary session
-        let session = temps_entities::sessions::Entity::find()
-            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
-            .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| AuthError::GenericError("Invalid or expired session".to_string()))?;
+    ) -> Result<temps_entities::users::Model, MfaChallengeError> {
+        let session_token = session_token.to_owned();
+        let code = code.to_owned();
+        self.db
+            .transaction::<_, temps_entities::users::Model, MfaChallengeError>(|transaction| {
+                Box::pin(async move {
+                    // Get the user from the temporary session. Require mfa_pending so a
+                    // real (fully authenticated) session token can never be spent as an
+                    // MFA challenge -- the discriminator cuts both ways.
+                    let session = temps_entities::sessions::Entity::find()
+                        .filter(temps_entities::sessions::Column::SessionToken.eq(&session_token))
+                        .filter(temps_entities::sessions::Column::ExpiresAt.gt(Utc::now()))
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "load the pending session",
+                            user_id: None,
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::InvalidOrExpiredSession)?;
 
-        let user = temps_entities::users::Entity::find_by_id(session.user_id)
-            .one(self.db.as_ref())
-            .await?
-            .ok_or_else(|| AuthError::NotFound("User not found".to_string()))?;
+                    let user = temps_entities::users::Entity::find_by_id(session.user_id)
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "load the challenge user",
+                            user_id: Some(session.user_id),
+                            source,
+                        })?
+                        .ok_or(MfaChallengeError::UserNotFound {
+                            user_id: session.user_id,
+                        })?;
 
-        // Verify the MFA code
-        if !self.verify_totp_code(&user, code) {
-            return Err(AuthError::GenericError("Invalid MFA code".to_string()));
-        }
+                    // Verify the MFA code
+                    if !Self::verify_totp_code(&user, &code)? {
+                        return Err(MfaChallengeError::InvalidCode { user_id: user.id });
+                    }
 
-        // Delete the temporary session
-        temps_entities::sessions::Entity::delete_many()
-            .filter(temps_entities::sessions::Column::SessionToken.eq(session_token))
-            .exec(self.db.as_ref())
-            .await?;
+                    let mut verified_user = user;
+                    if !verified_user.mfa_enabled {
+                        let mut user_update: temps_entities::users::ActiveModel =
+                            verified_user.into();
+                        user_update.mfa_enabled = Set(true);
+                        verified_user =
+                            user_update.update(transaction).await.map_err(|source| {
+                                MfaChallengeError::Database {
+                                    operation: "enable MFA for the challenge user",
+                                    user_id: Some(session.user_id),
+                                    source,
+                                }
+                            })?;
+                    }
 
-        Ok(user)
+                    // Consume the challenge in the same transaction as enrollment so a
+                    // failed update never strands the user without a retryable challenge.
+                    let deletion = temps_entities::sessions::Entity::delete_many()
+                        .filter(temps_entities::sessions::Column::SessionToken.eq(&session_token))
+                        .filter(temps_entities::sessions::Column::MfaPending.eq(true))
+                        .exec(transaction)
+                        .await
+                        .map_err(|source| MfaChallengeError::Database {
+                            operation: "consume the verified pending session",
+                            user_id: Some(verified_user.id),
+                            source,
+                        })?;
+                    if deletion.rows_affected != 1 {
+                        return Err(MfaChallengeError::InvalidOrExpiredSession);
+                    }
+
+                    Ok(verified_user)
+                })
+            })
+            .await
+            .map_err(|error| match error {
+                sea_orm::TransactionError::Transaction(error) => error,
+                sea_orm::TransactionError::Connection(source) => MfaChallengeError::Database {
+                    operation: "run the MFA challenge transaction",
+                    user_id: None,
+                    source,
+                },
+            })
     }
 
-    fn verify_totp_code(&self, user: &temps_entities::users::Model, code: &str) -> bool {
+    fn verify_totp_code(
+        user: &temps_entities::users::Model,
+        code: &str,
+    ) -> Result<bool, MfaChallengeError> {
         match &user.mfa_secret {
             Some(secret) => {
-                use totp_rs::{Algorithm, TOTP};
+                use totp_rs::{Algorithm, Builder};
 
-                let decoded =
-                    match base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret) {
-                        Some(bytes) => bytes,
-                        None => {
-                            tracing::error!(
-                                "Failed to base32-decode MFA secret for user {}",
-                                user.id
-                            );
-                            return false;
-                        }
-                    };
+                let decoded = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret)
+                    .ok_or(MfaChallengeError::VerifierConfiguration {
+                    user_id: user.id,
+                    reason: "stored secret is not valid base32".to_string(),
+                })?;
 
-                let secret_bytes = match Secret::Raw(decoded).to_bytes() {
-                    Ok(bytes) => bytes,
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to convert MFA secret to bytes for user {}: {:?}",
-                            user.id,
-                            e
-                        );
-                        return false;
-                    }
-                };
+                // Algorithm::SHA1, 6 digits, skew 1, step 30 — these are the
+                // parameters that were used when the secret was enrolled (see
+                // `generate_mfa_setup_candidate`). They must not silently change.
+                // `build()` (not `build_noncompliant()`) so a malformed stored
+                // secret still fails loudly instead of constructing a Totp that
+                // silently never validates.
+                let totp = Builder::new()
+                    .with_algorithm(Algorithm::SHA1)
+                    .with_digits(6)
+                    .with_skew(1)
+                    .with_step_duration(30)
+                    .with_secret(decoded)
+                    .build()
+                    .map_err(|error| MfaChallengeError::VerifierConfiguration {
+                        user_id: user.id,
+                        reason: format!("TOTP verifier cannot be initialized: {error}"),
+                    })?;
 
-                let totp = match TOTP::new(Algorithm::SHA1, 6, 1, 30, secret_bytes) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to create TOTP instance for user {}: {:?}",
-                            user.id,
-                            e
-                        );
-                        return false;
-                    }
-                };
-
-                totp.check_current(code).unwrap_or(false)
+                // check_current now returns Option<u64>: Some(step) = valid,
+                // None = invalid. There is no longer a fallible clock path.
+                Ok(totp.check_current(code).is_some())
             }
-            None => false,
+            None => Err(MfaChallengeError::VerifierConfiguration {
+                user_id: user.id,
+                reason: "stored MFA secret is missing".to_string(),
+            }),
         }
     }
     // Register a new user with email/password
@@ -345,6 +458,7 @@ impl AuthService {
             email: Set(request.email.to_lowercase()),
             name: Set(request.name.clone()),
             password_hash: Set(Some(password_hash)),
+            must_change_password: Set(false),
             email_verified: Set(false),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
@@ -434,6 +548,14 @@ impl AuthService {
             return Err(UserAuthError::InvalidCredentials);
         }
 
+        // A required password change is completed before role-based MFA
+        // enrollment. The password-change handler starts a pending MFA
+        // challenge when the policy applies, without issuing a full session.
+        if user.must_change_password {
+            debug!("Temporary password verified for user {}", user.id);
+            return Ok(user);
+        }
+
         // SOC2 hardening (bherila/temps#32): operators can require MFA
         // enrollment for Admin-role accounts via the `require_mfa_for_admins`
         // setting. This check only runs in the password-login path -- SSO/OIDC
@@ -476,83 +598,50 @@ impl AuthService {
         Ok(user)
     }
 
-    // Send magic link for passwordless login
-    pub async fn send_magic_link(&self, request: MagicLinkRequest) -> Result<(), UserAuthError> {
-        // Check if email service is configured
-
-        // Check if user exists
-        let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::Email.eq(request.email.to_lowercase()))
-            .one(self.db.as_ref())
-            .await?;
-
-        // Always return success to avoid email enumeration
-        if user.is_none() {
-            return Ok(());
-        }
-
-        // Generate magic link token
-        let token = self.generate_token();
-        let expires_at = Utc::now() + Duration::minutes(15);
-
-        // Save token to database
-        let magic_link_token = temps_entities::magic_link_tokens::ActiveModel {
-            email: Set(request.email.to_lowercase()),
-            token: Set(token.clone()),
-            expires_at: Set(expires_at),
-            used: Set(false),
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        };
-
-        magic_link_token.insert(self.db.as_ref()).await?;
-        let settings = self.get_settings().await?;
-        // Send magic link email
-        let base_url = settings
-            .external_url
-            .unwrap_or_else(|| DEFAULT_EXTERNAL_URL.to_string());
-        let magic_link_url = format!("{}/auth/magic-link?token={}", base_url, token);
-
-        self.email_service
-            .send_magic_link_email(&request.email, &magic_link_url)
-            .await
-            .map_err(|e| UserAuthError::EmailServiceError(e.to_string()))?;
-
-        Ok(())
-    }
-
-    // Verify magic link token
-    pub async fn verify_magic_link(
+    /// Create a short-lived reset credential after the user's temporary
+    /// password has been verified. No regular session is created while the
+    /// account is marked as requiring a password change.
+    pub async fn create_required_password_change_token(
         &self,
-        token: &str,
-    ) -> Result<temps_entities::users::Model, UserAuthError> {
-        // Find the token
-        let magic_link = temps_entities::magic_link_tokens::Entity::find()
-            .filter(temps_entities::magic_link_tokens::Column::Token.eq(token))
-            .filter(temps_entities::magic_link_tokens::Column::Used.eq(false))
-            .filter(temps_entities::magic_link_tokens::Column::ExpiresAt.gt(Utc::now()))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(UserAuthError::InvalidToken)?;
-
-        // Mark token as used
-        let mut magic_link_update: temps_entities::magic_link_tokens::ActiveModel =
-            magic_link.clone().into();
-        magic_link_update.used = Set(true);
-        magic_link_update.update(self.db.as_ref()).await?;
-
-        // Find user by email
-        let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::Email.eq(&magic_link.email))
+        user_id: i32,
+    ) -> Result<String, UserAuthError> {
+        let user = temps_entities::users::Entity::find_by_id(user_id)
             .one(self.db.as_ref())
             .await?
             .ok_or(UserAuthError::UserNotFound)?;
 
-        // Mark email as verified if not already
-        if !user.email_verified {
-            let mut user_update: temps_entities::users::ActiveModel = user.clone().into();
-            user_update.email_verified = Set(true);
-            user_update.update(self.db.as_ref()).await?;
+        if !user.must_change_password {
+            return Err(UserAuthError::PasswordChangeNotRequired { user_id });
+        }
+
+        let token = self.generate_token();
+        let mut user_update: temps_entities::users::ActiveModel = user.into();
+        user_update.password_reset_token = Set(Some(token.clone()));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
+        user_update.update(self.db.as_ref()).await?;
+
+        Ok(token)
+    }
+
+    /// Resolve a live first-login password-change credential without
+    /// consuming it. The handler uses this to evaluate post-change policy
+    /// before committing the password replacement.
+    pub async fn required_password_change_user(
+        &self,
+        token: &str,
+    ) -> Result<temps_entities::users::Model, UserAuthError> {
+        let user = temps_entities::users::Entity::find()
+            .filter(temps_entities::users::Column::PasswordResetToken.eq(token))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(UserAuthError::InvalidToken)?;
+
+        if !user.must_change_password
+            || user
+                .password_reset_expires
+                .is_none_or(|expires_at| expires_at < Utc::now())
+        {
+            return Err(UserAuthError::InvalidToken);
         }
 
         Ok(user)
@@ -599,41 +688,147 @@ impl AuthService {
         // Validate password complexity
         validate_password_complexity(&request.new_password)?;
 
-        // Find user by reset token
-        let user = temps_entities::users::Entity::find()
-            .filter(temps_entities::users::Column::PasswordResetToken.eq(&request.token))
-            .one(self.db.as_ref())
-            .await?
-            .ok_or(UserAuthError::InvalidToken)?;
+        self.db
+            .transaction::<_, temps_entities::users::Model, UserAuthError>(|transaction| {
+                Box::pin(async move {
+                    // Find user by reset token. The transaction callback guarantees that
+                    // every rejection path is rolled back before this method returns.
+                    let user = temps_entities::users::Entity::find()
+                        .filter(
+                            temps_entities::users::Column::PasswordResetToken.eq(&request.token),
+                        )
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await?
+                        .ok_or(UserAuthError::InvalidToken)?;
 
-        // Check if token is expired
-        if let Some(expires_at) = user.password_reset_expires {
-            if expires_at < Utc::now() {
-                return Err(UserAuthError::InvalidToken);
-            }
-        } else {
-            return Err(UserAuthError::InvalidToken);
+                    // Check if token is expired
+                    if user
+                        .password_reset_expires
+                        .is_none_or(|expires_at| expires_at < Utc::now())
+                    {
+                        return Err(UserAuthError::InvalidToken);
+                    }
+
+                    if user.must_change_password {
+                        if let Some(current_hash) = user.password_hash.as_deref() {
+                            let parsed_hash =
+                                argon2::password_hash::PasswordHash::new(current_hash)
+                                    .map_err(|_| UserAuthError::PasswordHashError)?;
+                            if argon2::Argon2::default()
+                                .verify_password(request.new_password.as_bytes(), &parsed_hash)
+                                .is_ok()
+                            {
+                                return Err(UserAuthError::SamePassword);
+                            }
+                        }
+                    }
+
+                    // Hash new password
+                    use argon2::password_hash::{rand_core::OsRng, SaltString};
+                    let argon2 = argon2::Argon2::default();
+                    let salt = SaltString::generate(&mut OsRng);
+
+                    let password_hash = argon2
+                        .hash_password(request.new_password.as_bytes(), &salt)
+                        .map_err(|_| UserAuthError::PasswordHashError)?
+                        .to_string();
+
+                    // Update user password and clear reset token
+                    let mut user_update: temps_entities::users::ActiveModel = user.into();
+                    user_update.password_hash = Set(Some(password_hash));
+                    user_update.password_reset_token = Set(None);
+                    user_update.password_reset_expires = Set(None);
+                    user_update.must_change_password = Set(false);
+                    user_update.updated_at = Set(Utc::now());
+                    user_update.update(transaction).await.map_err(Into::into)
+                })
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Complete the first-login password change. Unlike an email reset, this
+    /// requires the account to still be flagged and rejects reuse of the
+    /// administrator-provided temporary password.
+    pub async fn reset_required_password(
+        &self,
+        request: ResetPasswordRequest,
+    ) -> Result<temps_entities::users::Model, UserAuthError> {
+        validate_password_complexity(&request.new_password)?;
+
+        self.db
+            .transaction::<_, temps_entities::users::Model, UserAuthError>(|transaction| {
+                Box::pin(async move {
+                    let user = temps_entities::users::Entity::find()
+                        .filter(
+                            temps_entities::users::Column::PasswordResetToken.eq(&request.token),
+                        )
+                        .lock_exclusive()
+                        .one(transaction)
+                        .await?
+                        .ok_or(UserAuthError::InvalidToken)?;
+
+                    if !user.must_change_password
+                        || user
+                            .password_reset_expires
+                            .is_none_or(|expires_at| expires_at < Utc::now())
+                    {
+                        return Err(UserAuthError::InvalidToken);
+                    }
+
+                    if let Some(current_hash) = user.password_hash.as_deref() {
+                        let parsed_hash = argon2::password_hash::PasswordHash::new(current_hash)
+                            .map_err(|_| UserAuthError::PasswordHashError)?;
+                        if argon2::Argon2::default()
+                            .verify_password(request.new_password.as_bytes(), &parsed_hash)
+                            .is_ok()
+                        {
+                            return Err(UserAuthError::SamePassword);
+                        }
+                    }
+
+                    use argon2::password_hash::{rand_core::OsRng, SaltString};
+                    let salt = SaltString::generate(&mut OsRng);
+                    let password_hash = argon2::Argon2::default()
+                        .hash_password(request.new_password.as_bytes(), &salt)
+                        .map_err(|_| UserAuthError::PasswordHashError)?
+                        .to_string();
+
+                    let mut user_update: temps_entities::users::ActiveModel = user.into();
+                    user_update.password_hash = Set(Some(password_hash));
+                    user_update.password_reset_token = Set(None);
+                    user_update.password_reset_expires = Set(None);
+                    user_update.must_change_password = Set(false);
+                    user_update.updated_at = Set(Utc::now());
+                    user_update.update(transaction).await.map_err(Into::into)
+                })
+            })
+            .await
+            .map_err(Into::into)
+    }
+
+    pub async fn requires_mfa_enrollment(&self, user_id: i32) -> Result<bool, UserAuthError> {
+        let settings = self.get_settings().await?;
+        if !settings.require_mfa_for_admins {
+            return Ok(false);
         }
 
-        // Hash new password
-        use argon2::password_hash::{rand_core::OsRng, SaltString};
-        let argon2 = argon2::Argon2::default();
-        let salt = SaltString::generate(&mut OsRng);
+        let user = temps_entities::users::Entity::find_by_id(user_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(UserAuthError::UserNotFound)?;
+        if user.mfa_enabled {
+            return Ok(false);
+        }
 
-        let password_hash = argon2
-            .hash_password(request.new_password.as_bytes(), &salt)
-            .map_err(|_| UserAuthError::PasswordHashError)?
-            .to_string();
-
-        // Update user password and clear reset token
-        let mut user_update: temps_entities::users::ActiveModel = user.into();
-        user_update.password_hash = Set(Some(password_hash));
-        user_update.password_reset_token = Set(None);
-        user_update.password_reset_expires = Set(None);
-        user_update.updated_at = Set(Utc::now());
-        let updated_user = user_update.update(self.db.as_ref()).await?;
-
-        Ok(updated_user)
+        crate::user_service::UserService::new(self.db.clone())
+            .is_admin(user_id)
+            .await
+            .map_err(|error| UserAuthError::RoleLookup {
+                user_id,
+                reason: error.to_string(),
+            })
     }
 
     /// In-app password change for an authenticated user.
@@ -661,7 +856,7 @@ impl AuthService {
             .await?
             .ok_or_else(|| AuthError::NotFound(format!("User {} not found", user_id)))?;
 
-        // 1. Account must have a password set. SSO/magic-link-only users
+        // 1. Account must have a password set. SSO-only users
         // get a friendly error instead of a generic 401.
         let stored_hash = user
             .password_hash
@@ -801,9 +996,8 @@ impl AuthService {
     /// Whether an email provider is configured for transactional mail.
     ///
     /// Checks specifically for an enabled *email* notification provider —
-    /// not just any provider — because password reset, email verification
-    /// and magic links require real inbox delivery, not a Slack/webhook
-    /// channel.
+    /// not just any provider — because password reset and email
+    /// verification require real inbox delivery, not a Slack/webhook channel.
     pub async fn is_email_configured(&self) -> bool {
         self.email_service.is_email_provider_configured().await
     }
@@ -901,6 +1095,12 @@ pub enum UserAuthError {
         "MFA is required for the '{role}' role but user {user_id} has not enrolled multi-factor authentication"
     )]
     MfaRequiredForRole { user_id: i32, role: String },
+    #[error("User {user_id} is not required to change their password")]
+    PasswordChangeNotRequired { user_id: i32 },
+    #[error("New password must differ from the temporary password")]
+    SamePassword,
+    #[error("Failed to determine roles for user {user_id}: {reason}")]
+    RoleLookup { user_id: i32, reason: String },
 }
 
 /// Detect a Postgres unique-constraint violation regardless of the specific
@@ -918,7 +1118,7 @@ fn is_unique_violation(error: &sea_orm::DbErr) -> bool {
     // Match the specific constraint name rather than a generic "duplicate
     // key"/"23505" substring: this crate has other unique-constrained
     // columns reachable through `UserAuthError` (e.g.
-    // `magic_link_tokens.token`), and a generic substring match would
+    // `api_keys.key_hash`), and a generic substring match would
     // misreport an unrelated collision on one of those as
     // `EmailAlreadyRegistered`.
     error.to_string().contains("idx_users_email_unique")
@@ -930,6 +1130,15 @@ impl From<sea_orm::DbErr> for UserAuthError {
             return UserAuthError::EmailAlreadyRegistered;
         }
         UserAuthError::DatabaseError(error)
+    }
+}
+
+impl From<sea_orm::TransactionError<UserAuthError>> for UserAuthError {
+    fn from(error: sea_orm::TransactionError<UserAuthError>) -> Self {
+        match error {
+            sea_orm::TransactionError::Transaction(error) => error,
+            sea_orm::TransactionError::Connection(error) => error.into(),
+        }
     }
 }
 
@@ -948,11 +1157,6 @@ pub struct LoginRequest {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct MagicLinkRequest {
-    pub email: String,
-}
-
-#[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ResetPasswordRequest {
     pub token: String,
     pub new_password: String,
@@ -963,14 +1167,14 @@ mod tests {
     use super::*;
     use axum::http::HeaderMap;
     use chrono::{Duration, Utc};
+    use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_database::test_utils::TestDatabase;
     use temps_entities::types::RoleType;
-    use temps_entities::{magic_link_tokens, sessions, settings, users};
+    use temps_entities::{sessions, settings, users};
 
     struct MockEmailService {
         verification_emails_sent: std::sync::Mutex<Vec<(String, String, String)>>,
         password_reset_emails_sent: std::sync::Mutex<Vec<(String, String, String)>>,
-        magic_link_emails_sent: std::sync::Mutex<Vec<(String, String)>>,
     }
 
     impl MockEmailService {
@@ -978,7 +1182,6 @@ mod tests {
             Self {
                 verification_emails_sent: std::sync::Mutex::new(Vec::new()),
                 password_reset_emails_sent: std::sync::Mutex::new(Vec::new()),
-                magic_link_emails_sent: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -988,10 +1191,6 @@ mod tests {
 
         fn get_password_reset_emails(&self) -> Vec<(String, String, String)> {
             self.password_reset_emails_sent.lock().unwrap().clone()
-        }
-
-        fn get_magic_link_emails(&self) -> Vec<(String, String)> {
-            self.magic_link_emails_sent.lock().unwrap().clone()
         }
     }
 
@@ -1027,15 +1226,6 @@ mod tests {
                             "".to_string(),
                             url,
                         ));
-                    }
-                } else if message.subject.contains("Magic") {
-                    // Extract magic link URL from body
-                    if let Some(start) = message.body.find("Click here to login: ") {
-                        let url = &message.body[start + 21..];
-                        self.magic_link_emails_sent
-                            .lock()
-                            .unwrap()
-                            .push((to.clone(), url.to_string()));
                     }
                 }
             }
@@ -1137,7 +1327,7 @@ mod tests {
             updated_at: Set(Utc::now()),
             mfa_enabled: Set(mfa_enabled),
             mfa_secret: if mfa_enabled {
-                Set(Some("JBSWY3DPEHPK3PXP".to_string()))
+                Set(Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()))
             } else {
                 Set(None)
             },
@@ -1280,6 +1470,87 @@ mod tests {
         // Session should be valid
         let verified_user = auth_service.verify_session(&session_token).await.unwrap();
         assert_eq!(verified_user.id, user.id);
+    }
+
+    /// Regression: an MFA challenge token (first factor only) must never
+    /// authenticate a real request. Before the `mfa_pending` discriminator,
+    /// `create_mfa_session` inserted an ordinary `sessions` row and
+    /// `verify_session` accepted it, so replaying the `mfa_session` cookie as
+    /// the `session` cookie yielded a fully authenticated context without the
+    /// second factor.
+    #[tokio::test]
+    async fn test_mfa_pending_session_cannot_authenticate_via_verify_session() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = create_test_user(&db.db, "mfabypass@example.com", "password").await;
+
+        // Token handed to the client as the `mfa_session` cookie.
+        let mfa_token = auth_service.create_mfa_session(user.id).await.unwrap();
+
+        // The attack: replay it on the normal session path.
+        let result = auth_service.verify_session(&mfa_token).await;
+        assert!(
+            result.is_err(),
+            "MFA challenge token must NOT authenticate a real request"
+        );
+        assert!(
+            matches!(result.unwrap_err(), AuthError::NotFound(_)),
+            "MFA challenge token should be indistinguishable from a missing session"
+        );
+
+        // Sanity: a genuine session on the same user still authenticates.
+        let real_token = auth_service.create_session(user.id).await.unwrap();
+        assert_eq!(
+            auth_service.verify_session(&real_token).await.unwrap().id,
+            user.id
+        );
+    }
+
+    /// Regression (symmetric): a real, fully authenticated session token must
+    /// not be consumable as an MFA challenge. `verify_mfa_challenge` filters on
+    /// `mfa_pending = true`, so a real token is rejected before the TOTP code
+    /// is ever checked.
+    #[tokio::test]
+    async fn test_real_session_cannot_be_used_as_mfa_challenge() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = create_test_user(&db.db, "notachallenge@example.com", "password").await;
+
+        let real_token = auth_service.create_session(user.id).await.unwrap();
+
+        let result = auth_service
+            .verify_mfa_challenge(&real_token, "000000")
+            .await;
+        assert!(
+            matches!(result, Err(MfaChallengeError::InvalidOrExpiredSession)),
+            "A real session token must be rejected before TOTP verification, got: {result:?}"
+        );
+    }
+
+    /// A pending MFA challenge row is not a real, active session, so it must
+    /// not inflate the concurrent-session count used for login auditing.
+    #[tokio::test]
+    async fn test_mfa_pending_session_not_counted_as_active() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user = create_test_user(&db.db, "activecount@example.com", "password").await;
+
+        auth_service.create_mfa_session(user.id).await.unwrap();
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            0,
+            "A pending MFA challenge must not count as an active session"
+        );
+
+        auth_service.create_session(user.id).await.unwrap();
+        assert_eq!(
+            auth_service.count_active_sessions(user.id).await.unwrap(),
+            1,
+            "Only the real session should be counted"
+        );
     }
 
     #[tokio::test]
@@ -1510,130 +1781,6 @@ mod tests {
         assert_eq!(user.email, "user@example.com");
     }
 
-    // Magic Link Tests
-
-    #[tokio::test]
-    async fn test_send_magic_link_existing_user() {
-        let (db, auth_service, email_service) = setup_test_env().await;
-        create_test_user(&db.db, "user@example.com", "password").await;
-
-        let request = MagicLinkRequest {
-            email: "user@example.com".to_string(),
-        };
-
-        auth_service.send_magic_link(request).await.unwrap();
-
-        // Verify token was saved
-        let token = magic_link_tokens::Entity::find()
-            .filter(magic_link_tokens::Column::Email.eq("user@example.com"))
-            .one(db.db.as_ref())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(!token.used);
-        assert!(token.expires_at > Utc::now());
-
-        // Verify email was sent
-        let emails = email_service.get_magic_link_emails();
-        assert_eq!(emails.len(), 1);
-        assert_eq!(emails[0].0, "user@example.com");
-    }
-
-    #[tokio::test]
-    async fn test_send_magic_link_nonexistent_user() {
-        let (_db, auth_service, email_service) = setup_test_env().await;
-
-        let request = MagicLinkRequest {
-            email: "nonexistent@example.com".to_string(),
-        };
-
-        // Should not error to prevent email enumeration
-        auth_service.send_magic_link(request).await.unwrap();
-
-        // No email should be sent
-        let emails = email_service.get_magic_link_emails();
-        assert_eq!(emails.len(), 0);
-    }
-
-    #[tokio::test]
-    async fn test_verify_magic_link_valid() {
-        let (db, auth_service, _) = setup_test_env().await;
-        let user = create_test_user(&db.db, "user@example.com", "password").await;
-
-        // Create magic link token manually
-        let token = Uuid::new_v4().to_string();
-        let magic_link = magic_link_tokens::ActiveModel {
-            email: Set("user@example.com".to_string()),
-            token: Set(token.clone()),
-            expires_at: Set(Utc::now() + Duration::minutes(15)),
-            used: Set(false),
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        magic_link.insert(db.db.as_ref()).await.unwrap();
-
-        let verified_user = auth_service.verify_magic_link(&token).await.unwrap();
-
-        assert_eq!(verified_user.id, user.id);
-
-        // Verify token was marked as used
-        let updated_token = magic_link_tokens::Entity::find()
-            .filter(magic_link_tokens::Column::Token.eq(&token))
-            .one(db.db.as_ref())
-            .await
-            .unwrap()
-            .unwrap();
-
-        assert!(updated_token.used);
-    }
-
-    #[tokio::test]
-    async fn test_verify_magic_link_expired() {
-        let (db, auth_service, _) = setup_test_env().await;
-        create_test_user(&db.db, "user@example.com", "password").await;
-
-        // Create expired token
-        let token = Uuid::new_v4().to_string();
-        let magic_link = magic_link_tokens::ActiveModel {
-            email: Set("user@example.com".to_string()),
-            token: Set(token.clone()),
-            expires_at: Set(Utc::now() - Duration::minutes(1)), // Expired
-            used: Set(false),
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        magic_link.insert(db.db.as_ref()).await.unwrap();
-
-        let result = auth_service.verify_magic_link(&token).await;
-
-        assert!(result.is_err());
-        matches!(result.unwrap_err(), UserAuthError::InvalidToken);
-    }
-
-    #[tokio::test]
-    async fn test_verify_magic_link_already_used() {
-        let (db, auth_service, _) = setup_test_env().await;
-        create_test_user(&db.db, "user@example.com", "password").await;
-
-        // Create used token
-        let token = Uuid::new_v4().to_string();
-        let magic_link = magic_link_tokens::ActiveModel {
-            email: Set("user@example.com".to_string()),
-            token: Set(token.clone()),
-            expires_at: Set(Utc::now() + Duration::minutes(15)),
-            used: Set(true), // Already used
-            created_at: Set(Utc::now()),
-            ..Default::default()
-        };
-        magic_link.insert(db.db.as_ref()).await.unwrap();
-
-        let result = auth_service.verify_magic_link(&token).await;
-
-        assert!(result.is_err());
-        matches!(result.unwrap_err(), UserAuthError::InvalidToken);
-    }
-
     // Password Reset Tests
 
     #[tokio::test]
@@ -1687,6 +1834,7 @@ mod tests {
         let mut user_update: users::ActiveModel = user.clone().into();
         user_update.password_reset_token = Set(Some(reset_token.clone()));
         user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+        user_update.must_change_password = Set(true);
         user_update.update(db.db.as_ref()).await.unwrap();
 
         // Reset password
@@ -1706,6 +1854,7 @@ mod tests {
 
         assert!(updated_user.password_reset_token.is_none());
         assert!(updated_user.password_reset_expires.is_none());
+        assert!(!updated_user.must_change_password);
 
         // Verify new password works
         let login = LoginRequest {
@@ -1713,6 +1862,198 @@ mod tests {
             password: "newSecurePassword123!".to_string(),
         };
         auth_service.login(login).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn email_reset_rejects_temporary_password_reuse() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user =
+            create_test_user(&db.db, "forced-email-reset@example.com", "Temporary123!").await;
+        let reset_token = Uuid::new_v4().to_string();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::hours(1)));
+        user_update.must_change_password = Set(true);
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        let result = auth_service
+            .reset_password(ResetPasswordRequest {
+                token: reset_token.clone(),
+                new_password: "Temporary123!".to_string(),
+            })
+            .await;
+
+        assert!(matches!(result, Err(UserAuthError::SamePassword)));
+        let unchanged = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(unchanged.must_change_password);
+        assert_eq!(
+            unchanged.password_reset_token.as_deref(),
+            Some(reset_token.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn required_password_change_rejects_temporary_password_reuse() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "forced-change@example.com", "Temporary123!").await;
+        let reset_token = Uuid::new_v4().to_string();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
+        user_update.must_change_password = Set(true);
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        let result = auth_service
+            .reset_required_password(ResetPasswordRequest {
+                token: reset_token.clone(),
+                new_password: "Temporary123!".to_string(),
+            })
+            .await;
+
+        assert!(matches!(result, Err(UserAuthError::SamePassword)));
+        let unchanged = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(unchanged.must_change_password);
+        assert_eq!(
+            unchanged.password_reset_token.as_deref(),
+            Some(reset_token.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn required_password_change_consumes_token_and_allows_session_creation() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user =
+            create_test_user(&db.db, "forced-change-success@example.com", "Temporary123!").await;
+        let reset_token = Uuid::new_v4().to_string();
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
+        user_update.must_change_password = Set(true);
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        let updated = auth_service
+            .reset_required_password(ResetPasswordRequest {
+                token: reset_token.clone(),
+                new_password: "DifferentPassword123!".to_string(),
+            })
+            .await
+            .unwrap();
+
+        assert!(!updated.must_change_password);
+        assert!(updated.password_reset_token.is_none());
+        assert!(auth_service.create_session(user.id).await.is_ok());
+        assert!(matches!(
+            auth_service
+                .reset_required_password(ResetPasswordRequest {
+                    token: reset_token,
+                    new_password: "AnotherPassword123!".to_string(),
+                })
+                .await,
+            Err(UserAuthError::InvalidToken)
+        ));
+    }
+
+    #[tokio::test]
+    async fn required_password_change_token_is_single_use_under_concurrency() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user =
+            create_test_user(&db.db, "forced-change-race@example.com", "Temporary123!").await;
+        let reset_token = Uuid::new_v4().to_string();
+        let mut user_update: users::ActiveModel = user.into();
+        user_update.password_reset_token = Set(Some(reset_token.clone()));
+        user_update.password_reset_expires = Set(Some(Utc::now() + Duration::minutes(15)));
+        user_update.must_change_password = Set(true);
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        let first = auth_service.reset_required_password(ResetPasswordRequest {
+            token: reset_token.clone(),
+            new_password: "FirstReplacement123!".to_string(),
+        });
+        let second = auth_service.reset_required_password(ResetPasswordRequest {
+            token: reset_token,
+            new_password: "SecondReplacement123!".to_string(),
+        });
+        let (first_result, second_result) = tokio::join!(first, second);
+
+        assert_ne!(first_result.is_ok(), second_result.is_ok());
+        let rejected = if first_result.is_err() {
+            first_result
+        } else {
+            second_result
+        };
+        assert!(matches!(rejected, Err(UserAuthError::InvalidToken)));
+    }
+
+    #[tokio::test]
+    async fn full_session_is_rejected_while_password_change_is_required() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "no-session@example.com", "Temporary123!").await;
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.must_change_password = Set(true);
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        let result = auth_service.create_session(user.id).await;
+
+        assert!(matches!(
+            result,
+            Err(AuthError::PasswordChangeRequired { user_id }) if user_id == user.id
+        ));
+        assert_eq!(
+            sessions::Entity::find()
+                .filter(sessions::Column::UserId.eq(user.id))
+                .count(db.db.as_ref())
+                .await
+                .unwrap(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn required_password_change_token_is_short_lived_and_only_for_flagged_users() {
+        let (db, auth_service, _) = setup_test_env().await;
+        let user = create_test_user(&db.db, "temporary@example.com", "Temporary1!").await;
+
+        let result = auth_service
+            .create_required_password_change_token(user.id)
+            .await;
+        assert!(matches!(
+            result,
+            Err(UserAuthError::PasswordChangeNotRequired { user_id }) if user_id == user.id
+        ));
+
+        let mut user_update: users::ActiveModel = user.clone().into();
+        user_update.must_change_password = Set(true);
+        user_update.update(db.db.as_ref()).await.unwrap();
+
+        let issued_at = Utc::now();
+        let token = auth_service
+            .create_required_password_change_token(user.id)
+            .await
+            .unwrap();
+        let updated_user = users::Entity::find_by_id(user.id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            updated_user.password_reset_token.as_deref(),
+            Some(token.as_str())
+        );
+        let expires_at = updated_user
+            .password_reset_expires
+            .expect("required password-change token has an expiry");
+        assert!(expires_at > issued_at + Duration::minutes(14));
+        assert!(expires_at <= issued_at + Duration::minutes(16));
+        assert!(updated_user.must_change_password);
     }
 
     #[tokio::test]
@@ -1839,8 +2180,128 @@ mod tests {
             .verify_mfa_challenge(&mfa_session_token, "123456")
             .await;
 
-        assert!(result.is_err());
-        matches!(result.unwrap_err(), AuthError::GenericError(_));
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::VerifierConfiguration { user_id, .. })
+                if user_id == user.id
+        ));
+    }
+
+    fn current_totp_code(secret: &str) -> String {
+        let secret_bytes = base32::decode(base32::Alphabet::Rfc4648 { padding: true }, secret)
+            .expect("test secret should be valid base32");
+        // In totp-rs 6.0.0 the constructor is Builder-based and generate_current()
+        // returns Token (implements Display), not Result<String, _>.
+        totp_rs::Builder::new()
+            .with_algorithm(totp_rs::Algorithm::SHA1)
+            .with_digits(6)
+            .with_skew(1)
+            .with_step_duration(30)
+            .with_secret(secret_bytes)
+            .build_noncompliant()
+            .generate_current()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_verify_mfa_challenge_distinguishes_invalid_code() {
+        let Some((db, auth_service)) = setup_test_env_with_mfa_setting(false).await else {
+            return;
+        };
+        let user =
+            create_test_user_with_mfa(&db.db, "wrong-code@example.com", "password", true).await;
+        let session_token = auth_service.create_mfa_session(user.id).await.unwrap();
+        let current_code = current_totp_code("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
+        let wrong_code = if current_code == "000000" {
+            "000001"
+        } else {
+            "000000"
+        };
+
+        let result = auth_service
+            .verify_mfa_challenge(&session_token, wrong_code)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::InvalidCode { user_id }) if user_id == user.id
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_verify_mfa_challenge_distinguishes_database_failure() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "challenge database unavailable".to_string(),
+            )])
+            .into_connection();
+        let auth_service = AuthService::new(Arc::new(db), Arc::new(MockEmailService::new()));
+
+        let result = auth_service
+            .verify_mfa_challenge("pending-session", "123456")
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::Database {
+                operation: "load the pending session",
+                user_id: None,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_correct_mfa_code_with_consume_failure_is_not_rejected_code() {
+        let now = Utc::now();
+        let user = users::Model {
+            id: 7,
+            name: "MFA User".to_string(),
+            email: "mfa-user@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: Some("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP".to_string()),
+            mfa_enabled: true,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let session = sessions::Model {
+            id: 9,
+            user_id: user.id,
+            session_token: "pending-session".to_string(),
+            expires_at: now + Duration::minutes(5),
+            mfa_pending: true,
+            step_up_expires_at: None,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![session]])
+            .append_query_results([vec![user]])
+            .append_exec_errors([sea_orm::DbErr::Custom("session delete failed".to_string())])
+            .into_connection();
+        let auth_service = AuthService::new(Arc::new(db), Arc::new(MockEmailService::new()));
+        let code = current_totp_code("JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP");
+
+        let result = auth_service
+            .verify_mfa_challenge("pending-session", &code)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::Database {
+                operation: "consume the verified pending session",
+                user_id: Some(7),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -1862,8 +2323,10 @@ mod tests {
             .verify_mfa_challenge(session_token, "123456")
             .await;
 
-        assert!(result.is_err());
-        matches!(result.unwrap_err(), AuthError::GenericError(_));
+        assert!(matches!(
+            result,
+            Err(MfaChallengeError::InvalidOrExpiredSession)
+        ));
     }
 
     // Helper Method Tests
@@ -2037,10 +2500,10 @@ mod tests {
     #[test]
     fn is_unique_violation_false_for_unrelated_unique_constraint() {
         // A collision on a *different* unique-constrained column (e.g.
-        // magic_link_tokens.token) must not be misreported as a duplicate
+        // api_keys.key_hash) must not be misreported as a duplicate
         // email -- only `idx_users_email_unique` should match.
         let err = sea_orm::DbErr::Custom(
-            "error returned from database: duplicate key value violates unique constraint \"magic_link_tokens_token_key\" (SQLSTATE 23505)".to_string(),
+            "error returned from database: duplicate key value violates unique constraint \"api_keys_key_hash_key\" (SQLSTATE 23505)".to_string(),
         );
         assert!(!is_unique_violation(&err));
     }
@@ -2332,6 +2795,7 @@ mod tests {
             email_verification_expires: None,
             password_reset_token: None,
             password_reset_expires: None,
+            must_change_password: false,
             deleted_at: None,
             mfa_secret: None,
             mfa_enabled: false,

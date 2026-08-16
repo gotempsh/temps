@@ -20,7 +20,6 @@ use std::process::Command;
 
 use nix::libc;
 use nix::pty::{openpty, Winsize};
-use nix::sys::termios::{self, SetArg};
 use tokio::fs::File;
 
 /// Everything we need to talk to a spawned PTY child.
@@ -50,17 +49,24 @@ pub fn spawn_pty(
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    // Start in raw mode — the child program (bash / claude / opencode) will
-    // renegotiate its own termios once it opens the slave. Without this the
-    // PTY defaults to line-buffered cooked mode, so the user's keystrokes
-    // don't reach the child until they press Enter.
+    // Leave the pty at its kernel defaults — cooked mode with ECHO and
+    // ICANON on, exactly what `openpty` hands back and what every other
+    // terminal multiplexer (ssh, script, tmux) starts from.
+    //
+    // This used to call `cfmakeraw()` here, on the theory that raw mode was
+    // needed for keystrokes to reach the child before Enter. That is the
+    // child's decision, not ours: readline (bash) and full-screen TUIs
+    // (claude, vim) each call `tcsetattr` themselves when they want
+    // char-at-a-time input. Forcing raw up front only cleared ECHO for
+    // everything that *doesn't* renegotiate — which is bash, whose readline
+    // then assumed the driver was echoing. The result was a shell where
+    // commands ran but the user could not see a single character they
+    // typed; `stty -a` inside the session reported `-echo -icanon`.
+    //
+    // Terminals do not manage the line discipline for their children. We
+    // move bytes; the program on the far end owns its termios.
     let result =
         openpty(Some(&winsize), None).map_err(|e| io::Error::other(format!("openpty: {e}")))?;
-    // Put the master in raw mode so we don't eat characters.
-    if let Ok(mut t) = termios::tcgetattr(&result.master) {
-        termios::cfmakeraw(&mut t);
-        let _ = termios::tcsetattr(&result.master, SetArg::TCSANOW, &t);
-    }
 
     let master_fd: OwnedFd = result.master;
     let slave_fd: OwnedFd = result.slave;
@@ -222,6 +228,39 @@ mod tests {
         // PTY often CR-LF translates, so match loosely.
         let s = String::from_utf8_lossy(&buf[..n]);
         assert!(s.contains("hello"), "output did not contain 'hello': {s:?}");
+    }
+
+    /// The pty must start with ECHO and ICANON on.
+    ///
+    /// This is the regression guard for a shell in which commands ran but
+    /// the user could not see a single character they typed: the pty was
+    /// put into raw mode at creation, clearing ECHO, and bash's readline
+    /// assumed the driver was echoing. Anything that wants raw mode — vim,
+    /// claude, readline itself — sets it per-program; a terminal must not
+    /// pre-empt that decision for the whole session.
+    #[tokio::test]
+    async fn pty_starts_with_echo_and_canonical_mode_enabled() {
+        use nix::sys::termios::{self, LocalFlags};
+
+        let pty = spawn_pty(
+            "sleep 5",
+            "/tmp",
+            &[("PATH".into(), "/usr/bin:/bin".into())],
+            80,
+            24,
+        )
+        .expect("spawn");
+
+        let attrs = termios::tcgetattr(&pty.master).expect("read pty termios");
+        assert!(
+            attrs.local_flags.contains(LocalFlags::ECHO),
+            "pty must start with ECHO enabled — without it the user types blind"
+        );
+        assert!(
+            attrs.local_flags.contains(LocalFlags::ICANON),
+            "pty must start in canonical mode; programs opt into raw themselves"
+        );
+        kill_tree(pty.pid).await;
     }
 
     #[tokio::test]

@@ -10,6 +10,7 @@ import {
   getEnvironmentVariables,
   createEnvironmentVariable,
   updateEnvironmentVariable,
+  getEnvironmentVariableValue,
 } from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptSelect, promptConfirm, promptCheckbox } from '../../ui/prompts.js'
@@ -21,6 +22,23 @@ import {
   colors,
   error as errorOutput,
 } from '../../ui/output.js'
+
+export function findEnvironment<T extends { name: string; slug: string }>(
+  envs: T[],
+  query: string
+): T | undefined {
+  return envs.find(e => e.name.toLowerCase() === query.toLowerCase() || e.slug === query)
+}
+
+export function formatEnvLine(key: string, value: string): string {
+  const escapedValue =
+    value.includes('\n') || value.includes('"')
+      ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+      : value.includes(' ') || value.includes('#')
+        ? `"${value}"`
+        : value
+  return `${key}=${escapedValue}`
+}
 
 async function resolveProjectId(slug: string): Promise<number> {
   const { data, error } = await getProjectBySlug({
@@ -55,6 +73,7 @@ async function pull(
     if (envsResult.error) throw new Error(getErrorMessage(envsResult.error))
 
     return {
+      projectId,
       vars: varsResult.data ?? [],
       envs: envsResult.data ?? [],
     }
@@ -64,10 +83,7 @@ async function pull(
 
   // Filter by environment
   if (options.environment) {
-    const targetEnv = result.envs.find(
-      e => e.name.toLowerCase() === options.environment!.toLowerCase() ||
-           e.slug === options.environment
-    )
+    const targetEnv = findEnvironment(result.envs, options.environment)
     if (!targetEnv) {
       errorOutput(`Environment "${options.environment}" not found`)
       info(`Available: ${result.envs.map(e => e.name).join(', ')}`)
@@ -99,16 +115,53 @@ async function pull(
     return
   }
 
+  // Write-only secrets have no readable value at all. Drop them, but say so
+  // explicitly rather than emitting an empty assignment that would blank the
+  // variable wherever this file gets loaded.
+  const secretVars = filteredVars.filter(v => v.is_secret)
+  const exportableVars = filteredVars.filter(v => !v.is_secret)
+
+  if (secretVars.length > 0) {
+    warning(
+      `Skipping ${secretVars.length} write-only secret(s): ${secretVars.map(v => v.key).join(', ')}. ` +
+        'Their values are never returned by the API — set them by hand where you need them.'
+    )
+  }
+
+  // The list endpoint masks every value as `***`; plaintext only comes from the
+  // audited per-key reveal endpoint. Without this the pull would overwrite the
+  // developer's .env with a file full of `***`.
+  // Keyed by row id: the same name can exist in several environments.
+  const resolvedValues = new Map<number, string>()
+  const unreadable: string[] = []
+  await withSpinner('Resolving values...', async () => {
+    for (const v of exportableVars) {
+      const valueResult = await getEnvironmentVariableValue({
+        client,
+        path: { project_id: result.projectId, key: v.key },
+        query: { var_id: v.id },
+      })
+      if (valueResult.error || !valueResult.data) {
+        unreadable.push(v.key)
+        continue
+      }
+      resolvedValues.set(v.id, valueResult.data.value)
+    }
+  })
+
+  if (unreadable.length > 0) {
+    errorOutput(
+      `Could not read ${unreadable.length} value(s): ${unreadable.join(', ')}. ` +
+        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        `overwriting ${outputFile} with partial values would blank these variables.`
+    )
+    process.exitCode = 1
+    return
+  }
+
   // Generate .env content
-  const envContent = filteredVars
-    .map(v => {
-      const escapedValue = v.value.includes('\n') || v.value.includes('"')
-        ? `"${v.value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
-        : v.value.includes(' ') || v.value.includes('#')
-          ? `"${v.value}"`
-          : v.value
-      return `${v.key}=${escapedValue}`
-    })
+  const envContent = exportableVars
+    .map(v => formatEnvLine(v.key, resolvedValues.get(v.id) ?? ''))
     .join('\n')
 
   const outputPath = path.isAbsolute(outputFile)
@@ -128,7 +181,7 @@ async function pull(
   }
 
   fs.writeFileSync(outputPath, envContent + '\n')
-  success(`Pulled ${filteredVars.length} variables to ${outputFile}`)
+  success(`Pulled ${exportableVars.length} variables to ${outputFile}`)
 }
 
 async function push(
@@ -190,9 +243,7 @@ async function push(
     const envNames = options.environment.split(',').map(n => n.trim().toLowerCase())
     environmentIds = []
     for (const name of envNames) {
-      const env = result.envs.find(e =>
-        e.name.toLowerCase() === name || e.slug === name
-      )
+      const env = findEnvironment(result.envs, name)
       if (!env) {
         errorOutput(`Environment "${name}" not found`)
         info(`Available: ${result.envs.map(e => e.name).join(', ')}`)
@@ -254,7 +305,7 @@ async function push(
   }
 }
 
-function parseEnvFile(content: string): Record<string, string> {
+export function parseEnvFile(content: string): Record<string, string> {
   const variables: Record<string, string> = {}
 
   for (const line of content.split('\n')) {

@@ -71,9 +71,14 @@ impl TempsPlugin for ProjectsPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let project_service = context.require_service::<ProjectService>();
+        let deployment_canceller = context.require_service::<dyn temps_core::DeploymentCanceller>();
+        let deployment_container_cleaner =
+            context.require_service::<dyn temps_core::DeploymentContainerCleaner>();
         let custom_domain_service = context.require_service::<CustomDomainService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
         let template_service = context.require_service::<TemplateService>();
+        let project_archive_cleaner =
+            context.require_service::<dyn temps_core::ProjectArchiveCleaner>();
         let telemetry = context
             .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
@@ -85,9 +90,12 @@ impl TempsPlugin for ProjectsPlugin {
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
+            deployment_canceller,
+            deployment_container_cleaner,
             custom_domain_service,
             audit_service,
             template_service,
+            project_archive_cleaner,
             telemetry,
             project_access_checker,
         });

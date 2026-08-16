@@ -1,4 +1,7 @@
-import { getProxyLogByIdOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  getProxyLogByIdOptions,
+  getProxyLogByRequestIdOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import {
   Card,
@@ -11,7 +14,7 @@ import { Separator } from '@/components/ui/separator'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
-import { Link as RouterLink } from 'react-router-dom'
+import { Link as RouterLink } from 'react-router'
 import {
   Activity,
   AlertCircle,
@@ -33,13 +36,20 @@ import {
 } from 'lucide-react'
 
 interface ProxyLogDetailProps {
-  logId: number
+  /**
+   * request_id of the log row (list links navigate with it — it resolves
+   * under both the TimescaleDB and ClickHouse backends), or a legacy
+   * numeric serial id from an old deep-link.
+   */
+  logId: string
   /**
    * Event time of the log row, forwarded from the list link. Bounds the
    * backend's hypertable lookup; without it the lookup falls back to a
    * wider (slower) scan.
    */
   timestamp?: string
+  /** Project scope required for non-administrator detail lookups. */
+  projectId?: number
 }
 
 function formatBytes(bytes: number | null | undefined): string {
@@ -62,17 +72,28 @@ function getDeviceIcon(deviceType: string | null | undefined) {
   }
 }
 
-export function ProxyLogDetail({ logId, timestamp }: ProxyLogDetailProps) {
-  const {
-    data: log,
-    isLoading,
-    error,
-  } = useQuery({
+export function ProxyLogDetail({
+  logId,
+  timestamp,
+  projectId,
+}: ProxyLogDetailProps) {
+  const isLegacyNumericId = /^\d+$/.test(logId)
+
+  const byId = useQuery({
     ...getProxyLogByIdOptions({
-      path: { id: logId },
-      query: timestamp ? { timestamp } : undefined,
+      path: { id: parseInt(logId, 10) },
+      query: { timestamp, project_id: projectId },
     }),
+    enabled: isLegacyNumericId,
   })
+  const byRequestId = useQuery({
+    ...getProxyLogByRequestIdOptions({
+      path: { request_id: logId },
+      query: { timestamp, project_id: projectId },
+    }),
+    enabled: !isLegacyNumericId,
+  })
+  const { data: log, isLoading, error } = isLegacyNumericId ? byId : byRequestId
 
   if (isLoading) {
     return (

@@ -5,6 +5,7 @@ pub mod ai_gateway_config;
 pub mod ai_messages;
 pub mod ai_pending_actions;
 pub mod ai_provider_keys;
+pub mod ai_provider_models;
 pub mod ai_usage_logs;
 pub mod alarms;
 pub mod cross_project_trace_refs;
@@ -54,6 +55,8 @@ pub mod external_images;
 pub mod external_service_backups;
 pub mod external_service_health_checks;
 pub mod external_services;
+pub mod feature_flag_environments;
+pub mod feature_flags;
 pub mod funnel_steps;
 pub mod funnels;
 pub mod git_provider_connections;
@@ -80,6 +83,7 @@ pub mod project_custom_domains;
 pub mod project_services;
 pub mod projects;
 pub mod proxy_logs;
+pub mod renewal_attempts;
 pub mod repositories;
 pub mod request_sessions;
 pub mod restore_runs;
@@ -91,19 +95,28 @@ pub mod secrets;
 pub mod service_endpoints;
 pub mod service_members;
 pub mod sessions;
+pub mod source_bundles;
 pub mod source_type;
 pub mod static_asset_cache;
 pub mod static_bundles;
+pub mod suppressed_recipients;
 pub mod tls_acme_certificates;
 pub mod types;
 pub mod upstream_config;
 pub mod user_roles;
 pub mod users;
 
+// Teams + project-scoped RBAC entities
+pub mod project_team_access;
+pub mod team_members;
+pub mod team_role;
+pub mod teams;
+
+pub use team_role::{TeamRole, TeamRoleParseError};
+
 // OpenTelemetry entities
 
 pub mod events;
-pub mod magic_link_tokens;
 pub mod session_replay_events;
 pub mod session_replay_sessions;
 pub mod settings;
@@ -115,6 +128,7 @@ pub mod error_alert_rules;
 pub mod error_events;
 pub mod error_groups;
 pub mod project_dsns;
+pub mod source_files;
 pub mod source_maps;
 pub mod tokenizer;
 
@@ -132,6 +146,9 @@ pub mod metric_dashboards;
 
 // Metric alert rules (first-class metric-centric alerting)
 pub mod metric_alert_rules;
+
+// OTel span attribute facets (pre-allocated slot columns for fast filtering)
+pub mod otel_span_facets;
 
 // Webhook entities
 pub mod webhook_deliveries;
@@ -152,6 +169,8 @@ pub mod log_chunks;
 pub mod log_events;
 
 // Standalone sandbox API (Vercel-compatible)
+pub mod sandbox_events;
+pub mod sandbox_snapshots;
 pub mod sandboxes;
 
 // Workflow memory

@@ -298,7 +298,38 @@ bunx @temps-sdk/cli containers list --project <slug>
 bunx @temps-sdk/cli runtime-logs --project <slug>
 ```
 
-**Full resource list:** projects, deployments, environments, domains, custom-domains, DNS, DNS providers, git providers, services, backups, containers, monitors, incidents, webhooks, API keys, tokens, users, settings, audit logs, proxy logs, errors, DSN, KV, blob, scans, IP access, email domains, email providers, emails, load balancer, templates, presets, funnels, notifications, notification preferences, platform.
+**Full resource list:** projects, deployments, environments, domains, custom-domains, DNS, DNS providers, git providers, services, backups, containers, monitors, incidents, webhooks, API keys, tokens, users, settings, audit logs, proxy logs, errors, DSN, KV, blob, scans, IP access, email domains, email providers, emails, load balancer, templates, presets, funnels, notifications, notification preferences, platform, data.
+
+## Browsing service data
+
+Read-only access to the data *inside* a service — tables, collections, keys and
+objects across PostgreSQL, MySQL/MariaDB, MongoDB, Redis and S3. Useful for
+answering questions about your application's real data from a script or a
+coding agent, without opening the console.
+
+```bash
+# What does this service support, and how do its containers nest?
+bunx @temps-sdk/cli data info my-db
+
+# Databases (or buckets), then tables (or collections/keys/objects)
+bunx @temps-sdk/cli data containers my-db
+bunx @temps-sdk/cli data tables my-db --path mydb/public
+
+# Columns and types, then the rows themselves
+bunx @temps-sdk/cli data schema my-db users --path mydb/public
+bunx @temps-sdk/cli data rows my-db users --path mydb/public --limit 20
+
+# Filter using the backend's own syntax (see `data info` for the schema)
+bunx @temps-sdk/cli data rows my-db users --path mydb/public \
+  --filter '{"where":"plan = '"'"'pro'"'"'"}' --json
+```
+
+Each command prints the next one with a real path filled in. `--path` is
+slash-separated and mirrors the engine's hierarchy — `mydb/public` for
+PostgreSQL (database/schema), just `mydb` for MySQL and MongoDB, the database
+number for Redis, the bucket name for S3.
+
+Add `--json` for untruncated, machine-readable output.
 
 ## CI/CD Integration
 

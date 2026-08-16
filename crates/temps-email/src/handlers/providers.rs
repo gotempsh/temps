@@ -19,11 +19,12 @@ use tracing::error;
 
 use super::audit::{
     EmailProviderCreatedAudit, EmailProviderDeletedAudit, EmailProviderTestedAudit,
-    EmailProviderUpdatedAudit,
+    EmailProviderTrackingSetupAudit, EmailProviderUpdatedAudit,
 };
 use super::types::{
     AppState, CreateEmailProviderRequest, EmailProviderResponse, EmailProviderTypeRoute,
-    TestEmailRequest, TestEmailResponse, UpdateEmailProviderRequest,
+    EmailTrackingSetupResponse, EmailTrackingStatusResponse, TestEmailRequest, TestEmailResponse,
+    UpdateEmailProviderRequest,
 };
 use crate::providers::{EmailProviderType, ScalewayCredentials, SesCredentials, SmtpCredentials};
 use crate::services::{CreateProviderRequest, ProviderCredentials, UpdateProviderRequest};
@@ -42,6 +43,14 @@ pub fn routes() -> Router<Arc<AppState>> {
                 .delete(delete_email_provider),
         )
         .route("/email-providers/{id}/test", post(test_provider))
+        .route(
+            "/email-providers/{id}/tracking/status",
+            get(get_email_tracking_status),
+        )
+        .route(
+            "/email-providers/{id}/tracking/setup",
+            post(setup_email_tracking),
+        )
 }
 
 /// Create a new email provider
@@ -125,10 +134,11 @@ pub async fn create_email_provider(
         region: request.region.clone(),
         credentials,
     };
+    let sns_topic_arn = request.sns_topic_arn.clone();
 
     let provider = state
         .provider_service
-        .create(create_request)
+        .create_with_sns_topic(create_request, sns_topic_arn)
         .await
         .map_err(|e| {
             error!("Failed to create email provider: {}", e);
@@ -175,6 +185,7 @@ pub async fn create_email_provider(
             .map(EmailProviderTypeRoute::from)
             .unwrap_or(EmailProviderTypeRoute::Ses),
         region: provider.region,
+        sns_topic_arn: provider.sns_topic_arn,
         is_active: provider.is_active,
         credentials: masked_credentials,
         created_at: provider.created_at.to_rfc3339(),
@@ -225,6 +236,7 @@ pub async fn list_email_providers(
                     .map(EmailProviderTypeRoute::from)
                     .unwrap_or(EmailProviderTypeRoute::Ses),
                 region: p.region,
+                sns_topic_arn: p.sns_topic_arn,
                 is_active: p.is_active,
                 credentials: masked_credentials,
                 created_at: p.created_at.to_rfc3339(),
@@ -277,6 +289,7 @@ pub async fn get_email_provider(
             .map(EmailProviderTypeRoute::from)
             .unwrap_or(EmailProviderTypeRoute::Ses),
         region: provider.region,
+        sns_topic_arn: provider.sns_topic_arn,
         is_active: provider.is_active,
         credentials: masked_credentials,
         created_at: provider.created_at.to_rfc3339(),
@@ -403,6 +416,7 @@ pub async fn update_email_provider(
         }
     };
 
+    let sns_topic_arn = request.sns_topic_arn;
     let update_request = UpdateProviderRequest {
         name: request.name,
         region: request.region,
@@ -412,7 +426,7 @@ pub async fn update_email_provider(
 
     let outcome = state
         .provider_service
-        .update(id, update_request)
+        .update_with_sns_topic(id, update_request, sns_topic_arn)
         .await
         .map_err(|e: crate::errors::EmailError| -> Problem {
             error!("Failed to update email provider {}: {}", id, e);
@@ -452,6 +466,7 @@ pub async fn update_email_provider(
             .map(EmailProviderTypeRoute::from)
             .unwrap_or(EmailProviderTypeRoute::Ses),
         region: provider.region,
+        sns_topic_arn: provider.sns_topic_arn,
         is_active: provider.is_active,
         credentials: masked_credentials,
         created_at: provider.created_at.to_rfc3339(),
@@ -603,5 +618,166 @@ pub async fn test_provider(
         sent_to: result.recipient_email,
         provider_message_id: result.provider_message_id,
         error: result.error,
+    }))
+}
+
+/// The public SES tracking webhook URL for the current external URL.
+async fn tracking_webhook_url(state: &AppState) -> Result<String, Problem> {
+    let external_url = state
+        .config_service
+        .get_external_url_or_default()
+        .await
+        .map_err(|e| {
+            error!("Failed to resolve external URL: {}", e);
+            internal_server_error()
+                .detail("Failed to resolve the instance external URL")
+                .build()
+        })?;
+    Ok(format!(
+        "{}/api/t/webhook/ses",
+        external_url.trim_end_matches('/')
+    ))
+}
+
+/// Live status of SES event tracking for a provider
+#[utoipa::path(
+    tag = "Email Providers",
+    get,
+    path = "/email-providers/{id}/tracking/status",
+    params(("id" = i32, Path, description = "Provider ID")),
+    responses(
+        (status = 200, description = "Event tracking status", body = EmailTrackingStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Provider not found")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_email_tracking_status(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailProvidersRead);
+
+    let provider = state.provider_service.get(id).await.map_err(|e| match e {
+        crate::EmailError::ProviderNotFound(_) => not_found().detail("Provider not found").build(),
+        other => {
+            error!("Failed to load email provider {id}: {other}");
+            internal_server_error()
+                .detail("Failed to load provider")
+                .build()
+        }
+    })?;
+
+    let webhook_url = tracking_webhook_url(&state).await?;
+    let supports_event_tracking = EmailProviderType::from_str(&provider.provider_type)
+        .map(|t| t == EmailProviderType::Ses)
+        .unwrap_or(false);
+
+    let last_event_at = if supports_event_tracking {
+        state
+            .tracking_setup_service
+            .last_provider_event_at(id)
+            .await
+            .map_err(|e| {
+                error!("Failed to query last provider event: {}", e);
+                internal_server_error()
+                    .detail("Failed to query event history")
+                    .build()
+            })?
+    } else {
+        None
+    };
+
+    Ok(Json(EmailTrackingStatusResponse {
+        webhook_url,
+        supports_event_tracking,
+        sns_topic_arn: provider.sns_topic_arn,
+        subscription_confirmed_at: provider
+            .sns_subscription_confirmed_at
+            .map(|dt| dt.to_rfc3339()),
+        last_event_at: last_event_at.map(|dt| dt.to_rfc3339()),
+    }))
+}
+
+/// One-click AWS-side setup of SES event tracking (SNS topic + webhook
+/// subscription + SESv2 event destination), using the provider's stored
+/// credentials.
+#[utoipa::path(
+    tag = "Email Providers",
+    post,
+    path = "/email-providers/{id}/tracking/setup",
+    params(("id" = i32, Path, description = "Provider ID")),
+    responses(
+        (status = 200, description = "Setup completed", body = EmailTrackingSetupResponse),
+        (status = 400, description = "Provider does not support event tracking"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Provider not found"),
+        (status = 502, description = "An AWS call failed — the response detail names the failed step")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn setup_email_tracking(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EmailProvidersWrite);
+
+    let provider = state.provider_service.get(id).await.map_err(|e| match e {
+        crate::EmailError::ProviderNotFound(_) => not_found().detail("Provider not found").build(),
+        other => {
+            error!("Failed to load email provider {id}: {other}");
+            internal_server_error()
+                .detail("Failed to load provider")
+                .build()
+        }
+    })?;
+
+    let webhook_url = tracking_webhook_url(&state).await?;
+
+    let result = state
+        .tracking_setup_service
+        .setup_ses_event_tracking(id, &webhook_url)
+        .await
+        .map_err(|e| match e {
+            crate::EmailError::Validation(msg) | crate::EmailError::Configuration(msg) => {
+                bad_request().detail(msg).build()
+            }
+            crate::EmailError::ProviderNotFound(_) => {
+                not_found().detail("Provider not found").build()
+            }
+            other => {
+                error!("Event tracking setup failed: {}", other);
+                temps_core::error_builder::ErrorBuilder::new(StatusCode::BAD_GATEWAY)
+                    .title("AWS Setup Failed")
+                    .detail(other.to_string())
+                    .build()
+            }
+        })?;
+
+    let audit = EmailProviderTrackingSetupAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        provider_id: provider.id,
+        name: provider.name,
+        topic_arn: result.topic_arn.clone(),
+        webhook_url: result.webhook_url.clone(),
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!("Failed to create audit log: {}", e);
+    }
+
+    Ok(Json(EmailTrackingSetupResponse {
+        topic_arn: result.topic_arn,
+        webhook_url: result.webhook_url,
+        subscription_requested: result.subscription_requested,
+        event_destination_attached: result.event_destination_attached,
     }))
 }

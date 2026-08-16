@@ -11,6 +11,9 @@ use crate::error::OtelError;
 use crate::storage::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageResult};
 use crate::types::*;
 
+/// Cross-project trace refs: `(trace_id, project_id)` → `first_seen`.
+pub type TraceRefMap = HashMap<(String, i32), chrono::DateTime<chrono::Utc>>;
+
 /// In-memory storage backend for tests.
 ///
 /// Stores all data in `Arc<Mutex<...>>` collections so tests can
@@ -23,6 +26,9 @@ pub struct MockOtelStorage {
     pub archived_logs: Arc<Mutex<Vec<LogRecord>>>,
     pub insights: Arc<Mutex<Vec<Insight>>>,
     pub health_summaries: Arc<Mutex<Vec<HealthSummary>>>,
+    /// Cross-project trace refs keyed by `(trace_id, project_id)` — value is
+    /// the `first_seen` of the FIRST recording (later re-recordings are no-ops).
+    pub trace_refs: Arc<Mutex<TraceRefMap>>,
     pub next_insight_id: Arc<Mutex<i64>>,
     /// If set, store_spans will return this error instead.
     pub fail_store_spans: Arc<Mutex<Option<String>>>,
@@ -65,6 +71,163 @@ impl MockOtelStorage {
     pub fn get_storage_quota_call_count(&self) -> u32 {
         *self.get_storage_quota_calls.lock().unwrap()
     }
+
+    /// Aggregate the stored spans exactly as a real backend would: filter,
+    /// group by `(project, service, span name)`, apply the `min_count` floor,
+    /// then sort. Shared by `query_span_stats` and `count_span_stats` so the
+    /// mock cannot report a total that disagrees with its own rows.
+    fn aggregate_span_stats(&self, query: &SpanStatsQuery) -> Vec<SpanStats> {
+        let spans = self.spans.lock().unwrap();
+
+        let mut groups: HashMap<(i32, String, String), Vec<SpanRecord>> = HashMap::new();
+        for span in spans.iter() {
+            if !query.project_ids.contains(&span.project_id) {
+                continue;
+            }
+            if span.start_time < query.start_time || span.start_time > query.end_time {
+                continue;
+            }
+            if let Some(ref svc) = query.service_name {
+                if &span.resource.service_name != svc {
+                    continue;
+                }
+            }
+            if let Some(ref name) = query.span_name {
+                if &span.name != name {
+                    continue;
+                }
+            }
+            if let Some(ref pattern) = query.name_pattern {
+                if !span.name.to_lowercase().contains(&pattern.to_lowercase()) {
+                    continue;
+                }
+            }
+            if let Some(kind) = query.kind {
+                if span.kind != kind {
+                    continue;
+                }
+            }
+            if let Some(status) = query.status {
+                if span.status_code != status {
+                    continue;
+                }
+            }
+            if let Some(min_dur) = query.min_duration_ms {
+                if span.duration_ms < min_dur {
+                    continue;
+                }
+            }
+            groups
+                .entry((
+                    span.project_id,
+                    span.resource.service_name.clone(),
+                    span.name.clone(),
+                ))
+                .or_default()
+                .push(span.clone());
+        }
+
+        let mut rows: Vec<SpanStats> = groups
+            .into_iter()
+            .filter(|(_, members)| members.len() as u64 >= query.min_count)
+            .map(|((project_id, service_name, span_name), members)| {
+                let mut durations: Vec<f64> = members.iter().map(|s| s.duration_ms).collect();
+                durations.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                let count = durations.len() as i64;
+                let total: f64 = durations.iter().sum();
+                let avg = total / count as f64;
+                // Sample standard deviation; a single sample has no spread.
+                let stddev = if count > 1 {
+                    (durations.iter().map(|d| (d - avg).powi(2)).sum::<f64>()
+                        / (count as f64 - 1.0))
+                        .sqrt()
+                } else {
+                    0.0
+                };
+                let error_count = members
+                    .iter()
+                    .filter(|s| s.status_code == SpanStatusCode::Error)
+                    .count() as i64;
+                let last_seen = members
+                    .iter()
+                    .map(|s| s.start_time)
+                    .max()
+                    .unwrap_or_else(chrono::Utc::now);
+                let kind = members.last().map(|s| s.kind).unwrap_or(SpanKind::Internal);
+
+                build_span_stats(
+                    SpanStatsGroup {
+                        project_id,
+                        service_name,
+                        span_name,
+                        kind,
+                        count,
+                        error_count,
+                    },
+                    SpanDurationStats {
+                        total_ms: total,
+                        min_ms: durations.first().copied().unwrap_or(0.0),
+                        max_ms: durations.last().copied().unwrap_or(0.0),
+                        avg_ms: avg,
+                        stddev_ms: stddev,
+                        p50_ms: percentile(&durations, 0.50),
+                        p95_ms: percentile(&durations, 0.95),
+                        p99_ms: percentile(&durations, 0.99),
+                    },
+                    last_seen,
+                )
+            })
+            .collect();
+
+        rows.sort_by(|a, b| {
+            let key = |s: &SpanStats| match query.sort_by {
+                SpanStatsSortField::TotalDurationMs => s.total_duration_ms,
+                SpanStatsSortField::P50DurationMs => s.p50_duration_ms,
+                SpanStatsSortField::P95DurationMs => s.p95_duration_ms,
+                SpanStatsSortField::P99DurationMs => s.p99_duration_ms,
+                SpanStatsSortField::MaxDurationMs => s.max_duration_ms,
+                SpanStatsSortField::AvgDurationMs => s.avg_duration_ms,
+                SpanStatsSortField::StddevDurationMs => s.stddev_duration_ms,
+                SpanStatsSortField::Count => s.count as f64,
+                SpanStatsSortField::ErrorCount => s.error_count as f64,
+                SpanStatsSortField::ErrorRate => s.error_rate,
+                SpanStatsSortField::CoefficientOfVariation => s.coefficient_of_variation,
+                SpanStatsSortField::TailRatio => s.tail_ratio,
+            };
+            let ordering = key(a)
+                .partial_cmp(&key(b))
+                .unwrap_or(std::cmp::Ordering::Equal);
+            let ordering = match query.sort_order {
+                SortOrder::Asc => ordering,
+                SortOrder::Desc => ordering.reverse(),
+            };
+            // Same deterministic tie-breaker the SQL backends use.
+            ordering
+                .then_with(|| a.project_id.cmp(&b.project_id))
+                .then_with(|| a.service_name.cmp(&b.service_name))
+                .then_with(|| a.span_name.cmp(&b.span_name))
+        });
+
+        rows
+    }
+}
+
+/// Linear-interpolated percentile over a pre-sorted slice, matching
+/// PostgreSQL's `percentile_cont`.
+fn percentile(sorted: &[f64], q: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let rank = q * (sorted.len() - 1) as f64;
+    let lower = rank.floor() as usize;
+    let upper = rank.ceil() as usize;
+    if lower == upper {
+        return sorted[lower];
+    }
+    sorted[lower] + (sorted[upper] - sorted[lower]) * (rank - lower as f64)
 }
 
 #[async_trait]
@@ -224,6 +387,17 @@ impl OtelStorage for MockOtelStorage {
         Ok(filtered)
     }
 
+    async fn query_span_stats(&self, query: SpanStatsQuery) -> StorageResult<Vec<SpanStats>> {
+        let all = self.aggregate_span_stats(&query);
+        let offset = query.effective_offset() as usize;
+        let limit = query.effective_limit() as usize;
+        Ok(all.into_iter().skip(offset).take(limit).collect())
+    }
+
+    async fn count_span_stats(&self, query: SpanStatsQuery) -> StorageResult<u64> {
+        Ok(self.aggregate_span_stats(&query).len() as u64)
+    }
+
     async fn query_logs(&self, query: LogQuery) -> StorageResult<Vec<LogRecord>> {
         let logs = self.logs.lock().unwrap();
         let filtered: Vec<LogRecord> = logs
@@ -247,6 +421,34 @@ impl OtelStorage for MockOtelStorage {
             .cloned()
             .collect();
         Ok(filtered)
+    }
+
+    async fn record_trace_refs(&self, trace_ids: &[String], project_id: i32) -> StorageResult<u64> {
+        let mut refs = self.trace_refs.lock().unwrap();
+        for tid in trace_ids {
+            // First write per (trace_id, project_id) wins, matching both
+            // production backends.
+            refs.entry((tid.clone(), project_id))
+                .or_insert_with(chrono::Utc::now);
+        }
+        Ok(trace_ids.len() as u64)
+    }
+
+    async fn get_trace_ref_projects(
+        &self,
+        trace_id: &str,
+    ) -> StorageResult<Vec<crate::storage::TraceRefProject>> {
+        let refs = self.trace_refs.lock().unwrap();
+        Ok(refs
+            .iter()
+            .filter(|((tid, _), _)| tid == trace_id)
+            .map(
+                |((_, project_id), first_seen)| crate::storage::TraceRefProject {
+                    project_id: *project_id,
+                    first_seen: *first_seen,
+                },
+            )
+            .collect())
     }
 
     async fn upsert_insight(&self, insight: &Insight) -> StorageResult<i64> {
@@ -494,6 +696,11 @@ impl OtelStorage for MockOtelStorage {
         };
 
         Ok(count as u64)
+    }
+
+    async fn has_traces(&self, project_id: i32) -> StorageResult<bool> {
+        let spans = self.spans.lock().unwrap();
+        Ok(spans.iter().any(|span| span.project_id == project_id))
     }
 
     async fn apply_retention(&self, _project_id: i32) -> StorageResult<u64> {

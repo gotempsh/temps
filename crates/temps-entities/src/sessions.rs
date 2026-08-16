@@ -11,6 +11,14 @@ pub struct Model {
     #[serde(skip_serializing)]
     pub session_token: String,
     pub expires_at: DBDateTime,
+    /// True while this row is a first-factor-only MFA challenge awaiting TOTP
+    /// verification. Such rows must never authenticate a real request: only
+    /// `verify_mfa_challenge` may consume them, and `verify_session` filters
+    /// them out. A fully authenticated session has this set to false.
+    pub mfa_pending: bool,
+    /// Until this instant the session may perform sensitive actions. `NULL`
+    /// means the session has not completed recent step-up verification.
+    pub step_up_expires_at: Option<DBDateTime>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

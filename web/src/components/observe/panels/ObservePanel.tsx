@@ -10,7 +10,7 @@ import {
   SheetTitle,
 } from '@/components/ui/sheet'
 import { ExternalLink } from 'lucide-react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import type { ObservabilityEvent } from '../types'
 
 /**

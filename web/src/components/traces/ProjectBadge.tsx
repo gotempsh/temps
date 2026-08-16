@@ -21,7 +21,7 @@ export function projectColor(projectId: number): string {
   return PROJECT_COLORS[Math.abs(projectId) % PROJECT_COLORS.length]
 }
 
-/** A colour-matched project badge used in the legend and on each span row. */
+/** A colour-matched project badge used in the legend and in detail panels. */
 export function ProjectBadge({
   projectId,
   name,
@@ -47,5 +47,63 @@ export function ProjectBadge({
       />
       {name}
     </span>
+  )
+}
+
+/**
+ * Just the colour, for per-span use in the waterfall.
+ *
+ * Span rows are the one place the full badge does not pay for itself: the name
+ * column is already competing with indentation and the span name, so a slug
+ * like `payments-gateway-prod` truncates to `payments-gatew…` on every row and
+ * still costs ~88px. The colour carries the identity and `ProjectLegend`
+ * decodes it once at the top; the name stays reachable via the tooltip.
+ */
+export function ProjectDot({
+  projectId,
+  name,
+  className,
+}: {
+  projectId: number
+  name: string
+  className?: string
+}) {
+  return (
+    <span
+      className={cn('h-2.5 w-2.5 shrink-0 rounded-full', className)}
+      style={{ backgroundColor: projectColor(projectId) }}
+      title={name}
+      // role="img" so the label is actually announced — an aria-label on a
+      // role-less generic element is ignored by most screen readers, which
+      // would leave the project unreadable once the slug text is gone.
+      role="img"
+      aria-label={`Project: ${name}`}
+    />
+  )
+}
+
+/** Decodes the per-span dot colours. Required wherever `ProjectDot` is used. */
+export function ProjectLegend({
+  projects,
+  className,
+}: {
+  projects: Array<{ project_id: number; project_name: string }>
+  className?: string
+}) {
+  if (projects.length === 0) return null
+  return (
+    <div className={cn('flex flex-wrap items-center gap-2', className)}>
+      <span className="text-xs text-muted-foreground">Projects:</span>
+      {projects.map((p) => (
+        <ProjectBadge
+          key={p.project_id}
+          projectId={p.project_id}
+          name={p.project_name}
+          // The legend is what decodes the dots, so it shows the whole slug —
+          // truncating here would defeat the point.
+          className="max-w-none"
+        />
+      ))}
+    </div>
   )
 }

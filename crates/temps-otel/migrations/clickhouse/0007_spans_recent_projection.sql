@@ -1,0 +1,103 @@
+-- Projection giving `spans` a second physical ordering by (project_id, start_time),
+-- so "most recent N spans for this project" stops being a full-table scan.
+--
+-- WHY
+--
+-- The table's ORDER BY is (project_id, trace_id, span_id) — chosen in
+-- 0001_spans.sql to make get_trace() lookups (all spans of one trace_id) a
+-- contiguous read. That is the right key for trace lookups and the wrong key
+-- for every time-ordered query:
+--
+--   * `trace_id` is a random 128-bit hash, so rows within a project are
+--     scattered by ingest time. Every granule therefore spans essentially the
+--     whole retention window.
+--   * `start_time` is not in the sort key, and a minmax skip index on it would
+--     be useless for the same reason (min/max per granule ≈ the full window).
+--   * The partition key is toYYYYMM(start_time), so pruning only happens at
+--     MONTH granularity. A 24h query still reads the entire current month.
+--
+-- The consequence: `SELECT … WHERE project_id = ? AND start_time >= ?
+-- ORDER BY start_time DESC LIMIT 100` — the Observe feed and the Traces span
+-- list — read every span the project has in the month, to return 100 rows.
+--
+-- MEASURED (2026-07-26, ClickHouse 24.8.14, local single-node)
+--   Dataset: 159.8M spans / 23.84 GiB, 150M of them in one busy project,
+--   spread over 7 days. Query: root spans, 24h window, ORDER BY start_time
+--   DESC LIMIT 100 (exactly what ObservabilityService::fetch_spans issues).
+--   Best of 3 warm runs, statistics.elapsed from FORMAT JSON.
+--
+--     current (FINAL, single-stage)            5050 ms   rows_read 151.6M
+--     drop FINAL only                          3842 ms   rows_read 150.0M
+--     drop FINAL + two-stage, no projection     671 ms   rows_read 158.8M
+--     drop FINAL + two-stage + THIS projection  132 ms   rows_read  24.2M
+--
+--   38x faster than the query this replaces, and the result set is
+--   byte-identical (verified by hashing the returned
+--   (trace_id, span_id, start_time) rows).
+--
+--   Those four rows predate the `LIMIT 1 BY (trace_id, span_id)` dedup that
+--   query_spans applies to restore the row-count guarantee FINAL used to give
+--   (see the two-stage comment in storage/clickhouse/mod.rs). Re-measured on a
+--   10M-span single-project rebuild of the same shape:
+--
+--     FINAL, single-stage                       932 ms   rows_read 10.2M
+--     two-stage + projection, no dedup          112 ms   rows_read  5.3M
+--     two-stage + projection + dedup (SHIPS)    122 ms   rows_read  5.3M
+--
+--   The dedup costs ~8% and the projection's advantage is unaffected.
+--
+-- WHY A PROJECTION AND NOT A NEW SORT KEY
+--
+-- Changing ORDER BY would require rewriting the table and would trade the
+-- trace-lookup locality that get_trace() depends on. A projection keeps both
+-- access patterns fast at the cost of storing the narrow columns twice.
+--
+-- COST — measured on identical 10M-row loads into two tables differing only by
+-- this projection (same box, same data, ClickHouse 24.8.14):
+--
+--     read (Observe feed, above)      671 ms  →  132 ms    5x faster
+--     disk                           1.49 GiB → 1.78 GiB     +19%
+--     merge (OPTIMIZE FINAL, 10M)      14.2 s →   16.0 s     +13%
+--     ingest (10M rows)                21.6 s →   22.6 s      +5%
+--
+-- Only the five columns below are duplicated — the fat `attributes` / `events`
+-- JSON strings are NOT in the projection, which is the entire point: the query
+-- planner resolves the ordering and the LIMIT against the narrow projection,
+-- then reads the wide columns for just the ~100 surviving rows via the base
+-- table's primary key. That is why the disk cost is +19% and not +100%.
+--
+-- Whether this trade is worth it depends on span volume, and the cost is paid
+-- by every deployment while the benefit only accrues to ones large enough for
+-- the scan to hurt. It is kept because the read cost WITHOUT the projection
+-- grows with total table size, while WITH it the read is proportional to the
+-- queried window and stays roughly flat as the table grows. A deployment that
+-- decides otherwise can drop it — `ALTER TABLE spans DROP PROJECTION
+-- proj_recent` — and query_spans keeps working, just at the 671ms shape.
+--
+-- deduplicate_merge_projection_mode = 'rebuild'
+--   ClickHouse refuses projections on a ReplacingMergeTree unless this is set
+--   (error 344, SUPPORT_IS_DISABLED). 'rebuild' regenerates the projection
+--   when parts merge, which is correct here: the read paths that use this
+--   projection do not use FINAL (see 0001_spans.sql — the feed and list
+--   queries are LIMIT-ed and duplicate-tolerant), so projection rows and base
+--   rows stay consistent with each other.
+ALTER TABLE spans MODIFY SETTING deduplicate_merge_projection_mode = 'rebuild';
+
+ALTER TABLE spans ADD PROJECTION IF NOT EXISTS proj_recent
+(
+    SELECT project_id, start_time, trace_id, span_id, parent_span_id
+    ORDER BY (project_id, start_time)
+);
+
+-- Backfill the projection into existing parts. ClickHouse can only use a
+-- projection when EVERY part being read has it, so without this the projection
+-- would do nothing until the whole table had been rewritten by TTL/merges.
+--
+-- This is a mutation: it re-reads the five projected columns for every existing
+-- part and writes the sorted copy. It took 2m08s for 159.8M rows / 23.84 GiB on
+-- the benchmark box. The migration runner does NOT wait for it (mutations are
+-- asynchronous by default — no mutations_sync setting is issued), so server
+-- startup is not blocked; queries keep using the base-table path and get faster
+-- part-by-part as the mutation progresses. Track it via:
+--   SELECT * FROM system.mutations WHERE table = 'spans' AND NOT is_done;
+ALTER TABLE spans MATERIALIZE PROJECTION proj_recent;

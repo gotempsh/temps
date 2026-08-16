@@ -96,6 +96,7 @@ use crate::services::secret_service::SecretService;
         definitions::list_mcps,
         definitions::create_mcp,
         definitions::get_mcp,
+        definitions::reveal_mcp_config,
         definitions::update_mcp,
         definitions::delete_mcp,
 
@@ -110,6 +111,7 @@ use crate::services::secret_service::SecretService;
         definitions::list_global_mcps,
         definitions::create_global_mcp,
         definitions::get_global_mcp,
+        definitions::reveal_global_mcp_config,
         definitions::update_global_mcp,
         definitions::delete_global_mcp,
 
@@ -154,6 +156,7 @@ use crate::services::secret_service::SecretService;
         autofixer::AutofixerRunResponse,
         autofixer::AutofixerRunWithLogsResponse,
         autofixer::CreatePrResponse,
+        crate::services::autofixer::AutofixRunConfig,
 
         // Preview gateway
         preview_gateway::LogsQuery,
@@ -172,6 +175,7 @@ use crate::services::secret_service::SecretService;
         // MCP server definitions
         definitions::McpDefinitionResponse,
         definitions::ListMcpsResponse,
+        definitions::SensitiveMcpConfigValueResponse,
         definitions::CreateMcpRequest,
         definitions::UpdateMcpRequest,
 

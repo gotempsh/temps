@@ -45,46 +45,42 @@ impl HtmlTrackingRewriter {
         let email_id_pixel = email_id_str.clone();
 
         let mut rewriter = HtmlRewriter::new(
-            Settings {
-                element_content_handlers: vec![
-                    // Rewrite <a href="..."> to click tracking URL
-                    element!("a[href]", move |el| {
-                        if let Some(href) = el.get_attribute("href") {
-                            // Only rewrite http/https links — skip mailto:, tel:, #anchors, etc.
-                            if href.starts_with("http://") || href.starts_with("https://") {
-                                let sig =
-                                    generate_tracking_hmac(&hmac_key_click, &email_id_click, &href);
-                                let encoded_url = urlencoding::encode(&href);
-                                let tracking_url = format!(
-                                    "{}/t/click/{}/{}/{}",
-                                    base_url_click, email_id_click, sig, encoded_url
-                                );
-                                el.set_attribute("href", &tracking_url)
-                                    .map_err(|e| format!("Failed to set href: {}", e))?;
-                            }
+            Settings::new()
+                // Rewrite <a href="..."> to click tracking URL
+                .append_element_content_handler(element!("a[href]", move |el| {
+                    if let Some(href) = el.get_attribute("href") {
+                        // Only rewrite http/https links — skip mailto:, tel:, #anchors, etc.
+                        if href.starts_with("http://") || href.starts_with("https://") {
+                            let sig =
+                                generate_tracking_hmac(&hmac_key_click, &email_id_click, &href);
+                            let encoded_url = urlencoding::encode(&href);
+                            let tracking_url = format!(
+                                "{}/t/click/{}/{}/{}",
+                                base_url_click, email_id_click, sig, encoded_url
+                            );
+                            el.set_attribute("href", &tracking_url)
+                                .map_err(|e| format!("Failed to set href: {}", e))?;
                         }
-                        Ok(())
-                    }),
-                    // Inject tracking pixel before </body>
-                    element!("body", move |el| {
-                        let pixel_sig =
-                            generate_tracking_hmac(&hmac_key_pixel, &email_id_pixel, "open");
-                        let pixel_url = format!(
-                            "{}/t/pixel/{}/{}.gif",
-                            base_url_pixel, email_id_pixel, pixel_sig
-                        );
-                        el.append(
-                            &format!(
-                                r#"<img src="{}" width="1" height="1" alt="" style="display:none" />"#,
-                                pixel_url
-                            ),
-                            lol_html::html_content::ContentType::Html,
-                        );
-                        Ok(())
-                    }),
-                ],
-                ..Settings::default()
-            },
+                    }
+                    Ok(())
+                }))
+                // Inject tracking pixel before </body>
+                .append_element_content_handler(element!("body", move |el| {
+                    let pixel_sig =
+                        generate_tracking_hmac(&hmac_key_pixel, &email_id_pixel, "open");
+                    let pixel_url = format!(
+                        "{}/t/pixel/{}/{}.gif",
+                        base_url_pixel, email_id_pixel, pixel_sig
+                    );
+                    el.append(
+                        &format!(
+                            r#"<img src="{}" width="1" height="1" alt="" style="display:none" />"#,
+                            pixel_url
+                        ),
+                        lol_html::html_content::ContentType::Html,
+                    );
+                    Ok(())
+                })),
             |c: &[u8]| output.extend_from_slice(c),
         );
 

@@ -7,7 +7,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
 import { useState } from 'react'
-import { Link, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Link, useNavigate, useParams, useSearchParams } from 'react-router'
 
 interface ContainerDetailPageProps {
   project: ProjectResponse

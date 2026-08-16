@@ -1,9 +1,9 @@
 //! IP-based rate limiting middleware for authentication endpoints.
 //!
 //! Provides a simple sliding-window rate limiter to prevent brute force attacks
-//! on login, password reset, magic link, and MFA verification endpoints.
+//! on login, password reset, and MFA verification endpoints.
 
-use crate::client_ip::resolve_client_ip;
+use crate::resolve_client_ip;
 use axum::{
     extract::ConnectInfo,
     http::{Request, StatusCode},
@@ -61,9 +61,9 @@ impl AuthRateLimiter {
         }
     }
 
-    /// Check if a request from the given IP should be allowed.
+    /// Check if a request for the given identity key should be allowed.
     /// Returns Ok(()) if allowed, Err(()) if rate limited.
-    async fn check(&self, ip: &str) -> Result<(), ()> {
+    pub(crate) async fn check(&self, key: &str) -> Result<(), ()> {
         let now = Instant::now();
         let window_start = now - self.config.window;
 
@@ -75,16 +75,16 @@ impl AuthRateLimiter {
             entries.retain(|_, v| v.timestamps.last().is_some_and(|t| *t > window_start));
         }
 
-        // If at cap after eviction, only allow already-tracked IPs
-        if entries.len() >= self.config.max_tracked_ips && !entries.contains_key(ip) {
+        // If at cap after eviction, only allow already-tracked identities.
+        if entries.len() >= self.config.max_tracked_ips && !entries.contains_key(key) {
             warn!(
-                "Rate limiter at capacity ({} IPs tracked), rejecting new IP",
+                "Rate limiter at capacity ({} identities tracked), rejecting new identity",
                 entries.len()
             );
             return Err(());
         }
 
-        let entry = entries.entry(ip.to_string()).or_insert(RateLimitEntry {
+        let entry = entries.entry(key.to_string()).or_insert(RateLimitEntry {
             timestamps: Vec::new(),
         });
 

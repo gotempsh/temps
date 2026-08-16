@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use crate::errors::EmailError;
 use crate::providers::SendEmailRequest as ProviderSendRequest;
-use crate::services::{DomainService, ProviderService, TrackingService};
+use crate::services::{DomainService, ProviderService, SuppressionService, TrackingService};
 
 /// Trait for rewriting HTML to inject tracking (pixel + click links).
 /// Implemented by `temps-email-tracking::HtmlTrackingRewriter`.
@@ -27,6 +27,7 @@ pub struct EmailService {
     domain_service: Arc<DomainService>,
     tracking_rewriter: Option<Arc<dyn TrackingRewriter>>,
     tracking_service: Arc<TrackingService>,
+    suppression_service: Arc<SuppressionService>,
 }
 
 /// Request to send an email
@@ -75,6 +76,7 @@ impl EmailService {
         provider_service: Arc<ProviderService>,
         domain_service: Arc<DomainService>,
         tracking_service: Arc<TrackingService>,
+        suppression_service: Arc<SuppressionService>,
     ) -> Self {
         Self {
             db,
@@ -82,6 +84,7 @@ impl EmailService {
             domain_service,
             tracking_rewriter: None,
             tracking_service,
+            suppression_service,
         }
     }
 
@@ -181,6 +184,79 @@ impl EmailService {
             }
         }
 
+        // Refuse to send to previously hard-bounced/complained addresses —
+        // repeatedly emailing one is exactly what gets a sending domain's
+        // reputation downgraded by receiving mail providers. Checked after
+        // the row is inserted (still visible for debugging) but before any
+        // domain/provider work, since it's independent of both.
+        //
+        // Checks to/cc/bcc together (a suppressed address left in cc/bcc
+        // would otherwise still receive mail), and drops only the
+        // suppressed addresses rather than capturing the whole send — a
+        // suppressed address mixed into `to` alongside legitimate
+        // recipients used to silently deny delivery to everyone on the
+        // email, not just the bad address.
+        let mut all_recipients: Vec<String> = request.to.clone();
+        all_recipients.extend(request.cc.iter().flatten().cloned());
+        all_recipients.extend(request.bcc.iter().flatten().cloned());
+
+        let suppressed = match domain.as_ref() {
+            Some(domain) => {
+                self.suppression_service
+                    .suppressed_among(domain.id, &all_recipients)
+                    .await?
+            }
+            None => Vec::new(),
+        };
+
+        if !suppressed.is_empty() {
+            // Addresses go to `debug!` only — `info!` (and any field
+            // persisted where a caller with send+read access could read it
+            // back, like `error_message` below) must not let one recipient
+            // enumerate another recipient's bounce/complaint history.
+            info!(
+                "Dropping {} suppressed recipient(s) from email {}",
+                suppressed.len(),
+                email_id
+            );
+            debug!(
+                "Suppressed recipient(s) dropped from email {}: {:?}",
+                email_id, suppressed
+            );
+        }
+        let (to, cc, bcc) =
+            filter_suppressed_recipients(request.to, request.cc, request.bcc, &suppressed);
+
+        // Nothing left to send to (either every `to` address was
+        // suppressed, or `to` was already empty) — capture instead of
+        // sending an email with no primary recipient.
+        if to.is_empty() {
+            info!(
+                "Refusing to send email {} — {} recipient(s) suppressed",
+                email_id,
+                suppressed.len()
+            );
+            debug!(
+                "Email {} refused — suppressed recipient(s): {:?}",
+                email_id, suppressed
+            );
+
+            let mut active_model: emails::ActiveModel = email_model.into();
+            active_model.status = Set("captured".to_string());
+            active_model.error_message = Set(Some(
+                "Recipient(s) suppressed (previous hard bounce or complaint)".to_string(),
+            ));
+            active_model.sent_at = Set(Some(Utc::now()));
+
+            active_model.update(self.db.as_ref()).await?;
+
+            return Ok(SendEmailResponse {
+                id: email_id,
+                status: "captured".to_string(),
+                provider_message_id: None,
+            });
+        }
+
         // If no domain configured, capture email without sending (Mailhog-like behavior)
         let domain = match domain {
             Some(d) => d,
@@ -198,7 +274,7 @@ impl EmailService {
 
                 info!(
                     "Email captured (no domain configured), id: {}, from: {}, to: {:?}",
-                    email_id, request.from, request.to
+                    email_id, request.from, to
                 );
 
                 return Ok(SendEmailResponse {
@@ -256,7 +332,7 @@ impl EmailService {
 
             info!(
                 "Email captured (no provider), id: {}, from: {}, to: {:?}",
-                email_id, request.from, request.to
+                email_id, request.from, to
             );
 
             return Ok(SendEmailResponse {
@@ -299,9 +375,9 @@ impl EmailService {
         let provider_request = ProviderSendRequest {
             from: request.from,
             from_name: request.from_name,
-            to: request.to,
-            cc: request.cc,
-            bcc: request.bcc,
+            to,
+            cc,
+            bcc,
             reply_to: request.reply_to,
             subject: request.subject,
             html: tracked_html,
@@ -447,6 +523,34 @@ pub struct EmailStats {
     pub captured: u64,
 }
 
+/// Drop suppressed addresses from `to`/`cc`/`bcc`. `suppressed` is the
+/// (already-normalized) output of `SuppressionService::suppressed_among`.
+///
+/// Filters each list independently rather than rejecting the whole send —
+/// a suppressed address mixed into `to` alongside legitimate recipients
+/// must not deny delivery to everyone on the email, just to itself.
+fn filter_suppressed_recipients(
+    to: Vec<String>,
+    cc: Option<Vec<String>>,
+    bcc: Option<Vec<String>>,
+    suppressed: &[String],
+) -> (Vec<String>, Option<Vec<String>>, Option<Vec<String>>) {
+    if suppressed.is_empty() {
+        return (to, cc, bcc);
+    }
+
+    let suppressed_set: std::collections::HashSet<&str> =
+        suppressed.iter().map(String::as_str).collect();
+    let keep =
+        |addr: &String| !suppressed_set.contains(SuppressionService::normalize(addr).as_str());
+
+    (
+        to.into_iter().filter(&keep).collect(),
+        cc.map(|list| list.into_iter().filter(&keep).collect()),
+        bcc.map(|list| list.into_iter().filter(&keep).collect()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +595,7 @@ mod tests {
             clickhouse_database: None,
             clickhouse_user: None,
             clickhouse_password: None,
+            docker_extra_networks: Vec::new(),
         });
         let config_service = Arc::new(temps_config::ConfigService::new(
             server_config,
@@ -501,11 +606,13 @@ mod tests {
             config_service,
             "http://localhost:3000".to_string(),
         ));
+        let suppression_service = Arc::new(SuppressionService::new(db.db.clone()));
         let email_service = EmailService::new(
             db.db.clone(),
             Arc::new(provider_service.clone()),
             Arc::new(domain_service.clone()),
             tracking_service,
+            suppression_service,
         );
         (db, email_service, provider_service, domain_service)
     }
@@ -660,6 +767,84 @@ mod tests {
         let invalid_from = "invalid-email";
         let domain = invalid_from.split('@').nth(1);
         assert!(domain.is_none());
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_passes_through_when_nothing_suppressed() {
+        let (to, cc, bcc) = filter_suppressed_recipients(
+            vec!["a@example.com".to_string()],
+            Some(vec!["b@example.com".to_string()]),
+            None,
+            &[],
+        );
+        assert_eq!(to, vec!["a@example.com"]);
+        assert_eq!(cc, Some(vec!["b@example.com".to_string()]));
+        assert_eq!(bcc, None);
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_drops_only_the_suppressed_cc_address() {
+        // A suppressed address in `cc` used to be invisible to the check
+        // entirely — it must be dropped from the send, and it must not take
+        // the legitimate `to` recipient down with it.
+        let (to, cc, bcc) = filter_suppressed_recipients(
+            vec!["good@example.com".to_string()],
+            Some(vec![
+                "bad@example.com".to_string(),
+                "also-good@example.com".to_string(),
+            ]),
+            None,
+            &["bad@example.com".to_string()],
+        );
+        assert_eq!(to, vec!["good@example.com"]);
+        assert_eq!(cc, Some(vec!["also-good@example.com".to_string()]));
+        assert_eq!(bcc, None);
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_keeps_other_to_addresses() {
+        // One suppressed address mixed into `to` used to capture the whole
+        // send — the other `to` recipients must still get the email.
+        let (to, cc, bcc) = filter_suppressed_recipients(
+            vec![
+                "bad@example.com".to_string(),
+                "good@example.com".to_string(),
+            ],
+            None,
+            None,
+            &["bad@example.com".to_string()],
+        );
+        assert_eq!(to, vec!["good@example.com"]);
+        assert_eq!(cc, None);
+        assert_eq!(bcc, None);
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_matches_case_and_whitespace_insensitively() {
+        // `suppressed_among` returns normalized (trimmed/lowercased) forms
+        // from the DB — the filter must normalize candidates the same way,
+        // not compare raw strings.
+        let (to, _, _) = filter_suppressed_recipients(
+            vec![
+                "  Bad@Example.COM  ".to_string(),
+                "good@example.com".to_string(),
+            ],
+            None,
+            None,
+            &["bad@example.com".to_string()],
+        );
+        assert_eq!(to, vec!["good@example.com"]);
+    }
+
+    #[test]
+    fn filter_suppressed_recipients_empties_to_when_all_suppressed() {
+        let (to, _, _) = filter_suppressed_recipients(
+            vec!["bad@example.com".to_string()],
+            None,
+            None,
+            &["bad@example.com".to_string()],
+        );
+        assert!(to.is_empty());
     }
 
     #[test]

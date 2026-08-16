@@ -19,6 +19,10 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import {
+  targetLabelsToPayload,
+  targetNodesToPayload,
+} from '@/lib/environment-placement'
+import {
   Select,
   SelectContent,
   SelectItem,
@@ -26,7 +30,18 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { GitBranch, KeyRound, Loader2, Moon, Network, Plus, Shield, X } from 'lucide-react'
+import {
+  Clock,
+  GitBranch,
+  Gauge,
+  KeyRound,
+  Loader2,
+  Moon,
+  Network,
+  Plus,
+  Shield,
+  X,
+} from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
 
@@ -62,7 +77,9 @@ type AttackModeSelect = 'inherit' | 'on' | 'off'
  * `false` → "off". Keeping these distinct is what lets an environment opt out
  * of (or into) attack mode independently of the project default.
  */
-function attackModeToSelect(value: boolean | null | undefined): AttackModeSelect {
+function attackModeToSelect(
+  value: boolean | null | undefined
+): AttackModeSelect {
   if (value === true) return 'on'
   if (value === false) return 'off'
   return 'inherit'
@@ -77,6 +94,32 @@ function attackModeToSelect(value: boolean | null | undefined): AttackModeSelect
 function attackModeToPayload(value: AttackModeSelect): boolean | null {
   if (value === 'on') return true
   if (value === 'off') return false
+  return null
+}
+
+/** Select value for the tri-state environment HTTP→HTTPS redirect override. */
+type ForceHttpsSelect = 'inherit' | 'always' | 'never'
+
+/**
+ * Map the environment's nullable `force_https` to the select value.
+ * `null`/`undefined` → "inherit", which is NOT the same as "never": the proxy
+ * default still redirects any host that has an active TLS certificate.
+ */
+function forceHttpsToSelect(
+  value: boolean | null | undefined
+): ForceHttpsSelect {
+  if (value === true) return 'always'
+  if (value === false) return 'never'
+  return 'inherit'
+}
+
+/**
+ * Map the select value back to the API payload. "inherit" sends `null` to clear
+ * the override; "always"/"never" send the explicit boolean.
+ */
+function forceHttpsToPayload(value: ForceHttpsSelect): boolean | null {
+  if (value === 'always') return true
+  if (value === 'never') return false
   return null
 }
 
@@ -109,21 +152,36 @@ export function EnvironmentConfigurationCard({
     // 'on' (true → force on) or 'off' (false → force off). Map the nullable
     // boolean from the API to the select value.
     attack_mode: attackModeToSelect(environment.attack_mode),
+    force_https: forceHttpsToSelect(environment.force_https),
     protected: environment.protected ?? false,
     anti_affinity: environment.deployment_config?.antiAffinity ?? true,
-    target_nodes: (environment.deployment_config?.targetNodes ?? []) as number[],
-    target_labels: (environment.deployment_config?.targetLabels ?? {}) as Record<string, string>,
+    target_nodes: (environment.deployment_config?.targetNodes ??
+      []) as number[],
+    target_labels: (environment.deployment_config?.targetLabels ??
+      {}) as Record<string, string>,
     automatic_deploy: environment.deployment_config?.automaticDeploy ?? true,
     on_demand: environment.deployment_config?.onDemand ?? false,
-    idle_timeout_seconds: environment.deployment_config?.idleTimeoutSeconds?.toString() ?? '300',
-    wake_timeout_seconds: environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
-    password_enabled: environment.deployment_config?.security?.passwordProtection?.enabled ?? false,
+    idle_timeout_seconds:
+      environment.deployment_config?.idleTimeoutSeconds?.toString() ?? '300',
+    wake_timeout_seconds:
+      environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
+    request_timeout_seconds:
+      environment.deployment_config?.requestTimeoutSeconds?.toString() ?? '',
+    sse_idle_timeout_seconds:
+      environment.deployment_config?.sseIdleTimeoutSeconds?.toString() ?? '',
+    websocket_idle_timeout_seconds:
+      environment.deployment_config?.websocketIdleTimeoutSeconds?.toString() ??
+      '',
+    max_concurrent_connections:
+      environment.deployment_config?.maxConcurrentConnections?.toString() ?? '',
+    password_enabled:
+      environment.deployment_config?.security?.passwordProtection?.enabled ??
+      false,
     password: '',
     security: {
       enabled: environment.deployment_config?.security?.enabled ?? false,
       headers: {
-        preset:
-          environment.deployment_config?.security?.headers?.preset ?? '',
+        preset: environment.deployment_config?.security?.headers?.preset ?? '',
         contentSecurityPolicy:
           environment.deployment_config?.security?.headers
             ?.contentSecurityPolicy ?? '',
@@ -133,7 +191,8 @@ export function EnvironmentConfigurationCard({
           environment.deployment_config?.security?.headers
             ?.strictTransportSecurity ?? '',
         referrerPolicy:
-          environment.deployment_config?.security?.headers?.referrerPolicy ?? '',
+          environment.deployment_config?.security?.headers?.referrerPolicy ??
+          '',
       },
       rateLimiting: {
         maxRequestsPerMinute:
@@ -161,17 +220,35 @@ export function EnvironmentConfigurationCard({
       memory_limit:
         environment.deployment_config?.memoryLimit?.toString() ?? '',
       replicas: environment.deployment_config?.replicas?.toString() ?? '1',
-      exposed_port: environment.deployment_config?.exposedPort?.toString() ?? '',
+      exposed_port:
+        environment.deployment_config?.exposedPort?.toString() ?? '',
       attack_mode: attackModeToSelect(environment.attack_mode),
+      force_https: forceHttpsToSelect(environment.force_https),
       protected: environment.protected ?? false,
       anti_affinity: environment.deployment_config?.antiAffinity ?? true,
-      target_nodes: (environment.deployment_config?.targetNodes ?? []) as number[],
-      target_labels: (environment.deployment_config?.targetLabels ?? {}) as Record<string, string>,
+      target_nodes: (environment.deployment_config?.targetNodes ??
+        []) as number[],
+      target_labels: (environment.deployment_config?.targetLabels ??
+        {}) as Record<string, string>,
       automatic_deploy: environment.deployment_config?.automaticDeploy ?? true,
-    on_demand: environment.deployment_config?.onDemand ?? false,
-      idle_timeout_seconds: environment.deployment_config?.idleTimeoutSeconds?.toString() ?? '300',
-      wake_timeout_seconds: environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
-      password_enabled: environment.deployment_config?.security?.passwordProtection?.enabled ?? false,
+      on_demand: environment.deployment_config?.onDemand ?? false,
+      idle_timeout_seconds:
+        environment.deployment_config?.idleTimeoutSeconds?.toString() ?? '300',
+      wake_timeout_seconds:
+        environment.deployment_config?.wakeTimeoutSeconds?.toString() ?? '30',
+      request_timeout_seconds:
+        environment.deployment_config?.requestTimeoutSeconds?.toString() ?? '',
+      sse_idle_timeout_seconds:
+        environment.deployment_config?.sseIdleTimeoutSeconds?.toString() ?? '',
+      websocket_idle_timeout_seconds:
+        environment.deployment_config?.websocketIdleTimeoutSeconds?.toString() ??
+        '',
+      max_concurrent_connections:
+        environment.deployment_config?.maxConcurrentConnections?.toString() ??
+        '',
+      password_enabled:
+        environment.deployment_config?.security?.passwordProtection?.enabled ??
+        false,
       password: '',
       security: {
         enabled: environment.deployment_config?.security?.enabled ?? false,
@@ -244,13 +321,12 @@ export function EnvironmentConfigurationCard({
         automatic_deploy: formData.automatic_deploy,
         // Tri-state: null clears the override (inherit project), true/false force it.
         attack_mode: attackModeToPayload(formData.attack_mode),
+        // Tri-state: null clears the override (inherit the proxy's
+        // certificate-driven default), true/false force it.
+        force_https: forceHttpsToPayload(formData.force_https),
         anti_affinity: formData.anti_affinity,
-        target_nodes:
-          formData.target_nodes.length > 0 ? formData.target_nodes : null,
-        target_labels:
-          Object.keys(formData.target_labels).length > 0
-            ? formData.target_labels
-            : null,
+        target_nodes: targetNodesToPayload(formData.target_nodes),
+        target_labels: targetLabelsToPayload(formData.target_labels),
         on_demand: formData.on_demand,
         idle_timeout_seconds: formData.idle_timeout_seconds
           ? parseInt(formData.idle_timeout_seconds)
@@ -258,12 +334,35 @@ export function EnvironmentConfigurationCard({
         wake_timeout_seconds: formData.wake_timeout_seconds
           ? parseInt(formData.wake_timeout_seconds)
           : null,
+        // Empty string clears the override (inherit the project/global
+        // default, which itself defaults to "no timeout"). "0" is a valid,
+        // distinct override meaning "explicitly no timeout for this
+        // environment." Any nonzero value is clamped server-side to the
+        // operator's global hard ceiling regardless of what's set here.
+        request_timeout_seconds: formData.request_timeout_seconds
+          ? parseInt(formData.request_timeout_seconds)
+          : null,
+        sse_idle_timeout_seconds: formData.sse_idle_timeout_seconds
+          ? parseInt(formData.sse_idle_timeout_seconds)
+          : null,
+        websocket_idle_timeout_seconds: formData.websocket_idle_timeout_seconds
+          ? parseInt(formData.websocket_idle_timeout_seconds)
+          : null,
+        // Same semantics as the timeout overrides above: empty string clears
+        // the override (inherit project/global default, itself unlimited by
+        // default), "0" is a valid, distinct override meaning "explicitly
+        // unlimited for this environment."
+        max_concurrent_connections: formData.max_concurrent_connections
+          ? parseInt(formData.max_concurrent_connections)
+          : null,
         security: formData.security,
         password: formData.password_enabled
-          ? (formData.password || null)
-          : (formData.password_enabled === false && environment.deployment_config?.security?.passwordProtection?.enabled
+          ? formData.password || null
+          : formData.password_enabled === false &&
+              environment.deployment_config?.security?.passwordProtection
+                ?.enabled
             ? ''
-            : null),
+            : null,
       },
     })
   }
@@ -310,13 +409,17 @@ export function EnvironmentConfigurationCard({
                 <div className="flex-1 min-w-0">
                   <Label className="text-sm font-medium">Deploy on push</Label>
                   <p className="text-xs text-muted-foreground">
-                    Automatically deploy when a commit is pushed to this branch. Disable to deploy on demand only.
+                    Automatically deploy when a commit is pushed to this branch.
+                    Disable to deploy on demand only.
                   </p>
                 </div>
                 <Switch
                   checked={formData.automatic_deploy}
                   onCheckedChange={(checked) =>
-                    setFormData((prev) => ({ ...prev, automatic_deploy: checked }))
+                    setFormData((prev) => ({
+                      ...prev,
+                      automatic_deploy: checked,
+                    }))
                   }
                 />
               </div>
@@ -408,24 +511,42 @@ export function EnvironmentConfigurationCard({
                     <div>
                       <div className="flex items-center justify-between">
                         <Label>Memory Limit (MB)</Label>
-                        <Button
-                          type="button"
-                          variant="ghost"
-                          size="sm"
-                          className="h-auto px-1 py-0 text-xs text-muted-foreground"
-                          disabled={formData.memory_limit === ''}
-                          onClick={() =>
-                            setFormData((prev) => ({
-                              ...prev,
-                              memory_limit: '',
-                            }))
-                          }
-                        >
-                          No limit
-                        </Button>
+                        <div className="flex items-center gap-1">
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-auto px-1 py-0 text-xs text-muted-foreground"
+                            disabled={formData.memory_limit === ''}
+                            onClick={() =>
+                              setFormData((prev) => ({
+                                ...prev,
+                                memory_limit: '',
+                              }))
+                            }
+                          >
+                            Use default
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="ghost"
+                            size="sm"
+                            className="h-auto px-1 py-0 text-xs text-muted-foreground"
+                            disabled={formData.memory_limit === '0'}
+                            onClick={() =>
+                              setFormData((prev) => ({
+                                ...prev,
+                                memory_limit: '0',
+                              }))
+                            }
+                          >
+                            Uncapped
+                          </Button>
+                        </div>
                       </div>
                       <Input
                         type="number"
+                        min={0}
                         value={formData.memory_limit}
                         onChange={(e) =>
                           setFormData((prev) => ({
@@ -433,10 +554,12 @@ export function EnvironmentConfigurationCard({
                             memory_limit: e.target.value,
                           }))
                         }
-                        placeholder="No limit"
+                        placeholder="Use default"
                       />
                       <p className="text-xs text-muted-foreground mt-1">
-                        Maximum memory allocation. Leave empty for no limit.
+                        Maximum memory allocation. Leave empty to inherit the
+                        project/default limit, or set <code>0</code> (
+                        <strong>Uncapped</strong>) to run with no memory limit.
                       </p>
                     </div>
                   </div>
@@ -494,15 +617,19 @@ export function EnvironmentConfigurationCard({
             <div className="border-t pt-6">
               <div className="flex items-center gap-2 mb-4">
                 <Moon className="h-4 w-4" />
-                <h3 className="text-sm font-medium">On-Demand (Scale-to-Zero)</h3>
+                <h3 className="text-sm font-medium">
+                  On-Demand (Scale-to-Zero)
+                </h3>
               </div>
               <div className="space-y-4">
                 <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
                   <div className="flex-1 min-w-0">
-                    <Label className="text-sm font-medium">Enable On-Demand</Label>
+                    <Label className="text-sm font-medium">
+                      Enable On-Demand
+                    </Label>
                     <p className="text-xs text-muted-foreground">
-                      Automatically stop containers after idle timeout
-                      and restart on the next request.
+                      Automatically stop containers after idle timeout and
+                      restart on the next request.
                     </p>
                   </div>
                   <Switch
@@ -534,7 +661,8 @@ export function EnvironmentConfigurationCard({
                         placeholder="300"
                       />
                       <p className="text-xs text-muted-foreground mt-1">
-                        Seconds of inactivity before containers are stopped (60–86400). Default: 300 (5 minutes).
+                        Seconds of inactivity before containers are stopped
+                        (60–86400). Default: 300 (5 minutes).
                       </p>
                     </div>
                     <div>
@@ -553,17 +681,120 @@ export function EnvironmentConfigurationCard({
                         placeholder="30"
                       />
                       <p className="text-xs text-muted-foreground mt-1">
-                        Maximum seconds to wait for containers to start when waking (5–120). Default: 30.
+                        Maximum seconds to wait for containers to start when
+                        waking (5–120). Default: 30.
                       </p>
                     </div>
                     {environment.sleeping && (
                       <div className="flex items-center gap-2 p-2 rounded-md bg-yellow-500/10 border border-yellow-500/20 text-yellow-600 dark:text-yellow-400 text-xs">
                         <Moon className="h-3.5 w-3.5" />
-                        This environment is currently sleeping. It will wake on the next request.
+                        This environment is currently sleeping. It will wake on
+                        the next request.
                       </div>
                     )}
                   </div>
                 )}
+              </div>
+            </div>
+
+            {/* Request Timeouts */}
+            <div className="border-t pt-6">
+              <div className="flex items-center gap-2 mb-4">
+                <Clock className="h-4 w-4" />
+                <h3 className="text-sm font-medium">Request Timeouts</h3>
+              </div>
+              <p className="text-xs text-muted-foreground mb-4">
+                Override the global request timeout defaults for this
+                environment. Leave blank to inherit the project/global default
+                (no timeout, unless an operator configured one). Enter 0 to
+                explicitly force no timeout for this environment. Nonzero values
+                are always clamped server-side to the operator&apos;s global
+                hard ceiling.
+              </p>
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+                <div>
+                  <Label>Regular HTTP (seconds)</Label>
+                  <Input
+                    type="number"
+                    min="0"
+                    max="86400"
+                    value={formData.request_timeout_seconds}
+                    onChange={(e) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        request_timeout_seconds: e.target.value,
+                      }))
+                    }
+                    placeholder="Inherit"
+                  />
+                </div>
+                <div>
+                  <Label>SSE Idle (seconds)</Label>
+                  <Input
+                    type="number"
+                    min="0"
+                    max="86400"
+                    value={formData.sse_idle_timeout_seconds}
+                    onChange={(e) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        sse_idle_timeout_seconds: e.target.value,
+                      }))
+                    }
+                    placeholder="Inherit"
+                  />
+                </div>
+                <div>
+                  <Label>WebSocket Idle (seconds)</Label>
+                  <Input
+                    type="number"
+                    min="0"
+                    max="86400"
+                    value={formData.websocket_idle_timeout_seconds}
+                    onChange={(e) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        websocket_idle_timeout_seconds: e.target.value,
+                      }))
+                    }
+                    placeholder="Inherit"
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* Concurrent Connection Limit */}
+            <div className="border-t pt-6">
+              <div className="flex items-center gap-2 mb-4">
+                <Gauge className="h-4 w-4" />
+                <h3 className="text-sm font-medium">
+                  Concurrent Connection Limit
+                </h3>
+              </div>
+              <p className="text-xs text-muted-foreground mb-4">
+                Cap on concurrent in-flight requests to this environment&apos;s
+                upstream. Protects the proxy&apos;s own connection budget from a
+                stalled or malicious app — mainly relevant when this environment
+                shares a node with other tenants. Leave blank to inherit the
+                project/global default (unlimited, unless an operator configured
+                one). Enter 0 to explicitly force unlimited for this
+                environment. Requests over the limit get an immediate 503
+                instead of queuing.
+              </p>
+              <div className="max-w-xs">
+                <Label>Max concurrent connections</Label>
+                <Input
+                  type="number"
+                  min="0"
+                  value={formData.max_concurrent_connections}
+                  onChange={(e) =>
+                    setFormData((prev) => ({
+                      ...prev,
+                      max_concurrent_connections: e.target.value,
+                    }))
+                  }
+                  placeholder="Inherit"
+                />
               </div>
             </div>
 
@@ -583,7 +814,8 @@ export function EnvironmentConfigurationCard({
                         Protected
                       </Label>
                       <p className="text-xs text-muted-foreground">
-                        Git pushes will not auto-deploy. Deployments must be promoted from another environment.
+                        Git pushes will not auto-deploy. Deployments must be
+                        promoted from another environment.
                       </p>
                     </div>
                     <Switch
@@ -807,6 +1039,41 @@ export function EnvironmentConfigurationCard({
 
                 <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
                   <div className="flex-1 min-w-0">
+                    <Label className="text-sm font-medium">Force HTTPS</Label>
+                    <p className="text-xs text-muted-foreground">
+                      Redirect plain HTTP requests to HTTPS with a 301. Inherit
+                      redirects only when this environment&apos;s host has a
+                      certificate issued here — choose Always when TLS is
+                      terminated upstream (CDN or external load balancer), since
+                      there is no local certificate to trigger the default.
+                      Let&apos;s Encrypt HTTP-01 challenges are never
+                      redirected.
+                    </p>
+                  </div>
+                  <Select
+                    value={formData.force_https}
+                    onValueChange={(value) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        force_https: value as ForceHttpsSelect,
+                      }))
+                    }
+                  >
+                    <SelectTrigger className="w-full sm:w-[180px]">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="inherit">
+                        Inherit (when certified)
+                      </SelectItem>
+                      <SelectItem value="always">Always</SelectItem>
+                      <SelectItem value="never">Never</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+
+                <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg">
+                  <div className="flex-1 min-w-0">
                     <Label className="text-sm font-medium">
                       Security Headers
                     </Label>
@@ -900,13 +1167,15 @@ export function EnvironmentConfigurationCard({
                           }))
                         }
                         placeholder={
-                          environment.deployment_config?.security?.passwordProtection?.enabled
+                          environment.deployment_config?.security
+                            ?.passwordProtection?.enabled
                             ? 'Leave empty to keep current password'
                             : 'Enter a password'
                         }
                       />
                       <p className="text-xs text-muted-foreground mt-1">
-                        {environment.deployment_config?.security?.passwordProtection?.enabled
+                        {environment.deployment_config?.security
+                          ?.passwordProtection?.enabled
                           ? 'A password is currently set. Enter a new one to change it, or leave empty to keep the current password.'
                           : 'Set a password that visitors must enter to access this environment. The password is securely hashed.'}
                       </p>
@@ -947,8 +1216,8 @@ export function EnvironmentConfigurationCard({
                       <Input
                         type="number"
                         value={
-                          formData.security?.rateLimiting
-                            ?.maxRequestsPerHour ?? ''
+                          formData.security?.rateLimiting?.maxRequestsPerHour ??
+                          ''
                         }
                         onChange={(e) =>
                           setFormData((prev) => ({

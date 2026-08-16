@@ -87,6 +87,7 @@ pub struct AlertNotification {
     pub message: String,
     // Enriched fields (set by ErrorTrackingService after evaluation)
     pub project_name: Option<String>,
+    pub project_slug: Option<String>,
     pub environment_name: Option<String>,
     pub error_type: String,
     pub total_count: i32,
@@ -579,6 +580,7 @@ impl ErrorAlertService {
             message,
             // These get populated by enrich_notifications in ErrorTrackingService
             project_name: None,
+            project_slug: None,
             environment_name: None,
             error_type: group.error_type.clone(),
             total_count: group.total_count,

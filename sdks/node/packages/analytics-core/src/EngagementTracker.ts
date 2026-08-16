@@ -185,6 +185,7 @@ export class EngagementTracker {
         request_path: window.location.pathname,
         request_query: window.location.search,
         domain: this.domain,
+        language: navigator.language,
         event_data: {
           engagement_time: Math.round(this.engagementTime),
           total_time: Math.round(Date.now() - this.startTime),
@@ -221,6 +222,7 @@ export class EngagementTracker {
         request_path: window.location.pathname,
         request_query: window.location.search,
         domain: this.domain,
+        language: navigator.language,
         event_data: {
           engagement_time_seconds: data.engagement_time_seconds,
           total_time_seconds: data.total_time_seconds,

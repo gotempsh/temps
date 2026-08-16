@@ -5,7 +5,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Timelike, Utc};
 
 use temps_otel::storage::timescaledb::TimescaleDbStorage;
 use temps_otel::storage::OtelStorage;
@@ -26,6 +26,33 @@ async fn setup_storage() -> Option<(temps_database::test_utils::TestDatabase, Ti
     };
 
     let storage = TimescaleDbStorage::new(test_db.db.clone(), None);
+    Some((test_db, storage))
+}
+
+/// Same as [`setup_storage`], but with a populated facet cache so ingest
+/// writes `facet_attr_N` slot columns and `query_spans`/trace-summary
+/// queries route faceted keys through them instead of the JSON fallback.
+/// `facets` maps attribute key -> slot (1..=20).
+async fn setup_storage_with_facets(
+    facets: &[(&str, u8)],
+) -> Option<(temps_database::test_utils::TestDatabase, TimescaleDbStorage)> {
+    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(e) => {
+            println!("Docker/TestDatabase not available, skipping test: {}", e);
+            return None;
+        }
+    };
+
+    let map: std::collections::HashMap<String, u8> = facets
+        .iter()
+        .map(|(key, slot)| (key.to_string(), *slot))
+        .collect();
+    let facet_cache: temps_otel::services::FacetCache =
+        std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(map));
+
+    let storage =
+        TimescaleDbStorage::with_config(test_db.db.clone(), None, 7, None, Some(facet_cache));
     Some((test_db, storage))
 }
 
@@ -166,6 +193,42 @@ async fn test_store_and_get_trace() {
 }
 
 #[tokio::test]
+async fn test_has_traces() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let project_with_spans = 1;
+    let project_without_spans = 2;
+
+    assert!(
+        !storage.has_traces(project_with_spans).await.unwrap(),
+        "no spans stored yet"
+    );
+
+    let root = sample_span(
+        project_with_spans,
+        "aabbccdd11223344aabbccdd11223344",
+        "0102030405060708",
+        None,
+        "GET /api/users",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        100.0,
+    );
+    storage.store_spans(vec![root]).await.unwrap();
+
+    assert!(
+        storage.has_traces(project_with_spans).await.unwrap(),
+        "a span was just stored for this project"
+    );
+    assert!(
+        !storage.has_traces(project_without_spans).await.unwrap(),
+        "a different project must not see another project's spans"
+    );
+}
+
+#[tokio::test]
 async fn test_query_spans_filters() {
     let Some((_db, storage)) = setup_storage().await else {
         return;
@@ -230,6 +293,102 @@ async fn test_query_spans_filters() {
         .await
         .unwrap();
     assert_eq!(by_svc.len(), 2);
+}
+
+#[tokio::test]
+async fn test_query_spans_faceted_attribute_routes_through_slot_column() {
+    let Some((_db, storage)) = setup_storage_with_facets(&[("enduser.id", 1)]).await else {
+        return;
+    };
+
+    let project_id = 21;
+
+    let mut faceted_span = sample_span(
+        project_id,
+        "trace_faceted",
+        "span_faceted",
+        None,
+        "faceted-op",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        10.0,
+    );
+    faceted_span
+        .attributes
+        .insert("enduser.id".to_string(), "user-42".to_string());
+
+    let mut other_span = sample_span(
+        project_id,
+        "trace_other",
+        "span_other",
+        None,
+        "other-op",
+        SpanKind::Server,
+        SpanStatusCode::Ok,
+        10.0,
+    );
+    other_span
+        .attributes
+        .insert("enduser.id".to_string(), "someone-else".to_string());
+    // Also carries an unfaceted attribute, to prove the JSON fallback still
+    // works for keys that aren't registered as a facet.
+    other_span
+        .attributes
+        .insert("unfaceted.key".to_string(), "unfaceted-value".to_string());
+
+    storage
+        .store_spans(vec![faceted_span, other_span])
+        .await
+        .unwrap();
+
+    // 1. Prove ingest actually wrote the value into facet_attr_1, not just
+    //    that the query happens to return the right row for other reasons.
+    use sea_orm::ConnectionTrait;
+    let raw = _db
+        .db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT facet_attr_1 FROM otel_spans WHERE span_id = $1",
+            vec!["span_faceted".into()],
+        ))
+        .await
+        .unwrap()
+        .unwrap();
+    let facet_attr_1: Option<String> = raw.try_get("", "facet_attr_1").unwrap();
+    assert_eq!(facet_attr_1.as_deref(), Some("user-42"));
+
+    // 2. Prove query_spans, given the same faceted key, returns exactly the
+    //    matching span — i.e. the facet_attr_1 = $x branch (not the JSON
+    //    fallback) is what's actually being evaluated, since a broken
+    //    routing (e.g. always-false column reference) would return zero
+    //    rows here instead of silently falling back.
+    let mut faceted_filter = BTreeMap::new();
+    faceted_filter.insert("enduser.id".to_string(), "user-42".to_string());
+    let matched = storage
+        .query_spans(TraceQuery {
+            project_id,
+            attributes: Some(faceted_filter),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(matched.len(), 1);
+    assert_eq!(matched[0].span_id, "span_faceted");
+
+    // 3. Control: an unfaceted key on the same query path still resolves via
+    //    the JSON `attributes->>` fallback.
+    let mut unfaceted_filter = BTreeMap::new();
+    unfaceted_filter.insert("unfaceted.key".to_string(), "unfaceted-value".to_string());
+    let matched_unfaceted = storage
+        .query_spans(TraceQuery {
+            project_id,
+            attributes: Some(unfaceted_filter),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(matched_unfaceted.len(), 1);
+    assert_eq!(matched_unfaceted[0].span_id, "span_other");
 }
 
 #[tokio::test]
@@ -485,13 +644,177 @@ async fn test_storage_quota() {
         return;
     };
 
+    // Default storage has no quota configured: the estimate short-circuits
+    // to zeros and check_quota reports "not exceeded".
     let quota = storage.get_storage_quota(1).await.unwrap();
     assert_eq!(quota.project_id, 1);
-    assert_eq!(quota.limit_bytes, 10 * 1024 * 1024 * 1024); // 10 GB
-    assert!(quota.usage_pct >= 0.0);
+    assert_eq!(quota.limit_bytes, 0);
+    assert_eq!(quota.usage_pct, 0.0);
 
     let exceeded = storage.check_quota(1).await.unwrap();
+    assert!(!exceeded);
+
+    // With an explicit quota, the check runs for real against a fresh DB.
+    let storage_with_quota = TimescaleDbStorage::with_config(
+        _db.db.clone(),
+        None,
+        7,
+        Some(10 * 1024 * 1024 * 1024),
+        None,
+    );
+    let quota = storage_with_quota.get_storage_quota(1).await.unwrap();
+    assert_eq!(quota.limit_bytes, 10 * 1024 * 1024 * 1024);
+    let exceeded = storage_with_quota.check_quota(1).await.unwrap();
     assert!(!exceeded); // Fresh DB, should not be exceeded
+}
+
+/// Regression test for the `hypertable_size()` fix.
+///
+/// `test_storage_quota` above only exercises a freshly-created, empty
+/// database, where the old buggy `pg_total_relation_size(otel_spans)`
+/// (root-relation) formula and the fixed `hypertable_size('otel_spans')`
+/// (chunk-aware) formula are indistinguishable — both report ~0 bytes
+/// because no data has ever been inserted. That made the old formula's bug
+/// invisible to this test suite: a hypertable's root relation holds no
+/// rows/bytes of its own regardless of how much real data lives in its
+/// child chunk tables, so quota enforcement was silently inert for every
+/// project (see the CORRECTNESS comment on `get_storage_quota`).
+///
+/// This test closes that gap by actually inserting span rows via
+/// `store_spans` (the real ingest path, not a synthetic row count) and
+/// asserting `total_bytes`/`usage_pct` track that real volume. If a future
+/// change reverts `get_storage_quota` back to
+/// `pg_total_relation_size(otel_spans::regclass)` on the hypertable root,
+/// `total_bytes` will stay near zero regardless of the ~500 inserted spans
+/// and the assertions below will fail.
+#[tokio::test]
+async fn test_storage_quota_tracks_real_ingested_span_volume() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+
+    let project_id = 4242;
+
+    // Each span carries a sizeable `attributes` payload (20 keys x ~200
+    // bytes each, ~4KB/span) so the real bytes written to the `otel_spans`
+    // hypertable's chunks are well above any catalog/index noise floor a
+    // table -- even an empty one -- can carry. With ~500 such spans this is
+    // several hundred KB to low-MB of real chunk data, comfortably over the
+    // 200KB quota limit used below.
+    let mut attrs = BTreeMap::new();
+    for i in 0..20 {
+        attrs.insert(format!("attribute.key.number.{i}"), "x".repeat(200));
+    }
+
+    let mut spans = Vec::with_capacity(500);
+    for i in 0..500u32 {
+        let mut span = sample_span(
+            project_id,
+            &format!("{i:032x}"),
+            &format!("{i:016x}"),
+            None,
+            "load-test-span",
+            SpanKind::Internal,
+            SpanStatusCode::Ok,
+            10.0,
+        );
+        span.attributes = attrs.clone();
+        spans.push(span);
+    }
+
+    let stored = storage.store_spans(spans).await.unwrap();
+    assert_eq!(stored, 500);
+
+    // A 200KB limit. Calibrated live against both formulas on this exact
+    // dataset (~500 spans x ~4KB attributes each):
+    //   - fixed `hypertable_size()` formula:            ~856KB total_bytes
+    //   - old `pg_total_relation_size(root)` formula:     ~64KB total_bytes
+    //     (a hypertable's empty root relation carries a small constant
+    //     amount of index/catalog overhead that does NOT grow with chunk
+    //     data — this is that constant, not real ingested volume)
+    // 200KB sits with wide margin between the two, so this assertion is
+    // only satisfied by a formula that actually accounts for chunk storage.
+    const TEST_QUOTA_LIMIT_BYTES: u64 = 200 * 1024;
+    let storage_with_tiny_quota = TimescaleDbStorage::with_config(
+        _db.db.clone(),
+        None,
+        7,
+        Some(TEST_QUOTA_LIMIT_BYTES),
+        None,
+    );
+    let quota = storage_with_tiny_quota
+        .get_storage_quota(project_id)
+        .await
+        .unwrap();
+    assert!(
+        quota.total_bytes > TEST_QUOTA_LIMIT_BYTES,
+        "expected chunk-aware total_bytes to exceed the {TEST_QUOTA_LIMIT_BYTES}-byte test \
+         limit after inserting ~500 spans with ~4KB of attributes each (got {} bytes) -- \
+         this is exactly the regression the hypertable_size() fix protects against: the old \
+         pg_total_relation_size(root) formula reports only the root relation's constant \
+         ~64KB of index/catalog overhead here, never the real chunk volume",
+        quota.total_bytes
+    );
+    assert!(
+        quota.usage_pct >= 100.0,
+        "usage_pct should have crossed 100% of the {TEST_QUOTA_LIMIT_BYTES}-byte limit, got {}",
+        quota.usage_pct
+    );
+
+    let exceeded = storage_with_tiny_quota
+        .check_quota(project_id)
+        .await
+        .unwrap();
+    assert!(
+        exceeded,
+        "check_quota must trip once real ingested span volume exceeds the configured limit"
+    );
+
+    // Sanity check in the other direction: a generous limit against the
+    // same real data must NOT report exceeded, proving usage_pct is a real
+    // proportional measurement and not just pegged to 100%.
+    let storage_with_generous_quota = TimescaleDbStorage::with_config(
+        _db.db.clone(),
+        None,
+        7,
+        Some(10 * 1024 * 1024 * 1024),
+        None,
+    );
+    let generous_quota = storage_with_generous_quota
+        .get_storage_quota(project_id)
+        .await
+        .unwrap();
+    assert!(
+        generous_quota.usage_pct < 100.0,
+        "a 10GB limit should not be exceeded by ~500 spans of test data, got usage_pct = {}",
+        generous_quota.usage_pct
+    );
+    let not_exceeded = storage_with_generous_quota
+        .check_quota(project_id)
+        .await
+        .unwrap();
+    assert!(!not_exceeded);
+}
+
+#[tokio::test]
+async fn test_get_storage_quota_disabled_skips_database() {
+    use sea_orm::{DatabaseBackend, MockDatabase};
+
+    // No query results are prepared, so any database access would error.
+    // With no quota configured, the usage estimate must short-circuit
+    // without touching the database — this is the ingest hot path
+    // (`OtelService::check_quota` calls `get_storage_quota` on every
+    // quota-cache miss).
+    let mock_db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+    let storage = TimescaleDbStorage::new(std::sync::Arc::new(mock_db), None);
+
+    let quota = storage.get_storage_quota(1).await.unwrap();
+    assert_eq!(quota.total_bytes, 0);
+    assert_eq!(quota.limit_bytes, 0);
+    assert_eq!(quota.usage_pct, 0.0);
+
+    let exceeded = storage.check_quota(1).await.unwrap();
+    assert!(!exceeded);
 }
 
 // ── Retention is a no-op (Timescale's policy is the source of truth) ─
@@ -1069,7 +1392,7 @@ async fn test_full_fidelity_bad_label_key_rejected() {
 fn hist_pt(
     project_id: i32,
     name: &str,
-    secs_ago: i64,
+    timestamp: DateTime<Utc>,
     temporality: AggregationTemporality,
     count: u64,
     sum: f64,
@@ -1082,7 +1405,7 @@ fn hist_pt(
         name.into(),
         MetricType::Histogram,
         "ms".into(),
-        Utc::now() - Duration::seconds(secs_ago),
+        timestamp,
         BTreeMap::new(),
     );
     p.histogram_count = Some(count);
@@ -1095,6 +1418,16 @@ fn hist_pt(
     p
 }
 
+/// Choose a stable point inside the current hour so relative fixture offsets
+/// cannot cross an hourly aggregation boundary when a test starts near HH:00.
+fn histogram_fixture_now() -> DateTime<Utc> {
+    Utc::now()
+        .with_minute(30)
+        .and_then(|time| time.with_second(0))
+        .and_then(|time| time.with_nanosecond(0))
+        .expect("30 minutes past the current UTC hour is always valid")
+}
+
 /// DELTA histograms in the same bucket must be ELEMENT-WISE summed (validates the
 /// WITH ORDINALITY array aggregation across multiple rows — not just one).
 #[tokio::test]
@@ -1104,12 +1437,13 @@ async fn test_full_fidelity_histogram_delta_elementwise_sum() {
     };
     let project_id = 110;
     let name = "http.latency.delta";
+    let fixture_now = histogram_fixture_now();
     storage
         .store_metrics(vec![
             hist_pt(
                 project_id,
                 name,
-                30,
+                fixture_now - Duration::seconds(30),
                 AggregationTemporality::Delta,
                 100,
                 5000.0,
@@ -1118,7 +1452,7 @@ async fn test_full_fidelity_histogram_delta_elementwise_sum() {
             hist_pt(
                 project_id,
                 name,
-                20,
+                fixture_now - Duration::seconds(20),
                 AggregationTemporality::Delta,
                 15,
                 300.0,
@@ -1158,13 +1492,14 @@ async fn test_full_fidelity_histogram_cumulative_latest_snapshot() {
     };
     let project_id = 111;
     let name = "http.latency.cumulative";
+    let fixture_now = histogram_fixture_now();
     storage
         .store_metrics(vec![
             // earlier snapshot
             hist_pt(
                 project_id,
                 name,
-                40,
+                fixture_now - Duration::seconds(40),
                 AggregationTemporality::Cumulative,
                 50,
                 2500.0,
@@ -1174,7 +1509,7 @@ async fn test_full_fidelity_histogram_cumulative_latest_snapshot() {
             hist_pt(
                 project_id,
                 name,
-                10,
+                fixture_now - Duration::seconds(10),
                 AggregationTemporality::Cumulative,
                 100,
                 5000.0,
@@ -1220,11 +1555,12 @@ async fn test_full_fidelity_histogram_quantile() {
     };
     let project_id = 112;
     let name = "http.latency.quantile";
+    let fixture_now = histogram_fixture_now();
     storage
         .store_metrics(vec![hist_pt(
             project_id,
             name,
-            20,
+            fixture_now - Duration::seconds(20),
             AggregationTemporality::Delta,
             100,
             5000.0,
@@ -1288,11 +1624,12 @@ async fn test_full_fidelity_histogram_group_by_null_label() {
     };
     let project_id = 113;
     let name = "http.latency.bylabel";
+    let fixture_now = histogram_fixture_now();
 
     let mut with_route = hist_pt(
         project_id,
         name,
-        20,
+        fixture_now - Duration::seconds(20),
         AggregationTemporality::Delta,
         100,
         5000.0,
@@ -1303,7 +1640,7 @@ async fn test_full_fidelity_histogram_group_by_null_label() {
     let without_route = hist_pt(
         project_id,
         name,
-        20,
+        fixture_now - Duration::seconds(20),
         AggregationTemporality::Delta,
         40,
         2000.0,
@@ -1446,4 +1783,398 @@ async fn test_migration_ddl_safe_on_compressed_chunks() {
     ))
     .await
     .expect("GIN CREATE INDEX must succeed on a compressed hypertable");
+}
+
+// ── Span stats (per-operation latency report) ────────────────────────
+
+/// Build a span with an explicit start time, so aggregation tests can place
+/// spans deterministically inside (and outside) the queried window.
+#[allow(clippy::too_many_arguments)]
+fn stats_span(
+    project_id: i32,
+    service_name: &str,
+    name: &str,
+    duration_ms: f64,
+    status: SpanStatusCode,
+    start_time: DateTime<Utc>,
+) -> SpanRecord {
+    let seq = next_span_seq();
+    let mut span = sample_span(
+        project_id,
+        &format!("{seq:032x}"),
+        &format!("{seq:016x}"),
+        None,
+        name,
+        SpanKind::Server,
+        status,
+        duration_ms,
+    );
+    span.resource.service_name = service_name.into();
+    span.start_time = start_time;
+    span.end_time = start_time + Duration::microseconds((duration_ms * 1000.0) as i64);
+    span
+}
+
+/// Monotonic id source — trace/span ids only need to be distinct here, and a
+/// counter keeps the fixtures reproducible.
+fn next_span_seq() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn stats_query(project_ids: Vec<i32>, start: DateTime<Utc>, end: DateTime<Utc>) -> SpanStatsQuery {
+    SpanStatsQuery {
+        project_ids,
+        start_time: start,
+        end_time: end,
+        service_name: None,
+        span_name: None,
+        name_pattern: None,
+        kind: None,
+        status: None,
+        environment_id: None,
+        deployment_id: None,
+        attributes: None,
+        min_duration_ms: None,
+        min_count: 1,
+        sort_by: SpanStatsSortField::default(),
+        sort_order: SortOrder::default(),
+        limit: None,
+        offset: None,
+    }
+}
+
+#[tokio::test]
+async fn test_span_stats_aggregates_percentiles_and_ratios() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let now = Utc::now();
+    let window_start = now - Duration::hours(1);
+
+    // `steady` is uniformly ~100ms. `erratic` is bimodal: 18 fast calls and
+    // 2 that take 2s — the case an average alone hides completely.
+    let mut spans = Vec::new();
+    for i in 0..20 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "steady",
+            100.0 + i as f64,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(30),
+        ));
+    }
+    for i in 0..18 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "erratic",
+            40.0 + i as f64,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(30),
+        ));
+    }
+    for _ in 0..2 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "erratic",
+            2000.0,
+            SpanStatusCode::Error,
+            now - Duration::minutes(30),
+        ));
+    }
+    storage.store_spans(spans).await.expect("store spans");
+
+    let rows = storage
+        .query_span_stats(stats_query(vec![1], window_start, now))
+        .await
+        .expect("query span stats");
+
+    let steady = rows
+        .iter()
+        .find(|r| r.span_name == "steady")
+        .expect("steady");
+    let erratic = rows
+        .iter()
+        .find(|r| r.span_name == "erratic")
+        .expect("erratic");
+
+    assert_eq!(steady.count, 20);
+    assert_eq!(erratic.count, 20);
+    assert_eq!(erratic.error_count, 2);
+    assert!((erratic.error_rate - 0.1).abs() < 1e-9);
+
+    // The max is what "how bad did it ever get?" asks for.
+    assert!((erratic.max_duration_ms - 2000.0).abs() < 1.0);
+    // p50 stays in the fast band even though the max is 2s — which is exactly
+    // why a median-only view misses this operation.
+    assert!(
+        erratic.p50_duration_ms < 100.0,
+        "p50 was {}",
+        erratic.p50_duration_ms
+    );
+    assert!(
+        erratic.p99_duration_ms > 1000.0,
+        "p99 was {}",
+        erratic.p99_duration_ms
+    );
+
+    // Both ranking signals must prefer the erratic operation, even though the
+    // steady one is not meaningfully faster on average.
+    assert!(erratic.tail_ratio > steady.tail_ratio);
+    assert!(erratic.coefficient_of_variation > steady.coefficient_of_variation);
+}
+
+#[tokio::test]
+async fn test_span_stats_respects_window_project_and_min_count() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let now = Utc::now();
+
+    let mut spans = Vec::new();
+    // In-window, project 1, 5 samples.
+    for _ in 0..5 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "in-window",
+            10.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    // In-window, project 1, but only 2 samples — below a min_count of 3.
+    for _ in 0..2 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "rare",
+            10.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    // Outside the window entirely.
+    for _ in 0..5 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "too-old",
+            10.0,
+            SpanStatusCode::Ok,
+            now - Duration::hours(48),
+        ));
+    }
+    // A different project.
+    for _ in 0..5 {
+        spans.push(stats_span(
+            2,
+            "api",
+            "other-project",
+            10.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    storage.store_spans(spans).await.expect("store spans");
+
+    let query = stats_query(vec![1], now - Duration::hours(1), now);
+    let rows = storage
+        .query_span_stats(query.clone())
+        .await
+        .expect("query span stats");
+    let names: Vec<&str> = rows.iter().map(|r| r.span_name.as_str()).collect();
+
+    assert!(names.contains(&"in-window"));
+    assert!(names.contains(&"rare"));
+    assert!(
+        !names.contains(&"too-old"),
+        "spans outside the window must not be aggregated"
+    );
+    assert!(
+        !names.contains(&"other-project"),
+        "another project's spans must never leak into the report"
+    );
+
+    // The min_count floor is what keeps three-sample noise out of a
+    // variability ranking, so it must actually drop rows.
+    let floored = SpanStatsQuery {
+        min_count: 3,
+        ..query.clone()
+    };
+    let rows = storage
+        .query_span_stats(floored.clone())
+        .await
+        .expect("query span stats");
+    let names: Vec<&str> = rows.iter().map(|r| r.span_name.as_str()).collect();
+    assert!(names.contains(&"in-window"));
+    assert!(
+        !names.contains(&"rare"),
+        "min_count must drop low-sample rows"
+    );
+
+    // The count must agree with the rows, including the min_count floor —
+    // otherwise pagination silently loses or repeats operations.
+    let total = storage
+        .count_span_stats(floored)
+        .await
+        .expect("count span stats");
+    assert_eq!(total as usize, rows.len());
+}
+
+#[tokio::test]
+async fn test_span_stats_spans_multiple_projects_and_sorts() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let now = Utc::now();
+
+    let mut spans = Vec::new();
+    // Project 1: cheap but very frequent — wins on count, loses on p95.
+    for _ in 0..50 {
+        spans.push(stats_span(
+            1,
+            "api",
+            "cache.get",
+            2.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    // Project 2: expensive but rare — wins on p95, loses on count.
+    for _ in 0..5 {
+        spans.push(stats_span(
+            2,
+            "worker",
+            "report.render",
+            900.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ));
+    }
+    storage.store_spans(spans).await.expect("store spans");
+
+    let base = stats_query(vec![1, 2], now - Duration::hours(1), now);
+
+    // Both projects appear in one report, each tagged with its own project_id.
+    let rows = storage
+        .query_span_stats(base.clone())
+        .await
+        .expect("query span stats");
+    assert_eq!(rows.len(), 2);
+    assert!(rows
+        .iter()
+        .any(|r| r.project_id == 1 && r.span_name == "cache.get"));
+    assert!(rows
+        .iter()
+        .any(|r| r.project_id == 2 && r.span_name == "report.render"));
+
+    // total_time: 50 x 2ms = 100ms vs 5 x 900ms = 4500ms.
+    let by_total = storage
+        .query_span_stats(SpanStatsQuery {
+            sort_by: SpanStatsSortField::TotalDurationMs,
+            ..base.clone()
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(by_total[0].span_name, "report.render");
+
+    // count: the frequent cheap call wins.
+    let by_count = storage
+        .query_span_stats(SpanStatsQuery {
+            sort_by: SpanStatsSortField::Count,
+            ..base.clone()
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(by_count[0].span_name, "cache.get");
+
+    // Ascending order must actually invert the ranking.
+    let ascending = storage
+        .query_span_stats(SpanStatsQuery {
+            sort_by: SpanStatsSortField::TotalDurationMs,
+            sort_order: SortOrder::Asc,
+            ..base
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(ascending[0].span_name, "cache.get");
+}
+
+#[tokio::test]
+async fn test_span_stats_filters_by_service_name_and_status() {
+    let Some((_db, storage)) = setup_storage().await else {
+        return;
+    };
+    let now = Utc::now();
+
+    let spans = vec![
+        stats_span(
+            1,
+            "api",
+            "checkout",
+            100.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ),
+        stats_span(
+            1,
+            "api",
+            "checkout",
+            900.0,
+            SpanStatusCode::Error,
+            now - Duration::minutes(5),
+        ),
+        stats_span(
+            1,
+            "worker",
+            "checkout",
+            50.0,
+            SpanStatusCode::Ok,
+            now - Duration::minutes(5),
+        ),
+    ];
+    storage.store_spans(spans).await.expect("store spans");
+
+    let base = stats_query(vec![1], now - Duration::hours(1), now);
+
+    let api_only = storage
+        .query_span_stats(SpanStatsQuery {
+            service_name: Some("api".into()),
+            ..base.clone()
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(api_only.len(), 1);
+    assert_eq!(api_only[0].service_name, "api");
+    assert_eq!(api_only[0].count, 2);
+
+    // status=error answers "how slow are the failures?" — the OK span must not
+    // dilute the numbers.
+    let errors_only = storage
+        .query_span_stats(SpanStatsQuery {
+            status: Some(SpanStatusCode::Error),
+            ..base.clone()
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(errors_only.len(), 1);
+    assert_eq!(errors_only[0].count, 1);
+    assert!((errors_only[0].max_duration_ms - 900.0).abs() < 1.0);
+
+    // An exact span_name plus max is the "worst case for this operation" query.
+    let named = storage
+        .query_span_stats(SpanStatsQuery {
+            span_name: Some("checkout".into()),
+            service_name: Some("api".into()),
+            ..base
+        })
+        .await
+        .expect("query span stats");
+    assert_eq!(named.len(), 1);
+    assert!((named[0].max_duration_ms - 900.0).abs() < 1.0);
 }

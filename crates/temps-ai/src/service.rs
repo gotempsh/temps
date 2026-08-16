@@ -4,8 +4,10 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::streaming::{
-    ChatStreamDelta, ChatTurnRequest, ChatTurnResponse, ChatTurnStream, TokenStream,
+    ChatMessage, ChatStreamDelta, ChatTurnRequest, ChatTurnResponse, ChatTurnStream, TokenStream,
+    ToolExecutor, TurnServices,
 };
+use crate::{ProviderCapabilities, RefreshPolicy};
 
 /// A single AI completion request. Construct with `..Default::default()` and set
 /// only what you need:
@@ -20,6 +22,8 @@ pub struct AiRequest {
     pub purpose: String,
     /// Optional governance + usage scope (per-project budgets / allow-lists).
     pub project_id: Option<i32>,
+    /// Optional explicit provider selection; `None` uses the instance default.
+    pub provider: Option<String>,
     /// Optional system instruction.
     pub system: Option<String>,
     /// The user prompt.
@@ -30,6 +34,9 @@ pub struct AiRequest {
     pub max_tokens: Option<u32>,
     /// Sampling temperature (provider default when `None`).
     pub temperature: Option<f32>,
+    /// Provider-normalized reasoning depth. Callers must validate this value
+    /// against [`ProviderCapabilities`] before dispatching it.
+    pub thinking_level: Option<String>,
     /// When set, the provider is asked to return JSON matching this JSON Schema.
     /// Usually populated by [`crate::complete_typed`] from a Rust type rather than
     /// by hand.
@@ -76,9 +83,85 @@ pub trait AiService: Send + Sync {
     /// caller skip prompt construction when AI is unavailable.
     async fn is_available(&self) -> bool;
 
+    /// Provider-aware availability for a resource pinned to an immutable route.
+    async fn is_available_for(&self, _provider: Option<&str>) -> bool {
+        self.is_available().await
+    }
+
+    /// Cheap gate for the multi-turn tool-calling workload specifically
+    /// (debugging chat, propose-then-confirm write actions — anything that
+    /// calls [`Self::chat`]/[`Self::chat_stream_turn`]). Defaults to
+    /// [`Self::is_available`] for implementations where the two coincide.
+    ///
+    /// This is a distinct method — not just a reuse of `is_available` — for
+    /// implementations that serve *some* workloads but not tool-calling
+    /// (e.g. a subscription agent CLI: it can do plain completions, but has
+    /// no external function-calling protocol to hand it). Those
+    /// implementations override this to report `false` even while
+    /// `is_available` reports `true`, so a readiness check gated on the
+    /// right method never tells a caller "configured" for a workload the
+    /// active provider can't actually serve.
+    async fn chat_capable(&self) -> bool {
+        self.is_available().await
+    }
+
+    /// Provider-aware readiness for a pinned conversation.
+    async fn chat_capable_for(&self, _provider: Option<&str>) -> bool {
+        self.chat_capable().await
+    }
+
+    /// Return the normalized controls and realtime features for one provider.
+    /// UI and conversation validation consume this contract, so adding an
+    /// adapter never requires provider-id branches in either layer.
+    async fn capabilities_for(
+        &self,
+        _provider: Option<&str>,
+        _refresh: RefreshPolicy,
+    ) -> Result<ProviderCapabilities, AiError> {
+        Err(AiError::NotAvailable)
+    }
+
     /// Low-level completion. Prefer the [`crate::complete_text`] /
     /// [`crate::complete_typed`] helpers for everyday use.
     async fn complete(&self, request: AiRequest) -> Result<AiResponse, AiError>;
+
+    /// Stream a single-pass completion. Providers with native structured
+    /// streaming override this method so `response_schema` is enforced by the
+    /// provider. The default adapter keeps every [`AiService`] reusable: it
+    /// translates the request into a tool-less chat stream and embeds the JSON
+    /// Schema in the system instruction for providers (notably host CLIs) that
+    /// cannot accept a native response-format argument.
+    async fn complete_stream(&self, request: AiRequest) -> Result<TokenStream, AiError> {
+        let mut system = request.system.unwrap_or_default();
+        if let Some(schema) = request.response_schema {
+            if !system.is_empty() {
+                system.push_str("\n\n");
+            }
+            system.push_str(
+                "Return only one JSON object matching this JSON Schema. Do not use Markdown fences:\n",
+            );
+            system.push_str(&schema.to_string());
+        }
+
+        let mut messages = Vec::with_capacity(2);
+        if !system.is_empty() {
+            messages.push(ChatMessage::system(system));
+        }
+        messages.push(ChatMessage::user(request.prompt));
+
+        self.chat_stream(ChatTurnRequest {
+            purpose: request.purpose,
+            project_id: request.project_id,
+            provider: request.provider,
+            messages,
+            model: request.model,
+            max_tokens: request.max_tokens,
+            temperature: request.temperature,
+            thinking_level: request.thinking_level,
+            ..Default::default()
+        })
+        .await
+    }
 
     /// Multi-turn streaming completion (ADR-023): replays the supplied history
     /// and streams the assistant reply token-by-token. The substrate for
@@ -107,5 +190,29 @@ pub trait AiService: Send + Sync {
         use futures::StreamExt;
         let stream = self.chat_stream(request).await?;
         Ok(Box::pin(stream.map(|item| item.map(ChatStreamDelta::Text))))
+    }
+
+    /// Provider-native tool harness entry point. Gateway implementations use
+    /// their normal tool-call stream and leave execution to the caller; CLI
+    /// implementations override this to expose `request.tools` through an
+    /// ephemeral scoped bridge and invoke `executor` from that bridge.
+    async fn chat_stream_turn_with_executor(
+        &self,
+        request: ChatTurnRequest,
+        _executor: Option<ToolExecutor>,
+    ) -> Result<ChatTurnStream, AiError> {
+        self.chat_stream_turn(request).await
+    }
+
+    /// Provider-neutral turn entry point. Tools, user interactions, streaming,
+    /// and cancellation use the same runtime contract for gateway and harness
+    /// adapters. The executor-only method remains as a compatibility shim.
+    async fn chat_stream_turn_with_services(
+        &self,
+        request: ChatTurnRequest,
+        services: TurnServices,
+    ) -> Result<ChatTurnStream, AiError> {
+        self.chat_stream_turn_with_executor(request, services.tools)
+            .await
     }
 }

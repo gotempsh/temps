@@ -26,11 +26,13 @@ examples/
 ├── nestjs/
 │   └── basic/            NestJS + TypeScript (generated)
 ├── go/
-│   └── gin-basic/        Go + Gin framework
+│   ├── gin-basic/        Go + Gin framework
+│   └── error-tracking/   Go + sentry-go — error tracking with source context
 ├── python/
 │   └── flask-basic/      Python + Flask
 ├── rust/
-│   └── actix-basic/      Rust + Actix Web
+│   ├── actix-basic/      Rust + Actix Web
+│   └── error-tracking/   Rust + Axum + sentry — error tracking with source context
 ├── java/
 │   └── spring-basic/     Java + Spring Boot
 ├── csharp/

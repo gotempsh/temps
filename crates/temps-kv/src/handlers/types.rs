@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use temps_core::AuditLogger;
+use temps_core::{AuditLogger, ProjectAccessChecker};
 use temps_providers::externalsvc::RedisService;
 use temps_providers::ExternalServiceManager;
 use utoipa::ToSchema;
@@ -17,6 +17,10 @@ pub struct KvAppState {
     pub redis_service: Arc<RedisService>,
     pub external_service_manager: Arc<ExternalServiceManager>,
     pub audit_service: Arc<dyn AuditLogger>,
+    /// Team-based project access checker (registered by a plugin; `None` in
+    /// plain OSS, where the guard is a no-op). Confines KV data-plane access to
+    /// projects the caller may reach when the checker is present.
+    pub project_access_checker: Option<Arc<dyn ProjectAccessChecker>>,
 }
 
 // =============================================================================

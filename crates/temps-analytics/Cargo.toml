@@ -13,10 +13,12 @@ readme = "README.md"
 
 [dependencies]
 temps-auth = { path = "../temps-auth" }
+temps-ai = { path = "../temps-ai" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-migrations = { path = "../temps-migrations" }
+schemars = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 async-trait = "0.1"
@@ -34,6 +36,7 @@ axum = { workspace = true }
 axum-macros = { workspace = true }
 url = "2"
 urlencoding = "2"
+moka = { version = "0.12", features = ["future"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

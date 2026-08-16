@@ -168,12 +168,12 @@ impl TempsClient {
 
     // ── Low-level request/response ─────────────────────────────────────
 
-    /// Send a request and wait for the response.
-    async fn request(
-        &self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, PluginSdkError> {
+    /// Make a typed call and get back exactly that call's output.
+    ///
+    /// The return type is inferred from `C`, so a call and its reply cannot
+    /// drift apart: pairing them is the [`PlatformCall`] impl's job, and
+    /// that impl is generated alongside both wire enums.
+    pub async fn call<C: PlatformCall>(&self, call: C) -> Result<C::Output, PluginSdkError> {
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
 
         let (tx, rx) = oneshot::channel();
@@ -181,8 +181,7 @@ impl TempsClient {
 
         let msg = ChannelMessage::Request(ChannelRequest {
             id,
-            method: method.to_string(),
-            params,
+            call: call.into_request(),
         });
 
         self.inner
@@ -192,37 +191,33 @@ impl TempsClient {
 
         let resp = rx.await.map_err(|_| PluginSdkError::ChannelClosed)?;
 
-        if let Some(err) = resp.error {
-            return Err(PluginSdkError::PlatformError {
+        match resp.outcome {
+            CallOutcome::Ok(payload) => {
+                C::output_from(*payload).map_err(|e| PluginSdkError::ProtocolMismatch {
+                    reason: e.to_string(),
+                })
+            }
+            CallOutcome::Err(err) => Err(PluginSdkError::PlatformError {
                 code: format!("{:?}", err.code),
                 message: err.message,
-            });
+            }),
         }
-
-        resp.result.ok_or(PluginSdkError::ChannelClosed)
     }
 
     // ── Typed query methods ────────────────────────────────────────────
+    //
+    // Thin wrappers over `call`. They exist for discoverability — a plugin
+    // author should find `list_environments` by typing `client.` — not
+    // because they add behaviour.
 
     /// Get a project by ID.
     pub async fn get_project(&self, project_id: i32) -> Result<ProjectInfo, PluginSdkError> {
-        let value = self
-            .request(
-                "get_project",
-                serde_json::json!({ "project_id": project_id }),
-            )
-            .await?;
-        serde_json::from_value(value).map_err(|e| PluginSdkError::Deserialization {
-            reason: e.to_string(),
-        })
+        self.call(GetProject { project_id }).await
     }
 
     /// List all (non-deleted) projects.
     pub async fn list_projects(&self) -> Result<Vec<ProjectInfo>, PluginSdkError> {
-        let value = self.request("list_projects", serde_json::json!({})).await?;
-        serde_json::from_value(value).map_err(|e| PluginSdkError::Deserialization {
-            reason: e.to_string(),
-        })
+        self.call(ListProjects {}).await
     }
 
     /// Get an environment by ID.
@@ -230,15 +225,7 @@ impl TempsClient {
         &self,
         environment_id: i32,
     ) -> Result<EnvironmentInfo, PluginSdkError> {
-        let value = self
-            .request(
-                "get_environment",
-                serde_json::json!({ "environment_id": environment_id }),
-            )
-            .await?;
-        serde_json::from_value(value).map_err(|e| PluginSdkError::Deserialization {
-            reason: e.to_string(),
-        })
+        self.call(GetEnvironment { environment_id }).await
     }
 
     /// List environments for a project.
@@ -246,15 +233,7 @@ impl TempsClient {
         &self,
         project_id: i32,
     ) -> Result<Vec<EnvironmentInfo>, PluginSdkError> {
-        let value = self
-            .request(
-                "list_environments",
-                serde_json::json!({ "project_id": project_id }),
-            )
-            .await?;
-        serde_json::from_value(value).map_err(|e| PluginSdkError::Deserialization {
-            reason: e.to_string(),
-        })
+        self.call(ListEnvironments { project_id }).await
     }
 
     /// Get a deployment by ID.
@@ -262,15 +241,7 @@ impl TempsClient {
         &self,
         deployment_id: i32,
     ) -> Result<DeploymentInfo, PluginSdkError> {
-        let value = self
-            .request(
-                "get_deployment",
-                serde_json::json!({ "deployment_id": deployment_id }),
-            )
-            .await?;
-        serde_json::from_value(value).map_err(|e| PluginSdkError::Deserialization {
-            reason: e.to_string(),
-        })
+        self.call(GetDeployment { deployment_id }).await
     }
 
     /// Get the most recent deployment for a project, optionally filtered
@@ -280,14 +251,11 @@ impl TempsClient {
         project_id: i32,
         environment_id: Option<i32>,
     ) -> Result<DeploymentInfo, PluginSdkError> {
-        let mut params = serde_json::json!({ "project_id": project_id });
-        if let Some(env_id) = environment_id {
-            params["environment_id"] = serde_json::json!(env_id);
-        }
-        let value = self.request("get_last_deployment", params).await?;
-        serde_json::from_value(value).map_err(|e| PluginSdkError::Deserialization {
-            reason: e.to_string(),
+        self.call(GetLastDeployment {
+            project_id,
+            environment_id,
         })
+        .await
     }
 
     /// List deployments for a project, optionally filtered by environment.
@@ -297,17 +265,21 @@ impl TempsClient {
         environment_id: Option<i32>,
         limit: Option<u64>,
     ) -> Result<Vec<DeploymentInfo>, PluginSdkError> {
-        let mut params = serde_json::json!({ "project_id": project_id });
-        if let Some(env_id) = environment_id {
-            params["environment_id"] = serde_json::json!(env_id);
-        }
-        if let Some(limit) = limit {
-            params["limit"] = serde_json::json!(limit);
-        }
-        let value = self.request("list_deployments", params).await?;
-        serde_json::from_value(value).map_err(|e| PluginSdkError::Deserialization {
-            reason: e.to_string(),
+        self.call(ListDeployments {
+            project_id,
+            environment_id,
+            limit,
         })
+        .await
+    }
+
+    /// Call the platform's own HTTP API as the user who called this plugin.
+    ///
+    /// Prefer the typed helpers on [`crate::api`], which fill in the path
+    /// and method for you; this is the escape hatch for an endpoint the SDK
+    /// has no wrapper for yet.
+    pub async fn api_call(&self, call: ApiCall) -> Result<ApiCallResult, PluginSdkError> {
+        self.call(call).await
     }
 }
 

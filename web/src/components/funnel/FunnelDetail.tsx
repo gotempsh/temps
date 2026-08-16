@@ -21,7 +21,7 @@ import { format, subDays } from 'date-fns'
 import { ArrowLeft, Calendar as CalendarIcon } from 'lucide-react'
 import * as React from 'react'
 import { DateRange } from 'react-day-picker'
-import { useNavigate } from 'react-router-dom'
+import { useGoBack } from '@/hooks/useGoBack'
 import { FunnelVisualization } from './FunnelVisualization'
 
 interface FunnelDetailProps {
@@ -30,7 +30,7 @@ interface FunnelDetailProps {
 }
 
 export function FunnelDetail({ project, funnelId }: FunnelDetailProps) {
-  const navigate = useNavigate()
+  const goBack = useGoBack(`/projects/${project.slug}/analytics/funnels`)
   const [dateRange, setDateRange] = React.useState<DateRange | undefined>({
     from: subDays(new Date(), 30),
     to: new Date(),
@@ -59,7 +59,7 @@ export function FunnelDetail({ project, funnelId }: FunnelDetailProps) {
     <div className="space-y-6">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-4">
-          <Button variant="ghost" size="icon" onClick={() => navigate(-1)}>
+          <Button variant="ghost" size="icon" onClick={() => goBack()}>
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
@@ -97,7 +97,7 @@ export function FunnelDetail({ project, funnelId }: FunnelDetailProps) {
           </PopoverTrigger>
           <PopoverContent className="w-auto p-0" align="end">
             <Calendar
-              initialFocus
+              autoFocus
               mode="range"
               defaultMonth={dateRange?.from}
               selected={dateRange}

@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
-use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
+use sea_orm::{
+    ActiveValue::Set, ConnectionTrait, DatabaseBackend, DatabaseTransaction, DbErr, QueryFilter,
+    Statement,
+};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
@@ -43,9 +46,48 @@ pub struct Model {
     /// this environment, taking precedence over the project default.
     /// (A nullable boolean column maps to `Option<bool>` automatically.)
     pub attack_mode: Option<bool>,
+    /// Per-environment override for the proxy's HTTP→HTTPS redirect.
+    /// `None` (NULL) means inherit the proxy default, which redirects only when
+    /// the requested host has an active TLS certificate. `Some(true)` always
+    /// redirects plain HTTP for this environment (useful when TLS is terminated
+    /// by an upstream CDN, so no local cert exists to trigger the default);
+    /// `Some(false)` never redirects it (HTTP-only clients).
+    /// Requests under `/.well-known/acme-challenge/` are exempt in every case so
+    /// Let's Encrypt HTTP-01 issuance and renewal can always complete.
+    pub force_https: Option<bool>,
     /// Last proxied request timestamp for on-demand environments.
     /// Persisted periodically by the idle sweep, not on every request.
     pub last_activity_at: Option<DBDateTime>,
+}
+
+/// Serialize a claim on the global preview-hostname namespace and return any
+/// active environment that already owns it. Callers must keep `txn` open until
+/// the corresponding create, restore, or rename is committed.
+pub async fn claim_subdomain(
+    txn: &DatabaseTransaction,
+    subdomain: &str,
+    excluded_environment_ids: &[i32],
+) -> Result<Option<Model>, DbErr> {
+    let canonical_subdomain = subdomain.trim().to_ascii_lowercase();
+    txn.execute(Statement::from_sql_and_values(
+        DatabaseBackend::Postgres,
+        "SELECT pg_advisory_xact_lock(hashtext($1))",
+        [canonical_subdomain.clone().into()],
+    ))
+    .await?;
+
+    let mut conflict = Entity::find()
+        // Include legacy mixed-case rows because DNS and the route store treat
+        // hostnames case-insensitively.
+        .filter(sea_orm::sea_query::Expr::cust_with_values(
+            "LOWER(BTRIM(\"subdomain\")) = $1",
+            [canonical_subdomain],
+        ))
+        .filter(Column::DeletedAt.is_null());
+    if !excluded_environment_ids.is_empty() {
+        conflict = conflict.filter(Column::Id.is_not_in(excluded_environment_ids.iter().copied()));
+    }
+    conflict.one(txn).await
 }
 
 impl Model {

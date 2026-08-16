@@ -339,6 +339,7 @@ impl MonitorService {
             project_id: i32,
             monitor_count: i64,
             operational_count: i64,
+            major_outage_count: i64,
         }
 
         // Single query: for each project, get latest check status of production monitors.
@@ -359,7 +360,8 @@ impl MonitorService {
             SELECT
                 sm.project_id,
                 COUNT(sm.id) as monitor_count,
-                COUNT(lc.status) FILTER (WHERE lc.status = 'operational') as operational_count
+                COUNT(lc.status) FILTER (WHERE lc.status = 'operational') as operational_count,
+                COUNT(*) FILTER (WHERE lc.status = 'major_outage' OR lc.status IS NULL) as major_outage_count
             FROM status_monitors sm
             JOIN environments e ON e.id = sm.environment_id
                 AND e.name = 'production'
@@ -393,11 +395,15 @@ impl MonitorService {
             std::collections::HashMap::new();
 
         for r in results {
+            // "down" is reserved for monitors that are hard-down (major_outage or no
+            // recent check at all) across the board; a monitor merely returning a
+            // soft client error (degraded/partial_outage) should not paint the whole
+            // project red -- see health_check_service.rs for the per-monitor statuses.
             let status = if r.monitor_count == 0 {
                 "no_monitors".to_string()
             } else if r.operational_count == r.monitor_count {
                 "operational".to_string()
-            } else if r.operational_count == 0 {
+            } else if r.major_outage_count == r.monitor_count {
                 "down".to_string()
             } else {
                 "degraded".to_string()
@@ -600,6 +606,12 @@ impl MonitorService {
             successful_checks: i64,
         }
 
+        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
+        // row ("Monitor created - awaiting first health check") from the
+        // denominator -- without it, a monitor with a 100% real pass rate
+        // still reports <100% uptime for as long as that placeholder row
+        // stays within the window, since it counts toward total_checks but
+        // never toward successful_checks.
         let stats = status_checks::Entity::find()
             .filter(status_checks::Column::MonitorId.eq(monitor_id))
             .filter(status_checks::Column::CheckedAt.gte(start_date))
@@ -610,7 +622,7 @@ impl MonitorService {
                     COUNT(*) as total_checks,
                     COUNT(*) FILTER (WHERE status = 'operational') as successful_checks
                 FROM status_checks
-                WHERE monitor_id = $1 AND checked_at >= $2
+                WHERE monitor_id = $1 AND checked_at >= $2 AND status != 'unknown'
                 "#,
                 vec![monitor_id.into(), start_date.into()],
             ))
@@ -665,13 +677,18 @@ impl MonitorService {
             avg_time: Option<f64>,
         }
 
+        // Postgres' AVG() over an integer column returns NUMERIC, not
+        // double precision -- casting here keeps sqlx's try_get<f64> from
+        // erroring on the type mismatch (this silently failed
+        // get_monitor_status -> get_status_overview swallowed it into a
+        // fake "unknown" status for every monitor, even fully healthy ones).
         let result = status_checks::Entity::find()
             .filter(status_checks::Column::MonitorId.eq(monitor_id))
             .filter(status_checks::Column::CheckedAt.gte(start_date))
             .from_raw_sql(sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r#"
-                SELECT AVG(response_time_ms) as avg_time
+                SELECT AVG(response_time_ms)::double precision as avg_time
                 FROM status_checks
                 WHERE monitor_id = $1 AND checked_at >= $2 AND response_time_ms IS NOT NULL
                 "#,
@@ -740,8 +757,12 @@ impl MonitorService {
                     time_bucket('{}', checked_at) AS bucket,
                     COUNT(*) as total_checks,
                     COUNT(*) FILTER (WHERE status = 'operational') as operational_count,
-                    COUNT(*) FILTER (WHERE status = 'degraded') as degraded_count,
-                    COUNT(*) FILTER (WHERE status = 'down') as down_count,
+                    -- health_check_service.rs writes 'partial_outage'/'major_outage' for
+                    -- the finer-grained cases, not just plain 'degraded'/'down' -- without
+                    -- these, a bucket made entirely of real outage checks fell through to
+                    -- "unknown" below instead of "down".
+                    COUNT(*) FILTER (WHERE status IN ('degraded', 'partial_outage')) as degraded_count,
+                    COUNT(*) FILTER (WHERE status IN ('down', 'major_outage')) as down_count,
                     AVG(response_time_ms) as avg_response_time_ms,
                     MIN(response_time_ms) as min_response_time_ms,
                     MAX(response_time_ms) as max_response_time_ms,
@@ -752,6 +773,9 @@ impl MonitorService {
                 WHERE monitor_id = $1
                   AND checked_at >= $2
                   AND checked_at < $3
+                  -- excludes create_monitor's synthetic bootstrap row -- see
+                  -- get_current_status_for_timeframe's identical comment.
+                  AND status != 'unknown'
                 GROUP BY bucket
             ) sub
             ORDER BY bucket ASC
@@ -850,7 +874,11 @@ impl MonitorService {
             _ => "24 hours", // Default
         };
 
-        // Query to calculate uptime percentage and current status
+        // Query to calculate uptime percentage and current status.
+        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
+        // row from both the uptime denominator and the "latest status" pick --
+        // without it, a monitor with a 100% real pass rate still reports
+        // <100% uptime for as long as that placeholder row stays in the window.
         let query = format!(
             r#"
             WITH recent_checks AS (
@@ -862,6 +890,7 @@ impl MonitorService {
                 FROM status_checks
                 WHERE monitor_id = $1
                     AND checked_at >= NOW() - INTERVAL '{}'
+                    AND status != 'unknown'
             ),
             stats AS (
                 SELECT
@@ -935,7 +964,10 @@ impl MonitorService {
             last_check_at: Option<UtcDateTime>,
         }
 
-        // If custom time range provided, use it
+        // If custom time range provided, use it.
+        // `status != 'unknown'` excludes create_monitor's synthetic bootstrap
+        // row from both the uptime denominator and the "latest status" pick --
+        // see get_current_status_for_timeframe's identical comment.
 
         let query = r#"
             WITH recent_checks AS (
@@ -948,6 +980,7 @@ impl MonitorService {
                 WHERE monitor_id = $1
                     AND checked_at >= $2
                     AND checked_at <= $3
+                    AND status != 'unknown'
             ),
             stats AS (
                 SELECT
@@ -1319,5 +1352,108 @@ mod tests {
         if !monitor.monitor_url.is_empty() {
             assert!(monitor.monitor_url.ends_with("/health"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_project_health_degraded_monitor_is_not_reported_as_down() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let config_service = create_mock_config_service(&db);
+        let service = MonitorService::new(db.clone(), config_service);
+
+        let project = create_test_project(&db).await;
+
+        // get_projects_monitor_health only looks at "production" environments.
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let subdomain = format!("test-prod-{}", nanos);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set(subdomain.clone()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.local", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let request = CreateMonitorRequest {
+            name: "Production Monitor".to_string(),
+            monitor_type: "web".to_string(),
+            environment_id: environment.id,
+            check_interval_seconds: Some(60),
+            ..Default::default()
+        };
+        let monitor = service.create_monitor(project.id, request).await.unwrap();
+
+        // A monitor that's merely degraded (e.g. a soft 4xx) should not be
+        // indistinguishable from a fully unreachable one at the project level.
+        service
+            .record_check(monitor.id, "degraded".to_string(), Some(120), None)
+            .await
+            .unwrap();
+
+        let health = service
+            .get_projects_monitor_health(&[project.id])
+            .await
+            .unwrap();
+
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].project_id, project.id);
+        assert_eq!(health[0].status, "degraded");
+    }
+
+    #[tokio::test]
+    async fn test_project_health_major_outage_monitor_is_reported_as_down() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let config_service = create_mock_config_service(&db);
+        let service = MonitorService::new(db.clone(), config_service);
+
+        let project = create_test_project(&db).await;
+
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
+        let subdomain = format!("test-prod-{}", nanos);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set(subdomain.clone()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.local", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let request = CreateMonitorRequest {
+            name: "Production Monitor".to_string(),
+            monitor_type: "web".to_string(),
+            environment_id: environment.id,
+            check_interval_seconds: Some(60),
+            ..Default::default()
+        };
+        let monitor = service.create_monitor(project.id, request).await.unwrap();
+
+        service
+            .record_check(
+                monitor.id,
+                "major_outage".to_string(),
+                None,
+                Some("connection refused".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let health = service
+            .get_projects_monitor_health(&[project.id])
+            .await
+            .unwrap();
+
+        assert_eq!(health.len(), 1);
+        assert_eq!(health[0].status, "down");
     }
 }

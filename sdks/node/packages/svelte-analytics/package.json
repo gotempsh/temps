@@ -1,6 +1,6 @@
 {
 	"name": "@temps-sdk/svelte-analytics",
-	"version": "0.0.1",
+	"version": "0.0.2",
 	"description": "Temps analytics for Svelte — stores, actions, and helpers for events, Web Vitals, engagement, and session replay.",
 	"private": false,
 	"type": "module",

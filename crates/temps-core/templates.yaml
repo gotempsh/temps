@@ -8,12 +8,16 @@ version: "1"
 
 templates:
   # Observability Starter — the one-click "try Temps" demo app.
-  # Showcases all four built-in observability pillars (analytics, error
-  # tracking, distributed tracing) plus a Postgres database in a single deploy,
-  # so a new user can activate without building a project of their own first.
+  # "Cadence", a mock revenue-analytics SaaS, showcases all four built-in
+  # observability pillars (analytics, error tracking, distributed tracing) plus a
+  # Postgres database in a single deploy. Its "Simulate a user journey" button
+  # drives a real funnel so a new user sees the data land without building a
+  # project of their own first.
   - slug: observability-starter
     name: Observability Starter
-    description: A Next.js demo app pre-wired with analytics, error tracking, distributed tracing, and a Postgres database — see Temps in action in one deploy
+    description: Cadence — a mock revenue-analytics SaaS pre-wired with analytics, error tracking, distributed tracing, and a Postgres database. Hit Simulate to watch the funnel fill Temps in one deploy.
+    # Screenshot of a real running instance, served from web/public/templates/.
+    screenshot_url: /templates/observability-starter.png
     git:
       url: https://github.com/gotempsh/temps-examples.git
       ref: main
@@ -32,10 +36,11 @@ templates:
       - analytics
       - getting-started
     features:
+      - One-click "Simulate a user journey" funnel demo
       - Product analytics with @temps-sdk/react-analytics
       - Error tracking via Sentry-compatible DSN
       - Distributed tracing with OpenTelemetry
-      - Postgres-backed guestbook
+      - Postgres-backed signups & subscriptions
       - Session recording on errors
     services:
       - postgres
@@ -66,6 +71,7 @@ templates:
   - slug: nextjs-saas-starter
     name: Next.js SaaS Starter
     description: A complete SaaS starter kit with authentication, billing, and database integration
+    screenshot_url: /templates/nextjs-saas-starter.png
     git:
       url: https://github.com/gotempsh/temps-examples.git
       ref: main
@@ -114,6 +120,7 @@ templates:
   - slug: nextjs-docs-template
     name: Next.js Docs Template
     description: A modern documentation site template with syntax highlighting, dark mode, and responsive design
+    screenshot_url: /templates/nextjs-docs-template.png
     git:
       url: https://github.com/gotempsh/temps-examples.git
       ref: main

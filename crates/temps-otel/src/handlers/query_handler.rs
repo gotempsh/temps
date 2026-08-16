@@ -94,8 +94,70 @@ pub struct TraceQueryParams {
     pub sort_by: Option<String>,
     /// Sort direction: "asc" or "desc" (default).
     pub sort_order: Option<String>,
+    /// Whether to compute `total` on the trace-summaries list. Defaults to
+    /// true. Set false when the caller only needs the page itself (an
+    /// existence probe, a poll, an infinite-scroll feed): the total is a
+    /// second aggregation over the whole window, and skipping it removes one
+    /// of the two queries the endpoint would otherwise issue.
+    pub include_total: Option<bool>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+}
+
+/// Query parameters for `GET /otel/span-stats`.
+///
+/// Every filter is optional except the project selection: pass `project_id` for
+/// one project, or `project_ids` (comma-separated) to rank operations across
+/// several at once. Each project is access-checked individually.
+#[derive(Debug, Deserialize)]
+pub struct SpanStatsQueryParams {
+    /// Single project to report on. Ignored when `project_ids` is given.
+    pub project_id: Option<i32>,
+    /// Comma-separated project ids, e.g. `4,5,6`. At most
+    /// [`SPAN_STATS_MAX_PROJECTS`].
+    pub project_ids: Option<String>,
+    /// Window start (RFC 3339). Defaults to 24h before `end_time`.
+    pub start_time: Option<String>,
+    /// Window end (RFC 3339). Defaults to now.
+    pub end_time: Option<String>,
+    pub service_name: Option<String>,
+    /// Exact span name — "how slow did *this* operation get?".
+    pub span_name: Option<String>,
+    /// Substring match on the span name (case-insensitive).
+    pub name_pattern: Option<String>,
+    /// `server` | `client` | `internal` | `producer` | `consumer`.
+    pub kind: Option<String>,
+    /// `ok` | `error` | `unset`. `error` answers "how slow are the failures?".
+    pub status: Option<String>,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
+    /// Span attribute filters as comma-separated `key=value` pairs.
+    pub attributes: Option<String>,
+    /// Ignore spans faster than this before aggregating.
+    pub min_duration_ms: Option<f64>,
+    /// Drop operations with fewer than this many samples (default 1).
+    pub min_count: Option<u64>,
+    /// `total_time` (default) | `p50` | `p95` | `p99` | `max` | `avg` |
+    /// `stddev` | `count` | `errors` | `error_rate` | `variability` | `tail_ratio`.
+    pub sort_by: Option<String>,
+    /// `asc` | `desc` (default).
+    pub sort_order: Option<String>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// Response for `GET /otel/span-stats`.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SpanStatsResponse {
+    pub data: Vec<SpanStats>,
+    /// Total number of distinct operations matching the filters, for pagination.
+    pub total: u64,
+    /// The window actually aggregated, echoed back because it is defaulted
+    /// server-side when the caller omits it.
+    #[schema(value_type = String, format = DateTime)]
+    pub start_time: DateTime<Utc>,
+    #[schema(value_type = String, format = DateTime)]
+    pub end_time: DateTime<Utc>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,7 +217,12 @@ pub struct TracesResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TraceSummariesResponse {
     pub data: Vec<TraceSummary>,
-    pub total: u64,
+    /// Total traces matching the filters, ignoring pagination. Omitted when
+    /// the request passed `include_total=false`, in which case the caller
+    /// asked not to pay for the count — treat its absence as "unknown", not
+    /// as zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -178,6 +245,11 @@ pub struct HealthResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct QuotaResponse {
     pub quota: StorageQuota,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct HasTracesResponse {
+    pub has_traces: bool,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -470,6 +542,15 @@ pub async fn list_metric_label_values(
 }
 
 /// Query trace spans with optional filters.
+///
+/// Each returned span has a `duration_ms` field (float, milliseconds) — this is
+/// the ONLY field guaranteed to be in milliseconds. Spans also carry an
+/// `attributes` map of raw key/value pairs exactly as reported by the
+/// instrumenting library: numeric attribute values may be seconds, milliseconds,
+/// microseconds, or nanoseconds depending on that library's convention, and
+/// nothing in this response labels the unit. Never assume an attribute's
+/// numeric value shares `duration_ms`'s unit, and never state a duration in
+/// milliseconds unless it came from a `duration_ms` field.
 #[utoipa::path(
     tag = "Traces",
     get,
@@ -484,6 +565,8 @@ pub async fn list_metric_label_values(
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
+        ("attributes" = Option<String>, Query, description = "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\""),
+        ("name_pattern" = Option<String>, Query, description = "Filter by span name pattern (ILIKE)"),
         ("limit" = Option<u64>, Query, description = "Max spans to return (default: 100, max: 1000)"),
         ("offset" = Option<u64>, Query, description = "Offset for pagination"),
     ),
@@ -528,6 +611,7 @@ pub async fn query_traces(
             .map(parse_attributes)
             .filter(|m| !m.is_empty()),
         name_pattern: params.name_pattern.clone(),
+        root_only: false,
         // Sorting only applies to the trace-summaries list, not raw span queries.
         sort_by: TraceSortField::default(),
         sort_order: SortOrder::default(),
@@ -557,9 +641,11 @@ pub async fn query_traces(
         ("end_time" = Option<String>, Query, description = "End time (RFC 3339)"),
         ("environment_id" = Option<i32>, Query, description = "Filter by environment ID"),
         ("deployment_id" = Option<i32>, Query, description = "Filter by deployment ID"),
+        ("attributes" = Option<String>, Query, description = "Filter by span attributes as comma-separated key=value pairs, e.g. \"gen_ai.system=openai,gen_ai.request.model=gpt-4\""),
         ("name_pattern" = Option<String>, Query, description = "Filter by span name pattern (ILIKE)"),
         ("sort_by" = Option<String>, Query, description = "Sort field: 'start_time' (default) or 'duration'"),
         ("sort_order" = Option<String>, Query, description = "Sort direction: 'asc' or 'desc' (default)"),
+        ("include_total" = Option<bool>, Query, description = "Compute the `total` count (default: true). Set false to skip the second aggregation when only the page is needed"),
         ("limit" = Option<u64>, Query, description = "Max traces to return (default: 50, max: 100)"),
         ("offset" = Option<u64>, Query, description = "Offset for pagination"),
     ),
@@ -604,6 +690,7 @@ pub async fn query_trace_summaries(
             .map(parse_attributes)
             .filter(|m| !m.is_empty()),
         name_pattern: params.name_pattern.clone(),
+        root_only: false,
         sort_by: params
             .sort_by
             .as_deref()
@@ -618,15 +705,24 @@ pub async fn query_trace_summaries(
         offset: params.offset,
     };
 
-    // Clone query for the count call (which ignores limit/offset)
-    let count_query = TraceQuery {
-        limit: None,
-        offset: None,
-        ..query.clone()
+    // The page and the total are independent aggregations over the same
+    // window, so issue them concurrently rather than paying for both in
+    // series. `include_total=false` skips the second one entirely.
+    let (mut data, total) = if params.include_total.unwrap_or(true) {
+        // Clone query for the count call (which ignores limit/offset)
+        let count_query = TraceQuery {
+            limit: None,
+            offset: None,
+            ..query.clone()
+        };
+        let (data, total) = tokio::try_join!(
+            state.otel_service.query_trace_summaries(query),
+            state.otel_service.count_traces(count_query),
+        )?;
+        (data, Some(total))
+    } else {
+        (state.otel_service.query_trace_summaries(query).await?, None)
     };
-
-    let mut data = state.otel_service.query_trace_summaries(query).await?;
-    let total = state.otel_service.count_traces(count_query).await?;
 
     // Name cross-project trace rows whose root span lives in a sibling project:
     // when this project holds only child spans, the summary has no root and would
@@ -662,7 +758,211 @@ pub async fn query_trace_summaries(
     Ok(Json(TraceSummariesResponse { data, total }))
 }
 
+/// Rank operations by latency, volume, or inconsistency.
+///
+/// Groups spans by `(project, service, span name)` over a bounded window and
+/// returns count, error rate, total/min/max/avg/stddev duration, p50/p95/p99,
+/// and two variability ratios per operation. Sorting is what makes it useful:
+///
+/// - `sort_by=total_time` (default) — where the wall-clock actually goes.
+/// - `sort_by=p95` / `p99` — what users actually feel.
+/// - `sort_by=variability` or `tail_ratio` — operations whose *spread* is the
+///   problem: the ones that take 40ms most of the time and 4s the rest.
+/// - `span_name=payments.charge` — the worst this one operation ever got, in
+///   `max_duration_ms`.
+///
+/// Pair the variability sorts with `min_count` — a ratio computed from three
+/// samples is noise, and without a floor it outranks every real signal.
+///
+/// Two bounds are enforced rather than clamped, so a result never claims to
+/// cover more than it does: at most 50 projects, and a window no wider than
+/// 31 days. Both return 400. Unlike the trace list this report has no early
+/// exit — it aggregates every span in the window before it can rank anything.
+#[utoipa::path(
+    tag = "Traces",
+    get,
+    path = "/otel/span-stats",
+    params(
+        ("project_id" = Option<i32>, Query, description = "Single project to report on"),
+        ("project_ids" = Option<String>, Query, description = "Comma-separated project ids, e.g. `4,5,6` (max 50)"),
+        ("start_time" = Option<String>, Query, description = "Window start (RFC 3339); defaults to 24h before end_time. The window may not exceed 31 days"),
+        ("end_time" = Option<String>, Query, description = "Window end (RFC 3339); defaults to now"),
+        ("service_name" = Option<String>, Query, description = "Restrict to one service"),
+        ("span_name" = Option<String>, Query, description = "Restrict to one operation by exact span name"),
+        ("name_pattern" = Option<String>, Query, description = "Case-insensitive substring match on the span name"),
+        ("kind" = Option<String>, Query, description = "server | client | internal | producer | consumer"),
+        ("status" = Option<String>, Query, description = "ok | error | unset"),
+        ("environment_id" = Option<i32>, Query, description = "Restrict to one environment"),
+        ("deployment_id" = Option<i32>, Query, description = "Restrict to one deployment"),
+        ("attributes" = Option<String>, Query, description = "Comma-separated key=value span attribute filters"),
+        ("min_duration_ms" = Option<f64>, Query, description = "Ignore spans faster than this"),
+        ("min_count" = Option<u64>, Query, description = "Drop operations with fewer samples than this"),
+        ("sort_by" = Option<String>, Query, description = "total_time | p50 | p95 | p99 | max | avg | stddev | count | errors | error_rate | variability | tail_ratio"),
+        ("sort_order" = Option<String>, Query, description = "asc | desc (default)"),
+        ("limit" = Option<u64>, Query, description = "Page size (default 20, max 100)"),
+        ("offset" = Option<u64>, Query, description = "Page offset"),
+    ),
+    responses(
+        (status = 200, description = "Per-operation latency statistics", body = SpanStatsResponse),
+        (status = 400, description = "Invalid query (no project, empty window)", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn query_span_stats(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<SpanStatsQueryParams>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+
+    let project_ids = parse_project_ids(&params)?;
+    // Authorize every project individually. A multi-project report must not
+    // become a way to read a project the caller cannot open on its own.
+    for project_id in &project_ids {
+        project_scope_guard!(auth, *project_id);
+        project_access_guard!(auth, *project_id, state.project_access_checker);
+    }
+
+    let (start_time, end_time) =
+        discovery_window(params.start_time.as_deref(), params.end_time.as_deref());
+
+    let query = SpanStatsQuery {
+        project_ids,
+        start_time,
+        end_time,
+        service_name: params.service_name.clone(),
+        span_name: params.span_name.clone(),
+        name_pattern: params.name_pattern.clone().filter(|p| !p.is_empty()),
+        kind: params.kind.as_deref().and_then(parse_span_kind_param),
+        status: params.status.as_deref().and_then(parse_span_status_param),
+        environment_id: params.environment_id,
+        deployment_id: params.deployment_id,
+        attributes: params
+            .attributes
+            .as_deref()
+            .map(parse_attributes)
+            .filter(|m| !m.is_empty()),
+        min_duration_ms: params.min_duration_ms,
+        min_count: params.min_count.unwrap_or(1).max(1),
+        sort_by: params
+            .sort_by
+            .as_deref()
+            .map(SpanStatsSortField::parse)
+            .unwrap_or_default(),
+        sort_order: params
+            .sort_order
+            .as_deref()
+            .map(SortOrder::parse)
+            .unwrap_or_default(),
+        limit: params.limit,
+        offset: params.offset,
+    };
+
+    // The count ignores limit/offset but must keep every other filter, or the
+    // total disagrees with the page.
+    let count_query = SpanStatsQuery {
+        limit: None,
+        offset: None,
+        ..query.clone()
+    };
+
+    let (data, total) = tokio::try_join!(
+        state.otel_service.query_span_stats(query),
+        state.otel_service.count_span_stats(count_query),
+    )?;
+
+    Ok(Json(SpanStatsResponse {
+        data,
+        total,
+        start_time,
+        end_time,
+    }))
+}
+
+/// Resolve the requested projects from `project_ids` (preferred) or the
+/// single-project `project_id`.
+///
+/// Rejects an empty selection with a 400 rather than silently reporting on
+/// nothing: a typo in `project_ids` would otherwise return an empty table that
+/// looks exactly like "this project has no traces".
+fn parse_project_ids(params: &SpanStatsQueryParams) -> Result<Vec<i32>, Problem> {
+    let mut ids: Vec<i32> = match params.project_ids.as_deref() {
+        Some(raw) => raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<i32>().map_err(|_| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid Project Ids")
+                        .with_detail(format!("'{s}' in project_ids is not an integer"))
+                })
+            })
+            .collect::<Result<Vec<i32>, Problem>>()?,
+        None => params.project_id.into_iter().collect(),
+    };
+    ids.sort_unstable();
+    ids.dedup();
+
+    if ids.is_empty() {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Project Required")
+            .with_detail(
+                "Provide project_id, or project_ids as a comma-separated list of project ids",
+            ));
+    }
+    // Rejected here, before the per-project access checks run, so an oversized
+    // list costs one string parse rather than one authorization round-trip per
+    // id. The service re-checks the same bound for non-HTTP callers.
+    if ids.len() > SPAN_STATS_MAX_PROJECTS {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Too Many Projects")
+            .with_detail(format!(
+                "span-stats accepts at most {} projects per query, got {}",
+                SPAN_STATS_MAX_PROJECTS,
+                ids.len()
+            )));
+    }
+    Ok(ids)
+}
+
+/// Parse a span-kind query token. Unknown → `None` (no filter).
+fn parse_span_kind_param(s: &str) -> Option<SpanKind> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "server" => Some(SpanKind::Server),
+        "client" => Some(SpanKind::Client),
+        "internal" => Some(SpanKind::Internal),
+        "producer" => Some(SpanKind::Producer),
+        "consumer" => Some(SpanKind::Consumer),
+        "unspecified" => Some(SpanKind::Unspecified),
+        _ => None,
+    }
+}
+
+/// Parse a span-status query token. Unknown → `None` (no filter).
+fn parse_span_status_param(s: &str) -> Option<SpanStatusCode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "ok" => Some(SpanStatusCode::Ok),
+        "error" => Some(SpanStatusCode::Error),
+        "unset" => Some(SpanStatusCode::Unset),
+        _ => None,
+    }
+}
+
 /// Get all spans for a specific trace.
+///
+/// Each span has a `duration_ms` field (float, milliseconds) — the ONLY field
+/// guaranteed to be in milliseconds — plus an `attributes` map of raw
+/// key/value pairs exactly as the instrumenting library reported them.
+/// Numeric attribute values (e.g. connection-pool wait times, queue delays)
+/// may be in seconds, milliseconds, microseconds, or nanoseconds depending on
+/// that library's own convention; this response never labels the unit. When
+/// explaining what a span spent time on, only quote milliseconds from
+/// `duration_ms` (or from `start_time`/`end_time` deltas) — never assume a raw
+/// attribute number is already in milliseconds.
 #[utoipa::path(
     tag = "Traces",
     get,
@@ -875,6 +1175,44 @@ pub async fn get_quota(
     Ok(Json(QuotaResponse { quota }))
 }
 
+/// Whether a project has ever received at least one trace span.
+///
+/// A pure existence check for onboarding/setup UI (e.g. "has this project
+/// set up OpenTelemetry yet?"). Deliberately not `/otel/trace-summaries`
+/// with `limit=1`: that endpoint aggregates by trace (`GROUP BY trace_id`,
+/// `argMax`) and, without a time bound, that aggregation runs over every
+/// span the project has ever ingested. This endpoint answers the same
+/// yes/no question in O(1) — see `OtelStorage::has_traces`.
+#[utoipa::path(
+    tag = "OTel",
+    get,
+    path = "/otel/has-traces/{project_id}",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+    ),
+    responses(
+        (status = 200, description = "Trace existence check", body = HasTracesResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn has_traces(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Path(project_id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+    // Confine a project-scoped deployment token to its own project (no-op for
+    // user/API-key/session auth).
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let has_traces = state.otel_service.has_traces(project_id).await?;
+    Ok(Json(HasTracesResponse { has_traces }))
+}
+
 /// Get OTel pipeline statistics (admin/system view).
 #[utoipa::path(
     tag = "OTel",
@@ -900,6 +1238,11 @@ pub async fn get_pipeline_stats(
 // ── GenAI Agent Activity Handlers ──────────────────────────────────
 
 /// Query GenAI trace summaries — traces containing spans with `gen_ai.*` attributes.
+///
+/// `duration_ms` is the only field guaranteed to be milliseconds. `gen_ai.*`
+/// span attributes (e.g. time-to-first-token, token latency) often follow the
+/// OTel GenAI semantic conventions, which use **seconds** (a fractional
+/// double), not milliseconds — do not read them as ms without converting.
 #[utoipa::path(
     tag = "GenAI",
     get,
@@ -976,6 +1319,11 @@ pub async fn query_genai_traces(
 }
 
 /// Get GenAI span details for a specific trace.
+///
+/// `duration_ms` is the only field guaranteed to be milliseconds. `gen_ai.*`
+/// span attributes (e.g. time-to-first-token, token latency) often follow the
+/// OTel GenAI semantic conventions, which use **seconds** (a fractional
+/// double), not milliseconds — do not read them as ms without converting.
 #[utoipa::path(
     tag = "GenAI",
     get,
@@ -1032,21 +1380,24 @@ pub async fn get_genai_trace(
 /// The match is exhaustive with no catch-all arm per CLAUDE.md rules.
 impl From<CrossProjectTraceError> for Problem {
     fn from(error: CrossProjectTraceError) -> Self {
-        let detail = error.to_string();
         match error {
             CrossProjectTraceError::InvalidTraceId { .. } => {
                 problemdetails::new(StatusCode::BAD_REQUEST)
                     .with_title("Invalid Trace ID")
-                    .with_detail(detail)
+                    .with_detail(error.to_string())
             }
-            CrossProjectTraceError::RecordHint { .. }
-            | CrossProjectTraceError::QuerySiblings { .. }
+            CrossProjectTraceError::QuerySiblings { .. }
             | CrossProjectTraceError::QueryProjects { .. }
             | CrossProjectTraceError::Database(_)
             | CrossProjectTraceError::Storage(_) => {
+                // Log the real error server-side only — DB/storage error text
+                // can contain schema/table names or paths that must not reach
+                // the caller. Same pattern as `ingest_handler`'s
+                // `From<OtelError> for Problem`.
+                warn!(error = %error, "Cross-project trace query internal error");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(detail)
+                    .with_detail("An internal error occurred")
             }
         }
     }
@@ -1252,6 +1603,72 @@ pub async fn get_unified_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `include_total=false` must OMIT the key rather than report 0. A client
+    /// that reads `total ?? 0` would otherwise render "0 traces" over a full
+    /// page of results.
+    #[test]
+    fn trace_summaries_response_omits_total_when_not_requested() {
+        let json = serde_json::to_value(TraceSummariesResponse {
+            data: vec![],
+            total: None,
+        })
+        .expect("serialize");
+
+        assert!(
+            json.get("total").is_none(),
+            "absent total must mean 'not computed', never zero: {json}"
+        );
+    }
+
+    #[test]
+    fn trace_summaries_response_includes_total_when_computed() {
+        let json = serde_json::to_value(TraceSummariesResponse {
+            data: vec![],
+            total: Some(0),
+        })
+        .expect("serialize");
+
+        assert_eq!(
+            json.get("total").and_then(|t| t.as_u64()),
+            Some(0),
+            "a genuinely-zero total must still be serialized: {json}"
+        );
+    }
+
+    #[test]
+    fn cross_project_trace_error_internal_variants_do_not_leak_db_error_text() {
+        let err = CrossProjectTraceError::Database(sea_orm::DbErr::Custom(
+            "column \"trace_id\" not found in table \"cross_project_trace_refs\"".into(),
+        ));
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert_eq!(detail, "An internal error occurred");
+        assert!(
+            !detail.contains("cross_project_trace_refs"),
+            "detail leaked: {detail}"
+        );
+    }
+
+    #[test]
+    fn cross_project_trace_error_invalid_trace_id_keeps_user_facing_detail() {
+        let err = CrossProjectTraceError::InvalidTraceId {
+            trace_id: "not-hex".into(),
+        };
+        let problem: Problem = err.into();
+        assert_eq!(problem.status_code, StatusCode::BAD_REQUEST);
+        let detail = problem
+            .body
+            .get("detail")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        assert!(detail.contains("not-hex"), "detail: {detail}");
+    }
 
     #[test]
     fn test_parse_attributes_single_pair() {

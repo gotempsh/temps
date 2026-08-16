@@ -7,7 +7,7 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useEffect } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router'
 
 export function Email() {
   const { setBreadcrumbs } = useBreadcrumbs()
@@ -26,7 +26,7 @@ export function Email() {
 
   return (
     <div className="w-full px-4 sm:px-6 lg:px-8 py-8">
-      <div className="max-w-7xl mx-auto">
+      <div className="w-full">
         <div className="space-y-6">
           <div>
             <h1 className="text-3xl font-bold tracking-tight">Email</h1>

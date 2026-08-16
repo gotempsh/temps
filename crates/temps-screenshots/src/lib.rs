@@ -38,6 +38,13 @@ pub trait ScreenshotServiceTrait: Send + Sync {
 
     /// Check if the provider is available
     async fn is_provider_available(&self) -> bool;
+
+    /// Check whether the provider is available, returning the reason if it is not
+    ///
+    /// Callers that surface failures to the user (e.g. deployment jobs) must use
+    /// this instead of [`is_provider_available`](Self::is_provider_available) so
+    /// the operator sees *why* screenshots are unavailable.
+    async fn check_provider_availability(&self) -> ScreenshotResult<()>;
 }
 
 /// Implement the trait for the concrete ScreenshotService
@@ -61,6 +68,10 @@ impl ScreenshotServiceTrait for ScreenshotService {
 
     async fn is_provider_available(&self) -> bool {
         self.is_provider_available().await
+    }
+
+    async fn check_provider_availability(&self) -> ScreenshotResult<()> {
+        self.check_provider_availability().await
     }
 }
 

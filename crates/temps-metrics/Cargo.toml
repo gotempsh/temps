@@ -29,9 +29,10 @@ temps-entities = { path = "../temps-entities" }
 # Postgres collector
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1"] }
 
-# MongoDB collector
+# MongoDB collector. Use mongodb's own re-exported `mongodb::bson` types
+# rather than a standalone `bson` dependency — a standalone version can drift
+# out of sync with whatever bson version `mongodb` pins internally.
 mongodb = "3.7.0"
-bson = "2.13"
 
 # Redis collector
 redis = { workspace = true }
@@ -40,7 +41,13 @@ redis = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-config = { workspace = true }
 aws-credential-types = "1.2"
+aws-smithy-http-client = { version = "1.1", default-features = false, features = ["rustls-aws-lc"] }
+webpki-root-certs = "1.0"
+pem = "4"
 reqwest = { workspace = true }
 
 # Node collector (Linux /proc + statvfs)
 libc = "0.2"
+
+[dev-dependencies]
+testcontainers = { workspace = true, features = ["http_wait_plain"] }

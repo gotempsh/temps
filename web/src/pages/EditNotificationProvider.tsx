@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { useParams, useNavigate } from 'react-router-dom'
+import { useParams, useNavigate } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { useForm } from 'react-hook-form'
 import { zodResolver } from '@hookform/resolvers/zod'
@@ -13,10 +13,11 @@ import {
   testNotificationProviderMutation as testProvider2Mutation,
   deleteNotificationProviderMutation as deleteProvider2Mutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import { revealNotificationProviderConfig } from '@/api/client/sdk.gen'
 import { ProviderForm } from '@/components/monitoring/ProviderForm'
 import {
   ProviderFormData,
-  providerSchema,
+  providerUpdateSchema,
 } from '@/components/monitoring/schemas'
 import { Button } from '@/components/ui/button'
 import {
@@ -71,7 +72,7 @@ export function EditNotificationProvider() {
   }, [setBreadcrumbs, provider])
 
   const form = useForm<ProviderFormData>({
-    resolver: zodResolver(providerSchema),
+    resolver: zodResolver(providerUpdateSchema),
     defaultValues: {
       name: '',
       provider_type: 'email',
@@ -107,10 +108,7 @@ export function EditNotificationProvider() {
       form.reset({
         name: provider.name,
         provider_type: provider.provider_type as
-          | 'email'
-          | 'slack'
-          | 'webhook'
-          | 'cloudflare',
+          'email' | 'slack' | 'webhook' | 'cloudflare',
         config: {
           // Slack config
           webhook_url: config.webhook_url as string,
@@ -123,15 +121,14 @@ export function EditNotificationProvider() {
           // Email config
           smtp_host: config.smtp_host as string,
           smtp_port: config.smtp_port as number,
-          use_credentials: !!(
-            config.username || config.password
-          ),
+          use_credentials: !!(config.username || config.password),
           smtp_username: config.username as string,
           password: config.password as string,
           from_name: config.from_name as string,
           from_address: config.from_address as string,
           to_addresses: config.to_addresses as string[],
-          tls_mode: (config.tls_mode as 'None' | 'Starttls' | 'Tls') || undefined,
+          tls_mode:
+            (config.tls_mode as 'None' | 'Starttls' | 'Tls') || undefined,
           starttls_required: config.starttls_required as boolean,
           accept_invalid_certs: config.accept_invalid_certs as boolean,
 
@@ -288,6 +285,17 @@ export function EditNotificationProvider() {
     }
   }
 
+  const handleRevealCredential = async (field: string) => {
+    const { data } = await revealNotificationProviderConfig({
+      path: {
+        id: provider!.id,
+        field,
+      },
+      throwOnError: true,
+    })
+    return data.value
+  }
+
   const handleTest = async () => {
     if (!provider) return
 
@@ -331,7 +339,10 @@ export function EditNotificationProvider() {
             Failed to load provider. Please check the ID and try again.
           </AlertDescription>
         </Alert>
-        <Button onClick={() => navigate('/settings/notifications')} variant="outline">
+        <Button
+          onClick={() => navigate('/settings/notifications')}
+          variant="outline"
+        >
           <ArrowLeft className="h-4 w-4 mr-2" />
           Back to Providers
         </Button>
@@ -398,6 +409,8 @@ export function EditNotificationProvider() {
             onSubmit={handleSubmit}
             isEdit={true}
             isLoading={isSubmitting}
+            revealScopeKey={`${provider.id}:${provider.updated_at}`}
+            onRevealCredential={handleRevealCredential}
           />
         </CardContent>
       </Card>

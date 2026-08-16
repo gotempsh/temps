@@ -29,6 +29,7 @@ temps-analytics = { path = "../temps-analytics" }
 temps-analytics-events = { path = "../temps-analytics-events" }
 temps-blob = { path = "../temps-blob" }
 temps-kv = { path = "../temps-kv" }
+temps-flags = { path = "../temps-flags" }
 temps-analytics-funnels = { path = "../temps-analytics-funnels" }
 temps-analytics-performance = { path = "../temps-analytics-performance" }
 temps-analytics-session-replay = { path = "../temps-analytics-session-replay" }
@@ -48,6 +49,7 @@ temps-dns = { path = "../temps-dns" }
 temps-network = { path = "../temps-network" }
 temps-domains = { path = "../temps-domains" }
 temps-email = { path = "../temps-email" }
+temps-email-tracking = { path = "../temps-email-tracking" }
 temps-entities = { path = "../temps-entities" }
 temps-environments = { path = "../temps-environments" }
 temps-error-tracking = { path = "../temps-error-tracking" }
@@ -72,6 +74,7 @@ temps-queue = { path = "../temps-queue" }
 temps-screenshots = { path = "../temps-screenshots" }
 temps-status-page = { path = "../temps-status-page" }
 temps-static-files = { path = "../temps-static-files" }
+temps-teams = { path = "../temps-teams" }
 temps-vulnerability-scanner = { path = "../temps-vulnerability-scanner" }
 temps-webhooks = { path = "../temps-webhooks" }
 temps-wireguard = { path = "../temps-wireguard" }
@@ -89,7 +92,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 anyhow = { workspace = true }
-dirs = { version = "5.0" }
+dirs = { version = "6.0" }
 gethostname = "1.1"
 rand = { workspace = true }
 hex = { workspace = true }
@@ -100,6 +103,9 @@ utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
 async-trait = { workspace = true }
 sea-orm = { workspace = true }
+# Used for Postgres LISTEN/NOTIFY (`settings_change`) so the standalone
+# `temps proxy` picks up admin-gate edits made in another process.
+sqlx = { workspace = true }
 sysinfo = { workspace = true }
 include_dir = "0.7"
 ipnet = "2.10"
@@ -111,12 +117,12 @@ urlencoding = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 flate2 = "1.0"
-indicatif = "0.17"
+indicatif = "0.18"
 tar = { workspace = true }
 reqwest = { workspace = true }
 rustls = { workspace = true }
 sha2 = { workspace = true }
-x509-parser = "0.16"
+x509-parser = "0.18"
 glob = "0.3"
 uuid = { workspace = true }
 bytes = { workspace = true }
@@ -131,6 +137,10 @@ tikv-jemallocator = { workspace = true }
 # console health router through a single request in unit tests without binding
 # a real listener. Already present transitively; pinned here for test use.
 tower = { workspace = true }
+tempfile = { workspace = true }
+# Only for `tests/plugin_sdk_conformance.rs`: proves the SDK's hand-written
+# endpoint table still matches the handlers this crate assembles into the API.
+temps-plugin-sdk = { path = "../temps-plugin-sdk" }
 
 [build-dependencies]
 chrono = { workspace = true }

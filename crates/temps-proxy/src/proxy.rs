@@ -18,13 +18,15 @@
 //! branch was removed as part of `perf/remove-db-from-request-path` (WS1–WS6).
 
 use crate::handler::preview_wall::{
-    build_logout_cookie_sandbox, generate_preview_form_html_labeled, sanitize_next,
+    build_logout_cookie_sandbox, build_logout_cookie_sandbox_unpartitioned,
+    generate_preview_bridge_html, generate_preview_form_html_labeled, sanitize_next,
     PREVIEW_LOGIN_PATH, PREVIEW_LOGOUT_PATH,
 };
 use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
-    build_set_cookie_sandbox, check_preview_auth, encode_preview_cookie_subject,
-    parse_preview_host, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
+    build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
+    encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
+    preview_cookie_needs_refresh, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
     PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
     PREVIEW_GATEWAY_PEER,
 };
@@ -239,6 +241,23 @@ fn strip_script_and_style(html: &str) -> String {
     out
 }
 
+/// Last-resort fallback when `htmd::convert` fails: extract plain text nodes
+/// from an HTML fragment via `scraper`, which — unlike `htmd::convert` — has
+/// no failure mode on malformed input. Used only so a response already
+/// committed to `Content-Type: text/markdown` never carries literal HTML
+/// markup in its body.
+fn plain_text_fallback(html: &str) -> String {
+    let fragment = scraper::Html::parse_fragment(html);
+    fragment
+        .root_element()
+        .text()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Inspect the upstream response headers and decide whether Markdown conversion should
 /// proceed.  Cancels (`ctx.wants_markdown = false`) for anything other than a successful
 /// (2xx) `text/html` response, or when the connection is SSE/WebSocket.
@@ -266,7 +285,20 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
     let is_html = upstream_ct.contains("text/html");
     let has_ct = !upstream_ct.is_empty();
 
-    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html {
+    // Reject bodies we already know are too large from Content-Length, before
+    // we commit to a text/markdown Content-Type in response_filter. Pingora
+    // sends response headers to the client before response_body_filter runs,
+    // so once we say "markdown" we cannot take it back — the only safe time
+    // to opt out over size is here, before headers are sent. Chunked/unknown-
+    // length upstreams are still capped in response_body_filter_inner.
+    let declared_too_large = upstream_response
+        .headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<usize>().ok())
+        .is_some_and(|len| len > MAX_MARKDOWN_BODY_BYTES);
+
+    if ctx.is_sse || ctx.is_websocket || !is_success || !is_html || declared_too_large {
         // Cannot or should not convert — reset the flag so response_body_filter
         // will pass the body through normally.
         ctx.wants_markdown = false;
@@ -279,6 +311,12 @@ fn apply_markdown_upstream_gate(upstream_response: &mut ResponseHeader, ctx: &mu
             debug!(
                 "Markdown conversion cancelled: non-2xx status={}, content-type={:?}",
                 status, upstream_ct
+            );
+        } else if declared_too_large {
+            debug!(
+                "Markdown conversion cancelled: Content-Length exceeds {}-byte limit \
+                 (content-type={:?})",
+                MAX_MARKDOWN_BODY_BYTES, upstream_ct
             );
         } else {
             debug!(
@@ -339,6 +377,156 @@ pub const SERVER_NAME: &[u8; 5] = b"Temps";
 pub const LB_SEED: u64 = 42;
 pub const MAX_WEBHOOK_BODY_SIZE: usize = 16 * 1024;
 pub const LOG_STATIC_ASSETS: bool = false;
+
+/// Path prefix reserved for ACME HTTP-01 challenge validation (RFC 8555 §8.3).
+///
+/// Single source of truth: both the challenge responder and the HTTP→HTTPS
+/// redirect gate compare against this, so a request that could be a Let's
+/// Encrypt validation can never be redirected out from under the CA.
+pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
+
+/// Decide whether a request on the plain-HTTP listener should be answered with
+/// a 301 to the HTTPS URL.
+///
+/// The inputs, in the order they are consulted:
+///
+/// - `globally_disabled` — the `disable_https_redirect` operator kill switch
+///   (set by the service unit in local/testing mode). Master off; nothing
+///   overrides it, including a per-environment `force_https = true`, so a local
+///   rig never starts bouncing developers to a port with no certificate.
+/// - `is_tls` — already HTTPS, nothing to do.
+/// - `path` — anything under [`ACME_HTTP01_PREFIX`] is exempt unconditionally.
+///   A 301 here breaks issuance and, worse, silent renewal: the CA follows the
+///   redirect to an HTTPS endpoint whose certificate is precisely the one that
+///   has expired or does not exist yet. This exemption applies even when the
+///   host has a valid certificate, because renewal happens while the old
+///   certificate is still installed.
+/// - `env_force_https` — the per-environment override. `None` inherits
+///   `host_has_cert`; `Some(b)` wins outright.
+/// - `host_has_cert` — the default heuristic: redirect only hosts that actually
+///   completed TLS provisioning, so HTTP-only installs are never redirected.
+///
+/// Kept as a free function over plain values so the decision table is unit
+/// testable without a live session, and so the hot path stays allocation-free.
+/// `host_has_cert` is a closure rather than a `bool` to preserve the
+/// short-circuit the original `&&` chain had: the overwhelmingly common case is
+/// an HTTPS request, which must not pay for a cert-cache snapshot read, and an
+/// environment with an explicit override never needs the lookup at all.
+fn should_redirect_to_https(
+    globally_disabled: bool,
+    is_tls: bool,
+    path: &str,
+    env_force_https: Option<bool>,
+    host_has_cert: impl FnOnce() -> bool,
+) -> bool {
+    if globally_disabled || is_tls {
+        return false;
+    }
+
+    if path.starts_with(ACME_HTTP01_PREFIX) {
+        return false;
+    }
+
+    env_force_https.unwrap_or_else(host_has_cert)
+}
+
+fn deployment_asset_path_matches(
+    current_deployment_slug: Option<&str>,
+    requested_deployment_slug: &str,
+) -> bool {
+    current_deployment_slug == Some(requested_deployment_slug)
+}
+
+fn inherited_https_policy(production_https: bool, host_has_cert: bool) -> bool {
+    production_https || host_has_cert
+}
+
+/// Whether the "production" HTTPS-by-default assumption (no `external_url`
+/// configured -> treat every host as production) should even be consulted for
+/// this request.
+///
+/// Scoped to resolved project traffic only (`has_environment`): requests whose
+/// `Host` never matched a project domain — the admin/console UI, and internal
+/// cluster-management API calls such as node registration/heartbeat — must
+/// never be redirected off this default. Cluster bootstrap traffic runs over
+/// plaintext HTTP by design, before any TLS material exists to redirect to.
+fn should_apply_production_https_default(
+    disable_https_redirect: bool,
+    is_tls: bool,
+    path: &str,
+    env_force_https: Option<bool>,
+    has_environment: bool,
+) -> bool {
+    !disable_https_redirect
+        && !is_tls
+        && !path.starts_with(ACME_HTTP01_PREFIX)
+        && env_force_https.is_none()
+        && has_environment
+}
+
+#[cfg(test)]
+mod deployment_asset_scope_tests {
+    use super::{
+        deployment_asset_path_matches, inherited_https_policy,
+        should_apply_production_https_default,
+    };
+
+    #[test]
+    fn prefixed_asset_must_name_the_current_deployment() {
+        assert!(deployment_asset_path_matches(Some("deploy-a"), "deploy-a"));
+        assert!(!deployment_asset_path_matches(Some("deploy-a"), "deploy-b"));
+        assert!(!deployment_asset_path_matches(None, "deploy-a"));
+    }
+
+    #[test]
+    fn production_https_cannot_be_bypassed_with_an_unknown_host() {
+        assert!(inherited_https_policy(true, false));
+        assert!(!inherited_https_policy(false, false));
+        assert!(inherited_https_policy(false, true));
+    }
+
+    #[test]
+    fn production_https_default_never_applies_without_a_resolved_environment() {
+        // Unresolved Host (admin/console UI, internal cluster API like node
+        // registration) — must not be redirected even though every other gate
+        // would otherwise allow it.
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/api/internal/nodes/register",
+            None,
+            false
+        ));
+        // Resolved project traffic with everything else the same — applies.
+        assert!(should_apply_production_https_default(
+            false, false, "/", None, true
+        ));
+    }
+
+    #[test]
+    fn production_https_default_respects_the_other_gates() {
+        assert!(!should_apply_production_https_default(
+            true, false, "/", None, true
+        ));
+        assert!(!should_apply_production_https_default(
+            false, true, "/", None, true
+        ));
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/.well-known/acme-challenge/token",
+            None,
+            true
+        ));
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/",
+            Some(false),
+            true
+        ));
+    }
+}
 
 /// Proxy context for tracking request state
 pub struct ProxyContext {
@@ -412,6 +600,17 @@ pub struct ProxyContext {
     /// Set when the request matched a workspace preview hostname and passed
     /// auth — `upstream_peer` will route it to the local preview gateway.
     pub preview_route: Option<PreviewHost>,
+    /// The upstream confirmed a long-lived stream (SSE `text/event-stream`, or
+    /// a `101` WebSocket upgrade). Such a session's total duration is a
+    /// connection lifetime, not a latency, so `logging` keeps it out of the
+    /// duration histograms — see [`crate::metrics::ProxyMetrics::record`].
+    pub streaming_session: bool,
+    /// Reserved in-flight slot for this request's project/environment, held
+    /// for the whole request lifetime and released when dropped in
+    /// `logging()`. `None` when no cap applies (unlimited, or no
+    /// project/environment resolved for this request — e.g. console/preview
+    /// traffic).
+    pub connection_permit: Option<crate::connection_limiter::ConnectionPermit>,
 }
 
 /// Main load balancer proxy implementation using traits
@@ -446,13 +645,16 @@ pub struct LoadBalancer {
     route_table: Option<Arc<temps_routes::CachedPeerTable>>,
     file_store: Option<Arc<dyn temps_file_store::FileStore>>,
     /// In-memory moka cache for `static_asset_cache` DB lookups. Keyed on
-    /// `(project_id, url_path)`; values are `Option<content_hash>` so that
+    /// `(project_id, environment_id, deployment_id, url_path)`; values are `Option<content_hash>` so that
     /// **negative results (no row found) are cached too** — the miss case is
     /// the common path for container deployments where most assets are served
     /// by upstream, not the fallback store. TTL 60 s, max ~50 k entries. See
     /// `service/static_asset_lookup.rs` and WS4 in IMPLEMENTATION_PLAN.md.
     static_asset_lookup: Arc<crate::service::static_asset_lookup::StaticAssetLookup>,
     preview_auth_limiter: Arc<PreviewAuthLimiter>,
+    /// Per-project/environment concurrent-connection cap enforcement. See
+    /// issue #646 and `crate::connection_limiter`.
+    connection_limiter: Arc<crate::connection_limiter::ConnectionLimiter>,
     /// In-memory moka cache for sandbox preview lookups. Keyed by sandbox
     /// hex suffix; values are `PreviewSandboxLookup` (both `Protected` and
     /// `NotFound` are cached). TTL 30 s. See `preview_auth.rs` and WS6 in
@@ -511,6 +713,7 @@ impl LoadBalancer {
             route_table: None,
             file_store: None,
             preview_auth_limiter: Arc::new(PreviewAuthLimiter::new()),
+            connection_limiter: Arc::new(crate::connection_limiter::ConnectionLimiter::new()),
             admin_gate: None,
             proxy_metrics: Arc::new(crate::metrics::ProxyMetrics::default()),
         }
@@ -635,6 +838,16 @@ impl LoadBalancer {
             .any(|ext| path_lower.ends_with(ext))
     }
 
+    fn traffic_classification(path: &str, user_agent: &str) -> (&'static str, bool) {
+        if user_agent.starts_with("Temps-Status-Monitor/") {
+            ("temps_monitor", true)
+        } else if path.starts_with(ROUTE_PREFIX_TEMPS) {
+            ("proxy", true)
+        } else {
+            ("proxy", false)
+        }
+    }
+
     fn get_host_header(&self, session: &PingoraSession) -> Result<String> {
         let host_with_port = if let Some(host) = session.req_header().headers.get("host") {
             host.to_str()
@@ -731,9 +944,9 @@ impl LoadBalancer {
         identifier_type: &str,
     ) -> String {
         // Generate a random challenge (32 hex characters)
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let bytes: Vec<u8> = (0..16).map(|_| rng.gen()).collect();
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        let bytes: Vec<u8> = (0..16).map(|_| rng.random()).collect();
         let challenge = hex::encode(bytes);
 
         // Difficulty: 20 leading zero bits (~1 million attempts)
@@ -1166,13 +1379,11 @@ impl LoadBalancer {
     }
 
     async fn handle_acme_http_challenge(&self, host: &str, path: &str) -> Result<Option<String>> {
-        const ACME_CHALLENGE_PREFIX: &str = "/.well-known/acme-challenge/";
-
-        if !path.starts_with(ACME_CHALLENGE_PREFIX) {
+        if !path.starts_with(ACME_HTTP01_PREFIX) {
             return Ok(None);
         }
 
-        let token = &path[ACME_CHALLENGE_PREFIX.len()..];
+        let token = &path[ACME_HTTP01_PREFIX.len()..];
         if token.is_empty() {
             debug!("Empty ACME challenge token in path: {}", path);
             return Ok(None);
@@ -1397,6 +1608,8 @@ impl LoadBalancer {
                 .and_then(|h| h.get("x-cache").or_else(|| h.get("cf-cache-status")))
                 .cloned();
 
+            let (request_source, is_system_request) =
+                Self::traffic_classification(&ctx.path, &ctx.user_agent);
             let proxy_log_request = CreateProxyLogRequest {
                 method: ctx.method.clone(),
                 path: ctx.path.clone(),
@@ -1404,8 +1617,8 @@ impl LoadBalancer {
                 host: ctx.host.clone(),
                 status_code: status_code as i16,
                 response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                request_source: "proxy".to_string(),
-                is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+                request_source: request_source.to_string(),
+                is_system_request,
                 routing_status: ctx.routing_status.clone(),
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
@@ -1522,6 +1735,8 @@ impl LoadBalancer {
             return;
         }
 
+        let (request_source, is_system_request) =
+            Self::traffic_classification(&ctx.path, &ctx.user_agent);
         let proxy_log_request = CreateProxyLogRequest {
             method: ctx.method.clone(),
             path: ctx.path.clone(),
@@ -1529,8 +1744,8 @@ impl LoadBalancer {
             host: ctx.host.clone(),
             status_code,
             response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-            request_source: "proxy".to_string(),
-            is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+            request_source: request_source.to_string(),
+            is_system_request,
             routing_status: routing_status.to_string(),
             project_id: ctx.project.as_ref().map(|p| p.id),
             environment_id: ctx.environment.as_ref().map(|e| e.id),
@@ -1940,8 +2155,8 @@ impl LoadBalancer {
 
     /// Serve a static asset from CAS via the in-memory lookup cache.
     ///
-    /// `static_asset_lookup` resolves `(project_id, url_path) → content_hash`
-    /// using a moka TTL cache (60 s) so the `static_asset_cache` table is not
+    /// `static_asset_lookup` resolves the exact routed project/environment/
+    /// deployment and URL path using a moka TTL cache (60 s), so the table is not
     /// queried on every cacheable-asset request. Both hits and misses are cached;
     /// the miss case (no fallback row — the common path for container deployments)
     /// is the most important one to protect. See WS4 / `static_asset_lookup.rs`.
@@ -1958,16 +2173,18 @@ impl LoadBalancer {
             None => return Ok(false),
         };
 
-        // Resolve project_id, then look up the content hash via cache (no DB on hit/cached-miss).
-        let content_hash = match ctx.project.as_ref().map(|p| p.id) {
-            Some(pid) => match self
-                .static_asset_lookup
-                .get_content_hash(pid, url_path)
-                .await
-            {
-                Some(hash) => hash,
-                None => return Ok(false),
-            },
+        let scope = match (&ctx.project, &ctx.environment, &ctx.deployment) {
+            (Some(project), Some(environment), Some(deployment)) => {
+                (project.id, environment.id, deployment.id)
+            }
+            _ => return Ok(false),
+        };
+        let content_hash = match self
+            .static_asset_lookup
+            .get_content_hash(scope.0, scope.1, scope.2, url_path)
+            .await
+        {
+            Some(hash) => hash,
             None => return Ok(false),
         };
 
@@ -2188,21 +2405,29 @@ fn response_body_filter_inner(
     // HTML-to-Markdown conversion: buffer chunks, convert on end_of_stream.
     if ctx.wants_markdown {
         if let Some(chunk) = body.take() {
-            // Enforce 2 MB limit — mirrors Cloudflare's Markdown for Agents constraint.
-            if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
-                warn!(
-                    "Response body exceeds 2 MB markdown conversion limit for path={}, \
-                     falling back to passthrough",
-                    ctx.path
-                );
-                // Disable markdown, flush the buffer + current chunk as-is.
-                ctx.wants_markdown = false;
-                let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
-                flushed.extend_from_slice(&chunk);
-                *body = Some(Bytes::from(flushed));
-                return Ok(None);
+            // Enforce a 2 MB cap — mirrors Cloudflare's Markdown for Agents constraint.
+            //
+            // We must NOT fall back to raw-HTML passthrough here even though the
+            // buffer is over budget: response_filter already sent the client a
+            // `Content-Type: text/markdown` header before this function ever runs
+            // (Pingora sends response headers before invoking response_body_filter),
+            // so there is no way to un-promise Markdown at this point. Emitting the
+            // untouched HTML bytes under that header is exactly the "text/markdown
+            // returns raw HTML" bug — instead we truncate the buffer at the cap and
+            // still convert what we have, discarding the remainder of the upstream
+            // body rather than forwarding it unconverted.
+            let remaining = MAX_MARKDOWN_BODY_BYTES.saturating_sub(ctx.markdown_buffer.len());
+            if remaining > 0 {
+                let take = remaining.min(chunk.len());
+                ctx.markdown_buffer.extend_from_slice(&chunk[..take]);
+                if take < chunk.len() {
+                    warn!(
+                        "Response body for path={} exceeds the {}-byte markdown conversion \
+                         limit; truncating before conversion",
+                        ctx.path, MAX_MARKDOWN_BODY_BYTES
+                    );
+                }
             }
-            ctx.markdown_buffer.extend_from_slice(&chunk);
         }
 
         if end_of_stream {
@@ -2216,14 +2441,18 @@ fn response_body_filter_inner(
             let markdown = match htmd::convert(&content) {
                 Ok(md) => md,
                 Err(e) => {
+                    // Cannot fall back to the original HTML bytes here: response_filter
+                    // already committed `Content-Type: text/markdown` to the client
+                    // before this body was available (see the truncation comment
+                    // above), so raw HTML would arrive mislabeled as Markdown. Use a
+                    // tag-stripping plain-text extraction instead — it cannot fail —
+                    // so the body is always actual text under a text/markdown header.
                     warn!(
-                        "HTML-to-Markdown conversion failed for path={}: {}",
+                        "HTML-to-Markdown conversion failed for path={}: {}; falling back to \
+                         plain-text extraction",
                         ctx.path, e
                     );
-                    // Fall back to the original HTML bytes so the client gets something.
-                    let original = std::mem::take(&mut ctx.markdown_buffer);
-                    *body = Some(Bytes::from(original));
-                    return Ok(None);
+                    plain_text_fallback(&content)
                 }
             };
 
@@ -2261,6 +2490,586 @@ fn response_body_filter_inner(
 
     // Default: pass all responses through without buffering
     Ok(None)
+}
+
+/// Resolve the client IP for a session from the TCP peer, honoring
+/// `CF-Connecting-IP` only when the peer is a verified Cloudflare egress
+/// address (see `cloudflare_ips`). Returns `None` for non-inet peers (unix
+/// sockets) so callers keep their own fallback.
+///
+/// Using `as_inet()` (not string-splitting on `:`) keeps IPv6 peers intact —
+/// `[2001:db8::1]:443` must resolve to `2001:db8::1`, not a mangled prefix.
+fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
+    let peer = session.client_addr()?.as_inet()?.ip();
+    let cf_connecting_ip = session
+        .req_header()
+        .headers
+        .get("cf-connecting-ip")
+        .and_then(|v| v.to_str().ok());
+    Some(
+        crate::cloudflare_ips::CLOUDFLARE_TRUST
+            .resolve_client_ip(peer, cf_connecting_ip)
+            .to_string(),
+    )
+}
+
+/// Selects the upstream read/write/idle timeout for a proxied request.
+/// `default_timeout` is the caller's already-computed websocket-aware value
+/// (3600s for websocket upgrades, 60s otherwise); this only widens it
+/// further, to [`CONSOLE_IO_TIMEOUT_SECS`], for non-websocket traffic bound
+/// for the console address — long-running admin operations (e.g.
+/// triggering an import) routinely exceed the 60s hot-path bound tuned for
+/// customer-app traffic. See the call site in `LoadBalancer::upstream_peer`
+/// for the full rationale.
+///
+/// [`CONSOLE_IO_TIMEOUT_SECS`] must cover the real worst case of the
+/// slowest known console operation (import execute), not just look
+/// generous: `POST /imports/execute` runs service creation, then every
+/// created service's data transfer concurrently (each individually bounded
+/// by `temps_import::resource_executor::TRANSFER_TIMEOUT` = 1800s), then
+/// deploy-and-verify (`temps_import::deployment_verifier`'s
+/// `TRIGGER_GRACE`(15s) + `DEPLOY_TIMEOUT`(600s) + `HTTP_TIMEOUT`(90s) =
+/// 705s) — all inside the one HTTP request the handler awaits directly. A
+/// timeout shorter than `1800 + 705` would reintroduce, at a longer time
+/// constant, the exact "import succeeds server-side, browser sees a dead
+/// connection" bug this timeout extension exists to fix.
+const CONSOLE_IO_TIMEOUT_SECS: u64 = 3600;
+
+/// Whether a `Content-Type` value's media type — its "essence", the part
+/// before any `;` parameters — is exactly `text/event-stream`.
+///
+/// Deliberately not a substring match. This gates `ctx.streaming_session`,
+/// which excludes a request from the proxy latency histograms, and the value
+/// comes from the upstream (i.e. from a tenant's own app). A `contains` check
+/// would also accept `text/html; note=text/event-stream`, letting an app
+/// classify arbitrary responses as streaming and drop itself out of the
+/// operator's latency and alerting series.
+///
+/// Note this is the right shape only for `Content-Type`, which carries a
+/// single media type plus parameters. The request-side `Accept` check stays a
+/// substring match because `Accept` is a comma-separated list.
+fn is_event_stream_content_type(value: &str) -> bool {
+    value
+        .split(';')
+        .next()
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+/// Console/control-plane traffic always gets a fixed timeout, regardless of
+/// what customer app traffic is configured to use — a `None` (no timeout)
+/// resolved for customer traffic must never leak into the console path.
+fn upstream_io_timeout(
+    peer_addr: &str,
+    console_addr: &str,
+    is_websocket: bool,
+    default_timeout: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let is_console = !console_addr.is_empty() && peer_addr == console_addr;
+    if is_console && !is_websocket {
+        Some(std::time::Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS))
+    } else {
+        default_timeout
+    }
+}
+
+/// Which of the three configurable timeout classes a request falls under.
+/// SSE and WebSocket are long-lived by design and get their own idle-timeout
+/// class distinct from regular HTTP — see `resolve_customer_io_timeout`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TimeoutTrafficKind {
+    Http,
+    Sse,
+    WebSocket,
+}
+
+/// Resolve the upstream I/O timeout for customer app traffic: pick the
+/// override for this traffic kind from the merged project/environment
+/// `DeploymentConfig` (falling back to the matching global default), then
+/// clamp to the global hard ceiling — unless the resolved value is `0`
+/// ("no timeout"), in which case `None` is returned and the ceiling never
+/// applies. Timeouts are opt-in: an app with no override and a zero global
+/// default (the platform default) gets an unbounded connection, exactly as
+/// it did before this setting existed. `0` can also be set explicitly as a
+/// project/environment override, to force "no timeout" even when the
+/// operator has configured a nonzero global default.
+///
+/// Pure function so the classify+clamp logic is unit-testable without a full
+/// Pingora session — mirrors `upstream_io_timeout` above, which stays
+/// separate and untouched: it governs the fixed console/control-plane
+/// timeout, not customer app traffic.
+fn resolve_customer_io_timeout(
+    kind: TimeoutTrafficKind,
+    effective_config: &temps_entities::deployment_config::DeploymentConfig,
+    request_timeouts: &temps_core::RequestTimeoutSettings,
+) -> Option<std::time::Duration> {
+    let (override_seconds, default_seconds) = match kind {
+        TimeoutTrafficKind::Http => (
+            effective_config.request_timeout_seconds,
+            request_timeouts.default_http_timeout_seconds,
+        ),
+        TimeoutTrafficKind::Sse => (
+            effective_config.sse_idle_timeout_seconds,
+            request_timeouts.default_sse_idle_timeout_seconds,
+        ),
+        TimeoutTrafficKind::WebSocket => (
+            effective_config.websocket_idle_timeout_seconds,
+            request_timeouts.default_websocket_idle_timeout_seconds,
+        ),
+    };
+    let resolved = override_seconds
+        .and_then(|secs| u32::try_from(secs).ok())
+        .unwrap_or(default_seconds);
+    if resolved == 0 {
+        return None;
+    }
+    Some(std::time::Duration::from_secs(
+        request_timeouts.clamp_to_ceiling(resolved) as u64,
+    ))
+}
+
+#[cfg(test)]
+mod resolve_customer_io_timeout_tests {
+    use super::*;
+    use temps_core::RequestTimeoutSettings;
+    use temps_entities::deployment_config::DeploymentConfig;
+
+    #[test]
+    fn no_timeout_by_default_when_nothing_is_configured() {
+        // The platform default: an app with no project/environment override
+        // and no operator-configured global default gets an unbounded
+        // connection for every traffic kind, exactly as it did before this
+        // setting existed.
+        let config = DeploymentConfig::default();
+        let settings = RequestTimeoutSettings::default();
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            None
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Sse, &config, &settings),
+            None
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            None
+        );
+    }
+
+    #[test]
+    fn falls_back_to_a_nonzero_global_default_per_kind_when_unconfigured() {
+        // Once an operator opts the platform into default timeouts, SSE must
+        // get its own idle-timeout class rather than silently falling
+        // through to the HTTP default (the RST-on-idle bug this feature
+        // fixes).
+        let config = DeploymentConfig::default();
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 3600,
+            default_http_timeout_seconds: 60,
+            default_sse_idle_timeout_seconds: 3600,
+            default_websocket_idle_timeout_seconds: 1800,
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            Some(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Sse, &config, &settings),
+            Some(std::time::Duration::from_secs(3600))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            Some(std::time::Duration::from_secs(1800))
+        );
+    }
+
+    #[test]
+    fn project_or_environment_override_wins_when_below_ceiling() {
+        let config = DeploymentConfig {
+            request_timeout_seconds: Some(10),
+            sse_idle_timeout_seconds: Some(120),
+            websocket_idle_timeout_seconds: Some(90),
+            ..Default::default()
+        };
+        let settings = RequestTimeoutSettings::default();
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            Some(std::time::Duration::from_secs(10))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Sse, &config, &settings),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            Some(std::time::Duration::from_secs(90))
+        );
+    }
+
+    #[test]
+    fn explicit_zero_override_forces_no_timeout_even_with_a_nonzero_global_default() {
+        // An operator can opt the whole platform into a default timeout, and
+        // a specific project can still opt back out with an explicit 0.
+        let config = DeploymentConfig {
+            request_timeout_seconds: Some(0),
+            ..Default::default()
+        };
+        let settings = RequestTimeoutSettings {
+            default_http_timeout_seconds: 60,
+            ..RequestTimeoutSettings::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            None
+        );
+    }
+
+    #[test]
+    fn global_hard_ceiling_always_wins_even_over_an_explicit_override() {
+        let config = DeploymentConfig {
+            request_timeout_seconds: Some(9000),
+            ..Default::default()
+        };
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 120,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            Some(std::time::Duration::from_secs(120)),
+            "an operator-lowered ceiling must win even over a project's explicit override"
+        );
+    }
+
+    /// Same guarantee as above, but for the SSE and WebSocket arms — each
+    /// traffic kind reads a different `DeploymentConfig` field, so the ceiling
+    /// clamp needs to be proven for all three, not just HTTP.
+    #[test]
+    fn global_hard_ceiling_wins_over_an_explicit_override_for_sse_and_websocket() {
+        let config = DeploymentConfig {
+            sse_idle_timeout_seconds: Some(9000),
+            websocket_idle_timeout_seconds: Some(9000),
+            ..Default::default()
+        };
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 120,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Sse, &config, &settings),
+            Some(std::time::Duration::from_secs(120))
+        );
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            Some(std::time::Duration::from_secs(120))
+        );
+    }
+
+    #[test]
+    fn global_hard_ceiling_also_clamps_a_nonzero_unconfigured_default() {
+        let config = DeploymentConfig::default();
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 30,
+            default_websocket_idle_timeout_seconds: 9000,
+            ..RequestTimeoutSettings::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::WebSocket, &config, &settings),
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn ceiling_has_no_effect_when_nothing_resolves_to_a_timeout() {
+        // The ceiling only constrains a timeout that's actually configured —
+        // it must never *create* one for traffic that has none.
+        let config = DeploymentConfig::default();
+        let settings = RequestTimeoutSettings {
+            max_request_timeout_seconds: 30,
+            ..RequestTimeoutSettings::default()
+        };
+
+        assert_eq!(
+            resolve_customer_io_timeout(TimeoutTrafficKind::Http, &config, &settings),
+            None
+        );
+    }
+}
+
+#[cfg(test)]
+mod upstream_io_timeout_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Regression test: POST /api/imports/execute (and any other
+    /// long-running console/control-plane call) used to be RST'd at the
+    /// 60s hot-path default before the handler finished — the import would
+    /// complete successfully server-side while the browser saw a 503 with
+    /// no way to tell the user it actually worked.
+    #[test]
+    fn console_traffic_gets_the_extended_timeout() {
+        let console = "10.0.0.5:8081";
+        let timeout = upstream_io_timeout(console, console, false, Some(Duration::from_secs(60)));
+        assert_eq!(timeout, Some(Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS)));
+    }
+
+    /// Console traffic must always get a concrete timeout even when customer
+    /// traffic elsewhere is resolving to "no timeout" — a `None` default
+    /// must never leak the unbounded state onto the control plane.
+    #[test]
+    fn console_traffic_gets_the_extended_timeout_even_when_default_is_none() {
+        let console = "10.0.0.5:8081";
+        let timeout = upstream_io_timeout(console, console, false, None);
+        assert_eq!(timeout, Some(Duration::from_secs(CONSOLE_IO_TIMEOUT_SECS)));
+    }
+
+    /// The console timeout must actually cover the real worst case of the
+    /// slowest console operation (import execute), not just be "generous".
+    ///
+    /// This crate can't depend on `temps-import` (wrong direction --
+    /// `temps-proxy` sits below it), so the four constants below are
+    /// necessarily hardcoded copies, not references to the real ones. The
+    /// authoritative check lives in
+    /// `temps_import::services::resource_executor::tests::worst_case_execute_duration_fits_under_the_documented_console_timeout`,
+    /// which owns all four real constants and fails at the source if they
+    /// drift. If you change any of the four numbers below, update that test
+    /// (and this one) too.
+    #[test]
+    fn console_timeout_covers_the_worst_case_import_execute_duration() {
+        const TRIGGER_GRACE_SECS: u64 = 15;
+        const DEPLOY_TIMEOUT_SECS: u64 = 600;
+        const HTTP_TIMEOUT_SECS: u64 = 90;
+        const TRANSFER_TIMEOUT_SECS: u64 = 30 * 60;
+
+        let worst_case_execute_duration =
+            TRANSFER_TIMEOUT_SECS + TRIGGER_GRACE_SECS + DEPLOY_TIMEOUT_SECS + HTTP_TIMEOUT_SECS;
+
+        assert!(
+            CONSOLE_IO_TIMEOUT_SECS > worst_case_execute_duration,
+            "console timeout ({CONSOLE_IO_TIMEOUT_SECS}s) must exceed the worst-case import \
+             execute duration ({worst_case_execute_duration}s) — service data transfers run \
+             concurrently (see populate_services), so the worst case no longer scales with the \
+             number of services, but it must still fit inside one timeout window"
+        );
+    }
+
+    #[test]
+    fn customer_app_traffic_keeps_the_hot_path_default() {
+        let timeout = upstream_io_timeout(
+            "10.0.0.9:9000",
+            "10.0.0.5:8081",
+            false,
+            Some(Duration::from_secs(60)),
+        );
+        assert_eq!(timeout, Some(Duration::from_secs(60)));
+    }
+
+    /// The whole point of the opt-in default: customer traffic resolving to
+    /// "no timeout" (`None`) must pass straight through unchanged.
+    #[test]
+    fn customer_app_traffic_with_no_timeout_configured_stays_unbounded() {
+        let timeout = upstream_io_timeout("10.0.0.9:9000", "10.0.0.5:8081", false, None);
+        assert_eq!(timeout, None);
+    }
+
+    #[test]
+    fn websocket_upgrade_to_the_console_keeps_the_websocket_timeout() {
+        // Console traffic never upgrades to websocket today, but the
+        // extended console bound must never override the caller's own
+        // websocket-specific timeout if that combination ever occurs. Uses
+        // a value distinct from CONSOLE_IO_TIMEOUT_SECS so the assertion
+        // can't pass by coincidence.
+        let console = "10.0.0.5:8081";
+        let timeout = upstream_io_timeout(console, console, true, Some(Duration::from_secs(7200)));
+        assert_eq!(timeout, Some(Duration::from_secs(7200)));
+    }
+
+    #[test]
+    fn empty_console_address_never_matches() {
+        // The trait's default console_address() is "" for resolvers that
+        // don't override it (test mocks) — must never accidentally match a
+        // peer address and grant an unintended extended timeout.
+        let timeout =
+            upstream_io_timeout("10.0.0.9:9000", "", false, Some(Duration::from_secs(60)));
+        assert_eq!(timeout, Some(Duration::from_secs(60)));
+    }
+}
+
+#[cfg(test)]
+mod https_redirect_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// Convenience wrapper for the common "cert lookup returns X" case.
+    fn decide(
+        globally_disabled: bool,
+        is_tls: bool,
+        path: &str,
+        env_force_https: Option<bool>,
+        host_has_cert: bool,
+    ) -> bool {
+        should_redirect_to_https(globally_disabled, is_tls, path, env_force_https, || {
+            host_has_cert
+        })
+    }
+
+    #[test]
+    fn default_behaviour_follows_certificate_presence() {
+        // No per-environment override → the pre-existing heuristic is unchanged:
+        // hosts with a provisioned certificate are redirected, HTTP-only installs
+        // (sslip.io quick/local modes) are not.
+        assert!(decide(false, false, "/", None, true));
+        assert!(!decide(false, false, "/", None, false));
+    }
+
+    #[test]
+    fn force_https_true_redirects_without_a_local_certificate() {
+        // The motivating case: TLS terminated by an upstream CDN, so the control
+        // plane holds no certificate for the host and the default heuristic would
+        // happily keep serving a full 200 over plain HTTP alongside HTTPS.
+        assert!(decide(false, false, "/", Some(true), false));
+    }
+
+    #[test]
+    fn force_https_false_suppresses_redirect_even_with_a_certificate() {
+        // Escape hatch for environments that must stay reachable over plain HTTP
+        // (appliances, hardware clients with no modern TLS stack).
+        assert!(!decide(false, false, "/", Some(false), true));
+    }
+
+    #[test]
+    fn https_requests_are_never_redirected() {
+        for force in [None, Some(true), Some(false)] {
+            assert!(
+                !decide(false, true, "/", force, true),
+                "already-TLS request must never redirect (force_https={force:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn global_kill_switch_outranks_the_environment_override() {
+        // `disable_https_redirect` is set by the service unit in local/testing
+        // mode. A per-environment force_https must not resurrect the redirect
+        // there, or a developer's local rig bounces to a port serving no cert.
+        assert!(!decide(true, false, "/", Some(true), true));
+        assert!(!decide(true, false, "/", None, true));
+    }
+
+    #[test]
+    fn acme_challenge_is_exempt_under_every_override() {
+        let path = "/.well-known/acme-challenge/some-token";
+        for force in [None, Some(true), Some(false)] {
+            for has_cert in [true, false] {
+                assert!(
+                    !decide(false, false, path, force, has_cert),
+                    "ACME challenge must never redirect \
+                     (force_https={force:?}, has_cert={has_cert})"
+                );
+            }
+        }
+    }
+
+    /// Regression guard for silent renewal failure. A host that already has a
+    /// certificate is exactly the host that will renew, and renewal happens
+    /// while the old certificate is still installed. If the challenge request
+    /// were redirected, the CA would follow it to an HTTPS endpoint presenting
+    /// the certificate that is about to expire — issuance fails, nothing logs an
+    /// error at the proxy, and the site breaks weeks later when the old cert
+    /// finally lapses.
+    #[test]
+    fn acme_challenge_is_exempt_during_renewal_of_an_existing_certificate() {
+        assert!(!decide(
+            false,
+            false,
+            "/.well-known/acme-challenge/renewal-token",
+            None,
+            true,
+        ));
+    }
+
+    /// The exemption is anchored to the full challenge prefix, not a loose
+    /// `.well-known` match — other well-known resources should still be pushed
+    /// to HTTPS like any normal path.
+    #[test]
+    fn other_well_known_paths_still_redirect() {
+        assert!(decide(
+            false,
+            false,
+            "/.well-known/security.txt",
+            None,
+            true
+        ));
+        assert!(decide(
+            false,
+            false,
+            "/.well-known/acme-challenge-not-really",
+            None,
+            true
+        ));
+    }
+
+    #[test]
+    fn certificate_lookup_is_skipped_when_it_cannot_change_the_answer() {
+        // The cert-cache read is a lock-free snapshot, but it runs on every
+        // plain-HTTP request, so the cases that cannot possibly need it must not
+        // pay for it.
+        let calls = Cell::new(0);
+        let counting_lookup = || {
+            calls.set(calls.get() + 1);
+            true
+        };
+
+        // Already HTTPS — the overwhelmingly common case.
+        assert!(!should_redirect_to_https(
+            false,
+            true,
+            "/",
+            None,
+            counting_lookup
+        ));
+        // Global kill switch.
+        assert!(!should_redirect_to_https(
+            true,
+            false,
+            "/",
+            None,
+            counting_lookup
+        ));
+        // ACME challenge.
+        assert!(!should_redirect_to_https(
+            false,
+            false,
+            "/.well-known/acme-challenge/t",
+            None,
+            counting_lookup
+        ));
+        // Explicit environment override — answer is known without the lookup.
+        assert!(should_redirect_to_https(
+            false,
+            false,
+            "/",
+            Some(true),
+            counting_lookup
+        ));
+        assert_eq!(calls.get(), 0, "cert cache must not have been consulted");
+
+        // Only the inherit-the-default path consults it.
+        assert!(should_redirect_to_https(
+            false,
+            false,
+            "/",
+            None,
+            counting_lookup
+        ));
+        assert_eq!(calls.get(), 1);
+    }
 }
 
 #[async_trait]
@@ -2315,6 +3124,8 @@ impl ProxyHttp for LoadBalancer {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            streaming_session: false,
+            connection_permit: None,
         }
     }
 
@@ -2324,13 +3135,7 @@ impl ProxyHttp for LoadBalancer {
         ctx: &mut Self::CTX,
     ) -> Result<()> {
         // Extract client IP address FIRST (needed for TLS fingerprinting)
-        let client_ip = session
-            .client_addr()
-            .map(|addr| {
-                let addr_str = addr.to_string();
-                addr_str.split(':').next().unwrap_or("unknown").to_string()
-            })
-            .unwrap_or_else(|| "unknown".to_string());
+        let client_ip = resolve_session_client_ip(session).unwrap_or_else(|| "unknown".to_string());
         ctx.ip_address = Some(client_ip.clone());
 
         // Extract user-agent FIRST (needed for TLS fingerprinting)
@@ -2513,10 +3318,8 @@ impl ProxyHttp for LoadBalancer {
             .unwrap_or_default();
 
         // Extract client IP address early (needed for attack mode checks)
-        if let Some(addr) = session.client_addr() {
-            let addr_str = addr.to_string();
-            let client_ip = addr_str.split(':').next().unwrap_or_default();
-            ctx.ip_address = Some(client_ip.to_string());
+        if let Some(client_ip) = resolve_session_client_ip(session) {
+            ctx.ip_address = Some(client_ip);
         }
 
         // SECURITY: Strip any inbound X-Temps-Demo-Mode header. Demo mode
@@ -2553,31 +3356,6 @@ impl ProxyHttp for LoadBalancer {
                     .clone()
                     .filter(|_| ctx.path == PREVIEW_LOGIN_PATH && ctx.method == "POST")
                 {
-                    if self.preview_auth_limiter.is_blocked(client_ip, &hex) {
-                        warn!(
-                            sandbox = %hex,
-                            client_ip = %client_ip,
-                            "preview-auth: sandbox login POST rate limited"
-                        );
-                        let mut response =
-                            ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
-                        response.insert_header("Retry-After", "60")?;
-                        response.insert_header("Cache-Control", "no-store")?;
-                        response.insert_header("X-Request-ID", &ctx.request_id)?;
-                        response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                        session
-                            .write_response_header(Box::new(response), false)
-                            .await?;
-                        session
-                            .write_response_body(
-                                Some(Bytes::from_static(b"Too many failed attempts\n")),
-                                true,
-                            )
-                            .await?;
-                        ctx.routing_status = "preview_rate_limited".to_string();
-                        return Ok(true);
-                    }
-
                     let stored_hash = match self.sandbox_lookup_cache.lookup(&hex).await {
                         PreviewSandboxLookup::Protected { password_hash } => password_hash,
                         PreviewSandboxLookup::Open => {
@@ -2628,6 +3406,11 @@ impl ProxyHttp for LoadBalancer {
                         .find(|(k, _)| k == "password")
                         .map(|(_, v)| v.as_str())
                         .unwrap_or("");
+                    let session_grant = params
+                        .iter()
+                        .find(|(k, _)| k == "session_grant")
+                        .map(|(_, v)| v.as_str())
+                        .unwrap_or("");
                     let next_raw = params
                         .iter()
                         .find(|(k, _)| k == "next")
@@ -2635,44 +3418,164 @@ impl ProxyHttp for LoadBalancer {
                         .unwrap_or("/");
                     let next = sanitize_next(next_raw);
 
-                    if verify_argon2(password, &stored_hash) {
+                    let subject = format!("sbx_{}", hex);
+                    let now = std::time::SystemTime::now();
+                    // Grants are bound to the password hash that existed when
+                    // they were minted. Authenticate the self-contained grant
+                    // envelope before touching the database so random public
+                    // input cannot amplify into an uncached lookup. A valid
+                    // candidate then bypasses the cache so password rotation
+                    // revokes it immediately rather than after the cache TTL.
+                    let grant_password_hash = self
+                        .sandbox_lookup_cache
+                        .verify_session_grant(&self.crypto, session_grant, &hex, now)
+                        .await;
+                    let valid_session_grant = grant_password_hash.is_some();
+
+                    // A valid platform-session grant is not a password guess
+                    // and must remain usable even if this IP previously hit
+                    // the manual-login limiter.
+                    if !valid_session_grant && self.preview_auth_limiter.is_blocked(client_ip, &hex)
+                    {
+                        warn!(
+                            sandbox = %hex,
+                            client_ip = %client_ip,
+                            "preview-auth: sandbox login POST rate limited"
+                        );
+                        let mut response =
+                            ResponseHeader::build(StatusCode::TOO_MANY_REQUESTS, None)?;
+                        response.insert_header("Retry-After", "60")?;
+                        response.insert_header("Cache-Control", "no-store")?;
+                        response.insert_header("Referrer-Policy", "no-referrer")?;
+                        response.insert_header("X-Request-ID", &ctx.request_id)?;
+                        response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                        session
+                            .write_response_header(Box::new(response), false)
+                            .await?;
+                        session
+                            .write_response_body(
+                                Some(Bytes::from_static(b"Too many failed attempts\n")),
+                                true,
+                            )
+                            .await?;
+                        ctx.routing_status = "preview_rate_limited".to_string();
+                        return Ok(true);
+                    }
+
+                    // Password reconciliation can update the sandbox row
+                    // immediately while this worker still has the previous
+                    // hash in its short-lived lookup cache. The owner bridge
+                    // already has the new password, so retry against a fresh
+                    // row before showing a manual password wall.
+                    let verified_hash = if let Some(password_hash) = grant_password_hash {
+                        Some(password_hash)
+                    } else if verify_argon2(password, &stored_hash) {
+                        Some(stored_hash)
+                    } else {
+                        match self.sandbox_lookup_cache.lookup_fresh(&hex).await {
+                            PreviewSandboxLookup::Protected { password_hash }
+                                if verify_argon2(password, &password_hash) =>
+                            {
+                                debug!(
+                                    sandbox = %hex,
+                                    "preview-auth: login succeeded after refreshing stale password hash"
+                                );
+                                Some(password_hash)
+                            }
+                            _ => None,
+                        }
+                    };
+
+                    if let Some(stored_hash) = verified_hash {
                         self.preview_auth_limiter.record_success(client_ip, &hex);
-                        let subject = format!("sbx_{}", hex);
-                        let Some(cookie_value) = encode_preview_cookie_subject(
+                        let cookie_name = format!("temps_preview_sbx_{}", hex);
+                        let cookie_values = session
+                            .req_header()
+                            .headers
+                            .get_all("cookie")
+                            .iter()
+                            .filter_map(|value| value.to_str().ok())
+                            .collect::<Vec<_>>();
+                        let cookie_header = combine_cookie_header_values(cookie_values);
+                        let cookie_needs_refresh = preview_cookie_needs_refresh(
                             &self.crypto,
+                            cookie_header.as_deref(),
+                            &cookie_name,
                             &subject,
                             &stored_hash,
-                            std::time::SystemTime::now(),
-                        ) else {
-                            error!("preview-auth: failed to encode sandbox preview cookie");
-                            let mut response =
-                                ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
-                            response.insert_header("Cache-Control", "no-store")?;
-                            response.insert_header("X-Request-ID", &ctx.request_id)?;
-                            session
-                                .write_response_header(Box::new(response), false)
-                                .await?;
-                            session
-                                .write_response_body(
-                                    Some(Bytes::from_static(b"Cookie mint failed\n")),
-                                    true,
-                                )
-                                .await?;
-                            ctx.routing_status = "preview_cookie_error".to_string();
-                            return Ok(true);
-                        };
-                        let set_cookie = build_set_cookie_sandbox(
-                            &hex,
-                            &cookie_value,
-                            &settings.preview_domain,
-                            self.is_tls_connection(session),
+                            now,
                         );
+                        // Duplicate names indicate an obsolete cookie scope.
+                        // Mint the partitioned replacement before expiring the
+                        // old scopes so cleanup can never delete the only
+                        // healthy cookie.
+                        let has_duplicate_candidates =
+                            cookie_header.as_deref().is_some_and(|header| {
+                                extract_cookie_values(header, &cookie_name).len() > 1
+                            });
+                        let should_refresh_cookie =
+                            cookie_needs_refresh || has_duplicate_candidates;
 
-                        info!(sandbox = %hex, "preview-auth: sandbox login succeeded");
+                        let set_cookie = if !should_refresh_cookie {
+                            None
+                        } else {
+                            let Some(cookie_value) = encode_preview_cookie_subject(
+                                &self.crypto,
+                                &subject,
+                                &stored_hash,
+                                now,
+                            ) else {
+                                error!("preview-auth: failed to encode sandbox preview cookie");
+                                let mut response =
+                                    ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
+                                response.insert_header("Cache-Control", "no-store")?;
+                                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                                session
+                                    .write_response_header(Box::new(response), false)
+                                    .await?;
+                                session
+                                    .write_response_body(
+                                        Some(Bytes::from_static(b"Cookie mint failed\n")),
+                                        true,
+                                    )
+                                    .await?;
+                                ctx.routing_status = "preview_cookie_error".to_string();
+                                return Ok(true);
+                            };
+                            Some(build_set_cookie_sandbox(
+                                &hex,
+                                &cookie_value,
+                                &settings.preview_domain,
+                                self.is_tls_connection(session),
+                            ))
+                        };
+
+                        info!(
+                            sandbox = %hex,
+                            auth_kind = if valid_session_grant { "platform_session" } else { "password" },
+                            cookie_refreshed = should_refresh_cookie,
+                            "preview-auth: sandbox login succeeded"
+                        );
                         let mut response = ResponseHeader::build(303, None)?;
                         response.insert_header("Location", &next)?;
-                        response.insert_header("Set-Cookie", &set_cookie)?;
+                        if let Some(set_cookie) = &set_cookie {
+                            response.append_header("Set-Cookie", set_cookie)?;
+                        }
+                        // Expire both scopes used by older gateway versions.
+                        // Chrome can keep an unpartitioned host-only cookie and
+                        // a parent-domain cookie alongside the fresh CHIPS
+                        // cookie, sometimes emitting them in separate Cookie
+                        // header fields.
+                        if should_refresh_cookie && self.is_tls_connection(session) {
+                            let unpartitioned_cookie =
+                                build_logout_cookie_sandbox_unpartitioned(&hex);
+                            response.append_header("Set-Cookie", &unpartitioned_cookie)?;
+                            let legacy_cookie =
+                                build_logout_cookie_sandbox(&hex, &settings.preview_domain, false);
+                            response.append_header("Set-Cookie", &legacy_cookie)?;
+                        }
                         response.insert_header("Cache-Control", "no-store")?;
+                        response.insert_header("Referrer-Policy", "no-referrer")?;
                         response.insert_header("X-Request-ID", &ctx.request_id)?;
                         session
                             .write_response_header(Box::new(response), true)
@@ -2693,6 +3596,7 @@ impl ProxyHttp for LoadBalancer {
                         let mut response = ResponseHeader::build(StatusCode::UNAUTHORIZED, None)?;
                         response.insert_header("Content-Type", "text/html; charset=utf-8")?;
                         response.insert_header("Cache-Control", "no-store")?;
+                        response.insert_header("Referrer-Policy", "no-referrer")?;
                         response.insert_header("X-Request-ID", &ctx.request_id)?;
                         session
                             .write_response_header(Box::new(response), false)
@@ -2718,12 +3622,32 @@ impl ProxyHttp for LoadBalancer {
                         .unwrap_or_else(|| "/".to_string());
                     let next = sanitize_next(&next_raw);
                     let label = format!("sandbox sbx_{}", hex);
-                    let html =
-                        generate_preview_form_html_labeled(&label, preview_host.port, &next, false);
+
+                    // A share link carries its grant in the URL fragment, which
+                    // never reaches this request. The non-secret `grant=1`
+                    // marker selects a bridge whose JavaScript reads the
+                    // fragment, clears browser history, and POSTs the grant to
+                    // the existing verification/cookie path.
+                    let has_session_grant = ctx
+                        .query_string
+                        .as_deref()
+                        .and_then(|qs| {
+                            url::form_urlencoded::parse(qs.as_bytes())
+                                .find(|(k, _)| k == "grant")
+                                .map(|(_, v)| v == "1")
+                        })
+                        .unwrap_or(false);
+
+                    let html = if has_session_grant {
+                        generate_preview_bridge_html(&label, &next)
+                    } else {
+                        generate_preview_form_html_labeled(&label, preview_host.port, &next, false)
+                    };
                     let html_bytes = Bytes::from(html);
                     let mut response = ResponseHeader::build(StatusCode::OK, None)?;
                     response.insert_header("Content-Type", "text/html; charset=utf-8")?;
                     response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("Referrer-Policy", "no-referrer")?;
                     response.insert_header("X-Request-ID", &ctx.request_id)?;
                     session
                         .write_response_header(Box::new(response), false)
@@ -2760,12 +3684,17 @@ impl ProxyHttp for LoadBalancer {
                 }
 
                 // ── Regular preview request: check cookie ─────────────────
-                let cookie_header = session
+                // HTTP/2 and some browser cookie stores may emit duplicate
+                // cookie names in separate Cookie header fields. Join every
+                // field so check_preview_auth can validate every candidate.
+                let cookie_values = session
                     .req_header()
                     .headers
-                    .get("cookie")
-                    .and_then(|h| h.to_str().ok())
-                    .map(|s| s.to_string());
+                    .get_all("cookie")
+                    .iter()
+                    .filter_map(|value| value.to_str().ok())
+                    .collect::<Vec<_>>();
+                let cookie_header = combine_cookie_header_values(cookie_values);
 
                 let outcome = check_preview_auth(
                     &self.sandbox_lookup_cache,
@@ -3073,6 +4002,65 @@ impl ProxyHttp for LoadBalancer {
             // Record activity for on-demand idle tracking
             if let Some(ref on_demand) = self.on_demand_manager {
                 on_demand.record_activity(project_ctx.environment.id);
+            }
+
+            // Per-project/environment concurrent-connection cap (issue #646): a slow
+            // or malicious upstream must not be able to exhaust the proxy's own
+            // connection budget now that request timeouts are opt-in (PR #642). Keyed
+            // on environment id (the actual upstream-instance granularity); global
+            // default and the project/environment DeploymentConfig override are
+            // resolved the same way as the timeout settings above.
+            let connection_limits = self
+                .config_service
+                .get_settings()
+                .await
+                .map(|settings| settings.connection_limits)
+                .unwrap_or_default();
+            let project_config = project_ctx
+                .project
+                .deployment_config
+                .clone()
+                .unwrap_or_default();
+            let effective_config = project_ctx
+                .environment
+                .get_effective_deployment_config(&project_config);
+            let connection_limit = effective_config
+                .max_concurrent_connections
+                .map(|v| v.max(0) as u32)
+                .unwrap_or(connection_limits.default_max_concurrent_connections);
+
+            match self
+                .connection_limiter
+                .try_acquire(project_ctx.environment.id, connection_limit)
+            {
+                Some(permit) => ctx.connection_permit = Some(permit),
+                None => {
+                    warn!(
+                        environment_id = project_ctx.environment.id,
+                        project_id = project_ctx.project.id,
+                        limit = connection_limit,
+                        "Environment at concurrent-connection capacity; rejecting request"
+                    );
+                    let mut response =
+                        ResponseHeader::build(StatusCode::SERVICE_UNAVAILABLE, None)?;
+                    response.insert_header("Retry-After", "1")?;
+                    response.insert_header("Cache-Control", "no-store")?;
+                    response.insert_header("X-Request-ID", &ctx.request_id)?;
+                    response.insert_header("Content-Type", "application/json")?;
+                    // Generic body/message: this must not be distinguishable from the
+                    // proxy's other 503 responses (e.g. no upstream route found), or
+                    // an unauthenticated caller could use it as an oracle to confirm
+                    // that a given hostname routes to a real project/environment.
+                    let body_bytes = Bytes::from_static(
+                        br#"{"status":"service_unavailable","message":"Service temporarily unavailable, please retry"}"#,
+                    );
+                    session
+                        .write_response_header(Box::new(response), false)
+                        .await?;
+                    session.write_response_body(Some(body_bytes), true).await?;
+                    ctx.routing_status = "connection_limit_exceeded".to_string();
+                    return Ok(true);
+                }
             }
 
             // Check if this is a CAPTCHA endpoint - allow these to bypass attack mode
@@ -3400,21 +4388,70 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // HTTP to HTTPS redirect for non-TLS connections.
-        // This MUST come after ACME challenge handling to allow Let's Encrypt HTTP-01 validation.
+        // This MUST come after ACME challenge handling to allow Let's Encrypt
+        // HTTP-01 validation. `should_redirect_to_https` additionally exempts the
+        // whole `/.well-known/acme-challenge/` prefix, so a validation request
+        // that did NOT match a stored token (renewal in flight, token written to
+        // a sibling domain row, wildcard parent) still falls through to normal
+        // routing instead of being 301'd to a certificate that has expired or
+        // does not exist yet.
         //
-        // Redirect is per-domain: we only redirect when the requesting host
-        // actually has an active TLS certificate in the database (exact match or
-        // wildcard parent). This means HTTP-only installs (sslip.io quick/local
-        // modes, no cert provisioned) never get redirected, while hosts that
-        // have gone through SSL provisioning get automatic HTTPS enforcement.
+        // By default the redirect is per-domain: we only redirect when the
+        // requesting host actually has an active TLS certificate in the database
+        // (exact match or wildcard parent). This means HTTP-only installs
+        // (sslip.io quick/local modes, no cert provisioned) never get redirected,
+        // while hosts that have gone through SSL provisioning get automatic HTTPS
+        // enforcement.
+        //
+        // The environment resolved above can override that default in either
+        // direction (`force_https`): `Some(true)` for sites whose TLS is
+        // terminated by an upstream CDN — no local cert exists, so the default
+        // heuristic would leave plain HTTP serving a full 200 alongside HTTPS —
+        // and `Some(false)` for environments that must stay reachable over HTTP.
+        // Reading it off `ctx.environment` costs nothing extra: the environment
+        // was already resolved and cloned into the context earlier in this
+        // filter, so there is no additional lookup on the hot path.
         //
         // `disable_https_redirect` is a global escape hatch (set by the service
-        // unit in local/testing mode) that bypasses the check entirely.
+        // unit in local/testing mode) that bypasses the check entirely and
+        // outranks the per-environment override.
         // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
         // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
-        let needs_redirect = !self.disable_https_redirect
-            && !self.is_tls_connection(session)
-            && self.cert_host_cache.has_cert_for_host(&ctx.host);
+        let env_force_https = ctx.environment.as_ref().and_then(|env| env.force_https);
+        let production_https = if should_apply_production_https_default(
+            self.disable_https_redirect,
+            self.is_tls_connection(session),
+            &ctx.path,
+            env_force_https,
+            ctx.environment.is_some(),
+        ) {
+            match self.config_service.get_url_scheme().await {
+                Ok(scheme) => scheme != "http",
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Failed to read external URL scheme; enforcing HTTPS"
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        let needs_redirect = should_redirect_to_https(
+            self.disable_https_redirect,
+            self.is_tls_connection(session),
+            &ctx.path,
+            env_force_https,
+            // Lock-free ArcSwap snapshot read, and only reached when the
+            // environment has no explicit override.
+            || {
+                inherited_https_policy(
+                    production_https,
+                    self.cert_host_cache.has_cert_for_host(&ctx.host),
+                )
+            },
+        );
         if needs_redirect {
             // Build the HTTPS redirect URL preserving path and query string
             let redirect_url = if let Some(query) = &ctx.query_string {
@@ -3762,8 +4799,15 @@ impl ProxyHttp for LoadBalancer {
         if ctx.path.starts_with("/_temps/assets/") {
             let after_prefix = &ctx.path["/_temps/assets/".len()..];
             if let Some(slash_pos) = after_prefix.find('/') {
+                let deployment_slug = &after_prefix[..slash_pos];
                 let asset_path = after_prefix[slash_pos + 1..].to_string();
-                if Self::is_cacheable_static_asset(&asset_path) {
+                if deployment_asset_path_matches(
+                    ctx.deployment
+                        .as_ref()
+                        .map(|deployment| deployment.slug.as_str()),
+                    deployment_slug,
+                ) && Self::is_cacheable_static_asset(&asset_path)
+                {
                     if let Ok(true) = self.serve_asset_from_store(session, ctx, &asset_path).await {
                         ctx.routing_status = "prefixed_asset".to_string();
                         return Ok(true);
@@ -3834,7 +4878,7 @@ impl ProxyHttp for LoadBalancer {
 
     async fn upstream_response_filter(
         &self,
-        _session: &mut PingoraSession,
+        session: &mut PingoraSession,
         upstream_response: &mut ResponseHeader,
         ctx: &mut Self::CTX,
     ) -> Result<()>
@@ -3864,20 +4908,31 @@ impl ProxyHttp for LoadBalancer {
             .headers
             .get("content-type")
             .and_then(|v| v.to_str().ok())
-            .map(|ct| ct.contains("text/event-stream"))
+            .map(is_event_stream_content_type)
             .unwrap_or(false);
 
         if is_sse {
             ctx.is_sse = true;
-            ctx.skip_tracking = true; // Skip visitor/session tracking for SSE streams
+            // Skip visitor/session tracking for SSE streams
+            ctx.skip_tracking = true;
+            // The upstream *confirmed* a stream, as opposed to `ctx.is_sse` set
+            // from the request's Accept header, which is only client intent and
+            // may still be answered by an ordinary short response.
+            ctx.streaming_session = true;
             debug!("SSE response detected from upstream");
         }
 
-        // Strip content-length from HEAD responses. The upstream correctly includes it
-        // (per RFC 9110 §9.3.2, HEAD responses SHOULD have the same content-length as GET)
-        // but when proxied over HTTP/2, clients like curl interpret the content-length as
-        // a promise of body bytes and error when none arrive. Cloudflare strips it too.
-        if ctx.method == "HEAD" {
+        // Strip content-length from HEAD responses, but ONLY when the downstream
+        // client is on HTTP/2. The upstream correctly includes it (per RFC 9110
+        // §9.3.2, HEAD responses SHOULD have the same content-length as GET) --
+        // over HTTP/2, clients like curl interpret the content-length as a promise
+        // of body bytes and error when none arrive, and Cloudflare strips it too.
+        // But an HTTP/1.1 downstream needs content-length (or chunked encoding) on
+        // a keep-alive connection to know the response is complete; a HEAD response
+        // with neither leaves the client blocked waiting for a body that will never
+        // come, since HTTP/1.1 has no other framing signal for "zero-length body,
+        // connection stays open."
+        if ctx.method == "HEAD" && session.is_http2() {
             upstream_response.remove_header("content-length");
         }
 
@@ -4103,15 +5158,14 @@ impl ProxyHttp for LoadBalancer {
             .and_then(|v| v.to_str().ok())
             .map(|s| s.eq_ignore_ascii_case("websocket"))
             .unwrap_or(false);
-        let io_timeout = if is_websocket {
-            std::time::Duration::from_secs(3600)
-        } else {
-            std::time::Duration::from_secs(60)
-        };
 
         // Workspace preview gateway: skip the route table and forward straight
         // to the local gateway. The host header is preserved so the gateway
         // can decode `ws-<sid>-<port>` and pick the right sandbox container.
+        // This peer is an internal shared gateway, not customer app traffic,
+        // so it keeps the fixed WS/HTTP split rather than the configurable
+        // per-project/environment timeouts resolved below for the customer
+        // traffic path.
         //
         // Every preview target shares this same physical peer address, so
         // `group_key` MUST be set per-target — otherwise Pingora's
@@ -4120,12 +5174,17 @@ impl ProxyHttp for LoadBalancer {
         // serve a different sandbox's request (see `preview_peer_group_key`
         // doc comment for the full mechanism).
         if let Some(host) = &ctx.preview_route {
+            let preview_io_timeout = if is_websocket {
+                std::time::Duration::from_secs(3600)
+            } else {
+                std::time::Duration::from_secs(60)
+            };
             let mut peer = Box::new(HttpPeer::new(PREVIEW_GATEWAY_PEER, false, String::new()));
             peer.group_key = preview_peer_group_key(host);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
-            peer.options.read_timeout = Some(io_timeout);
-            peer.options.write_timeout = Some(io_timeout);
-            peer.options.idle_timeout = Some(io_timeout);
+            peer.options.read_timeout = Some(preview_io_timeout);
+            peer.options.write_timeout = Some(preview_io_timeout);
+            peer.options.idle_timeout = Some(preview_io_timeout);
             ctx.upstream_host = Some(PREVIEW_GATEWAY_PEER.to_string());
             return Ok(peer);
         }
@@ -4147,15 +5206,71 @@ impl ProxyHttp for LoadBalancer {
 
         let mut peer = selection.peer;
 
-        // Configure upstream connection options. `io_timeout` is bumped to
-        // 1h for websocket upgrades (see top of this method) so idle terminals
-        // and SSE streams don't get RST every 60s.
+        // Resolve the effective per-request/idle timeout for customer app
+        // traffic: project config as the base layer, environment config
+        // overriding it (Environment > Project > Global — the same
+        // inheritance chain used elsewhere, e.g. for security config), then
+        // always clamped to the operator's global hard ceiling. SSE and
+        // WebSocket get their own idle-timeout class since they're
+        // long-lived by design; `ctx.is_sse`/`ctx.is_websocket` were already
+        // detected from request headers in `early_request_filter`.
+        let request_timeouts = self
+            .config_service
+            .get_settings()
+            .await
+            .map(|settings| settings.request_timeouts)
+            .unwrap_or_default();
+        let project_config = ctx
+            .project
+            .as_ref()
+            .and_then(|p| p.deployment_config.clone())
+            .unwrap_or_default();
+        let effective_config = ctx
+            .environment
+            .as_ref()
+            .map(|env| env.get_effective_deployment_config(&project_config))
+            .unwrap_or(project_config);
+        let traffic_kind = if ctx.is_websocket {
+            TimeoutTrafficKind::WebSocket
+        } else if ctx.is_sse {
+            TimeoutTrafficKind::Sse
+        } else {
+            TimeoutTrafficKind::Http
+        };
+        let customer_io_timeout =
+            resolve_customer_io_timeout(traffic_kind, &effective_config, &request_timeouts);
+
+        // The customer-traffic timeout above is tuned per project/environment
+        // — a slow customer endpoint shouldn't hang a proxy worker forever.
+        // It's the wrong bound for the console/control-plane API, which the
+        // browser reaches through this same proxy: long-running admin
+        // operations (e.g. POST /api/imports/execute, which synchronously
+        // builds, deploys, and health-checks the imported app) routinely
+        // take well over 60s for a real app. Without this, the request is
+        // RST'd out from under a handler that goes on to finish successfully
+        // server-side — the import completes, but the browser sees a 503
+        // and the user has no way to know it worked.
+        let io_timeout = upstream_io_timeout(
+            &peer.address().to_string(),
+            self.upstream_resolver.console_address(),
+            is_websocket,
+            customer_io_timeout,
+        );
+
+        // Configure upstream connection options. `io_timeout` is the
+        // project/environment-configured (or global-default) value for this
+        // traffic's class — HTTP/SSE/WebSocket — resolved above, bumped to
+        // `CONSOLE_IO_TIMEOUT_SECS` for console/control-plane traffic (see
+        // above). `None` means no timeout is configured for this traffic at
+        // all (the platform default) and flows straight through to Pingora,
+        // which leaves the connection unbounded — never converted to "the
+        // ceiling" or any other fallback duration.
         peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
-        peer.options.read_timeout = Some(io_timeout);
-        peer.options.write_timeout = Some(io_timeout);
+        peer.options.read_timeout = io_timeout;
+        peer.options.write_timeout = io_timeout;
         // Close idle pooled connections after the same window to avoid stale
         // keep-alive reuse.
-        peer.options.idle_timeout = Some(io_timeout);
+        peer.options.idle_timeout = io_timeout;
 
         // Populate context with upstream information
         let addr = peer.address();
@@ -4287,6 +5402,8 @@ impl ProxyHttp for LoadBalancer {
             // For failed requests, response size is the error message size
             let response_size = Some(SERVICE_UNAVAILABLE_BODY.len() as i64);
 
+            let (request_source, is_system_request) =
+                Self::traffic_classification(&ctx.path, &ctx.user_agent);
             let proxy_log_request = CreateProxyLogRequest {
                 method: ctx.method.clone(),
                 path: ctx.path.clone(),
@@ -4294,8 +5411,8 @@ impl ProxyHttp for LoadBalancer {
                 host: ctx.host.clone(),
                 status_code: error_code as i16,
                 response_time_ms: Some(ctx.start_time.elapsed().as_millis() as i32),
-                request_source: "proxy".to_string(),
-                is_system_request: ctx.path.starts_with(ROUTE_PREFIX_TEMPS),
+                request_source: request_source.to_string(),
+                is_system_request,
                 routing_status: ctx.routing_status.clone(),
                 project_id: ctx.project.as_ref().map(|p| p.id),
                 environment_id: ctx.environment.as_ref().map(|e| e.id),
@@ -4352,6 +5469,9 @@ impl ProxyHttp for LoadBalancer {
     where
         Self::CTX: Send + Sync,
     {
+        // ctx.connection_permit (if any) releases its slot when ctx is dropped
+        // after this hook returns — no explicit release needed here.
+
         // No response written (client abort / connect failure with no reply)
         // has no status; 0 falls into the 5xx class, which is the honest read.
         let status_code = session
@@ -4364,12 +5484,20 @@ impl ProxyHttp for LoadBalancer {
             &ctx.routing_status,
         );
 
+        // A `101` means the WebSocket tunnel was actually established, so this
+        // hook is firing at tunnel *close* — anything up to the 1h idle timeout
+        // set in `upstream_peer`. Together with an upstream-confirmed SSE
+        // stream these are the two cases where `start_time.elapsed()` is a
+        // connection lifetime rather than a request latency.
+        let is_streaming = status_code == 101 || ctx.streaming_session;
+
         // Hot path: a handful of relaxed atomic adds, no locks, no I/O.
         self.proxy_metrics.record(
             status_code,
             ctx.start_time.elapsed().as_millis() as u64,
             ctx.upstream_response_time_ms,
             destination,
+            is_streaming,
         );
 
         // The response body has now fully streamed through response_body_filter
@@ -4678,6 +5806,8 @@ mod markdown_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            streaming_session: false,
+            connection_permit: None,
         }
     }
 
@@ -4780,39 +5910,12 @@ mod markdown_tests {
 
     // ── response_body_filter buffering logic ──────────────────────────────────
 
-    /// Simulate the body filter for a single-chunk response.
-    /// Mirrors the production pipeline: parse → extract_page_meta →
-    /// extract_content_html → htmd::convert → prepend frontmatter.
+    /// Simulate the body filter for a single-chunk response by delegating to
+    /// the real `response_body_filter_inner`, so this test module exercises
+    /// production behaviour rather than a parallel re-implementation of it.
     fn run_body_filter_single_chunk(ctx: &mut ProxyContext, html: &[u8]) -> Option<Bytes> {
         let mut body: Option<Bytes> = Some(Bytes::copy_from_slice(html));
-        let end_of_stream = true;
-
-        if ctx.wants_markdown {
-            if let Some(chunk) = body.take() {
-                if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
-                    ctx.wants_markdown = false;
-                    let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
-                    flushed.extend_from_slice(&chunk);
-                    return Some(Bytes::from(flushed));
-                }
-                ctx.markdown_buffer.extend_from_slice(&chunk);
-            }
-            if end_of_stream {
-                let html_str = String::from_utf8_lossy(&ctx.markdown_buffer);
-                let document = scraper::Html::parse_document(&html_str);
-                let meta = extract_page_meta(&document);
-                let content = extract_content_html(&document);
-                let markdown = htmd::convert(&content).unwrap_or_default();
-                let final_markdown = match meta.to_frontmatter() {
-                    Some(fm) => fm + &markdown,
-                    None => markdown,
-                };
-                ctx.markdown_buffer = Vec::new();
-                return Some(Bytes::from(final_markdown));
-            }
-            return None;
-        }
-
+        response_body_filter_inner(&mut body, true, ctx).unwrap();
         body
     }
 
@@ -5069,21 +6172,36 @@ mod markdown_tests {
     }
 
     #[test]
-    fn test_body_filter_size_guard_disables_conversion() {
+    fn test_body_filter_size_guard_truncates_instead_of_passthrough() {
+        // Regression test: response_filter has already sent the client a
+        // `Content-Type: text/markdown` header by the time this body filter
+        // runs, so it must never fall back to raw HTML passthrough for an
+        // oversized body — that would ship raw markup mislabeled as markdown.
+        // It must truncate to the cap and still convert.
         let mut ctx = make_ctx();
         ctx.wants_markdown = true;
 
-        // Create a body slightly larger than 2 MB
-        let oversized = vec![b'x'; MAX_MARKDOWN_BODY_BYTES + 1];
-        let result = run_body_filter_single_chunk(&mut ctx, &oversized);
-
-        // Should fall back to passthrough — returns original bytes, conversion disabled
-        assert!(
-            !ctx.wants_markdown,
-            "wants_markdown should be reset to false"
+        let html = format!(
+            "<html><body><main><p>{}</p></main></body></html>",
+            "x".repeat(MAX_MARKDOWN_BODY_BYTES + 1)
         );
-        assert!(result.is_some());
-        assert_eq!(result.unwrap().len(), oversized.len());
+        let result = run_body_filter_single_chunk(&mut ctx, html.as_bytes());
+
+        assert!(
+            ctx.wants_markdown,
+            "wants_markdown must stay true — the header commitment can't be undone"
+        );
+        let result = result.expect("a truncated, converted body must still be produced");
+        assert!(
+            result.len() <= MAX_MARKDOWN_BODY_BYTES + 1024,
+            "body must be bounded near the cap, got {} bytes",
+            result.len()
+        );
+        assert!(
+            result.len() < html.len(),
+            "body must actually be truncated, not equal to the {}-byte input",
+            html.len()
+        );
     }
 
     #[test]
@@ -5221,6 +6339,8 @@ mod markdown_pipeline_tests {
             upstream_start_time: None,
             upstream_response_time_ms: None,
             preview_route: None,
+            streaming_session: false,
+            connection_permit: None,
         }
     }
 
@@ -5233,7 +6353,9 @@ mod markdown_pipeline_tests {
         resp
     }
 
-    /// Simulate the full pipeline for a single-chunk body.
+    /// Simulate the full pipeline for a single-chunk body, delegating body handling
+    /// to the real `response_body_filter_inner` (the production function) rather
+    /// than a re-implementation, so these tests catch real regressions in it.
     /// Returns (final_ctx, outbound_response_header, body_bytes).
     fn run_pipeline(
         mut ctx: ProxyContext,
@@ -5246,35 +6368,33 @@ mod markdown_pipeline_tests {
         // Phase 2: response_filter — header rewrite
         apply_markdown_response_headers(&mut resp, &ctx);
 
-        // Phase 3: response_body_filter — buffer + convert (single-chunk, end_of_stream=true)
-        let body_out = if ctx.is_sse || ctx.is_websocket {
-            Some(Bytes::copy_from_slice(body))
-        } else if ctx.wants_markdown {
-            let chunk = Bytes::copy_from_slice(body);
-            if ctx.markdown_buffer.len() + chunk.len() > MAX_MARKDOWN_BODY_BYTES {
-                ctx.wants_markdown = false;
-                let mut flushed = std::mem::take(&mut ctx.markdown_buffer);
-                flushed.extend_from_slice(&chunk);
-                Some(Bytes::from(flushed))
-            } else {
-                ctx.markdown_buffer.extend_from_slice(&chunk);
-                let html = String::from_utf8_lossy(&ctx.markdown_buffer);
-                let document = scraper::Html::parse_document(&html);
-                let meta = extract_page_meta(&document);
-                let content = extract_content_html(&document);
-                let markdown = htmd::convert(&content).unwrap_or_default();
-                ctx.markdown_buffer = Vec::new();
-                let final_md = match meta.to_frontmatter() {
-                    Some(fm) => fm + &markdown,
-                    None => markdown,
-                };
-                Some(Bytes::from(final_md))
-            }
-        } else {
-            Some(Bytes::copy_from_slice(body))
-        };
+        // Phase 3: response_body_filter — single chunk, end_of_stream=true
+        let mut body_opt: Option<Bytes> = Some(Bytes::copy_from_slice(body));
+        response_body_filter_inner(&mut body_opt, true, &mut ctx).unwrap();
 
-        (ctx, resp, body_out)
+        (ctx, resp, body_opt)
+    }
+
+    /// Feed a body through `response_body_filter_inner` as multiple chunks,
+    /// mirroring how Pingora streams a real chunked upstream response — used to
+    /// exercise the size cap without allocating one enormous `Bytes` value.
+    fn run_pipeline_chunked(
+        mut ctx: ProxyContext,
+        mut resp: ResponseHeader,
+        chunks: &[&[u8]],
+    ) -> (ProxyContext, ResponseHeader, Option<Bytes>) {
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+        apply_markdown_response_headers(&mut resp, &ctx);
+
+        let mut last_body = None;
+        for (i, chunk) in chunks.iter().enumerate() {
+            let end_of_stream = i == chunks.len() - 1;
+            let mut body_opt: Option<Bytes> = Some(Bytes::copy_from_slice(chunk));
+            response_body_filter_inner(&mut body_opt, end_of_stream, &mut ctx).unwrap();
+            last_body = body_opt;
+        }
+
+        (ctx, resp, last_body)
     }
 
     // ── Gate tests ────────────────────────────────────────────────────────────
@@ -5634,24 +6754,160 @@ mod markdown_pipeline_tests {
         );
     }
 
+    // ── Regression tests: text/markdown must never surface raw HTML ───────────
+    //
+    // response_filter rewrites Content-Type to text/markdown and Pingora sends
+    // those headers to the client BEFORE response_body_filter ever runs — so by
+    // the time the body-filter discovers a problem (body too large, conversion
+    // failure), it is too late to change the Content-Type back to text/html.
+    // These tests pin down that once wants_markdown is true after the gate, the
+    // body filter must always hand back real, tag-free text — truncated if
+    // necessary — never the untouched upstream HTML bytes.
+
     #[test]
-    fn pipeline_size_guard_passthrough_on_oversized_body() {
+    fn gate_cancels_when_content_length_declares_oversized_body() {
+        // Discovered upfront (before headers are sent) via Content-Length —
+        // the cheapest way to avoid ever promising markdown for a body we
+        // already know will not fit.
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+        resp.insert_header("Content-Length", (MAX_MARKDOWN_BODY_BYTES + 1).to_string())
+            .unwrap();
+
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+
+        assert!(
+            !ctx.wants_markdown,
+            "an oversized declared Content-Length must cancel conversion before \
+             response_filter ever commits the markdown Content-Type"
+        );
+    }
+
+    #[test]
+    fn gate_allows_when_content_length_under_limit() {
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let mut resp = make_response(200, Some("text/html; charset=utf-8"));
+        resp.insert_header("Content-Length", "1024").unwrap();
+
+        apply_markdown_upstream_gate(&mut resp, &mut ctx);
+
+        assert!(
+            ctx.wants_markdown,
+            "a small declared Content-Length must not cancel conversion"
+        );
+    }
+
+    #[test]
+    fn pipeline_oversized_body_is_truncated_not_leaked_as_raw_html() {
+        // No Content-Length header — the gate can't reject this upfront (mirrors
+        // a chunked upstream response), so the over-cap condition is only
+        // discovered while streaming the body, after the client already has a
+        // `Content-Type: text/markdown` response header.
         let mut ctx = make_ctx();
         ctx.wants_markdown = true;
         let resp = make_response(200, Some("text/html; charset=utf-8"));
-        let oversized = vec![b'x'; MAX_MARKDOWN_BODY_BYTES + 1];
+        let html = format!(
+            "<html><body><main><p>{}</p></main></body></html>",
+            "x".repeat(MAX_MARKDOWN_BODY_BYTES + 1)
+        );
 
-        let (final_ctx, _out_resp, body) = run_pipeline(ctx, resp, &oversized);
+        let (final_ctx, out_resp, body) = run_pipeline(ctx, resp, html.as_bytes());
+
+        assert_eq!(
+            out_resp
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/markdown; charset=utf-8"),
+            "the markdown Content-Type was already sent to the client before the \
+             body filter ran — it cannot be reverted to text/html here"
+        );
+        assert!(
+            final_ctx.wants_markdown,
+            "conversion must stay committed once the header promise is made"
+        );
+
+        let body = body.expect("a body must still be produced when truncated");
+        assert!(
+            body.len() <= MAX_MARKDOWN_BODY_BYTES + 1024,
+            "converted body ({} bytes) must be bounded near the cap, not grow to \
+             the full oversized input",
+            body.len()
+        );
+        assert!(
+            body.len() < html.len(),
+            "body must actually be truncated, not the full {}-byte input passed \
+             through untouched",
+            html.len()
+        );
+
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains("<main>") && !text.contains("<body>") && !text.contains("<html>"),
+            "a response already labeled text/markdown must never contain literal, \
+             unconverted HTML tags: {}",
+            &text[..text.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn pipeline_oversized_body_truncated_across_multiple_chunks() {
+        // Same regression as above, but exercised the way Pingora actually
+        // delivers a chunked upstream response: several response_body_filter
+        // calls, only the last one with end_of_stream = true.
+        let mut ctx = make_ctx();
+        ctx.wants_markdown = true;
+        let resp = make_response(200, Some("text/html; charset=utf-8"));
+
+        let opening = b"<html><body><main><p>".to_vec();
+        let giant_chunk = vec![b'x'; MAX_MARKDOWN_BODY_BYTES];
+        let closing = b"</p></main></body></html>".to_vec();
+        let chunks: Vec<&[u8]> = vec![&opening, &giant_chunk, &closing];
+
+        let (final_ctx, out_resp, body) = run_pipeline_chunked(ctx, resp, &chunks);
+
+        assert_eq!(
+            out_resp
+                .headers
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/markdown; charset=utf-8")
+        );
+        assert!(final_ctx.wants_markdown);
+
+        let body = body.expect("final chunk must flush a converted body");
+        assert!(
+            body.len() <= MAX_MARKDOWN_BODY_BYTES + 1024,
+            "buffer must have been capped across chunk boundaries, got {} bytes",
+            body.len()
+        );
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            !text.contains('<'),
+            "no raw HTML tags may survive into a text/markdown body: {}",
+            &text[..text.len().min(200)]
+        );
+    }
+
+    #[test]
+    fn plain_text_fallback_never_leaks_html_tags() {
+        // Exercises the last-resort branch used when htmd::convert() itself
+        // fails — must always return readable text, never markup, since the
+        // client has already been told Content-Type: text/markdown.
+        let html = "<div><h1>Title</h1><p>Some <b>bold</b> text.</p></div>";
+        let text = plain_text_fallback(html);
 
         assert!(
-            !final_ctx.wants_markdown,
-            "size guard must disable conversion"
+            !text.contains('<') && !text.contains('>'),
+            "fallback must strip all HTML tags: {}",
+            text
         );
-        assert_eq!(
-            body.unwrap().len(),
-            oversized.len(),
-            "original bytes must be returned unchanged"
-        );
+        assert!(text.contains("Title"));
+        assert!(text.contains("Some"));
+        assert!(text.contains("bold"));
+        assert!(text.contains("text."));
     }
 
     #[test]
@@ -5774,6 +7030,67 @@ mod traceparent_tests {
         assert_eq!(
             LoadBalancer::extract_traceparent_trace_id(Some(&h)),
             Some("4bf92f3577b34da6a3ce929d0e0e4736".to_string())
+        );
+    }
+}
+
+#[cfg(test)]
+mod content_type_tests {
+    use super::is_event_stream_content_type;
+
+    #[test]
+    fn accepts_plain_and_parameterised_event_stream() {
+        assert!(is_event_stream_content_type("text/event-stream"));
+        assert!(is_event_stream_content_type(
+            "text/event-stream; charset=utf-8"
+        ));
+        assert!(is_event_stream_content_type(
+            "text/event-stream;charset=utf-8"
+        ));
+        // Media types are case-insensitive, and surrounding space is legal.
+        assert!(is_event_stream_content_type("  TEXT/Event-Stream  "));
+    }
+
+    #[test]
+    fn rejects_event_stream_hidden_in_a_parameter() {
+        // The reason this is not a substring match: an upstream that smuggles
+        // the token into a parameter would otherwise classify itself as a
+        // streaming session and drop out of the proxy latency histograms.
+        assert!(!is_event_stream_content_type(
+            "text/html; note=text/event-stream"
+        ));
+        assert!(!is_event_stream_content_type(
+            "application/json; x=\"text/event-stream\""
+        ));
+    }
+
+    #[test]
+    fn rejects_ordinary_content_types() {
+        assert!(!is_event_stream_content_type("text/html"));
+        assert!(!is_event_stream_content_type("application/json"));
+        assert!(!is_event_stream_content_type(""));
+        // A prefix match must not count either.
+        assert!(!is_event_stream_content_type("text/event-stream-x"));
+    }
+}
+
+#[cfg(test)]
+mod traffic_classification_tests {
+    use super::LoadBalancer;
+
+    #[test]
+    fn classifies_temps_monitor_as_synthetic_system_traffic() {
+        assert_eq!(
+            LoadBalancer::traffic_classification("/api/health", "Temps-Status-Monitor/1.0"),
+            ("temps_monitor", true)
+        );
+    }
+
+    #[test]
+    fn leaves_customer_requests_as_proxy_traffic() {
+        assert_eq!(
+            LoadBalancer::traffic_classification("/api/health", "Mozilla/5.0"),
+            ("proxy", false)
         );
     }
 }

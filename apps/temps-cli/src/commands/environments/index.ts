@@ -7,7 +7,6 @@ import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { parseEnvFile } from '../../lib/env-file.js'
 import {
   getEnvironments,
-  getEnvironment,
   createEnvironment,
   deleteEnvironment,
   getEnvironmentVariables,
@@ -15,6 +14,7 @@ import {
   deleteEnvironmentVariable,
   updateEnvironmentVariable,
   updateEnvironmentSettings,
+  getEnvironmentVariableValue,
   getProjectBySlug,
   getEnvironmentCrons,
   getCronById,
@@ -91,6 +91,7 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('-e, --environments <names>', 'Comma-separated environment names (interactive if not provided)')
     .option('--no-preview', 'Exclude from preview environments')
     .option('--update', 'Update existing variable instead of creating new')
+    .option('--secret', 'Store as a secret: the value is masked in the UI and never returned by the API. One-way — to make a secret readable again you must delete the variable and create it anew')
     .action(async (key, value, options, cmd) => {
       const projectSlug = cmd.parent!.opts().project
       return setEnvVar(projectSlug, key, value, options)
@@ -139,6 +140,29 @@ export function registerEnvironmentsCommands(program: Command): void {
     .option('--memory-request <mb>', 'Memory request in MB (guaranteed minimum)')
     .option('--json', 'Output in JSON format')
     .action(resourcesCmd)
+
+  // Request timeouts subcommand
+  environments
+    .command('timeouts <environment>')
+    .description('View or set upstream request/idle timeouts for an environment')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--request <seconds>', 'Timeout for regular (non-streaming) HTTP requests, in seconds')
+    .option('--sse-idle <seconds>', 'Idle timeout for Server-Sent Events streams, in seconds')
+    .option('--websocket-idle <seconds>', 'Idle timeout for WebSocket connections, in seconds')
+    .option('--inherit', 'Clear all three overrides (inherit the project/global defaults)')
+    .option('--json', 'Output in JSON format')
+    .action(timeoutsCmd)
+
+  // Force HTTPS subcommand
+  environments
+    .command('force-https <environment>')
+    .description('View or set the HTTP to HTTPS redirect override for an environment')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--enable', 'Always redirect plain HTTP to HTTPS, even without a local certificate')
+    .option('--disable', 'Never redirect: keep serving this environment over plain HTTP')
+    .option('--inherit', 'Clear the override and follow the proxy default')
+    .option('--json', 'Output in JSON format')
+    .action(forceHttpsCmd)
 
   // Scale subcommand
   environments
@@ -402,8 +426,16 @@ async function listEnvVars(
     { header: 'Key', key: 'key', color: (v) => colors.bold(v) },
     {
       header: 'Value',
-      accessor: (v) => options.showValues ? v.value : '••••••••',
-      color: (v) => options.showValues ? colors.primary(v) : colors.muted(v),
+      // Secrets come back with no value at all — the API never returns their
+      // plaintext — so --show-values must say so rather than print an empty cell.
+      accessor: (v) =>
+        v.is_secret ? '(secret)' : options.showValues ? (v.value ?? '') : '••••••••',
+      color: (v) =>
+        v === '(secret)'
+          ? colors.warning(v)
+          : options.showValues
+            ? colors.primary(v)
+            : colors.muted(v),
     },
     {
       header: 'Environments',
@@ -426,6 +458,16 @@ async function listEnvVars(
   newline()
 }
 
+/**
+ * Render an env var's value for display. Secrets carry no value at all — the
+ * API never returns their plaintext — so they must read as deliberately
+ * withheld rather than as an empty variable.
+ */
+export function formatEnvVarValue(v: EnvironmentVariableResponse): string {
+  if (v.is_secret) return colors.warning('(secret - write-only, never returned by the API)')
+  return v.value ?? ''
+}
+
 async function getEnvVar(
   projectFlag: string | undefined,
   key: string,
@@ -440,8 +482,9 @@ async function getEnvVar(
     info(`Using project ${colors.bold(project)} (from ${resolved.source})`)
   }
 
+  let projectId!: number
   const [vars, environments] = await withSpinner(`Fetching ${key}...`, async () => {
-    const projectId = await getProjectId(project)
+    projectId = await getProjectId(project)
 
     const [varsResult, envsResult] = await Promise.all([
       getEnvironmentVariables({
@@ -468,6 +511,18 @@ async function getEnvVar(
     return
   }
 
+  // The list endpoint masks every value to "***" regardless of is_secret --
+  // resolve real plaintext for the non-secret rows we're about to print
+  // through the same audited per-key endpoint `vars export` uses, rather
+  // than echoing the masked placeholder for a command whose whole point is
+  // showing this one variable's value.
+  const { resolved: resolvedValues } = await resolveEnvVarValues(
+    projectId,
+    matchingVars.filter(v => !v.is_secret),
+  )
+  const displayValue = (v: EnvironmentVariableResponse): string =>
+    v.is_secret ? formatEnvVarValue(v) : (resolvedValues.get(v.id) ?? formatEnvVarValue(v))
+
   // If environment specified, filter to that environment
   if (options.environment) {
     const targetEnv = environments.find(
@@ -489,7 +544,7 @@ async function getEnvVar(
 
     newline()
     keyValue('Key', envVar.key)
-    keyValue('Value', envVar.value)
+    keyValue('Value', displayValue(envVar))
     keyValue('Environment', targetEnv.name)
     keyValue('Include in Preview', envVar.include_in_preview ? 'Yes' : 'No')
     newline()
@@ -502,7 +557,7 @@ async function getEnvVar(
 
   for (const v of matchingVars) {
     keyValue('ID', String(v.id))
-    keyValue('Value', v.value)
+    keyValue('Value', displayValue(v))
     keyValue('Environments', v.environments.map(e => e.name).join(', ') || 'None')
     keyValue('Include in Preview', v.include_in_preview ? 'Yes' : 'No')
     newline()
@@ -513,7 +568,7 @@ async function setEnvVar(
   projectFlag: string | undefined,
   key: string,
   value: string | undefined,
-  options: { environments?: string; preview?: boolean; update?: boolean }
+  options: { environments?: string; preview?: boolean; update?: boolean; secret?: boolean }
 ): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -608,11 +663,15 @@ async function setEnvVar(
           value: actualValue,
           environment_ids: environmentIds,
           include_in_preview: options.preview !== false,
+          // Only sent when --secret is passed. Omitting it leaves the existing
+          // flag untouched; sending false against an already-secret variable is
+          // rejected by the API, since promotion is deliberately one-way.
+          ...(options.secret ? { is_secret: true } : {}),
         },
       })
       if (error) throw new Error(getErrorMessage(error))
     })
-    success(`Updated ${key}`)
+    success(`Updated ${key}${options.secret ? ' (secret)' : ''}`)
   } else {
     // Create new variable
     await withSpinner(`Setting ${key}...`, async () => {
@@ -624,11 +683,12 @@ async function setEnvVar(
           value: actualValue,
           environment_ids: environmentIds,
           include_in_preview: options.preview !== false,
+          ...(options.secret ? { is_secret: true } : {}),
         },
       })
       if (error) throw new Error(getErrorMessage(error))
     })
-    success(`Set ${key}`)
+    success(`Set ${key}${options.secret ? ' (secret)' : ''}`)
   }
 
   info(`Environments: ${envs.filter(e => environmentIds.includes(e.id)).map(e => e.name).join(', ')}`)
@@ -876,6 +936,44 @@ async function importEnvVars(
   }
 }
 
+/**
+ * Resolve real plaintext values for a set of variables.
+ *
+ * The list endpoint deliberately masks every value as `***` so a bulk read can
+ * never become a credential dump — plaintext is only available one key at a
+ * time through the audited reveal endpoint. Anything that writes a .env file
+ * has to go through here, or it writes `KEY=***` over the user's real config.
+ *
+ * Secrets are skipped by the caller (they have no readable value at all).
+ * A failed reveal is reported, never silently substituted.
+ */
+async function resolveEnvVarValues(
+  projectId: number,
+  vars: EnvironmentVariableResponse[],
+  environmentId?: number
+): Promise<{ resolved: Map<number, string>; failed: string[] }> {
+  // Keyed by row id, not key: the same name can exist as separate rows in
+  // separate environments, and keying by name would print one row's value
+  // under the other's line.
+  const resolved = new Map<number, string>()
+  const failed: string[] = []
+
+  for (const v of vars) {
+    const result = await getEnvironmentVariableValue({
+      client,
+      path: { project_id: projectId, key: v.key },
+      query: { environment_id: environmentId, var_id: v.id },
+    })
+    if (result.error || !result.data) {
+      failed.push(v.key)
+      continue
+    }
+    resolved.set(v.id, result.data.value)
+  }
+
+  return { resolved, failed }
+}
+
 async function exportEnvVars(
   project: string,
   options: { environment?: string; output?: string }
@@ -883,7 +981,7 @@ async function exportEnvVars(
   await requireAuth()
   await setupClient()
 
-  const [vars, environments] = await withSpinner('Fetching environment variables...', async () => {
+  const [projectId, vars, environments] = await withSpinner('Fetching environment variables...', async () => {
     const projectId = await getProjectId(project)
 
     const [varsResult, envsResult] = await Promise.all([
@@ -900,7 +998,7 @@ async function exportEnvVars(
     if (varsResult.error) throw new Error(getErrorMessage(varsResult.error))
     if (envsResult.error) throw new Error(getErrorMessage(envsResult.error))
 
-    return [varsResult.data ?? [], envsResult.data ?? []] as const
+    return [projectId, varsResult.data ?? [], envsResult.data ?? []] as const
   })
 
   let filteredVars = vars
@@ -925,14 +1023,52 @@ async function exportEnvVars(
     return
   }
 
+  // Write-only secrets have no readable value at all. Drop them, but say so
+  // explicitly rather than emitting an empty assignment that would blank the
+  // variable wherever this file gets loaded.
+  const secretVars = filteredVars.filter(v => v.is_secret)
+  const exportableVars = filteredVars.filter(v => !v.is_secret)
+
+  if (secretVars.length > 0) {
+    warning(
+      `Skipping ${secretVars.length} write-only secret(s): ${secretVars.map(v => v.key).join(', ')}. ` +
+        'Their values are never returned by the API — set them by hand where you need them.'
+    )
+  }
+
+  const targetEnvId = options.environment
+    ? environments.find(
+        e => e.name.toLowerCase() === options.environment!.toLowerCase() ||
+             e.slug === options.environment!.toLowerCase()
+      )?.id
+    : undefined
+
+  const { resolved, failed } = await withSpinner(
+    'Resolving values...',
+    () => resolveEnvVarValues(projectId, exportableVars, targetEnvId)
+  )
+
+  if (failed.length > 0) {
+    errorOutput(
+      `Could not read ${failed.length} value(s): ${failed.join(', ')}. ` +
+        'Reading plaintext needs the secrets:read permission. Nothing was written — ' +
+        'a partial export would silently blank these variables.'
+    )
+    // Non-zero exit so `export -o .env && deploy` cannot march on with a stale
+    // or missing file believing the export succeeded.
+    process.exitCode = 1
+    return
+  }
+
   // Generate .env content
-  const envContent = filteredVars
+  const envContent = exportableVars
     .map(v => {
-      const escapedValue = v.value.includes('\n') || v.value.includes('"')
-        ? `"${v.value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
-        : v.value.includes(' ') || v.value.includes('#')
-          ? `"${v.value}"`
-          : v.value
+      const value = resolved.get(v.id) ?? ''
+      const escapedValue = value.includes('\n') || value.includes('"')
+        ? `"${value.replace(/"/g, '\\"').replace(/\n/g, '\\n')}"`
+        : value.includes(' ') || value.includes('#')
+          ? `"${value}"`
+          : value
       return `${v.key}=${escapedValue}`
     })
     .join('\n')
@@ -942,7 +1078,7 @@ async function exportEnvVars(
       ? options.output
       : path.resolve(process.cwd(), options.output)
     fs.writeFileSync(outputPath, envContent + '\n')
-    success(`Exported ${filteredVars.length} variables to ${options.output}`)
+    success(`Exported ${exportableVars.length} variables to ${options.output}`)
   } else {
     // Output to stdout
     console.log(envContent)
@@ -952,6 +1088,7 @@ async function exportEnvVars(
 // ============ Resources Command ============
 
 interface ResourcesOptions {
+  project?: string
   cpu?: string
   memory?: string
   cpuRequest?: string
@@ -959,15 +1096,74 @@ interface ResourcesOptions {
   json?: boolean
 }
 
-async function resourcesCmd(
-  project: string,
-  environment: string,
-  options: ResourcesOptions
-): Promise<void> {
+export interface ResourceUpdateBody {
+  cpu_limit?: number | null
+  cpu_request?: number | null
+  memory_limit?: number | null
+  memory_request?: number | null
+}
+
+/**
+ * Parse and validate the --cpu/--memory/--cpu-request/--memory-request flags
+ * into the API's update body. A request left unspecified defaults to the
+ * limit being set in the same call — otherwise a container could get a limit
+ * with no matching guaranteed minimum, which the scheduler would silently
+ * treat as "no request" rather than "same as limit".
+ */
+export function parseResourceUpdate(
+  options: Pick<ResourcesOptions, 'cpu' | 'memory' | 'cpuRequest' | 'memoryRequest'>
+): { body: ResourceUpdateBody } | { error: string } {
+  const updateBody: ResourceUpdateBody = {}
+
+  let cpuLimit: number | undefined
+  if (options.cpu) {
+    cpuLimit = parseInt(options.cpu, 10)
+    if (isNaN(cpuLimit) || cpuLimit <= 0) {
+      return { error: 'CPU must be a positive number (millicores)' }
+    }
+    updateBody.cpu_limit = cpuLimit
+  }
+
+  let memoryLimit: number | undefined
+  if (options.memory) {
+    memoryLimit = parseInt(options.memory, 10)
+    if (isNaN(memoryLimit) || memoryLimit <= 0) {
+      return { error: 'Memory must be a positive number (MB)' }
+    }
+    updateBody.memory_limit = memoryLimit
+  }
+
+  if (options.cpuRequest) {
+    const cpuRequest = parseInt(options.cpuRequest, 10)
+    if (isNaN(cpuRequest) || cpuRequest <= 0) {
+      return { error: 'CPU request must be a positive number (millicores)' }
+    }
+    updateBody.cpu_request = cpuRequest
+  } else if (cpuLimit !== undefined) {
+    // Default request to same as limit when setting limit
+    updateBody.cpu_request = cpuLimit
+  }
+
+  if (options.memoryRequest) {
+    const memoryRequest = parseInt(options.memoryRequest, 10)
+    if (isNaN(memoryRequest) || memoryRequest <= 0) {
+      return { error: 'Memory request must be a positive number (MB)' }
+    }
+    updateBody.memory_request = memoryRequest
+  } else if (memoryLimit !== undefined) {
+    // Default request to same as limit when setting limit
+    updateBody.memory_request = memoryLimit
+  }
+
+  return { body: updateBody }
+}
+
+async function resourcesCmd(environment: string, options: ResourcesOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectId = await getProjectId(project)
+  const resolved = await requireProjectSlug(options.project)
+  const projectId = await getProjectId(resolved.slug)
 
   // Find environment by slug
   const envs = await withSpinner('Fetching environments...', async () => {
@@ -994,60 +1190,12 @@ async function resourcesCmd(
 
   if (hasResourceOptions) {
     // Update resources
-    const updateBody: {
-      cpu_limit?: number | null
-      cpu_request?: number | null
-      memory_limit?: number | null
-      memory_request?: number | null
-    } = {}
-
-    // Parse CPU limit
-    let cpuLimit: number | undefined
-    if (options.cpu) {
-      cpuLimit = parseInt(options.cpu, 10)
-      if (isNaN(cpuLimit) || cpuLimit <= 0) {
-        errorOutput('CPU must be a positive number (millicores)')
-        return
-      }
-      updateBody.cpu_limit = cpuLimit
+    const parsed = parseResourceUpdate(options)
+    if ('error' in parsed) {
+      errorOutput(parsed.error)
+      return
     }
-
-    // Parse memory limit
-    let memoryLimit: number | undefined
-    if (options.memory) {
-      memoryLimit = parseInt(options.memory, 10)
-      if (isNaN(memoryLimit) || memoryLimit <= 0) {
-        errorOutput('Memory must be a positive number (MB)')
-        return
-      }
-      updateBody.memory_limit = memoryLimit
-    }
-
-    // Parse CPU request (or default to limit)
-    if (options.cpuRequest) {
-      const cpuRequest = parseInt(options.cpuRequest, 10)
-      if (isNaN(cpuRequest) || cpuRequest <= 0) {
-        errorOutput('CPU request must be a positive number (millicores)')
-        return
-      }
-      updateBody.cpu_request = cpuRequest
-    } else if (cpuLimit !== undefined) {
-      // Default request to same as limit when setting limit
-      updateBody.cpu_request = cpuLimit
-    }
-
-    // Parse memory request (or default to limit)
-    if (options.memoryRequest) {
-      const memoryRequest = parseInt(options.memoryRequest, 10)
-      if (isNaN(memoryRequest) || memoryRequest <= 0) {
-        errorOutput('Memory request must be a positive number (MB)')
-        return
-      }
-      updateBody.memory_request = memoryRequest
-    } else if (memoryLimit !== undefined) {
-      // Default request to same as limit when setting limit
-      updateBody.memory_request = memoryLimit
-    }
+    const updateBody = parsed.body
 
     const updatedEnv = await withSpinner('Updating resources...', async () => {
       const { data, error } = await updateEnvironmentSettings({
@@ -1072,7 +1220,7 @@ async function resourcesCmd(
     }
 
     newline()
-    success(`Resources updated for ${project}/${environment}`)
+    success(`Resources updated for ${resolved.slug}/${environment}`)
     newline()
     displayResources(updatedEnv)
   } else {
@@ -1090,30 +1238,30 @@ async function resourcesCmd(
     }
 
     newline()
-    header(`${icons.folder} Resources for ${project}/${environment}`)
+    header(`${icons.folder} Resources for ${resolved.slug}/${environment}`)
     newline()
     displayResources(targetEnv)
   }
+}
+
+export function formatCpu(millicores: number | null | undefined): string {
+  if (millicores == null) return colors.muted('not set')
+  const cores = millicores / 1000
+  return `${millicores}m (${cores} CPU)`
+}
+
+export function formatMemory(mb: number | null | undefined): string {
+  if (mb == null) return colors.muted('not set')
+  if (mb >= 1024) {
+    return `${mb}MB (${(mb / 1024).toFixed(1)}GB)`
+  }
+  return `${mb}MB`
 }
 
 function displayResources(env: EnvironmentResponse | null | undefined): void {
   if (!env) return
 
   const config = env.deployment_config
-
-  const formatCpu = (millicores: number | null | undefined): string => {
-    if (millicores == null) return colors.muted('not set')
-    const cores = millicores / 1000
-    return `${millicores}m (${cores} CPU)`
-  }
-
-  const formatMemory = (mb: number | null | undefined): string => {
-    if (mb == null) return colors.muted('not set')
-    if (mb >= 1024) {
-      return `${mb}MB (${(mb / 1024).toFixed(1)}GB)`
-    }
-    return `${mb}MB`
-  }
 
   keyValue('CPU Limit', formatCpu(config?.cpuLimit))
   keyValue('CPU Request', formatCpu(config?.cpuRequest))
@@ -1127,7 +1275,288 @@ function displayResources(env: EnvironmentResponse | null | undefined): void {
   info(`Example: ${colors.muted('temps env resources my-project production --cpu 1000 --memory 512')}`)
 }
 
+// ============ Request Timeouts Command ============
+
+interface TimeoutsOptions {
+  project?: string
+  request?: string
+  sseIdle?: string
+  websocketIdle?: string
+  inherit?: boolean
+  json?: boolean
+}
+
+function formatTimeout(seconds: number | null | undefined): string {
+  if (seconds == null) return colors.muted('inherit (project/global default)')
+  if (seconds === 0) return colors.muted('no timeout (explicit override)')
+  return `${seconds}s`
+}
+
+async function timeoutsCmd(environment: string, options: TimeoutsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const resolved = await requireProjectSlug(options.project)
+  const projectId = await getProjectId(resolved.slug)
+
+  const envs = await withSpinner('Fetching environments...', async () => {
+    const { data, error } = await getEnvironments({
+      client,
+      path: { project_id: projectId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data ?? []
+  })
+
+  const targetEnv = envs.find(
+    e => e.slug === environment || e.name.toLowerCase() === environment.toLowerCase()
+  )
+
+  if (!targetEnv) {
+    errorOutput(`Environment "${environment}" not found`)
+    info(`Available environments: ${envs.map(e => e.slug).join(', ')}`)
+    return
+  }
+
+  const hasSetOptions = options.request || options.sseIdle || options.websocketIdle
+  if (hasSetOptions && options.inherit) {
+    errorOutput('Pass either --inherit or one of --request/--sse-idle/--websocket-idle, not both')
+    return
+  }
+
+  if (hasSetOptions || options.inherit) {
+    const updateBody: {
+      request_timeout_seconds?: number | null
+      sse_idle_timeout_seconds?: number | null
+      websocket_idle_timeout_seconds?: number | null
+    } = {}
+
+    if (options.inherit) {
+      updateBody.request_timeout_seconds = null
+      updateBody.sse_idle_timeout_seconds = null
+      updateBody.websocket_idle_timeout_seconds = null
+    } else {
+      if (options.request) {
+        const seconds = parseInt(options.request, 10)
+        if (isNaN(seconds) || seconds < 0) {
+          errorOutput('--request must be 0 (no timeout) or a positive number of seconds')
+          return
+        }
+        updateBody.request_timeout_seconds = seconds
+      }
+      if (options.sseIdle) {
+        const seconds = parseInt(options.sseIdle, 10)
+        if (isNaN(seconds) || seconds < 0) {
+          errorOutput('--sse-idle must be 0 (no timeout) or a positive number of seconds')
+          return
+        }
+        updateBody.sse_idle_timeout_seconds = seconds
+      }
+      if (options.websocketIdle) {
+        const seconds = parseInt(options.websocketIdle, 10)
+        if (isNaN(seconds) || seconds < 0) {
+          errorOutput('--websocket-idle must be 0 (no timeout) or a positive number of seconds')
+          return
+        }
+        updateBody.websocket_idle_timeout_seconds = seconds
+      }
+    }
+
+    const updatedEnv = await withSpinner('Updating timeouts...', async () => {
+      const { data, error } = await updateEnvironmentSettings({
+        client,
+        path: { project_id: projectId, env_id: targetEnv.id },
+        body: updateBody,
+      })
+      if (error) throw new Error(getErrorMessage(error))
+      return data
+    })
+
+    const config = updatedEnv?.deployment_config
+    if (options.json) {
+      json({
+        environment: updatedEnv?.slug,
+        request_timeout_seconds: config?.requestTimeoutSeconds ?? null,
+        sse_idle_timeout_seconds: config?.sseIdleTimeoutSeconds ?? null,
+        websocket_idle_timeout_seconds: config?.websocketIdleTimeoutSeconds ?? null,
+      })
+      return
+    }
+
+    newline()
+    success(`Timeouts updated for ${resolved.slug}/${environment}`)
+    newline()
+    keyValue('HTTP request timeout', formatTimeout(config?.requestTimeoutSeconds))
+    keyValue('SSE idle timeout', formatTimeout(config?.sseIdleTimeoutSeconds))
+    keyValue('WebSocket idle timeout', formatTimeout(config?.websocketIdleTimeoutSeconds))
+  } else {
+    const config = targetEnv.deployment_config
+    if (options.json) {
+      json({
+        environment: targetEnv.slug,
+        request_timeout_seconds: config?.requestTimeoutSeconds ?? null,
+        sse_idle_timeout_seconds: config?.sseIdleTimeoutSeconds ?? null,
+        websocket_idle_timeout_seconds: config?.websocketIdleTimeoutSeconds ?? null,
+      })
+      return
+    }
+
+    newline()
+    header(`${icons.folder} Request timeouts for ${resolved.slug}/${environment}`)
+    newline()
+    keyValue('HTTP request timeout', formatTimeout(config?.requestTimeoutSeconds))
+    keyValue('SSE idle timeout', formatTimeout(config?.sseIdleTimeoutSeconds))
+    keyValue('WebSocket idle timeout', formatTimeout(config?.websocketIdleTimeoutSeconds))
+    newline()
+    info('An unset value inherits the project default, then the operator\'s global default —')
+    info('which is "no timeout" unless an operator has configured one. Nonzero values are')
+    info('always clamped to the global hard ceiling regardless of what\'s configured here.')
+    newline()
+    info(`Set it with: ${colors.muted('temps env timeouts ' + environment + ' --request 30 --sse-idle 900')}`)
+    info(`Force no timeout: ${colors.muted('temps env timeouts ' + environment + ' --request 0')}`)
+    info(`Clear overrides: ${colors.muted('temps env timeouts ' + environment + ' --inherit')}`)
+  }
+}
+
+// ============ Force HTTPS Command ============
+
+interface ForceHttpsOptions {
+  project?: string
+  enable?: boolean
+  disable?: boolean
+  inherit?: boolean
+  json?: boolean
+}
+
+/**
+ * Render the tri-state override. `null`/`undefined` is deliberately NOT shown
+ * as "disabled": it means the proxy falls back to its default, which redirects
+ * any host that has an active TLS certificate.
+ */
+export function describeForceHttps(value: boolean | null | undefined): string {
+  if (value === true) return colors.success('always redirect')
+  if (value === false) return colors.warning('never redirect')
+  return colors.muted('inherit (redirect only when the host has a certificate)')
+}
+
+async function forceHttpsCmd(environment: string, options: ForceHttpsOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const chosen = [
+    options.enable ? '--enable' : null,
+    options.disable ? '--disable' : null,
+    options.inherit ? '--inherit' : null,
+  ].filter((flag): flag is string => flag !== null)
+
+  if (chosen.length > 1) {
+    errorOutput(`Pass only one of --enable, --disable, or --inherit (got ${chosen.join(' ')})`)
+    return
+  }
+
+  const resolved = await requireProjectSlug(options.project)
+
+  if (resolved.source !== 'flag') {
+    info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
+  }
+
+  const projectId = await getProjectId(resolved.slug)
+
+  const envs = await withSpinner('Fetching environments...', async () => {
+    const { data, error } = await getEnvironments({
+      client,
+      path: { project_id: projectId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data ?? []
+  })
+
+  const targetEnv = envs.find(
+    e => e.slug === environment || e.name.toLowerCase() === environment.toLowerCase()
+  )
+
+  if (!targetEnv) {
+    errorOutput(`Environment "${environment}" not found`)
+    info(`Available environments: ${envs.map(e => e.slug).join(', ')}`)
+    return
+  }
+
+  if (chosen.length === 0) {
+    // Read-only view
+    if (options.json) {
+      json({ environment: targetEnv.slug, force_https: targetEnv.force_https ?? null })
+      return
+    }
+
+    newline()
+    header(`${icons.folder} HTTPS redirect for ${resolved.slug}/${targetEnv.slug}`)
+    newline()
+    keyValue('Force HTTPS', describeForceHttps(targetEnv.force_https))
+    newline()
+    info('Set it with --enable, --disable, or --inherit')
+    info(
+      `Requests under ${colors.muted('/.well-known/acme-challenge/')} are never redirected, ` +
+        'so Let\'s Encrypt HTTP-01 validation keeps working in every mode'
+    )
+    newline()
+    return
+  }
+
+  // `--inherit` sends an explicit JSON null to clear the override; the API
+  // distinguishes that from an absent field ("leave unchanged").
+  const nextValue: boolean | null = options.enable ? true : options.disable ? false : null
+
+  const updatedEnv = await withSpinner('Updating HTTPS redirect...', async () => {
+    const { data, error } = await updateEnvironmentSettings({
+      client,
+      path: { project_id: projectId, env_id: targetEnv.id },
+      body: { force_https: nextValue },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data
+  })
+
+  if (options.json) {
+    json({ environment: updatedEnv?.slug, force_https: updatedEnv?.force_https ?? null })
+    return
+  }
+
+  newline()
+  success(`HTTPS redirect updated for ${resolved.slug}/${targetEnv.slug}`)
+  newline()
+  keyValue('Force HTTPS', describeForceHttps(updatedEnv?.force_https))
+  newline()
+
+  if (nextValue === true) {
+    info('Plain HTTP requests now get a 301 to the HTTPS URL, even if no certificate is registered here')
+    info('Use this when TLS is terminated upstream (CDN or external load balancer)')
+  } else if (nextValue === false) {
+    warning('Plain HTTP requests are served as-is — clients can reach this environment without TLS')
+  } else {
+    info('Following the proxy default: redirect only when the host has an active certificate')
+  }
+  newline()
+}
+
 // ============ Scale Command ============
+
+/** Validate a --replicas value. Zero is allowed (scale to nothing); negative
+ *  and non-numeric input are rejected before ever reaching the API. */
+export function parseReplicaCount(
+  value: string
+): { replicas: number; warning?: string } | { error: string } {
+  const replicaCount = parseInt(value, 10)
+  if (isNaN(replicaCount) || replicaCount < 0) {
+    return { error: 'Replicas must be a non-negative number' }
+  }
+  if (replicaCount > 10) {
+    return {
+      replicas: replicaCount,
+      warning: `Setting ${replicaCount} replicas. This may consume significant resources.`,
+    }
+  }
+  return { replicas: replicaCount }
+}
 
 async function scaleCmd(
   options: { project?: string; environment: string; replicas?: string; json?: boolean }
@@ -1166,14 +1595,14 @@ async function scaleCmd(
 
   if (options.replicas !== undefined) {
     // Set replicas
-    const replicaCount = parseInt(options.replicas, 10)
-    if (isNaN(replicaCount) || replicaCount < 0) {
-      errorOutput('Replicas must be a non-negative number')
+    const parsedReplicas = parseReplicaCount(options.replicas)
+    if ('error' in parsedReplicas) {
+      errorOutput(parsedReplicas.error)
       return
     }
-
-    if (replicaCount > 10) {
-      warning(`Setting ${replicaCount} replicas. This may consume significant resources.`)
+    const replicaCount = parsedReplicas.replicas
+    if (parsedReplicas.warning) {
+      warning(parsedReplicas.warning)
     }
 
     const updatedEnv = await withSpinner(`Scaling to ${replicaCount} replica${replicaCount !== 1 ? 's' : ''}...`, async () => {

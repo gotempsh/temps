@@ -13,6 +13,38 @@ updates:
     labels:
       - "dependencies"
       - "rust"
+    ignore:
+      # Keep sqlx aligned with sea-orm 1.1 (which requires sqlx ^0.8). A minor
+      # bump to 0.9 splits the graph into two sqlx versions, and 0.9's
+      # SqlSafeStr guard breaks our dynamic queries. Patch bumps within 0.8 are
+      # still allowed. Revisit when we move to sea-orm 2.0 (stable).
+      - dependency-name: "sqlx"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      # sea-orm 2.0 (major) is still pre-release and pulls sqlx 0.9; hold on 1.1.
+      - dependency-name: "sea-orm"
+        update-types:
+          - "version-update:semver-major"
+      - dependency-name: "sea-orm-migration"
+        update-types:
+          - "version-update:semver-major"
+      # sea-schema minor/major bumps drift ahead of the pinned sea-orm line.
+      - dependency-name: "sea-schema"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      # aws-config 1.8.17 / aws-sdk-s3 1.134.0 pin aws-smithy-schema ^0.1.0. A
+      # minor bump of these smithy crates pulls aws-smithy-schema 0.2.0 and
+      # breaks aws-config's compile (SharedClientProtocol type mismatch).
+      - dependency-name: "aws-smithy-runtime"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
+      - dependency-name: "aws-types"
+        update-types:
+          - "version-update:semver-minor"
+          - "version-update:semver-major"
     groups:
       # Patch/minor bumps are low-risk and numerous across 51 crates; batching
       # them into one PR keeps the review queue sane. Majors are left
@@ -38,7 +70,31 @@ updates:
       - "dependencies"
       - "web"
     groups:
+      # react and react-dom MUST be installed at the exact same version --
+      # React throws error #527 at runtime and the console renders a blank
+      # page if they diverge (issue #504, caused by the web-minor-patch group
+      # bumping react-dom to 19.2.8 while leaving react on 19.2.7). Keep them
+      # in a dedicated group, with all update-types, so any React bump lands
+      # as a single atomic PR. The @types packages ride along so the type
+      # surface matches the runtime.
+      react:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
+        update-types:
+          - "major"
+          - "minor"
+          - "patch"
       web-minor-patch:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "react"
+          - "react-dom"
+          - "@types/react"
+          - "@types/react-dom"
         update-types:
           - "minor"
           - "patch"

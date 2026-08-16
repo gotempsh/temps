@@ -620,23 +620,43 @@ async fn collect_metrics(
     // 4. Checkpoint counts (Counter)
     // PG17+ moved checkpoint stats to pg_stat_checkpointer; fall back to
     // pg_stat_bgwriter on older versions.
+    //
+    // This can't be done as a single UNION ALL query: Postgres resolves
+    // column references in every arm of a UNION at parse time, so an arm
+    // referencing pg_stat_bgwriter.checkpoints_timed/checkpoints_req fails
+    // to parse on PG17+ (where those columns were dropped) even though a
+    // `WHERE NOT EXISTS` would have skipped it at runtime. Check which view
+    // exists first, then issue only the matching query.
     // -------------------------------------------------------------------------
     {
-        let rows = client
-            .query(
-                "SELECT num_timed, num_requested \
-                 FROM pg_stat_checkpointer \
-                 UNION ALL \
-                 SELECT checkpoints_timed, checkpoints_req \
-                 FROM pg_stat_bgwriter \
-                 WHERE NOT EXISTS (SELECT 1 FROM pg_stat_checkpointer) \
-                 LIMIT 1",
+        let has_checkpointer_view = client
+            .query_one(
+                "SELECT to_regclass('pg_stat_checkpointer') IS NOT NULL",
                 &[],
             )
             .await
-            // If both views fail (very old PG), skip gracefully rather than
-            // aborting the entire collection cycle.
-            .unwrap_or_default();
+            .map(|row| row.get::<_, bool>(0))
+            .unwrap_or(false);
+
+        let query_result = if has_checkpointer_view {
+            client
+                .query(
+                    "SELECT num_timed, num_requested FROM pg_stat_checkpointer",
+                    &[],
+                )
+                .await
+        } else {
+            client
+                .query(
+                    "SELECT checkpoints_timed, checkpoints_req FROM pg_stat_bgwriter",
+                    &[],
+                )
+                .await
+        };
+
+        // If both views fail (very old PG), skip gracefully rather than
+        // aborting the entire collection cycle.
+        let rows = query_result.unwrap_or_default();
 
         if let Some(row) = rows.first() {
             let timed: i64 = row.get(0);

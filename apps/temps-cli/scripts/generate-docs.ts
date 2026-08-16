@@ -24,11 +24,15 @@ import { registerNotificationsCommands } from '../src/commands/notifications/ind
 import { registerDnsCommands } from '../src/commands/dns/index.js'
 import { registerServicesCommands } from '../src/commands/services/index.js'
 import { registerSettingsCommands } from '../src/commands/settings/index.js'
+import { registerPlatformCommands } from '../src/commands/platform/index.js'
 import { registerUsersCommands } from '../src/commands/users/index.js'
 import { registerApiKeysCommands } from '../src/commands/apikeys/index.js'
 import { registerMonitorsCommands } from '../src/commands/monitors/index.js'
 import { registerWebhooksCommands } from '../src/commands/webhooks/index.js'
 import { registerContainersCommands } from '../src/commands/containers/index.js'
+import { registerFlagsCommands } from '../src/commands/flags/index.js'
+import { registerDataCommands } from '../src/commands/data/index.js'
+import { registerAnalyticsCommands } from '../src/commands/analytics/index.js'
 
 interface CommandInfo {
   name: string
@@ -75,7 +79,8 @@ function extractCommandInfo(cmd: Command, parentName = ''): CommandInfo {
   const options: OptionInfo[] = cmd.options.map((opt: any) => ({
     flags: opt.flags,
     description: opt.description || '',
-    defaultValue: opt.defaultValue !== undefined ? String(opt.defaultValue) : undefined,
+    defaultValue:
+      opt.defaultValue !== undefined ? String(opt.defaultValue) : undefined,
     required: opt.required || opt.flags.includes('<'),
   }))
 
@@ -99,12 +104,17 @@ function escapeForMdx(text: string): string {
   return text.replace(/('[^']*\{[^']*')/g, '`$1`')
 }
 
-function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown' | 'mdx' = 'markdown'): string {
+function generateMarkdown(
+  commands: CommandInfo[],
+  level = 2,
+  format: 'markdown' | 'mdx' = 'markdown'
+): string {
   let md = ''
 
   for (const cmd of commands) {
     const heading = '#'.repeat(level)
-    const aliasText = cmd.aliases.length > 0 ? ` (alias: \`${cmd.aliases.join('`, `')}\`)` : ''
+    const aliasText =
+      cmd.aliases.length > 0 ? ` (alias: \`${cmd.aliases.join('`, `')}\`)` : ''
 
     md += `${heading} \`${cmd.name}\`${aliasText}\n\n`
 
@@ -118,7 +128,8 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
       md += '|------|-------------|---------|----------|\n'
 
       for (const opt of cmd.options) {
-        const defaultVal = opt.defaultValue !== undefined ? `\`${opt.defaultValue}\`` : '-'
+        const defaultVal =
+          opt.defaultValue !== undefined ? `\`${opt.defaultValue}\`` : '-'
         const required = opt.required ? 'Yes' : 'No'
         let escapedDesc = opt.description.replace(/\|/g, '\\|')
         if (format === 'mdx') {
@@ -132,7 +143,8 @@ function generateMarkdown(commands: CommandInfo[], level = 2, format: 'markdown'
     if (cmd.subcommands.length > 0) {
       md += '**Subcommands:**\n\n'
       for (const sub of cmd.subcommands) {
-        const subAliases = sub.aliases.length > 0 ? ` (\`${sub.aliases.join('`, `')}\`)` : ''
+        const subAliases =
+          sub.aliases.length > 0 ? ` (\`${sub.aliases.join('`, `')}\`)` : ''
         md += `- \`${sub.name.split(' ').pop()}\`${subAliases} - ${sub.description}\n`
       }
       md += '\n'
@@ -273,6 +285,58 @@ Use \`bunx @temps-sdk/cli configure show\` to view current configuration.
 `
 }
 
+/**
+ * Fail the docs build when a command group exists on disk but was never
+ * registered above.
+ *
+ * Directory names don't always equal command names (`apikeys/` registers
+ * `api-keys`, `dns-providers/` registers `dns providers`), so the match is
+ * deliberately fuzzy — normalise both sides by stripping separators. False
+ * negatives are fine; the point is to catch a whole group being forgotten.
+ */
+async function assertEveryCommandGroupIsRegistered(program: Command) {
+  const { readdirSync } = await import('node:fs')
+  const { join, dirname } = await import('node:path')
+  const { fileURLToPath } = await import('node:url')
+
+  const commandsDir = join(
+    dirname(fileURLToPath(import.meta.url)),
+    '../src/commands'
+  )
+  const normalise = (s: string) => s.replace(/[-_\s]/g, '').toLowerCase()
+
+  const registered = new Set<string>()
+  for (const cmd of program.commands) {
+    registered.add(normalise(cmd.name()))
+    for (const alias of cmd.aliases()) registered.add(normalise(alias))
+  }
+
+  const missing = readdirSync(commandsDir, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
+    .map((e) => e.name)
+    .filter((dir) => {
+      const key = normalise(dir)
+      // Registered directly, or as part of a multi-word command name.
+      return ![...registered].some(
+        (r) => r === key || r.includes(key) || key.includes(r)
+      )
+    })
+
+  if (missing.length > 0) {
+    // Warn rather than exit: this check found 28 pre-existing unregistered
+    // groups on first run, so failing the build would block every docs
+    // regeneration until that backlog is cleared. The point is to make the
+    // omission visible — silently shipping docs that miss a third of the CLI
+    // is how `data` went undocumented in the first place.
+    console.error(
+      `\n⚠  ${missing.length} command group(s) exist under src/commands/ but are not ` +
+        `registered in generate-docs.ts, so they are ABSENT from the generated docs:\n` +
+        `   ${missing.join(', ')}\n` +
+        `   Fix: add the matching register*Commands import + call below, then re-run.\n`
+    )
+  }
+}
+
 async function main() {
   const args = parseArgs()
 
@@ -295,11 +359,22 @@ async function main() {
   registerDnsCommands(program)
   registerServicesCommands(program)
   registerSettingsCommands(program)
+  registerPlatformCommands(program)
   registerUsersCommands(program)
   registerApiKeysCommands(program)
   registerMonitorsCommands(program)
   registerWebhooksCommands(program)
   registerContainersCommands(program)
+  registerFlagsCommands(program)
+  registerDataCommands(program)
+  registerAnalyticsCommands(program)
+
+  // Guard: this file keeps its own hand-maintained registration list rather
+  // than auto-discovering, so a new command group is silently absent from the
+  // docs until someone remembers to add it here. (That is exactly how `data`
+  // shipped undocumented.) Fail loudly instead: every directory under
+  // src/commands/ should surface at least one top-level command.
+  await assertEveryCommandGroupIsRegistered(program)
 
   // Extract command information
   const commands: CommandInfo[] = program.commands.map((cmd: Command) =>

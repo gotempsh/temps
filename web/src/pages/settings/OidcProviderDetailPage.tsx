@@ -52,7 +52,7 @@ import {
   Users as UsersIcon,
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
-import { Link, useNavigate, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
 
 function formatDate(iso: string): string {

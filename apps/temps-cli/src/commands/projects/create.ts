@@ -22,6 +22,18 @@ import {
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import { createProject } from '../../api/sdk.gen.js'
 import type { RepositoryResponse, SourceType } from '../../api/types.gen.js'
+
+/**
+ * One environment variable to seed a new project with.
+ *
+ * `is_secret` marks the value write-only: temps stores it encrypted and never
+ * returns the plaintext again, so it can be replaced but never read back.
+ */
+interface ProjectEnvVar {
+  key: string
+  value: string
+  is_secret: boolean
+}
 import { readEnvFile, findEnvFiles } from '../../lib/env-file.js'
 
 // Shared utilities (extracted to avoid duplication with setup wizard)
@@ -72,6 +84,22 @@ const MANUAL_SOURCE_TYPES: {
     description: 'Locked to static file deployments only',
   },
 ]
+
+/**
+ * Splits a repository path into owner and name.
+ *
+ * Splitting on the LAST slash rather than requiring exactly two segments is
+ * what makes nested GitLab groups work: `acme/infra/platform/my-repo`
+ * is owner `acme/infra/platform`, name `my-repo`. That matches how the
+ * API stores it (repo_owner / repo_name) and how the provider lists it.
+ * Requiring exactly two segments rejected every repo in a subgroup, even
+ * though the backend supported them.
+ */
+export function parseRepoPath(repo: string): { owner: string; name: string } | null {
+  const lastSlash = repo.lastIndexOf('/')
+  if (lastSlash <= 0 || lastSlash === repo.length - 1) return null
+  return { owner: repo.slice(0, lastSlash), name: repo.slice(lastSlash + 1) }
+}
 
 export async function create(options: CreateOptions): Promise<void> {
   await requireAuth()
@@ -149,14 +177,14 @@ export async function create(options: CreateOptions): Promise<void> {
       info(`Using git connection: ${connection.account_name}`)
     } else if (options.repo && skipPrompts) {
       // Auto-find the connection that has this repo
-      const parts = options.repo.split('/')
-      if (parts.length !== 2 || !parts[0] || !parts[1]) {
-        error('Repository must be in owner/name format (e.g., myorg/myrepo)')
+      const parsed = parseRepoPath(options.repo)
+      if (!parsed) {
+        error('Repository must be in owner/name format (e.g., myorg/myrepo or mygroup/subgroup/myrepo)')
         return
       }
       const connections = await fetchGitConnections()
       for (const conn of connections) {
-        const repo = await findRepositoryByName(conn.id, parts[0], parts[1])
+        const repo = await findRepositoryByName(conn.id, parsed.owner, parsed.name)
         if (repo) {
           connection = conn
           info(`Auto-selected git connection: ${conn.account_name}`)
@@ -178,13 +206,13 @@ export async function create(options: CreateOptions): Promise<void> {
     // Step 2: Select Repository
     let repository
     if (options.repo) {
-      // Parse owner/name format
-      const parts = options.repo.split('/')
-      if (parts.length !== 2 || !parts[0] || !parts[1]) {
-        error('Repository must be in owner/name format (e.g., myorg/myrepo)')
+      // Parse owner/name, tolerating nested groups (mygroup/subgroup/myrepo)
+      const parsed = parseRepoPath(options.repo)
+      if (!parsed) {
+        error('Repository must be in owner/name format (e.g., myorg/myrepo or mygroup/subgroup/myrepo)')
         return
       }
-      repository = await findRepositoryByName(connection.id, parts[0], parts[1])
+      repository = await findRepositoryByName(connection.id, parsed.owner, parsed.name)
       if (!repository) {
         error(`Repository "${options.repo}" not found in connection "${connection.account_name}".`)
         return
@@ -491,7 +519,7 @@ async function configureProjectName(
 /**
  * Step 7: Configure Environment Variables
  */
-async function configureEnvironmentVariables(): Promise<[string, string][]> {
+async function configureEnvironmentVariables(): Promise<ProjectEnvVar[]> {
   newline()
 
   const addEnvVars = await promptConfirm({
@@ -503,7 +531,7 @@ async function configureEnvironmentVariables(): Promise<[string, string][]> {
     return []
   }
 
-  const envVars: [string, string][] = []
+  const envVars: ProjectEnvVar[] = []
 
   // Check for .env files in the current directory
   const envFiles = findEnvFiles()
@@ -578,8 +606,13 @@ async function configureEnvironmentVariables(): Promise<[string, string][]> {
       })
 
       if (confirm) {
+        const importAsSecret = await promptConfirm({
+          message: 'Mark these as secrets? (write-only: stored encrypted, never shown again)',
+          default: false,
+        })
+
         for (const [key, value] of entries) {
-          envVars.push([key, value])
+          envVars.push({ key, value, is_secret: importAsSecret })
         }
         success(`Imported ${entries.length} variable(s) from ${filePath}`)
       }
@@ -614,7 +647,12 @@ async function configureEnvironmentVariables(): Promise<[string, string][]> {
           required: true,
         })
 
-        envVars.push([key, value])
+        const isSecret = await promptConfirm({
+          message: `Is ${key} a secret? (write-only: stored encrypted, never shown again)`,
+          default: false,
+        })
+
+        envVars.push({ key, value, is_secret: isSecret })
 
         addMore = await promptConfirm({
           message: 'Add another variable?',

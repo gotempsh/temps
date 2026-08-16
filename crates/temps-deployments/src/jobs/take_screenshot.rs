@@ -260,11 +260,14 @@ impl WorkflowTask for TakeScreenshotJob {
             ));
         }
 
-        // Check if screenshot service is available
-        if !self.screenshot_service.is_provider_available().await {
-            return Err(WorkflowError::JobValidationFailed(
-                "Screenshot provider is not available".to_string(),
-            ));
+        // Check if screenshot service is available, surfacing *why* it is not so the
+        // operator gets an actionable message instead of a silent skip.
+        if let Err(e) = self.screenshot_service.check_provider_availability().await {
+            return Err(WorkflowError::JobValidationFailed(format!(
+                "Screenshot provider '{}' is not available: {}",
+                self.screenshot_service.provider_name(),
+                e
+            )));
         }
 
         Ok(())
@@ -375,5 +378,131 @@ impl TakeScreenshotJobBuilder {
 impl Default for TakeScreenshotJobBuilder {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
+    use std::path::PathBuf;
+    use temps_screenshots::{ScreenshotError, ScreenshotResult};
+
+    /// Screenshot service whose provider is unavailable, mirroring a server where
+    /// Chrome is installed but its shared libraries are missing.
+    struct UnavailableScreenshotService;
+
+    #[async_trait]
+    impl ScreenshotServiceTrait for UnavailableScreenshotService {
+        async fn capture_and_save(&self, _url: &str, _filename: &str) -> ScreenshotResult<PathBuf> {
+            Err(ScreenshotError::ProviderNotConfigured)
+        }
+
+        async fn capture(&self, _url: &str) -> ScreenshotResult<Vec<u8>> {
+            Err(ScreenshotError::ProviderNotConfigured)
+        }
+
+        async fn is_enabled(&self) -> bool {
+            true
+        }
+
+        fn provider_name(&self) -> &'static str {
+            "local-headless-chrome"
+        }
+
+        async fn is_provider_available(&self) -> bool {
+            false
+        }
+
+        async fn check_provider_availability(&self) -> ScreenshotResult<()> {
+            Err(ScreenshotError::ChromeError(
+                "Failed to launch Chrome browser: libnss3.so: cannot open shared object file"
+                    .to_string(),
+            ))
+        }
+    }
+
+    fn test_config_service(db: Arc<DbConnection>) -> Arc<ConfigService> {
+        let server_config = Arc::new(temps_config::ServerConfig {
+            address: "127.0.0.1:3000".to_string(),
+            database_url: "postgres://test".to_string(),
+            tls_address: None,
+            console_address: "127.0.0.1:0".to_string(),
+            console_admin_address: None,
+            admin_allowed_ips: Vec::new(),
+            admin_allowed_hosts: Vec::new(),
+            admin_trust_forwarded_for: false,
+            docker_extra_networks: Vec::new(),
+            data_dir: std::path::PathBuf::from("/tmp/temps-test"),
+            auth_secret: "test-secret".to_string(),
+            encryption_key: "test-key".to_string(),
+            api_base_url: "/api".to_string(),
+            postgres_max_connections: None,
+            postgres_min_connections: None,
+            postgres_connect_timeout_secs: None,
+            postgres_acquire_timeout_secs: None,
+            postgres_idle_timeout_secs: None,
+            postgres_max_lifetime_secs: None,
+            clickhouse_url: None,
+            clickhouse_database: None,
+            clickhouse_user: None,
+            clickhouse_password: None,
+        });
+        Arc::new(ConfigService::new(server_config, db))
+    }
+
+    struct NoopLogWriter;
+
+    #[async_trait]
+    impl temps_core::LogWriter for NoopLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
+
+    fn test_context() -> WorkflowContext {
+        WorkflowContext::new(
+            "test-workflow".to_string(),
+            1,
+            1,
+            1,
+            Arc::new(NoopLogWriter),
+        )
+    }
+
+    /// Regression test for #477: the prerequisite failure must name the provider
+    /// and carry the underlying reason, so the deployment job's error message tells
+    /// the operator what to actually fix.
+    #[tokio::test]
+    async fn test_validate_prerequisites_surfaces_provider_failure_reason() {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let job = TakeScreenshotJob::new(
+            "take_screenshot".to_string(),
+            1,
+            Arc::new(UnavailableScreenshotService),
+            test_config_service(db.clone()),
+            db,
+        );
+
+        let err = job
+            .validate_prerequisites(&test_context())
+            .await
+            .expect_err("unavailable provider must fail prerequisites");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("local-headless-chrome"),
+            "error should name the provider, got: {}",
+            message
+        );
+        assert!(
+            message.contains("libnss3.so"),
+            "error should carry the underlying reason, got: {}",
+            message
+        );
     }
 }

@@ -477,7 +477,7 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
 // First, let's memoize the LogViewer component
 const MemoizedLogViewer = memo(LogViewer)
 
-// Config Modal Component
+// Stage details modal
 interface ConfigModalProps {
   isOpen: boolean
   onClose: () => void
@@ -494,7 +494,6 @@ function ConfigModal({ isOpen, onClose, stage }: ConfigModalProps) {
       job_id: stage.job_id,
       status: stage.status,
       execution_order: stage.execution_order,
-      job_config: stage.job_config,
       dependencies: stage.dependencies,
       outputs: stage.outputs,
       started_at: stage.started_at,
@@ -508,9 +507,9 @@ function ConfigModal({ isOpen, onClose, stage }: ConfigModalProps) {
     <Dialog open={isOpen} onOpenChange={onClose}>
       <DialogContent className="max-w-3xl max-h-[80vh] flex flex-col gap-4 p-6">
         <DialogHeader>
-          <DialogTitle>Stage Configuration</DialogTitle>
+          <DialogTitle>Stage Details</DialogTitle>
           <DialogDescription>
-            Configuration details for{' '}
+            Execution details for{' '}
             <span className="font-mono">{stage.name}</span>
           </DialogDescription>
         </DialogHeader>
@@ -565,12 +564,13 @@ export function DeploymentStages({
   // AI debugging chat (ADR-023), opened from a failed stage into the persistent
   // app-level dock. The chat is scoped to the whole deployment.
   const { open: openAiAssistant } = useAiAssistant()
-  // Read-only AI chat is safe, so we don't hide the "Debug with AI" affordance
-  // when it's off — we enable it inline (one click) and then open the chat,
-  // rather than sending the user to Settings. Local state so the button reflects
-  // enablement without refetching the project prop.
+  // Read-only AI chat is on by default; only an explicit opt-out
+  // (ai_debug_chat_enabled === false) disables it. For opted-out projects we
+  // re-enable inline (one click) and then open the chat, rather than sending
+  // the user to Settings. Local state so the button reflects enablement
+  // without refetching the project prop.
   const [chatEnabled, setChatEnabled] = useState(
-    project.ai_debug_chat_enabled === true ||
+    project.ai_debug_chat_enabled !== false ||
       project.ai_write_actions_enabled === true
   )
   const [enablingChat, setEnablingChat] = useState(false)
@@ -789,7 +789,7 @@ export function DeploymentStages({
                     e.stopPropagation()
                     setConfigModalStage(stage)
                   }}
-                  title="View stage configuration"
+                  title="View stage details"
                 >
                   <Settings className="h-4 w-4" />
                 </Button>
@@ -820,7 +820,7 @@ export function DeploymentStages({
         ))}
       </div>
 
-      {/* Config Modal */}
+      {/* Stage details modal */}
       {configModalStage && (
         <ConfigModal
           isOpen={!!configModalStage}

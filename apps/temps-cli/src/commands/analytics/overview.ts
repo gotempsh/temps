@@ -7,8 +7,8 @@ import {
   getUniqueCounts,
   getPagePaths,
   getEventsCount,
-  getVisitors,
-  getHourlyVisits,
+  getPropertyBreakdown,
+  getAggregatedBuckets,
 } from '../../api/sdk.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { newline, json as jsonOut, colors, info } from '../../ui/output.js'
@@ -26,17 +26,37 @@ interface LocationCount {
   percentage: number
 }
 
+export const SPARKLINE_WIDTH = 48
+
+/**
+ * Pick a server-side bucket size that renders the *whole* requested period in
+ * at most SPARKLINE_WIDTH columns.
+ *
+ * The overview used to always request hourly buckets and then keep only the
+ * last 48 of them, so `--period 7d` and `--period 30d` both silently drew the
+ * same last-two-days sparkline under a header claiming a much longer range.
+ */
+export function bucketSizeForRange(startDate: string, endDate: string): string {
+  const hours = (Date.parse(endDate) - Date.parse(startDate)) / 3_600_000
+
+  if (hours <= SPARKLINE_WIDTH) return '1 hour'
+  if (hours <= SPARKLINE_WIDTH * 6) return '6 hours'
+  if (hours <= SPARKLINE_WIDTH * 24) return '1 day'
+  if (hours <= SPARKLINE_WIDTH * 24 * 7) return '1 week'
+  return '1 month'
+}
 
 function formatNumber(n: number): string {
   return n.toLocaleString('en-US')
 }
 
-function renderSparkline(data: { count: number }[]): string {
+export function renderSparkline(data: { count: number }[]): string {
   const blocks = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█']
   const max = Math.max(...data.map((d) => d.count), 1)
 
-  // Take last 48 points to fit terminal
-  const points = data.length > 48 ? data.slice(-48) : data
+  // The bucket size is chosen so the full period already fits; trimming here is
+  // only a guard against a server returning more buckets than we asked for.
+  const points = data.length > SPARKLINE_WIDTH ? data.slice(-SPARKLINE_WIDTH) : data
 
   return points
     .map((d) => {
@@ -71,9 +91,11 @@ export async function overview(options: OverviewOptions): Promise<void> {
 
   const projectId = projectData.id
 
+  const bucketSize = bucketSizeForRange(startDate, endDate)
+
   // Fetch all data concurrently
   const data = await withSpinner('Fetching analytics...', async () => {
-    const [visitorsRes, sessionsRes, pageViewsRes, pagesRes, eventsRes, visitorsListRes, hourlyRes] =
+    const [visitorsRes, sessionsRes, pageViewsRes, pagesRes, eventsRes, locationsRes, bucketsRes] =
       await Promise.all([
         getUniqueCounts({
           client,
@@ -104,19 +126,32 @@ export async function overview(options: OverviewOptions): Promise<void> {
             custom_events_only: true,
           },
         }),
-        getVisitors({
-          client,
-          query: {
-            project_id: projectId,
-            start_date: startDate,
-            end_date: endDate,
-            limit: 200,
-          },
-        }),
-        getHourlyVisits({
+        // Locations must come from the server-side country aggregate. The
+        // previous implementation listed raw visitor rows and tallied their
+        // countries client-side, which silently reported the same numbers for
+        // every period: /analytics/visitors caps at 100 rows and orders by
+        // last_seen DESC, so 24h, 7d and 30d all got the same 100 most-recent
+        // visitors.
+        getPropertyBreakdown({
           client,
           path: { project_id: projectId },
-          query: { start_date: startDate, end_date: endDate, aggregation_level: 'visitors' },
+          query: {
+            start_date: startDate,
+            end_date: endDate,
+            group_by: 'country',
+            aggregation_level: 'visitors',
+            limit: 10,
+          },
+        }),
+        getAggregatedBuckets({
+          client,
+          path: { project_id: projectId },
+          query: {
+            start_date: startDate,
+            end_date: endDate,
+            aggregation_level: 'visitors',
+            bucket_size: bucketSize,
+          },
         }),
       ])
 
@@ -125,27 +160,16 @@ export async function overview(options: OverviewOptions): Promise<void> {
     if (pageViewsRes.error) throw new Error(getErrorMessage(pageViewsRes.error))
     if (pagesRes.error) throw new Error(getErrorMessage(pagesRes.error))
     if (eventsRes.error) throw new Error(getErrorMessage(eventsRes.error))
-    if (visitorsListRes.error) throw new Error(getErrorMessage(visitorsListRes.error))
+    if (locationsRes.error) throw new Error(getErrorMessage(locationsRes.error))
+    if (bucketsRes.error) throw new Error(getErrorMessage(bucketsRes.error))
 
-    // Aggregate locations from visitors
-    const locationMap = new Map<string, number>()
-    let totalWithCountry = 0
-    const visitors = (visitorsListRes.data as any)?.visitors ?? []
-    for (const v of visitors) {
-      if (v.country) {
-        locationMap.set(v.country, (locationMap.get(v.country) ?? 0) + 1)
-        totalWithCountry++
-      }
-    }
-
-    const topLocations: LocationCount[] = [...locationMap.entries()]
-      .map(([country, count]) => ({
-        country,
-        count,
-        percentage: totalWithCountry > 0 ? (count / totalWithCountry) * 100 : 0,
-      }))
-      .sort((a, b) => b.count - a.count)
-      .slice(0, 10)
+    const topLocations: LocationCount[] = ((locationsRes.data as any)?.items ?? []).map(
+      (item: any) => ({
+        country: item.value,
+        count: item.count,
+        percentage: item.percentage,
+      })
+    )
 
     return {
       uniqueVisitors: (visitorsRes.data as any)?.count ?? 0,
@@ -154,7 +178,10 @@ export async function overview(options: OverviewOptions): Promise<void> {
       topPages: (pagesRes.data as any)?.page_paths ?? [],
       topEvents: (eventsRes.data as any) ?? [],
       topLocations,
-      hourly: (hourlyRes.data as any) ?? [],
+      // Echo back the bucket size the server actually used, so the rendered
+      // label always describes the data rather than what we asked for.
+      bucketSize: (bucketsRes.data as any)?.bucket_size ?? bucketSize,
+      buckets: (bucketsRes.data as any)?.items ?? [],
     }
   })
 
@@ -183,12 +210,14 @@ export async function overview(options: OverviewOptions): Promise<void> {
   console.log(`  ${chalk.white('Total Sessions')}${' '.repeat(8)}${chalk.bold.green(formatNumber(data.totalSessions))}`)
   console.log(`  ${chalk.white('Page Views')}${' '.repeat(12)}${chalk.bold.green(formatNumber(data.pageViews))}`)
 
-  // Sparkline
-  if (data.hourly.length > 0) {
-    const max = Math.max(...data.hourly.map((d: any) => d.count), 1)
+  // Sparkline — spans the full requested period, one column per bucket
+  if (data.buckets.length > 0) {
+    const max = Math.max(...data.buckets.map((d: any) => d.count), 1)
     newline()
-    console.log(`  ${chalk.bold.white('Hourly Visitors')}`)
-    console.log(`  ${chalk.cyan(renderSparkline(data.hourly))} ${chalk.gray(`(max: ${formatNumber(max)})`)}`)
+    console.log(`  ${chalk.bold.white(`Visitors (${label}, per ${data.bucketSize})`)}`)
+    console.log(
+      `  ${chalk.cyan(renderSparkline(data.buckets))} ${chalk.gray(`(max: ${formatNumber(max)})`)}`
+    )
   }
 
   // Top Pages

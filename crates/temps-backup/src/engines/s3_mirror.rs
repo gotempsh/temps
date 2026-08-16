@@ -21,14 +21,14 @@ use aws_sdk_s3::Client as S3Client;
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{info, warn};
-use uuid::Uuid;
 
 use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 const ENGINE_KEY: &str = "s3_mirror";
-const MC_IMAGE: &str = "minio/mc:latest";
+const MC_IMAGE: &str =
+    "minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
 
 pub struct S3MirrorDeps {
     pub db: Arc<DatabaseConnection>,
@@ -141,7 +141,7 @@ impl BackupEngine for S3MirrorEngine {
                 ("http", dest_endpoint.as_str())
             };
 
-        let backup_uuid = Uuid::new_v4().to_string();
+        let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
         let dest_prefix = build_dest_prefix(&s3_dest.bucket_path, &service.name, &backup_uuid);
 
         let source_path = if source_bucket.is_empty() {
@@ -163,7 +163,10 @@ impl BackupEngine for S3MirrorEngine {
         );
 
         // ── One-shot mc mirror container ─────────────────────────────────────
-        super::image_pull::ensure_image_pulled_v2(MC_IMAGE, ENGINE_KEY).await?;
+        // This helper receives both source and destination credentials. Refresh
+        // the registry tag before each run so a poisoned local cache entry
+        // cannot execute with those secrets.
+        super::image_pull::force_pull_image_v2(MC_IMAGE, ENGINE_KEY).await?;
 
         let env_vars = vec![
             format!(
@@ -309,4 +312,14 @@ async fn list_total_s3_size(
         }
     }
     Ok(total)
+}
+
+#[cfg(test)]
+mod image_tests {
+    use super::MC_IMAGE;
+
+    #[test]
+    fn credentialed_sidecar_uses_immutable_image() {
+        assert!(MC_IMAGE.contains("@sha256:"));
+    }
 }

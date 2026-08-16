@@ -54,6 +54,7 @@ import {
   useAlertStatus,
   type AlertStatusLevel,
 } from '@/components/metrics/alert-status'
+import { SuggestAlertsButton } from '@/components/metrics/SuggestAlertsButton'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery } from '@tanstack/react-query'
 import { format } from 'date-fns'
@@ -73,7 +74,7 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { useEffect, useMemo, useState } from 'react'
-import { useSearchParams } from 'react-router-dom'
+import { useSearchParams } from 'react-router'
 
 interface MetricsExplorerProps {
   project: ProjectResponse
@@ -569,7 +570,14 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
     // Timestamps come back in seconds; normalise to ms.
     const toMs10 = (n: number) => (n < 1e12 ? n * 1000 : n)
     const bucketMs = chartData.map((p) => new Date(p.bucket).getTime())
-    const markers: ThresholdMarker[] = []
+    // Multiple deploys can snap to the same bucket — recharts renders one
+    // <ReferenceLine> per marker, and two labels at an identical x stack
+    // directly on top of each other and render as garbled overlapping text.
+    // Group by bucket and collapse each group into a single marker.
+    const byBucket = new Map<
+      number,
+      { label: string; title?: string; count: number }
+    >()
     for (const d of deploys) {
       const at = d.finished_at ?? d.started_at ?? d.created_at
       const ts = toMs10(at)
@@ -584,10 +592,24 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
           best = i
         }
       }
+      const existing = byBucket.get(best)
+      if (existing) {
+        // Keep the most recent deploy's label as the primary one shown.
+        existing.count += 1
+      } else {
+        byBucket.set(best, {
+          label: d.commit_hash ? d.commit_hash.slice(0, 7) : 'deploy',
+          title: d.commit_message ?? undefined,
+          count: 1,
+        })
+      }
+    }
+    const markers: ThresholdMarker[] = []
+    for (const [best, m] of byBucket) {
       markers.push({
         x: formatBucketLabel(chartData[best].bucket),
-        label: d.commit_hash ? d.commit_hash.slice(0, 7) : 'deploy',
-        title: d.commit_message ?? undefined,
+        label: m.count > 1 ? `${m.label} +${m.count - 1}` : m.label,
+        title: m.title,
       })
     }
     return markers
@@ -627,24 +649,32 @@ export default function MetricsExplorer({ project }: MetricsExplorerProps) {
             Explore OpenTelemetry metrics for {project.name}.
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={() => {
-            namesQuery.refetch()
-            if (metricName) metricsQuery.refetch()
-          }}
-          className="gap-1.5 self-start"
-        >
-          <RefreshCw
-            className={
-              metricsQuery.isFetching || namesQuery.isFetching
-                ? 'size-3.5 animate-spin'
-                : 'size-3.5'
-            }
+        <div className="flex flex-wrap items-center gap-2 self-start">
+          <SuggestAlertsButton
+            projectId={project.id}
+            projectSlug={project.slug}
+            projectName={project.name}
+            focusMetric={metricName || undefined}
           />
-          Refresh
-        </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => {
+              namesQuery.refetch()
+              if (metricName) metricsQuery.refetch()
+            }}
+            className="gap-1.5"
+          >
+            <RefreshCw
+              className={
+                metricsQuery.isFetching || namesQuery.isFetching
+                  ? 'size-3.5 animate-spin'
+                  : 'size-3.5'
+              }
+            />
+            Refresh
+          </Button>
+        </div>
       </div>
 
       {/* Filter bar — collapsed by default; the header summarizes the active

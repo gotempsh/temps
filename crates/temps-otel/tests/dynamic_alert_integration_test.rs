@@ -168,6 +168,8 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
         is_deleted: Set(false),
         is_public_repo: Set(false),
         attack_mode: Set(false),
+        error_source_context_enabled: Set(false),
+        error_source_root: Set(None),
         enable_preview_environments: Set(false),
         ..Default::default()
     };
@@ -184,6 +186,7 @@ async fn setup_evaluator() -> Option<EvaluatorTestCtx> {
         storage.clone(),
         auth_service,
         rate_limiter,
+        temps_otel::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
     ));
     let alert_service = Arc::new(MetricAlertService::new(db.clone()));
 
@@ -603,6 +606,8 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         is_deleted: Set(false),
         is_public_repo: Set(false),
         attack_mode: Set(false),
+        error_source_context_enabled: Set(false),
+        error_source_root: Set(None),
         enable_preview_environments: Set(false),
         ..Default::default()
     }
@@ -674,6 +679,14 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         ctx.db.clone(),
         Arc::new(TimescaleDbStorage::new(ctx.db.clone(), None)),
     ));
+    let facet_cache: temps_otel::services::FacetCache = Arc::new(arc_swap::ArcSwap::from_pointee(
+        std::collections::HashMap::new(),
+    ));
+    let facet_service = Arc::new(temps_otel::services::FacetService::new(
+        ctx.db.clone(),
+        None,
+        facet_cache,
+    ));
     let app_state = OtelAppState {
         otel_service: ctx.otel_service.clone(),
         metrics_store: None,
@@ -684,7 +697,9 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         audit_service: Arc::new(NoOpAuditLogger),
         cross_project_service,
         trace_hint_tx: None,
+        otel_relay_tx: None,
         project_access_checker: None,
+        facet_service,
     };
 
     let attacker_auth = AuthContext::new_session(attacker_user, Role::Admin);

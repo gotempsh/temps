@@ -5,7 +5,10 @@ import { pluginReact } from '@rsbuild/plugin-react'
 const rsbuildOutputPath = process.env.RSBUILD_OUTPUT_PATH as string | undefined
 const nodeEnv = process.env.NODE_ENV as string | undefined
 const tempsVersion = process.env.TEMPS_VERSION || 'dev'
-const consoleKitEntry = path.resolve(__dirname, 'packages/console-kit/src/index.ts')
+const consoleKitEntry = path.resolve(
+  __dirname,
+  'packages/console-kit/src/index.ts'
+)
 
 export default defineConfig({
   plugins: [pluginReact()],
@@ -63,11 +66,6 @@ export default defineConfig({
     }),
   },
   dev: {
-    lazyCompilation: false, // Add headers to prevent caching in development
-    headers: {
-      'Cache-Control': 'no-cache, no-store, must-revalidate',
-      Pragma: 'no-cache',
-      Expires: '0',
-    },
+    lazyCompilation: false,
   },
 })

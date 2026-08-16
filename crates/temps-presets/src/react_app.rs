@@ -11,6 +11,10 @@ impl Preset for CreateReactApp {
         "react-app".to_string()
     }
 
+    fn stored_preset(&self) -> Option<temps_entities::preset::Preset> {
+        Some(temps_entities::preset::Preset::React)
+    }
+
     fn project_type(&self) -> ProjectType {
         ProjectType::Static
     }

@@ -4,6 +4,7 @@ pub(crate) mod admin_gate_service;
 pub mod console;
 pub(crate) mod on_demand_cert;
 pub(crate) mod proxy;
+pub(crate) mod self_update;
 mod shutdown;
 
 use clap::{Args, ValueEnum};
@@ -13,6 +14,15 @@ use tracing::{debug, info, warn};
 
 pub use console::start_console_api;
 pub use proxy::start_proxy_server;
+
+const POST_MIGRATION_INDEX_INITIAL_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+const POST_MIGRATION_INDEX_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(300);
+
+fn next_post_migration_index_retry(current: std::time::Duration) -> std::time::Duration {
+    current
+        .saturating_mul(2)
+        .min(POST_MIGRATION_INDEX_MAX_RETRY)
+}
 
 /// Which halves of the control plane this `temps serve` process runs.
 ///
@@ -71,6 +81,18 @@ pub struct ServeCommand {
     /// defense-in-depth allowlist on top of the network-layer isolation.
     #[arg(long, env = "TEMPS_CONSOLE_ADMIN_ADDRESS")]
     pub console_admin_address: Option<String>,
+
+    /// Forbid applying release updates from the console, permanently for the
+    /// lifetime of this process.
+    ///
+    /// The console also has a Settings toggle for the same thing, but that one
+    /// lives in the database and can be switched back on by anyone who can
+    /// write settings. This flag cannot: it is set at launch, so an operator
+    /// who keeps upgrades under configuration management (or policy) can rule
+    /// the API path out entirely. The update banner still appears and still
+    /// shows the manual command — only the "Update now" action is refused.
+    #[arg(long)]
+    pub disable_self_update: bool,
 
     /// Screenshot provider to use: "local" (headless Chrome), "remote", or "noop" (disabled)
     /// Use "noop" on servers without Chrome installed to skip screenshot functionality
@@ -287,11 +309,30 @@ impl ServeCommand {
 
         let rt = tokio::runtime::Runtime::new()?;
 
-        // Backfill TimescaleDB continuous aggregates on this long-lived runtime,
-        // detached. `establish_connection` no longer runs this (it would block
-        // startup on a slow `CALL`); it's idempotent and the refresh policy
-        // catches up regardless, so it must not gate the proxy bind.
+        // Run non-transactional indexes and the TimescaleDB backfill on this
+        // long-lived runtime, detached. Index creation retries with capped
+        // backoff until the retention query has its supporting index; the
+        // idempotent backfill remains best-effort and never gates proxy bind.
         {
+            let index_db = db.clone();
+            rt.spawn(async move {
+                let mut retry_delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
+                loop {
+                    match temps_database::run_post_migration_indexes(index_db.as_ref()).await {
+                        Ok(()) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Post-migration index build failed; retrying in {:?}: {}",
+                                retry_delay,
+                                e
+                            );
+                            tokio::time::sleep(retry_delay).await;
+                            retry_delay = next_post_migration_index_retry(retry_delay);
+                        }
+                    }
+                }
+            });
+
             let backfill_db = db.clone();
             rt.spawn(async move {
                 if let Err(e) =
@@ -304,6 +345,51 @@ impl ServeCommand {
                 }
             });
         }
+
+        // Update notifier: shortly after startup, then at the configured
+        // interval (two hours by default), check GitHub
+        // for a newer release on this install's channel (stable vs beta is
+        // inferred from the running version tag). Hits land in this shared
+        // slot, which the console registers as a service so the settings API
+        // (`GET /settings/update-status`) can drive the web-console upgrade
+        // banner. Detached and best-effort — network failures are
+        // debug-logged and it never gates startup. Spawned before the role
+        // branch so it covers both `--role=all` (this runtime outlives the
+        // blocking proxy) and `--role=console` (the console block_on below
+        // runs on this same runtime).
+        let update_status = Arc::new(temps_core::UpdateStatusSlot::new());
+        let update_check_interval = crate::commands::upgrade::configured_update_check_interval();
+        rt.spawn(crate::commands::upgrade::update_notifier_loop(
+            update_status.clone(),
+            update_check_interval,
+            Arc::new(temps_config::ConfigService::new(
+                serve_config.clone(),
+                db.clone(),
+            )),
+        ));
+
+        // Companion to the notifier above: the notifier says a release exists,
+        // this applies it when an admin asks. Constructed here (not in the
+        // console) so it resolves the journal of a previous update attempt
+        // exactly once per process, before any request can observe it.
+        //
+        // In split topology (ADR-017) only the CONSOLE process restarts. The
+        // sibling `temps proxy` keeps serving :80/:443 on the binary it already
+        // exec'd, so the operator has to restart it separately to converge —
+        // stated up front rather than discovered as version skew later.
+        let self_update_caveat = (self.role == ServeRole::Console).then(|| {
+            "This process runs the console only (ADR-017 split topology). The separate \
+             `temps proxy` service keeps serving traffic on the binary it started with — \
+             restart it too once the console is back to finish the upgrade."
+                .to_string()
+        });
+        let self_updater = Arc::new(self_update::BinarySelfUpdater::new(
+            serve_config.data_dir.clone(),
+            self.disable_self_update,
+            self_update_caveat,
+            update_status.clone(),
+            self.database_url.clone(),
+        ));
 
         // Connect to Docker once and share the handle between:
         //   1. OnDemandManager (wake-on-request scale-to-zero)
@@ -465,6 +551,41 @@ impl ServeCommand {
             );
         }
 
+        // Converge on out-of-process gate edits here too. A single-binary
+        // `temps serve` swaps this handle in-process on save, so the listener
+        // is redundant for the common case — but in an HA deployment with
+        // several consoles against one database, replica B would otherwise keep
+        // enforcing its boot-time allowlist after an operator tightened the
+        // gate on replica A. `AdminGateService` is `Clone` and the handle is an
+        // `Arc<ArcSwap<_>>`, so this clone writes to the same live handle.
+        {
+            let listener_service = Arc::new(admin_gate_service.clone());
+            let database_url = self.database_url.clone();
+            rt.block_on(async { listener_service.start_settings_listener(database_url) });
+        }
+
+        // Shared retention-resolver slot: constructed ONCE here (before either
+        // the console or the proxy bootstraps begin) so both see the same
+        // object. The console's ProxyPlugin looks this up via the service
+        // registry and swaps in a plugin-provided resolver once one registers;
+        // the proxy (started separately below, own isolated plugin context)
+        // gets a direct clone as a function parameter since it can never see
+        // anything registered in the console's registry. See ADR 0017
+        // follow-up: register_services runs in plugin-registration order and
+        // the proxy is a wholly separate bootstrap, so neither side can reach
+        // the other's service registry — this slot is the one thing shared
+        // across both.
+        //
+        // **Security guardrail — shared-slot pattern:** this cross-context
+        // sharing is permissible for `RetentionResolverSlot` only because its
+        // sole effect is a per-row metadata value (`retention_days`) with no
+        // bearing on request routing, authorization, or connection handling.
+        // Do NOT add new objects to this pattern without an explicit security
+        // review: any object that influences auth, TLS/cert issuance, IP
+        // blocklists, or rate limiting MUST NOT be shared across plugin
+        // contexts this way.
+        let retention_resolver_slot = Arc::new(temps_core::RetentionResolverSlot::new_default());
+
         // Build the console params once; both roles consume them.
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         let params = console::ConsoleApiParams {
@@ -482,6 +603,9 @@ impl ServeCommand {
             extra_plugins,
             admin_gate_service: Some(admin_gate_service),
             admin_gate_handle: Some(admin_gate_handle.clone()),
+            retention_resolver_slot: retention_resolver_slot.clone(),
+            update_status,
+            self_updater,
         };
 
         if self.role == ServeRole::Console {
@@ -572,6 +696,21 @@ impl ServeCommand {
             self.disable_https_redirect,
             on_demand_manager,
             Some(admin_gate_handle),
+            retention_resolver_slot as Arc<dyn temps_core::RetentionResolver>,
         )
+    }
+}
+
+#[cfg(test)]
+mod post_migration_tests {
+    use super::*;
+
+    #[test]
+    fn index_retry_backoff_grows_and_caps() {
+        let mut delay = POST_MIGRATION_INDEX_INITIAL_RETRY;
+        for expected in [10, 20, 40, 80, 160, 300, 300] {
+            delay = next_post_migration_index_retry(delay);
+            assert_eq!(delay, std::time::Duration::from_secs(expected));
+        }
     }
 }

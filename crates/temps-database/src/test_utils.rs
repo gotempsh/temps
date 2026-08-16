@@ -56,8 +56,39 @@ use sea_orm::*;
 use sea_orm_migration::MigratorTrait;
 use std::sync::Arc;
 use temps_migrations::Migrator;
-use testcontainers::{runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
+use testcontainers::{core::WaitFor, runners::AsyncRunner, ContainerAsync, GenericImage, ImageExt};
 use tokio::sync::{Mutex, OnceCell};
+
+/// The postgres/timescaledb entrypoint starts a temporary server to run
+/// initdb + init scripts, shuts it down, then starts the real server --
+/// "database system is ready to accept connections" is logged once for
+/// each. This waits for the first (temporary-server) occurrence -- same
+/// wait condition already proven reliable elsewhere in this workspace
+/// (temps-providers/src/pg_stat_statements.rs,
+/// temps-metrics/tests/postgres_checkpoint_stats_integration.rs) -- and
+/// callers add a short buffer sleep afterward to clear the temp-server
+/// shutdown/real-server restart window before connecting.
+fn postgres_ready_wait_for() -> WaitFor {
+    WaitFor::message_on_stderr("database system is ready to accept connections")
+}
+
+/// Returns true only for errors that indicate the container runtime itself
+/// cannot be reached. Test callers may skip on these infrastructure errors,
+/// while migration, schema, and image failures must still fail the test.
+pub fn is_container_runtime_unavailable(error: &str) -> bool {
+    let message = error.to_ascii_lowercase();
+    [
+        "hyper legacy client: client error (connect)",
+        "failed to connect to docker",
+        "error connecting to docker",
+        "docker daemon is unavailable",
+        "docker client is unavailable",
+        "could not find docker environment",
+        "docker socket",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
 
 /// Shared test database container that lives for the duration of the test run
 static TEST_CONTAINER: OnceCell<Arc<Mutex<Option<SharedContainer>>>> = OnceCell::const_new();
@@ -121,11 +152,18 @@ impl SharedContainer {
 
         // Start TimescaleDB container
         let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_wait_for(postgres_ready_wait_for())
             .with_env_var("POSTGRES_DB", db_name)
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
             .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
+            // testcontainers' default is 60s. CI and dev boxes here routinely run
+            // many Docker-based integration tests concurrently (this repo's own
+            // convention), so the container can legitimately take longer than
+            // that to become ready under contention -- give it real headroom
+            // instead of racing the default.
+            .with_startup_timeout(std::time::Duration::from_secs(120))
             .start()
             .await?;
 
@@ -136,8 +174,10 @@ impl SharedContainer {
             username, password, port, db_name
         );
 
-        // Wait for the database to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // The wait strategy fires on the temp-server's "ready" line, but
+        // postgres shuts that server down and restarts a second one right
+        // after -- a short buffer clears that window before we connect.
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
         Ok(Self {
             container: postgres_container,
@@ -512,11 +552,18 @@ impl TestDatabase {
     ) -> anyhow::Result<Self> {
         // Start TimescaleDB container
         let postgres_container = GenericImage::new("timescale/timescaledb-ha", "pg18")
+            .with_wait_for(postgres_ready_wait_for())
             .with_env_var("POSTGRES_DB", db_name)
             .with_env_var("POSTGRES_USER", username)
             .with_env_var("POSTGRES_PASSWORD", password)
             .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
             .with_cmd(TIMESCALEDB_NO_BACKGROUND_WORKERS_CMD)
+            // testcontainers' default is 60s. CI and dev boxes here routinely run
+            // many Docker-based integration tests concurrently (this repo's own
+            // convention), so the container can legitimately take longer than
+            // that to become ready under contention -- give it real headroom
+            // instead of racing the default.
+            .with_startup_timeout(std::time::Duration::from_secs(120))
             .start()
             .await?;
 
@@ -527,10 +574,12 @@ impl TestDatabase {
             username, password, port, db_name
         );
 
-        // Wait for the database to be ready
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        // The wait strategy fires on the temp-server's "ready" line, but
+        // postgres shuts that server down and restarts a second one right
+        // after -- a short buffer clears that window before we connect.
+        tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
 
-        // Connect with retries
+        // Connect with retries as a safety net on top of the buffer above.
         let db = Self::connect_with_retry(&database_url, 10).await?;
 
         let test_db = TestDatabase {
@@ -1025,9 +1074,41 @@ where
 mod tests {
     use super::*;
 
+    async fn test_database_or_skip() -> anyhow::Result<Option<TestDatabase>> {
+        match TestDatabase::new().await {
+            Ok(database) => Ok(Some(database)),
+            Err(error) if is_container_runtime_unavailable(&error.to_string()) => {
+                eprintln!("Skipping Docker-dependent database test: {error}");
+                Ok(None)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    #[test]
+    fn container_runtime_error_classification_does_not_hide_test_failures() {
+        assert!(is_container_runtime_unavailable(
+            "Error in the hyper legacy client: client error (Connect)"
+        ));
+        assert!(is_container_runtime_unavailable(
+            "Docker daemon is unavailable: connection refused"
+        ));
+        assert!(!is_container_runtime_unavailable(
+            "Failed to run migrations: column does not exist"
+        ));
+        assert!(!is_container_runtime_unavailable(
+            "Migrations did not create expected tables"
+        ));
+        assert!(!is_container_runtime_unavailable(
+            "Failed to pull timescale/timescaledb-ha: manifest unknown"
+        ));
+    }
+
     #[tokio::test]
     async fn test_database_setup() -> anyhow::Result<()> {
-        let test_db = TestDatabase::new().await?;
+        let Some(test_db) = test_database_or_skip().await? else {
+            return Ok(());
+        };
 
         // Test basic connectivity
         test_db.test_connection().await?;
@@ -1041,7 +1122,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_transaction_rollback() -> anyhow::Result<()> {
-        let test_db = TestDatabase::new().await?;
+        let Some(test_db) = test_database_or_skip().await? else {
+            return Ok(());
+        };
 
         // Create a test table
         test_db
@@ -1077,6 +1160,10 @@ mod tests {
     async fn test_concurrent_test_isolation() -> anyhow::Result<()> {
         use std::sync::Arc;
         use tokio::sync::Barrier;
+
+        if test_database_or_skip().await?.is_none() {
+            return Ok(());
+        }
 
         // Create a barrier to ensure all tests start at the same time
         let barrier = Arc::new(Barrier::new(5));
@@ -1132,6 +1219,10 @@ mod tests {
     /// Test that each TestDatabase instance gets a unique schema
     #[tokio::test]
     async fn test_unique_schemas() -> anyhow::Result<()> {
+        if test_database_or_skip().await?.is_none() {
+            return Ok(());
+        }
+
         let db1 = TestDatabase::new().await?;
         let db2 = TestDatabase::new().await?;
         let db3 = TestDatabase::new().await?;
@@ -1176,6 +1267,10 @@ mod tests {
     async fn test_with_migrations_concurrent() -> anyhow::Result<()> {
         use std::sync::Arc;
         use tokio::sync::Barrier;
+
+        if test_database_or_skip().await?.is_none() {
+            return Ok(());
+        }
 
         let barrier = Arc::new(Barrier::new(3));
 

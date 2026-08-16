@@ -218,6 +218,46 @@ sudo cp target/release/temps /usr/local/bin/
 temps --version
 ```
 
+### Docker Compose from Source
+
+The repository Compose stack requires independent URL-safe database and Redis
+passwords. Copy the template and generate 256-bit hexadecimal values (do not
+use URI punctuation, because the values are also used in connection URLs):
+
+```bash
+install -m 600 .env.example .env
+openssl rand -hex 32  # set as POSTGRES_PASSWORD
+openssl rand -hex 32  # set as REDIS_PASSWORD
+# Set TEMPS_ADMIN_EMAIL to the initial administrator's email address.
+# Create its password as a permission-restricted Compose secret:
+mkdir -p secrets
+chmod 700 secrets
+{ printf 'tT3!'; openssl rand -hex 32; } > secrets/admin_password
+chmod 444 secrets/admin_password
+# Set DOCKER_GID to the container-visible socket group on Linux or macOS:
+# docker run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine:3.22 stat -c '%g' /var/run/docker.sock
+docker compose up --build --detach
+```
+
+The Docker builder compiles Temps inside Alpine, so the resulting binary
+matches the host architecture and the musl-based runtime even when Compose is
+invoked from macOS or a glibc Linux distribution.
+
+Keep `.env` owned by the account that operates Temps and mode `0600`; it
+contains credentials that can access the loopback-published data services.
+
+Compose validates the password alphabet before starting data services. It
+publishes PostgreSQL, Redis, and the console API on loopback only; HTTP and
+HTTPS remain publicly bound. Temps receives Docker-socket access through the
+socket owner's group while the application process remains non-root. Treat
+membership in that group as root-equivalent host access.
+On the first unattended startup, Temps creates `TEMPS_ADMIN_EMAIL` as the
+administrator using the mounted `TEMPS_ADMIN_PASSWORD_FILE`. The password is
+not placed in the container environment, command line, or logs. The source file
+must be `0444` so the image's non-root UID can read—but not modify—the bind-mounted secret on
+Linux; its `0700` parent directory prevents other host users from traversing to
+it. Rotate the password after first login.
+
 ---
 
 ## Running Temps

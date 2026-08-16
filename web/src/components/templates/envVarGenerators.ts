@@ -102,6 +102,9 @@ function parseExternalUrl(externalUrl?: string | null): DeploymentUrlBase | null
  *      also set, we inherit its **scheme** and **port** so dev installs
  *      like `external_url=http://localhost:8080` + `preview_domain=*.localho.st`
  *      generate `http://my-app.localho.st:8080` instead of dropping the port.
+ *      When `external_url` is unset, `proxyPort` (from `AppSettingsResponse.proxy_port`)
+ *      fills the port instead — this is the exact fallback the backend itself
+ *      uses in `compute_environment_url`/`compute_deployment_url`.
  *   2. The full URL parts of `external_url` (scheme, host, port) when
  *      `preview_domain` is empty — generated URLs at least reach the same
  *      origin the user is configured to use.
@@ -112,9 +115,13 @@ function parseExternalUrl(externalUrl?: string | null): DeploymentUrlBase | null
 export function resolveDeploymentUrlBase(opts?: {
   previewDomain?: string | null
   externalUrl?: string | null
+  /** `AppSettingsResponse.proxy_port` — the real Pingora listener port, used
+   * only when `externalUrl` doesn't already supply one. */
+  proxyPort?: number | null
 }): DeploymentUrlBase {
   const externalUrlBase = parseExternalUrl(opts?.externalUrl)
   const previewDomain = opts?.previewDomain?.trim()
+  const proxyPort = opts?.proxyPort ? String(opts.proxyPort) : undefined
 
   if (previewDomain) {
     const host = previewDomain.replace(/^\*\./, '')
@@ -129,7 +136,10 @@ export function resolveDeploymentUrlBase(opts?: {
         port: externalUrlBase.port,
       }
     }
-    return { scheme: 'https', host }
+    // Matches the backend's own fallback (`compute_environment_url` /
+    // `compute_deployment_url` in temps-deployments): no `external_url`
+    // configured means the proxy is serving plain HTTP on `proxy_port()`.
+    return { scheme: 'http', host, port: proxyPort }
   }
 
   if (externalUrlBase) return externalUrlBase
@@ -158,15 +168,19 @@ export function formatDeploymentUrlBase(base: DeploymentUrlBase): string {
  * Computes the deployment URL for a given repository slug. Returns `null` if
  * the repo name is empty (the URL would be invalid until the user types one).
  *
- * Format: `{scheme}://{slug}.{host}[:port]` — port preserved verbatim from
- * `external_url` so non-default ports (8080, 9000, …) survive the round-trip.
+ * Format: `{scheme}://{slug}-production.{host}[:port]` — the same
+ * `{project_slug}-{environment_slug}` subdomain the backend actually assigns
+ * a project's first environment (see `format!("{}-{}", project.slug, env.slug)`
+ * in temps-deployments/temps-projects), not just the bare project slug. Port
+ * is preserved verbatim from `external_url` so non-default ports (8080,
+ * 9000, …) survive the round-trip.
  */
 export function generateAppUrl(ctx: GeneratorContext): string | null {
   const slug = ctx.repositoryName?.trim()
   if (!slug) return null
   const base = ctx.base || resolveDeploymentUrlBase()
   const portPart = base.port ? `:${base.port}` : ''
-  return `${base.scheme}://${slug}.${base.host}${portPart}`
+  return `${base.scheme}://${slug}-production.${base.host}${portPart}`
 }
 
 /**

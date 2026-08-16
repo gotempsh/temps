@@ -63,6 +63,7 @@ pub struct EventPropertiesResponse {
 }
 
 #[derive(Debug, Serialize, ToSchema)]
+#[schema(as = ActiveVisitorCountResponse)]
 pub struct ActiveVisitorsResponse {
     pub active_visitors: i64,
     pub window_minutes: i32,

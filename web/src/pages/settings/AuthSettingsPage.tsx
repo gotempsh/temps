@@ -49,7 +49,7 @@ import {
 } from 'lucide-react'
 import type { ComponentType, SVGProps } from 'react'
 import { useEffect, useState } from 'react'
-import { Link } from 'react-router-dom'
+import { Link } from 'react-router'
 import { SiAuth0, SiGoogle, SiKeycloak, SiOkta } from 'react-icons/si'
 import { toast } from 'sonner'
 
@@ -178,8 +178,7 @@ export function AuthSettingsPage() {
               SSO providers
             </CardTitle>
             <CardDescription>
-              Password and magic-link login keep working alongside any SSO
-              provider you add.
+              Password login keeps working alongside any SSO provider you add.
             </CardDescription>
           </CardHeader>
           <CardContent>

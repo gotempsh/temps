@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use chrono::{Duration, Utc};
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -94,21 +96,21 @@ pub struct MonitorListQuery {
 #[derive(Deserialize)]
 pub struct UptimeQuery {
     pub days: Option<i32>,
-    pub start_time: DateTime, // ISO 8601 datetime
-    pub end_time: DateTime,   // ISO 8601 datetime
+    pub start_time: Option<DateTime>, // ISO 8601 datetime -- overrides `days` when set
+    pub end_time: Option<DateTime>,   // ISO 8601 datetime -- overrides `days` when set
 }
 
 #[derive(Deserialize)]
 pub struct CurrentStatusQuery {
-    pub start_time: DateTime, // Custom start time (ISO 8601)
-    pub end_time: DateTime,   // Custom end time (ISO 8601)
+    pub start_time: Option<DateTime>, // Custom start time (ISO 8601) -- defaults to last 24h when unset
+    pub end_time: Option<DateTime>, // Custom end time (ISO 8601) -- defaults to last 24h when unset
 }
 
 #[derive(Deserialize)]
 pub struct BucketedQuery {
-    pub interval: Option<String>, // "5min", "hourly", or "daily"
-    pub start_time: DateTime,     // ISO 8601 datetime
-    pub end_time: DateTime,       // ISO 8601 datetime
+    pub interval: Option<String>,     // "5min", "hourly", or "daily"
+    pub start_time: Option<DateTime>, // ISO 8601 datetime -- defaults to 24 hours ago when unset
+    pub end_time: Option<DateTime>,   // ISO 8601 datetime -- defaults to now when unset
 }
 
 /// Get status page overview
@@ -328,18 +330,27 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageRead);
-    // Use custom timeframe method if any non-default values specified
-    app_state
-        .status_page_service()
-        .monitor_service()
-        .get_current_status_with_timeframes(
-            monitor_id,
-            query.start_time.into(),
-            query.end_time.into(),
-        )
-        .await
-        .map(Json)
-        .map_err(map_error)
+    // Custom timeframe only when BOTH bounds are given; otherwise the documented
+    // default (last 24h) applies. These were previously non-optional `DateTime`
+    // fields, so every call had to pass both or 400 -- making the 24h-default
+    // path (and this doc comment's own premise) unreachable.
+    let result = match (query.start_time, query.end_time) {
+        (Some(start_time), Some(end_time)) => {
+            app_state
+                .status_page_service()
+                .monitor_service()
+                .get_current_status_with_timeframes(monitor_id, *start_time, *end_time)
+                .await
+        }
+        _ => {
+            app_state
+                .status_page_service()
+                .monitor_service()
+                .get_current_status(monitor_id)
+                .await
+        }
+    };
+    result.map(Json).map_err(map_error)
 }
 
 /// Get uptime history for a monitor
@@ -349,8 +360,8 @@ where
     params(
         ("monitor_id" = i32, Path, description = "Monitor ID"),
         ("days" = Option<i32>, Query, description = "Number of days of history (default: 60) - ignored if start_time/end_time provided"),
-        ("start_time" = String, Query, description = "Start time (ISO 8601) - overrides days parameter"),
-        ("end_time" = String, Query, description = "End time (ISO 8601) - defaults to now"),
+        ("start_time" = Option<String>, Query, description = "Start time (ISO 8601) - overrides days parameter"),
+        ("end_time" = Option<String>, Query, description = "End time (ISO 8601) - defaults to now"),
     ),
     responses(
         (status = 200, description = "Successfully retrieved uptime history", body = UptimeHistoryResponse),
@@ -373,13 +384,27 @@ where
     T: StatusPageAppState,
 {
     permission_guard!(auth, StatusPageRead);
-    app_state
-        .status_page_service()
-        .monitor_service()
-        .get_uptime_history_range(monitor_id, query.start_time.into(), query.end_time.into())
-        .await
-        .map(Json)
-        .map_err(map_error)
+    // Custom range only when BOTH bounds are given; otherwise fall back to the
+    // `days`-based default (see get_uptime_history's own doc: 60 days). These
+    // were previously non-optional `DateTime` fields, so `days` could never
+    // actually take effect -- every call had to pass an explicit range.
+    let result = match (query.start_time, query.end_time) {
+        (Some(start_time), Some(end_time)) => {
+            app_state
+                .status_page_service()
+                .monitor_service()
+                .get_uptime_history_range(monitor_id, *start_time, *end_time)
+                .await
+        }
+        _ => {
+            app_state
+                .status_page_service()
+                .monitor_service()
+                .get_uptime_history(monitor_id, query.days)
+                .await
+        }
+    };
+    result.map(Json).map_err(map_error)
 }
 
 /// Get bucketed status data for a monitor using TimescaleDB
@@ -414,15 +439,18 @@ where
 {
     permission_guard!(auth, StatusPageRead);
     let interval = query.interval.as_deref().unwrap_or("hourly");
+    // These were previously non-optional `DateTime` fields, so the documented
+    // "(default: 24 hours ago)" / "(default: now)" behavior was unreachable --
+    // every call had to pass both explicitly or 400.
+    let end_time = query.end_time.map(|d| *d).unwrap_or_else(Utc::now);
+    let start_time = query
+        .start_time
+        .map(|d| *d)
+        .unwrap_or_else(|| end_time - Duration::hours(24));
     app_state
         .status_page_service()
         .monitor_service()
-        .get_bucketed_status(
-            monitor_id,
-            interval,
-            query.start_time.into(),
-            query.end_time.into(),
-        )
+        .get_bucketed_status(monitor_id, interval, start_time, end_time)
         .await
         .map(Json)
         .map_err(map_error)
@@ -658,6 +686,14 @@ where
     permission_guard!(auth, StatusPageRead);
     project_access_guard!(auth, project_id, app_state.project_access_checker());
     let interval = bucket_query.interval.as_deref().unwrap_or("hourly");
+    // Previously non-optional `DateTime` fields made the documented
+    // "(default: 7 days ago)" / "(default: now)" behavior unreachable -- every
+    // call had to pass both explicitly or 400.
+    let end_time = bucket_query.end_time.map(|d| *d).unwrap_or_else(Utc::now);
+    let start_time = bucket_query
+        .start_time
+        .map(|d| *d)
+        .unwrap_or_else(|| end_time - Duration::days(7));
 
     app_state
         .status_page_service()
@@ -666,8 +702,8 @@ where
             project_id,
             query.environment_id,
             interval,
-            bucket_query.start_time.into(),
-            bucket_query.end_time.into(),
+            start_time,
+            end_time,
         )
         .await
         .map(Json)
