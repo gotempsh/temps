@@ -1434,6 +1434,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         let mut clauses: Vec<String> = vec![
             "timestamp >= fromUnixTimestamp64Milli(?)".to_string(),
             "timestamp < fromUnixTimestamp64Milli(?)".to_string(),
+            "is_system_request = 0".to_string(),
             "project_id IN ?".to_string(),
         ];
         let project_id_array: Vec<i32> = project_ids.to_vec();

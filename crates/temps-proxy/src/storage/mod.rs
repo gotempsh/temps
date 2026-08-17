@@ -149,8 +149,9 @@ pub trait ProxyLogStorage: Send + Sync {
         filters: Option<StatsFilters>,
     ) -> Result<Vec<TimeBucketStats>, ProxyLogServiceError>;
 
-    /// `stats/projects-health` — per-project request/error/latency rollup with a
-    /// derived health status, including projects with no data as `unknown`.
+    /// `stats/projects-health` — per-project user-traffic request/error/latency
+    /// rollup with a derived health status, including projects with no data as
+    /// `unknown`. Temps' own status-monitor requests are excluded.
     async fn get_projects_health_summary(
         &self,
         project_ids: &[i32],

@@ -1425,6 +1425,7 @@ impl ProxyLogService {
                 FROM proxy_logs_stats_1m
                 WHERE bucket >= $1
                   AND bucket < $2
+                  AND is_system_request = FALSE
                   AND project_id IN ({}){}
                 GROUP BY project_id, date_trunc('hour', bucket)
                 ORDER BY project_id, hour
@@ -1444,6 +1445,7 @@ impl ProxyLogService {
                 FROM proxy_logs
                 WHERE timestamp >= $1
                   AND timestamp < $2
+                  AND is_system_request = FALSE
                   AND project_id IN ({}){}
                 GROUP BY project_id, date_trunc('hour', timestamp)
                 ORDER BY project_id, hour
@@ -1767,7 +1769,8 @@ impl ProxyLogService {
 
     /// True when every set filter dimension is a grouping column of
     /// `proxy_logs_stats_1m` (`project_id`, `environment_id`, `is_bot`,
-    /// `has_project`). Any other filter forces the raw-table path.
+    /// `is_system_request`, `has_project`). Any other filter forces the
+    /// raw-table path.
     fn cagg_serves_filters(filters: Option<&StatsFilters>) -> bool {
         let Some(f) = filters else { return true };
         f.method.is_none()
@@ -3524,12 +3527,17 @@ mod tests {
         async fn insert_log(
             db: &DatabaseConnection,
             ts: chrono::DateTime<Utc>,
-            n: i32,
             project_id: i32,
             status: i16,
             rt_ms: i32,
             is_bot: bool,
+            is_system_request: bool,
         ) {
+            let request_source = if is_system_request {
+                "temps_monitor"
+            } else {
+                "proxy"
+            };
             let stmt = sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r#"INSERT INTO proxy_logs
@@ -3537,15 +3545,18 @@ mod tests {
                      request_source, is_system_request, routing_status, project_id,
                      request_id, is_bot, request_size_bytes, response_size_bytes,
                      created_date)
-                   VALUES ($1, 'GET', '/', 'test.local', $2, $3, 'proxy', false,
-                           'routed', $4, $5, $6, 100, 200, $7)"#,
+                   VALUES ($1, 'GET', '/', 'test.local', $2, $3, $7, $8,
+                           'routed', $4, $5, $6, 100, 200, $9)"#,
                 vec![
                     ts.into(),
                     status.into(),
                     rt_ms.into(),
                     project_id.into(),
-                    format!("cagg-test-{n}").into(),
+                    format!("cagg-test-{project_id}-{status}-{rt_ms}-{is_bot}-{is_system_request}")
+                        .into(),
                     is_bot.into(),
+                    request_source.into(),
+                    is_system_request.into(),
                     ts.date_naive().into(),
                 ],
             );
@@ -3556,11 +3567,12 @@ mod tests {
         // by real-time aggregation (the refresh policy hasn't materialized
         // them yet — exactly the state right after deploy).
         let ts = Utc::now() - chrono::Duration::minutes(5);
-        insert_log(&db, ts, 1, 1, 200, 100, false).await;
-        insert_log(&db, ts, 2, 1, 404, 50, false).await;
-        insert_log(&db, ts, 3, 1, 500, 30, false).await;
-        insert_log(&db, ts, 4, 1, 200, 20, true).await; // bot row
-        insert_log(&db, ts, 5, 2, 200, 10, false).await;
+        insert_log(&db, ts, 1, 200, 100, false, false).await;
+        insert_log(&db, ts, 1, 404, 50, false, false).await;
+        insert_log(&db, ts, 1, 500, 30, false, false).await;
+        insert_log(&db, ts, 1, 200, 20, true, false).await; // bot row
+        insert_log(&db, ts, 2, 200, 10, false, false).await;
+        insert_log(&db, ts, 1, 500, 900, false, true).await; // Temps monitor
 
         let start = Utc::now() - chrono::Duration::hours(1);
         let end = Utc::now() + chrono::Duration::minutes(1);
@@ -3573,6 +3585,8 @@ mod tests {
         assert_eq!(health.len(), 3);
 
         let p1 = health.iter().find(|h| h.project_id == 1).expect("p1");
+        // The dashboard summary excludes Temps' own status checks while still
+        // retaining ordinary crawler traffic unless is_bot is requested.
         assert_eq!(p1.total_requests, 4);
         assert_eq!(p1.total_errors, 1); // only the 500 counts (>= 500)
         assert!((p1.avg_response_time_ms - 50.0).abs() < 1e-9); // (100+50+30+20)/4

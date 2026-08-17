@@ -191,6 +191,7 @@ mod m20260814_000001_create_otel_span_facets;
 mod m20260814_000002_add_ai_summary_preference;
 mod m20260815_000001_add_facet_attr_columns_to_otel_spans;
 mod m20260815_000001_default_preview_inclusion_off;
+mod m20260817_000001_add_system_dimension_to_proxy_stats;
 
 pub struct Migrator;
 
@@ -416,6 +417,7 @@ impl MigratorTrait for Migrator {
             // the same date and sequence stamp.
             Box::new(m20260815_000001_add_facet_attr_columns_to_otel_spans::Migration),
             Box::new(m20260815_000001_default_preview_inclusion_off::Migration),
+            Box::new(m20260817_000001_add_system_dimension_to_proxy_stats::Migration),
         ]
     }
 }
