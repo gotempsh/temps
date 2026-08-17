@@ -4299,6 +4299,15 @@ export type CreateProjectRequest = {
  * the API after create. Distinct from agent secrets (global `/settings/secrets`).
  */
 export type CreateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     /**
      * Include this secret in preview environments (default: false).
@@ -8077,8 +8086,8 @@ export type GatewayStatus = {
      */
     host_port?: number | null;
     /**
-     * Image reference the container was created with (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`).
+     * Image reference the container was created with (e.g. an immutable
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
      */
     image?: string | null;
     /**
@@ -9756,6 +9765,22 @@ export type KvStatusResponse = {
      * Service version
      */
     version?: string | null;
+};
+
+export type LatestDeploymentMediaResponse = {
+    /**
+     * Latest deployment media keyed by project ID. Projects with no
+     * deployments are omitted.
+     */
+    projects: {
+        [key: string]: LatestDeploymentMediaResponseItem;
+    };
+};
+
+export type LatestDeploymentMediaResponseItem = {
+    project_id: number;
+    screenshot_location?: string | null;
+    url?: string | null;
 };
 
 export type LemonSqueezyConfig = {
@@ -12811,7 +12836,7 @@ export type PreviewGatewaySettings = {
      */
     host_port?: number;
     /**
-     * Docker image reference for the gateway. Pinned per Temps release.
+     * Docker image reference for the gateway. Pinned by digest per Temps release.
      * Operators can override this to test a custom build.
      */
     image?: string;
@@ -13013,7 +13038,7 @@ export type ProjectEnvVarInput = {
 };
 
 /**
- * Health summary for a single project (last 1 hour)
+ * Health summary for a single project over the requested time range.
  */
 export type ProjectHealthSummary = {
     /**
@@ -13024,6 +13049,10 @@ export type ProjectHealthSummary = {
      * Error rate as a percentage (0-100)
      */
     error_rate: number;
+    /**
+     * Hourly request counts ordered by bucket start.
+     */
+    hourly_requests: Array<ProjectHourlyRequestCount>;
     project_id: number;
     /**
      * Health status: "healthy", "degraded", "down", "unknown"
@@ -13037,6 +13066,17 @@ export type ProjectHealthSummary = {
      * Total requests in the period
      */
     total_requests: number;
+};
+
+/**
+ * One hourly request-count point in a project health summary.
+ */
+export type ProjectHourlyRequestCount = {
+    /**
+     * Start of the UTC hour in RFC 3339 format.
+     */
+    bucket: string;
+    request_count: number;
 };
 
 export type ProjectInfo = {
@@ -13203,6 +13243,11 @@ export type ProjectSecretEnvironmentInfo = {
  * must read it from the mounted file inside the container.
  */
 export type ProjectSecretResponse = {
+    /**
+     * Compose services this secret is restricted to. Empty means every
+     * service in the stack.
+     */
+    compose_services: Array<string>;
     created_at: number;
     environments: Array<ProjectSecretEnvironmentInfo>;
     id: number;
@@ -19481,6 +19526,15 @@ export type UpdatePreferencesRequest = {
  * ciphertext.
  */
 export type UpdateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     include_in_preview?: boolean;
     /**
@@ -19827,7 +19881,8 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`). Empty resets to default.
+     * an immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
+     * Empty resets to default.
      */
     image: string;
 };
@@ -26436,6 +26491,48 @@ export type GetActivityGraphResponses = {
 };
 
 export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
+
+export type GetLatestDeploymentMediaData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Comma-separated project IDs. At most 100 IDs are accepted.
+         */
+        project_ids: string;
+    };
+    url: '/deployments/latest-media';
+};
+
+export type GetLatestDeploymentMediaErrors = {
+    /**
+     * Invalid project IDs
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permission or project access
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestDeploymentMediaError = GetLatestDeploymentMediaErrors[keyof GetLatestDeploymentMediaErrors];
+
+export type GetLatestDeploymentMediaResponses = {
+    /**
+     * Latest deployment media keyed by project ID
+     */
+    200: LatestDeploymentMediaResponse;
+};
+
+export type GetLatestDeploymentMediaResponse = GetLatestDeploymentMediaResponses[keyof GetLatestDeploymentMediaResponses];
 
 export type GetScanByDeploymentData = {
     body?: never;
@@ -48137,10 +48234,6 @@ export type ReassignProjectCustomDomainData = {
 
 export type ReassignProjectCustomDomainErrors = {
     /**
-     * Target environment does not belong to the target project
-     */
-    400: unknown;
-    /**
      * Unauthorized
      */
     401: unknown;
@@ -48149,7 +48242,7 @@ export type ReassignProjectCustomDomainErrors = {
      */
     403: unknown;
     /**
-     * Custom domain not found
+     * Custom domain or target environment not found in the authorized project scopes
      */
     404: unknown;
     /**

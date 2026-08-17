@@ -281,12 +281,19 @@ pub struct ComposeDeployRequest {
     /// Environment variables to inject (merged with .env)
     pub environment_vars: HashMap<String, String>,
     /// Decrypted project secrets, keyed by name. Materialized as files under
-    /// `/run/secrets/<KEY>` in every service via a generated override.
+    /// `/run/secrets/<KEY>` via a generated override.
     ///
     /// Deliberately separate from [`Self::environment_vars`] and
     /// [`Self::build_args`]: values here must never reach a container
     /// environment, a build argument, an env file, or `docker inspect`.
     pub secrets: HashMap<String, String>,
+    /// Which Compose services may read each secret, keyed by secret name.
+    ///
+    /// A key absent from this map (or mapped to an empty list) goes to every
+    /// service -- that is the pre-scoping behaviour, and it has to stay the
+    /// default so an unconfigured secret is never silently withheld from the
+    /// service that needs it.
+    pub secret_compose_services: HashMap<String, Vec<String>>,
     /// Platform-owned arguments passed only to `docker compose build`.
     /// These are deliberately separate from service runtime environments.
     pub build_args: HashMap<String, String>,
@@ -370,50 +377,114 @@ impl ComposeExecutor {
         self.secrets_root().join(project_name)
     }
 
-    /// Materialize `secrets` as files for a stack and return the host
-    /// directory to bind-mount, or `None` when there is nothing to mount.
+    /// Which secrets a given Compose service is entitled to read.
     ///
-    /// The directory is removed and recreated on every deploy so a key the
-    /// user deleted (or renamed) cannot survive in a running container as a
+    /// A secret with no scope entry (or an empty one) is readable by every
+    /// service. Scoping is opt-in: "not configured" must never mean "withheld",
+    /// or enabling this feature would break stacks on upgrade.
+    fn secrets_for_service<'a>(
+        secrets: &'a HashMap<String, String>,
+        scopes: &HashMap<String, Vec<String>>,
+        service: &str,
+    ) -> Vec<(&'a String, &'a String)> {
+        secrets
+            .iter()
+            .filter(|(key, _)| match scopes.get(*key) {
+                None => true,
+                Some(services) if services.is_empty() => true,
+                Some(services) => services.iter().any(|s| s == service),
+            })
+            .collect()
+    }
+
+    /// Secret names a given service is entitled to read. Public so the deploy
+    /// job can report the delivery matrix using exactly the same rule the
+    /// executor applies when writing the files -- a second, drifting copy of
+    /// this predicate would make the log lie.
+    pub fn secret_names_for_service(
+        secrets: &HashMap<String, String>,
+        scopes: &HashMap<String, Vec<String>>,
+        service: &str,
+    ) -> Vec<String> {
+        Self::secrets_for_service(secrets, scopes, service)
+            .into_iter()
+            .map(|(key, _)| key.clone())
+            .collect()
+    }
+
+    /// Scoped service names that do not exist in the deployed stack.
+    ///
+    /// A Compose service name lives in the user's repository, so a rename
+    /// silently strands any secret scoped to the old name. Callers surface
+    /// this in the deployment log rather than letting delivery quietly stop.
+    pub fn unmatched_secret_scopes(
+        scopes: &HashMap<String, Vec<String>>,
+        known_services: &[String],
+    ) -> Vec<(String, String)> {
+        let mut unmatched: Vec<(String, String)> = scopes
+            .iter()
+            .flat_map(|(key, services)| {
+                services
+                    .iter()
+                    .filter(|service| !known_services.contains(service))
+                    .map(move |service| (key.clone(), service.clone()))
+            })
+            .collect();
+        unmatched.sort();
+        unmatched
+    }
+
+    /// Materialize `secrets` as one directory per Compose service and return
+    /// the per-service host directories to bind-mount.
+    ///
+    /// Per-service directories rather than one shared directory are what make
+    /// scoping real: a service's mount can only expose files that were written
+    /// into its own directory, so a service outside a secret's scope has no
+    /// path to the value at all. Duplicating a value across the services
+    /// entitled to it costs at most `SECRET_VALUE_MAX_BYTES` per copy.
+    ///
+    /// The whole tree is removed and recreated on every deploy, so a key the
+    /// user deleted, renamed, or narrowed the scope of cannot survive as a
     /// stale file.
     ///
     /// ### Permissions
-    /// `0700` on the root, `0755` on the per-stack directory, `0444` on each
+    /// `0700` on the root, `0755` on each service directory, `0444` on each
     /// file. The single-container path chowns `0400` files to the uid resolved
-    /// from the image's `USER`; that is not available here, because a stack has
-    /// many images and Compose pulls several of them during `up` — after this
-    /// file has to exist. World-readable *inside the container* is not a
-    /// boundary worth defending (any process there already runs as the app),
-    /// and on the host the `0700` root denies every other local user. Root and
-    /// the Docker daemon can read these files under either scheme.
+    /// from the image's `USER`; that is not available here, because Compose
+    /// pulls several of a stack's images during `up` -- after these files have
+    /// to exist. World-readable *inside* the container is not a boundary worth
+    /// defending (any process there already runs as the app), and on the host
+    /// the `0700` root denies every other local user.
     async fn materialize_secrets(
         &self,
         project_name: &str,
         secrets: &HashMap<String, String>,
-    ) -> Result<Option<PathBuf>, ComposeError> {
-        let dir = self.secrets_dir(project_name);
+        scopes: &HashMap<String, Vec<String>>,
+        services: &[String],
+    ) -> Result<HashMap<String, PathBuf>, ComposeError> {
+        let root_for_project = self.secrets_dir(project_name);
 
         // Clear unconditionally, even with no secrets: a project whose last
         // secret was just deleted must not keep serving the old file.
-        if let Err(error) = tokio::fs::remove_dir_all(&dir).await {
+        if let Err(error) = tokio::fs::remove_dir_all(&root_for_project).await {
             if error.kind() != std::io::ErrorKind::NotFound {
                 return Err(ComposeError::FileWriteFailed {
-                    path: dir.display().to_string(),
+                    path: root_for_project.display().to_string(),
                     reason: format!("failed to clear previous secrets directory: {error}"),
                 });
             }
         }
 
         if secrets.is_empty() {
-            return Ok(None);
+            return Ok(HashMap::new());
         }
 
         // Docker splits a short-form bind spec on ':', so a data directory
         // containing one would silently mount the wrong host path (or nothing)
         // rather than fail. Refuse instead of delivering no secrets quietly.
-        if dir.to_string_lossy().contains(':') {
+        if root_for_project.to_string_lossy().contains(':') {
             return Err(ComposeError::FileWriteFailed {
-                path: dir.display().to_string(),
+                path: root_for_project.display().to_string(),
                 reason: "the Temps data directory path contains ':', which Docker treats as a \
                          bind-mount field separator; secrets cannot be mounted from it. \
                          Move TEMPS_DATA_DIR to a path without a colon."
@@ -430,33 +501,70 @@ impl ComposeExecutor {
             })?;
         Self::set_mode(&root, 0o700).await?;
 
-        tokio::fs::create_dir(&dir)
-            .await
-            .map_err(|e| ComposeError::FileWriteFailed {
-                path: dir.display().to_string(),
-                reason: format!("failed to create secrets directory: {e}"),
-            })?;
-        Self::set_mode(&dir, 0o755).await?;
+        let mut mounts = HashMap::new();
+        for service in services {
+            let entitled = Self::secrets_for_service(secrets, scopes, service);
+            if entitled.is_empty() {
+                continue;
+            }
 
-        for (key, value) in secrets {
-            // `SecretService::validate_secret_key` already enforces this at the
-            // API. Re-checked here because this value becomes a filesystem
-            // path: a key containing `..` or a separator would write outside
-            // the stack's directory.
-            Self::validate_secret_file_name(key)?;
-            let path = dir.join(key);
-            tokio::fs::write(&path, value)
+            // The service name becomes a directory component. Compose service
+            // names come from a repository file, so this is validated here and
+            // not merely trusted from the API layer.
+            Self::validate_service_dir_name(service)?;
+            let dir = root_for_project.join(service);
+            tokio::fs::create_dir_all(&dir)
                 .await
                 .map_err(|e| ComposeError::FileWriteFailed {
-                    path: path.display().to_string(),
-                    // Never interpolate `value` — this string reaches the
-                    // deployment log.
-                    reason: format!("failed to write secret '{key}': {e}"),
+                    path: dir.display().to_string(),
+                    reason: format!("failed to create secrets directory: {e}"),
                 })?;
-            Self::set_mode(&path, 0o444).await?;
+            Self::set_mode(&dir, 0o755).await?;
+
+            for (key, value) in entitled {
+                // `SecretService::validate_secret_key` already enforces this at
+                // the API. Re-checked because this value becomes a path.
+                Self::validate_secret_file_name(key)?;
+                let path = dir.join(key);
+                tokio::fs::write(&path, value).await.map_err(|e| {
+                    ComposeError::FileWriteFailed {
+                        path: path.display().to_string(),
+                        // Never interpolate `value` -- this reaches the log.
+                        reason: format!("failed to write secret '{key}': {e}"),
+                    }
+                })?;
+                Self::set_mode(&path, 0o444).await?;
+            }
+
+            mounts.insert(service.clone(), dir);
         }
 
-        Ok(Some(dir))
+        // `0700` on the per-project root too, so an unscoped service cannot
+        // even enumerate the sibling directories it has no mount for.
+        Self::set_mode(&root_for_project, 0o700).await?;
+
+        Ok(mounts)
+    }
+
+    /// Reject a Compose service name that cannot be used as a single path
+    /// component.
+    fn validate_service_dir_name(service: &str) -> Result<(), ComposeError> {
+        let invalid = service.is_empty()
+            || service == "."
+            || service == ".."
+            || service.contains('/')
+            || service.contains('\\')
+            || service.contains('\0');
+        if invalid {
+            return Err(ComposeError::SecurityPolicyViolation {
+                service: service.to_string(),
+                field: "service name".to_string(),
+                reason: "compose service name cannot be used as a directory name; \
+                         it must not be empty, '.', '..', or contain path separators"
+                    .to_string(),
+            });
+        }
+        Ok(())
     }
 
     #[cfg_attr(not(unix), allow(unused_variables))]
@@ -618,34 +726,42 @@ impl ComposeExecutor {
         names
     }
 
-    /// Generate the override that mounts `host_dir` read-only at
-    /// `/run/secrets` in every service that is not already managing that path
-    /// itself. Returns the YAML and the services it covers.
+    /// Generate the override that mounts each service's own secrets directory
+    /// read-only at `/run/secrets`. Returns the YAML and the services covered.
+    ///
+    /// Every service gets a *different* mount source, so a service outside a
+    /// secret's scope has no filesystem path to that value at all -- the
+    /// scoping is enforced by what was written, not by the container.
     fn generate_secrets_override(
         &self,
-        compose_documents: &[&str],
-        host_dir: &Path,
+        mounts: &HashMap<String, PathBuf>,
         skip_services: &HashSet<String>,
     ) -> (String, Vec<String>) {
-        let mount = format!(
-            "{}:{}:ro",
-            host_dir.to_string_lossy(),
-            CONTAINER_SECRETS_DIR
-        );
+        let mut mounted: Vec<String> = mounts
+            .keys()
+            .filter(|service| !skip_services.contains(*service))
+            .cloned()
+            .collect();
+        // Deterministic output so a redeploy with unchanged inputs produces a
+        // byte-identical override.
+        mounted.sort();
 
-        let mut mounted = Vec::new();
         let mut services_map = Mapping::new();
-        for service in self.all_service_names(compose_documents) {
-            if skip_services.contains(&service) {
+        for service in &mounted {
+            let Some(host_dir) = mounts.get(service) else {
                 continue;
-            }
-            mounted.push(service.clone());
+            };
+            let mount = format!(
+                "{}:{}:ro",
+                host_dir.to_string_lossy(),
+                CONTAINER_SECRETS_DIR
+            );
             let mut service_map = Mapping::new();
             service_map.insert(
                 Value::String("volumes".to_string()),
-                Value::Sequence(vec![Value::String(mount.clone())]),
+                Value::Sequence(vec![Value::String(mount)]),
             );
-            services_map.insert(Value::String(service), Value::Mapping(service_map));
+            services_map.insert(Value::String(service.clone()), Value::Mapping(service_map));
         }
 
         if services_map.is_empty() {
@@ -1238,39 +1354,43 @@ impl ComposeExecutor {
         // Materialize project secrets and mount them at /run/secrets in every
         // service. Values never enter the compose documents, the env files or
         // the build args — only the host path of the directory does.
-        let secrets_dir = self
-            .materialize_secrets(&request.project_name, &request.secrets)
+        let documents = [
+            request.compose_content.as_str(),
+            request.compose_override.as_deref().unwrap_or_default(),
+        ];
+        let services = self.all_service_names(&documents);
+        let secret_mounts = self
+            .materialize_secrets(
+                &request.project_name,
+                &request.secrets,
+                &request.secret_compose_services,
+                &services,
+            )
             .await?;
         let secrets_override_path = Self::confined_write_path(
             project_dir,
             Path::new(TEMPS_SECRETS_OVERRIDE),
             TEMPS_SECRETS_OVERRIDE,
         )?;
-        let secrets_content = match secrets_dir {
-            Some(ref host_dir) => {
-                let documents = [
-                    request.compose_content.as_str(),
-                    request.compose_override.as_deref().unwrap_or_default(),
-                ];
-                let skip = Self::services_managing_own_secrets(&documents);
-                for service in &skip {
-                    warn!(
-                        project = %request.project_name,
-                        service = %service,
-                        "Service already mounts {CONTAINER_SECRETS_DIR}; \
-                         skipping Temps secret injection for it"
-                    );
-                }
-                let (content, mounted) =
-                    self.generate_secrets_override(&documents, host_dir, &skip);
-                debug!(
+        let secrets_content = if secret_mounts.is_empty() {
+            String::new()
+        } else {
+            let skip = Self::services_managing_own_secrets(&documents);
+            for service in &skip {
+                warn!(
                     project = %request.project_name,
-                    services = %mounted.join(", "),
-                    "Mounted project secrets into compose services"
+                    service = %service,
+                    "Service already mounts {CONTAINER_SECRETS_DIR}; \
+                     skipping Temps secret injection for it"
                 );
-                content
             }
-            None => String::new(),
+            let (content, mounted) = self.generate_secrets_override(&secret_mounts, &skip);
+            debug!(
+                project = %request.project_name,
+                services = %mounted.join(", "),
+                "Mounted project secrets into compose services"
+            );
+            content
         };
         if secrets_content.is_empty() {
             // A stale override from a previous deploy would keep mounting a
@@ -5586,6 +5706,7 @@ services:
             compose_path: None,
             environment_vars: HashMap::new(),
             secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
             build_args: HashMap::new(),
             labels: HashMap::new(),
             repo_dir: None,
@@ -5693,6 +5814,7 @@ services:
             compose_path: None,
             environment_vars: HashMap::new(),
             secrets,
+            secret_compose_services: HashMap::new(),
             build_args: HashMap::new(),
             labels: HashMap::new(),
             repo_dir: None,
@@ -5725,7 +5847,10 @@ services:
             .await
             .unwrap();
 
-        let secret_file = executor.secrets_dir("temps-1-2").join("DB_PASSWORD");
+        let secret_file = executor
+            .secrets_dir("temps-1-2")
+            .join("web")
+            .join("DB_PASSWORD");
         assert_eq!(
             tokio::fs::read_to_string(&secret_file).await.unwrap(),
             "hunter2"
@@ -5798,12 +5923,13 @@ services:
             & 0o777;
         assert_eq!(root_mode, 0o700);
 
-        let file_mode = tokio::fs::metadata(executor.secrets_dir("temps-1-2").join("TOKEN"))
-            .await
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o222;
+        let file_mode =
+            tokio::fs::metadata(executor.secrets_dir("temps-1-2").join("web").join("TOKEN"))
+                .await
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o222;
         assert_eq!(file_mode, 0, "secret files must not be writable");
     }
 
@@ -5870,7 +5996,7 @@ services:
             .await
             .unwrap();
 
-        let dir = executor.secrets_dir("temps-1-2");
+        let dir = executor.secrets_dir("temps-1-2").join("web");
         assert!(
             !dir.join("API_KEY").exists(),
             "renamed key left a stale file"
@@ -5881,6 +6007,174 @@ services:
                 .unwrap(),
             "new-value"
         );
+    }
+
+    fn scoped_request(
+        secrets: HashMap<String, String>,
+        scopes: HashMap<String, Vec<String>>,
+    ) -> ComposeDeployRequest {
+        let mut request = secrets_test_request(
+            "temps-1-2",
+            "services:\n  web:\n    image: nginx\n  db:\n    image: postgres:18\n",
+            secrets,
+        );
+        request.secret_compose_services = scopes;
+        request
+    }
+
+    #[tokio::test]
+    async fn test_scoped_secret_is_only_written_for_entitled_services() {
+        let Some(docker) = Docker::connect_with_defaults().ok() else {
+            return;
+        };
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), data_dir.path().to_path_buf());
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = scoped_request(
+            HashMap::from([
+                ("APP_ONLY".to_string(), "app-value".to_string()),
+                ("SHARED".to_string(), "shared-value".to_string()),
+            ]),
+            HashMap::from([("APP_ONLY".to_string(), vec!["web".to_string()])]),
+        );
+
+        executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap();
+
+        let stack = executor.secrets_dir("temps-1-2");
+        // The scoped secret exists only under the entitled service. This is
+        // the whole point: `db` has no filesystem path to the value, so it is
+        // not merely "not mounted" -- it was never written for that service.
+        assert!(stack.join("web").join("APP_ONLY").exists());
+        assert!(!stack.join("db").join("APP_ONLY").exists());
+        // The unscoped secret still reaches everyone.
+        assert!(stack.join("web").join("SHARED").exists());
+        assert!(stack.join("db").join("SHARED").exists());
+    }
+
+    #[tokio::test]
+    async fn test_service_entitled_to_nothing_gets_no_mount_at_all() {
+        let Some(docker) = Docker::connect_with_defaults().ok() else {
+            return;
+        };
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), data_dir.path().to_path_buf());
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = scoped_request(
+            one_secret("APP_ONLY", "app-value"),
+            HashMap::from([("APP_ONLY".to_string(), vec!["web".to_string()])]),
+        );
+
+        executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap();
+
+        let parsed: YamlValue = serde_yaml::from_str(
+            &tokio::fs::read_to_string(project_dir.path().join(TEMPS_SECRETS_OVERRIDE))
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(parsed["services"]["web"].is_mapping());
+        // An empty /run/secrets mount would imply "this app has no secrets";
+        // no mount at all is the honest representation.
+        assert!(parsed["services"]["db"].is_null());
+        assert!(!executor.secrets_dir("temps-1-2").join("db").exists());
+    }
+
+    #[tokio::test]
+    async fn test_narrowing_a_scope_removes_the_previous_service_copy() {
+        let Some(docker) = Docker::connect_with_defaults().ok() else {
+            return;
+        };
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), data_dir.path().to_path_buf());
+        let project_dir = tempfile::tempdir().unwrap();
+
+        // Deploy once unscoped, so both services hold a copy.
+        executor
+            .write_compose_files(
+                project_dir.path(),
+                &scoped_request(one_secret("TOKEN", "value"), HashMap::new()),
+            )
+            .await
+            .unwrap();
+        assert!(executor
+            .secrets_dir("temps-1-2")
+            .join("db")
+            .join("TOKEN")
+            .exists());
+
+        // Then narrow it to `web` only. Revoking access must actually delete
+        // the plaintext the other service already had on disk.
+        executor
+            .write_compose_files(
+                project_dir.path(),
+                &scoped_request(
+                    one_secret("TOKEN", "value"),
+                    HashMap::from([("TOKEN".to_string(), vec!["web".to_string()])]),
+                ),
+            )
+            .await
+            .unwrap();
+
+        assert!(executor
+            .secrets_dir("temps-1-2")
+            .join("web")
+            .join("TOKEN")
+            .exists());
+        assert!(
+            !executor.secrets_dir("temps-1-2").join("db").exists(),
+            "narrowing a scope left the revoked service's plaintext on disk"
+        );
+    }
+
+    #[test]
+    fn test_empty_scope_means_every_service_not_no_service() {
+        let secrets = one_secret("TOKEN", "value");
+        // Both shapes a caller can produce for "unconfigured".
+        for scopes in [
+            HashMap::new(),
+            HashMap::from([("TOKEN".to_string(), Vec::<String>::new())]),
+        ] {
+            let names = ComposeExecutor::secret_names_for_service(&secrets, &scopes, "anything");
+            assert_eq!(
+                names,
+                vec!["TOKEN".to_string()],
+                "an unconfigured scope must not withhold the secret"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unmatched_scopes_are_reported_for_renamed_services() {
+        let scopes = HashMap::from([
+            ("TOKEN".to_string(), vec!["worker".to_string()]),
+            ("OTHER".to_string(), vec!["web".to_string()]),
+        ]);
+        let known = vec!["web".to_string(), "db".to_string()];
+
+        let unmatched = ComposeExecutor::unmatched_secret_scopes(&scopes, &known);
+
+        assert_eq!(
+            unmatched,
+            vec![("TOKEN".to_string(), "worker".to_string())],
+            "a scope naming a service that no longer exists must be reported"
+        );
+    }
+
+    #[test]
+    fn test_service_names_that_are_not_path_components_are_rejected() {
+        for service in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+            assert!(
+                ComposeExecutor::validate_service_dir_name(service).is_err(),
+                "service {service:?} should be rejected"
+            );
+        }
+        assert!(ComposeExecutor::validate_service_dir_name("web-1.api_v2").is_ok());
     }
 
     #[tokio::test]

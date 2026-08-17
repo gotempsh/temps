@@ -4299,6 +4299,15 @@ export type CreateProjectRequest = {
  * the API after create. Distinct from agent secrets (global `/settings/secrets`).
  */
 export type CreateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     /**
      * Include this secret in preview environments (default: false).
@@ -13234,6 +13243,11 @@ export type ProjectSecretEnvironmentInfo = {
  * must read it from the mounted file inside the container.
  */
 export type ProjectSecretResponse = {
+    /**
+     * Compose services this secret is restricted to. Empty means every
+     * service in the stack.
+     */
+    compose_services: Array<string>;
     created_at: number;
     environments: Array<ProjectSecretEnvironmentInfo>;
     id: number;
@@ -19512,6 +19526,15 @@ export type UpdatePreferencesRequest = {
  * ciphertext.
  */
 export type UpdateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     include_in_preview?: boolean;
     /**

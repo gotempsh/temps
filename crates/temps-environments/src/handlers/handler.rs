@@ -113,6 +113,9 @@ impl From<crate::services::secret_service::SecretError> for Problem {
             SecretError::InvalidKey { .. } => temps_core::error_builder::bad_request()
                 .detail(err.to_string())
                 .build(),
+            SecretError::InvalidComposeService { .. } => temps_core::error_builder::bad_request()
+                .detail(err.to_string())
+                .build(),
             SecretError::EnvironmentNotFound { .. } => temps_core::error_builder::not_found()
                 .detail(err.to_string())
                 .build(),
@@ -1974,6 +1977,7 @@ pub async fn list_project_secrets(
                     main_url: env.main_url,
                 })
                 .collect(),
+            compose_services: s.compose_services,
         })
         .collect();
 
@@ -2017,6 +2021,7 @@ pub async fn create_project_secret(
             request.key,
             request.value,
             request.include_in_preview,
+            request.compose_services,
         )
         .await?;
 
@@ -2036,6 +2041,7 @@ pub async fn create_project_secret(
                 main_url: env.main_url,
             })
             .collect(),
+        compose_services: secret.compose_services,
     };
 
     Ok((StatusCode::CREATED, Json(response)))
@@ -2079,6 +2085,7 @@ pub async fn update_project_secret(
             request.value,
             request.environment_ids,
             request.include_in_preview,
+            request.compose_services,
         )
         .await?;
 
@@ -2098,6 +2105,7 @@ pub async fn update_project_secret(
                 main_url: env.main_url,
             })
             .collect(),
+        compose_services: secret.compose_services,
     };
 
     Ok(Json(response))

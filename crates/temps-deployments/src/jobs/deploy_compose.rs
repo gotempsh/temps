@@ -67,6 +67,9 @@ pub struct DeployComposeJob {
     /// in every compose service. Never injected as environment variables, so
     /// they stay out of `docker inspect` and out of the generated env files.
     secrets: HashMap<String, String>,
+    /// Which compose services may read each secret. A key that is absent goes
+    /// to every service.
+    secret_compose_services: HashMap<String, Vec<String>>,
     /// Platform-owned build arguments. These are passed only to
     /// `docker compose build`, never to service runtime environments.
     build_args: HashMap<String, String>,
@@ -107,6 +110,7 @@ pub struct DeployComposeJobBuilder {
     public_ports: Vec<ComposePublicPort>,
     environment_vars: HashMap<String, String>,
     secrets: HashMap<String, String>,
+    secret_compose_services: HashMap<String, Vec<String>>,
     build_args: HashMap<String, String>,
     download_job_id: Option<String>,
     log_id: Option<String>,
@@ -137,6 +141,7 @@ impl DeployComposeJobBuilder {
             public_ports: Vec::new(),
             environment_vars: HashMap::new(),
             secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
             build_args: HashMap::new(),
             download_job_id: None,
             log_id: None,
@@ -214,6 +219,11 @@ impl DeployComposeJobBuilder {
         self.secrets = secrets;
         self
     }
+    /// Per-secret compose-service scope. Absent key = every service.
+    pub fn secret_compose_services(mut self, scopes: HashMap<String, Vec<String>>) -> Self {
+        self.secret_compose_services = scopes;
+        self
+    }
     pub fn log_id(mut self, id: Option<String>) -> Self {
         self.log_id = id;
         self
@@ -250,6 +260,7 @@ impl DeployComposeJobBuilder {
             public_ports: self.public_ports,
             environment_vars: self.environment_vars,
             secrets: self.secrets,
+            secret_compose_services: self.secret_compose_services,
             build_args: self.build_args,
             download_job_id: self
                 .download_job_id
@@ -548,51 +559,79 @@ impl WorkflowTask for DeployComposeJob {
             }
         }
 
-        // Report secret delivery. A secret that exists in the dashboard but
-        // never reaches the container is the worst possible failure mode —
-        // silent, and indistinguishable from a wrong value — so the log states
-        // exactly which keys were mounted and which services opted out.
+        // Report secret delivery per service. A secret that exists in the
+        // dashboard but never reaches the container is the worst failure mode
+        // here -- silent, and indistinguishable from a wrong value -- so the
+        // log states the delivery matrix rather than asserting success.
         if let Some(ref log_id) = self.log_id {
             if !self.secrets.is_empty() {
-                let mut keys: Vec<&str> = self.secrets.keys().map(String::as_str).collect();
-                keys.sort_unstable();
                 let documents = [
                     compose_content.as_str(),
                     self.compose_override.as_deref().unwrap_or_default(),
                 ];
-                let mut skipped = ComposeExecutor::services_managing_own_secrets(&documents)
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                skipped.sort();
-                let mounted_into = self
-                    .compose_executor
-                    .all_service_names(&documents)
-                    .into_iter()
-                    .filter(|service| !skipped.contains(service))
-                    .collect::<Vec<_>>();
+                let services = self.compose_executor.all_service_names(&documents);
+                let skipped = ComposeExecutor::services_managing_own_secrets(&documents);
 
-                let _ = self
-                    .log_service
-                    .log_info(
-                        log_id,
-                        &format!(
-                            "Mounting {} secret(s) at /run/secrets in service(s) {}: {}",
+                for service in &services {
+                    if skipped.contains(service) {
+                        continue;
+                    }
+                    let mut keys = ComposeExecutor::secret_names_for_service(
+                        &self.secrets,
+                        &self.secret_compose_services,
+                        service,
+                    );
+                    keys.sort();
+                    let message = if keys.is_empty() {
+                        format!(
+                            "Service '{service}' receives no secrets                              (every secret is scoped to other services)"
+                        )
+                    } else {
+                        format!(
+                            "Service '{}' receives {} secret(s) at /run/secrets: {}",
+                            service,
                             keys.len(),
-                            mounted_into.join(", "),
                             keys.join(", ")
-                        ),
-                    )
-                    .await;
+                        )
+                    };
+                    let _ = self.log_service.log_info(log_id, &message).await;
+                }
+
+                let mut skipped: Vec<String> = skipped.into_iter().collect();
+                skipped.sort();
                 if !skipped.is_empty() {
                     let _ = self
                         .log_service
                         .log_warning(
                             log_id,
                             &format!(
-                                "Service(s) {} already define their own /run/secrets mount or \
-                                 compose `secrets:` entry — Temps secrets are NOT mounted there. \
-                                 Remove that mount if you want Temps to deliver them.",
+                                "Service(s) {} already define their own /run/secrets mount or                                  compose `secrets:` entry — Temps secrets are NOT mounted there.                                  Remove that mount if you want Temps to deliver them.",
                                 skipped.join(", ")
+                            ),
+                        )
+                        .await;
+                }
+
+                // A compose service rename strands every secret scoped to the
+                // old name. Without this the secret simply stops arriving and
+                // nothing anywhere says why.
+                for (key, missing) in ComposeExecutor::unmatched_secret_scopes(
+                    &self.secret_compose_services,
+                    &services,
+                ) {
+                    let _ = self
+                        .log_service
+                        .log_warning(
+                            log_id,
+                            &format!(
+                                "Secret '{}' is scoped to compose service '{}', which does not                                  exist in this stack (services: {}). It was not delivered to that                                  service. Update the secret's scope or the compose file.",
+                                key,
+                                missing,
+                                if services.is_empty() {
+                                    "none".to_string()
+                                } else {
+                                    services.join(", ")
+                                }
                             ),
                         )
                         .await;
@@ -666,6 +705,7 @@ impl WorkflowTask for DeployComposeJob {
             compose_path: self.compose_path.clone(),
             environment_vars: self.environment_vars.clone(),
             secrets: self.secrets.clone(),
+            secret_compose_services: self.secret_compose_services.clone(),
             build_args: self.build_args.clone(),
             labels,
             repo_dir: repo_path.clone(),

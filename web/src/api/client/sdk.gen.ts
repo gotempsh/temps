@@ -7152,7 +7152,8 @@ export const getAiStatusBreakdown = <ThrowOnError extends boolean = false>(optio
 });
 
 /**
- * Get health summaries for multiple projects (last 1 hour)
+ * Get user-traffic health summaries for multiple projects (last 1 hour).
+ * Temps' own status-monitor requests are excluded.
  */
 export const getProjectsHealth = <ThrowOnError extends boolean = false>(options: Options<GetProjectsHealthData, ThrowOnError>): RequestResult<GetProjectsHealthResponses, GetProjectsHealthErrors, ThrowOnError> => (options.client ?? client).get<GetProjectsHealthResponses, GetProjectsHealthErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],

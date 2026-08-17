@@ -56,4 +56,7 @@ pub struct SecretWithEnvironments {
     pub created_at: UtcDateTime,
     pub updated_at: UtcDateTime,
     pub environments: Vec<SecretEnvironmentRef>,
+    /// Docker Compose services this secret is restricted to. Empty means
+    /// every service in the stack receives it.
+    pub compose_services: Vec<String>,
 }

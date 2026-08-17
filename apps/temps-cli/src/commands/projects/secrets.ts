@@ -17,7 +17,7 @@ import { promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning } from '../../ui/output.js'
 
 // Project secrets are mounted into the deployed container as FILES at
-// /run/secrets/<KEY> (mode 0400) on the next deployment — distinct from the
+// /run/secrets/<KEY> on the next deployment — distinct from the
 // top-level `temps secrets` command, which manages agent/MCP-sandbox-scoped
 // secrets (a completely different store, referenced via ${TEMPS_SECRET:name}
 // in MCP config, unrelated to any specific project's own deployment).
@@ -33,6 +33,7 @@ interface CreateOptions {
   key: string
   value: string
   environment: string[]
+  service: string[]
   includeInPreview?: boolean
 }
 
@@ -41,6 +42,8 @@ interface UpdateOptions {
   key: string
   value?: string
   environment: string[]
+  service: string[]
+  allServices?: boolean
   includeInPreview?: boolean
 }
 
@@ -100,7 +103,7 @@ export function registerProjectSecretsCommands(projects: Command): void {
   const secrets = projects
     .command('secrets')
     .description(
-      'Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY> (mode 0400), not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).',
+      'Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).',
     )
 
   secrets
@@ -126,6 +129,12 @@ export function registerProjectSecretsCommands(projects: Command): void {
       'Secret value (<=1 MiB). Prefix with @ to read from a local file, e.g. @./auth.json — never touches shell history.',
     )
     .option('-e, --environment <name>', 'Scope to one environment (repeatable; default: all)', collect, [])
+    .option(
+      '-s, --service <name>',
+      'Docker Compose service allowed to read this secret (repeatable; default: every service). Ignored for non-Compose projects, which deploy a single container.',
+      collect,
+      [],
+    )
     .option('--include-in-preview', 'Also mount this secret in preview environments')
     .action(createAction)
 
@@ -139,6 +148,13 @@ export function registerProjectSecretsCommands(projects: Command): void {
       'New value (<=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value.',
     )
     .option('-e, --environment <name>', 'Replace environment scoping (repeatable)', collect, [])
+    .option(
+      '-s, --service <name>',
+      'Replace the Docker Compose service scope (repeatable). Pass none to keep the current scope; use --all-services to widen it back to every service.',
+      collect,
+      [],
+    )
+    .option('--all-services', 'Deliver to every Compose service, clearing any per-service scope')
     .option('--include-in-preview', 'Include in preview environments')
     .option('--no-include-in-preview', 'Exclude from preview environments')
     .action(updateAction)
@@ -203,6 +219,11 @@ async function listAction(options: ListOptions): Promise<void> {
     console.log(
       `    ${colors.muted('Environments:')} ${scope}${secret.include_in_preview ? ' (+ preview)' : ''}`,
     )
+    const services =
+      secret.compose_services && secret.compose_services.length > 0
+        ? secret.compose_services.join(', ')
+        : 'all services'
+    console.log(`    ${colors.muted('Compose services:')} ${services}`)
     newline()
   }
 }
@@ -230,6 +251,7 @@ async function createAction(options: CreateOptions): Promise<void> {
         key: options.key,
         value,
         ...(environmentIds ? { environment_ids: environmentIds } : {}),
+        ...(options.service.length > 0 ? { compose_services: options.service } : {}),
         ...(options.includeInPreview !== undefined ? { include_in_preview: options.includeInPreview } : {}),
       },
     })
@@ -238,7 +260,12 @@ async function createAction(options: CreateOptions): Promise<void> {
   })
 
   success(`Secret created: ${secret.key}`)
-  info(`Mounted at ${colors.bold(`/run/secrets/${secret.key}`)} (mode 0400) on the next deployment`)
+  info(`Mounted at ${colors.bold(`/run/secrets/${secret.key}`)} on the next deployment`)
+  info(
+    secret.compose_services && secret.compose_services.length > 0
+      ? `Readable only by Compose service(s): ${secret.compose_services.join(', ')}`
+      : 'Readable by every service in the stack (use --service to restrict it)',
+  )
   info('A redeploy is required for this to take effect.')
 }
 
@@ -246,9 +273,20 @@ async function updateAction(options: UpdateOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  if (options.value === undefined && options.environment.length === 0 && options.includeInPreview === undefined) {
-    warning('No fields to update. Provide at least one of --value, --environment, or --include-in-preview')
+  if (
+    options.value === undefined &&
+    options.environment.length === 0 &&
+    options.service.length === 0 &&
+    options.allServices !== true &&
+    options.includeInPreview === undefined
+  ) {
+    warning(
+      'No fields to update. Provide at least one of --value, --environment, --service, --all-services, or --include-in-preview',
+    )
     return
+  }
+  if (options.service.length > 0 && options.allServices === true) {
+    throw new Error('--service and --all-services are mutually exclusive')
   }
 
   const resolved = await requireProjectSlug(options.project)
@@ -262,12 +300,22 @@ async function updateAction(options: UpdateOptions): Promise<void> {
     const environmentIds =
       options.environment.length > 0 ? await resolveEnvironmentIds(projectId, options.environment) : undefined
 
+    // The API replaces the service scope wholesale, so omitting it would
+    // silently widen a scoped secret back to every service. Echo the current
+    // scope back unless the caller explicitly asked to change it.
+    const composeServices = options.allServices
+      ? []
+      : options.service.length > 0
+        ? options.service
+        : (current.compose_services ?? [])
+
     const { data, error } = await updateProjectSecret({
       client,
       path: { project_id: projectId, secret_id: current.id },
       body: {
         ...(options.value !== undefined ? { value: resolveValue(options.value) } : {}),
         ...(environmentIds ? { environment_ids: environmentIds } : {}),
+        compose_services: composeServices,
         ...(options.includeInPreview !== undefined ? { include_in_preview: options.includeInPreview } : {}),
       },
     })
