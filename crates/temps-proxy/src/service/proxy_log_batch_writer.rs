@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 
 use super::proxy_log_service::CreateProxyLogRequest;
 use crate::crawler_detector::CrawlerDetector;
+use crate::redaction;
 use crate::storage::ProxyLogStorage;
 use crate::traits::FirstVisitAttribution;
 
@@ -118,7 +119,17 @@ impl ProxyLogBatchHandle {
     /// so proxy memory stays flat. Never `.await`-send from the hot path and
     /// never wrap this in `tokio::spawn` — parked send futures each pin the
     /// full request struct and become an unbounded queue in the task list.
-    pub fn send_or_drop(&self, request: CreateProxyLogRequest) {
+    ///
+    /// Credentials are redacted here, on the way in. This is the single
+    /// boundary every log entry crosses to become persisted, so redacting at
+    /// this point — rather than at each of the three construction sites in
+    /// `proxy.rs` — is what makes "no secret reaches storage" a property of the
+    /// type rather than a convention a future caller can forget. It also keeps
+    /// `ProxyContext` holding the *unredacted* values it still needs to build
+    /// redirects with. See [`crate::redaction`].
+    pub fn send_or_drop(&self, mut request: CreateProxyLogRequest) {
+        redaction::redact_log_entry(&mut request);
+
         if self.sender.try_send(request).is_err() {
             let total = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
             if total == 1 || total.is_multiple_of(DROP_LOG_EVERY) {
@@ -663,6 +674,109 @@ mod tests {
         let received = writer.receiver.try_recv();
         assert!(received.is_ok());
         assert_eq!(received.unwrap().path, "/");
+    }
+
+    /// Regression: proxy logs used to persist `Cookie`/`Authorization` headers
+    /// and raw OAuth callback query strings verbatim, so an access-log row (and
+    /// every backup containing it) held live credentials in plaintext.
+    ///
+    /// This asserts at the choke point every persisted entry crosses: whatever
+    /// the caller hands to `send_or_drop`, what lands in the channel — and
+    /// therefore in TimescaleDB/ClickHouse — carries no secret.
+    #[tokio::test]
+    async fn send_or_drop_redacts_credentials_before_they_reach_the_channel() {
+        let db = Arc::new(DatabaseConnection::default());
+        let ip_service = create_test_ip_service(db.clone());
+        let storage = create_test_storage(db.clone(), ip_service.clone());
+        let (handle, _tracking_handle, mut writer) =
+            ProxyLogBatchWriter::new(db, ip_service, storage);
+
+        let mut request = make_test_log_request("/api/integrations/github/callback");
+        // Shape of a real OAuth authorization-code callback.
+        request.query_string = Some(
+            "code=synthetic-oauth-code&state=synthetic-csrf-state&next=/dashboard".to_string(),
+        );
+        request.referrer = Some("https://example.test/login?token=leaked-in-referrer".to_string());
+        request.request_headers = Some(serde_json::json!({
+            "cookie": "temps_session=super-secret-session",
+            "authorization": "Bearer tok_live_should_never_persist",
+            "user-agent": "curl/8.4.0",
+        }));
+        request.response_headers = Some(serde_json::json!({
+            "set-cookie": "sid=another-secret; HttpOnly",
+            "location": "https://example.test/cb?code=second-secret",
+            "content-type": "text/html",
+        }));
+
+        handle.send_or_drop(request);
+
+        let stored = writer
+            .receiver
+            .try_recv()
+            .expect("entry should be queued for persistence");
+
+        // Query string: credentials gone, parameter names and the harmless
+        // `next` value intact.
+        assert_eq!(
+            stored.query_string.as_deref(),
+            Some("code=[REDACTED]&state=[REDACTED]&next=/dashboard")
+        );
+
+        // Referrer query strings leak too.
+        assert_eq!(
+            stored.referrer.as_deref(),
+            Some("https://example.test/login?token=[REDACTED]")
+        );
+
+        let request_headers = stored
+            .request_headers
+            .as_ref()
+            .expect("request headers retained");
+        assert_eq!(request_headers["cookie"], serde_json::json!("[REDACTED]"));
+        assert_eq!(
+            request_headers["authorization"],
+            serde_json::json!("[REDACTED]")
+        );
+        // Non-secret headers must survive — they are why we store headers.
+        assert_eq!(
+            request_headers["user-agent"],
+            serde_json::json!("curl/8.4.0")
+        );
+
+        let response_headers = stored
+            .response_headers
+            .as_ref()
+            .expect("response headers retained");
+        assert_eq!(
+            response_headers["set-cookie"],
+            serde_json::json!("[REDACTED]")
+        );
+        assert_eq!(
+            response_headers["location"],
+            serde_json::json!("https://example.test/cb?code=[REDACTED]")
+        );
+        assert_eq!(
+            response_headers["content-type"],
+            serde_json::json!("text/html")
+        );
+
+        // Belt and braces: no fragment of any secret survives anywhere in the
+        // serialized entry, regardless of which field it might have hidden in.
+        let serialized = serde_json::to_string(&stored).expect("entry serializes");
+        for secret in [
+            "synthetic-oauth-code",
+            "synthetic-csrf-state",
+            "super-secret-session",
+            "tok_live_should_never_persist",
+            "another-secret",
+            "second-secret",
+            "leaked-in-referrer",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "secret {secret:?} leaked into the persisted entry: {serialized}"
+            );
+        }
     }
 
     #[tokio::test]

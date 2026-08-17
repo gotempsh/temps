@@ -13726,9 +13726,29 @@ export type ProxyLogResponse = {
     project_id?: number | null;
     query_string?: string | null;
     referrer?: string | null;
+    /**
+     * Inbound request headers, credential values already replaced with
+     * `[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry
+     * predates header capture or was written by a path that doesn't record
+     * them; an empty map means "captured, but no headers", which is different
+     * and worth being able to tell apart.
+     *
+     * A `BTreeMap` rather than a raw `serde_json::Value` so the schema stays
+     * typed and the UI gets a stable alphabetical ordering for free.
+     */
+    request_headers?: {
+        [key: string]: string;
+    } | null;
     request_id: string;
     request_size_bytes?: number | null;
     request_source: string;
+    /**
+     * Upstream response headers, redacted on the same terms as
+     * [`Self::request_headers`].
+     */
+    response_headers?: {
+        [key: string]: string;
+    } | null;
     response_size_bytes?: number | null;
     response_time_ms?: number | null;
     routing_status: string;

@@ -17283,7 +17283,7 @@
             ]
           },
           "image": {
-            "description": "Image reference the container was created with (e.g.\n`ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`).",
+            "description": "Image reference the container was created with (e.g. an immutable\n`ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).",
             "type": [
               "string",
               "null"
@@ -21008,6 +21008,48 @@
         "required": [
           "enabled",
           "healthy"
+        ],
+        "type": "object"
+      },
+      "LatestDeploymentMediaResponse": {
+        "properties": {
+          "projects": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/LatestDeploymentMediaResponseItem"
+            },
+            "description": "Latest deployment media keyed by project ID. Projects with no\ndeployments are omitted.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "projects"
+        ],
+        "type": "object"
+      },
+      "LatestDeploymentMediaResponseItem": {
+        "properties": {
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "screenshot_location": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id"
         ],
         "type": "object"
       },
@@ -28064,7 +28106,7 @@
           },
           "image": {
             "default": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9",
-            "description": "Docker image reference for the gateway. Pinned per Temps release.\nOperators can override this to test a custom build.",
+            "description": "Docker image reference for the gateway. Pinned by digest per Temps release.\nOperators can override this to test a custom build.",
             "example": "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9",
             "type": "string"
           },
@@ -28442,7 +28484,7 @@
         "type": "object"
       },
       "ProjectHealthSummary": {
-        "description": "Health summary for a single project (last 1 hour)",
+        "description": "Health summary for a single project over the requested time range.",
         "properties": {
           "avg_response_time_ms": {
             "description": "Average response time in ms",
@@ -28453,6 +28495,13 @@
             "description": "Error rate as a percentage (0-100)",
             "format": "double",
             "type": "number"
+          },
+          "hourly_requests": {
+            "description": "Hourly request counts ordered by bucket start.",
+            "items": {
+              "$ref": "#/components/schemas/ProjectHourlyRequestCount"
+            },
+            "type": "array"
           },
           "project_id": {
             "format": "int32",
@@ -28479,7 +28528,27 @@
           "total_errors",
           "avg_response_time_ms",
           "error_rate",
-          "status"
+          "status",
+          "hourly_requests"
+        ],
+        "type": "object"
+      },
+      "ProjectHourlyRequestCount": {
+        "description": "One hourly request-count point in a project health summary.",
+        "properties": {
+          "bucket": {
+            "description": "Start of the UTC hour in RFC 3339 format.",
+            "example": "2026-08-16T12:00:00Z",
+            "type": "string"
+          },
+          "request_count": {
+            "format": "int64",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "bucket",
+          "request_count"
         ],
         "type": "object"
       },
@@ -30013,6 +30082,19 @@
               "null"
             ]
           },
+          "request_headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Inbound request headers, credential values already replaced with\n`[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry\npredates header capture or was written by a path that doesn't record\nthem; an empty map means \"captured, but no headers\", which is different\nand worth being able to tell apart.\n\nA `BTreeMap` rather than a raw `serde_json::Value` so the schema stays\ntyped and the UI gets a stable alphabetical ordering for free.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "request_id": {
             "type": "string"
           },
@@ -30025,6 +30107,19 @@
           },
           "request_source": {
             "type": "string"
+          },
+          "response_headers": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Upstream response headers, redacted on the same terms as\n[`Self::request_headers`].",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "response_size_bytes": {
             "format": "int64",
@@ -43594,7 +43689,7 @@
       "UpgradeRequest": {
         "properties": {
           "image": {
-            "description": "Image reference to pull and run (e.g.\n`ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`). Empty resets to default.",
+            "description": "Image reference to pull and run (e.g.\nan immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).\nEmpty resets to default.",
             "type": "string"
           }
         },
@@ -55703,6 +55798,83 @@
           }
         ],
         "summary": "Get deployment activity graph showing daily deployment counts\nSimilar to GitHub's contribution graph",
+        "tags": [
+          "Deployments"
+        ]
+      }
+    },
+    "/deployments/latest-media": {
+      "get": {
+        "operationId": "get_latest_deployment_media",
+        "parameters": [
+          {
+            "description": "Comma-separated project IDs. At most 100 IDs are accepted.",
+            "in": "query",
+            "name": "project_ids",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LatestDeploymentMediaResponse"
+                }
+              }
+            },
+            "description": "Latest deployment media keyed by project ID"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Invalid project IDs"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permission or project access"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Get the latest deployment URL and screenshot location for multiple projects.",
         "tags": [
           "Deployments"
         ]
@@ -89519,9 +89691,6 @@
             },
             "description": "Domain assignment updated atomically"
           },
-          "400": {
-            "description": "Target environment does not belong to the target project"
-          },
           "401": {
             "description": "Unauthorized"
           },
@@ -89529,7 +89698,7 @@
             "description": "Write access required for both projects"
           },
           "404": {
-            "description": "Custom domain not found"
+            "description": "Custom domain or target environment not found in the authorized project scopes"
           },
           "409": {
             "description": "Domain assignment changed; refresh and retry"
@@ -91104,7 +91273,7 @@
             "bearer_auth": []
           }
         ],
-        "summary": "Get health summaries for multiple projects (last 1 hour)",
+        "summary": "Get user-traffic health summaries for multiple projects (last 1 hour).\nTemps' own status-monitor requests are excluded.",
         "tags": [
           "Proxy Logs"
         ]

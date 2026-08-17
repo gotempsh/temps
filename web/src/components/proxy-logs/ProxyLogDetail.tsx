@@ -30,6 +30,7 @@ import {
   Monitor,
   Network,
   Server,
+  ShieldCheck,
   Smartphone,
   Tablet,
   Zap,
@@ -57,6 +58,62 @@ function formatBytes(bytes: number | null | undefined): string {
   if (bytes < 1024) return `${bytes} B`
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`
   return `${(bytes / (1024 * 1024)).toFixed(2)} MB`
+}
+
+/** Placeholder the backend writes in place of a credential value. */
+const REDACTED = '[REDACTED]'
+
+interface HeaderListProps {
+  title: string
+  headers: { [key: string]: string } | null | undefined
+}
+
+/**
+ * One side of the headers card.
+ *
+ * Renders the empty/absent state explicitly rather than collapsing to nothing:
+ * "no headers stored for this request" and "this request had no headers" look
+ * identical if you render neither, and the first one is a thing an operator
+ * needs to be able to find out.
+ */
+function HeaderList({ title, headers }: HeaderListProps) {
+  const entries = headers ? Object.entries(headers) : []
+
+  return (
+    <div>
+      <div className="flex items-center gap-2 mb-2">
+        <FileText className="h-4 w-4 text-muted-foreground" />
+        <p className="text-sm font-medium">{title}</p>
+        {entries.length > 0 && (
+          <Badge variant="secondary">{entries.length}</Badge>
+        )}
+      </div>
+
+      {entries.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          Not captured for this request.
+        </p>
+      ) : (
+        <div className="bg-muted rounded-md divide-y divide-border overflow-hidden">
+          {entries.map(([name, value]) => (
+            <div
+              key={name}
+              className="grid grid-cols-1 sm:grid-cols-[minmax(0,12rem)_minmax(0,1fr)] gap-1 sm:gap-3 p-2 font-mono text-xs"
+            >
+              <span className="font-medium break-all">{name}</span>
+              {value === REDACTED ? (
+                <span className="text-muted-foreground italic">
+                  {REDACTED}
+                </span>
+              ) : (
+                <span className="break-all">{value}</span>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
 }
 
 function getDeviceIcon(deviceType: string | null | undefined) {
@@ -436,6 +493,26 @@ export function ProxyLogDetail({
               </div>
             </>
           )}
+        </CardContent>
+      </Card>
+
+      {/* Headers — always rendered: an operator needs to be able to tell
+          "this request sent no headers" apart from "we don't store them". */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Network className="h-5 w-5" />
+            Headers
+          </CardTitle>
+          <CardDescription className="flex items-center gap-2">
+            <ShieldCheck className="h-4 w-4 shrink-0" />
+            Credential headers (Cookie, Authorization, API keys) are redacted
+            before storage and are never written to disk.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+          <HeaderList title="Request Headers" headers={log.request_headers} />
+          <HeaderList title="Response Headers" headers={log.response_headers} />
         </CardContent>
       </Card>
 
