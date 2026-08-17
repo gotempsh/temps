@@ -8,8 +8,12 @@ import {
   deleteProject,
   deployFromUploadedSource,
   getEnvironments,
+  getProject,
+  getProjectBySlug,
   inspectDropArchive,
+  updateProjectSettings,
 } from '../../api/sdk.gen.js'
+import type { EnvironmentResponse, ProjectResponse, SourceType } from '../../api/types.gen.js'
 import { requireAuth, config, credentials } from '../../config/store.js'
 import { client, normalizeApiUrl, setupClient } from '../../lib/api-client.js'
 import { watchDeployment } from '../../lib/deployment-watcher.jsx'
@@ -20,6 +24,8 @@ interface DropOptions {
   name?: string
   preset?: string
   directory?: string
+  project?: string
+  environment?: string
   wait?: boolean
   timeout?: string
 }
@@ -84,9 +90,153 @@ export async function zipDirectory(directory: string): Promise<{ data: Buffer; c
   }
 }
 
+/**
+ * Source types that can receive an uploaded archive. Everything else has a
+ * dedicated command, and silently deploying into it would be a surprise.
+ */
+const UPLOADABLE_SOURCE_TYPES: SourceType[] = ['uploaded_source', 'static_files']
+
+const COMMAND_BY_SOURCE_TYPE: Partial<Record<SourceType, string>> = {
+  git: 'deploy',
+  docker_image: 'deploy:image',
+  manual: 'deploy:image',
+}
+
+/** A project's build directory as the API stores it: `.`-relative, no leading `./`. */
+export function normalizeDirectory(directory?: string | null): string {
+  return (directory || '.').replace(/^\.\/+/, '') || '.'
+}
+
+/**
+ * Look up an existing project by slug or numeric ID.
+ *
+ * Only ever called with an explicit `--project` value. It deliberately does
+ * NOT go through `resolveProjectSlug()`, which would also consult
+ * `.temps/config.json`, `TEMPS_PROJECT` and the context default — picking
+ * those up would change what a bare `drop ./` does for anyone who has linked
+ * the directory, turning a create into an overwrite without being asked.
+ */
+async function resolveExistingProject(reference: string): Promise<ProjectResponse> {
+  const numericId = /^\d+$/.test(reference) ? Number.parseInt(reference, 10) : null
+  const result = numericId === null
+    ? await getProjectBySlug({ client, path: { slug: reference } })
+    : await getProject({ client, path: { id: numericId } })
+  if (result.error || !result.data) {
+    throw new Error(`Project "${reference}" not found`)
+  }
+  return result.data as ProjectResponse
+}
+
+/** Reject targets whose deployments come from somewhere other than an upload. */
+export function assertUploadable(project: Pick<ProjectResponse, 'slug' | 'source_type'>): void {
+  if (UPLOADABLE_SOURCE_TYPES.includes(project.source_type)) return
+  const command = COMMAND_BY_SOURCE_TYPE[project.source_type]
+  const alternative = command
+    ? `\nUse: bunx @temps-sdk/cli ${command} --project ${project.slug}`
+    : ''
+  throw new Error(
+    `Project "${project.slug}" deploys from ${project.source_type}, ` +
+    `so it cannot take an uploaded source archive.${alternative}`
+  )
+}
+
+/**
+ * Choose which detected project inside the archive to deploy.
+ *
+ * `--preset`/`--directory` filter, exactly as they always have. When neither
+ * is given and we're targeting an existing project, prefer the candidate that
+ * matches the project's current build directory so a re-drop of the same
+ * folder stays on the same subproject instead of jumping to whichever
+ * candidate the server happened to rank first. Mirrors the console's
+ * `ProjectDrop` page.
+ */
+export function selectCandidate(
+  candidates: Candidate[],
+  options: Pick<DropOptions, 'preset' | 'directory'>,
+  currentDirectory?: string,
+): Candidate | undefined {
+  const matches = candidates.filter((item) =>
+    (!options.preset || item.preset === options.preset) &&
+    (!options.directory || item.directory === options.directory)
+  )
+  if (currentDirectory !== undefined && !options.preset && !options.directory) {
+    const sameDirectory = matches.find(
+      (item) => normalizeDirectory(item.directory) === normalizeDirectory(currentDirectory)
+    )
+    if (sameDirectory) return sameDirectory
+  }
+  return matches[0]
+}
+
+/**
+ * Persist `directory`/`preset` when the archive no longer matches what the
+ * project is configured to build — and nothing else. Ports, resource limits,
+ * environment variables and domains are left alone: re-uploading source is not
+ * an invitation to re-provision the service. Same contract as the console.
+ */
+async function syncBuildConfig(project: ProjectResponse, candidate: Candidate): Promise<void> {
+  const nextDirectory = normalizeDirectory(candidate.directory)
+  const changes = buildConfigChanges(project, candidate)
+  if (changes.length === 0) return
+
+  startSpinner('Updating build configuration...')
+  const updated = await updateProjectSettings({
+    client,
+    path: { project_id: project.id },
+    body: {
+      directory: nextDirectory,
+      preset: candidate.preset,
+      ...(candidate.preset === 'docker-compose' && candidate.composePath
+        ? { preset_config: { composePath: candidate.composePath } }
+        : {}),
+    },
+  })
+  if (updated.error) throw new Error(JSON.stringify(updated.error))
+  succeedSpinner(`Build config updated: ${changes.join(', ')}`)
+}
+
+/** Human-readable list of what re-detection would change about the project. */
+export function buildConfigChanges(
+  project: Pick<ProjectResponse, 'directory' | 'preset'>,
+  candidate: Pick<Candidate, 'directory' | 'preset'>,
+): string[] {
+  const changes: string[] = []
+  const nextDirectory = normalizeDirectory(candidate.directory)
+  const currentDirectory = normalizeDirectory(project.directory)
+  if (nextDirectory !== currentDirectory) {
+    changes.push(`directory ${currentDirectory} → ${nextDirectory}`)
+  }
+  if (candidate.preset !== project.preset) {
+    changes.push(`preset ${project.preset || 'none'} → ${candidate.preset}`)
+  }
+  return changes
+}
+
+/** Pick the target environment for an existing project, honouring `--environment`. */
+export function selectEnvironment(
+  environments: EnvironmentResponse[],
+  wanted: string | undefined,
+  projectSlug: string,
+): EnvironmentResponse {
+  if (wanted) {
+    const named = environments.find((item) => item.name === wanted)
+    if (named) return named
+    const available = environments.map((item) => item.name).join(', ') || 'none'
+    throw new Error(
+      `Project "${projectSlug}" has no environment named "${wanted}" (available: ${available})`
+    )
+  }
+  const fallback = environments.find((item) => item.name === 'production') || environments[0]
+  if (!fallback) throw new Error(`Project "${projectSlug}" has no environments`)
+  return fallback
+}
+
 export async function drop(path: string, options: DropOptions): Promise<void> {
   await requireAuth()
   await setupClient()
+  if (options.environment && !options.project) {
+    throw new Error('--environment requires --project: a newly created project only has production')
+  }
   const sourcePath = resolve(path)
   if (!existsSync(sourcePath)) throw new Error(`Path does not exist: ${sourcePath}`)
 
@@ -129,52 +279,75 @@ export async function drop(path: string, options: DropOptions): Promise<void> {
       throw new Error(JSON.stringify(inspected.error || 'Preset inspection returned no data'))
     }
     const inspection = inspected.data as Inspection
-    const candidate = inspection.candidates.find((item) =>
-      (!options.preset || item.preset === options.preset) &&
-      (!options.directory || item.directory === options.directory)
+
+    // `--project` targets a project that already exists; without it the
+    // command creates one, exactly as it always has.
+    const existing = options.project ? await resolveExistingProject(options.project) : null
+    if (existing) assertUploadable(existing)
+
+    const candidate = selectCandidate(
+      inspection.candidates,
+      options,
+      existing ? existing.directory : undefined,
     )
     if (!candidate) throw new Error('No detected project matches --preset/--directory')
     succeedSpinner(`${candidate.label} (${candidate.confidence}): ${candidate.reason}`)
 
-    const name = slugName(options.name || inspection.suggestedName || basename(sourcePath))
-    startSpinner(`Creating project ${name}...`)
-    const created = await createProject({
-      client,
-      body: {
-        name,
-        directory: candidate.directory,
-        main_branch: 'main',
-        preset: candidate.preset,
-        source_type: candidate.isStatic ? 'static_files' : 'uploaded_source',
-        automatic_deploy: false,
-        storage_service_ids: [],
-        preset_config:
-          candidate.preset === 'docker-compose' && candidate.composePath
-            ? { composePath: candidate.composePath }
-            : undefined,
-      },
-    })
-    if (created.error || !created.data) throw new Error(JSON.stringify(created.error || 'Project creation returned no data'))
-    projectId = created.data.id
+    let target: { id: number; slug: string }
+    let environment: EnvironmentResponse
+    if (existing) {
+      await syncBuildConfig(existing, candidate)
+      target = existing
 
-    const environments = await getEnvironments({ client, path: { project_id: projectId } })
-    const environmentList = Array.isArray(environments.data) ? environments.data : []
-    const environment = environmentList.find((item) => item.name === 'production') || environmentList[0]
-    if (!environment) throw new Error('Created project has no environment')
-    succeedSpinner(`Created ${created.data.slug}`)
+      const environments = await getEnvironments({ client, path: { project_id: existing.id } })
+      const environmentList = Array.isArray(environments.data) ? environments.data : []
+      environment = selectEnvironment(environmentList, options.environment, existing.slug)
+      info(`Deploying into ${existing.slug} (${environment.name})`)
+    } else {
+      const name = slugName(options.name || inspection.suggestedName || basename(sourcePath))
+      startSpinner(`Creating project ${name}...`)
+      const created = await createProject({
+        client,
+        body: {
+          name,
+          directory: candidate.directory,
+          main_branch: 'main',
+          preset: candidate.preset,
+          source_type: candidate.isStatic ? 'static_files' : 'uploaded_source',
+          automatic_deploy: false,
+          storage_service_ids: [],
+          preset_config:
+            candidate.preset === 'docker-compose' && candidate.composePath
+              ? { composePath: candidate.composePath }
+              : undefined,
+        },
+      })
+      if (created.error || !created.data) throw new Error(JSON.stringify(created.error || 'Project creation returned no data'))
+      // Set only for projects this command created — the rollback below must
+      // never delete a project the user already had.
+      projectId = created.data.id
+      target = created.data
+
+      const environments = await getEnvironments({ client, path: { project_id: projectId } })
+      const environmentList = Array.isArray(environments.data) ? environments.data : []
+      const firstEnvironment = environmentList.find((item) => item.name === 'production') || environmentList[0]
+      if (!firstEnvironment) throw new Error('Created project has no environment')
+      environment = firstEnvironment
+      succeedSpinner(`Created ${created.data.slug}`)
+    }
 
     startSpinner(candidate.isStatic ? 'Uploading static site...' : 'Uploading source and starting deployment...')
     const deployForm = new FormData()
     deployForm.append('file', archive, 'source.zip')
     let deployment: { id: number; slug: string }
     if (candidate.isStatic) {
-      const upload = await fetch(`${apiUrl}/projects/${projectId}/upload/static`, {
+      const upload = await fetch(`${apiUrl}/projects/${target.id}/upload/static`, {
         method: 'POST', headers, body: deployForm,
       })
       if (!upload.ok) throw new Error(await upload.text())
       const bundle = (await upload.json()) as { id: number }
       const response = await fetch(
-        `${apiUrl}/projects/${projectId}/environments/${environment.id}/deploy/static`,
+        `${apiUrl}/projects/${target.id}/environments/${environment.id}/deploy/static`,
         {
           method: 'POST',
           headers: { ...headers, 'Content-Type': 'application/json' },
@@ -186,7 +359,7 @@ export async function drop(path: string, options: DropOptions): Promise<void> {
     } else {
       const sourceDeployment = await deployFromUploadedSource({
         client,
-        path: { project_id: projectId, environment_id: environment.id },
+        path: { project_id: target.id, environment_id: environment.id },
         body: { file: new File([archive], 'source.zip', { type: 'application/zip' }) },
       })
       if (sourceDeployment.error || !sourceDeployment.data) {
@@ -195,13 +368,13 @@ export async function drop(path: string, options: DropOptions): Promise<void> {
       deployment = sourceDeployment.data
     }
     succeedSpinner(`Deployment started: ${deployment.slug}`)
-    info(`Dashboard: ${config.get('apiUrl').replace(/\/api\/?$/, '')}/projects/${created.data.slug}/deployments/${deployment.id}`)
+    info(`Dashboard: ${config.get('apiUrl').replace(/\/api\/?$/, '')}/projects/${target.slug}/deployments/${deployment.id}`)
     if (options.wait !== false) {
       const result = await watchDeployment({
-        projectId,
+        projectId: target.id,
         deploymentId: deployment.id,
         timeoutSecs: Number(options.timeout || '600'),
-        projectName: created.data.slug,
+        projectName: target.slug,
       })
       if (!result.success) process.exitCode = 1
     } else {
