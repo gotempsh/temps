@@ -2626,7 +2626,7 @@ mod tests {
                 8210,
             )
             .as_deref(),
-            Some("http://admin-awesome-compose-nextcloud-postgres-production.localho.st:3013")
+            Some("http://admin--awesome-compose-nextcloud-postgres-production.localho.st:3013")
         );
         assert_eq!(
             public_compose_service_url(

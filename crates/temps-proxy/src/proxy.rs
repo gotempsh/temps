@@ -385,6 +385,12 @@ pub const LOG_STATIC_ASSETS: bool = false;
 /// Encrypt validation can never be redirected out from under the CA.
 pub const ACME_HTTP01_PREFIX: &str = "/.well-known/acme-challenge/";
 
+/// Path prefix for control-plane↔node cluster management (registration,
+/// heartbeat, DNS sync). A worker joining the cluster speaks plaintext HTTP
+/// before any TLS material exists, so these calls must never be answered with
+/// a redirect to a certificate that has not been issued yet.
+pub const INTERNAL_CLUSTER_PREFIX: &str = "/api/internal/";
+
 /// Decide whether a request on the plain-HTTP listener should be answered with
 /// a 301 to the HTTPS URL.
 ///
@@ -445,23 +451,32 @@ fn inherited_https_policy(production_https: bool, host_has_cert: bool) -> bool {
 /// configured -> treat every host as production) should even be consulted for
 /// this request.
 ///
-/// Scoped to resolved project traffic only (`has_environment`): requests whose
-/// `Host` never matched a project domain — the admin/console UI, and internal
-/// cluster-management API calls such as node registration/heartbeat — must
-/// never be redirected off this default. Cluster bootstrap traffic runs over
-/// plaintext HTTP by design, before any TLS material exists to redirect to.
+/// Scoped to resolved project traffic (`has_environment`) **and to the console
+/// host itself** (`is_console_host`). An unresolved `Host` is routed to the
+/// console as the fallback upstream, so exempting every unresolved host from
+/// the default meant the management surface — the one place credentials and
+/// session cookies are typed — was the only surface served over plaintext, and
+/// the console then minted cookies with `Secure` derived from
+/// `X-Forwarded-Proto: http`.
+///
+/// The exemption that motivated the original scoping survives as a narrower
+/// rule: internal cluster-management calls (node registration, heartbeat) run
+/// over plaintext HTTP by design, before any TLS material exists to redirect
+/// to, so [`INTERNAL_CLUSTER_PREFIX`] is never redirected.
 fn should_apply_production_https_default(
     disable_https_redirect: bool,
     is_tls: bool,
     path: &str,
     env_force_https: Option<bool>,
     has_environment: bool,
+    is_console_host: bool,
 ) -> bool {
     !disable_https_redirect
         && !is_tls
         && !path.starts_with(ACME_HTTP01_PREFIX)
+        && !path.starts_with(INTERNAL_CLUSTER_PREFIX)
         && env_force_https.is_none()
-        && has_environment
+        && (has_environment || is_console_host)
 }
 
 #[cfg(test)]
@@ -486,44 +501,69 @@ mod deployment_asset_scope_tests {
     }
 
     #[test]
-    fn production_https_default_never_applies_without_a_resolved_environment() {
-        // Unresolved Host (admin/console UI, internal cluster API like node
-        // registration) — must not be redirected even though every other gate
-        // would otherwise allow it.
+    fn production_https_default_applies_to_the_console_host() {
+        // The console is the one surface where credentials are typed, and an
+        // unresolved Host is routed to it as the fallback upstream — so it
+        // must get the production default even with no environment.
+        assert!(should_apply_production_https_default(
+            false, false, "/login", None, false, true
+        ));
+        // A genuinely unknown host that is not the console gets nothing.
+        assert!(!should_apply_production_https_default(
+            false, false, "/login", None, false, false
+        ));
+        // Resolved project traffic still applies regardless.
+        assert!(should_apply_production_https_default(
+            false, false, "/", None, true, false
+        ));
+    }
+
+    /// Cluster bootstrap speaks plaintext HTTP before any TLS material
+    /// exists, so internal node calls are never redirected — including on the
+    /// console host, which is exactly where a worker registers.
+    #[test]
+    fn production_https_default_never_applies_to_internal_cluster_calls() {
         assert!(!should_apply_production_https_default(
             false,
             false,
             "/api/internal/nodes/register",
             None,
-            false
+            false,
+            true
         ));
-        // Resolved project traffic with everything else the same — applies.
-        assert!(should_apply_production_https_default(
-            false, false, "/", None, true
+        assert!(!should_apply_production_https_default(
+            false,
+            false,
+            "/api/internal/nodes/1/heartbeat",
+            None,
+            true,
+            false
         ));
     }
 
     #[test]
     fn production_https_default_respects_the_other_gates() {
         assert!(!should_apply_production_https_default(
-            true, false, "/", None, true
+            true, false, "/", None, true, false
         ));
         assert!(!should_apply_production_https_default(
-            false, true, "/", None, true
+            false, true, "/", None, true, false
         ));
         assert!(!should_apply_production_https_default(
             false,
             false,
             "/.well-known/acme-challenge/token",
             None,
-            true
+            true,
+            false
         ));
         assert!(!should_apply_production_https_default(
             false,
             false,
             "/",
             Some(false),
-            true
+            true,
+            false
         ));
     }
 }
@@ -4487,12 +4527,42 @@ impl ProxyHttp for LoadBalancer {
         // WS3: cert-host check is now a lock-free ArcSwap snapshot read; the
         // background `CertHostCache::run_refresh_loop` keeps it current (±30 s).
         let env_force_https = ctx.environment.as_ref().and_then(|env| env.force_https);
+        // An unresolved Host falls through to the console upstream, so the
+        // console hostname has to opt back in to the production default — it
+        // is where credentials are typed and where session cookies get their
+        // `Secure` flag from `X-Forwarded-Proto`. Only consulted when the host
+        // did not resolve to an environment, and `get_settings` is TTL-cached,
+        // so this adds nothing to the hot path.
+        let is_console_host = if ctx.environment.is_none() {
+            match self.config_service.get_settings().await {
+                Ok(settings) => {
+                    let request_host = ctx
+                        .host
+                        .split(':')
+                        .next()
+                        .unwrap_or(&ctx.host)
+                        .trim_end_matches('.')
+                        .to_ascii_lowercase();
+                    settings.console_hostname().as_deref() == Some(request_host.as_str())
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Failed to read app settings; treating host as the console for HTTPS policy"
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
         let production_https = if should_apply_production_https_default(
             self.disable_https_redirect,
             self.is_tls_connection(session),
             &ctx.path,
             env_force_https,
             ctx.environment.is_some(),
+            is_console_host,
         ) {
             match self.config_service.get_url_scheme().await {
                 Ok(scheme) => scheme != "http",
