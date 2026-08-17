@@ -79,6 +79,12 @@ pub enum FailureReportError {
 
     #[error("Deployment lookup failed: {0}")]
     Deployment(#[from] DeploymentError),
+
+    #[error(
+        "Outbound failure reporting is disabled on this instance (TEMPS_TELEMETRY opt-out); \
+         no report was sent"
+    )]
+    ReportingDisabled,
 }
 
 /// A redacted, user-editable preview of a failed deployment's trace.
@@ -113,6 +119,11 @@ pub struct FailureReportService {
     encryption_service: Arc<EncryptionService>,
     client: reqwest::Client,
     endpoint: String,
+    /// Whether this instance may send reports outbound at all. Read once at
+    /// construction from the same `TEMPS_TELEMETRY` opt-out the preview
+    /// reports, and enforced in `send_report` so the opt-out holds for direct
+    /// API callers, not only for clients that respect the preview's flag.
+    reporting_enabled: bool,
 }
 
 impl FailureReportService {
@@ -143,6 +154,7 @@ impl FailureReportService {
             encryption_service,
             client,
             endpoint,
+            reporting_enabled: Self::reporting_enabled_from_env(),
         })
     }
 
@@ -317,6 +329,16 @@ impl FailureReportService {
         job_id: &str,
         report_text: &str,
     ) -> Result<(), FailureReportError> {
+        // Enforce the opt-out here, not just in the preview. `reporting_enabled`
+        // was only used to decide whether the UI offered the action, so an
+        // operator who set TEMPS_TELEMETRY=0 to stop all outbound reporting
+        // could still have deployment logs POSTed to the central endpoint by
+        // anyone with DeploymentsRead calling this route directly. The opt-out
+        // has to hold at the point the request would actually leave the box.
+        if !self.reporting_enabled {
+            return Err(FailureReportError::ReportingDisabled);
+        }
+
         let jobs = self.jobs_up_to(project_id, deployment_id, job_id).await?;
         let failed_job = jobs.last().expect("jobs_up_to always returns >= 1 job");
         let secrets = self.known_secret_values(&jobs);
@@ -365,6 +387,30 @@ mod tests {
         std::env::set_var("TEMPS_TELEMETRY", "0");
         assert!(!FailureReportService::reporting_enabled_from_env());
         std::env::remove_var("TEMPS_TELEMETRY");
+    }
+
+    /// The opt-out has to be enforced where the request would leave the box,
+    /// not only where the UI decides whether to offer the button. Before this,
+    /// TEMPS_TELEMETRY=0 only cleared a flag in the preview response, so any
+    /// caller with DeploymentsRead could still POST deployment logs to the
+    /// central endpoint by calling the send route directly.
+    #[test]
+    fn send_report_is_refused_when_reporting_is_disabled() {
+        // The construction path reads the same env var the preview reports, so
+        // an instance built under the opt-out carries reporting_enabled = false.
+        std::env::set_var("TEMPS_TELEMETRY", "0");
+        let disabled = FailureReportService::reporting_enabled_from_env();
+        std::env::remove_var("TEMPS_TELEMETRY");
+        assert!(!disabled);
+
+        // And that state maps to a refusal the client can render, not a 500.
+        let problem: temps_core::problemdetails::Problem =
+            FailureReportError::ReportingDisabled.into();
+        use axum::response::IntoResponse;
+        assert_eq!(
+            problem.into_response().status(),
+            axum::http::StatusCode::FORBIDDEN
+        );
     }
 
     #[test]

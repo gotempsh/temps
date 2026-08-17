@@ -137,6 +137,16 @@ impl From<FailureReportError> for Problem {
                 .with_detail(format!(
                     "Failed to send failure report for deployment {deployment_id}: {reason}"
                 )),
+            // 403, not 500: the request was well-formed and the caller was
+            // authorised — the operator has switched the capability off, and
+            // the client should say so rather than offering a retry.
+            FailureReportError::ReportingDisabled => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Failure Reporting Disabled")
+                .with_detail(
+                    "This instance has outbound failure reporting disabled (TEMPS_TELEMETRY \
+                     opt-out). No report was sent. You can still open a GitHub issue from the \
+                     deployment's failure view — that path never contacts a Temps server.",
+                ),
             FailureReportError::Deployment(deployment_error) => deployment_error.into(),
         }
     }

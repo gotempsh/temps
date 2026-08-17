@@ -321,27 +321,8 @@ impl JoinCommand {
             register_response.id
         );
 
-        // Verify the cluster CA out of band before trusting it (ADR-020 WS-2.2):
-        // if the operator passed the expected fingerprint, the CA the control
-        // plane returned must match it, or a MITM could have swapped its own CA.
-        if let Some(expected) = self.ca_fingerprint.as_deref() {
-            match register_response.ca_cert_pem.as_deref() {
-                Some(ca_pem) => {
-                    let actual = temps_core::node_pki::ca_fingerprint_sha256(ca_pem)
-                        .map_err(|e| anyhow::anyhow!("could not fingerprint received CA: {e}"))?;
-                    if !actual.eq_ignore_ascii_case(expected.trim()) {
-                        anyhow::bail!(
-                            "Cluster CA fingerprint mismatch — expected {expected}, got {actual}. \
-                             Aborting join (possible man-in-the-middle)."
-                        );
-                    }
-                    println!("Cluster CA fingerprint verified.");
-                }
-                None => anyhow::bail!(
-                    "--ca-fingerprint was provided but the control plane returned no CA certificate."
-                ),
-            }
-        }
+        // Verify the cluster CA out of band before trusting it (ADR-020 WS-2.2).
+        self.verify_ca_fingerprint(&register_response)?;
 
         // Persist the signed leaf + cluster CA so `temps agent` can serve mTLS.
         let tls_paths = persist_tls(&tls_material, &register_response);
@@ -513,6 +494,10 @@ impl JoinCommand {
         };
         let node_id = register_response.id;
 
+        // Pin the CA *before* persisting any of it: `persist_tls` writes the
+        // returned CA to disk and `temps agent` then trusts it for mTLS.
+        self.verify_ca_fingerprint(&register_response)?;
+
         println!(
             "Registered with control plane successfully (node_id={}).",
             node_id
@@ -539,6 +524,40 @@ impl JoinCommand {
         println!("Run 'temps agent' to start the worker.");
 
         Ok(())
+    }
+
+    /// Check the cluster CA the control plane returned against the
+    /// out-of-band fingerprint the operator passed with `--ca-fingerprint`.
+    ///
+    /// Called from **both** join paths. It used to live inline in
+    /// `join_direct` only, so an operator following the documented enrollment
+    /// flow could run `temps join --ca-fingerprint ...` in the default relay
+    /// mode and still silently persist whatever CA a malicious relay or a
+    /// MITM'd registration endpoint returned — exactly the pinning the flag
+    /// exists to provide. A missing CA is a hard failure too: "no certificate
+    /// returned" must not be quietly treated as "nothing to verify".
+    fn verify_ca_fingerprint(&self, register_response: &RegisterResponse) -> anyhow::Result<()> {
+        let Some(expected) = self.ca_fingerprint.as_deref() else {
+            return Ok(());
+        };
+
+        match register_response.ca_cert_pem.as_deref() {
+            Some(ca_pem) => {
+                let actual = temps_core::node_pki::ca_fingerprint_sha256(ca_pem)
+                    .map_err(|e| anyhow::anyhow!("could not fingerprint received CA: {e}"))?;
+                if !actual.eq_ignore_ascii_case(expected.trim()) {
+                    anyhow::bail!(
+                        "Cluster CA fingerprint mismatch — expected {expected}, got {actual}. \
+                         Aborting join (possible man-in-the-middle)."
+                    );
+                }
+                println!("Cluster CA fingerprint verified.");
+                Ok(())
+            }
+            None => anyhow::bail!(
+                "--ca-fingerprint was provided but the control plane returned no CA certificate."
+            ),
+        }
     }
 
     fn parse_labels(&self) -> serde_json::Value {
