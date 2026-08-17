@@ -386,11 +386,11 @@ Si Temps vous fait économiser un abonnement SaaS, [une étoile](https://github.
 
 ## Historique des étoiles
 
-<a href="https://www.star-history.com/#gotempsh/temps&Date">
+<a href="https://star-history.dera.page/#gotempsh/temps&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
-    <img alt="Graphique de l'historique des étoiles" src="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
+    <img alt="Graphique de l'historique des étoiles" src="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
   </picture>
 </a>
 
