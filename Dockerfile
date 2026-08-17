@@ -128,7 +128,7 @@ COPY crates/temps-cli/GeoLite2-City.mmdb /GeoLite2-City.mmdb
 FROM ${TEMPS_ARTIFACTS} AS artifacts
 
 # Stage 3: Runtime
-FROM alpine:3.20
+FROM alpine:3.22
 
 # Install runtime dependencies
 RUN apk add --no-cache \
