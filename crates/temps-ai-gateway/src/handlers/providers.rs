@@ -50,6 +50,46 @@ impl From<AiGatewayError> for Problem {
             AiGatewayError::ModelNotAllowed { .. } => problemdetails::new(StatusCode::FORBIDDEN)
                 .with_title("Model Not Allowed")
                 .with_detail(error.to_string()),
+            AiGatewayError::RateLimitExceeded { .. } => {
+                problemdetails::new(StatusCode::TOO_MANY_REQUESTS)
+                    .with_title("AI Gateway Rate Limit Exceeded")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::MonthlyBudgetExceeded { .. } => {
+                problemdetails::new(StatusCode::PAYMENT_REQUIRED)
+                    .with_title("AI Gateway Budget Exceeded")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::PricingUnavailable { .. } => {
+                problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                    .with_title("AI Gateway Pricing Unavailable")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::BudgetRequiresMaxTokens { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("AI Gateway max_tokens Required")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::BudgetProjectionUnavailable { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Unsupported Budgeted AI Input")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::InvalidGovernanceConfig { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid AI Gateway Configuration")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::InvalidGovernanceScope { .. } => {
+                problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid AI Gateway Scope")
+                    .with_detail(error.to_string())
+            }
+            AiGatewayError::GovernanceConfigNotFound { .. } => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("AI Gateway Configuration Not Found")
+                    .with_detail(error.to_string())
+            }
             AiGatewayError::UpstreamError { status, .. } => {
                 let http_status = StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY);
                 problemdetails::new(http_status)

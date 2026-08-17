@@ -121,3 +121,5 @@ If a signal never appears, check whether the SDK was actually initialized, then 
 ## Everything else
 
 Beyond the runtime health contract and observability guidance above, deployment, service/database provisioning, environment variables, domains, monitoring config, backups, and CI/CD automation are all reached through the Temps CLI (`bunx @temps-sdk/cli`). Use the **temps-cli** skill for those operations.
+
+If an app calls the Temps AI Gateway (deployment-token-attributed AI provider requests), set a monthly cost budget and RPM limit for its project/environment/token scope before it goes live — an unconfigured scope has no spend ceiling. Configure and review these limits via the CLI's AI gateway governance commands (see the **temps-cli** skill) or the AI Gateway → Governance tab in the console.

@@ -10442,6 +10442,7 @@ dependencies = [
  "temps-auth",
  "temps-config",
  "temps-core",
+ "temps-database",
  "temps-entities",
  "thiserror 2.0.20",
  "tokio",

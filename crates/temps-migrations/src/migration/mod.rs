@@ -192,6 +192,10 @@ mod m20260814_000002_add_ai_summary_preference;
 mod m20260815_000001_add_facet_attr_columns_to_otel_spans;
 mod m20260815_000001_default_preview_inclusion_off;
 mod m20260816_000001_add_image_retention_hours;
+// Same date/sequence stamp as the image-retention migration above: this
+// branch was authored independently and reapplied after main moved. Ordering
+// in `migrations()` below (not this timestamp) determines apply order.
+pub mod m20260816_000001_add_ai_governance_tables;
 mod m20260817_000001_add_system_dimension_to_proxy_stats;
 mod m20260817_000001_index_deployments_retention_scan;
 
@@ -425,6 +429,9 @@ impl MigratorTrait for Migrator {
             // migration with the same date and sequence stamp.
             Box::new(m20260817_000001_add_system_dimension_to_proxy_stats::Migration),
             Box::new(m20260817_000001_index_deployments_retention_scan::Migration),
+            // Independently authored, reapplied after the migrations above
+            // landed on main -- registered last so it runs after all of them.
+            Box::new(m20260816_000001_add_ai_governance_tables::Migration),
         ]
     }
 }

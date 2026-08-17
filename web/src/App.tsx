@@ -353,6 +353,11 @@ const AiGatewaySetupPage = lazy(() =>
     default: m.AiGatewaySetupPage,
   }))
 )
+const AiGatewayGovernancePage = lazy(() =>
+  import('./pages/AiGatewayGovernancePage').then((m) => ({
+    default: m.AiGatewayGovernancePage,
+  }))
+)
 
 const AiChat = lazy(() =>
   import('./pages/AiChat').then((m) => ({
@@ -729,6 +734,10 @@ const FullAppRoutes = () => {
                     <Route
                       path="/ai-gateway/setup"
                       element={<AiGatewaySetupPage />}
+                    />
+                    <Route
+                      path="/ai-gateway/governance"
+                      element={<AiGatewayGovernancePage />}
                     />
                     <Route path="/chat" element={<AiChat />} />
                     <Route

@@ -1,7 +1,10 @@
-import { Fragment, useMemo, useState } from 'react'
+import { Fragment, useEffect, useMemo, useState } from 'react'
 import { Link, useSearchParams } from 'react-router'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
+import { useForm, useWatch } from 'react-hook-form'
+import { zodResolver } from '@hookform/resolvers/zod'
+import { z } from 'zod'
 import {
   Card,
   CardContent,
@@ -79,6 +82,37 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import {
+  Form,
+  FormControl,
+  FormField,
+  FormItem,
+  FormLabel,
+  FormMessage,
+} from '@/components/ui/form'
+import { Checkbox } from '@/components/ui/checkbox'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import {
+  Popover,
+  PopoverContent,
+  PopoverTrigger,
+} from '@/components/ui/popover'
+import {
+  Command,
+  CommandEmpty,
+  CommandInput,
+  CommandItem,
+  CommandList,
+} from '@/components/ui/command'
+import {
   Plus,
   Trash2,
   Loader2,
@@ -94,6 +128,7 @@ import {
   ChevronLeft,
   ChevronRight,
   ChevronDown,
+  ChevronsUpDown,
   ListTree,
   ArrowLeft,
   SlidersHorizontal,
@@ -107,6 +142,9 @@ import {
   Hash,
   Info,
   RefreshCw,
+  ShieldCheck,
+  Save,
+  Check,
 } from 'lucide-react'
 import { toast } from 'sonner'
 import { AI_CLI_PROVIDER_SHELL } from '@/lib/ai-cli-providers'
@@ -124,6 +162,8 @@ import {
   saveAiProviderCredential,
   type ProviderKeyResponse,
   type ProviderCatalogDto,
+  type ProjectResponse,
+  type EnvironmentResponse,
 } from '@/api/client'
 import {
   getAiProviderStatusOptions,
@@ -133,6 +173,13 @@ import {
   listAiProvidersOptions,
   listAiProvidersQueryKey,
   refreshAiProviderStatusMutation,
+  getProjectsOptions,
+  getEnvironmentsOptions,
+  getPricingOptions,
+  listGovernanceConfigsOptions,
+  listGovernanceConfigsQueryKey,
+  upsertGovernanceConfigMutation,
+  deleteGovernanceConfigMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import { useSettings } from '@/hooks/useSettings'
 import { useProjects } from '@/contexts/ProjectsContext'
@@ -5159,6 +5206,679 @@ console.log(response.choices[0].message.content);`,
         onConfirm={(id) => deleteMutation.mutate(id)}
         isPending={deleteMutation.isPending}
       />
+    </div>
+  )
+}
+
+// ── GovernanceSettings ──────────────────────────────────────────────
+//
+// Per-scope (instance/project/environment) model allowlists, RPM limits, and
+// monthly cost budgets. Reads/writes GovernanceConfigResponse rows via
+// /ai/governance. Listing is gated behind AiGatewayWrite server-side (it
+// exposes budget and allowlist details, so it uses the same operator-only
+// permission as mutations) -- a 403 here means "no permission", not "not
+// found", so it gets its own explanatory state rather than a blank panel.
+
+const GOVERNANCE_SCOPE_KINDS = [
+  { value: 'instance', label: 'Instance (global default)' },
+  { value: 'project', label: 'Project' },
+  { value: 'environment', label: 'Environment' },
+] as const
+
+type GovernanceScopeKind = (typeof GOVERNANCE_SCOPE_KINDS)[number]['value']
+
+const governanceFormSchema = z.object({
+  restrictModels: z.boolean(),
+  selectedModels: z.array(z.string()),
+  maxRequestsPerMinute: z
+    .string()
+    .refine((v) => v === '' || (Number.isInteger(Number(v)) && Number(v) > 0), {
+      message: 'Must be a positive whole number',
+    }),
+  maxCostPerMonth: z
+    .string()
+    .refine((v) => v === '' || (Number.isFinite(Number(v)) && Number(v) >= 0), {
+      message: 'Must be a non-negative dollar amount',
+    }),
+})
+
+type GovernanceFormValues = z.infer<typeof governanceFormSchema>
+
+/**
+ * "instance" | "project:7" | "environment:12" -> a human label using
+ * whatever project/environment names are already loaded on this page. Falls
+ * back to the raw scope id rather than fabricating a name for data that
+ * hasn't been fetched (e.g. an environment override for a project other than
+ * the one currently selected).
+ */
+function governanceScopeLabel(
+  scope: string,
+  projects: ProjectResponse[],
+  environments: EnvironmentResponse[]
+): string {
+  if (scope === 'instance') return 'Instance (global default)'
+  const [kind, idStr] = scope.split(':')
+  const id = Number(idStr)
+  if (kind === 'project') {
+    return projects.find((p) => p.id === id)?.name ?? `Project #${id}`
+  }
+  if (kind === 'environment') {
+    return environments.find((e) => e.id === id)?.name ?? `Environment #${id}`
+  }
+  if (kind === 'token') return `Deployment token #${id}`
+  return scope
+}
+
+function governanceMonthStartIso(): string {
+  const now = new Date()
+  return new Date(
+    Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1)
+  ).toISOString()
+}
+
+function isInsufficientPermissionsError(error: unknown): boolean {
+  return (
+    !!error &&
+    typeof error === 'object' &&
+    (error as { type?: string }).type ===
+      'https://temps.sh/probs/insufficient-permissions'
+  )
+}
+
+export function GovernanceSettings() {
+  const queryClient = useQueryClient()
+
+  const [scopeKind, setScopeKind] = useState<GovernanceScopeKind>('instance')
+  const [selectedProjectId, setSelectedProjectId] = useState<
+    number | undefined
+  >(undefined)
+  const [selectedEnvironmentId, setSelectedEnvironmentId] = useState<
+    number | undefined
+  >(undefined)
+  const [modelPickerOpen, setModelPickerOpen] = useState(false)
+  const [removeDialogOpen, setRemoveDialogOpen] = useState(false)
+
+  const { data: projectsData, isLoading: projectsLoading } = useQuery(
+    getProjectsOptions({ query: { page: 1, per_page: 100 } })
+  )
+  const projects = useMemo(() => projectsData?.projects ?? [], [projectsData])
+
+  const { data: environmentsData, isLoading: environmentsLoading } = useQuery({
+    ...getEnvironmentsOptions({
+      path: { project_id: selectedProjectId ?? 0 },
+    }),
+    enabled: scopeKind === 'environment' && !!selectedProjectId,
+  })
+  const environments = useMemo(() => environmentsData ?? [], [environmentsData])
+
+  const scope = useMemo(() => {
+    if (scopeKind === 'instance') return 'instance'
+    if (scopeKind === 'project') {
+      return selectedProjectId ? `project:${selectedProjectId}` : undefined
+    }
+    return selectedEnvironmentId
+      ? `environment:${selectedEnvironmentId}`
+      : undefined
+  }, [scopeKind, selectedProjectId, selectedEnvironmentId])
+
+  const {
+    data: configs,
+    isLoading: configsLoading,
+    isError: configsIsError,
+    error: configsError,
+  } = useQuery(listGovernanceConfigsOptions())
+
+  const existingConfig = useMemo(
+    () => configs?.find((c) => c.scope === scope),
+    [configs, scope]
+  )
+
+  const { data: pricing } = useQuery({
+    ...getPricingOptions(),
+    staleTime: 60 * 60 * 1000,
+  })
+  const allModels = useMemo(() => {
+    const set = new Set<string>()
+    for (const m of pricing?.models ?? []) set.add(m.model)
+    return Array.from(set).sort()
+  }, [pricing])
+
+  const form = useForm<GovernanceFormValues>({
+    resolver: zodResolver(governanceFormSchema),
+    defaultValues: {
+      restrictModels: false,
+      selectedModels: [],
+      maxRequestsPerMinute: '',
+      maxCostPerMonth: '',
+    },
+  })
+  const { reset: resetForm, control: formControl } = form
+  const restrictModels = useWatch({
+    control: formControl,
+    name: 'restrictModels',
+  })
+  const selectedModels = useWatch({
+    control: formControl,
+    name: 'selectedModels',
+  })
+
+  // Re-sync the draft form whenever the selected scope (or its saved config)
+  // changes -- switching scopes must not carry over the previous scope's
+  // draft values. `reset` only touches react-hook-form's own internal store,
+  // not React state, so this doesn't cascade renders the way a raw setState
+  // call in an effect would.
+  useEffect(() => {
+    resetForm({
+      restrictModels: existingConfig?.allowed_models != null,
+      selectedModels: existingConfig?.allowed_models ?? [],
+      maxRequestsPerMinute:
+        existingConfig?.max_requests_per_minute != null
+          ? String(existingConfig.max_requests_per_minute)
+          : '',
+      maxCostPerMonth:
+        existingConfig?.max_cost_per_month_microcents != null
+          ? String(existingConfig.max_cost_per_month_microcents / 100_000_000)
+          : '',
+    })
+  }, [existingConfig, scope, resetForm])
+
+  const monthStart = useMemo(() => governanceMonthStartIso(), [])
+  const { data: monthSummary, isLoading: spendLoading } = useQuery({
+    queryKey: [
+      'aiUsage',
+      'summary',
+      'governance-month',
+      monthStart,
+      scopeKind,
+      selectedProjectId,
+      selectedEnvironmentId,
+    ],
+    queryFn: () =>
+      fetchJson<UsageSummary>(
+        buildUsageUrl('summary', {
+          from: monthStart,
+          to: new Date().toISOString(),
+          project_id:
+            scopeKind === 'project' || scopeKind === 'environment'
+              ? selectedProjectId?.toString()
+              : undefined,
+          environment_id:
+            scopeKind === 'environment'
+              ? selectedEnvironmentId?.toString()
+              : undefined,
+        })
+      ),
+    enabled: scopeKind === 'instance' || !!scope,
+  })
+
+  const upsertMutation = useMutation({
+    ...upsertGovernanceConfigMutation(),
+    meta: { errorTitle: 'Failed to save governance policy' },
+    onSuccess: (_data, variables) => {
+      queryClient.invalidateQueries({
+        queryKey: listGovernanceConfigsQueryKey(),
+      })
+      toast.success(`Limits saved for ${variables.path.scope}`)
+    },
+  })
+
+  const deleteMutation = useMutation({
+    ...deleteGovernanceConfigMutation(),
+    meta: { errorTitle: 'Failed to remove governance policy' },
+    onSuccess: () => {
+      queryClient.invalidateQueries({
+        queryKey: listGovernanceConfigsQueryKey(),
+      })
+      toast.success('Limits removed — this scope now has unlimited spend')
+      setRemoveDialogOpen(false)
+    },
+  })
+
+  const onSubmit = (values: GovernanceFormValues) => {
+    if (!scope) return
+    const maxRequestsPerMinute =
+      values.maxRequestsPerMinute === ''
+        ? null
+        : Math.round(Number(values.maxRequestsPerMinute))
+    const maxCostPerMonthMicrocents =
+      values.maxCostPerMonth === ''
+        ? null
+        : Math.round(Number(values.maxCostPerMonth) * 100_000_000)
+    upsertMutation.mutate({
+      path: { scope },
+      body: {
+        allowed_models: values.restrictModels ? values.selectedModels : null,
+        max_requests_per_minute: maxRequestsPerMinute,
+        max_cost_per_month_microcents: maxCostPerMonthMicrocents,
+      },
+    })
+  }
+
+  const toggleModel = (model: string) => {
+    const current = form.getValues('selectedModels')
+    form.setValue(
+      'selectedModels',
+      current.includes(model)
+        ? current.filter((m) => m !== model)
+        : [...current, model],
+      { shouldDirty: true }
+    )
+  }
+
+  if (configsIsError && isInsufficientPermissionsError(configsError)) {
+    return (
+      <EmptyState
+        icon={ShieldCheck}
+        title="You don't have access to Governance"
+        description="Viewing and configuring AI gateway cost limits requires the AI Gateway management permission. Ask an operator to grant it."
+      />
+    )
+  }
+
+  if (configsIsError) {
+    return (
+      <EmptyState
+        icon={AlertTriangle}
+        title="Couldn't load governance settings"
+        description={apiErrorMessage(configsError)}
+      />
+    )
+  }
+
+  const scopeDisplayLabel = scope
+    ? governanceScopeLabel(scope, projects, environments)
+    : null
+
+  const budgetMicrocents = existingConfig?.max_cost_per_month_microcents ?? null
+  const spendMicrocents = monthSummary?.total_cost_microcents ?? 0
+  const spendDollars = spendMicrocents / 100_000_000
+  const budgetDollars =
+    budgetMicrocents != null ? budgetMicrocents / 100_000_000 : null
+  const spendPct =
+    budgetDollars != null && budgetDollars > 0
+      ? Math.min(100, (spendDollars / budgetDollars) * 100)
+      : null
+
+  return (
+    <div className="space-y-4">
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h3 className="text-lg font-semibold">Governance</h3>
+          <p className="text-sm text-muted-foreground">
+            Set model allowlists, request-rate limits, and monthly spend caps
+            per instance, project, or environment.
+          </p>
+        </div>
+      </div>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base">Scope</CardTitle>
+          <CardDescription>
+            Instance limits apply everywhere by default. A project or
+            environment override replaces the instance limit for that scope
+            only.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+            <Select
+              value={scopeKind}
+              onValueChange={(v) => {
+                setScopeKind(v as GovernanceScopeKind)
+                setSelectedProjectId(undefined)
+                setSelectedEnvironmentId(undefined)
+              }}
+            >
+              <SelectTrigger className="w-full sm:w-[220px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {GOVERNANCE_SCOPE_KINDS.map((k) => (
+                  <SelectItem key={k.value} value={k.value}>
+                    {k.label}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+
+            {(scopeKind === 'project' || scopeKind === 'environment') && (
+              <Select
+                value={selectedProjectId?.toString() ?? ''}
+                onValueChange={(v) => {
+                  setSelectedProjectId(Number(v))
+                  setSelectedEnvironmentId(undefined)
+                }}
+                disabled={projectsLoading || projects.length === 0}
+              >
+                <SelectTrigger className="w-full sm:w-[220px]">
+                  <SelectValue
+                    placeholder={
+                      projectsLoading ? 'Loading projects…' : 'Select project'
+                    }
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {projects.map((p) => (
+                    <SelectItem key={p.id} value={p.id.toString()}>
+                      {p.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+
+            {scopeKind === 'environment' && (
+              <Select
+                value={selectedEnvironmentId?.toString() ?? ''}
+                onValueChange={(v) => setSelectedEnvironmentId(Number(v))}
+                disabled={
+                  !selectedProjectId ||
+                  environmentsLoading ||
+                  environments.length === 0
+                }
+              >
+                <SelectTrigger className="w-full sm:w-[220px]">
+                  <SelectValue
+                    placeholder={
+                      !selectedProjectId
+                        ? 'Select a project first'
+                        : environmentsLoading
+                          ? 'Loading environments…'
+                          : 'Select environment'
+                    }
+                  />
+                </SelectTrigger>
+                <SelectContent>
+                  {environments.map((e) => (
+                    <SelectItem key={e.id} value={e.id.toString()}>
+                      {e.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+
+      {!scope ? (
+        <EmptyState
+          icon={SlidersHorizontal}
+          title="Select a scope"
+          description="Choose a project or environment above to view or set its AI gateway limits."
+        />
+      ) : configsLoading ? (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <Skeleton className="h-96 w-full rounded-lg" />
+          <Skeleton className="h-48 w-full rounded-lg" />
+        </div>
+      ) : (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <Card>
+            <CardHeader>
+              <CardTitle className="text-base">
+                Limits for {scopeDisplayLabel}
+              </CardTitle>
+              <CardDescription>
+                {existingConfig
+                  ? 'Custom limits are active for this scope.'
+                  : 'No custom limits are set — this scope currently inherits unlimited spend and full model access.'}
+              </CardDescription>
+            </CardHeader>
+            <CardContent>
+              <Form {...form}>
+                <form
+                  noValidate
+                  onSubmit={form.handleSubmit(onSubmit)}
+                  className="space-y-5"
+                >
+                  <div className="space-y-2">
+                    <div className="flex items-center gap-2">
+                      <Checkbox
+                        id="restrict-models"
+                        checked={restrictModels}
+                        onCheckedChange={(checked) =>
+                          form.setValue('restrictModels', checked === true, {
+                            shouldDirty: true,
+                          })
+                        }
+                      />
+                      <Label htmlFor="restrict-models" className="font-normal">
+                        Restrict to specific models
+                      </Label>
+                    </div>
+                    <p className="text-xs text-muted-foreground">
+                      {restrictModels
+                        ? selectedModels.length === 0
+                          ? 'No models selected — every request to this scope will be denied.'
+                          : `Only the ${selectedModels.length} model${selectedModels.length === 1 ? '' : 's'} selected below may be used.`
+                        : 'Unchecked (default): every model from every configured provider is allowed.'}
+                    </p>
+                    {restrictModels && (
+                      <>
+                        <Popover
+                          open={modelPickerOpen}
+                          onOpenChange={setModelPickerOpen}
+                        >
+                          <PopoverTrigger asChild>
+                            <Button
+                              type="button"
+                              variant="outline"
+                              role="combobox"
+                              className="w-full justify-between font-normal"
+                            >
+                              {selectedModels.length === 0
+                                ? 'Choose models…'
+                                : `${selectedModels.length} model${selectedModels.length === 1 ? '' : 's'} selected`}
+                              <ChevronsUpDown className="h-4 w-4 opacity-50" />
+                            </Button>
+                          </PopoverTrigger>
+                          <PopoverContent
+                            align="start"
+                            className="w-[min(calc(100vw-2rem),320px)] p-0"
+                          >
+                            <Command>
+                              <CommandInput placeholder="Search models…" />
+                              <CommandList className="max-h-[280px]">
+                                <CommandEmpty>No models found.</CommandEmpty>
+                                {allModels.map((model) => {
+                                  const isSelected =
+                                    selectedModels.includes(model)
+                                  return (
+                                    <CommandItem
+                                      key={model}
+                                      value={model}
+                                      onSelect={() => toggleModel(model)}
+                                      className="gap-2"
+                                    >
+                                      <Check
+                                        className={
+                                          isSelected
+                                            ? 'h-4 w-4 opacity-100'
+                                            : 'h-4 w-4 opacity-0'
+                                        }
+                                      />
+                                      <span className="truncate font-mono text-xs">
+                                        {model}
+                                      </span>
+                                    </CommandItem>
+                                  )
+                                })}
+                              </CommandList>
+                            </Command>
+                          </PopoverContent>
+                        </Popover>
+                        {selectedModels.length > 0 && (
+                          <div className="flex flex-wrap gap-1">
+                            {selectedModels.map((model) => (
+                              <Badge
+                                key={model}
+                                variant="secondary"
+                                className="gap-1 font-mono text-[11px]"
+                              >
+                                {model}
+                                <button
+                                  type="button"
+                                  aria-label={`Remove ${model}`}
+                                  onClick={() => toggleModel(model)}
+                                  className="hover:text-destructive"
+                                >
+                                  <X className="h-3 w-3" />
+                                </button>
+                              </Badge>
+                            ))}
+                          </div>
+                        )}
+                      </>
+                    )}
+                  </div>
+
+                  <FormField
+                    control={form.control}
+                    name="maxRequestsPerMinute"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Requests per minute</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type="number"
+                            min={1}
+                            step={1}
+                            placeholder="Unlimited"
+                          />
+                        </FormControl>
+                        <p className="text-xs text-muted-foreground">
+                          Leave blank for no rate limit.
+                        </p>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <FormField
+                    control={form.control}
+                    name="maxCostPerMonth"
+                    render={({ field }) => (
+                      <FormItem>
+                        <FormLabel>Monthly budget (USD)</FormLabel>
+                        <FormControl>
+                          <Input
+                            {...field}
+                            type="number"
+                            min={0}
+                            step={0.01}
+                            placeholder="Unlimited"
+                          />
+                        </FormControl>
+                        <p className="text-xs text-muted-foreground">
+                          Requests that would exceed this are rejected for the
+                          rest of the calendar month. Leave blank for no budget.
+                        </p>
+                        <FormMessage />
+                      </FormItem>
+                    )}
+                  />
+
+                  <div className="flex flex-wrap gap-2">
+                    <Button type="submit" disabled={upsertMutation.isPending}>
+                      {upsertMutation.isPending ? (
+                        <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+                      ) : (
+                        <Save className="mr-1.5 h-4 w-4" />
+                      )}
+                      Save limits
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      disabled={!existingConfig || deleteMutation.isPending}
+                      onClick={() => setRemoveDialogOpen(true)}
+                    >
+                      <Trash2 className="mr-1.5 h-4 w-4" />
+                      Remove limits
+                    </Button>
+                  </div>
+                </form>
+              </Form>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <DollarSign className="h-4 w-4 text-muted-foreground" />
+                Spend this month
+              </CardTitle>
+              <CardDescription>
+                {scopeKind === 'instance'
+                  ? 'Total AI gateway spend across the whole instance, this calendar month.'
+                  : scope
+                    ? `AI gateway spend for this ${scopeKind}, this calendar month.`
+                    : `Select a ${scopeKind} above to see its spend.`}
+              </CardDescription>
+            </CardHeader>
+            <CardContent className="space-y-3">
+              {spendLoading ? (
+                <Skeleton className="h-16 w-full rounded-lg" />
+              ) : (
+                <>
+                  <div className="text-2xl font-semibold">
+                    {formatCost(spendDollars)}
+                    {budgetDollars != null && (
+                      <span className="text-base font-normal text-muted-foreground">
+                        {' '}
+                        / {formatCost(budgetDollars)}
+                      </span>
+                    )}
+                  </div>
+                  {spendPct != null ? (
+                    <Progress value={spendPct} />
+                  ) : (
+                    <p className="text-xs text-muted-foreground">
+                      No monthly budget set for this scope — spend is unlimited.
+                    </p>
+                  )}
+                </>
+              )}
+              <Button variant="link" size="sm" className="h-auto p-0" asChild>
+                <Link to="/ai-gateway/usage">View detailed usage →</Link>
+              </Button>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      <AlertDialog open={removeDialogOpen} onOpenChange={setRemoveDialogOpen}>
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Remove limits for {scopeDisplayLabel}?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              This deletes the custom model allowlist, rate limit, and budget
+              for this scope. It reverts to unlimited spend and full model
+              access until a new limit is saved.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={() =>
+                scope && deleteMutation.mutate({ path: { scope } })
+              }
+              disabled={deleteMutation.isPending}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deleteMutation.isPending ? (
+                <Loader2 className="mr-1.5 h-4 w-4 animate-spin" />
+              ) : null}
+              Remove
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   )
 }

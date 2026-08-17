@@ -8800,6 +8800,16 @@ export type GlobalRevenueSummaryResponse = {
     transactions_last_30d: number;
 };
 
+export type GovernanceConfigResponse = {
+    allowed_models?: Array<string> | null;
+    created_at: string;
+    id: number;
+    max_cost_per_month_microcents?: number | null;
+    max_requests_per_minute?: number | null;
+    scope: string;
+    updated_at: string;
+};
+
 export type GroupedPageMetric = {
     cls?: number | null;
     /**
@@ -19964,6 +19974,21 @@ export type UpsertAgentRequest = {
     trigger_config?: unknown;
 };
 
+export type UpsertGovernanceConfigRequest = {
+    /**
+     * NULL allows every model; an empty array denies every model.
+     */
+    allowed_models?: Array<string> | null;
+    /**
+     * NULL disables the operator-funded monthly budget for this scope.
+     */
+    max_cost_per_month_microcents?: number | null;
+    /**
+     * NULL disables the request-rate limit for this scope.
+     */
+    max_requests_per_minute?: number | null;
+};
+
 export type UpsertSecretRequest = {
     description?: string | null;
     /**
@@ -20016,7 +20041,11 @@ export type UsageFilter = {
      * Cost less-than-or-equal, in microcents.
      */
     cost_lte?: number | null;
+    deployment_id?: number | null;
+    deployment_token_id?: number | null;
+    environment_id?: number | null;
     model?: string | null;
+    project_id?: number | null;
     provider?: string | null;
     /**
      * Filter by HTTP status code (exact match).
@@ -20053,6 +20082,9 @@ export type UsageInfo = {
 
 export type UsageLogEntry = {
     conversation_id?: string | null;
+    deployment_id?: number | null;
+    deployment_token_id?: number | null;
+    environment_id?: number | null;
     estimated_cost_microcents: number;
     id: number;
     input_tokens: number;
@@ -20061,12 +20093,14 @@ export type UsageLogEntry = {
     latency_ms: number;
     model: string;
     output_tokens: number;
+    project_id?: number | null;
     provider: string;
     request_id?: string | null;
     status: number;
     tags: Array<string>;
     timestamp: string;
     trace_id?: string | null;
+    user_id?: number | null;
 };
 
 /**
@@ -20089,6 +20123,10 @@ export type UsageQueryParams = {
      */
     conversation_id?: string | null;
     /**
+     * Filter by environment ID (matches the governance policy scope `environment:<id>`)
+     */
+    environment_id?: number | null;
+    /**
      * ISO 8601 start time (defaults to 24h ago)
      */
     from?: string | null;
@@ -20096,6 +20134,10 @@ export type UsageQueryParams = {
      * Filter by model name
      */
     model?: string | null;
+    /**
+     * Filter by project ID (matches the governance policy scope `project:<id>`)
+     */
+    project_id?: number | null;
     /**
      * Filter by provider name
      */
@@ -21616,6 +21658,78 @@ export type ListAllConversationsResponses = {
 
 export type ListAllConversationsResponse = ListAllConversationsResponses[keyof ListAllConversationsResponses];
 
+export type ListGovernanceConfigsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/governance';
+};
+
+export type ListGovernanceConfigsErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+};
+
+export type ListGovernanceConfigsError = ListGovernanceConfigsErrors[keyof ListGovernanceConfigsErrors];
+
+export type ListGovernanceConfigsResponses = {
+    200: Array<GovernanceConfigResponse>;
+};
+
+export type ListGovernanceConfigsResponse = ListGovernanceConfigsResponses[keyof ListGovernanceConfigsResponses];
+
+export type DeleteGovernanceConfigData = {
+    body?: never;
+    path: {
+        /**
+         * instance, project:<id>, environment:<id>, or token:<id>
+         */
+        scope: string;
+    };
+    query?: never;
+    url: '/ai/governance/{scope}';
+};
+
+export type DeleteGovernanceConfigErrors = {
+    401: ProblemDetails;
+    403: ProblemDetails;
+    404: ProblemDetails;
+};
+
+export type DeleteGovernanceConfigError = DeleteGovernanceConfigErrors[keyof DeleteGovernanceConfigErrors];
+
+export type DeleteGovernanceConfigResponses = {
+    204: void;
+};
+
+export type DeleteGovernanceConfigResponse = DeleteGovernanceConfigResponses[keyof DeleteGovernanceConfigResponses];
+
+export type UpsertGovernanceConfigData = {
+    body: UpsertGovernanceConfigRequest;
+    path: {
+        /**
+         * instance, project:<id>, environment:<id>, or token:<id>
+         */
+        scope: string;
+    };
+    query?: never;
+    url: '/ai/governance/{scope}';
+};
+
+export type UpsertGovernanceConfigErrors = {
+    400: ProblemDetails;
+    401: ProblemDetails;
+    403: ProblemDetails;
+};
+
+export type UpsertGovernanceConfigError = UpsertGovernanceConfigErrors[keyof UpsertGovernanceConfigErrors];
+
+export type UpsertGovernanceConfigResponses = {
+    200: GovernanceConfigResponse;
+};
+
+export type UpsertGovernanceConfigResponse = UpsertGovernanceConfigResponses[keyof UpsertGovernanceConfigResponses];
+
 export type GetPricingData = {
     body?: never;
     path?: never;
@@ -22113,6 +22227,14 @@ export type GetUsageByProviderData = {
          * ISO 8601 end time (defaults to now)
          */
         to?: string;
+        /**
+         * Filter by project ID
+         */
+        project_id?: number;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
     };
     url: '/ai/usage/by-provider';
 };
@@ -22334,6 +22456,14 @@ export type GetUsageSummaryData = {
          * ISO 8601 end time (defaults to now)
          */
         to?: string;
+        /**
+         * Filter by project ID
+         */
+        project_id?: number;
+        /**
+         * Filter by environment ID
+         */
+        environment_id?: number;
     };
     url: '/ai/usage/summary';
 };

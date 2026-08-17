@@ -1,12 +1,14 @@
 use chrono::{DateTime, Utc};
 use sea_orm::{
-    ActiveModelTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Set, Statement,
+    ActiveModelTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Set,
+    Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_entities::ai_usage_logs;
 use utoipa::ToSchema;
 
+use super::GovernanceReservation;
 use crate::error::AiGatewayError;
 
 // ============================================================================
@@ -71,6 +73,16 @@ pub struct UsageLogEntry {
     pub is_streaming: bool,
     pub is_byok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub environment_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deployment_token_id: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<String>,
     pub tags: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -103,6 +115,17 @@ pub struct ConversationSummary {
     pub last_at: String,
 }
 
+/// Stable ownership dimensions attached by trusted authentication context.
+/// These values never come from caller-controlled request headers.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AiUsageAttribution {
+    pub user_id: Option<i32>,
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
+    pub deployment_token_id: Option<i32>,
+}
+
 /// Optional metadata the caller can attach to an AI gateway request.
 #[derive(Debug, Clone, Default)]
 pub struct AiRequestContext {
@@ -121,6 +144,10 @@ pub struct AiRequestContext {
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 pub struct UsageFilter {
     pub user_id: Option<i32>,
+    pub project_id: Option<i32>,
+    pub environment_id: Option<i32>,
+    pub deployment_id: Option<i32>,
+    pub deployment_token_id: Option<i32>,
     pub conversation_id: Option<String>,
     /// Comma-separated tags to filter by (AND logic).
     pub tags: Option<String>,
@@ -206,6 +233,11 @@ struct UsageLogRow {
     status: Option<i16>,
     is_streaming: Option<bool>,
     is_byok: Option<bool>,
+    user_id: Option<i32>,
+    project_id: Option<i32>,
+    environment_id: Option<i32>,
+    deployment_id: Option<i32>,
+    deployment_token_id: Option<i32>,
     conversation_id: Option<String>,
     tags: Option<String>,
     request_id: Option<String>,
@@ -259,7 +291,10 @@ impl UsageService {
         is_byok: bool,
     ) -> Result<(), AiGatewayError> {
         self.log_usage_with_context(
-            user_id,
+            &AiUsageAttribution {
+                user_id,
+                ..Default::default()
+            },
             provider,
             model,
             input_tokens,
@@ -277,7 +312,7 @@ impl UsageService {
     #[allow(clippy::too_many_arguments)]
     pub async fn log_usage_with_context(
         &self,
-        user_id: Option<i32>,
+        attribution: &AiUsageAttribution,
         provider: &str,
         model: &str,
         input_tokens: i64,
@@ -289,9 +324,54 @@ impl UsageService {
         is_byok: bool,
         context: &AiRequestContext,
     ) -> Result<(), AiGatewayError> {
+        self.log_usage_with_context_and_reservation(
+            attribution,
+            provider,
+            model,
+            input_tokens,
+            output_tokens,
+            latency_ms,
+            estimated_cost_microcents,
+            status,
+            is_streaming,
+            is_byok,
+            context,
+            None,
+        )
+        .await
+    }
+
+    /// Atomically converts a conservative governance reservation into actual
+    /// usage. If persistence fails, the reservation remains in place so a
+    /// transient database error cannot open a quota bypass.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn log_usage_with_context_and_reservation(
+        &self,
+        attribution: &AiUsageAttribution,
+        provider: &str,
+        model: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        latency_ms: i32,
+        estimated_cost_microcents: i64,
+        status: i16,
+        is_streaming: bool,
+        is_byok: bool,
+        context: &AiRequestContext,
+        reservation: Option<&GovernanceReservation>,
+    ) -> Result<(), AiGatewayError> {
         let record = ai_usage_logs::ActiveModel {
             timestamp: Set(chrono::Utc::now()),
-            user_id: Set(user_id),
+            user_id: Set(attribution.user_id),
+            project_id: Set(attribution.project_id),
+            environment_id: Set(attribution.environment_id),
+            deployment_id: Set(attribution.deployment_id),
+            deployment_token_id: Set(attribution.deployment_token_id),
+            billing_period: Set(Some(
+                reservation
+                    .map(GovernanceReservation::billing_period)
+                    .unwrap_or_else(current_billing_period),
+            )),
             provider: Set(provider.to_string()),
             model: Set(model.to_string()),
             input_tokens: Set(input_tokens),
@@ -308,7 +388,19 @@ impl UsageService {
             ..Default::default()
         };
 
-        record.insert(self.db.as_ref()).await?;
+        if let Some(reservation) = reservation {
+            let txn = self.db.begin().await?;
+            record.insert(&txn).await?;
+            txn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "DELETE FROM ai_gateway_cost_reservations WHERE request_id = $1",
+                [reservation.request_id().into()],
+            ))
+            .await?;
+            txn.commit().await?;
+        } else {
+            record.insert(self.db.as_ref()).await?;
+        }
         Ok(())
     }
 
@@ -630,6 +722,11 @@ impl UsageService {
                 status,
                 is_streaming,
                 is_byok,
+                user_id,
+                project_id,
+                environment_id,
+                deployment_id,
+                deployment_token_id,
                 conversation_id,
                 array_to_string(tags, ',') as tags,
                 request_id,
@@ -738,6 +835,11 @@ impl UsageService {
                 status,
                 is_streaming,
                 is_byok,
+                user_id,
+                project_id,
+                environment_id,
+                deployment_id,
+                deployment_token_id,
                 conversation_id,
                 array_to_string(tags, ',') as tags,
                 request_id,
@@ -769,6 +871,30 @@ impl UsageService {
         if let Some(user_id) = filter.user_id {
             conditions.push(format!("user_id = ${}", param_idx));
             values.push(user_id.into());
+            param_idx += 1;
+        }
+
+        if let Some(project_id) = filter.project_id {
+            conditions.push(format!("project_id = ${}", param_idx));
+            values.push(project_id.into());
+            param_idx += 1;
+        }
+
+        if let Some(environment_id) = filter.environment_id {
+            conditions.push(format!("environment_id = ${}", param_idx));
+            values.push(environment_id.into());
+            param_idx += 1;
+        }
+
+        if let Some(deployment_id) = filter.deployment_id {
+            conditions.push(format!("deployment_id = ${}", param_idx));
+            values.push(deployment_id.into());
+            param_idx += 1;
+        }
+
+        if let Some(deployment_token_id) = filter.deployment_token_id {
+            conditions.push(format!("deployment_token_id = ${}", param_idx));
+            values.push(deployment_token_id.into());
             param_idx += 1;
         }
 
@@ -904,6 +1030,11 @@ fn usage_log_from_row(r: UsageLogRow) -> UsageLogEntry {
         status: r.status.unwrap_or(0),
         is_streaming: r.is_streaming.unwrap_or(false),
         is_byok: r.is_byok.unwrap_or(false),
+        user_id: r.user_id,
+        project_id: r.project_id,
+        environment_id: r.environment_id,
+        deployment_id: r.deployment_id,
+        deployment_token_id: r.deployment_token_id,
         conversation_id: r.conversation_id,
         tags: r
             .tags
@@ -917,9 +1048,17 @@ fn usage_log_from_row(r: UsageLogRow) -> UsageLogEntry {
     }
 }
 
+fn current_billing_period() -> chrono::NaiveDate {
+    use chrono::Datelike;
+
+    let today = Utc::now().date_naive();
+    chrono::NaiveDate::from_ymd_opt(today.year(), today.month(), 1).unwrap_or(today)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sea_orm::{DatabaseBackend, MockDatabase};
 
     #[test]
     fn test_shift_params_basic() {
@@ -1015,6 +1154,30 @@ mod tests {
     }
 
     #[test]
+    fn test_build_filter_clause_with_project_and_environment_scope() {
+        let db = sea_orm::DatabaseConnection::Disconnected;
+        let service = UsageService::new(Arc::new(db));
+        let from = Utc::now() - chrono::Duration::hours(1);
+        let to = Utc::now();
+        let filter = UsageFilter {
+            project_id: Some(7),
+            environment_id: Some(11),
+            ..Default::default()
+        };
+
+        let (clause, values) = service.build_filter_clause(from, to, &filter);
+        // $1/$2 are the time range; project_id and environment_id follow in
+        // struct-declaration order (governance's scope filters, wired in via
+        // UsageQueryParams for /ai/usage/summary and /ai/usage/by-provider).
+        assert!(clause.contains("project_id = $3"));
+        assert!(clause.contains("environment_id = $4"));
+        assert_eq!(values.len(), 4);
+
+        assert!(matches!(values[2], sea_orm::Value::Int(Some(7))));
+        assert!(matches!(values[3], sea_orm::Value::Int(Some(11))));
+    }
+
+    #[test]
     fn test_build_filter_clause_with_status_and_cost_bounds() {
         let db = sea_orm::DatabaseConnection::Disconnected;
         let service = UsageService::new(Arc::new(db));
@@ -1069,6 +1232,11 @@ mod tests {
             status: Some(200),
             is_streaming: Some(false),
             is_byok: Some(false),
+            user_id: None,
+            project_id: Some(7),
+            environment_id: Some(11),
+            deployment_id: Some(13),
+            deployment_token_id: Some(17),
             conversation_id: Some("conv_123".to_string()),
             tags: Some("agent:support,env:prod".to_string()),
             request_id: Some("req_abc".to_string()),
@@ -1080,6 +1248,10 @@ mod tests {
         assert_eq!(entry.tags, vec!["agent:support", "env:prod"]);
         assert_eq!(entry.request_id, Some("req_abc".to_string()));
         assert_eq!(entry.trace_id, Some("trace_xyz".to_string()));
+        assert_eq!(entry.project_id, Some(7));
+        assert_eq!(entry.environment_id, Some(11));
+        assert_eq!(entry.deployment_id, Some(13));
+        assert_eq!(entry.deployment_token_id, Some(17));
     }
 
     #[test]
@@ -1096,6 +1268,11 @@ mod tests {
             status: Some(200),
             is_streaming: Some(true),
             is_byok: Some(true),
+            user_id: Some(3),
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            deployment_token_id: None,
             conversation_id: None,
             tags: Some("".to_string()),
             request_id: None,
@@ -1122,6 +1299,10 @@ mod tests {
     fn test_usage_filter_default() {
         let filter = UsageFilter::default();
         assert!(filter.user_id.is_none());
+        assert!(filter.project_id.is_none());
+        assert!(filter.environment_id.is_none());
+        assert!(filter.deployment_id.is_none());
+        assert!(filter.deployment_token_id.is_none());
         assert!(filter.conversation_id.is_none());
         assert!(filter.tags.is_none());
         assert!(filter.model.is_none());
@@ -1142,6 +1323,11 @@ mod tests {
             status: 200,
             is_streaming: false,
             is_byok: false,
+            user_id: None,
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            deployment_token_id: None,
             conversation_id: None,
             tags: vec![],
             request_id: None,
@@ -1168,6 +1354,11 @@ mod tests {
             status: 200,
             is_streaming: false,
             is_byok: false,
+            user_id: None,
+            project_id: Some(7),
+            environment_id: Some(11),
+            deployment_id: Some(13),
+            deployment_token_id: Some(17),
             conversation_id: Some("conv_abc".to_string()),
             tags: vec!["agent:support".to_string()],
             request_id: Some("req_123".to_string()),
@@ -1179,6 +1370,97 @@ mod tests {
         assert!(json.contains("agent:support"));
         assert!(json.contains("req_123"));
         assert!(json.contains("trace_456"));
+        assert!(json.contains("\"project_id\":7"));
+        assert!(json.contains("\"environment_id\":11"));
+    }
+
+    #[tokio::test]
+    async fn log_usage_persists_deployment_attribution() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![ai_usage_logs::Model {
+                    id: 1,
+                    timestamp: Utc::now(),
+                    user_id: None,
+                    project_id: Some(7),
+                    environment_id: Some(11),
+                    deployment_id: Some(13),
+                    deployment_token_id: Some(17),
+                    billing_period: Some(
+                        chrono::NaiveDate::from_ymd_opt(2026, 8, 1)
+                            .expect("valid test billing period"),
+                    ),
+                    provider: "openai".to_string(),
+                    model: "gpt-5-mini".to_string(),
+                    input_tokens: 100,
+                    output_tokens: 50,
+                    latency_ms: 25,
+                    estimated_cost_microcents: 120,
+                    status: 200,
+                    is_streaming: false,
+                    is_byok: false,
+                    conversation_id: None,
+                    tags: Vec::new(),
+                    request_id: None,
+                    trace_id: None,
+                }]])
+                .into_connection(),
+        );
+        let service = UsageService::new(db.clone());
+        let attribution = AiUsageAttribution {
+            project_id: Some(7),
+            environment_id: Some(11),
+            deployment_id: Some(13),
+            deployment_token_id: Some(17),
+            ..Default::default()
+        };
+
+        service
+            .log_usage_with_context(
+                &attribution,
+                "openai",
+                "gpt-5-mini",
+                100,
+                50,
+                25,
+                120,
+                200,
+                false,
+                false,
+                &AiRequestContext::default(),
+            )
+            .await
+            .expect("scoped usage should be inserted");
+
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("usage service should release database");
+        let log = db.into_transaction_log();
+        let sql = log[0].statements()[0].sql.to_lowercase();
+        assert!(sql.contains("project_id"));
+        assert!(sql.contains("environment_id"));
+        assert!(sql.contains("deployment_id"));
+        assert!(sql.contains("deployment_token_id"));
+    }
+
+    #[test]
+    fn test_build_filter_clause_with_deployment_scope() {
+        let service = UsageService::new(Arc::new(sea_orm::DatabaseConnection::Disconnected));
+        let from = Utc::now() - chrono::Duration::hours(1);
+        let to = Utc::now();
+        let filter = UsageFilter {
+            project_id: Some(7),
+            environment_id: Some(11),
+            deployment_id: Some(13),
+            deployment_token_id: Some(17),
+            ..Default::default()
+        };
+
+        let (clause, values) = service.build_filter_clause(from, to, &filter);
+        assert!(clause.contains("project_id = $3"));
+        assert!(clause.contains("environment_id = $4"));
+        assert!(clause.contains("deployment_id = $5"));
+        assert!(clause.contains("deployment_token_id = $6"));
+        assert_eq!(values.len(), 6);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    /// Scope: "instance", "project:{id}", "environment:{id}"
+    /// Scope: "instance", "project:{id}", "environment:{id}", "token:{id}"
     pub scope: String,
     /// JSON array of allowed model IDs, NULL means all models allowed
     pub allowed_models: Option<serde_json::Value>,

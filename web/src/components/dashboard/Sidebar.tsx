@@ -51,6 +51,7 @@ import {
   Settings2,
   Shield,
   ShieldAlert,
+  ShieldCheck,
   Sun,
   Sparkles,
   Terminal,
@@ -269,6 +270,12 @@ const aiNavItems: PlatformNavItem[] = [
     title: 'Setup',
     url: '/ai-gateway/setup',
     icon: Terminal,
+    featureKey: 'ai-gateway',
+  },
+  {
+    title: 'Governance',
+    url: '/ai-gateway/governance',
+    icon: ShieldCheck,
     featureKey: 'ai-gateway',
   },
   {

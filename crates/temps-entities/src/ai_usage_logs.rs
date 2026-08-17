@@ -9,12 +9,22 @@ pub struct Model {
     pub id: i64,
     pub timestamp: DBDateTime,
     pub user_id: Option<i32>,
+    /// Project charged for a deployment-token request.
+    pub project_id: Option<i32>,
+    /// Optional environment scope carried by the deployment token.
+    pub environment_id: Option<i32>,
+    /// Optional deployment scope carried by the deployment token.
+    pub deployment_id: Option<i32>,
+    /// Deployment-token row used for the request. Kept after token deletion.
+    pub deployment_token_id: Option<i32>,
+    /// UTC calendar month in which governance reserved this request's cost.
+    pub billing_period: Option<chrono::NaiveDate>,
     pub provider: String,
     pub model: String,
     pub input_tokens: i64,
     pub output_tokens: i64,
     pub latency_ms: i32,
-    /// Estimated cost in microcents (1/10000 of a cent)
+    /// Estimated cost in microcents (1/1,000,000 of a cent)
     pub estimated_cost_microcents: i64,
     /// HTTP status code returned to the caller
     pub status: i16,

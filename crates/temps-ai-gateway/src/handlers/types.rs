@@ -3,8 +3,8 @@ use temps_core::AuditLogger;
 
 use super::provider_status::AiProviderStatusCache;
 use crate::services::{
-    GatewayService, ProviderKeyService, ProviderModelService, ProviderPreferenceService,
-    StructuredOutputService, UsageService,
+    GatewayService, GovernanceService, ProviderKeyService, ProviderModelService,
+    ProviderPreferenceService, StructuredOutputService, UsageService,
 };
 
 pub struct AiGatewayAppState {
@@ -14,6 +14,7 @@ pub struct AiGatewayAppState {
     pub provider_model_service: Arc<ProviderModelService>,
     pub provider_preference_service: Arc<ProviderPreferenceService>,
     pub usage_service: Arc<UsageService>,
+    pub governance_service: Arc<GovernanceService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     pub provider_status_cache: Arc<AiProviderStatusCache>,
@@ -31,6 +32,7 @@ pub async fn create_ai_gateway_app_state(
     provider_model_service: Arc<ProviderModelService>,
     provider_preference_service: Arc<ProviderPreferenceService>,
     usage_service: Arc<UsageService>,
+    governance_service: Arc<GovernanceService>,
     audit_service: Arc<dyn AuditLogger>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     structured_output_service: Arc<StructuredOutputService>,
@@ -43,6 +45,7 @@ pub async fn create_ai_gateway_app_state(
         provider_model_service,
         provider_preference_service,
         usage_service,
+        governance_service,
         audit_service,
         telemetry,
         provider_status_cache: Arc::new(AiProviderStatusCache::default()),

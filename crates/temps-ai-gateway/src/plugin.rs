@@ -14,8 +14,8 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::{
     handlers::{self, create_ai_gateway_app_state, AiGatewayAppState},
     services::{
-        GatewayService, ProviderKeyService, ProviderModelService, ProviderPreferenceService,
-        StructuredOutputService, UsageService,
+        GatewayService, GovernanceService, ProviderKeyService, ProviderModelService,
+        ProviderPreferenceService, StructuredOutputService, UsageService,
     },
 };
 
@@ -171,6 +171,9 @@ impl TempsPlugin for AiGatewayPlugin {
             let usage_service = Arc::new(UsageService::new(db.clone()));
             context.register_service(usage_service.clone());
 
+            let governance_service = Arc::new(GovernanceService::new(db.clone()));
+            context.register_service(governance_service.clone());
+
             let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
             let project_access_checker =
                 context.get_service::<dyn temps_core::ProjectAccessChecker>();
@@ -188,6 +191,7 @@ impl TempsPlugin for AiGatewayPlugin {
                 provider_model_service,
                 provider_preference_service,
                 usage_service,
+                governance_service,
                 audit_service,
                 telemetry,
                 structured_output_service,
@@ -214,6 +218,7 @@ impl TempsPlugin for AiGatewayPlugin {
             .merge(handlers::configure_gateway_routes())
             .merge(handlers::configure_provider_status_routes())
             .merge(handlers::configure_structured_output_routes())
+            .merge(handlers::configure_governance_routes())
             .with_state(app_state);
 
         Some(PluginRoutes::new(routes))
@@ -233,6 +238,9 @@ impl TempsPlugin for AiGatewayPlugin {
         let structured_output_schema =
             <handlers::structured_output::StructuredOutputApiDoc as OpenApiTrait>::openapi();
         schema.merge(structured_output_schema);
+        let governance_schema =
+            <handlers::governance::AiGatewayGovernanceApiDoc as OpenApiTrait>::openapi();
+        schema.merge(governance_schema);
         Some(schema)
     }
 }

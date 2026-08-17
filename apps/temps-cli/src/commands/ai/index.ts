@@ -12,6 +12,7 @@ import {
   keyValue,
   json as jsonOutput,
 } from '../../ui/output.js'
+import { registerAiGovernanceCommands } from './governance.js'
 
 interface ReadinessOptions {
   project?: string
@@ -118,4 +119,6 @@ export function registerAiCommands(program: Command): void {
       }
       return readiness(projectArg, opts)
     })
+
+  registerAiGovernanceCommands(ai)
 }

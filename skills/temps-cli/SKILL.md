@@ -108,6 +108,7 @@ Use these routing hints:
 | Configure telemetry forwarding | `otel-forward` |
 | Manage Cloud integration | `cloud` |
 | Manage agent capabilities | `sandbox`, `skills`, `mcp-servers`, `secrets`, `workflow`, `ai` |
+| Set AI Gateway spend/rate limits or model allowlists | `ai governance` |
 | Administer the platform | `platform`, `settings`, `users`, `audit` |
 
 ## Target contexts
