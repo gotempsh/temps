@@ -339,11 +339,39 @@ fn default_docker_image() -> Option<String> {
     Some("gotempsh/postgres-walg:18-bookworm".to_string())
 }
 
+/// Every PostgreSQL-flavoured image the platform is allowed to pull and run.
+///
+/// This is an exact-match allowlist on purpose (never a substring/prefix test):
+/// a service's `docker_image` comes from client-deserializable parameters, and
+/// backup/restore helpers pull and execute it in sidecar containers, so a
+/// permissive match is remote code execution.
+///
+/// Because it is exact, it must list *every* image any other part of the
+/// product can put on a service, or that service becomes permanently
+/// un-initializable — `get_postgres_config` runs this check on every read of
+/// the config, so an unlisted image doesn't just block creation, it blocks
+/// deploys of every app linked to the service. Three sources feed it:
+///
+/// - images this repo builds (`images/*-walg/Dockerfile`),
+/// - images the console offers as upgrade targets
+///   (`web/src/components/storage/UpgradeServiceDialog.tsx`),
+/// - upstream images container discovery classifies as Postgres
+///   (`services.rs`, which matches `postgres` / `timescaledb` / `pgvector`).
+///
+/// Adding an image to any of those without adding it here is the bug this
+/// list keeps regressing into.
 const ALLOWED_POSTGRES_DOCKER_IMAGES: &[&str] = &[
     "gotempsh/postgres-walg:15-bookworm",
     "gotempsh/postgres-walg:16-bookworm",
     "gotempsh/postgres-walg:17-bookworm",
     "gotempsh/postgres-walg:18-bookworm",
+    "gotempsh/pgvector-walg:pg17",
+    "gotempsh/pgvector-walg:pg18",
+    "gotempsh/timescaledb-walg:pg18",
+    "pgvector/pgvector:pg15",
+    "pgvector/pgvector:pg16",
+    "pgvector/pgvector:pg17",
+    "pgvector/pgvector:pg18",
     "timescale/timescaledb-ha:pg17",
     "timescale/timescaledb-ha:pg18",
 ];
@@ -4235,6 +4263,96 @@ mod tests {
     fn managed_postgres_images_are_allowlisted() {
         assert!(validate_postgres_docker_image("gotempsh/postgres-walg:18-bookworm").is_ok());
         assert!(validate_postgres_docker_image("attacker/postgres:latest").is_err());
+    }
+
+    /// Every image the console offers as an upgrade target in
+    /// `web/src/components/storage/UpgradeServiceDialog.tsx` must validate.
+    /// These were offered in the UI while being rejected by the allowlist, so
+    /// picking one was a guaranteed failure.
+    #[test]
+    fn console_upgrade_target_images_are_allowlisted() {
+        for image in [
+            "gotempsh/postgres-walg:18-bookworm",
+            "gotempsh/postgres-walg:17-bookworm",
+            "gotempsh/pgvector-walg:pg18",
+            "gotempsh/pgvector-walg:pg17",
+            "gotempsh/timescaledb-walg:pg18",
+        ] {
+            assert!(
+                validate_postgres_docker_image(image).is_ok(),
+                "console offers {image} as an upgrade target but it is not allowlisted"
+            );
+        }
+    }
+
+    /// `services.rs` classifies any discovered container whose image contains
+    /// `pgvector` as a Postgres service, so importing one must not produce a
+    /// service that can never be initialized.
+    #[test]
+    fn discovered_pgvector_images_are_allowlisted() {
+        for image in [
+            "pgvector/pgvector:pg15",
+            "pgvector/pgvector:pg16",
+            "pgvector/pgvector:pg17",
+            "pgvector/pgvector:pg18",
+        ] {
+            assert!(
+                validate_postgres_docker_image(image).is_ok(),
+                "container discovery imports {image} as Postgres but it is not allowlisted"
+            );
+        }
+    }
+
+    /// The allowlist stays exact-match: a listed image must not make an
+    /// arbitrary image sharing its repository or tag prefix acceptable.
+    #[test]
+    fn allowlist_does_not_match_by_prefix_or_repository() {
+        for image in [
+            "pgvector/pgvector:latest",
+            "pgvector/pgvector",
+            "attacker/pgvector:pg18",
+            "gotempsh/pgvector-walg:pg18-evil",
+            "timescale/timescaledb-ha:pg18-attacker",
+        ] {
+            assert!(
+                validate_postgres_docker_image(image).is_err(),
+                "{image} must not be accepted by the exact-match allowlist"
+            );
+        }
+    }
+
+    /// pgvector needs no preload library, but the WAL-G TimescaleDB variant is
+    /// still a TimescaleDB image and must keep `timescaledb` preloaded —
+    /// dropping it silently disables hypertable background workers.
+    #[test]
+    fn shared_preload_libraries_cover_new_allowlisted_images() {
+        assert_eq!(
+            PostgresService::shared_preload_libraries_for_image("pgvector/pgvector:pg18"),
+            "pg_stat_statements"
+        );
+        assert_eq!(
+            PostgresService::shared_preload_libraries_for_image("gotempsh/pgvector-walg:pg18"),
+            "pg_stat_statements"
+        );
+        assert_eq!(
+            PostgresService::shared_preload_libraries_for_image("gotempsh/timescaledb-walg:pg18"),
+            "timescaledb,pg_stat_statements"
+        );
+    }
+
+    /// PGDATA is derived from the image tag, so every allowlisted image must
+    /// yield a parseable major version — otherwise the container is created
+    /// with a broken data directory path.
+    #[test]
+    fn every_allowlisted_image_yields_a_pgdata_path() {
+        for image in ALLOWED_POSTGRES_DOCKER_IMAGES {
+            let version = PostgresService::extract_postgres_version(image)
+                .unwrap_or_else(|e| panic!("no version for allowlisted image {image}: {e}"));
+            assert!(
+                (15..=18).contains(&version),
+                "unexpected major version {version} for {image}"
+            );
+        }
     }
 
     #[test]
