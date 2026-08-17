@@ -194,7 +194,8 @@ impl TempsPlugin for DeploymentsPlugin {
                     cleanup_file_store,
                 )
                 .with_static_dir(config_service.static_dir())
-                .with_image_retention(&image_retention),
+                .with_image_retention(&image_retention)
+                .with_config_service(config_service.clone()),
             );
             tokio::spawn({
                 let cleanup_service = docker_cleanup.clone();

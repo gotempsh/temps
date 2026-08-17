@@ -20,7 +20,7 @@ use temps_auth::{
 };
 use temps_auth::{AuthContext, RequireAuth};
 use temps_core::RequestMetadata;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::types::{
     ChangeProjectSourceRequest, CreateProjectRequest, PaginatedProjectList, PaginationParams,
@@ -1072,12 +1072,24 @@ pub async fn update_project_settings(
     // changing, so an unrelated settings save (slug, attack mode, ...)
     // doesn't pay for an extra read.
     let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
-        state
-            .project_service
-            .get_project(project_id)
-            .await
-            .ok()
-            .and_then(|project| project.image_retention_hours)
+        match state.project_service.get_project(project_id).await {
+            Ok(project) => project.image_retention_hours,
+            Err(e) => {
+                // A failed read and a genuinely-unset prior value both end up
+                // `None` in the audit record below — that's an accepted gap
+                // in what the double-Option type can express, but a *silent*
+                // one would let a transient DB error read back as "there was
+                // no prior retention window" during an incident review. Log
+                // it so the ambiguity is at least visible operationally.
+                warn!(
+                    error = %e,
+                    project_id,
+                    "Could not read prior image_retention_hours before update; \
+                     audit log will record it as unset rather than unknown"
+                );
+                None
+            }
+        }
     } else {
         None
     };

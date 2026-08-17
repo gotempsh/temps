@@ -348,6 +348,16 @@ pub struct DockerCleanupService {
     /// When false, the retention pass is skipped entirely and built images are
     /// kept forever. Sourced from `AppSettings.image_retention.enabled`.
     image_retention_enabled: bool,
+    /// When set, `prune_old_deployment_images` re-reads `image_retention`
+    /// from this service at the start of every run instead of relying on the
+    /// `image_retention_enabled`/`default_image_retention_hours` snapshot
+    /// taken at construction. Without this, an operator disabling retention
+    /// via the settings UI would have no effect until the process restarts —
+    /// `ConfigService::get_settings` is TTL-cached (5s, NOTIFY-backed), so
+    /// this costs nothing on a job that runs once nightly. `None` in tests
+    /// that construct the service directly, which fall back to the
+    /// constructor/builder-supplied values.
+    config_service: Option<Arc<temps_config::ConfigService>>,
 }
 
 impl DockerCleanupService {
@@ -372,6 +382,7 @@ impl DockerCleanupService {
             // rollback window (14 days), not a cache TTL.
             default_image_retention_hours: 336,
             image_retention_enabled: true,
+            config_service: None,
         }
     }
 
@@ -406,10 +417,50 @@ impl DockerCleanupService {
     }
 
     /// Apply the operator-configured retention policy from `AppSettings`.
+    /// Used as the boot-time value and as the fallback when a live re-read
+    /// (see `with_config_service`) fails.
     pub fn with_image_retention(mut self, settings: &temps_core::ImageRetentionSettings) -> Self {
         self.image_retention_enabled = settings.enabled;
         self.default_image_retention_hours = settings.effective_default_hours();
         self
+    }
+
+    /// Re-read `image_retention` from this service at the start of every
+    /// nightly run instead of only once at construction, so an operator
+    /// disabling retention takes effect on the very next run rather than
+    /// requiring a restart.
+    pub fn with_config_service(mut self, config_service: Arc<temps_config::ConfigService>) -> Self {
+        self.config_service = Some(config_service);
+        self
+    }
+
+    /// Current retention policy: the fresh settings-row value when a
+    /// `ConfigService` is wired up, falling back to the constructor/builder
+    /// snapshot otherwise (all existing tests) or on a read error (matches
+    /// the same fail-safe fallback used at boot in `plugin.rs`).
+    async fn current_image_retention(&self) -> (bool, i64) {
+        let Some(config_service) = &self.config_service else {
+            return (
+                self.image_retention_enabled,
+                self.default_image_retention_hours,
+            );
+        };
+        match config_service.get_settings().await {
+            Ok(settings) => (
+                settings.image_retention.enabled,
+                settings.image_retention.effective_default_hours(),
+            ),
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Could not read image retention settings; using last-known values"
+                );
+                (
+                    self.image_retention_enabled,
+                    self.default_image_retention_hours,
+                )
+            }
+        }
     }
 
     fn is_temps_managed_image(image_name: &str) -> bool {
@@ -485,30 +536,33 @@ impl DockerCleanupService {
     /// normal cache policy. Docker removal is non-forced, so an image still referenced
     /// by any container is retained as a final safety net.
     async fn prune_old_deployment_images(&self) {
-        if !self.image_retention_enabled {
+        let (image_retention_enabled, default_image_retention_hours) =
+            self.current_image_retention().await;
+        if !image_retention_enabled {
             debug!("Deployment image retention is disabled; skipping");
             return;
         }
 
         // Eligibility (and the oldest reference per image, used to order
-        // removal) is computed inside Postgres via GROUP BY rather than by
-        // pulling every deployment row into the process: this table only
-        // grows, and the previous implementation loaded the full history —
-        // one row per deployment ever created — into a `Vec` on every nightly
-        // run. Only distinct `image_name`s come back to the app, which is
-        // bounded by how many images actually exist, not by deployment count.
-        let (mut candidates, oldest_reference_by_image) =
-            match self.expired_image_candidates().await {
-                Ok(result) => result,
-                Err(e) => {
-                    error!(
-                        error = %e,
-                        "Could not compute deployment image retention eligibility; \
-                         skipping image retention this run"
-                    );
-                    return;
-                }
-            };
+        // removal) is computed inside Postgres via GROUP BY/HAVING rather
+        // than by pulling every deployment row into the process, and capped
+        // at `max_deployment_images_per_run` — see the doc comment on
+        // `expired_image_candidates` for why this table's row count doesn't
+        // shrink to "how many images exist".
+        let (mut candidates, oldest_reference_by_image) = match self
+            .expired_image_candidates(default_image_retention_hours)
+            .await
+        {
+            Ok(result) => result,
+            Err(e) => {
+                error!(
+                    error = %e,
+                    "Could not compute deployment image retention eligibility; \
+                     skipping image retention this run"
+                );
+                return;
+            }
+        };
 
         if candidates.is_empty() {
             debug!("No Temps-managed deployment images to consider");
@@ -666,12 +720,18 @@ impl DockerCleanupService {
     /// referencing it is older than its owning project's retention window
     /// (`BOOL_AND`), so an image reused by a newer rollback or promotion
     /// survives. The per-project override is applied via `COALESCE` in the
-    /// same query rather than fetched separately. Grouping happens in SQL so
-    /// only one row per distinct `image_name` crosses into the process,
-    /// bounded by how many images exist rather than by how many deployments
-    /// have ever referenced one.
+    /// same query rather than fetched separately. `HAVING` drops any image
+    /// group that isn't fully expired before it ever leaves Postgres — the
+    /// built image name is `temps-{slug}:{deployment_id}` (unique per
+    /// deployment), so without this the row count tracks total deployment
+    /// history, not "how many images exist" as an earlier version of this
+    /// comment claimed. `ORDER BY ... LIMIT` caps the result at
+    /// `max_deployment_images_per_run`, the same bound already used for the
+    /// removal step, so both the candidate scan and the removal batch share
+    /// one ceiling; any remainder is picked up on the following night's run.
     async fn expired_image_candidates(
         &self,
+        default_hours: i64,
     ) -> Result<
         (
             HashMap<String, bool>,
@@ -681,6 +741,7 @@ impl DockerCleanupService {
     > {
         use sea_orm::{ConnectionTrait, Statement};
 
+        let limit = i64::try_from(self.max_deployment_images_per_run).unwrap_or(i64::MAX);
         let rows = self
             .db
             .as_ref()
@@ -689,11 +750,6 @@ impl DockerCleanupService {
                 r#"
                 SELECT
                     d.image_name,
-                    BOOL_AND(
-                        d.created_at < NOW() - (
-                            COALESCE(p.image_retention_hours, $1) * INTERVAL '1 hour'
-                        )
-                    ) AS all_expired,
                     MIN(d.created_at) AS oldest_reference
                 FROM deployments d
                 JOIN projects p ON p.id = d.project_id
@@ -701,8 +757,15 @@ impl DockerCleanupService {
                   AND d.image_name LIKE 'temps-%'
                   AND d.image_name NOT LIKE '%/%'
                 GROUP BY d.image_name
+                HAVING BOOL_AND(
+                    d.created_at < NOW() - (
+                        COALESCE(p.image_retention_hours, $1) * INTERVAL '1 hour'
+                    )
+                )
+                ORDER BY MIN(d.created_at) ASC
+                LIMIT $2
                 "#,
-                vec![self.default_image_retention_hours.into()],
+                vec![default_hours.into(), limit.into()],
             ))
             .await?;
 
@@ -710,11 +773,14 @@ impl DockerCleanupService {
         let mut oldest_reference_by_image = HashMap::new();
         for row in rows {
             let image_name: String = row.try_get("", "image_name")?;
-            let all_expired: bool = row.try_get("", "all_expired")?;
             let oldest_reference: chrono::DateTime<chrono::Utc> =
                 row.try_get("", "oldest_reference")?;
             oldest_reference_by_image.insert(image_name.clone(), oldest_reference);
-            candidates.insert(image_name, all_expired);
+            // Every row that survives the query's HAVING clause is, by
+            // definition, fully expired — `protect_image` (called for the
+            // recent/unrebuildable/active/remote-node sets below) is what
+            // flips an entry back to `false`.
+            candidates.insert(image_name, true);
         }
 
         Ok((candidates, oldest_reference_by_image))
@@ -749,7 +815,12 @@ impl DockerCleanupService {
                 ) ranked
                 WHERE rn <= $1
                 "#,
-                vec![(keep_recent as i64).into()],
+                // `as i64` would silently wrap a value above i64::MAX negative,
+                // making `rn <= $1` match zero rows and emptying the
+                // rollback-floor protection right before an irreversible
+                // delete — every other error path in this function fails
+                // closed (aborts the run), so this must too.
+                vec![i64::try_from(keep_recent).unwrap_or(i64::MAX).into()],
             ))
             .await?;
 
@@ -804,6 +875,8 @@ impl DockerCleanupService {
                 FROM deployments d
                 JOIN projects p ON p.id = d.project_id
                 WHERE d.image_name IS NOT NULL
+                  AND d.image_name LIKE 'temps-%'
+                  AND d.image_name NOT LIKE '%/%'
                   AND (
                         d.context_vars ->> 'trigger' = 'image_upload'
                      OR d.metadata ->> 'externalImageRef' IS NOT NULL
@@ -834,6 +907,8 @@ impl DockerCleanupService {
                 FROM deployments d
                 JOIN deployment_containers dc ON dc.deployment_id = d.id
                 WHERE d.image_name IS NOT NULL
+                  AND d.image_name LIKE 'temps-%'
+                  AND d.image_name NOT LIKE '%/%'
                   AND dc.node_id IS NOT NULL
                 "#,
             ))
@@ -1772,6 +1847,134 @@ mod tests {
         assert!(
             still_present.is_some(),
             "pruning must never delete the deployment row, only the image"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for the fix that made retention settings live: before
+    /// this, `DockerCleanupService` only ever read `AppSettings.image_retention`
+    /// once at construction, so an operator disabling retention (or changing
+    /// the default window) after boot had no effect until the process
+    /// restarted. This proves a settings row written *after* the service was
+    /// built is picked up on the very next run, with no rebuild in between.
+    #[tokio::test]
+    async fn test_disabling_retention_via_settings_takes_effect_without_restart(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::ActiveModelTrait;
+        use temps_entities::preset::Preset;
+        use temps_entities::upstream_config::UpstreamList;
+        use temps_entities::{deployments, environments, projects};
+
+        if !cleanup_integration_tests_available().await {
+            eprintln!("Docker/Postgres unavailable; skipping live-settings regression test");
+            return Ok(());
+        }
+
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let now = chrono::Utc::now();
+        let old = now - chrono::Duration::hours(72);
+
+        let project = projects::ActiveModel {
+            name: sea_orm::ActiveValue::Set("Live Settings Test Project".to_string()),
+            slug: sea_orm::ActiveValue::Set("live-settings-test-project".to_string()),
+            repo_owner: sea_orm::ActiveValue::Set("test-owner".to_string()),
+            repo_name: sea_orm::ActiveValue::Set("test-repo".to_string()),
+            preset: sea_orm::ActiveValue::Set(Preset::Dockerfile),
+            directory: sea_orm::ActiveValue::Set("/".to_string()),
+            main_branch: sea_orm::ActiveValue::Set("main".to_string()),
+            created_at: sea_orm::ActiveValue::Set(now),
+            updated_at: sea_orm::ActiveValue::Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let environment = environments::ActiveModel {
+            project_id: sea_orm::ActiveValue::Set(project.id),
+            name: sea_orm::ActiveValue::Set("Test Environment".to_string()),
+            slug: sea_orm::ActiveValue::Set("test".to_string()),
+            host: sea_orm::ActiveValue::Set("live-settings-test.example.com".to_string()),
+            upstreams: sea_orm::ActiveValue::Set(UpstreamList::default()),
+            current_deployment_id: sea_orm::ActiveValue::Set(None),
+            subdomain: sea_orm::ActiveValue::Set("live-settings-test.example.com".to_string()),
+            created_at: sea_orm::ActiveValue::Set(now),
+            updated_at: sea_orm::ActiveValue::Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        deployments::ActiveModel {
+            project_id: sea_orm::ActiveValue::Set(project.id),
+            environment_id: sea_orm::ActiveValue::Set(environment.id),
+            slug: sea_orm::ActiveValue::Set("expired-deployment".to_string()),
+            state: sea_orm::ActiveValue::Set("success".to_string()),
+            image_name: sea_orm::ActiveValue::Set(Some(
+                "temps-live-settings-test:expired".to_string(),
+            )),
+            metadata: sea_orm::ActiveValue::Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: sea_orm::ActiveValue::Set(old),
+            updated_at: sea_orm::ActiveValue::Set(old),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let server_config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://test".to_string(),
+                None,
+                None,
+            )
+            .unwrap(),
+        );
+        let config_service = Arc::new(temps_config::ConfigService::new(server_config, db.clone()));
+
+        // Settings row starts with retention enabled and a 1-hour window, so
+        // the seeded deployment above is expired.
+        config_service
+            .update_settings(temps_core::AppSettings {
+                image_retention: temps_core::ImageRetentionSettings {
+                    enabled: true,
+                    default_hours: 1,
+                },
+                ..Default::default()
+            })
+            .await?;
+
+        let docker = Arc::new(RecordingDockerClient::default());
+        // Constructed with a stale "enabled" snapshot on purpose — this is
+        // what the service would have looked like right after boot, before
+        // the settings row below is written.
+        let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
+            .with_keep_recent_deployment_images(0)
+            .with_image_retention(&temps_core::ImageRetentionSettings {
+                enabled: true,
+                default_hours: 1,
+            })
+            .with_config_service(config_service.clone());
+
+        // Operator disables retention via the settings row *after* the
+        // service was constructed — no restart, no rebuild.
+        config_service
+            .update_settings(temps_core::AppSettings {
+                image_retention: temps_core::ImageRetentionSettings {
+                    enabled: false,
+                    default_hours: 1,
+                },
+                ..Default::default()
+            })
+            .await?;
+
+        service.prune_old_deployment_images().await;
+
+        assert!(
+            docker.removed_sorted().is_empty(),
+            "disabling retention after construction must be honored on the very \
+             next run, not require a restart"
         );
 
         Ok(())
