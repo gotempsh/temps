@@ -1,5 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { orderedChartDateRange } from './chart-range-selection'
+import {
+  formatChartDateRange,
+  orderedChartDateRange,
+} from './chart-range-selection'
 
 describe('orderedChartDateRange', () => {
   test('orders a selection dragged from right to left', () => {
@@ -24,5 +27,15 @@ describe('orderedChartDateRange', () => {
       orderedChartDateRange(1_776_583_800_000, 1_776_583_800_000)
     ).toBeNull()
     expect(orderedChartDateRange('not-a-date', null)).toBeNull()
+  })
+
+  test('formats the selected timestamps for the chart label', () => {
+    const label = formatChartDateRange({
+      from: new Date(2026, 7, 16, 17, 0),
+      to: new Date(2026, 7, 17, 5, 0),
+    })
+
+    expect(label).toContain('Aug 16, 2026 · 17:00')
+    expect(label).toContain('→ Aug 17, 2026 · 05:00')
   })
 })

@@ -1,6 +1,15 @@
+import { format, isSameDay } from 'date-fns'
+
 export interface ChartDateRange {
   from: Date
   to: Date
+}
+
+export function formatChartDateRange(range: ChartDateRange): string {
+  if (isSameDay(range.from, range.to)) {
+    return `${format(range.from, 'MMM d, yyyy · HH:mm')} → ${format(range.to, 'HH:mm')}`
+  }
+  return `${format(range.from, 'MMM d, yyyy · HH:mm')} → ${format(range.to, 'MMM d, yyyy · HH:mm')}`
 }
 
 function chartValueToDate(value: unknown): Date | null {

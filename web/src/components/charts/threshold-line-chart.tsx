@@ -1,4 +1,4 @@
-import { ReactNode, useCallback, useRef, useState } from 'react'
+import { ReactNode, useCallback, useMemo, useRef, useState } from 'react'
 import {
   Area,
   CartesianGrid,
@@ -16,7 +16,11 @@ import {
   ChartTooltipContent,
 } from '@/components/ui/chart'
 import { cn } from '@/lib/utils'
-import { orderedChartDateRange } from '@/lib/chart-range-selection'
+import {
+  formatChartDateRange,
+  orderedChartDateRange,
+} from '@/lib/chart-range-selection'
+import type { ChartDateRange } from '@/lib/chart-range-selection'
 import type { MetricTone } from './metric-sparkline'
 
 export type ThresholdLineSeries = {
@@ -90,6 +94,8 @@ interface ThresholdLineChartProps {
   height?: number
   /** Format the Y-axis ticks (e.g. "2.5s"). */
   yTickFormatter?: (value: number) => string
+  /** Format categorical X-axis ticks without changing their unique values. */
+  xTickFormatter?: (value: string | number) => string
   /** Format the tooltip value. */
   tooltipValueFormatter?: (value: number) => string
   /** Extra content rendered inside the tooltip under the value. */
@@ -103,6 +109,8 @@ interface ThresholdLineChartProps {
   selectionKey?: string
   /** Called with the ordered timestamp range after a multi-point drag. */
   onRangeSelect?: (from: Date, to: Date) => void
+  /** Confirmed-but-not-yet-applied range to keep highlighted on the chart. */
+  selectedRange?: ChartDateRange | null
   className?: string
 }
 
@@ -136,6 +144,47 @@ const THRESHOLD_STROKE: Record<MetricTone, string> = {
   neutral: 'var(--muted-foreground)',
 }
 
+function SelectedRangeLabel({
+  viewBox,
+  range,
+}: {
+  viewBox?: { x?: number; y?: number; width?: number }
+  range: ChartDateRange
+}) {
+  const x = viewBox?.x ?? 0
+  const y = viewBox?.y ?? 0
+  const width = viewBox?.width ?? 0
+  const text = formatChartDateRange(range)
+  const labelWidth = Math.min(Math.max(text.length * 6.4 + 20, 190), 330)
+  const center = x + width / 2
+
+  return (
+    <g className="pointer-events-none">
+      <rect
+        x={center - labelWidth / 2}
+        y={y + 8}
+        width={labelWidth}
+        height={24}
+        rx={6}
+        fill="var(--popover)"
+        stroke="var(--primary)"
+        strokeOpacity={0.45}
+      />
+      <text
+        x={center}
+        y={y + 24}
+        textAnchor="middle"
+        fill="var(--popover-foreground)"
+        fontFamily="var(--font-mono)"
+        fontSize={10}
+        fontWeight={500}
+      >
+        {text}
+      </text>
+    </g>
+  )
+}
+
 /**
  * Themed line chart with optional horizontal threshold reference lines (e.g.
  * Core Web Vitals "Good" / "Poor" bands). `series` is either a single line
@@ -155,11 +204,13 @@ export function ThresholdLineChart({
   bandSeries,
   height = 300,
   yTickFormatter,
+  xTickFormatter,
   tooltipValueFormatter,
   tooltipFooter,
   emptyMessage,
   selectionKey,
   onRangeSelect,
+  selectedRange,
   className,
 }: ThresholdLineChartProps) {
   const isMulti = Array.isArray(series)
@@ -259,6 +310,34 @@ export function ThresholdLineChart({
     clearSelection()
     if (range) onRangeSelect(range.from, range.to)
   }, [clearSelection, onRangeSelect])
+
+  const selectedRangeX = useMemo(() => {
+    if (!selectedRange || !selectionKey) return null
+
+    const points = data.flatMap((point) => {
+      const rawTimestamp = point?.[selectionKey]
+      const timestamp = new Date(rawTimestamp).getTime()
+      const x = point?.[xKey]
+      return Number.isNaN(timestamp) ||
+        (typeof x !== 'string' && typeof x !== 'number')
+        ? []
+        : [{ timestamp, x }]
+    })
+    if (points.length === 0) return null
+
+    const closestX = (target: number) =>
+      points.reduce((closest, point) =>
+        Math.abs(point.timestamp - target) <
+        Math.abs(closest.timestamp - target)
+          ? point
+          : closest
+      ).x
+
+    return {
+      from: closestX(selectedRange.from.getTime()),
+      to: closestX(selectedRange.to.getTime()),
+    }
+  }, [data, selectedRange, selectionKey, xKey])
 
   const config: ChartConfig = {}
   seriesList.forEach((s, i) => {
@@ -405,6 +484,7 @@ export function ThresholdLineChart({
           axisLine={false}
           tickMargin={8}
           minTickGap={32}
+          tickFormatter={xTickFormatter}
           className="text-xs"
         />
         <YAxis
@@ -479,6 +559,18 @@ export function ThresholdLineChart({
             fillOpacity={0.1}
             stroke="var(--primary)"
             strokeOpacity={0.35}
+          />
+        )}
+        {selectionStartX == null && selectedRangeX && selectedRange && (
+          <ReferenceArea
+            x1={selectedRangeX.from}
+            x2={selectedRangeX.to}
+            fill="var(--primary)"
+            fillOpacity={0.14}
+            stroke="var(--primary)"
+            strokeOpacity={0.55}
+            strokeWidth={1}
+            label={<SelectedRangeLabel range={selectedRange} />}
           />
         )}
         {thresholds.map((t, idx) => (

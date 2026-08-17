@@ -131,6 +131,7 @@ interface VisitorChartProps {
   endDate: Date | undefined
   environment: number | undefined
   onZoom?: (from: Date, to: Date) => void
+  selectedRange?: ChartDateRange | null
 }
 
 export function VisitorChart({
@@ -139,6 +140,7 @@ export function VisitorChart({
   endDate,
   environment,
   onZoom,
+  selectedRange,
 }: VisitorChartProps) {
   const [aggregationLevel, setAggregationLevel] = React.useState<
     'events' | 'sessions' | 'visitors'
@@ -295,16 +297,21 @@ export function VisitorChart({
       ) : (
         <ThresholdLineChart
           data={chartData}
-          xKey="date"
+          xKey="timestamp"
           series={{
             dataKey: 'count',
             label: getAggregationLabel(),
             tone: 'neutral',
           }}
           height={250}
+          xTickFormatter={(value) =>
+            chartData.find((point) => point.timestamp === Number(value))
+              ?.date ?? ''
+          }
           yTickFormatter={(value) => value.toLocaleString()}
           tooltipValueFormatter={(value) => value.toLocaleString()}
           selectionKey="timestamp"
+          selectedRange={selectedRange}
           onRangeSelect={onZoom}
         />
       )}
@@ -1626,6 +1633,7 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               endDate={endDate}
               environment={selectedEnvironment}
               onZoom={handleChartZoom}
+              selectedRange={pendingChartRange}
             />
             {pendingChartRange && (
               <ChartRangeSelectionBar

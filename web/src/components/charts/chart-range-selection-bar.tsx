@@ -1,19 +1,14 @@
 import { Button } from '@/components/ui/button'
-import type { ChartDateRange } from '@/lib/chart-range-selection'
-import { format, isSameDay } from 'date-fns'
+import {
+  formatChartDateRange,
+  type ChartDateRange,
+} from '@/lib/chart-range-selection'
 import { CalendarRange, Check, X } from 'lucide-react'
 
 interface ChartRangeSelectionBarProps {
   range: ChartDateRange
   onApply: () => void
   onCancel: () => void
-}
-
-function formatSelectedRange(range: ChartDateRange): string {
-  if (isSameDay(range.from, range.to)) {
-    return `${format(range.from, 'MMM d, yyyy · HH:mm')} → ${format(range.to, 'HH:mm')}`
-  }
-  return `${format(range.from, 'MMM d, yyyy · HH:mm')} → ${format(range.to, 'MMM d, yyyy · HH:mm')}`
 }
 
 export function ChartRangeSelectionBar({
@@ -36,7 +31,7 @@ export function ChartRangeSelectionBar({
             Selected timeframe
           </p>
           <p className="truncate font-mono text-xs font-medium text-foreground sm:text-sm">
-            {formatSelectedRange(range)}
+            {formatChartDateRange(range)}
           </p>
         </div>
       </div>

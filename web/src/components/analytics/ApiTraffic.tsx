@@ -867,6 +867,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
               yTickFormatter={(v) => `${v.toFixed(0)}ms`}
               tooltipValueFormatter={(v) => `${v.toFixed(0)}ms`}
               selectionKey="timestamp"
+              selectedRange={pendingChartRange}
               onRangeSelect={(from, to) => setPendingChartRange({ from, to })}
             />
           )}
