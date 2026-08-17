@@ -4724,6 +4724,22 @@ impl GitProviderManager {
             .await
     }
 
+    /// Whether a project with this source type should still act on a Git push.
+    ///
+    /// `Git` obviously does. `Manual` does too — it is documented as "accepts
+    /// any deployment method... allows switching between deployment methods
+    /// without recreating the project", so a repository left configured on a
+    /// manual project is a deliberate, still-live Git source, not a leftover.
+    ///
+    /// The rest (`DockerImage`, `StaticFiles`, `UploadedSource`) named a
+    /// non-Git source explicitly. A push to their old repository has nothing
+    /// to build: the planner fails, but only after the deployment row exists
+    /// and any in-flight deployment has been cancelled.
+    fn project_accepts_git_push(source_type: &temps_entities::source_type::SourceType) -> bool {
+        use temps_entities::source_type::SourceType;
+        matches!(source_type, SourceType::Git | SourceType::Manual)
+    }
+
     async fn queue_push_event_for_projects(
         &self,
         branch: Option<String>,
@@ -4741,6 +4757,29 @@ impl GitProviderManager {
             );
             return Ok(0);
         }
+
+        // A project that has been switched away from Git keeps its
+        // repo_owner/repo_name so the operator can switch back in one click,
+        // but it must stop acting on pushes. Webhooks match on repository
+        // alone, so without this a push to the old repository still reaches a
+        // `manual` project — where the planner treats the retained repo fields
+        // as a Git source and runs a real build with the project's deployment
+        // secrets — and still creates failed deployments (cancelling in-flight
+        // ones) for docker_image/static_files projects.
+        let matching_projects: Vec<projects::Model> = matching_projects
+            .into_iter()
+            .filter(|project| {
+                let accepts = Self::project_accepts_git_push(&project.source_type);
+                if !accepts {
+                    tracing::info!(
+                        project_id = project.id,
+                        source_type = ?project.source_type,
+                        "Ignoring push event for project that is no longer Git-sourced"
+                    );
+                }
+                accepts
+            })
+            .collect();
 
         if matching_projects.is_empty() {
             tracing::warn!("No authorized projects found, skipping push event");
@@ -5829,6 +5868,32 @@ mod classify_provider_response_error_tests {
 
 #[cfg(test)]
 mod tests {
+    use temps_entities::source_type::SourceType;
+
+    /// A project switched away from Git keeps its repo fields so the operator
+    /// can switch back in one click, but webhooks match on repository alone —
+    /// so a push to the old repository must not queue a deployment for it.
+    #[test]
+    fn only_git_capable_projects_act_on_push_events() {
+        assert!(super::GitProviderManager::project_accepts_git_push(
+            &SourceType::Git
+        ));
+        // Manual explicitly accepts any deployment method, including Git.
+        assert!(super::GitProviderManager::project_accepts_git_push(
+            &SourceType::Manual
+        ));
+        for source_type in [
+            SourceType::DockerImage,
+            SourceType::StaticFiles,
+            SourceType::UploadedSource,
+        ] {
+            assert!(
+                !super::GitProviderManager::project_accepts_git_push(&source_type),
+                "{source_type} must ignore Git pushes"
+            );
+        }
+    }
+
     use super::*;
     use sea_orm::{ActiveModelTrait, Set};
     use temps_core::{async_trait::async_trait, Job, JobReceiver, QueueError};

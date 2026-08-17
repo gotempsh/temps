@@ -26,6 +26,9 @@ pub enum NodeError {
     #[error("Node '{name}' is currently active; re-registering a different identity (token/address/WireGuard key) requires proof of the current token, or the node must be drained/removed first")]
     IdentityConflict { name: String },
 
+    #[error("Identity '{claimed}' is already held by node '{owner}'; a node cannot register under another node's name or address")]
+    IdentityClaimed { claimed: String, owner: String },
+
     #[error(
         "No node can run this image: it was built for [{image_platforms}], \
          the control plane runs {local_platform}, and no active worker node \
@@ -131,6 +134,25 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Which of the identities a registration claims collides with `owner`'s.
+/// Pure so the cross-field matching rule (a *name* may collide with another
+/// node's *address*, and vice versa) is testable without a database.
+fn identity_conflict_value(
+    claimed: &[String],
+    owner_name: &str,
+    owner_address: &str,
+    owner_private_address: &str,
+) -> Option<String> {
+    claimed
+        .iter()
+        .find(|value| {
+            value.as_str() == owner_name
+                || value.as_str() == owner_address
+                || value.as_str() == owner_private_address
+        })
+        .cloned()
+}
+
 pub struct NodeService {
     db: Arc<DatabaseConnection>,
 }
@@ -138,6 +160,74 @@ pub struct NodeService {
 impl NodeService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
+    }
+
+    /// Reject a registration that claims an identity another node already
+    /// holds — its name, its reachable address, or its mesh address.
+    ///
+    /// The cluster CA derives every SAN from these three fields, and
+    /// `san_from_str` emits an *IP* SAN when the value parses as an address,
+    /// so a name is as much an identity as an address is. Cross-checking all
+    /// three against all three is what makes "register under a fresh name,
+    /// claim the victim's IP" impossible rather than merely awkward.
+    ///
+    /// `self_node_id` is the row this registration legitimately owns (the
+    /// same-name reconnection resolved by the caller), excluded so a node
+    /// re-registering with its own unchanged identity is not blocked by
+    /// itself.
+    async fn assert_identity_unclaimed(
+        &self,
+        request: &RegisterNodeRequest,
+        self_node_id: Option<i32>,
+    ) -> Result<(), NodeError> {
+        let claimed: Vec<String> = [
+            request.name.trim(),
+            request.address.trim(),
+            request.private_address.trim(),
+        ]
+        .into_iter()
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_string())
+        .collect();
+
+        if claimed.is_empty() {
+            return Ok(());
+        }
+
+        let mut query = nodes::Entity::find().filter(
+            sea_orm::Condition::any()
+                .add(nodes::Column::Name.is_in(claimed.clone()))
+                .add(nodes::Column::Address.is_in(claimed.clone()))
+                .add(nodes::Column::PrivateAddress.is_in(claimed.clone())),
+        );
+        if let Some(self_node_id) = self_node_id {
+            query = query.filter(nodes::Column::Id.ne(self_node_id));
+        }
+
+        let owner = query.one(self.db.as_ref()).await?;
+        if let Some(owner) = owner {
+            let conflict = identity_conflict_value(
+                &claimed,
+                &owner.name,
+                &owner.address,
+                &owner.private_address,
+            )
+            .unwrap_or_else(|| request.name.clone());
+
+            tracing::warn!(
+                owner_node_id = owner.id,
+                owner_node_name = %owner.name,
+                claimed = %conflict,
+                requested_name = %request.name,
+                "Rejected node registration: identity already held by another node (possible CA SAN squatting)"
+            );
+            return Err(NodeError::IdentityClaimed {
+                claimed: conflict,
+                owner: owner.name,
+            });
+        }
+
+        Ok(())
     }
 
     /// Register a new node in the cluster.
@@ -171,6 +261,19 @@ impl NodeService {
         let existing = nodes::Entity::find()
             .filter(nodes::Column::Name.eq(&request.name))
             .one(self.db.as_ref())
+            .await?;
+
+        // Nothing about the enrollment proves the caller *owns* the identity
+        // it asks for, and the cluster CA signs SANs derived from exactly
+        // these three fields — including the name, which `san_from_str` turns
+        // into an IP SAN when it parses as an address. So a holder of a valid
+        // join token could register under a fresh name while claiming a
+        // victim node's address and walk away with a CA-signed certificate for
+        // the victim's identity, good enough to satisfy mTLS server-name
+        // verification. Identities are therefore exclusive: no registration
+        // may name, or address itself as, an identity another node already
+        // holds.
+        self.assert_identity_unclaimed(&request, existing.as_ref().map(|node| node.id))
             .await?;
 
         if let Some(existing_node) = existing {
@@ -782,6 +885,66 @@ impl AffectedDeployment {
 
 #[cfg(test)]
 mod tests {
+    /// A node registering under a fresh name must not be able to claim
+    /// another node's address — the cluster CA signs SANs built from exactly
+    /// these fields, so that certificate would be good for the victim's
+    /// identity. Name-vs-address is checked crosswise because `san_from_str`
+    /// emits an IP SAN for a name that parses as an address.
+    #[test]
+    fn identity_conflicts_are_detected_across_fields() {
+        let owner_name = "worker-1";
+        let owner_address = "203.0.113.7";
+        let owner_private = "10.44.0.2";
+
+        // Claiming the victim's public address under a different name.
+        assert_eq!(
+            super::identity_conflict_value(
+                &["attacker".to_string(), "203.0.113.7".to_string()],
+                owner_name,
+                owner_address,
+                owner_private,
+            ),
+            Some("203.0.113.7".to_string())
+        );
+
+        // Claiming the victim's address as a *name* (becomes an IP SAN).
+        assert_eq!(
+            super::identity_conflict_value(
+                &["10.44.0.2".to_string()],
+                owner_name,
+                owner_address,
+                owner_private,
+            ),
+            Some("10.44.0.2".to_string())
+        );
+
+        // Claiming the victim's name.
+        assert_eq!(
+            super::identity_conflict_value(
+                &["worker-1".to_string()],
+                owner_name,
+                owner_address,
+                owner_private,
+            ),
+            Some("worker-1".to_string())
+        );
+
+        // A genuinely distinct identity is not a conflict.
+        assert_eq!(
+            super::identity_conflict_value(
+                &[
+                    "worker-2".to_string(),
+                    "203.0.113.9".to_string(),
+                    "10.44.0.3".to_string()
+                ],
+                owner_name,
+                owner_address,
+                owner_private,
+            ),
+            None
+        );
+    }
+
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_entities::deployments;
@@ -859,6 +1022,7 @@ mod tests {
 
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![offline]]) // find by name
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard: unclaimed
             .append_query_results(vec![vec![sample_node()]]) // update
             .into_connection();
         let service = NodeService::new(Arc::new(db));
@@ -881,6 +1045,7 @@ mod tests {
         // is not an identity change and is always allowed, even while live.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![sample_node()]]) // find by name (live)
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard: unclaimed
             .append_query_results(vec![vec![sample_node()]]) // update
             .into_connection();
         let service = NodeService::new(Arc::new(db));
@@ -892,12 +1057,34 @@ mod tests {
         assert!(result.is_ok());
     }
 
+    /// End-to-end through `register`: a brand-new name whose address belongs
+    /// to an existing node is refused, so the cluster CA is never asked to
+    /// sign a SAN for the victim's address.
+    #[tokio::test]
+    async fn test_register_rejects_claiming_another_nodes_address() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // no node named "attacker"
+            .append_query_results(vec![vec![sample_node()]]) // ...but its address is taken
+            .into_connection();
+        let service = NodeService::new(Arc::new(db));
+
+        let result = service
+            .register(register_req("attacker", "hash", "https://10.100.0.2:3100"))
+            .await;
+
+        assert!(matches!(
+            result.unwrap_err(),
+            NodeError::IdentityClaimed { .. }
+        ));
+    }
+
     #[tokio::test]
     async fn test_register_rejects_identity_change_on_live_node() {
         // A live node (active + recent heartbeat) cannot have its identity
         // silently rebound by a join-token holder with no proof. (enroll-1.)
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![sample_node()]]) // find by name (live)
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard: unclaimed
             .into_connection();
         let service = NodeService::new(Arc::new(db));
 
@@ -921,6 +1108,7 @@ mod tests {
         // of the node's current token.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results(vec![vec![sample_node()]]) // find by name (live)
+            .append_query_results(vec![Vec::<nodes::Model>::new()]) // identity guard: unclaimed
             .append_query_results(vec![vec![sample_node()]]) // update
             .into_connection();
         let service = NodeService::new(Arc::new(db));

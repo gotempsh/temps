@@ -1452,6 +1452,94 @@ pub struct CrossProjectSiblingsParams {
 
 // ── Handlers ────────────────────────────────────────────────────────
 
+/// Projects out of `project_ids` the caller is entitled to read telemetry for.
+///
+/// A trace id is not an authorization boundary — it travels in `traceparent`
+/// headers, appears in logs and client-visible integrations, and an attacker
+/// can make an instrumented endpoint record a trace id of their choosing. So
+/// both cross-project endpoints intersect their results with the caller's
+/// actual project access instead of trusting the id.
+///
+/// Instance-wide Admin/PlatformAdmin bypass, matching the documented contract
+/// of [`temps_core::ProjectAccessChecker`]. With no checker registered (plain
+/// OSS) every project is readable, which is the documented
+/// fail-open-when-unconfigured behaviour of the extension point — there is no
+/// team model in OSS to scope against. Infrastructure errors from the checker
+/// drop the project (fail closed) rather than disclosing its spans.
+async fn readable_project_ids(
+    auth: &temps_auth::AuthContext,
+    state: &OtelAppState,
+    project_ids: impl IntoIterator<Item = i32>,
+) -> std::collections::HashSet<i32> {
+    let project_ids: std::collections::HashSet<i32> = project_ids.into_iter().collect();
+
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return project_ids;
+    }
+    let Some(checker) = state.project_access_checker.as_deref() else {
+        return project_ids;
+    };
+
+    let mut readable = std::collections::HashSet::new();
+    for project_id in project_ids {
+        match checker
+            .user_can_access_project(auth.user_id(), project_id)
+            .await
+        {
+            Ok(true) => {
+                readable.insert(project_id);
+            }
+            Ok(false) => {}
+            Err(error) => {
+                warn!(
+                    project_id,
+                    error = %error,
+                    "Project access check failed while scoping a cross-project trace; \
+                     excluding the project"
+                );
+            }
+        }
+    }
+    readable
+}
+
+/// Drop everything in `unified` that belongs to a project outside `readable`,
+/// and recompute the trace-level aggregates over what remains.
+///
+/// Mirrors the sharing-opt-out redaction the service already performs: the
+/// response still describes the same trace, it just stops carrying spans (and
+/// project names/ids) the caller may not see. `has_redacted_spans` is set so
+/// the UI can say the waterfall is partial rather than implying the trace was
+/// this short. Pure so the arithmetic is testable without storage.
+fn redact_unreadable_projects(
+    unified: &mut UnifiedTrace,
+    readable: &std::collections::HashSet<i32>,
+) {
+    unified
+        .projects
+        .retain(|project| readable.contains(&project.project_id));
+    unified
+        .spans
+        .retain(|span| readable.contains(&span.project_id));
+    unified
+        .truncated_projects
+        .retain(|project_id| readable.contains(project_id));
+
+    unified.has_redacted_spans = true;
+    unified.start_time = unified.spans.iter().map(|a| a.span.start_time).min();
+    unified.end_time = unified.spans.iter().map(|a| a.span.end_time).max();
+    unified.total_duration_ms = match (unified.start_time, unified.end_time) {
+        (Some(start), Some(end)) if end >= start => (end - start).num_milliseconds().max(0) as f64,
+        _ => 0.0,
+    };
+    unified.span_count = unified.spans.len();
+    unified.error_count = unified
+        .spans
+        .iter()
+        .filter(|a| matches!(a.span.status_code, crate::types::SpanStatusCode::Error))
+        .count();
+}
+
 /// Discover sibling projects that share the same `trace_id` (Phase 1 banner).
 ///
 /// Returns an empty `siblings` list when the trace is single-project — never
@@ -1522,8 +1610,13 @@ pub async fn get_cross_project_trace_siblings(
         .await
         .map_err(Problem::from)?;
 
+    // Scope to what the caller may actually read — the trace id alone proves
+    // nothing about entitlement, and the sibling list discloses project
+    // names/slugs as well as topology.
+    let readable = readable_project_ids(&auth, &state, siblings.iter().map(|s| s.project_id)).await;
     let siblings: Vec<CrossProjectSiblingRef> = siblings
         .into_iter()
+        .filter(|sibling| readable.contains(&sibling.project_id))
         .map(CrossProjectSiblingRef::from)
         .collect();
 
@@ -1591,11 +1684,21 @@ pub async fn get_unified_trace(
         );
     }
 
-    let unified: UnifiedTrace = state
+    let mut unified: UnifiedTrace = state
         .cross_project_service
         .get_unified_trace(&trace_id)
         .await
         .map_err(Problem::from)?;
+
+    let readable = readable_project_ids(
+        &auth,
+        &state,
+        unified.projects.iter().map(|project| project.project_id),
+    )
+    .await;
+    if readable.len() != unified.projects.len() {
+        redact_unreadable_projects(&mut unified, &readable);
+    }
 
     Ok(Json(unified))
 }
@@ -1603,6 +1706,112 @@ pub async fn get_unified_trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::services::cross_project::{AnnotatedSpan, ProjectRef};
+    use crate::types::{SpanKind, SpanRecord, SpanStatusCode};
+    use std::collections::{BTreeMap, HashSet};
+
+    fn span_for(project_id: i32, offset_ms: i64, status: SpanStatusCode) -> AnnotatedSpan {
+        let start_time = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("valid timestamp")
+            + chrono::Duration::milliseconds(offset_ms);
+        AnnotatedSpan {
+            project_id,
+            project_name: format!("project-{project_id}"),
+            span: SpanRecord {
+                project_id,
+                deployment_id: None,
+                resource: crate::types::ResourceInfo {
+                    service_name: "svc".to_string(),
+                    service_version: None,
+                    deployment_environment: None,
+                    attributes: BTreeMap::new(),
+                },
+                trace_id: "a".repeat(32),
+                span_id: format!("span-{project_id}-{offset_ms}"),
+                parent_span_id: None,
+                name: "op".to_string(),
+                kind: SpanKind::Server,
+                start_time,
+                end_time: start_time + chrono::Duration::milliseconds(100),
+                duration_ms: 100.0,
+                status_code: status,
+                status_message: String::new(),
+                attributes: BTreeMap::new(),
+                events: Vec::new(),
+            },
+        }
+    }
+
+    fn unified_fixture() -> UnifiedTrace {
+        UnifiedTrace {
+            trace_id: "a".repeat(32),
+            projects: vec![
+                ProjectRef {
+                    project_id: 1,
+                    project_name: "project-1".to_string(),
+                    project_slug: "project-1".to_string(),
+                },
+                ProjectRef {
+                    project_id: 2,
+                    project_name: "project-2".to_string(),
+                    project_slug: "project-2".to_string(),
+                },
+            ],
+            spans: vec![
+                span_for(1, 0, SpanStatusCode::Ok),
+                span_for(2, 500, SpanStatusCode::Error),
+            ],
+            start_time: None,
+            end_time: None,
+            total_duration_ms: 600.0,
+            span_count: 2,
+            error_count: 1,
+            has_redacted_spans: false,
+            truncated: false,
+            truncated_projects: vec![2],
+        }
+    }
+
+    /// A trace id is not an authorization boundary — it travels in
+    /// `traceparent` headers. Spans, project identities and the aggregates
+    /// computed from them must all be scoped to what the caller can read.
+    #[test]
+    fn unreadable_projects_are_stripped_from_a_unified_trace() {
+        let mut unified = unified_fixture();
+        redact_unreadable_projects(&mut unified, &HashSet::from([1]));
+
+        assert_eq!(unified.spans.len(), 1);
+        assert_eq!(unified.spans[0].project_id, 1);
+        assert!(unified.projects.iter().all(|p| p.project_id == 1));
+        assert!(
+            unified.truncated_projects.is_empty(),
+            "truncated_projects must not disclose a project the caller cannot read"
+        );
+        assert!(unified.has_redacted_spans);
+
+        // Aggregates are recomputed over the remaining spans, not carried
+        // over from the full trace.
+        assert_eq!(unified.span_count, 1);
+        assert_eq!(unified.error_count, 0);
+        assert_eq!(unified.total_duration_ms, 100.0);
+    }
+
+    /// Nothing readable at all must yield an empty, self-consistent trace
+    /// rather than the original aggregates.
+    #[test]
+    fn redaction_of_every_project_leaves_an_empty_trace() {
+        let mut unified = unified_fixture();
+        redact_unreadable_projects(&mut unified, &HashSet::new());
+
+        assert!(unified.spans.is_empty());
+        assert!(unified.projects.is_empty());
+        assert_eq!(unified.span_count, 0);
+        assert_eq!(unified.error_count, 0);
+        assert_eq!(unified.total_duration_ms, 0.0);
+        assert!(unified.start_time.is_none());
+        assert!(unified.end_time.is_none());
+    }
 
     /// `include_total=false` must OMIT the key rather than report 0. A client
     /// that reads `total ?? 0` would otherwise render "0 traces" over a full
