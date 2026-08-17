@@ -71,17 +71,6 @@ export function ProjectOverview({
     enabled: analyticsEnabled,
   })
 
-  const visitsQuery = useQuery({
-    ...getUniqueCountsOptions({
-      ...buildProjectAnalyticsCountRequest(
-        project.id,
-        analyticsWindow,
-        'sessions'
-      ),
-    }),
-    enabled: analyticsEnabled,
-  })
-
   const pageViewsQuery = useQuery({
     ...getUniqueCountsOptions({
       ...buildProjectAnalyticsCountRequest(
@@ -309,20 +298,18 @@ export function ProjectOverview({
             capabilityError={analyticsCapabilityQuery.isError}
             enabled={analyticsEnabled}
             visitors={visitors}
-            visits={visitsQuery.data?.count ?? 0}
             pageViews={pageViewsQuery.data?.count ?? 0}
+            returningVisitors={returningVisitors}
             returningRate={returningVisitorRate}
             hourlyVisitors={hourlyVisitorsQuery.data ?? []}
             loading={
               visitorsQuery.isPending ||
-              visitsQuery.isPending ||
               pageViewsQuery.isPending ||
               returningVisitorsQuery.isPending ||
               hourlyVisitorsQuery.isPending
             }
             error={
               visitorsQuery.isError ||
-              visitsQuery.isError ||
               pageViewsQuery.isError ||
               returningVisitorsQuery.isError ||
               hourlyVisitorsQuery.isError
@@ -381,8 +368,8 @@ function VisitorAnalyticsCard({
   capabilityError,
   enabled,
   visitors,
-  visits,
   pageViews,
+  returningVisitors,
   returningRate,
   hourlyVisitors,
   loading,
@@ -393,8 +380,8 @@ function VisitorAnalyticsCard({
   capabilityError: boolean
   enabled: boolean
   visitors: number
-  visits: number
   pageViews: number
+  returningVisitors: number
   returningRate: number
   hourlyVisitors: EventTimeline[]
   loading: boolean
@@ -430,8 +417,8 @@ function VisitorAnalyticsCard({
             <div>
               <p className="font-medium">Add browser analytics</p>
               <p className="mt-1 text-base text-pretty text-muted-foreground sm:text-sm">
-                Track visitors, sessions, page views, and returning users from
-                this project.
+                Track visitors, page views, and returning activity from this
+                project.
               </p>
             </div>
             <Button variant="outline" size="sm" asChild>
@@ -456,13 +443,16 @@ function VisitorAnalyticsCard({
             />
             <dl className="grid grid-cols-2 gap-x-5 gap-y-3">
               <AnalyticsValue label="Visitors" value={formatNumber(visitors)} />
-              <AnalyticsValue label="Visits" value={formatNumber(visits)} />
               <AnalyticsValue
                 label="Page views"
                 value={formatNumber(pageViews)}
               />
               <AnalyticsValue
-                label="Returning"
+                label="Returning visitors"
+                value={formatNumber(returningVisitors)}
+              />
+              <AnalyticsValue
+                label="Returning rate"
                 value={`${returningRate.toFixed(0)}%`}
               />
             </dl>

@@ -1,5 +1,12 @@
+/** Raw session IDs include browser-like automation and are not human KPIs. */
+export const PROJECT_OVERVIEW_ANALYTICS_METRICS = [
+  'visitors',
+  'page_views',
+  'returning_visitors',
+] as const
+
 export type ProjectAnalyticsMetric =
-  'visitors' | 'sessions' | 'returning_visitors' | 'page_views'
+  (typeof PROJECT_OVERVIEW_ANALYTICS_METRICS)[number]
 
 interface AnalyticsWindow {
   start_date: string

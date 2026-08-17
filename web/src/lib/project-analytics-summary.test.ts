@@ -1,7 +1,14 @@
 import { describe, expect, test } from 'bun:test'
-import { buildProjectAnalyticsCountRequest } from './project-analytics-summary'
+import {
+  buildProjectAnalyticsCountRequest,
+  PROJECT_OVERVIEW_ANALYTICS_METRICS,
+} from './project-analytics-summary'
 
 describe('buildProjectAnalyticsCountRequest', () => {
+  test('does not present raw sessions as human activity', () => {
+    expect(PROJECT_OVERVIEW_ANALYTICS_METRICS).not.toContain('sessions')
+  })
+
   test('keeps project overview analytics scoped to the current project', () => {
     const request = buildProjectAnalyticsCountRequest(
       42,
@@ -9,7 +16,7 @@ describe('buildProjectAnalyticsCountRequest', () => {
         start_date: '2026-08-16T12:00:00.000Z',
         end_date: '2026-08-17T12:00:00.000Z',
       },
-      'sessions'
+      'visitors'
     )
 
     expect(request).toEqual({
@@ -17,7 +24,7 @@ describe('buildProjectAnalyticsCountRequest', () => {
       query: {
         start_date: '2026-08-16T12:00:00.000Z',
         end_date: '2026-08-17T12:00:00.000Z',
-        metric: 'sessions',
+        metric: 'visitors',
       },
     })
   })
