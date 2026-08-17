@@ -13,14 +13,23 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use futures_util::TryStreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-use tokio::io::AsyncBufReadExt;
+use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::io::StreamReader;
 
 use temps_log_aggregator::{
     RemoteContainerInfo, RemoteContainerLogSource, RemoteLogSourceError, RemoteLogStream,
 };
+
+/// Maximum bytes a single remote log line may occupy before the stream is
+/// failed.
+///
+/// The control plane opens a follow stream for every tracked remote
+/// container, so this buffer exists once per container and is held for the
+/// lifetime of the stream. 1 MiB matches the downstream chunk limit, which is
+/// the largest line the pipeline can usefully carry anyway.
+const MAX_REMOTE_LOG_LINE_BYTES: usize = 1024 * 1024;
 
 /// Adapter that lets the log-aggregator collect logs from remote worker nodes.
 pub struct RemoteLogSourceImpl {
@@ -270,21 +279,37 @@ impl RemoteContainerLogSource for RemoteLogSourceImpl {
                 .map_err(|e| std::io::Error::other(e.to_string())),
         );
         let reader = StreamReader::new(byte_stream);
-        let lines = tokio::io::BufReader::new(reader).lines();
+        // `BufReader::lines()` has no maximum line length: it keeps appending
+        // bytes until a newline or EOF. These streams are opened with
+        // follow=true for *every* tracked remote container by a background
+        // collector, so a deployed app that writes one very long line — or
+        // simply never writes a newline — would make the control plane buffer
+        // it indefinitely. The 1 MiB chunk limit downstream never applies,
+        // because it only sees whole lines. `LinesCodec` bounds the in-flight
+        // line instead, and errors out once the limit is passed.
+        let lines = FramedRead::new(
+            reader,
+            LinesCodec::new_with_max_length(MAX_REMOTE_LOG_LINE_BYTES),
+        );
 
         let stream =
             futures_util::stream::unfold((lines, node_id), |(mut lines, node_id)| async move {
                 loop {
-                    match lines.next_line().await {
-                        Ok(Some(raw)) => {
+                    match lines.next().await {
+                        Some(Ok(raw)) => {
                             let cleaned: String = raw.chars().filter(|&c| c != '\0').collect();
                             if cleaned.trim().is_empty() {
                                 continue;
                             }
                             return Some((Ok(cleaned), (lines, node_id)));
                         }
-                        Ok(None) => return None,
-                        Err(e) => {
+                        None => return None,
+                        Some(Err(e)) => {
+                            // Includes LinesCodecError::MaxLineLengthExceeded.
+                            // Surfacing it ends this container's stream rather
+                            // than silently truncating, so the operator sees
+                            // why the tail stopped; the collector reopens the
+                            // stream on its next reconcile pass.
                             return Some((
                                 Err(RemoteLogSourceError::Source {
                                     node_id,

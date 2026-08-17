@@ -983,23 +983,18 @@ impl SourceMapService {
         // file stored "~/internal/gateway/mw.go". Try progressively shorter
         // trailing suffixes, longest (most specific) first, so we prefer the
         // least-ambiguous match and only fall back to the bare basename last.
-        if !filename.contains("://") {
-            let normalized = filename.trim_start_matches("~/").replace('\\', "/");
-            let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
-            for i in 0..segments.len() {
-                let suffix = segments[i..].join("/");
-                let pattern = format!("%/{}", escape_like(&suffix));
-                let file = source_files::Entity::find()
-                    .filter(source_files::Column::ProjectId.eq(project_id))
-                    .filter(source_files::Column::Release.eq(release))
-                    .filter(source_files::Column::FilePath.like(&pattern))
-                    .one(self.db.as_ref())
-                    .await
-                    .ok()
-                    .flatten();
-                if let Some(file) = file {
-                    return build_native_resolved(&file.content, filename, lineno);
-                }
+        for suffix in native_suffix_candidates(filename) {
+            let pattern = format!("%/{}", escape_like(&suffix));
+            let file = source_files::Entity::find()
+                .filter(source_files::Column::ProjectId.eq(project_id))
+                .filter(source_files::Column::Release.eq(release))
+                .filter(source_files::Column::FilePath.like(&pattern))
+                .one(self.db.as_ref())
+                .await
+                .ok()
+                .flatten();
+            if let Some(file) = file {
+                return build_native_resolved(&file.content, filename, lineno);
             }
         }
 
@@ -1007,8 +1002,58 @@ impl SourceMapService {
     }
 }
 
+/// Trailing-suffix candidates to try for a native frame path, most specific
+/// first.
+///
+/// Native build paths often carry a build-dir prefix the uploaded
+/// (module-relative) path lacks — a non-`-trimpath` Go binary reports
+/// `/src/internal/gateway/mw.go` for a file stored `~/internal/gateway/mw.go`
+/// — so we try progressively shorter trailing suffixes and prefer the
+/// least-ambiguous match, falling back to the bare basename last.
+///
+/// The number of candidates is capped. `filename` comes verbatim off a
+/// submitted Sentry event and the ingest route is public (DSNs are
+/// browser-observable), while each candidate costs one `LIKE` query against
+/// `source_files`. Without a cap, a single 2 MiB event carrying
+/// `"a/a/a/.../missing.go"` with hundreds of thousands of segments turns into
+/// that many `join` allocations and database round trips. Genuine build-dir
+/// prefixes are a few segments deep, so the deepest
+/// [`MAX_NATIVE_SUFFIX_ATTEMPTS`] suffixes cover every real case.
+fn native_suffix_candidates(filename: &str) -> Vec<String> {
+    if filename.contains("://") {
+        return Vec::new();
+    }
+
+    let normalized = filename.trim_start_matches("~/").replace('\\', "/");
+    let segments: Vec<&str> = normalized.split('/').filter(|s| !s.is_empty()).collect();
+
+    let start = segments.len().saturating_sub(MAX_NATIVE_SUFFIX_ATTEMPTS);
+    if start > 0 {
+        debug!(
+            filename,
+            total_segments = segments.len(),
+            attempts = MAX_NATIVE_SUFFIX_ATTEMPTS,
+            "Native frame path is unusually deep; only its deepest suffixes are matched"
+        );
+    }
+
+    (start..segments.len())
+        .map(|i| segments[i..].join("/"))
+        .collect()
+}
+
 /// Number of context lines to extract above and below the error line.
 const CONTEXT_LINES: u32 = 5;
+
+/// How many trailing-suffix candidates a single native frame may try.
+///
+/// Each attempt is one `LIKE` query against `source_files`, driven by a
+/// filename taken verbatim from a submitted Sentry event on a public ingest
+/// route. Real build-dir prefixes are a few segments deep (`/src/...`,
+/// `/home/runner/work/<repo>/<repo>/...`), so 16 covers every genuine case
+/// while turning a hostile "a/a/a/.../x.go" from unbounded CPU + database
+/// load into a fixed, small cost.
+const MAX_NATIVE_SUFFIX_ATTEMPTS: usize = 16;
 
 /// Whether a path contains a `..` (parent-dir) component, checking both `/` and
 /// `\` separators so it also catches Windows-style paths.
@@ -1310,6 +1355,60 @@ fn generate_lookup_paths(filename: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::{native_suffix_candidates, MAX_NATIVE_SUFFIX_ATTEMPTS};
+
+    /// Ordinary frames are unaffected: every suffix from the full path down to
+    /// the bare basename is tried, most specific first.
+    #[test]
+    fn native_suffix_candidates_are_most_specific_first() {
+        let candidates = native_suffix_candidates("/src/internal/gateway/mw.go");
+        assert_eq!(
+            candidates,
+            vec![
+                "src/internal/gateway/mw.go",
+                "internal/gateway/mw.go",
+                "gateway/mw.go",
+                "mw.go",
+            ]
+        );
+    }
+
+    #[test]
+    fn native_suffix_candidates_normalise_tilde_and_backslashes() {
+        assert_eq!(
+            native_suffix_candidates("~/internal\\gateway\\mw.go"),
+            vec!["internal/gateway/mw.go", "gateway/mw.go", "mw.go"]
+        );
+    }
+
+    /// URLs are handled by the source-map path, not the native path.
+    #[test]
+    fn native_suffix_candidates_skip_urls() {
+        assert!(native_suffix_candidates("https://example.com/a/b/c.js").is_empty());
+    }
+
+    /// The ingest route is public and `filename` is attacker-controlled: each
+    /// candidate costs a LIKE query, so a pathological path must not produce a
+    /// pathological number of them.
+    #[test]
+    fn native_suffix_candidates_are_bounded_for_hostile_paths() {
+        let hostile = format!("{}missing.go", "a/".repeat(200_000));
+        let candidates = native_suffix_candidates(&hostile);
+
+        assert_eq!(candidates.len(), MAX_NATIVE_SUFFIX_ATTEMPTS);
+        // The bare basename — the most likely genuine match — is still tried.
+        assert_eq!(candidates.last().map(String::as_str), Some("missing.go"));
+    }
+
+    #[test]
+    fn native_suffix_candidates_below_the_cap_are_complete() {
+        let path = format!("{}x.go", "d/".repeat(MAX_NATIVE_SUFFIX_ATTEMPTS - 1));
+        assert_eq!(
+            native_suffix_candidates(&path).len(),
+            MAX_NATIVE_SUFFIX_ATTEMPTS
+        );
+    }
+
     use super::*;
     use sea_orm::{ActiveModelTrait, DatabaseConnection, Set};
     use std::sync::Arc;
