@@ -1919,7 +1919,7 @@ pub async fn create_environment(
 // Secrets: file-mounted secret values.
 //
 // Secrets are delivered to containers as files under /run/secrets/<KEY>
-// (tmpfs, mode 0400) rather than as environment variables. Plaintext is
+// via a read-only mount rather than as environment variables. Plaintext is
 // NEVER returned from the API after creation — GET responses always
 // carry only metadata. The mounted file inside the running container is
 // the source of truth for reads.

@@ -1121,6 +1121,7 @@ impl WorkflowPlanner {
                     environment,
                     deployment,
                     env_vars,
+                    secrets,
                     buildkit_cache_namespace,
                 )
                 .await;
@@ -1863,6 +1864,7 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         env_vars: std::collections::HashMap<String, String>,
+        secrets: std::collections::HashMap<String, String>,
         buildkit_cache_namespace: String,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
@@ -1949,6 +1951,10 @@ impl WorkflowPlanner {
         });
         if let Some(obj) = compose_job_config.as_object_mut() {
             self.seal_sensitive_field(obj, deployment, "environment_vars", &env_vars)?;
+            // Sealed under its own field, never merged into `environment_vars`:
+            // the compose executor mounts these as files so they stay out of
+            // `docker inspect` and out of the generated env files.
+            self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
             let build_args = std::collections::HashMap::from([(
                 BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
                 buildkit_cache_namespace,

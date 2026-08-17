@@ -115,7 +115,7 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
             <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
               /run/secrets/&lt;KEY&gt;
             </code>{' '}
-            (mode 0400, tmpfs). They are never visible via{' '}
+            as a read-only mount. They are never visible via{' '}
             <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
               docker inspect
             </code>{' '}
@@ -123,7 +123,8 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
             <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
               fs.readFileSync('/run/secrets/DB_PASSWORD', 'utf8')
             </code>
-            . A redeploy is required for new or updated secrets to take effect.
+            . Docker Compose projects get the same mount in every service. A
+            redeploy is required for new or updated secrets to take effect.
           </p>
         </div>
         <Button onClick={() => setIsCreateOpen(true)}>

@@ -1,7 +1,7 @@
 //! Service for managing secrets.
 //!
 //! Secrets are exposed to user containers as files under `/run/secrets/<KEY>`
-//! (tmpfs, mode 0400) instead of as environment variables. Values are always
+//! via a read-only mount instead of as environment variables. Values are always
 //! stored encrypted with AES-256-GCM via `EncryptionService` and are never
 //! returned in plaintext from the API after creation — the UI shows a masked
 //! placeholder. Plaintext is only decrypted at deploy time for the deployer.
@@ -21,8 +21,8 @@ use thiserror::Error;
 
 use super::types::{SecretEnvironmentRef, SecretWithEnvironments};
 
-/// Maximum plaintext size for a single secret, in bytes. Matches the
-/// per-container tmpfs budget set in the deployer.
+/// Maximum plaintext size for a single secret, in bytes. Bounds how much
+/// plaintext a single deployment can materialize onto the host.
 pub const SECRET_VALUE_MAX_BYTES: usize = 1_048_576; // 1 MiB
 
 #[derive(Error, Debug)]

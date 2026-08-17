@@ -2090,7 +2090,12 @@ impl ContainerDeployer for DockerRuntime {
             pids_limit: Some(512),
             // Security hardening: use init process for proper signal handling and zombie reaping
             init: Some(true),
-            binds: secrets_bind.map(|b| vec![b]),
+            // Collected rather than assigned so adding a second bind here does
+            // not silently drop the secrets mount.
+            binds: {
+                let binds: Vec<String> = secrets_bind.into_iter().collect();
+                (!binds.is_empty()).then_some(binds)
+            },
             ..Default::default()
         };
 

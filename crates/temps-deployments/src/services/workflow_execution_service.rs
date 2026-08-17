@@ -2376,6 +2376,14 @@ impl WorkflowExecutionService {
                     "build_args",
                 )
                 .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
+                // Absent on jobs queued before compose secret support; the
+                // reader returns an empty map, so those deploy unchanged.
+                let secrets = crate::services::sensitive_envelope::read_sealed(
+                    config,
+                    self.encryption_service.get(),
+                    "secrets",
+                )
+                .map_err(|e| WorkflowExecutionError::InvalidJobConfig(e.to_string()))?;
 
                 // Projects created before directory normalization was applied on
                 // every write path can hold "" or "/" here. Both are rejected by
@@ -2452,6 +2460,7 @@ impl WorkflowExecutionService {
                     .public_ports(public_ports)
                     .download_job_id(download_job_id)
                     .environment_vars(env_vars)
+                    .secrets(secrets)
                     .build_args(build_args)
                     .log_id(Some(db_job.log_id.clone()))
                     .log_service(self.log_service.clone())

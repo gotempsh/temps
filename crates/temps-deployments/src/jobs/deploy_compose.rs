@@ -63,6 +63,10 @@ pub struct DeployComposeJob {
     /// Inline compose content (used when no git repo, e.g. manual project)
     compose_content: Option<String>,
     environment_vars: HashMap<String, String>,
+    /// Decrypted project secrets, mounted as files under `/run/secrets/<KEY>`
+    /// in every compose service. Never injected as environment variables, so
+    /// they stay out of `docker inspect` and out of the generated env files.
+    secrets: HashMap<String, String>,
     /// Platform-owned build arguments. These are passed only to
     /// `docker compose build`, never to service runtime environments.
     build_args: HashMap<String, String>,
@@ -102,6 +106,7 @@ pub struct DeployComposeJobBuilder {
     unsandboxed_services: Vec<String>,
     public_ports: Vec<ComposePublicPort>,
     environment_vars: HashMap<String, String>,
+    secrets: HashMap<String, String>,
     build_args: HashMap<String, String>,
     download_job_id: Option<String>,
     log_id: Option<String>,
@@ -131,6 +136,7 @@ impl DeployComposeJobBuilder {
             unsandboxed_services: Vec::new(),
             public_ports: Vec::new(),
             environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
             build_args: HashMap::new(),
             download_job_id: None,
             log_id: None,
@@ -202,6 +208,12 @@ impl DeployComposeJobBuilder {
         self.build_args = args;
         self
     }
+    /// Decrypted project secrets. Materialized as files under
+    /// `/run/secrets/<KEY>` by the compose executor.
+    pub fn secrets(mut self, secrets: HashMap<String, String>) -> Self {
+        self.secrets = secrets;
+        self
+    }
     pub fn log_id(mut self, id: Option<String>) -> Self {
         self.log_id = id;
         self
@@ -237,6 +249,7 @@ impl DeployComposeJobBuilder {
             unsandboxed_services: self.unsandboxed_services,
             public_ports: self.public_ports,
             environment_vars: self.environment_vars,
+            secrets: self.secrets,
             build_args: self.build_args,
             download_job_id: self
                 .download_job_id
@@ -535,6 +548,50 @@ impl WorkflowTask for DeployComposeJob {
             }
         }
 
+        // Report secret delivery. A secret that exists in the dashboard but
+        // never reaches the container is the worst possible failure mode —
+        // silent, and indistinguishable from a wrong value — so the log states
+        // exactly which keys were mounted and which services opted out.
+        if let Some(ref log_id) = self.log_id {
+            if !self.secrets.is_empty() {
+                let mut keys: Vec<&str> = self.secrets.keys().map(String::as_str).collect();
+                keys.sort_unstable();
+                let _ = self
+                    .log_service
+                    .log_info(
+                        log_id,
+                        &format!(
+                            "Mounting {} secret(s) at /run/secrets in every service: {}",
+                            keys.len(),
+                            keys.join(", ")
+                        ),
+                    )
+                    .await;
+
+                let mut skipped = ComposeExecutor::services_managing_own_secrets(&[
+                    &compose_content,
+                    self.compose_override.as_deref().unwrap_or_default(),
+                ])
+                .into_iter()
+                .collect::<Vec<_>>();
+                skipped.sort();
+                if !skipped.is_empty() {
+                    let _ = self
+                        .log_service
+                        .log_warning(
+                            log_id,
+                            &format!(
+                                "Service(s) {} already define their own /run/secrets mount or \
+                                 compose `secrets:` entry — Temps secrets are NOT mounted there. \
+                                 Remove that mount if you want Temps to deliver them.",
+                                skipped.join(", ")
+                            ),
+                        )
+                        .await;
+                }
+            }
+        }
+
         // Validate the compose security policy BEFORE tearing down the existing
         // stack. Rejecting after teardown would cause downtime on the running
         // deployment for what is purely a configuration problem.
@@ -600,6 +657,7 @@ impl WorkflowTask for DeployComposeJob {
             work_dir: PathBuf::from("/tmp"),
             compose_path: self.compose_path.clone(),
             environment_vars: self.environment_vars.clone(),
+            secrets: self.secrets.clone(),
             build_args: self.build_args.clone(),
             labels,
             repo_dir: repo_path.clone(),
