@@ -823,29 +823,37 @@ pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result
 
 /// Shared `INSERT … ON CONFLICT DO NOTHING` loop for control-plane-node
 /// -scoped default rules, keyed on the `(node_id, metric_name)` unique index.
+///
+/// Every `RuleSeed` field is a `&'static str`/literal defined in this file
+/// (see `proxy_default_seeds`/`node_fd_default_seeds`), never user input, but
+/// this still binds via `$1..$7` rather than `format!()`-ing the SQL — the
+/// project's raw-query rule (CLAUDE.md: `$1`, `$2` parameter binding) applies
+/// regardless of whether today's callers happen to be safe, since a future
+/// caller passing an operator-supplied `String` would silently inherit
+/// whatever escaping this function does or doesn't do.
 async fn seed_node_rules(db: &DatabaseConnection, seeds: &[RuleSeed]) -> Result<(), MetricsError> {
     use sea_orm::ConnectionTrait;
     for seed in seeds {
-        let sql = format!(
+        let statement = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
             "INSERT INTO monitoring_alert_rules \
              (service_id, deployment_id, node_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
-             VALUES (NULL, NULL, {node_id}, '{name}', '{metric_name}', {threshold}, '{comparator}', '{severity}', {for_duration}, true) \
+             VALUES (NULL, NULL, $1, $2, $3, $4, $5, $6, $7, true) \
              ON CONFLICT (node_id, metric_name) WHERE node_id IS NOT NULL DO NOTHING",
-            node_id = CONTROL_PLANE_NODE_ID,
-            name = seed.name.replace('\'', "''"),
-            metric_name = seed.metric_name.replace('\'', "''"),
-            threshold = seed.threshold,
-            comparator = seed.comparator.replace('\'', "''"),
-            severity = seed.severity.replace('\'', "''"),
-            for_duration = seed.for_duration_secs,
+            [
+                CONTROL_PLANE_NODE_ID.into(),
+                seed.name.into(),
+                seed.metric_name.into(),
+                seed.threshold.into(),
+                seed.comparator.into(),
+                seed.severity.into(),
+                seed.for_duration_secs.into(),
+            ],
         );
 
-        db.execute(sea_orm::Statement::from_string(
-            sea_orm::DatabaseBackend::Postgres,
-            sql,
-        ))
-        .await
-        .map_err(MetricsError::DatabaseError)?;
+        db.execute(statement)
+            .await
+            .map_err(MetricsError::DatabaseError)?;
     }
 
     info!(
