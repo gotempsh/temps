@@ -1022,6 +1022,7 @@ WHERE project_id = $1
                       AND timestamp >= $2::timestamp
                       AND timestamp <= $3::timestamp
                       AND visitor_id IS NOT NULL
+                      AND event_type = 'page_view'
                       AND is_crawler = false
                       AND ($4::int IS NULL OR environment_id = $4)
                       AND ($5::int IS NULL OR deployment_id = $5)
@@ -1034,6 +1035,8 @@ WHERE project_id = $1
                     WHERE previous.project_id = $1
                       AND previous.visitor_id = cv.visitor_id
                       AND previous.timestamp < $2::timestamp
+                      AND previous.event_type = 'page_view'
+                      AND previous.is_crawler = false
                       AND ($4::int IS NULL OR previous.environment_id = $4)
                       AND ($5::int IS NULL OR previous.deployment_id = $5)
                 )
@@ -1066,12 +1069,17 @@ WHERE project_id = $1
 
         // Determine what to count based on metric
         let count_expr = match metric.as_str() {
-            "sessions" => {
-                "COUNT(DISTINCT session_id) FILTER (WHERE session_id IS NOT NULL)::bigint"
-            }
-            "visitors" => {
-                "COUNT(DISTINCT visitor_id) FILTER (WHERE visitor_id IS NOT NULL)::bigint"
-            }
+            "sessions" => r#"COUNT(DISTINCT CASE
+                    WHEN session_id LIKE 'v2|%' THEN split_part(session_id, '|', 2)
+                    ELSE session_id
+                END) FILTER (
+                    WHERE session_id IS NOT NULL
+                      AND event_type = 'page_view'
+                )::bigint"#,
+            "visitors" => "COUNT(DISTINCT visitor_id) FILTER (
+                    WHERE visitor_id IS NOT NULL
+                      AND event_type = 'page_view'
+                )::bigint",
             "page_views" => "COUNT(*) FILTER (WHERE event_type = 'page_view')::bigint",
             "paths" => {
                 "COUNT(DISTINCT page_path) FILTER (WHERE event_type = 'page_view')::bigint"
@@ -1191,6 +1199,8 @@ WHERE project_id = $1
             FROM events
             WHERE timestamp >= $1 AND timestamp <= $2
               AND project_id IN ({in_clause})
+              AND event_type = 'page_view'
+              AND is_crawler = false
             GROUP BY project_id
             "#,
         );
@@ -1224,6 +1234,8 @@ WHERE project_id = $1
             FROM events
             WHERE timestamp >= $1 AND timestamp <= $2
               AND project_id IN ({in_clause})
+              AND event_type = 'page_view'
+              AND is_crawler = false
             GROUP BY project_id
             "#,
         );
@@ -1271,6 +1283,7 @@ WHERE project_id = $1
                   AND timestamp <= $2
                   AND project_id IN ({in_clause})
                   AND event_type = 'page_view'
+                  AND is_crawler = false
                 GROUP BY project_id, date_trunc('hour', timestamp)
             ) d ON d.project_id = p.project_id AND d.bucket = h.bucket
             ORDER BY p.project_id, h.bucket ASC
@@ -4529,6 +4542,55 @@ mod tests {
             )
             .await
             .expect("Failed to record event");
+
+        // API/custom events may carry correlation session IDs, but they are
+        // not browser visits and must not inflate the analytics session count.
+        service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                Some(deployment.id),
+                Some("api-only-session".to_string()),
+                None,
+                "api_request",
+                serde_json::json!({}),
+                "/v1/orders",
+                "",
+                Some("temps.example"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("service-client/1.0".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record API-only event");
+
+        let sessions = service
+            .get_unique_counts(
+                chrono::Utc::now() - chrono::Duration::hours(1),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+                project.id,
+                None,
+                None,
+                "sessions".to_string(),
+            )
+            .await
+            .expect("Failed to count browser sessions");
+        assert_eq!(
+            sessions.count, 1,
+            "only the normalized human page-view session should count"
+        );
 
         let breakdown = service
             .get_property_breakdown(

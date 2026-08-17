@@ -1287,6 +1287,7 @@ impl ProjectService {
         error_source_context_enabled: Option<bool>,
         error_source_root: Option<String>,
         ai_api_traffic_summary_enabled: Option<bool>,
+        image_retention_hours: Option<Option<i32>>,
     ) -> Result<Project, ProjectError> {
         // Validate preview env on-demand timeouts before touching the DB.
         // Mirrors DeploymentConfig::validate so the project-level defaults are
@@ -1304,6 +1305,14 @@ impl ProjectService {
                 return Err(ProjectError::InvalidInput(format!(
                     "preview_envs_wake_timeout_seconds {} is not in valid range (5-120)",
                     wake
+                )));
+            }
+        }
+        if let Some(Some(hours)) = image_retention_hours {
+            if !(1..=8760).contains(&hours) {
+                return Err(ProjectError::InvalidInput(format!(
+                    "image_retention_hours {} is not in valid range (1-8760)",
+                    hours
                 )));
             }
         }
@@ -1550,13 +1559,14 @@ impl ProjectService {
             active_project.update(self.db.as_ref()).await?;
         }
 
-        // Update preview environment settings if any are provided
-        let needs_preview_update = enable_preview_environments.is_some()
+        // Update preview environment settings and image retention if any are provided
+        let needs_project_row_update = enable_preview_environments.is_some()
             || preview_envs_on_demand.is_some()
             || preview_envs_idle_timeout_seconds.is_some()
-            || preview_envs_wake_timeout_seconds.is_some();
+            || preview_envs_wake_timeout_seconds.is_some()
+            || image_retention_hours.is_some();
 
-        if needs_preview_update {
+        if needs_project_row_update {
             // Reload project to ensure we have the latest state
             let project = projects::Entity::find_by_id(project_id)
                 .one(self.db.as_ref())
@@ -1579,6 +1589,9 @@ impl ProjectService {
             }
             if let Some(wake) = preview_envs_wake_timeout_seconds {
                 active_project.preview_envs_wake_timeout_seconds = Set(wake);
+            }
+            if let Some(hours) = image_retention_hours {
+                active_project.image_retention_hours = Set(hours);
             }
 
             active_project.update(self.db.as_ref()).await?;
@@ -3160,6 +3173,7 @@ impl ProjectService {
             source_type: db_project.source_type,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
             cross_project_trace_sharing: db_project.cross_project_trace_sharing,
+            image_retention_hours: db_project.image_retention_hours,
         }
     }
 
@@ -4096,6 +4110,7 @@ mod tests {
                 None, // error_source_context_enabled
                 None, // error_source_root
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -4465,6 +4480,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("partial preset_config patch");
@@ -4537,6 +4553,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("partial excludedServices patch");
@@ -4585,6 +4602,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("partial relaxedCapabilityServices patch");
@@ -4641,6 +4659,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("explicit composeServices patch, even though it strands relaxedCapabilityServices");
@@ -4693,6 +4712,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("unrelated excludedServices patch");
@@ -4766,6 +4786,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("relaxedCapabilityServices patch for a real non-database service");
@@ -4834,6 +4855,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -4893,6 +4915,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("explicit empty providers");
@@ -4993,6 +5016,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -5092,6 +5116,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await;
 
@@ -5213,6 +5238,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("update custom Dockerfile config");
@@ -5448,6 +5474,7 @@ mod tests {
                 None,
                 None,
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("update preset and config together");
@@ -5779,6 +5806,7 @@ mod tests {
                 None, // error_source_context_enabled
                 None, // error_source_root
                 None, // ai_api_traffic_summary_enabled
+                None, // image_retention_hours
             )
             .await
             .expect("update_project_settings should succeed");
@@ -5791,6 +5819,89 @@ mod tests {
         assert_eq!(
             stored.directory, ".",
             "a blank directory must be stored as the repo-root marker, not \"\""
+        );
+    }
+
+    /// `ImageRetentionSettings::effective_default_hours` clamps an
+    /// out-of-range *global* default instead of failing (see
+    /// `test_out_of_range_operator_setting_is_clamped` in
+    /// `docker_cleanup_service`). The *per-project* override validated here
+    /// is a different, intentional behavior: it rejects rather than clamps,
+    /// because it comes straight from an operator-typed API/CLI/form value
+    /// rather than a settings row an admin edited once.
+    #[tokio::test]
+    async fn test_update_project_settings_rejects_out_of_range_image_retention_hours() {
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue.clone()).await;
+
+        let inserted_project = temps_entities::projects::ActiveModel {
+            name: Set("Retention Validation Project".to_string()),
+            slug: Set("retention-validation-project".to_string()),
+            repo_name: Set("retention-validation-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set(".".to_string()),
+            git_provider_connection_id: Set(None),
+            main_branch: Set("main".to_string()),
+            preset: Set(Preset::DockerCompose),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let update_with_hours = |hours: i32| {
+            project_service.update_project_settings(
+                inserted_project.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,              // cross_project_trace_sharing
+                None,              // error_source_context_enabled
+                None,              // error_source_root
+                None,              // ai_api_traffic_summary_enabled
+                Some(Some(hours)), // image_retention_hours
+            )
+        };
+
+        let below_range = update_with_hours(0).await;
+        assert!(
+            matches!(below_range, Err(ProjectError::InvalidInput(_))),
+            "0 hours must be rejected, not clamped"
+        );
+
+        let above_range = update_with_hours(8761).await;
+        assert!(
+            matches!(above_range, Err(ProjectError::InvalidInput(_))),
+            "8761 hours must be rejected, not clamped"
+        );
+
+        let stored = temps_entities::projects::Entity::find_by_id(inserted_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stored.image_retention_hours, None,
+            "a rejected update must never reach the database"
         );
     }
 

@@ -4130,6 +4130,7 @@ mod tests {
     fn make_project(id: i32) -> projects::Model {
         projects::Model {
             id,
+            image_retention_hours: None,
             name: "test-app".into(),
             repo_name: "repo".into(),
             repo_owner: "testowner".into(),

@@ -2,6 +2,7 @@ export const PROJECT_PRIMARY_ROUTES = [
   'project',
   'deployments',
   'environments',
+  'environment-variables',
   'domains',
   'git',
   'build',

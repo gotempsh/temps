@@ -130,11 +130,6 @@ export const projectToolGroups: ProjectToolGroup[] = [
     label: 'Configure',
     description: 'Connect runtime features and automate project workflows.',
     items: [
-      {
-        title: 'Environment Variables',
-        url: 'environment-variables',
-        icon: KeyRound,
-      },
       { title: 'Feature Flags', url: 'flags', icon: Flag },
       {
         title: 'AI Workflows',

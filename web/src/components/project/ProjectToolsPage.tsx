@@ -106,7 +106,7 @@ export function ProjectToolsPage({ project }: { project: ProjectResponse }) {
   }
 
   return (
-    <div className="mx-auto w-full max-w-7xl space-y-8 pb-12">
+    <div className="w-full space-y-8 pb-12">
       <div className="flex flex-col gap-5 border-b pb-6 lg:flex-row lg:items-end lg:justify-between">
         <div className="max-w-2xl">
           <h1 className="text-2xl font-semibold tracking-tight">

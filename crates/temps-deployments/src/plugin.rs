@@ -173,13 +173,29 @@ impl TempsPlugin for DeploymentsPlugin {
             let cas_dir = config_service.data_dir().join("cas");
             let cleanup_file_store: Arc<dyn temps_file_store::FileStore> =
                 Arc::new(temps_file_store::fs_store::FsFileStore::new(cas_dir));
+            // Operator-configured image retention (settings row, not an env
+            // var). Falls back to the built-in default when settings cannot be
+            // read so a transient DB hiccup at boot cannot silently disable or
+            // over-aggressively enable image pruning.
+            let image_retention = match config_service.get_settings().await {
+                Ok(settings) => settings.image_retention,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Could not read image retention settings; using defaults"
+                    );
+                    temps_core::ImageRetentionSettings::default()
+                }
+            };
             let docker_cleanup = Arc::new(
                 crate::services::DockerCleanupService::new(
                     Arc::new(crate::services::DefaultDockerClient),
                     db.clone(),
                     cleanup_file_store,
                 )
-                .with_static_dir(config_service.static_dir()),
+                .with_static_dir(config_service.static_dir())
+                .with_image_retention(&image_retention)
+                .with_config_service(config_service.clone()),
             );
             tokio::spawn({
                 let cleanup_service = docker_cleanup.clone();

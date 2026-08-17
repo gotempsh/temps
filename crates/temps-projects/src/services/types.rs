@@ -87,6 +87,10 @@ pub struct Project {
     /// model). Operators can set false to suppress cross-project links to this
     /// project.
     pub cross_project_trace_sharing: bool,
+    /// How long (hours) to retain built Docker images before nightly cleanup.
+    /// None = use the system default (336 h / 14 days out of the box, from
+    /// `AppSettings.image_retention.default_hours`).
+    pub image_retention_hours: Option<i32>,
 }
 
 /// One environment variable supplied while creating a project.

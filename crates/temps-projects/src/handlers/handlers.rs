@@ -20,7 +20,7 @@ use temps_auth::{
 };
 use temps_auth::{AuthContext, RequireAuth};
 use temps_core::RequestMetadata;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::types::{
     ChangeProjectSourceRequest, CreateProjectRequest, PaginatedProjectList, PaginationParams,
@@ -1068,6 +1068,32 @@ pub async fn update_project_settings(
     project_scope_guard!(auth, project_id);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
+    // Capture the pre-update retention window only when it's actually
+    // changing, so an unrelated settings save (slug, attack mode, ...)
+    // doesn't pay for an extra read.
+    let previous_image_retention_hours = if settings.image_retention_hours.is_some() {
+        match state.project_service.get_project(project_id).await {
+            Ok(project) => project.image_retention_hours,
+            Err(e) => {
+                // A failed read and a genuinely-unset prior value both end up
+                // `None` in the audit record below — that's an accepted gap
+                // in what the double-Option type can express, but a *silent*
+                // one would let a transient DB error read back as "there was
+                // no prior retention window" during an incident review. Log
+                // it so the ambiguity is at least visible operationally.
+                warn!(
+                    error = %e,
+                    project_id,
+                    "Could not read prior image_retention_hours before update; \
+                     audit log will record it as unset rather than unknown"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let updated_project = state
         .project_service
         .update_project_settings(
@@ -1092,6 +1118,7 @@ pub async fn update_project_settings(
             settings.error_source_context_enabled,
             settings.error_source_root.clone(),
             settings.ai_api_traffic_summary_enabled,
+            settings.image_retention_hours,
         )
         .await
         .map_err(Problem::from)?;
@@ -1111,6 +1138,8 @@ pub async fn update_project_settings(
         performance_metrics_enabled: None,
         slug: settings.slug,
         compose_configuration_updated: settings.preset_config.as_ref().map(|_| true),
+        image_retention_hours: settings.image_retention_hours,
+        previous_image_retention_hours,
     };
 
     let audit_event = ProjectSettingsUpdatedAudit {

@@ -352,6 +352,10 @@ pub struct ProjectResponse {
     /// OSS global-observability model where any OtelRead holder can query any
     /// project's telemetry).
     pub cross_project_trace_sharing: bool,
+    /// Hours to retain built Docker images before nightly cleanup. Null = use the
+    /// system-wide default from settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_retention_hours: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -393,6 +397,7 @@ impl ProjectResponse {
             source_type: project.source_type,
             gitlab_webhook_id: project.gitlab_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
+            image_retention_hours: project.image_retention_hours,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -647,6 +652,17 @@ pub struct UpdateDeploymentConfigRequest {
     pub max_concurrent_connections: Option<i32>,
 }
 
+/// Deserialize a PATCH integer field while preserving the distinction between
+/// an omitted key (`None`) and an explicit JSON null (`Some(None)`).
+fn deserialize_optional_optional_i32<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<i32>::deserialize(deserializer)?))
+}
+
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateProjectSettingsRequest {
     pub slug: Option<String>,
@@ -681,6 +697,19 @@ pub struct UpdateProjectSettingsRequest {
     pub preview_envs_idle_timeout_seconds: Option<i32>,
     /// Wake timeout (seconds, 5..=120) for on-demand preview environments.
     pub preview_envs_wake_timeout_seconds: Option<i32>,
+    /// How long (hours) to retain built Docker images before nightly cleanup removes them.
+    /// Set to null to use the system default. Valid range: 1–8760.
+    ///
+    /// Omitting the key leaves the current value unchanged; sending an explicit
+    /// `null` clears the per-project override. `skip_serializing_if` keeps the
+    /// round-trip honest — re-serializing a request that omitted the key must
+    /// not emit `"image_retention_hours": null`, which would mean "reset".
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_i32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image_retention_hours: Option<Option<i32>>,
     /// Preset-specific configuration (e.g., Dockerfile path for Docker preset)
     ///
     /// Example for Dockerfile preset:
@@ -1213,5 +1242,18 @@ mod tests {
             ))
         );
         assert_eq!(problem.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn image_retention_patch_distinguishes_omitted_null_and_value() {
+        let omitted: UpdateProjectSettingsRequest = serde_json::from_str("{}").unwrap();
+        let cleared: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"image_retention_hours":null}"#).unwrap();
+        let set: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"image_retention_hours":72}"#).unwrap();
+
+        assert_eq!(omitted.image_retention_hours, None);
+        assert_eq!(cleared.image_retention_hours, Some(None));
+        assert_eq!(set.image_retention_hours, Some(Some(72)));
     }
 }

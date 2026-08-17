@@ -9,6 +9,9 @@ describe('project navigation route resolution', () => {
     expect(resolveProjectPrimaryRoute('errors/12')).toBe('errors')
     expect(resolveProjectPrimaryRoute('traces/trace-42')).toBe('traces')
     expect(resolveProjectPrimaryRoute('deployments/99')).toBe('deployments')
+    expect(resolveProjectPrimaryRoute('environment-variables')).toBe(
+      'environment-variables'
+    )
     expect(resolveProjectPrimaryRoute('domains/new')).toBe('domains')
     expect(resolveProjectPrimaryRoute('git/repository')).toBe('git')
     expect(resolveProjectPrimaryRoute('build/settings')).toBe('build')
@@ -37,6 +40,7 @@ describe('project navigation route resolution', () => {
 
   test('does not mark setup or primary routes as tools', () => {
     expect(isProjectToolsRoute('setup')).toBe(false)
+    expect(isProjectToolsRoute('environment-variables')).toBe(false)
     expect(isProjectToolsRoute('settings/security')).toBe(false)
     expect(isProjectToolsRoute('analytics')).toBe(false)
     expect(isProjectToolsRoute('traces/trace-1')).toBe(false)

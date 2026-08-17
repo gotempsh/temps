@@ -591,6 +591,7 @@ mod tests {
         let now = Utc::now();
         temps_entities::projects::Model {
             id,
+            image_retention_hours: None,
             name: "test-project".to_string(),
             repo_name: "repo".to_string(),
             repo_owner: "owner".to_string(),

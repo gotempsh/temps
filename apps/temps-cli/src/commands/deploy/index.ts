@@ -15,7 +15,9 @@ export function registerDeployCommands(program: Command): void {
   program
     .command('drop <path>')
     .description('Detect and deploy a local source directory or ZIP without Git')
-    .option('--name <name>', 'Project name (slugified automatically)')
+    .option('--name <name>', 'Name for the new project (slugified automatically)')
+    .option('--project <project>', 'Deploy into an existing project (slug or ID) instead of creating one')
+    .option('--environment <env>', 'Target environment (requires --project, default: production)')
     .option('--preset <preset>', 'Select a detected preset')
     .option('--directory <directory>', 'Select a detected project root')
     .option('--no-wait', 'Do not wait for deployment to complete')
