@@ -360,6 +360,10 @@ fn default_docker_image() -> Option<String> {
 ///
 /// Adding an image to any of those without adding it here is the bug this
 /// list keeps regressing into.
+///
+/// Operators can extend (never shrink) this set via
+/// `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES` — see
+/// [`extra_allowed_postgres_docker_images`].
 const ALLOWED_POSTGRES_DOCKER_IMAGES: &[&str] = &[
     "gotempsh/postgres-walg:15-bookworm",
     "gotempsh/postgres-walg:16-bookworm",
@@ -376,14 +380,117 @@ const ALLOWED_POSTGRES_DOCKER_IMAGES: &[&str] = &[
     "timescale/timescaledb-ha:pg18",
 ];
 
+/// Environment variable an operator sets to allow additional PostgreSQL images
+/// (comma-separated). This is deliberately host-level rather than an API
+/// setting: which images this machine may pull and execute is the operator's
+/// policy, and keeping it off the API avoids adding a write surface that can
+/// widen container execution.
+///
+/// Requires a restart to take effect, like the other process-wide operator
+/// knobs documented in `CLAUDE.md`.
+pub(crate) const EXTRA_POSTGRES_IMAGES_ENV: &str = "TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES";
+
+/// Parse the operator-provided image list.
+///
+/// Split on commas, trim, drop empties. Entries are kept verbatim otherwise —
+/// matching stays exact, so an entry without a `:tag` or `@sha256:` digest can
+/// never match a real service image. Those are returned separately as
+/// `suspicious` so startup can warn about them instead of silently ignoring
+/// them: a self-hosted operator who typo'd the variable gets told, rather than
+/// re-reading the same rejection error with no idea why their entry did
+/// nothing.
+fn parse_extra_allowed_images(raw: &str) -> (Vec<String>, Vec<String>) {
+    let mut images = Vec::new();
+    let mut suspicious = Vec::new();
+    for entry in raw.split(',') {
+        let entry = entry.trim();
+        if entry.is_empty() {
+            continue;
+        }
+        // A tag/digest separator must appear after the final `/`, otherwise the
+        // only `:` is a registry port (e.g. `registry.internal:5000/pg`).
+        let name_start = entry.rfind('/').map_or(0, |i| i + 1);
+        if !entry[name_start..].contains(':') && !entry.contains('@') {
+            suspicious.push(entry.to_string());
+        }
+        images.push(entry.to_string());
+    }
+    (images, suspicious)
+}
+
+/// Operator-supplied additions to [`ALLOWED_POSTGRES_DOCKER_IMAGES`], read once
+/// per process.
+///
+/// Additive by design: the built-in list stays the floor so a typo in this
+/// variable cannot strand every existing Postgres service. `get_postgres_config`
+/// validates on every read of a service's config, so shrinking the allowlist
+/// would not merely block new services — it would make existing ones
+/// permanently un-initializable and block deploys of every app linked to them.
+fn extra_allowed_postgres_docker_images() -> &'static [String] {
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        let Ok(raw) = std::env::var(EXTRA_POSTGRES_IMAGES_ENV) else {
+            return Vec::new();
+        };
+        let (images, suspicious) = parse_extra_allowed_images(&raw);
+        if !suspicious.is_empty() {
+            warn!(
+                "{} contains {} entr{} without a tag or digest ({}). Matching is exact, so \
+                 these can never match a service image — did you mean e.g. 'postgis/postgis:18-3.5'?",
+                EXTRA_POSTGRES_IMAGES_ENV,
+                suspicious.len(),
+                if suspicious.len() == 1 { "y" } else { "ies" },
+                suspicious.join(", ")
+            );
+        }
+        if !images.is_empty() {
+            info!(
+                "{} allows {} additional PostgreSQL image(s): {}",
+                EXTRA_POSTGRES_IMAGES_ENV,
+                images.len(),
+                images.join(", ")
+            );
+        }
+        images
+    })
+}
+
+/// Exact-match membership test over the built-in list plus the operator's
+/// additions.
+///
+/// Split out from [`validate_postgres_docker_image`] so the composition is
+/// testable without mutating process environment or racing the `OnceLock`.
+fn is_allowed_postgres_docker_image(docker_image: &str, extra: &[String]) -> bool {
+    ALLOWED_POSTGRES_DOCKER_IMAGES.contains(&docker_image)
+        || extra.iter().any(|allowed| allowed == docker_image)
+}
+
 pub(crate) fn validate_postgres_docker_image(docker_image: &str) -> Result<()> {
-    if ALLOWED_POSTGRES_DOCKER_IMAGES.contains(&docker_image) {
+    if is_allowed_postgres_docker_image(docker_image, extra_allowed_postgres_docker_images()) {
         Ok(())
     } else {
+        // Name the escape hatch. A self-hosted operator hitting this has no
+        // support channel; without this sentence the error is a dead end that
+        // reads as "temps cannot run your image" rather than "temps has not
+        // been told it may".
+        let extra = extra_allowed_postgres_docker_images();
         Err(anyhow::anyhow!(
-            "PostgreSQL Docker image '{}' is not supported. Allowed images: {}",
+            "PostgreSQL Docker image '{}' is not supported. Allowed images: {}{}. \
+             To allow additional images on this instance, set {} to a comma-separated \
+             list (e.g. {}=postgis/postgis:18-3.5) and restart temps.",
             docker_image,
-            ALLOWED_POSTGRES_DOCKER_IMAGES.join(", ")
+            ALLOWED_POSTGRES_DOCKER_IMAGES.join(", "),
+            if extra.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " (plus {} from {})",
+                    extra.join(", "),
+                    EXTRA_POSTGRES_IMAGES_ENV
+                )
+            },
+            EXTRA_POSTGRES_IMAGES_ENV,
+            EXTRA_POSTGRES_IMAGES_ENV
         ))
     }
 }
@@ -4337,6 +4444,117 @@ mod tests {
         assert_eq!(
             PostgresService::shared_preload_libraries_for_image("gotempsh/timescaledb-walg:pg18"),
             "timescaledb,pg_stat_statements"
+        );
+    }
+
+    #[test]
+    fn extra_images_env_is_split_trimmed_and_compacted() {
+        let (images, suspicious) = parse_extra_allowed_images(
+            "  postgis/postgis:18-3.5 ,,registry.internal:5000/team/pg:18 , ",
+        );
+        assert_eq!(
+            images,
+            vec![
+                "postgis/postgis:18-3.5".to_string(),
+                "registry.internal:5000/team/pg:18".to_string(),
+            ]
+        );
+        // A registry port is not a tag separator, but both entries here are
+        // properly tagged, so neither should be flagged.
+        assert!(suspicious.is_empty(), "unexpected warnings: {suspicious:?}");
+    }
+
+    #[test]
+    fn extra_images_env_empty_or_blank_yields_nothing() {
+        assert_eq!(parse_extra_allowed_images("").0, Vec::<String>::new());
+        assert_eq!(
+            parse_extra_allowed_images("  , ,, ").0,
+            Vec::<String>::new()
+        );
+    }
+
+    /// An entry with no tag can never match, since comparison is exact. It is
+    /// still accepted verbatim, but the operator is warned rather than left to
+    /// wonder why their variable did nothing.
+    #[test]
+    fn extra_images_env_flags_entries_without_tag_or_digest() {
+        let (images, suspicious) =
+            parse_extra_allowed_images("postgis/postgis,registry.internal:5000/team/pg");
+        assert_eq!(images.len(), 2);
+        assert_eq!(
+            suspicious,
+            vec![
+                "postgis/postgis".to_string(),
+                // ':5000' is a registry port, not a tag -- must still be flagged.
+                "registry.internal:5000/team/pg".to_string(),
+            ]
+        );
+
+        let (_, ok) = parse_extra_allowed_images(
+            "postgis/postgis:18-3.5,gotempsh/postgres-walg@sha256:abc123",
+        );
+        assert!(
+            ok.is_empty(),
+            "tagged/digested entries must not warn: {ok:?}"
+        );
+    }
+
+    /// End-to-end over the parse + membership composition: a value the operator
+    /// puts in the env var makes an otherwise-rejected image acceptable, and
+    /// only that exact image.
+    #[test]
+    fn extra_images_env_admits_exactly_the_operator_listed_image() {
+        let (extra, _) = parse_extra_allowed_images("postgis/postgis:18-3.5");
+
+        assert!(
+            !is_allowed_postgres_docker_image("postgis/postgis:18-3.5", &[]),
+            "image must be rejected without the operator override"
+        );
+        assert!(
+            is_allowed_postgres_docker_image("postgis/postgis:18-3.5", &extra),
+            "operator-listed image must be accepted"
+        );
+
+        // Still exact-match: the override admits one image, not a repository.
+        for near_miss in [
+            "postgis/postgis:latest",
+            "postgis/postgis",
+            "postgis/postgis:18-3.5-evil",
+            "attacker/postgis:18-3.5",
+        ] {
+            assert!(
+                !is_allowed_postgres_docker_image(near_miss, &extra),
+                "{near_miss} must not be admitted by an exact-match override"
+            );
+        }
+    }
+
+    /// The operator knob extends the allowlist; it must never be able to shrink
+    /// it, or a typo would strand every existing Postgres service.
+    #[test]
+    fn extra_images_env_cannot_remove_builtin_images() {
+        // Built-ins are checked before the env list is even consulted.
+        for image in ALLOWED_POSTGRES_DOCKER_IMAGES {
+            assert!(
+                validate_postgres_docker_image(image).is_ok(),
+                "{image} must stay allowed regardless of {EXTRA_POSTGRES_IMAGES_ENV}"
+            );
+        }
+    }
+
+    /// The rejection message must name the env var -- a self-hosted operator
+    /// has no support channel, so a bare "not supported" is a dead end.
+    #[test]
+    fn rejection_message_points_at_the_operator_override() {
+        // Deliberately an image no operator would ever allowlist, so this test
+        // cannot flip if TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES happens to be set
+        // in the environment running the suite.
+        let err = validate_postgres_docker_image("temps-test/never-allowlisted:0")
+            .expect_err("unlisted image must be rejected")
+            .to_string();
+        assert!(
+            err.contains(EXTRA_POSTGRES_IMAGES_ENV),
+            "rejection message must mention {EXTRA_POSTGRES_IMAGES_ENV}, got: {err}"
         );
     }
 

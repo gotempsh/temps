@@ -1073,6 +1073,7 @@ Process-wide ops/debug toggles (not bootstrap config, not per-tenant -- see the 
 | Variable | Default | Required |
 |---|---|---|
 | `TEMPS_DEPLOYMENT_KEEP_TEMP_FILES` | unset (clean up) | No -- set to any value to keep `/tmp/temps-deployments/deployment-*` directories after a deployment finishes or fails, for inspecting a build/download issue. Restart the server to change. |
+| `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES` | unset (built-in list only) | No -- comma-separated PostgreSQL images this instance may additionally pull and run, e.g. `postgis/postgis:18-3.5,registry.internal:5000/team/pg:18`. **Additive**: it extends the built-in allowlist in `crates/temps-providers/src/externalsvc/postgres.rs` and can never shrink it, so a typo cannot strand existing services. Matching is exact -- no globs or prefixes -- so each entry needs a `:tag` or `@sha256:` digest. Deliberately host-level rather than an API setting: which images this machine may execute is operator policy. Restart the server to change. |
 
 ---
 
