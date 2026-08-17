@@ -20,6 +20,7 @@ import {
   ThresholdLineChart,
   type ThresholdMarker,
 } from '@/components/charts/threshold-line-chart'
+import { ChartRangeSelectionBar } from '@/components/charts/chart-range-selection-bar'
 import { AnalyticsFilters } from '@/components/project/ProjectAnalytics'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -81,6 +82,7 @@ import {
 } from '@/lib/api-traffic-sort'
 import { apiTrafficProxyLogsUrl } from '@/lib/api-traffic-navigation'
 import { useAiAssistant } from '@/components/ai/AiAssistantContext'
+import type { ChartDateRange } from '@/lib/chart-range-selection'
 
 interface ApiTrafficTabProps {
   project: ProjectResponse
@@ -212,6 +214,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       return { quickFilter: '24hours', dateRange: undefined }
     }
   )
+  const [pendingChartRange, setPendingChartRange] =
+    React.useState<ChartDateRange | null>(null)
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
@@ -250,6 +254,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
 
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
+      setPendingChartRange(null)
       setDateFilter(next)
       setRoutePage(0)
       setCallerPage(0)
@@ -729,6 +734,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
     () =>
       points.map((p) => ({
         bucket: formatBucketLabel(p.timestamp),
+        timestamp: p.timestamp,
         p95: p.p95_latency_ms ?? undefined,
         p99: p.p99_latency_ms ?? undefined,
         requests: p.request_count,
@@ -736,6 +742,14 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
       })),
     [points]
   )
+
+  const applyChartRange = React.useCallback(() => {
+    if (!pendingChartRange) return
+    updateDateFilter({
+      quickFilter: 'custom',
+      dateRange: pendingChartRange,
+    })
+  }, [pendingChartRange, updateDateFilter])
 
   return (
     <div className="space-y-6">
@@ -832,7 +846,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
         <CardHeader>
           <CardTitle>Latency (p95 / p99)</CardTitle>
           <CardDescription>
-            Deploy markers show where a release may have shifted latency.
+            Deploy markers show where a release may have shifted latency. Drag
+            across the chart to select a timeframe.
           </CardDescription>
         </CardHeader>
         <CardContent>
@@ -851,6 +866,16 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
               markers={deployMarkers}
               yTickFormatter={(v) => `${v.toFixed(0)}ms`}
               tooltipValueFormatter={(v) => `${v.toFixed(0)}ms`}
+              selectionKey="timestamp"
+              selectedRange={pendingChartRange}
+              onRangeSelect={(from, to) => setPendingChartRange({ from, to })}
+            />
+          )}
+          {pendingChartRange && (
+            <ChartRangeSelectionBar
+              range={pendingChartRange}
+              onApply={applyChartRange}
+              onCancel={() => setPendingChartRange(null)}
             />
           )}
         </CardContent>

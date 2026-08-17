@@ -45,12 +45,8 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
-import {
-  ChartConfig,
-  ChartContainer,
-  ChartTooltip,
-  ChartTooltipContent,
-} from '@/components/ui/chart'
+import { ThresholdLineChart } from '@/components/charts/threshold-line-chart'
+import { ChartRangeSelectionBar } from '@/components/charts/chart-range-selection-bar'
 import { CodeBlock } from '@/components/ui/code-block'
 import { CopyButton } from '@/components/ui/copy-button'
 import {
@@ -81,6 +77,7 @@ import VisitorAnalytics from '@/components/visitors/VisitorAnalytics'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { cn } from '@/lib/utils'
+import type { ChartDateRange } from '@/lib/chart-range-selection'
 import { CreateFunnel } from '@/pages/CreateFunnel'
 import { EditFunnel } from '@/pages/EditFunnel'
 import RequestLogs from '@/pages/RequestLogs'
@@ -127,14 +124,6 @@ import {
 } from '@/components/analytics/SegmentVisitors'
 
 import { Badge } from '@/components/ui/badge'
-import { Line, LineChart, XAxis, YAxis } from 'recharts'
-
-const chartConfig2 = {
-  count: {
-    label: 'Count',
-    color: 'var(--chart-1)',
-  },
-} satisfies ChartConfig
 
 interface VisitorChartProps {
   project: ProjectResponse
@@ -142,6 +131,7 @@ interface VisitorChartProps {
   endDate: Date | undefined
   environment: number | undefined
   onZoom?: (from: Date, to: Date) => void
+  selectedRange?: ChartDateRange | null
 }
 
 export function VisitorChart({
@@ -150,20 +140,11 @@ export function VisitorChart({
   endDate,
   environment,
   onZoom,
+  selectedRange,
 }: VisitorChartProps) {
   const [aggregationLevel, setAggregationLevel] = React.useState<
     'events' | 'sessions' | 'visitors'
   >('visitors')
-
-  // Brush zoom state — track timestamps for zoom + pixel X for overlay
-  const [refAreaLeft, setRefAreaLeft] = React.useState<number | null>(null)
-  const [refAreaRight, setRefAreaRight] = React.useState<number | null>(null)
-  const [dragPixelLeft, setDragPixelLeft] = React.useState<number | null>(null)
-  const [dragPixelRight, setDragPixelRight] = React.useState<number | null>(
-    null
-  )
-  const isDragging = React.useRef(false)
-  const chartContainerRef = React.useRef<HTMLDivElement>(null)
 
   const { data, isLoading, error } = useQuery({
     ...getHourlyVisitsOptions({
@@ -234,79 +215,6 @@ export function VisitorChart({
     })
   }, [data, startDate, endDate])
 
-  // Helper: get pixel X relative to chart container from a recharts event
-  const getPixelX = React.useCallback((e: any): number | null => {
-    if (!e?.chartX) return null
-    return e.chartX
-  }, [])
-
-  const handleMouseDown = React.useCallback(
-    (e: any) => {
-      if (!e || !onZoom) return
-      const timestamp = e.activePayload?.[0]?.payload?.timestamp
-      const px = getPixelX(e)
-      if (timestamp && px != null) {
-        isDragging.current = true
-        setRefAreaLeft(timestamp)
-        setRefAreaRight(null)
-        setDragPixelLeft(px)
-        setDragPixelRight(null)
-      }
-    },
-    [onZoom, getPixelX]
-  )
-
-  const handleMouseMove = React.useCallback(
-    (e: any) => {
-      if (!isDragging.current || !e) return
-      const timestamp = e.activePayload?.[0]?.payload?.timestamp
-      const px = getPixelX(e)
-      if (timestamp) {
-        setRefAreaRight(timestamp)
-      }
-      if (px != null) {
-        setDragPixelRight(px)
-      }
-    },
-    [getPixelX]
-  )
-
-  const handleMouseUp = React.useCallback(() => {
-    if (!isDragging.current || refAreaLeft == null || refAreaRight == null) {
-      isDragging.current = false
-      setRefAreaLeft(null)
-      setRefAreaRight(null)
-      setDragPixelLeft(null)
-      setDragPixelRight(null)
-      return
-    }
-    isDragging.current = false
-
-    const left = Math.min(refAreaLeft, refAreaRight)
-    const right = Math.max(refAreaLeft, refAreaRight)
-
-    setRefAreaLeft(null)
-    setRefAreaRight(null)
-    setDragPixelLeft(null)
-    setDragPixelRight(null)
-
-    // Require a minimum drag distance (at least 2 data points apart)
-    if (right - left < 1000 * 60 * 30) {
-      return
-    }
-
-    onZoom?.(new Date(left), new Date(right))
-  }, [refAreaLeft, refAreaRight, onZoom])
-
-  // Compute the overlay position from pixel coordinates
-  const selectionOverlay = React.useMemo(() => {
-    if (dragPixelLeft == null || dragPixelRight == null) return null
-    const left = Math.min(dragPixelLeft, dragPixelRight)
-    const width = Math.abs(dragPixelRight - dragPixelLeft)
-    if (width < 4) return null
-    return { left, width }
-  }, [dragPixelLeft, dragPixelRight])
-
   const getAggregationLabel = () => {
     switch (aggregationLevel) {
       case 'events':
@@ -342,7 +250,7 @@ export function VisitorChart({
         <div className="flex items-center gap-2">
           {onZoom && (
             <span className="text-xs text-muted-foreground hidden sm:inline">
-              Drag on chart to zoom
+              Drag on chart to select a timeframe
             </span>
           )}
           <div className="flex gap-1.5 sm:gap-2">
@@ -387,57 +295,25 @@ export function VisitorChart({
           </div>
         </div>
       ) : (
-        <div ref={chartContainerRef} className="relative">
-          {selectionOverlay && (
-            <div
-              className="absolute top-0 bottom-0 bg-primary/10 dark:bg-primary/20 border-x border-primary/30 dark:border-primary/40 pointer-events-none z-10 transition-none"
-              style={{
-                left: selectionOverlay.left,
-                width: selectionOverlay.width,
-              }}
-            />
-          )}
-          <ChartContainer
-            config={chartConfig2}
-            className={cn('h-[250px] w-full', onZoom && 'cursor-crosshair')}
-          >
-            <LineChart
-              accessibilityLayer
-              data={chartData}
-              margin={{
-                left: 12,
-                right: 12,
-                top: 12,
-                bottom: 12,
-              }}
-              onMouseDown={onZoom ? handleMouseDown : undefined}
-              onMouseMove={onZoom ? handleMouseMove : undefined}
-              onMouseUp={onZoom ? handleMouseUp : undefined}
-            >
-              <XAxis
-                dataKey="date"
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
-                minTickGap={32}
-              />
-              <YAxis
-                tickLine={false}
-                axisLine={false}
-                tickMargin={8}
-                tickFormatter={(value) => value.toLocaleString()}
-              />
-              <ChartTooltip cursor={false} content={<ChartTooltipContent />} />
-              <Line
-                dataKey="count"
-                type="monotone"
-                stroke="var(--color-count)"
-                strokeWidth={2}
-                dot={false}
-              />
-            </LineChart>
-          </ChartContainer>
-        </div>
+        <ThresholdLineChart
+          data={chartData}
+          xKey="timestamp"
+          series={{
+            dataKey: 'count',
+            label: getAggregationLabel(),
+            tone: 'neutral',
+          }}
+          height={250}
+          xTickFormatter={(value) =>
+            chartData.find((point) => point.timestamp === Number(value))
+              ?.date ?? ''
+          }
+          yTickFormatter={(value) => value.toLocaleString()}
+          tooltipValueFormatter={(value) => value.toLocaleString()}
+          selectionKey="timestamp"
+          selectedRange={selectedRange}
+          onRangeSelect={onZoom}
+        />
       )}
     </div>
   )
@@ -1545,10 +1421,13 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
       return { quickFilter: '24hours', dateRange: undefined }
     }
   )
+  const [pendingChartRange, setPendingChartRange] =
+    React.useState<ChartDateRange | null>(null)
 
   // Sync date filter to URL search params
   const updateDateFilter = React.useCallback(
     (next: AnalyticsDateFilter) => {
+      setPendingChartRange(null)
       setDateFilter(next)
       const params = new URLSearchParams()
       params.set('filter', next.quickFilter)
@@ -1592,16 +1471,18 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
   const queryClient = useQueryClient()
   const { startDate, endDate } = getDateRangeFromFilter(dateFilter)
 
-  // Chart zoom handler — sets a custom date range from drag selection
-  const handleChartZoom = React.useCallback(
-    (from: Date, to: Date) => {
-      updateDateFilter({
-        quickFilter: 'custom',
-        dateRange: { from, to },
-      })
-    },
-    [updateDateFilter]
-  )
+  // Keep chart selections provisional until the user reviews the timestamps.
+  const handleChartZoom = React.useCallback((from: Date, to: Date) => {
+    setPendingChartRange({ from, to })
+  }, [])
+
+  const applyChartZoom = React.useCallback(() => {
+    if (!pendingChartRange) return
+    updateDateFilter({
+      quickFilter: 'custom',
+      dateRange: pendingChartRange,
+    })
+  }, [pendingChartRange, updateDateFilter])
 
   // Check if we have any analytics data using the new endpoint
   const hasAnalyticsEventsQuery = useQuery({
@@ -1752,7 +1633,15 @@ function ProjectAnalyticsOverview({ project }: ProjectAnalyticsOverviewProps) {
               endDate={endDate}
               environment={selectedEnvironment}
               onZoom={handleChartZoom}
+              selectedRange={pendingChartRange}
             />
+            {pendingChartRange && (
+              <ChartRangeSelectionBar
+                range={pendingChartRange}
+                onApply={applyChartZoom}
+                onCancel={() => setPendingChartRange(null)}
+              />
+            )}
           </div>
           {/* Globe link */}
           <Card

@@ -814,7 +814,8 @@ fn validate_projects_health_window(
     Ok(())
 }
 
-/// Get health summaries for multiple projects (last 1 hour)
+/// Get user-traffic health summaries for multiple projects (last 1 hour).
+/// Temps' own status-monitor requests are excluded.
 #[utoipa::path(
     get,
     path = "/proxy-logs/stats/projects-health",

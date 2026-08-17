@@ -45,6 +45,14 @@ jobs:
       contents: read
       # rustsec/audit-check publishes results as a GitHub check run.
       checks: write
+      # On `schedule` runs specifically, the action also files/updates a
+      # GitHub issue for any advisory found (see rustsec/audit-check's
+      # README, "Granular Permissions" -- it only does this off cron, not on
+      # pull_request/push). Without this, a schedule run 403s with
+      # "Resource not accessible by integration" against the Issues API even
+      # when zero vulnerabilities are found, since the action still needs to
+      # check for/close a prior issue.
+      issues: write
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -178,9 +186,23 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      # ghcr.io/${{ github.repository_owner }}/temps is a private package --
+      # anonymous pulls 401 (confirmed: `curl
+      # https://ghcr.io/token?scope=repository:gotempsh/temps:pull` returns
+      # UNAUTHORIZED even for this public repo's own image). Trivy's `remote`
+      # fallback therefore needs an authenticated pull, same as release.yml
+      # uses to publish the image in the first place.
+      packages: read
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Run Trivy vulnerability scanner on published image
         uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0

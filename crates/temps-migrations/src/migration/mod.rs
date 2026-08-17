@@ -192,6 +192,7 @@ mod m20260814_000002_add_ai_summary_preference;
 mod m20260815_000001_add_facet_attr_columns_to_otel_spans;
 mod m20260815_000001_default_preview_inclusion_off;
 mod m20260816_000001_add_image_retention_hours;
+mod m20260817_000001_add_system_dimension_to_proxy_stats;
 mod m20260817_000001_index_deployments_retention_scan;
 
 pub struct Migrator;
@@ -419,6 +420,10 @@ impl MigratorTrait for Migrator {
             Box::new(m20260815_000001_add_facet_attr_columns_to_otel_spans::Migration),
             Box::new(m20260815_000001_default_preview_inclusion_off::Migration),
             Box::new(m20260816_000001_add_image_retention_hours::Migration),
+            // Main shipped the proxy-stats migration first. Preserve that
+            // upgrade history before this branch's independently authored
+            // migration with the same date and sequence stamp.
+            Box::new(m20260817_000001_add_system_dimension_to_proxy_stats::Migration),
             Box::new(m20260817_000001_index_deployments_retention_scan::Migration),
         ]
     }

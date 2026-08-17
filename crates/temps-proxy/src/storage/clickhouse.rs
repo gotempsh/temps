@@ -1434,6 +1434,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         let mut clauses: Vec<String> = vec![
             "timestamp >= fromUnixTimestamp64Milli(?)".to_string(),
             "timestamp < fromUnixTimestamp64Milli(?)".to_string(),
+            "is_system_request = 0".to_string(),
             "project_id IN ?".to_string(),
         ];
         let project_id_array: Vec<i32> = project_ids.to_vec();
@@ -1442,10 +1443,14 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             clauses.push("is_bot = ?".to_string());
         }
 
+        // toStartOfHour(DateTime64) returns a second-precision DateTime, which
+        // toUnixTimestamp64Milli rejects (it only accepts DateTime64). Go
+        // through toUnixTimestamp * 1000 instead — same shape the time-bucket
+        // queries above use — so the bucket stays an Int64 of epoch millis.
         let sql = format!(
             "SELECT \
                 assumeNotNull(project_id) AS project_id, \
-                toUnixTimestamp64Milli(toStartOfHour(timestamp)) AS hour_ms, \
+                toInt64(toUnixTimestamp(toStartOfHour(timestamp))) * 1000 AS hour_ms, \
                 count() AS request_count, \
                 countIf(status_code >= 500) AS error_count, \
                 countIf(response_time_ms IS NOT NULL) AS latency_count, \
@@ -2464,6 +2469,60 @@ mod tests {
                 .any(|bucket| bucket.key == "GPTBot" && bucket.request_count == 1),
             "inserted AI request must appear in the agent timeline"
         );
+    }
+
+    /// Regression: the hourly bucket used to be built with
+    /// `toUnixTimestamp64Milli(toStartOfHour(timestamp))`, which ClickHouse
+    /// rejects because `toStartOfHour` returns a second-precision `DateTime`
+    /// (`ILLEGAL_TYPE_OF_ARGUMENT`), so the whole projects-health query failed.
+    #[tokio::test]
+    async fn clickhouse_projects_health_summary_buckets_by_hour() {
+        let Some((store, _container)) = setup_clickhouse_store().await else {
+            return;
+        };
+
+        let mut ok = make_entry("health-ok");
+        ok.project_id = Some(7);
+        let mut failed = make_entry("health-error");
+        failed.project_id = Some(7);
+        failed.status_code = 503;
+        store
+            .write_batch(vec![ok, failed])
+            .await
+            .expect("insert proxy-log fixtures");
+
+        let start = Utc::now() - chrono::Duration::minutes(2);
+        let end = Utc::now() + chrono::Duration::minutes(2);
+        let summaries = store
+            .get_projects_health_summary(&[7, 999], start, end, None)
+            .await
+            .expect("hourly bucket must be a valid millisecond expression");
+
+        // Input order is preserved and unseen projects come back as "unknown".
+        assert_eq!(
+            summaries.iter().map(|s| s.project_id).collect::<Vec<_>>(),
+            vec![7, 999]
+        );
+        let project = &summaries[0];
+        assert_eq!(project.total_requests, 2);
+        assert_eq!(project.total_errors, 1);
+        assert_eq!(
+            project
+                .hourly_requests
+                .iter()
+                .map(|h| h.request_count)
+                .sum::<i64>(),
+            2
+        );
+        assert!(
+            project.hourly_requests.iter().all(|h| h
+                .bucket
+                .parse::<chrono::DateTime<Utc>>()
+                .is_ok_and(|b| b.timestamp() % 3600 == 0)),
+            "buckets must be parseable and aligned to the hour: {:?}",
+            project.hourly_requests
+        );
+        assert_eq!(summaries[1].status, "unknown");
     }
 
     #[tokio::test]
