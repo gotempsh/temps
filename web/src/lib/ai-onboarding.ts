@@ -1,5 +1,5 @@
 export const AI_HARNESS_KEY_NAME = 'Temps AI harness'
-export const TEMPS_CLI_VERSION = '0.1.33'
+export const TEMPS_CLI_VERSION = '0.1.34'
 
 export type AiHarnessStatus = 'missing' | 'waiting' | 'connected'
 
