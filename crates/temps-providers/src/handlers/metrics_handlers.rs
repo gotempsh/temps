@@ -1514,6 +1514,28 @@ async fn assert_deployment_owned_by_caller(
             .build());
     }
 
+    // Session/API-key/CLI caller: `deployment_visible_to_caller` only binds
+    // deployment *tokens* to their project, so on its own it let any holder of
+    // `DeploymentsRead`/`DeploymentsWrite` read or mutate monitoring state on
+    // another tenant's deployment by changing the URL id. Apply the same
+    // team-access rule the external-service path already uses — a no-op in OSS
+    // where no checker is registered, real enforcement once one is (ADR-028).
+    if auth.project_id().is_none() {
+        session_caller_may_access_linked_projects(
+            auth,
+            &[deployment.project_id],
+            state.project_access_checker.as_deref(),
+        )
+        .await
+        .map_err(|_| {
+            // Mirror the 404 above: don't confirm that a deployment with this
+            // id exists in a project the caller cannot see.
+            not_found()
+                .detail(format!("Deployment {} not found", deployment_id))
+                .build()
+        })?;
+    }
+
     Ok(())
 }
 
@@ -1866,6 +1888,41 @@ mod tests {
         assert_eq!(
             problem.into_response().status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    /// Deployment metrics used the same team-access rule only for deployment
+    /// tokens; a session user with `DeploymentsRead` could read or toggle
+    /// monitoring on any deployment id (IDOR). The session path now runs
+    /// through the checker too, so a member with no grant on the deployment's
+    /// project is denied.
+    #[tokio::test]
+    async fn session_user_denied_for_deployment_in_unreachable_project() {
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![7],
+            fail: false,
+        };
+        // The deployment lives in project 42, which this member cannot reach.
+        let problem = session_caller_may_access_linked_projects(
+            &test_session_auth(temps_auth::Role::User),
+            &[42],
+            Some(&checker),
+        )
+        .await
+        .expect_err("deployment's project is not accessible — must deny");
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The pure visibility rule still binds deployment tokens to their own
+    /// project, and (by itself) says nothing about session users — which is
+    /// exactly why the session path needs the checker above.
+    #[test]
+    fn deployment_token_is_bound_to_its_own_project() {
+        assert!(deployment_visible_to_caller(42, Some(42)));
+        assert!(!deployment_visible_to_caller(42, Some(7)));
+        assert!(
+            deployment_visible_to_caller(42, None),
+            "session users are not constrained by this fn — the checker is"
         );
     }
 }

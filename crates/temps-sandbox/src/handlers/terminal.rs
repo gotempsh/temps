@@ -317,7 +317,13 @@ pub async fn terminal(
     axum::extract::Query(params): axum::extract::Query<TerminalParams>,
     ws: WebSocketUpgrade,
 ) -> Result<impl IntoResponse, Problem> {
-    sandbox_permission_guard(&auth, Permission::SandboxesWrite, Permission::ProjectsWrite)?;
+    // This endpoint launches a PTY and forwards `?cmd=` to the agent, which
+    // spawns it via `/bin/sh -c` — it is arbitrary code execution inside the
+    // sandbox, exactly like the /exec routes. It must therefore require
+    // `SandboxesExec`, not the lifecycle/file-write `SandboxesWrite` scope,
+    // or a token deliberately granted `sandboxes:write` without
+    // `sandboxes:exec` gets execution anyway and the split is meaningless.
+    sandbox_permission_guard(&auth, Permission::SandboxesExec, Permission::ProjectsWrite)?;
 
     let tab = params.tab.clone().unwrap_or_else(|| "main".to_string());
     validate_tab(&tab)?;

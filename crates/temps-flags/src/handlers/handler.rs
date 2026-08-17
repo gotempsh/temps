@@ -12,7 +12,8 @@ use axum::{
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use temps_auth::{
-    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
+    deny_deployment_token, permission_guard, project_access_guard, project_permission_guard,
+    project_scope_guard, RequireAuth,
 };
 use temps_core::problemdetails::{self, Problem};
 use temps_core::RequestMetadata;
@@ -305,9 +306,8 @@ pub async fn create_flag(
     Path(project_id): Path<i32>,
     Json(request): Json<CreateFlagRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, FlagsWrite);
     project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, &state.project_access_checker);
+    project_permission_guard!(auth, FlagsWrite, project_id, &state.project_access_checker);
 
     let flag = state
         .flag_service
@@ -405,9 +405,8 @@ pub async fn update_flag(
     Path((project_id, key)): Path<(i32, String)>,
     Json(request): Json<UpdateFlagRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, FlagsWrite);
     project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, &state.project_access_checker);
+    project_permission_guard!(auth, FlagsWrite, project_id, &state.project_access_checker);
 
     // One read for the before-image; `update()` reuses it rather than
     // fetching the flag a second time, and the environments come back with it
@@ -468,9 +467,8 @@ pub async fn archive_flag(
     Extension(metadata): Extension<RequestMetadata>,
     Path((project_id, key)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, FlagsDelete);
     project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, &state.project_access_checker);
+    project_permission_guard!(auth, FlagsDelete, project_id, &state.project_access_checker);
 
     let flag = state.flag_service.archive(project_id, &key).await?;
 
@@ -518,9 +516,8 @@ pub async fn restore_flag(
     Extension(metadata): Extension<RequestMetadata>,
     Path((project_id, key)): Path<(i32, String)>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, FlagsWrite);
     project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, &state.project_access_checker);
+    project_permission_guard!(auth, FlagsWrite, project_id, &state.project_access_checker);
 
     let flag = state.flag_service.restore(project_id, &key).await?;
 
@@ -565,9 +562,8 @@ pub async fn set_flag_environment(
     Path((project_id, key, environment_id)): Path<(i32, String, i32)>,
     Json(request): Json<SetFlagEnvironmentRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, FlagsWrite);
     project_scope_guard!(auth, project_id);
-    project_access_guard!(auth, project_id, &state.project_access_checker);
+    project_permission_guard!(auth, FlagsWrite, project_id, &state.project_access_checker);
 
     // Captured before the write so the audit entry records what the flag was
     // actually changed *from* — the only record that a production behaviour

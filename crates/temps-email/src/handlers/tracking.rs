@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{deny_deployment_token, permission_guard, RequireAuth};
 use temps_core::{
     error_builder::{bad_request, internal_server_error, not_found},
     problemdetails::Problem,
@@ -263,6 +263,13 @@ pub async fn get_global_events(
     Query(query): Query<GlobalEventsQuery>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EmailsRead);
+    // This endpoint is instance-wide by design (an operator view over every
+    // email's opens/clicks, including recipient IPs, user agents and clicked
+    // URLs). A deployment token is bound to a single project, and a
+    // `FullAccess` one satisfies every `permission_guard!` — without this it
+    // could read other tenants' tracking telemetry from inside a deployed app,
+    // and there is no project_id here to scope it against.
+    deny_deployment_token!(auth);
 
     let page = query.page.unwrap_or(1);
     let page_size = std::cmp::min(query.page_size.unwrap_or(20), 100);

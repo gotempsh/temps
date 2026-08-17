@@ -1819,6 +1819,29 @@ async fn trigger_weekly_digest(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, NotificationPreferencesWrite);
+    // The weekly digest is an *instance-wide* operator report: its queries
+    // aggregate events, error groups and funnels across every project with
+    // only a time-window predicate, and the result is delivered to whatever
+    // notification providers are configured. `NotificationPreferencesWrite`
+    // and `NotificationProvidersCreate` are both in the default `Role::User`,
+    // so without this any tenant could point a provider at themselves and
+    // trigger a dump of every other tenant's top pages (often containing PII),
+    // visitor geography, error titles and funnel conversion rates. Restrict
+    // the trigger to instance administrators; deployment tokens carry no user
+    // identity and are never operators.
+    if auth.is_deployment_token()
+        || !(auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin))
+    {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .type_("https://temps.sh/probs/insufficient-permissions")
+            .title("Instance Administrator Required")
+            .detail(
+                "The weekly digest aggregates data across every project on this instance, \
+                 so only an instance administrator may generate and send it.",
+            )
+            .value("user_role", auth.effective_role.to_string())
+            .build());
+    }
 
     info!("Manually triggering weekly digest generation");
 
