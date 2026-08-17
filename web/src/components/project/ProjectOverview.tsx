@@ -9,7 +9,6 @@ import {
   getApiRoutesOptions,
   getApiTimeseriesOptions,
   getErrorDashboardStatsOptions,
-  getGeneralStatsOptions,
   getHourlyVisitsOptions,
   getUniqueCountsOptions,
   hasAnalyticsEventsOptions,
@@ -26,6 +25,7 @@ import { Card, CardContent, CardHeader } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
+import { buildProjectAnalyticsCountRequest } from '@/lib/project-analytics-summary'
 import { useQuery } from '@tanstack/react-query'
 import { format, subDays } from 'date-fns'
 import { ArrowRight, Sparkles } from 'lucide-react'
@@ -60,22 +60,46 @@ export function ProjectOverview({
     end_date: endDate.toISOString(),
   }
 
-  const analyticsStatsQuery = useQuery({
-    ...getGeneralStatsOptions({
-      query: {
-        start_date: analyticsWindow.start_date,
-        end_date: analyticsWindow.end_date,
-        project_ids: [project.id],
-        include_project_breakdown: false,
-      },
+  const visitorsQuery = useQuery({
+    ...getUniqueCountsOptions({
+      ...buildProjectAnalyticsCountRequest(
+        project.id,
+        analyticsWindow,
+        'visitors'
+      ),
+    }),
+    enabled: analyticsEnabled,
+  })
+
+  const visitsQuery = useQuery({
+    ...getUniqueCountsOptions({
+      ...buildProjectAnalyticsCountRequest(
+        project.id,
+        analyticsWindow,
+        'sessions'
+      ),
+    }),
+    enabled: analyticsEnabled,
+  })
+
+  const pageViewsQuery = useQuery({
+    ...getUniqueCountsOptions({
+      ...buildProjectAnalyticsCountRequest(
+        project.id,
+        analyticsWindow,
+        'page_views'
+      ),
     }),
     enabled: analyticsEnabled,
   })
 
   const returningVisitorsQuery = useQuery({
     ...getUniqueCountsOptions({
-      path: { project_id: project.id },
-      query: { ...analyticsWindow, metric: 'returning_visitors' },
+      ...buildProjectAnalyticsCountRequest(
+        project.id,
+        analyticsWindow,
+        'returning_visitors'
+      ),
     }),
     enabled: analyticsEnabled,
   })
@@ -179,7 +203,7 @@ export function ProjectOverview({
     latencySampleCount / trafficHealthData.length >= 0.5
   const topRoutes = apiRoutesQuery.data?.routes ?? []
   const recentErrors = recentErrorsQuery.data?.data ?? []
-  const visitors = analyticsStatsQuery.data?.total_unique_visitors ?? 0
+  const visitors = visitorsQuery.data?.count ?? 0
   const returningVisitors = returningVisitorsQuery.data?.count ?? 0
   const returningVisitorRate =
     visitors > 0 ? (returningVisitors / visitors) * 100 : 0
@@ -285,17 +309,21 @@ export function ProjectOverview({
             capabilityError={analyticsCapabilityQuery.isError}
             enabled={analyticsEnabled}
             visitors={visitors}
-            sessions={analyticsStatsQuery.data?.total_visits ?? 0}
-            pageViews={analyticsStatsQuery.data?.total_page_views ?? 0}
+            visits={visitsQuery.data?.count ?? 0}
+            pageViews={pageViewsQuery.data?.count ?? 0}
             returningRate={returningVisitorRate}
             hourlyVisitors={hourlyVisitorsQuery.data ?? []}
             loading={
-              analyticsStatsQuery.isPending ||
+              visitorsQuery.isPending ||
+              visitsQuery.isPending ||
+              pageViewsQuery.isPending ||
               returningVisitorsQuery.isPending ||
               hourlyVisitorsQuery.isPending
             }
             error={
-              analyticsStatsQuery.isError ||
+              visitorsQuery.isError ||
+              visitsQuery.isError ||
+              pageViewsQuery.isError ||
               returningVisitorsQuery.isError ||
               hourlyVisitorsQuery.isError
             }
@@ -353,7 +381,7 @@ function VisitorAnalyticsCard({
   capabilityError,
   enabled,
   visitors,
-  sessions,
+  visits,
   pageViews,
   returningRate,
   hourlyVisitors,
@@ -365,7 +393,7 @@ function VisitorAnalyticsCard({
   capabilityError: boolean
   enabled: boolean
   visitors: number
-  sessions: number
+  visits: number
   pageViews: number
   returningRate: number
   hourlyVisitors: EventTimeline[]
@@ -428,7 +456,7 @@ function VisitorAnalyticsCard({
             />
             <dl className="grid grid-cols-2 gap-x-5 gap-y-3">
               <AnalyticsValue label="Visitors" value={formatNumber(visitors)} />
-              <AnalyticsValue label="Sessions" value={formatNumber(sessions)} />
+              <AnalyticsValue label="Visits" value={formatNumber(visits)} />
               <AnalyticsValue
                 label="Page views"
                 value={formatNumber(pageViews)}
