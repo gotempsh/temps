@@ -408,6 +408,19 @@ impl ComposeExecutor {
             return Ok(None);
         }
 
+        // Docker splits a short-form bind spec on ':', so a data directory
+        // containing one would silently mount the wrong host path (or nothing)
+        // rather than fail. Refuse instead of delivering no secrets quietly.
+        if dir.to_string_lossy().contains(':') {
+            return Err(ComposeError::FileWriteFailed {
+                path: dir.display().to_string(),
+                reason: "the Temps data directory path contains ':', which Docker treats as a \
+                         bind-mount field separator; secrets cannot be mounted from it. \
+                         Move TEMPS_DATA_DIR to a path without a colon."
+                    .to_string(),
+            });
+        }
+
         let root = self.secrets_root();
         tokio::fs::create_dir_all(&root)
             .await
@@ -494,20 +507,27 @@ impl ComposeExecutor {
     }
 
     /// Reject a secret key that cannot be used as a single filename.
+    ///
+    /// Mirrors `SecretService::validate_secret_key` rather than merely
+    /// excluding path separators: this runs on a value read back from the
+    /// database, so it must not assume the API layer was the only writer.
+    /// Anything outside `[A-Za-z0-9_]` (leading digit included) is rejected,
+    /// which subsumes `.`, `..`, and every path separator.
     fn validate_secret_file_name(key: &str) -> Result<(), ComposeError> {
-        let invalid = key.is_empty()
-            || key == "."
-            || key == ".."
-            || key.contains('/')
-            || key.contains('\\')
-            || key.contains('\0');
-        if invalid {
+        let valid = !key.is_empty()
+            && key.len() <= 255
+            && key
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+            && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !valid {
             return Err(ComposeError::SecurityPolicyViolation {
                 service: "<secrets>".to_string(),
                 field: "secret key".to_string(),
                 reason: format!(
-                    "secret key '{key}' is not a valid filename; \
-                     keys must not be empty, '.', '..', or contain path separators"
+                    "secret key '{key}' is not a valid filename; keys must start with a \
+                     letter or underscore and contain only letters, digits and underscores"
                 ),
             });
         }
@@ -576,26 +596,50 @@ impl ComposeExecutor {
         target == CONTAINER_SECRETS_DIR || target.starts_with(&format!("{CONTAINER_SECRETS_DIR}/"))
     }
 
+    /// Every service name across the base compose document and the user
+    /// override, de-duplicated in first-seen order.
+    ///
+    /// The override is a full compose document, so it can introduce services
+    /// the base file never mentions. Enumerating only the base file would
+    /// leave those with no secrets while the deployment log claimed every
+    /// service got them.
+    pub fn all_service_names(&self, compose_documents: &[&str]) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for document in compose_documents {
+            if document.trim().is_empty() {
+                continue;
+            }
+            for name in self.parse_service_names_yaml(document) {
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+        }
+        names
+    }
+
     /// Generate the override that mounts `host_dir` read-only at
     /// `/run/secrets` in every service that is not already managing that path
-    /// itself.
+    /// itself. Returns the YAML and the services it covers.
     fn generate_secrets_override(
         &self,
-        compose_content: &str,
+        compose_documents: &[&str],
         host_dir: &Path,
         skip_services: &HashSet<String>,
-    ) -> String {
+    ) -> (String, Vec<String>) {
         let mount = format!(
             "{}:{}:ro",
             host_dir.to_string_lossy(),
             CONTAINER_SECRETS_DIR
         );
 
+        let mut mounted = Vec::new();
         let mut services_map = Mapping::new();
-        for service in self.parse_service_names_yaml(compose_content) {
+        for service in self.all_service_names(compose_documents) {
             if skip_services.contains(&service) {
                 continue;
             }
+            mounted.push(service.clone());
             let mut service_map = Mapping::new();
             service_map.insert(
                 Value::String("volumes".to_string()),
@@ -605,7 +649,7 @@ impl ComposeExecutor {
         }
 
         if services_map.is_empty() {
-            return String::new();
+            return (String::new(), mounted);
         }
 
         let mut root = Mapping::new();
@@ -616,7 +660,10 @@ impl ComposeExecutor {
         // Built through serde_yaml rather than string formatting so a service
         // name or host path containing YAML metacharacters is quoted, not
         // injected as structure.
-        serde_yaml::to_string(&Value::Mapping(root)).unwrap_or_default()
+        (
+            serde_yaml::to_string(&Value::Mapping(root)).unwrap_or_default(),
+            mounted,
+        )
     }
 
     /// Remove a stack's materialized secret files from the host.
@@ -1201,10 +1248,11 @@ impl ComposeExecutor {
         )?;
         let secrets_content = match secrets_dir {
             Some(ref host_dir) => {
-                let skip = Self::services_managing_own_secrets(&[
-                    &request.compose_content,
+                let documents = [
+                    request.compose_content.as_str(),
                     request.compose_override.as_deref().unwrap_or_default(),
-                ]);
+                ];
+                let skip = Self::services_managing_own_secrets(&documents);
                 for service in &skip {
                     warn!(
                         project = %request.project_name,
@@ -1213,7 +1261,14 @@ impl ComposeExecutor {
                          skipping Temps secret injection for it"
                     );
                 }
-                self.generate_secrets_override(&request.compose_content, host_dir, &skip)
+                let (content, mounted) =
+                    self.generate_secrets_override(&documents, host_dir, &skip);
+                debug!(
+                    project = %request.project_name,
+                    services = %mounted.join(", "),
+                    "Mounted project secrets into compose services"
+                );
+                content
             }
             None => String::new(),
         };
@@ -5828,6 +5883,81 @@ services:
         );
     }
 
+    #[tokio::test]
+    async fn test_compose_override_cannot_introduce_a_service_without_secrets() {
+        let Some(docker) = Docker::connect_with_defaults().ok() else {
+            return;
+        };
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), data_dir.path().to_path_buf());
+        let project_dir = tempfile::tempdir().unwrap();
+        let mut request = secrets_test_request(
+            "temps-1-2",
+            "services:\n  web:\n    image: nginx\n",
+            one_secret("TOKEN", "value"),
+        );
+        request.compose_override = Some("services:\n  worker:\n    image: nginx\n".to_string());
+
+        // Secret coverage is enumerated from the compose documents, so a
+        // service the enumeration cannot see would silently get no secrets.
+        // `validate_compose_override` is what makes that unreachable: an
+        // inline override may not introduce services at all. This test pins
+        // that dependency so the guarantee cannot be removed elsewhere
+        // without a failure here.
+        let error = executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ComposeError::InvalidOverride { ref reason, .. } if reason.contains("cannot add service")),
+            "expected the override to be rejected, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn test_all_service_names_merges_both_documents_in_order() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+
+        let names = executor.all_service_names(&[
+            "services:\n  web:\n    image: nginx\n  shared:\n    image: nginx\n",
+            "",
+            "services:\n  shared:\n    image: nginx\n  extra:\n    image: nginx\n",
+        ]);
+
+        assert_eq!(names, vec!["web", "shared", "extra"]);
+    }
+
+    #[tokio::test]
+    async fn test_compose_secrets_fail_loudly_when_data_dir_has_a_colon() {
+        let Some(docker) = Docker::connect_with_defaults().ok() else {
+            return;
+        };
+        let data_dir = tempfile::tempdir().unwrap();
+        // Docker splits bind specs on ':', so this must not silently mount the
+        // wrong path.
+        let colon_dir = data_dir.path().join("has:colon");
+        let executor = ComposeExecutor::new(Arc::new(docker), colon_dir);
+        let project_dir = tempfile::tempdir().unwrap();
+        let request = secrets_test_request(
+            "temps-1-2",
+            "services:\n  web:\n    image: nginx\n",
+            one_secret("TOKEN", "value"),
+        );
+
+        let error = executor
+            .write_compose_files(project_dir.path(), &request)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, ComposeError::FileWriteFailed { ref reason, .. } if reason.contains("colon")),
+            "expected a clear colon error, got {error:?}"
+        );
+    }
+
     #[test]
     fn test_compose_path_cannot_shadow_a_generated_override() {
         for reserved in ComposeExecutor::GENERATED_OVERRIDES {
@@ -5846,7 +5976,19 @@ services:
 
     #[test]
     fn test_secret_keys_that_are_not_filenames_are_rejected() {
-        for key in ["", ".", "..", "a/b", "a\\b", "a\0b"] {
+        for key in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "a\0b",
+            "1LEADING_DIGIT",
+            "has space",
+            "has-dash",
+            "has:colon",
+            "..\\..\\etc\\passwd",
+        ] {
             assert!(
                 ComposeExecutor::validate_secret_file_name(key).is_err(),
                 "key {key:?} should be rejected"

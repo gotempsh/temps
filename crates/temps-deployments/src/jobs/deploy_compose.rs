@@ -556,25 +556,33 @@ impl WorkflowTask for DeployComposeJob {
             if !self.secrets.is_empty() {
                 let mut keys: Vec<&str> = self.secrets.keys().map(String::as_str).collect();
                 keys.sort_unstable();
+                let documents = [
+                    compose_content.as_str(),
+                    self.compose_override.as_deref().unwrap_or_default(),
+                ];
+                let mut skipped = ComposeExecutor::services_managing_own_secrets(&documents)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                skipped.sort();
+                let mounted_into = self
+                    .compose_executor
+                    .all_service_names(&documents)
+                    .into_iter()
+                    .filter(|service| !skipped.contains(service))
+                    .collect::<Vec<_>>();
+
                 let _ = self
                     .log_service
                     .log_info(
                         log_id,
                         &format!(
-                            "Mounting {} secret(s) at /run/secrets in every service: {}",
+                            "Mounting {} secret(s) at /run/secrets in service(s) {}: {}",
                             keys.len(),
+                            mounted_into.join(", "),
                             keys.join(", ")
                         ),
                     )
                     .await;
-
-                let mut skipped = ComposeExecutor::services_managing_own_secrets(&[
-                    &compose_content,
-                    self.compose_override.as_deref().unwrap_or_default(),
-                ])
-                .into_iter()
-                .collect::<Vec<_>>();
-                skipped.sort();
                 if !skipped.is_empty() {
                     let _ = self
                         .log_service
