@@ -1252,12 +1252,18 @@ impl ConversationService {
             // (project, alert, deployment, error-group, …) so the model can always
             // explore the source tree when a repo is connected, regardless of which
             // context_type seeded the chat.
-            if let Some(repo_tools_provider) = self.providers.get("__repo_tools__") {
-                tools.extend(
-                    repo_tools_provider
-                        .tools_with_auth(conv.project_id, &conv.context_id, auth)
-                        .await,
-                );
+            // ...but only for callers who hold the Git repository read
+            // permission: the tools read private source with the project's
+            // stored provider token, so `ProjectsRead` alone must not unlock
+            // them (see `caller_may_use_repo_tools`).
+            if caller_may_use_repo_tools(auth) {
+                if let Some(repo_tools_provider) = self.providers.get("__repo_tools__") {
+                    tools.extend(
+                        repo_tools_provider
+                            .tools_with_auth(conv.project_id, &conv.context_id, auth)
+                            .await,
+                    );
+                }
             }
 
             // Write tool: offered only when write support is wired AND the project
@@ -2311,6 +2317,21 @@ struct ToolExecutionState {
     seen_calls: std::collections::HashMap<String, String>,
 }
 
+/// Whether this caller may drive the Git repo-exploration tools
+/// (`read_repo_file`, `list_repo_dir`, `list_repo_branches`, `list_repo_tags`).
+///
+/// These tools read the project's private source through the stored Git
+/// provider connection token, and their raw output is streamed straight back
+/// to the caller in a `tool_result` SSE frame before anything could filter it.
+/// The chat endpoints themselves only require `ProjectsRead`/`ProjectsWrite`,
+/// so without this check a caller with no Git permission at all could ask the
+/// model to read `.env`, credentials or any source file and get the bytes
+/// verbatim — the repository permission would be enforced on
+/// `/git/repositories/*` and nowhere else.
+fn caller_may_use_repo_tools(auth: &AuthContext) -> bool {
+    auth.has_permission(&temps_auth::permissions::Permission::GitRepositoriesRead)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_conversation_tool(
     call: &ToolCall,
@@ -2357,7 +2378,16 @@ async fn dispatch_conversation_tool(
         call.name.as_str(),
         "read_repo_file" | "list_repo_dir" | "list_repo_branches" | "list_repo_tags"
     ) {
-        if let Some(provider) = repo_tools {
+        if !caller_may_use_repo_tools(auth) {
+            // Defence in depth: the tool was never offered to the model for
+            // this caller, but a model can still emit the call name from
+            // memory, and dispatch must not honour it.
+            format!(
+                "Tool '{}' is not available: it requires the {} permission.",
+                call.name,
+                temps_auth::permissions::Permission::GitRepositoriesRead
+            )
+        } else if let Some(provider) = repo_tools {
             provider
                 .execute_tool_with_auth(project_id, context_id, &call.name, &call.arguments, auth)
                 .await
@@ -3148,6 +3178,49 @@ mod tests {
             updated_at: now,
         };
         AuthContext::new_session(user, temps_auth::permissions::Role::Admin)
+    }
+
+    fn auth_with_role(role: temps_auth::permissions::Role) -> AuthContext {
+        let mut auth = test_auth();
+        auth.effective_role = role;
+        auth
+    }
+
+    /// The chat endpoints require only `ProjectsRead`/`ProjectsWrite`, but the
+    /// repo tools read private source through the project's stored Git token
+    /// and stream it back verbatim in a `tool_result` frame. Without the
+    /// repository permission the caller must not reach them.
+    #[test]
+    fn repo_tools_require_the_git_repository_read_permission() {
+        use temps_auth::permissions::{Permission, Role};
+
+        // Admin holds everything, including GitRepositoriesRead.
+        assert!(caller_may_use_repo_tools(&auth_with_role(Role::Admin)));
+
+        // A role that can read projects but not repositories must be refused —
+        // otherwise `projects:read` silently grants source-code access.
+        let reader = auth_with_role(Role::Reader);
+        if !reader.has_permission(&Permission::GitRepositoriesRead) {
+            assert!(
+                !caller_may_use_repo_tools(&reader),
+                "a caller without {} must not reach the repo tools",
+                Permission::GitRepositoriesRead
+            );
+        }
+
+        // A custom API key scoped to projects only is the concrete case from
+        // the report: ProjectsWrite, no Git permission at all.
+        let mut custom = auth_with_role(Role::Custom);
+        custom.custom_permissions = Some(vec![Permission::ProjectsRead, Permission::ProjectsWrite]);
+        assert!(!caller_may_use_repo_tools(&custom));
+
+        // The same key with the repository permission added is allowed.
+        custom.custom_permissions = Some(vec![
+            Permission::ProjectsRead,
+            Permission::ProjectsWrite,
+            Permission::GitRepositoriesRead,
+        ]);
+        assert!(caller_may_use_repo_tools(&custom));
     }
 
     fn assistant_msg_model() -> ai_messages::Model {

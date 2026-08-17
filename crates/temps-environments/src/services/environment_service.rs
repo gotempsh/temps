@@ -139,6 +139,83 @@ fn format_public_url(host: &str, external_url: Option<&str>, proxy_port: u16) ->
     format!("{protocol}://{host}{port_suffix}")
 }
 
+/// Longest legal hostname, per DNS.
+const MAX_HOSTNAME_LEN: usize = 253;
+/// Longest legal DNS label.
+const MAX_LABEL_LEN: usize = 63;
+
+/// Normalize and validate a hostname destined for the proxy route table.
+///
+/// Route keys are compared against the request `Host` after the proxy
+/// lowercases and strips the port, so the stored value has to arrive in that
+/// same shape or it silently never matches. Everything outside a strict
+/// LDH (letter-digit-hyphen) hostname is rejected rather than coerced: a
+/// wildcard, a scheme, a path or a port here would either shadow a broader set
+/// of hostnames than the caller owns, or produce a route that can never be hit.
+///
+/// A single bare label is allowed — that is the shape Temps itself stores for
+/// the auto-managed per-environment row.
+fn normalize_environment_domain(domain: &str) -> Result<String, EnvironmentError> {
+    let normalized = domain.trim().trim_end_matches('.').to_ascii_lowercase();
+
+    if normalized.is_empty() {
+        return Err(EnvironmentError::InvalidInput(
+            "Domain cannot be empty".to_string(),
+        ));
+    }
+    if normalized.len() > MAX_HOSTNAME_LEN {
+        return Err(EnvironmentError::InvalidInput(format!(
+            "Domain '{normalized}' is {} characters; hostnames must be {MAX_HOSTNAME_LEN} or fewer",
+            normalized.len()
+        )));
+    }
+
+    for label in normalized.split('.') {
+        if label.is_empty() {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Domain '{normalized}' has an empty label"
+            )));
+        }
+        if label.len() > MAX_LABEL_LEN {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Domain '{normalized}' has a label longer than {MAX_LABEL_LEN} characters"
+            )));
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Domain '{normalized}' has a label starting or ending with a hyphen"
+            )));
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "Domain '{normalized}' may only contain letters, digits, hyphens and dots \
+                 (no wildcards, schemes, ports or paths)"
+            )));
+        }
+    }
+
+    Ok(normalized)
+}
+
+/// True when `host` is the zone apex or sits anywhere beneath it.
+///
+/// Compared label-wise rather than with a plain `ends_with`, so
+/// `notexample.com` is not treated as being inside `example.com`.
+fn hostname_is_inside_zone(host: &str, zone: &str) -> bool {
+    let zone = zone
+        .trim()
+        .trim_start_matches("*.")
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    if zone.is_empty() {
+        return false;
+    }
+    host == zone || host.ends_with(&format!(".{zone}"))
+}
+
 #[derive(Clone)]
 pub struct EnvironmentService {
     db: Arc<temps_database::DbConnection>,
@@ -1046,6 +1123,18 @@ impl EnvironmentService {
         Ok(custom_domains)
     }
 
+    /// Attach a hostname to an environment.
+    ///
+    /// The value goes straight into the proxy route table as a key, with
+    /// `cert_eligible = true`, and `environment_domains` rows are loaded
+    /// *before* the platform's own generated preview routes — a hostname
+    /// already present wins. Unvalidated, that made this endpoint a
+    /// takeover primitive: claim `victim-env.<preview-zone>` and you shadow
+    /// the legitimate environment's route *and* satisfy the on-demand TLS gate,
+    /// which then issues a real ACME certificate for a name you do not own.
+    ///
+    /// So the value must be a well-formed hostname, must not name anything the
+    /// platform mints for itself, and must be globally unique.
     pub async fn add_environment_domain(
         &self,
         project_id_p: i32,
@@ -1056,24 +1145,67 @@ impl EnvironmentService {
             .filter(environments::Column::ProjectId.eq(project_id_p))
             .filter(environments::Column::Id.eq(env_id))
             .one(self.db.as_ref())
-            .await?;
+            .await?
+            .ok_or_else(|| {
+                EnvironmentError::NotFound(format!("Environment {} not found", env_id))
+            })?;
 
-        if let Some(env) = environment {
-            let new_domain = environment_domains::ActiveModel {
-                environment_id: Set(env.id),
-                domain: Set(domain),
-                created_at: Set(chrono::Utc::now()),
-                ..Default::default()
-            };
+        let normalized = normalize_environment_domain(&domain)?;
 
-            let inserted_domain = new_domain.insert(self.db.as_ref()).await?;
-            return Ok(inserted_domain);
+        // Reject the platform's own namespaces. `is_reserved_hostname` covers
+        // the console hostname and the preview apex; the zone checks below
+        // cover every generated name under the preview / on-demand zones,
+        // which is where both the route shadowing and the certificate
+        // issuance would otherwise happen.
+        let settings = self
+            .config_service
+            .get_settings()
+            .await
+            .map_err(|e| EnvironmentError::DatabaseConnectionError(e.to_string()))?;
+        if settings.is_reserved_hostname(&normalized) {
+            return Err(EnvironmentError::InvalidInput(format!(
+                "'{normalized}' is reserved by this Temps instance and cannot be attached to an environment"
+            )));
+        }
+        for zone in [
+            Some(settings.preview_domain.as_str()),
+            settings.on_demand_tls.zone.as_deref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if hostname_is_inside_zone(&normalized, zone) {
+                return Err(EnvironmentError::InvalidInput(format!(
+                    "'{normalized}' is inside the platform-managed zone '{zone}'; \
+                     those hostnames are generated by Temps and cannot be claimed manually"
+                )));
+            }
         }
 
-        Err(EnvironmentError::NotFound(format!(
-            "Environment {} not found",
-            env_id
-        )))
+        // Globally unique, not per-project: the route table is keyed by
+        // hostname alone, so a duplicate in *any* project is precisely the
+        // collision being prevented.
+        if let Some(existing) = environment_domains::Entity::find()
+            .filter(environment_domains::Column::Domain.eq(&normalized))
+            .one(self.db.as_ref())
+            .await?
+        {
+            if existing.environment_id != env_id {
+                return Err(EnvironmentError::InvalidInput(format!(
+                    "Domain '{normalized}' is already attached to another environment"
+                )));
+            }
+            return Ok(existing);
+        }
+
+        let new_domain = environment_domains::ActiveModel {
+            environment_id: Set(environment.id),
+            domain: Set(normalized),
+            created_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        };
+
+        Ok(new_domain.insert(self.db.as_ref()).await?)
     }
 
     pub async fn delete_environment_domain(
@@ -1178,6 +1310,64 @@ impl EnvironmentService {
 
 #[cfg(test)]
 mod tests {
+
+    /// The value becomes a proxy route key compared against a lowercased,
+    /// port-stripped Host, so it has to be stored in that shape.
+    #[test]
+    fn environment_domain_is_normalized() {
+        assert_eq!(
+            super::normalize_environment_domain("  App.Example.COM.  ").unwrap(),
+            "app.example.com"
+        );
+        // A bare label is legal — it is what the auto-managed row stores.
+        assert_eq!(
+            super::normalize_environment_domain("myproj-prod").unwrap(),
+            "myproj-prod"
+        );
+    }
+
+    /// Anything that could shadow more than the caller owns, or produce a route
+    /// that can never match, is refused rather than coerced.
+    #[test]
+    fn environment_domain_rejects_malformed_values() {
+        for bad in [
+            "",
+            "   ",
+            "*.example.com",
+            "https://example.com",
+            "example.com/path",
+            "example.com:8080",
+            "-leading.example.com",
+            "trailing-.example.com",
+            "double..dot.com",
+            "under_score.example.com",
+        ] {
+            assert!(
+                super::normalize_environment_domain(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// Zone membership is label-wise: `notexample.com` is not inside
+    /// `example.com`, but `a.b.example.com` is.
+    #[test]
+    fn zone_membership_is_label_wise() {
+        assert!(super::hostname_is_inside_zone("example.com", "example.com"));
+        assert!(super::hostname_is_inside_zone(
+            "victim-env.preview.example.com",
+            "preview.example.com"
+        ));
+        assert!(super::hostname_is_inside_zone(
+            "a.b.example.com",
+            "*.example.com"
+        ));
+        assert!(!super::hostname_is_inside_zone(
+            "notexample.com",
+            "example.com"
+        ));
+        assert!(!super::hostname_is_inside_zone("example.com", ""));
+    }
     use super::*;
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
 

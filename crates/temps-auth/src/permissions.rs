@@ -1015,10 +1015,16 @@ impl Role {
                 Permission::EmailsRead,
                 Permission::EmailsSend,
                 Permission::EmailsValidate,
+                // Read only, deliberately. PlatformAdmin is documented as
+                // read-only on deployable resources, but a deployment token is
+                // a credential, not a resource: creating one returns the
+                // plaintext `dt_` secret and defaults to full access when no
+                // permissions are supplied, and rotating one returns a fresh
+                // plaintext secret. Holding the mutating permissions let a
+                // "deploy-read-only" platform admin mint a token that writes to
+                // deployed-app APIs (analytics, email sending), and invalidate
+                // the tokens live deployments are running with.
                 Permission::DeploymentTokensRead,
-                Permission::DeploymentTokensWrite,
-                Permission::DeploymentTokensCreate,
-                Permission::DeploymentTokensDelete,
                 Permission::VulnerabilityScansRead,
                 Permission::VulnerabilityScansWrite,
                 Permission::VulnerabilityScansCreate,
@@ -1436,6 +1442,28 @@ mod tests {
                 "role {role:?} must not hold users:manage"
             );
         }
+    }
+
+    /// A deployment token is a credential, not a resource: creating one
+    /// returns the plaintext `dt_` secret (defaulting to full access when no
+    /// permissions are given) and rotating one returns a fresh secret. A role
+    /// documented as read-only on deployable resources must therefore not be
+    /// able to mint or revoke them, only list them.
+    #[test]
+    fn test_platform_admin_cannot_mint_deployment_tokens() {
+        assert!(Role::PlatformAdmin.has_permission(&Permission::DeploymentTokensRead));
+        for perm in [
+            Permission::DeploymentTokensWrite,
+            Permission::DeploymentTokensCreate,
+            Permission::DeploymentTokensDelete,
+        ] {
+            assert!(
+                !Role::PlatformAdmin.has_permission(&perm),
+                "PlatformAdmin must not hold {perm:?}"
+            );
+        }
+        // Admin still can — this narrows PlatformAdmin, not token management.
+        assert!(Role::Admin.has_permission(&Permission::DeploymentTokensCreate));
     }
 
     // Deployment token permission tests
