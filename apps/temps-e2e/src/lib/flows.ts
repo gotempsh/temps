@@ -482,6 +482,27 @@ export function resolveLoadTarget(
 }
 
 /**
+ * Headers that make a `fetch()` look like a browser navigating to a top-level
+ * document, which is what the proxy requires before it will create a
+ * visitor/session and emit `_temps_visitor_id`/`_temps_sid` cookies.
+ *
+ * See `temps-proxy::is_browser_document_request`. The proxy needs `GET` +
+ * an HTML `Accept`, and rejects a `Sec-Fetch-Dest` that is present but isn't
+ * `document` (that's how it drops framework data fetches). Bun's `fetch`
+ * sends a wildcard `Accept` and no Fetch Metadata by default, so without these
+ * a scenario request is correctly classified as a non-browser client and no
+ * cookie is ever issued — which is exactly what a real tracked page view
+ * would NOT look like.
+ */
+export const BROWSER_NAVIGATION_HEADERS: Record<string, string> = {
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+}
+
+/**
  * Poll an HTTP target until it returns a non-5xx/non-0 response or times out.
  * Confirms the deployed app is actually serving before we load-test it (the
  * deployment status string alone is not a reliability signal).

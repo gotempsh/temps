@@ -2608,20 +2608,52 @@ fn is_event_stream_content_type(value: &str) -> bool {
         .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
+/// Whether a request looks like a browser navigating to a top-level document,
+/// as opposed to a data fetch, an embedded subresource, or a generic HTTP
+/// client that happens to accept HTML.
+///
+/// `Sec-Fetch-Dest` is the strong signal and is used whenever it is present:
+/// a browser labels a navigation `document` and a `fetch()`/XHR `empty`, so
+/// "present and not `document`" is a definitive no. But it is **not** present
+/// on every real page view. Per the Fetch Metadata spec, user agents append
+/// `Sec-Fetch-*` only for potentially trustworthy URLs — HTTPS and localhost —
+/// and Safari only began sending them in 16.4. A self-hosted Temps serving an
+/// app over plain HTTP therefore receives no Fetch Metadata at all, and
+/// treating that absence as "not a browser" would silently zero out every
+/// visitor, session and page view for that operator, with nothing in the UI
+/// to explain why.
+///
+/// So absence falls back to the weaker `Accept` + `text/html` response pair
+/// (the caller checks the response content-type). That is spoofable, but the
+/// thing it admits is an unauthenticated visitor row — analytics noise, not a
+/// trust decision — and a client must still both ask for HTML and be served
+/// HTML at a non-asset, non-API path. A browser-issued `fetch()` defaults to
+/// `Accept: */*` and is excluded by that alone, which is what keeps framework
+/// data fetches out on HTTP origins too.
 fn is_browser_document_request(
     method: &str,
     accept: Option<&str>,
     fetch_destination: Option<&str>,
 ) -> bool {
-    method == "GET"
-        && accept.is_some_and(|value| {
-            value.split(',').any(|part| {
-                part.split(';')
-                    .next()
-                    .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
-            })
+    if method != "GET" {
+        return false;
+    }
+
+    let accepts_html = accept.is_some_and(|value| {
+        value.split(',').any(|part| {
+            part.split(';')
+                .next()
+                .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
         })
-        && fetch_destination.is_some_and(|destination| destination.eq_ignore_ascii_case("document"))
+    });
+    if !accepts_html {
+        return false;
+    }
+
+    match fetch_destination {
+        Some(destination) => destination.eq_ignore_ascii_case("document"),
+        None => true,
+    }
 }
 
 /// Console/control-plane traffic always gets a fixed timeout, regardless of

@@ -566,13 +566,35 @@ pub mod proxy_tests {
             None,
         ));
 
-        // Accept alone is spoofable and does not prove a browser document
-        // navigation; Fetch Metadata must explicitly identify the document.
-        assert!(!LoadBalancer::should_track_page(
+        // Absent Fetch Metadata falls back to Accept + an HTML response.
+        // Browsers omit Sec-Fetch-* on non-trustworthy (plain HTTP) origins,
+        // so requiring it would zero out analytics for every operator serving
+        // an app over HTTP. See is_browser_document_request.
+        assert!(LoadBalancer::should_track_page(
             "/docs",
             Some("text/html"),
             "GET",
             browser_accept,
+            None,
+        ));
+
+        // ...but that fallback is still gated on the response actually being
+        // HTML at a real page path.
+        assert!(!LoadBalancer::should_track_page(
+            "/v1/users",
+            Some("application/json"),
+            "GET",
+            browser_accept,
+            None,
+        ));
+
+        // A JS fetch() on an HTTP origin sends no Fetch Metadata either, but
+        // defaults to Accept: */* — which is what keeps it out.
+        assert!(!LoadBalancer::should_track_page(
+            "/data",
+            Some("text/html"),
+            "GET",
+            Some("*/*"),
             None,
         ));
 

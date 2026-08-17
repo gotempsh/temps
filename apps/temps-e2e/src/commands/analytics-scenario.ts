@@ -5,12 +5,13 @@
  *
  *   1. deploy a throwaway Go app (`analytics-app.ts`) that serves a real
  *      `text/html` page at `/` -- required because `should_track_page`
- *      (temps-proxy) only issues visitor/session cookies for HTML responses
- *      (or 4xx/5xx); the other apps in this suite all answer plain text and
- *      would never trigger cookie issuance at all
+ *      (temps-proxy) only issues visitor/session cookies for HTML responses;
+ *      the other apps in this suite all answer plain text and would never
+ *      trigger cookie issuance at all
  *   2. confirm the fresh project reports has_events=false before anything
  *      is sent
- *   3. GET `/` through the proxy and capture the REAL `_temps_visitor_id` /
+ *   3. GET `/` through the proxy AS A BROWSER DOCUMENT NAVIGATION
+ *      (`BROWSER_NAVIGATION_HEADERS`) and capture the REAL `_temps_visitor_id` /
  *      `_temps_sid` Set-Cookie values it issues -- these are encrypted,
  *      proxy-minted tokens; there's no way to synthesize them from the
  *      client side
@@ -61,6 +62,7 @@ import {
   waitForHttpReady,
   assertNotConsoleFallback,
   resolveLoadTarget,
+  BROWSER_NAVIGATION_HEADERS,
   teardown,
   makeRunId,
   pollUntil,
@@ -187,9 +189,11 @@ export async function analyticsScenarioCommand(opts: AnalyticsScenarioOptions): 
     let visitorCookie: string | undefined
     let sessionCookie: string | undefined
     await step(
-      'GET / issues real _temps_visitor_id and _temps_sid cookies (should_track_page requires an HTML response)',
+      'a browser document navigation issues real _temps_visitor_id and _temps_sid cookies',
       async () => {
-        const res = await fetch(target.url, { headers: target.headers })
+        const res = await fetch(target.url, {
+          headers: { ...target.headers, ...BROWSER_NAVIGATION_HEADERS },
+        })
         if (res.status !== 200) throw new Error(`GET / returned HTTP ${res.status}, expected 200`)
         const setCookies = res.headers.getSetCookie()
         visitorCookie = extractSetCookieValue(setCookies, '_temps_visitor_id')
@@ -198,6 +202,46 @@ export async function analyticsScenarioCommand(opts: AnalyticsScenarioOptions): 
         if (!sessionCookie) throw new Error(`no _temps_sid in Set-Cookie: ${JSON.stringify(setCookies)}`)
       },
     )
+
+    // The other half of the contract: tightening should_track_page (PR #700)
+    // exists to stop non-browser traffic creating a visitor/session on every
+    // request. Assert that directly, so a future loosening of the gate can't
+    // silently reintroduce the churn while the positive case above still passes.
+    await step('a non-browser client on the same URL is NOT tracked (no cookies issued)', async () => {
+      const res = await fetch(target.url, {
+        headers: { ...target.headers, Accept: '*/*' },
+      })
+      if (res.status !== 200) throw new Error(`GET / returned HTTP ${res.status}, expected 200`)
+      const setCookies = res.headers.getSetCookie()
+      const leaked = ['_temps_visitor_id', '_temps_sid'].filter((name) =>
+        extractSetCookieValue(setCookies, name),
+      )
+      if (leaked.length > 0) {
+        throw new Error(`generic HTTP client was tracked; unexpected cookies ${leaked.join(', ')} in ${JSON.stringify(setCookies)}`)
+      }
+    })
+
+    // A browser fetch()/XHR does send Fetch Metadata, and it must be rejected
+    // even when it asks for HTML — this is the case the plain-Accept fallback
+    // must never swallow.
+    await step('a browser data fetch (Sec-Fetch-Dest: empty) is NOT tracked', async () => {
+      const res = await fetch(target.url, {
+        headers: {
+          ...target.headers,
+          Accept: 'text/html,application/xhtml+xml',
+          'Sec-Fetch-Dest': 'empty',
+          'Sec-Fetch-Mode': 'cors',
+        },
+      })
+      if (res.status !== 200) throw new Error(`GET / returned HTTP ${res.status}, expected 200`)
+      const setCookies = res.headers.getSetCookie()
+      const leaked = ['_temps_visitor_id', '_temps_sid'].filter((name) =>
+        extractSetCookieValue(setCookies, name),
+      )
+      if (leaked.length > 0) {
+        throw new Error(`data fetch was tracked; unexpected cookies ${leaked.join(', ')} in ${JSON.stringify(setCookies)}`)
+      }
+    })
 
     const cookieHeader = () => `_temps_visitor_id=${visitorCookie}; _temps_sid=${sessionCookie}`
     const customEventName = `${runId}-purchase`
