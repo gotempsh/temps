@@ -1,5 +1,6 @@
 pub mod collector;
 pub mod error;
+pub mod node_sampler;
 pub mod scraper;
 pub mod store;
 
@@ -11,6 +12,7 @@ pub use collector::redis::RedisCollector;
 pub use collector::s3::S3Collector;
 pub use collector::{Collector, CollectorConfig};
 pub use error::MetricsError;
+pub use node_sampler::NodeMetricsSampler;
 pub use scraper::MetricsScraper;
 pub use store::clickhouse::{ChMetricRow, ClickHouseMetricsConfig, ClickhouseMetricsStore};
 pub use store::clickhouse_migrations;

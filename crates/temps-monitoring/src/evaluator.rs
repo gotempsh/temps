@@ -140,6 +140,15 @@ impl AlertEvaluator {
             warn!("AlertEvaluator: failed to seed default proxy rules on startup: {e}");
         }
 
+        // Seed default file-descriptor/socket exhaustion rules for the
+        // control-plane node. `NodeMetricsSampler` (spawned alongside the
+        // proxy metrics sampler) writes `node.*` points for node 0 whenever
+        // the proxy runs, so these defaults always have data to evaluate.
+        // Idempotent via the same ON CONFLICT DO NOTHING as the proxy rules.
+        if let Err(e) = seed_default_node_resource_rules(self.db.as_ref()).await {
+            warn!("AlertEvaluator: failed to seed default node resource rules on startup: {e}");
+        }
+
         loop {
             if let Err(e) = self.run_cycle().await {
                 error!("AlertEvaluator: cycle failed: {e}");
@@ -797,10 +806,26 @@ const CONTROL_PLANE_NODE_ID: i32 = 0;
 /// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
 /// `(node_id, metric_name)` so concurrent calls are safe.
 pub async fn seed_default_proxy_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
-    let seeds = proxy_default_seeds();
+    seed_node_rules(db, &proxy_default_seeds()).await
+}
 
+/// Insert default file-descriptor/socket exhaustion alert rules for the
+/// control-plane node if none exist.
+///
+/// `NodeMetricsSampler` writes `node.fd_percent` (system-wide) and
+/// `node.process_fd_percent` (this process's own `RLIMIT_NOFILE`) points for
+/// node 0 on every install where the proxy runs, so the defaults always have
+/// data to evaluate. Uses the same `(node_id, metric_name)` unique index as
+/// [`seed_default_proxy_rules`], so this is safe to call alongside it.
+pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
+    seed_node_rules(db, &node_fd_default_seeds()).await
+}
+
+/// Shared `INSERT … ON CONFLICT DO NOTHING` loop for control-plane-node
+/// -scoped default rules, keyed on the `(node_id, metric_name)` unique index.
+async fn seed_node_rules(db: &DatabaseConnection, seeds: &[RuleSeed]) -> Result<(), MetricsError> {
     use sea_orm::ConnectionTrait;
-    for seed in &seeds {
+    for seed in seeds {
         let sql = format!(
             "INSERT INTO monitoring_alert_rules \
              (service_id, deployment_id, node_id, name, metric_name, threshold, comparator, severity, for_duration_secs, enabled) \
@@ -823,7 +848,10 @@ pub async fn seed_default_proxy_rules(db: &DatabaseConnection) -> Result<(), Met
         .map_err(MetricsError::DatabaseError)?;
     }
 
-    info!("seed_default_proxy_rules: seeded default proxy alert rules (ON CONFLICT DO NOTHING)");
+    info!(
+        rule_count = seeds.len(),
+        "seed_node_rules: seeded default control-plane node alert rules (ON CONFLICT DO NOTHING)"
+    );
 
     Ok(())
 }
@@ -1121,6 +1149,46 @@ fn proxy_default_seeds() -> Vec<RuleSeed> {
     ]
 }
 
+/// Default alert rules over the node resource metrics written by
+/// `NodeMetricsSampler` (`node.*`, `SourceKind::Node`, control-plane node).
+/// Covers file descriptor / socket exhaustion specifically: both the
+/// system-wide ceiling (`fs.file-max`, which every open socket counts
+/// against) and this process's own `RLIMIT_NOFILE`, since either one alone
+/// can be near 100% while the other has headroom — a container typically
+/// reports an effectively infinite `fs.file-max` while its process nofile
+/// limit is the real, much lower ceiling.
+///
+/// One rule per metric, not a warning/critical pair: the
+/// `uidx_monitoring_alert_rules_node_metric` unique index is on
+/// `(node_id, metric_name)` alone (no `severity` column), so a second seed
+/// on the same metric name is a silent `ON CONFLICT DO NOTHING` no-op — a
+/// warning+critical pair here would leave the critical row never inserted.
+/// (The same trap already exists in `postgres_default_seeds`'s
+/// warning/critical pairs on `pg.connections_active`, which is scoped to
+/// `service_id` instead and pre-dates this file; out of scope to fix here.)
+/// `severity: "critical"` reflects that "near exhaustion" already means the
+/// machine may start refusing new connections.
+fn node_fd_default_seeds() -> Vec<RuleSeed> {
+    vec![
+        RuleSeed {
+            name: "System file descriptors near exhaustion",
+            metric_name: "node.fd_percent",
+            threshold: 90.0,
+            comparator: ">",
+            severity: "critical",
+            for_duration_secs: 30,
+        },
+        RuleSeed {
+            name: "Process file descriptors near limit",
+            metric_name: "node.process_fd_percent",
+            threshold: 90.0,
+            comparator: ">",
+            severity: "critical",
+            for_duration_secs: 30,
+        },
+    ]
+}
+
 fn container_default_seeds() -> Vec<RuleSeed> {
     vec![
         RuleSeed {
@@ -1310,6 +1378,32 @@ mod tests {
                 "seed {} is not rate/latency based",
                 s.metric_name
             );
+            // One rule per metric: (node_id, metric_name) is a unique index,
+            // a duplicate metric would be a silent ON CONFLICT no-op.
+            assert!(
+                names.insert(s.metric_name),
+                "duplicate seed metric {}",
+                s.metric_name
+            );
+        }
+    }
+
+    #[test]
+    fn node_fd_default_seeds_are_unique_per_metric_and_critical() {
+        let seeds = node_fd_default_seeds();
+        assert_eq!(seeds.len(), 2);
+        let mut names = std::collections::HashSet::new();
+        for s in &seeds {
+            assert!(s.metric_name.starts_with("node."));
+            assert!(
+                s.metric_name.contains("fd_percent"),
+                "seed {} is not an fd/socket exhaustion metric",
+                s.metric_name
+            );
+            // "Near exhaustion" is inherently a critical condition — see the
+            // doc comment on node_fd_default_seeds for why this can't be a
+            // warning+critical pair under the current unique index.
+            assert_eq!(s.severity, "critical");
             // One rule per metric: (node_id, metric_name) is a unique index,
             // a duplicate metric would be a silent ON CONFLICT no-op.
             assert!(
