@@ -284,6 +284,38 @@ pub async fn connect_for_migrate(database_url: &str) -> ServiceResult<(Arc<DbCon
     Ok((Arc::new(db), pid))
 }
 
+/// Whether `pid` is still a live backend executing a query.
+///
+/// A PID that has disconnected entirely is absent from `pg_stat_activity` and
+/// therefore reported as not active — the caller must be able to distinguish
+/// "gone" (safe) from "still running the DDL" (unsafe to re-run).
+async fn migration_backend_active(db: &DatabaseConnection, pid: i32) -> ServiceResult<bool> {
+    db.query_one(Statement::from_sql_and_values(
+        sea_orm::DatabaseBackend::Postgres,
+        "SELECT EXISTS (\
+             SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND state = 'active'\
+         ) AS active",
+        [pid.into()],
+    ))
+    .await
+    .map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to verify cancellation of migration backend {pid}: {error}"
+        ))
+    })?
+    .ok_or_else(|| {
+        ServiceError::Database(format!(
+            "PostgreSQL returned no verification result for migration backend {pid}"
+        ))
+    })?
+    .try_get::<bool>("", "active")
+    .map_err(|error| {
+        ServiceError::Database(format!(
+            "Failed to decode cancellation verification for migration backend {pid}: {error}"
+        ))
+    })
+}
+
 /// Cancel an in-flight migration server-side — used when `temps migrate` is
 /// interrupted (Ctrl+C). Opens a FRESH connection (the migrating one is busy)
 /// and sends a query-cancel to the captured backend `pid`, exactly like pressing
@@ -323,6 +355,14 @@ pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceRe
             ))
         })?;
     if !cancellation {
+        // `pg_cancel_backend` also returns false — with a
+        // "PID N is not a PostgreSQL backend process" warning — when the target
+        // is ALREADY GONE. That is the safe outcome, not a failure: there is no
+        // statement left to cancel and nothing for a re-run to race. Only treat
+        // it as a failure when the backend is still there running something.
+        if !migration_backend_active(&db, pid).await? {
+            return Ok(());
+        }
         return Err(ServiceError::Database(format!(
             "PostgreSQL did not confirm cancellation of migration backend {pid}"
         )));
@@ -333,31 +373,7 @@ pub async fn cancel_migration_backend(database_url: &str, pid: i32) -> ServiceRe
     // safe to rerun until the target is no longer executing an active query.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
-        let stopped = db
-            .query_one(Statement::from_sql_and_values(
-                sea_orm::DatabaseBackend::Postgres,
-                "SELECT NOT EXISTS (\
-                     SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND state = 'active'\
-                 ) AS stopped",
-                [pid.into()],
-            ))
-            .await
-            .map_err(|error| {
-                ServiceError::Database(format!(
-                    "Failed to verify cancellation of migration backend {pid}: {error}"
-                ))
-            })?
-            .ok_or_else(|| {
-                ServiceError::Database(format!(
-                    "PostgreSQL returned no verification result for migration backend {pid}"
-                ))
-            })?
-            .try_get::<bool>("", "stopped")
-            .map_err(|error| {
-                ServiceError::Database(format!(
-                    "Failed to decode cancellation verification for migration backend {pid}: {error}"
-                ))
-            })?;
+        let stopped = !migration_backend_active(&db, pid).await?;
         if stopped {
             break;
         }
@@ -599,6 +615,51 @@ pub async fn get_pending_migration_names(db: &DbConnection) -> ServiceResult<Vec
 
 const PERMISSION_DENIED_RETENTION_INDEX: &str = "idx_audit_logs_permission_denied_retention";
 
+/// Live progress events from post-migration maintenance (concurrent index
+/// builds and continuous-aggregate backfill).
+///
+/// Both phases are non-transactional and can legitimately run for minutes on a
+/// large install — a concurrent index build scans the whole audit history, and
+/// the backfill issues one `refresh_continuous_aggregate()` transaction per
+/// window. Without these events an operator watching `temps migrate` sees a
+/// frozen terminal after the last migration line and cannot tell "still
+/// working" from "wedged on a lock". Callers turn them into per-step output.
+#[derive(Debug, Clone)]
+pub enum MaintenanceProgress<'a> {
+    /// The PostgreSQL backend PID that will execute the phase about to start.
+    ///
+    /// Emitted first by each phase. It is NOT necessarily the PID captured by
+    /// [`connect_for_migrate`]: the index phase deliberately disposes of its
+    /// connection (`close_on_drop`), so the backfill that follows runs on a
+    /// freshly-opened backend with a different PID. A caller that cancels
+    /// server-side on interrupt must target this PID, not the connect-time one,
+    /// or it will signal a backend that no longer exists while the real work
+    /// keeps running.
+    PhaseBackend { pid: i32 },
+    /// A concurrent index build is about to start.
+    IndexStarted { name: &'a str },
+    /// The concurrent index build finished successfully.
+    IndexFinished { name: &'a str, elapsed: Duration },
+    /// A continuous aggregate is about to be refreshed over `windows` windows.
+    AggregateStarted { view: &'a str, windows: usize },
+    /// One refresh window finished. `error` is set when that window failed —
+    /// windows are independent, so the backfill continues either way.
+    AggregateWindow {
+        view: &'a str,
+        index: usize,
+        total: usize,
+        elapsed: Duration,
+        error: Option<String>,
+    },
+    /// Every window for this aggregate has been attempted.
+    AggregateFinished {
+        view: &'a str,
+        windows: usize,
+        failed: usize,
+        elapsed: Duration,
+    },
+}
+
 /// Build large, non-correctness-critical indexes outside SeaORM's migration
 /// transaction. The caller runs this after the server has bound (or explicitly
 /// from `temps migrate`), so a busy audit table cannot block application boot.
@@ -607,6 +668,21 @@ const PERMISSION_DENIED_RETENTION_INDEX: &str = "idx_audit_logs_permission_denie
 /// the concurrent index build. `CREATE INDEX CONCURRENTLY` allows audit writes
 /// to continue while PostgreSQL scans the existing history.
 pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> ServiceResult<()> {
+    run_post_migration_indexes_streaming(db, |_| {}).await
+}
+
+/// [`run_post_migration_indexes`] with live progress events.
+///
+/// `on_progress` is called immediately before the concurrent build starts and
+/// again when it completes, so an interactive caller can show which index is
+/// being built rather than an unexplained pause.
+pub async fn run_post_migration_indexes_streaming<F>(
+    db: &DatabaseConnection,
+    on_progress: F,
+) -> ServiceResult<()>
+where
+    F: Fn(MaintenanceProgress<'_>),
+{
     let pool = db.get_postgres_connection_pool();
     let mut connection = pool.acquire().await.map_err(|error| {
         ServiceError::Database(format!(
@@ -617,6 +693,17 @@ pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> ServiceResul
     // is cancelled. Treat this as a disposable maintenance connection so no
     // cancellation or RESET failure can leak its settings back into the pool.
     connection.close_on_drop();
+
+    // Report the backend actually doing the work. Because this connection is
+    // disposable, it is the LAST phase to run on the connect-time PID — anything
+    // after it gets a new backend, and an interrupt aimed at the old PID would
+    // signal a process that no longer exists.
+    if let Ok(pid) = sqlx::query_scalar::<_, i32>("SELECT pg_backend_pid()")
+        .fetch_one(&mut *connection)
+        .await
+    {
+        on_progress(MaintenanceProgress::PhaseBackend { pid });
+    }
 
     sqlx::query("SET lock_timeout = '5s'")
         .execute(&mut *connection)
@@ -668,6 +755,11 @@ pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> ServiceResul
             })?;
         }
 
+        on_progress(MaintenanceProgress::IndexStarted {
+            name: PERMISSION_DENIED_RETENTION_INDEX,
+        });
+        let started = std::time::Instant::now();
+
         sqlx::query(
             "CREATE INDEX CONCURRENTLY IF NOT EXISTS \
                  idx_audit_logs_permission_denied_retention \
@@ -682,6 +774,11 @@ pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> ServiceResul
                  '{PERMISSION_DENIED_RETENTION_INDEX}': {error}"
             ))
         })?;
+
+        on_progress(MaintenanceProgress::IndexFinished {
+            name: PERMISSION_DENIED_RETENTION_INDEX,
+            elapsed: started.elapsed(),
+        });
 
         Ok(())
     }
@@ -726,6 +823,39 @@ pub async fn run_post_migration_indexes(db: &DatabaseConnection) -> ServiceResul
 type RefreshWindow = (Option<String>, String);
 
 pub async fn run_post_migration_backfill(db: &DatabaseConnection) -> ServiceResult<()> {
+    run_post_migration_backfill_streaming(db, |_| {}).await
+}
+
+/// [`run_post_migration_backfill`] with live progress events.
+///
+/// One [`MaintenanceProgress::AggregateWindow`] is emitted per refresh window,
+/// so an interactive caller can show "window 7/31" instead of nothing at all
+/// while a multi-minute backfill runs.
+pub async fn run_post_migration_backfill_streaming<F>(
+    db: &DatabaseConnection,
+    on_progress: F,
+) -> ServiceResult<()>
+where
+    F: Fn(MaintenanceProgress<'_>),
+{
+    // Report the backend that will run the refresh calls, so an interrupt can
+    // cancel THIS one. The migrate pool is capped at a single connection, so the
+    // PID read here is the PID every `refresh_continuous_aggregate()` below runs
+    // on — and it differs from the connect-time PID whenever a disposable
+    // maintenance connection (see `run_post_migration_indexes_streaming`) has
+    // already been retired.
+    if let Ok(Some(row)) = db
+        .query_one(Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT pg_backend_pid() AS pid".to_owned(),
+        ))
+        .await
+    {
+        if let Ok(pid) = row.try_get::<i32>("", "pid") {
+            on_progress(MaintenanceProgress::PhaseBackend { pid });
+        }
+    }
+
     // Refresh windows per aggregate, executed in order. `None` as a bound
     // means unbounded (NULL). Window ends mirror each aggregate's
     // refresh-policy end_offset so the backfill never overlaps the region
@@ -801,13 +931,20 @@ pub async fn run_post_migration_backfill(db: &DatabaseConnection) -> ServiceResu
         }
 
         debug!("Backfilling {view_name} continuous aggregate");
+        let total_windows = windows.len();
+        on_progress(MaintenanceProgress::AggregateStarted {
+            view: view_name,
+            windows: total_windows,
+        });
+        let aggregate_started = std::time::Instant::now();
         let mut failed = 0usize;
-        for (window_start, window_end) in &windows {
+        for (position, (window_start, window_end)) in windows.iter().enumerate() {
             let start_sql = window_start.as_deref().unwrap_or("NULL");
             let backfill_sql = format!(
                 "CALL refresh_continuous_aggregate('{view_name}', {start_sql}, {window_end})"
             );
-            if let Err(e) = db
+            let window_started = std::time::Instant::now();
+            let window_error = if let Err(e) = db
                 .execute(Statement::from_string(
                     sea_orm::DatabaseBackend::Postgres,
                     backfill_sql,
@@ -821,8 +958,24 @@ pub async fn run_post_migration_backfill(db: &DatabaseConnection) -> ServiceResu
                     "Failed to backfill {view_name} window [{start_sql}, {window_end}] \
                      (refresh policy will catch up): {e}"
                 );
-            }
+                Some(e.to_string())
+            } else {
+                None
+            };
+            on_progress(MaintenanceProgress::AggregateWindow {
+                view: view_name,
+                index: position + 1,
+                total: total_windows,
+                elapsed: window_started.elapsed(),
+                error: window_error,
+            });
         }
+        on_progress(MaintenanceProgress::AggregateFinished {
+            view: view_name,
+            windows: total_windows,
+            failed,
+            elapsed: aggregate_started.elapsed(),
+        });
         if failed == 0 {
             debug!("{view_name} continuous aggregate backfill complete");
         } else {
@@ -1003,6 +1156,75 @@ mod tests {
             other_result.is_ok(),
             "a separate temps_migrate backend must not be cancelled"
         );
+
+        Ok(())
+    }
+
+    /// Cancelling a backend that has already gone away must SUCCEED.
+    ///
+    /// `pg_cancel_backend()` returns false (with a "PID N is not a PostgreSQL
+    /// backend process" warning) for a PID that no longer exists. Treating that
+    /// as a failure told the operator "PostgreSQL did not confirm cancellation
+    /// … do not rerun migrations" when in fact nothing was left running — the
+    /// exact false alarm reported after interrupting post-migration maintenance,
+    /// whose backend differs from the connect-time one.
+    #[tokio::test]
+    async fn cancelling_an_already_gone_backend_succeeds() -> anyhow::Result<()> {
+        let container = match GenericImage::new("postgres", "18-alpine")
+            .with_exposed_port(testcontainers::core::ContainerPort::Tcp(5432))
+            .with_wait_for(WaitFor::message_on_stderr(
+                "database system is ready to accept connections",
+            ))
+            .with_env_var("POSTGRES_DB", "postgres")
+            .with_env_var("POSTGRES_USER", "postgres")
+            .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+            .start()
+            .await
+        {
+            Ok(container) => container,
+            Err(error)
+                if crate::test_utils::is_container_runtime_unavailable(&error.to_string()) =>
+            {
+                eprintln!("Skipping Docker-dependent gone-backend cancellation test: {error}");
+                return Ok(());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let host = container.get_host().await?.to_string();
+        let port = container.get_host_port_ipv4(5432).await?;
+        let database_url = format!("postgresql://postgres@{host}:{port}/postgres");
+
+        // Capture a real PID, then close its connection so the backend is gone.
+        let (db, pid) = connect_for_migrate(&database_url).await?;
+        db.get_postgres_connection_pool().close().await;
+        drop(db);
+
+        let observer = Database::connect(&database_url).await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let present = observer
+                .query_one(Statement::from_sql_and_values(
+                    sea_orm::DatabaseBackend::Postgres,
+                    "SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1) AS present",
+                    [pid.into()],
+                ))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("activity query returned no row"))?
+                .try_get::<bool>("", "present")?;
+            if !present {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!("closed migration backend never left pg_stat_activity");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        cancel_migration_backend(&database_url, pid)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!("cancelling an already-gone backend must succeed: {error}")
+            })?;
 
         Ok(())
     }

@@ -4305,11 +4305,21 @@ export type CreateProjectRequest = {
  * Request to create a new project secret.
  *
  * Project secrets are mounted into the container as files under
- * `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+ * `/run/secrets/<KEY>` as a read-only mount, instead of as environment
+ * variables, so they do not appear in `docker inspect`.
  * Values are always encrypted at rest and never returned in plaintext from
  * the API after create. Distinct from agent secrets (global `/settings/secrets`).
  */
 export type CreateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     /**
      * Include this secret in preview environments (default: false).
@@ -13272,6 +13282,11 @@ export type ProjectSecretEnvironmentInfo = {
  * must read it from the mounted file inside the container.
  */
 export type ProjectSecretResponse = {
+    /**
+     * Compose services this secret is restricted to. Empty means every
+     * service in the stack.
+     */
+    compose_services: Array<string>;
     created_at: number;
     environments: Array<ProjectSecretEnvironmentInfo>;
     id: number;
@@ -13726,9 +13741,29 @@ export type ProxyLogResponse = {
     project_id?: number | null;
     query_string?: string | null;
     referrer?: string | null;
+    /**
+     * Inbound request headers, credential values already replaced with
+     * `[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry
+     * predates header capture or was written by a path that doesn't record
+     * them; an empty map means "captured, but no headers", which is different
+     * and worth being able to tell apart.
+     *
+     * A `BTreeMap` rather than a raw `serde_json::Value` so the schema stays
+     * typed and the UI gets a stable alphabetical ordering for free.
+     */
+    request_headers?: {
+        [key: string]: string;
+    } | null;
     request_id: string;
     request_size_bytes?: number | null;
     request_source: string;
+    /**
+     * Upstream response headers, redacted on the same terms as
+     * [`Self::request_headers`].
+     */
+    response_headers?: {
+        [key: string]: string;
+    } | null;
     response_size_bytes?: number | null;
     response_time_ms?: number | null;
     routing_status: string;
@@ -19550,6 +19585,15 @@ export type UpdatePreferencesRequest = {
  * ciphertext.
  */
 export type UpdateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     include_in_preview?: boolean;
     /**

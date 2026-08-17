@@ -509,7 +509,8 @@ pub struct CreateEnvironmentRequest {
 /// Request to create a new project secret.
 ///
 /// Project secrets are mounted into the container as files under
-/// `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+/// `/run/secrets/<KEY>` as a read-only mount, instead of as environment
+/// variables, so they do not appear in `docker inspect`.
 /// Values are always encrypted at rest and never returned in plaintext from
 /// the API after create. Distinct from agent secrets (global `/settings/secrets`).
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -525,6 +526,14 @@ pub struct CreateProjectSecretRequest {
     #[serde(default = "default_include_in_preview")]
     #[schema(default = false)]
     pub include_in_preview: bool,
+    /// Docker Compose services allowed to read this secret, by compose
+    /// service name. Empty (the default) delivers it to every service in the
+    /// stack, which is how secrets behaved before scoping existed.
+    ///
+    /// Ignored by non-Compose presets: those deploy a single container, which
+    /// always receives every secret in scope for its environment.
+    #[serde(default)]
+    pub compose_services: Vec<String>,
 }
 
 /// Request to update a project secret. The `value` field is optional — omit it
@@ -539,6 +548,14 @@ pub struct UpdateProjectSecretRequest {
     pub environment_ids: Vec<i32>,
     #[serde(default = "default_include_in_preview")]
     pub include_in_preview: bool,
+    /// Docker Compose services allowed to read this secret, by compose
+    /// service name. Empty (the default) delivers it to every service in the
+    /// stack, which is how secrets behaved before scoping existed.
+    ///
+    /// Ignored by non-Compose presets: those deploy a single container, which
+    /// always receives every secret in scope for its environment.
+    #[serde(default)]
+    pub compose_services: Vec<String>,
 }
 
 /// Project secret metadata. There is deliberately no `value` field — secret
@@ -553,6 +570,9 @@ pub struct ProjectSecretResponse {
     pub created_at: i64,
     pub updated_at: i64,
     pub environments: Vec<ProjectSecretEnvironmentInfo>,
+    /// Compose services this secret is restricted to. Empty means every
+    /// service in the stack.
+    pub compose_services: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, ToSchema, Clone)]

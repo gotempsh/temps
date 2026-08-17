@@ -14467,7 +14467,8 @@ export const getAiStatusBreakdownOptions = (options?: Options<GetAiStatusBreakdo
 export const getProjectsHealthQueryKey = (options: Options<GetProjectsHealthData>) => createQueryKey('getProjectsHealth', options);
 
 /**
- * Get health summaries for multiple projects (last 1 hour)
+ * Get user-traffic health summaries for multiple projects (last 1 hour).
+ * Temps' own status-monitor requests are excluded.
  */
 export const getProjectsHealthOptions = (options: Options<GetProjectsHealthData>) => queryOptions<GetProjectsHealthResponse, GetProjectsHealthError, GetProjectsHealthResponse, ReturnType<typeof getProjectsHealthQueryKey>>({
     queryFn: async ({ queryKey, signal }) => {

@@ -7,7 +7,7 @@
       "expected_output": "Inspects the app and target context, runs the capability detector, offers missing observability once without blocking deployment, uses pinned @temps-sdk/cli with --target-context, and verifies deployment health.",
       "files": [],
       "expectations": [
-        "Uses bunx or npx with @temps-sdk/cli@0.1.33 rather than a global temps command",
+        "Uses bunx or npx with @temps-sdk/cli@0.1.34 rather than a global temps command",
         "Names an explicit target context for state-changing commands",
         "Checks analytics, error tracking, and tracing before the final deploy step",
         "Treats observability as an opt-in offer rather than a deployment requirement",
@@ -34,7 +34,7 @@
       "files": [],
       "expectations": [
         "Uses only the relevant errors command-group reference",
-        "Uses @temps-sdk/cli@0.1.33 with the staging target context",
+        "Uses @temps-sdk/cli@0.1.34 with the staging target context",
         "Performs no state-changing operation",
         "Does not offer instrumentation during a read-only error query"
       ]
@@ -72,7 +72,7 @@
       "files": [],
       "expectations": [
         "Routes to ci-automation and deploy-application",
-        "Pins @temps-sdk/cli@0.1.33 and verifies the reviewed package integrity",
+        "Pins @temps-sdk/cli@0.1.34 and verifies the reviewed package integrity",
         "Uses CI secrets rather than repository plaintext or local ~/.temps files",
         "Uses an explicit production target context and preflight whoami",
         "Waits for deployment health and fails on a bounded timeout"

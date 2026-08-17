@@ -194,6 +194,7 @@ mod m20260815_000001_default_preview_inclusion_off;
 mod m20260816_000001_add_image_retention_hours;
 mod m20260817_000001_add_system_dimension_to_proxy_stats;
 mod m20260817_000001_index_deployments_retention_scan;
+mod m20260817_000002_create_secret_compose_services;
 
 pub struct Migrator;
 
@@ -425,6 +426,7 @@ impl MigratorTrait for Migrator {
             // migration with the same date and sequence stamp.
             Box::new(m20260817_000001_add_system_dimension_to_proxy_stats::Migration),
             Box::new(m20260817_000001_index_deployments_retention_scan::Migration),
+            Box::new(m20260817_000002_create_secret_compose_services::Migration),
         ]
     }
 }

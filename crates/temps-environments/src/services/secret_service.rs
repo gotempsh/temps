@@ -1,7 +1,7 @@
 //! Service for managing secrets.
 //!
 //! Secrets are exposed to user containers as files under `/run/secrets/<KEY>`
-//! (tmpfs, mode 0400) instead of as environment variables. Values are always
+//! via a read-only mount instead of as environment variables. Values are always
 //! stored encrypted with AES-256-GCM via `EncryptionService` and are never
 //! returned in plaintext from the API after creation — the UI shows a masked
 //! placeholder. Plaintext is only decrypted at deploy time for the deployer.
@@ -16,17 +16,20 @@ use sea_orm::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use temps_core::EncryptionService;
-use temps_entities::{environments, secret_environments, secrets};
+use temps_entities::{environments, secret_compose_services, secret_environments, secrets};
 use thiserror::Error;
 
 use super::types::{SecretEnvironmentRef, SecretWithEnvironments};
 
-/// Maximum plaintext size for a single secret, in bytes. Matches the
-/// per-container tmpfs budget set in the deployer.
+/// Maximum plaintext size for a single secret, in bytes. Bounds how much
+/// plaintext a single deployment can materialize onto the host.
 pub const SECRET_VALUE_MAX_BYTES: usize = 1_048_576; // 1 MiB
 
 #[derive(Error, Debug)]
 pub enum SecretError {
+    #[error("Invalid compose service name '{service}': {reason}")]
+    InvalidComposeService { service: String, reason: String },
+
     #[error("Secret {secret_id} not found in project {project_id}")]
     NotFound { secret_id: i32, project_id: i32 },
 
@@ -110,6 +113,61 @@ fn validate_secret_key(key: &str) -> Result<(), SecretError> {
     Ok(())
 }
 
+/// Validates a Docker Compose service name.
+///
+/// Compose itself allows `[a-zA-Z0-9._-]`. We enforce that same set and
+/// additionally reject `.` and `..`, because the deployer turns this value
+/// into a directory name under the secrets root -- a name containing a path
+/// separator or a parent-directory reference would materialize plaintext
+/// outside the stack's own directory.
+fn validate_compose_service_name(name: &str) -> Result<(), SecretError> {
+    if name.is_empty() {
+        return Err(SecretError::InvalidComposeService {
+            service: name.to_string(),
+            reason: "service name cannot be empty".to_string(),
+        });
+    }
+    if name.len() > 255 {
+        return Err(SecretError::InvalidComposeService {
+            service: name.to_string(),
+            reason: format!("service name length {} exceeds 255", name.len()),
+        });
+    }
+    if name == "." || name == ".." {
+        return Err(SecretError::InvalidComposeService {
+            service: name.to_string(),
+            reason: "service name cannot be '.' or '..'".to_string(),
+        });
+    }
+    if let Some(c) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '.' || *c == '_' || *c == '-'))
+    {
+        return Err(SecretError::InvalidComposeService {
+            service: name.to_string(),
+            reason: format!("invalid character '{c}' (allowed: A-Z, a-z, 0-9, '.', '_', '-')"),
+        });
+    }
+    Ok(())
+}
+
+/// Normalizes a requested service scope: validated, de-duplicated, order
+/// preserved. An empty list means "every service in the stack".
+fn normalize_compose_services(services: Vec<String>) -> Result<Vec<String>, SecretError> {
+    let mut out: Vec<String> = Vec::with_capacity(services.len());
+    for name in services {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        validate_compose_service_name(&name)?;
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    Ok(out)
+}
+
 #[derive(Clone)]
 pub struct SecretService {
     db: Arc<temps_database::DbConnection>,
@@ -173,7 +231,7 @@ impl SecretService {
         }
 
         let mut env_query = secret_environments::Entity::find()
-            .filter(secret_environments::Column::SecretId.is_in(ids));
+            .filter(secret_environments::Column::SecretId.is_in(ids.clone()));
         if let Some(env_id) = environment_id {
             env_query = env_query.filter(secret_environments::Column::EnvironmentId.eq(env_id));
         }
@@ -196,6 +254,8 @@ impl SecretService {
             }
         }
 
+        let mut service_map = self.load_compose_services(&ids).await?;
+
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
             let envs = env_map.get(&row.id).cloned().unwrap_or_default();
@@ -210,9 +270,32 @@ impl SecretService {
                 created_at: row.created_at,
                 updated_at: row.updated_at,
                 environments: envs,
+                compose_services: service_map.remove(&row.id).unwrap_or_default(),
             });
         }
         Ok(out)
+    }
+
+    /// Compose-service scopes for a set of secrets, in a single query.
+    /// Secrets with no rows are simply absent from the map, which callers
+    /// read as "every service".
+    async fn load_compose_services(
+        &self,
+        secret_ids: &[i32],
+    ) -> Result<HashMap<i32, Vec<String>>, SecretError> {
+        if secret_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let rows = secret_compose_services::Entity::find()
+            .filter(secret_compose_services::Column::SecretId.is_in(secret_ids.to_vec()))
+            .order_by_asc(secret_compose_services::Column::ServiceName)
+            .all(self.db.as_ref())
+            .await?;
+        let mut map: HashMap<i32, Vec<String>> = HashMap::new();
+        for row in rows {
+            map.entry(row.secret_id).or_default().push(row.service_name);
+        }
+        Ok(map)
     }
 
     /// Creates a secret. Value is encrypted before insert. Returns the metadata
@@ -225,8 +308,10 @@ impl SecretService {
         key: String,
         value: String,
         include_in_preview: bool,
+        compose_services: Vec<String>,
     ) -> Result<SecretWithEnvironments, SecretError> {
         validate_secret_key(&key)?;
+        let compose_services = normalize_compose_services(compose_services)?;
 
         if value.len() > SECRET_VALUE_MAX_BYTES {
             return Err(SecretError::ValueTooLarge {
@@ -256,6 +341,7 @@ impl SecretService {
                 let key = key.clone();
                 let encrypted = encrypted.clone();
                 let environment_ids = environment_ids.clone();
+                let compose_services = compose_services.clone();
                 Box::pin(async move {
                     let new_row = secrets::ActiveModel {
                         project_id: Set(project_id),
@@ -293,6 +379,17 @@ impl SecretService {
                         });
                     }
 
+                    for service in &compose_services {
+                        secret_compose_services::ActiveModel {
+                            secret_id: Set(row.id),
+                            service_name: Set(service.clone()),
+                            created_at: Set(chrono::Utc::now()),
+                            ..Default::default()
+                        }
+                        .insert(txn)
+                        .await?;
+                    }
+
                     Ok(SecretWithEnvironments {
                         id: row.id,
                         project_id: row.project_id,
@@ -301,6 +398,7 @@ impl SecretService {
                         created_at: row.created_at,
                         updated_at: row.updated_at,
                         environments: envs,
+                        compose_services,
                     })
                 })
             })
@@ -319,7 +417,9 @@ impl SecretService {
         new_value: Option<String>,
         environment_ids: Vec<i32>,
         include_in_preview: bool,
+        compose_services: Vec<String>,
     ) -> Result<SecretWithEnvironments, SecretError> {
+        let compose_services = normalize_compose_services(compose_services)?;
         if let Some(v) = &new_value {
             if v.len() > SECRET_VALUE_MAX_BYTES {
                 // Key unknown here without a DB read; use a placeholder that the
@@ -360,6 +460,7 @@ impl SecretService {
             .transaction::<_, SecretWithEnvironments, SecretError>(|txn| {
                 let environment_ids = environment_ids.clone();
                 let encrypted_new = encrypted_new.clone();
+                let compose_services = compose_services.clone();
                 Box::pin(async move {
                     let row = secrets::Entity::find_by_id(secret_id)
                         .filter(secrets::Column::ProjectId.eq(project_id))
@@ -407,6 +508,24 @@ impl SecretService {
                         });
                     }
 
+                    // Replace the scope wholesale, same as environments above:
+                    // a PATCH that omits a service must remove that service's
+                    // access, not silently keep it.
+                    secret_compose_services::Entity::delete_many()
+                        .filter(secret_compose_services::Column::SecretId.eq(secret_id))
+                        .exec(txn)
+                        .await?;
+                    for service in &compose_services {
+                        secret_compose_services::ActiveModel {
+                            secret_id: Set(row.id),
+                            service_name: Set(service.clone()),
+                            created_at: Set(chrono::Utc::now()),
+                            ..Default::default()
+                        }
+                        .insert(txn)
+                        .await?;
+                    }
+
                     Ok(SecretWithEnvironments {
                         id: row.id,
                         project_id: row.project_id,
@@ -415,6 +534,7 @@ impl SecretService {
                         created_at: row.created_at,
                         updated_at: row.updated_at,
                         environments: envs,
+                        compose_services,
                     })
                 })
             })
@@ -612,7 +732,7 @@ mod tests {
 
         let big = "x".repeat(SECRET_VALUE_MAX_BYTES + 1);
         let err = service
-            .create(10, vec![], "BIG_SECRET".to_string(), big, false)
+            .create(10, vec![], "BIG_SECRET".to_string(), big, false, vec![])
             .await
             .unwrap_err();
         assert!(matches!(
@@ -630,7 +750,14 @@ mod tests {
         let service = SecretService::new(db, svc);
 
         let err = service
-            .create(10, vec![], "bad-key!".to_string(), "v".to_string(), false)
+            .create(
+                10,
+                vec![],
+                "bad-key!".to_string(),
+                "v".to_string(),
+                false,
+                vec![],
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, SecretError::InvalidKey { .. }));
@@ -654,6 +781,7 @@ mod tests {
                 "API_KEY".to_string(),
                 "new_value".to_string(),
                 false,
+                vec![],
             )
             .await
             .unwrap_err();
@@ -686,12 +814,19 @@ mod tests {
                     secret_environments::Model,
                     Option<environments::Model>,
                 )>::new()])
+                // Compose-service scopes: none, so the secret goes to every
+                // service in the stack.
+                .append_query_results(vec![Vec::<secret_compose_services::Model>::new()])
                 .into_connection(),
         );
         let service = SecretService::new(db, svc);
         let out = service.list(10, None).await.unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].key, "TOKEN");
+        assert!(
+            out[0].compose_services.is_empty(),
+            "no scope rows must read as 'every service', not 'no services'"
+        );
         // There is no `value` field on SecretWithEnvironments — ciphertext
         // never leaves the service boundary via list().
     }

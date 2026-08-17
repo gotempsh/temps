@@ -425,7 +425,27 @@ function printProxyLogDetail(log: ProxyLogResponse): void {
     console.log(`  ${colors.error(log.error_message)}`)
   }
 
+  // Headers. Credential values (Cookie, Authorization, API keys) are replaced
+  // with [REDACTED] by the server before storage, so nothing sensitive can
+  // reach this output.
+  printHeaderSection('Request Headers', log.request_headers)
+  printHeaderSection('Response Headers', log.response_headers)
+
   newline()
+}
+
+function printHeaderSection(
+  title: string,
+  headers: { [key: string]: string } | null | undefined
+): void {
+  const entries = Object.entries(headers ?? {})
+  if (entries.length === 0) return
+
+  newline()
+  header(title)
+  for (const [name, value] of entries) {
+    keyValue(name, value === '[REDACTED]' ? colors.dim(value) : value)
+  }
 }
 
 export function formatBytes(bytes: number): string {

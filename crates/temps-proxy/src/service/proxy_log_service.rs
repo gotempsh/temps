@@ -4,7 +4,7 @@ use crate::traffic_aggregation::{
 use chrono::{DateTime, Utc};
 use sea_orm::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use temps_core::UtcDateTime;
@@ -70,6 +70,39 @@ pub struct ProxyLogResponse {
     pub request_size_bytes: Option<i64>,
     pub response_size_bytes: Option<i64>,
     pub cache_status: Option<String>,
+    /// Inbound request headers, credential values already replaced with
+    /// `[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry
+    /// predates header capture or was written by a path that doesn't record
+    /// them; an empty map means "captured, but no headers", which is different
+    /// and worth being able to tell apart.
+    ///
+    /// A `BTreeMap` rather than a raw `serde_json::Value` so the schema stays
+    /// typed and the UI gets a stable alphabetical ordering for free.
+    pub request_headers: Option<BTreeMap<String, String>>,
+    /// Upstream response headers, redacted on the same terms as
+    /// [`Self::request_headers`].
+    pub response_headers: Option<BTreeMap<String, String>>,
+}
+
+/// Convert a stored header blob into a typed, sorted map.
+///
+/// Headers are persisted as a flat JSON object. A non-object blob yields `None`
+/// rather than being surfaced half-parsed — a malformed blob is a storage-layer
+/// bug, and rendering fragments of it in the console would be misleading.
+/// Non-string values shouldn't occur (the proxy writes `HashMap<String,
+/// String>`) but are stringified rather than dropped, so a surprise is visible
+/// instead of silently missing.
+fn headers_from_json(value: Option<serde_json::Value>) -> Option<BTreeMap<String, String>> {
+    let object = value?.as_object()?.clone();
+    Some(
+        object
+            .into_iter()
+            .map(|(name, value)| match value {
+                serde_json::Value::String(text) => (name, text),
+                other => (name, other.to_string()),
+            })
+            .collect(),
+    )
 }
 
 impl From<proxy_logs::Model> for ProxyLogResponse {
@@ -108,6 +141,8 @@ impl From<proxy_logs::Model> for ProxyLogResponse {
             request_size_bytes: model.request_size_bytes,
             response_size_bytes: model.response_size_bytes,
             cache_status: model.cache_status,
+            request_headers: headers_from_json(model.request_headers),
+            response_headers: headers_from_json(model.response_headers),
         }
     }
 }
@@ -311,6 +346,12 @@ impl ProxyLogService {
         &self,
         mut request: CreateProxyLogRequest,
     ) -> Result<proxy_logs::Model, ProxyLogServiceError> {
+        // Strip credentials before anything is written. The batched hot path
+        // redacts in `send_or_drop`; this is the other way a row reaches the
+        // table, so it redacts too — a caller must not be able to persist a
+        // `Cookie` header or an OAuth `?code=` by picking this entry point.
+        crate::redaction::redact_log_entry(&mut request);
+
         let now = Utc::now();
         let created_date = now.date_naive();
 

@@ -69,6 +69,23 @@ fn buildkit_cache_mount_namespace(
     hex::encode(encryption_service.derive_subkey(&domain))
 }
 
+/// Secrets resolved for one deployment: plaintext values, plus which Compose
+/// services each one may be read by.
+///
+/// The scope sits beside the values rather than inside them because service
+/// names are not sensitive. Only `values` is sealed into `job_config`, so the
+/// scope stays readable for debugging without widening what the encrypted
+/// envelope has to carry.
+///
+/// A key absent from `compose_services` is delivered to every service. Only
+/// the Compose preset consults this map; every other preset deploys a single
+/// container, which receives all of `values`.
+#[derive(Debug, Default, Clone)]
+pub struct GatheredSecrets {
+    pub values: std::collections::HashMap<String, String>,
+    pub compose_services: std::collections::HashMap<String, Vec<String>>,
+}
+
 /// Plans and creates workflow jobs based on project configuration
 pub struct WorkflowPlanner {
     db: Arc<DatabaseConnection>,
@@ -593,11 +610,11 @@ impl WorkflowPlanner {
         &self,
         project: &projects::Model,
         environment: &environments::Model,
-    ) -> anyhow::Result<std::collections::HashMap<String, String>> {
+    ) -> anyhow::Result<GatheredSecrets> {
         use std::collections::{HashMap, HashSet};
-        use temps_entities::{secret_environments, secrets};
+        use temps_entities::{secret_compose_services, secret_environments, secrets};
 
-        let mut out: HashMap<String, String> = HashMap::new();
+        let mut out = GatheredSecrets::default();
 
         // 1. All secrets for this project.
         let all_secrets = secrets::Entity::find()
@@ -612,9 +629,23 @@ impl WorkflowPlanner {
         // 2. Junction rows — which secrets are environment-scoped.
         let secret_ids: Vec<i32> = all_secrets.iter().map(|s| s.id).collect();
         let junctions = secret_environments::Entity::find()
-            .filter(secret_environments::Column::SecretId.is_in(secret_ids))
+            .filter(secret_environments::Column::SecretId.is_in(secret_ids.clone()))
             .all(self.db.as_ref())
             .await?;
+
+        // 3. Compose-service scoping. A secret with no rows here goes to every
+        //    service, which is how every secret behaved before scoping existed.
+        let service_rows = secret_compose_services::Entity::find()
+            .filter(secret_compose_services::Column::SecretId.is_in(secret_ids))
+            .all(self.db.as_ref())
+            .await?;
+        let mut service_bindings: HashMap<i32, Vec<String>> = HashMap::new();
+        for row in service_rows {
+            service_bindings
+                .entry(row.secret_id)
+                .or_default()
+                .push(row.service_name);
+        }
 
         let mut bindings: HashMap<i32, HashSet<i32>> = HashMap::new();
         for j in junctions {
@@ -646,12 +677,16 @@ impl WorkflowPlanner {
                         e
                     )
                 })?;
-            out.insert(secret.key, plaintext);
+            if let Some(services) = service_bindings.remove(&secret.id) {
+                out.compose_services.insert(secret.key.clone(), services);
+            }
+            out.values.insert(secret.key, plaintext);
         }
 
         info!(
-            "Gathered {} secret file(s) for deployment to env {}",
-            out.len(),
+            "Gathered {} secret file(s) ({} compose-scoped) for deployment to env {}",
+            out.values.len(),
+            out.compose_services.len(),
             environment.id
         );
         Ok(out)
@@ -1121,10 +1156,15 @@ impl WorkflowPlanner {
                     environment,
                     deployment,
                     env_vars,
+                    secrets,
                     buildkit_cache_namespace,
                 )
                 .await;
         }
+        // Single-container presets deploy one container, which receives every
+        // secret in scope for the environment; compose-service scoping does
+        // not apply to them.
+        let secrets = secrets.values;
 
         // Route to appropriate job planning based on effective source type
         match effective_source_type {
@@ -1863,6 +1903,7 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         env_vars: std::collections::HashMap<String, String>,
+        secrets: GatheredSecrets,
         buildkit_cache_namespace: String,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
@@ -1949,6 +1990,17 @@ impl WorkflowPlanner {
         });
         if let Some(obj) = compose_job_config.as_object_mut() {
             self.seal_sensitive_field(obj, deployment, "environment_vars", &env_vars)?;
+            // Sealed under its own field, never merged into `environment_vars`:
+            // the compose executor mounts these as files so they stay out of
+            // `docker inspect` and out of the generated env files.
+            self.seal_sensitive_field(obj, deployment, "secrets", &secrets.values)?;
+            // Service names are not sensitive, so they stay plaintext: an
+            // operator dumping job_config can see which service was entitled
+            // to which key without being able to read any value.
+            obj.insert(
+                "secret_compose_services".to_string(),
+                serde_json::to_value(&secrets.compose_services)?,
+            );
             let build_args = std::collections::HashMap::from([(
                 BUILDKIT_CACHE_MOUNT_NAMESPACE_ARG.to_string(),
                 buildkit_cache_namespace,

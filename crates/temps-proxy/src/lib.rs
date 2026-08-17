@@ -21,6 +21,7 @@ pub mod on_demand_cert;
 pub mod plugin;
 pub mod preview_auth;
 pub mod proxy;
+pub mod redaction;
 pub mod server;
 pub mod service;
 pub mod services;

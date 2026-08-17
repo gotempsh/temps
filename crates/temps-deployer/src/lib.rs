@@ -145,10 +145,19 @@ pub struct DeployRequest {
     pub container_name: String,
     pub environment_vars: HashMap<String, String>,
     /// Secret values (plaintext, already decrypted by the caller) to mount as
-    /// files under `/run/secrets/<KEY>` inside the container. Each file is
-    /// mode 0400, root-owned, stored on a tmpfs volume, not visible via
-    /// `docker inspect`. Total tmpfs size is capped; per-secret plaintext
-    /// must be <= 1 MiB (enforced upstream in `SecretService`).
+    /// files under `/run/secrets/<KEY>` inside the container, and never
+    /// injected as environment variables — so they do not appear in
+    /// `docker inspect`. Per-secret plaintext must be <= 1 MiB (enforced
+    /// upstream in `SecretService`).
+    ///
+    /// Delivery is a read-only bind mount of a per-container directory under
+    /// `$TEMPS_DATA_DIR/secrets`, each file mode 0400 and chowned to the uid
+    /// resolved from the image's `USER`. **Not** a tmpfs: `/tmp` is tmpfs on
+    /// most distributions, so a tmpfs-backed mount would point at an empty
+    /// directory after a host reboot and every container would come back with
+    /// no secrets until someone redeployed. The tradeoff is that plaintext
+    /// lives on host disk for the container's lifetime; the threat this
+    /// addresses is read access to the Docker API, not host root.
     #[serde(default)]
     pub secrets: HashMap<String, String>,
     pub port_mappings: Vec<PortMapping>,
