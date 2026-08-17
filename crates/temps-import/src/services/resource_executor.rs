@@ -153,10 +153,41 @@ impl ResourceExecutor {
                 continue;
             };
 
+            // SSRF guard. `source_url` is a *separate* value from the
+            // importer's `base_url` (which is validated in the orchestrator):
+            // it comes out of the remote platform's API response — Coolify,
+            // for example, returns `external_db_url` verbatim whenever the
+            // database `is_public`. `populate_services` later starts an
+            // official database client container with `network_mode=host` and
+            // passes this straight to pg_dump/mariadb-dump/mongodump, so an
+            // attacker-controlled source platform could point Temps at a
+            // loopback, RFC 1918 or control-plane-internal address and have
+            // its contents copied into a project they own.
+            //
+            // Drop the URL rather than failing the whole import: the service
+            // is still created, and `populate_one_service` already has a
+            // "source not reachable — copy the data manually" path for a
+            // missing source_url, which is exactly the right outcome here.
             let source_url = service_plan
                 .parameters
                 .get(SOURCE_URL_PARAM)
-                .and_then(|v| v.as_str());
+                .and_then(|v| v.as_str())
+                .filter(|url| {
+                    match temps_core::url_validation::validate_external_database_url(url) {
+                        Ok(_) => true,
+                        Err(e) => {
+                            warn!(
+                                service = %service_plan.name,
+                                error = %e,
+                                source_url = %temps_core::url_validation::redact_url_password(url),
+                                "Refusing to use the source platform's database URL for automatic \
+                                 data copy: it does not point at a reachable public address. The \
+                                 service will be created empty; copy its data manually."
+                            );
+                            false
+                        }
+                    }
+                });
             let service_name = format!(
                 "{}-{}",
                 sanitize_slug(project_name),

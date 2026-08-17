@@ -265,10 +265,12 @@ pub async fn get_global_events(
     permission_guard!(auth, EmailsRead);
     // This endpoint is instance-wide by design (an operator view over every
     // email's opens/clicks, including recipient IPs, user agents and clicked
-    // URLs). A deployment token is bound to a single project, and a
-    // `FullAccess` one satisfies every `permission_guard!` — without this it
-    // could read other tenants' tracking telemetry from inside a deployed app,
-    // and there is no project_id here to scope it against.
+    // URLs) and carries no project_id to scope against. Deployment tokens are
+    // project-scoped machine credentials handed to deployed application code,
+    // so they must never reach it. Today `AuthContext::has_permission` already
+    // refuses to map any deployment-token permission onto `EmailsRead`; this
+    // states the requirement at the endpoint instead of relying on that
+    // allowlist never gaining an `EmailsRead` entry.
     deny_deployment_token!(auth);
 
     let page = query.page.unwrap_or(1);

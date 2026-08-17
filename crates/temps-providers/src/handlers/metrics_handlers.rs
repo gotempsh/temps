@@ -971,6 +971,30 @@ pub(crate) async fn provision_otlp_ingest_key(
     service: &external_services::Model,
     user_id: i32,
 ) {
+    // Services placed on a worker node are created there by
+    // `initialize_service_remote`. `store_and_apply_ingest_key`, however,
+    // builds a *local* service instance and calls `apply_ingest_key`, which
+    // stops/removes/creates a container through the control plane's own
+    // Docker client — so provisioning a key for a remote service would also
+    // pull and run its image (attacker-selectable via the `docker_image`
+    // service parameter) on the control-plane host, defeating the worker
+    // placement boundary entirely.
+    //
+    // Skip provisioning rather than silently running it locally. The service
+    // still works; only OTLP push is unconfigured, and the operator is told
+    // why instead of being left to wonder.
+    if let Some(node_id) = service.node_id {
+        tracing::warn!(
+            service_id = service.id,
+            service_name = %service.name,
+            node_id,
+            "Skipping OTLP ingest-key provisioning: this service runs on a remote worker node, \
+             and applying the key would create its container on the control-plane host. \
+             Configure metrics ingestion for this service from the worker node."
+        );
+        return;
+    }
+
     // Generate the si_ key tied to this service.
     let ingest_key = match state
         .api_key_service

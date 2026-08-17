@@ -52,10 +52,11 @@ use temps_core::{AuditContext, ProblemDetails, RequestMetadata};
 /// Reject anything that is not an instance administrator.
 ///
 /// Deliberately not a `permission_guard!`: no `Permission` variant means
-/// "instance administrator", and a `FullAccess` deployment token satisfies
-/// every `permission_guard!` by design — a token minted for one project must
-/// not be able to rewrite the shared spans table. `is_admin()`/`PlatformAdmin`
-/// are role checks, which deployment tokens cannot hold.
+/// "instance administrator". `is_admin()`/`PlatformAdmin` are role checks,
+/// which also excludes deployment tokens — they carry `Role::Custom` and no
+/// user identity, so a project-scoped machine credential can never rewrite the
+/// shared spans table even if `OtelWrite` were later added to the
+/// deployment-token permission mapping in `AuthContext::has_permission`.
 fn require_instance_admin(
     auth: &temps_auth::context::AuthContext,
     operation: &str,

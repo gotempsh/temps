@@ -2961,23 +2961,23 @@ impl SandboxProvider for DockerSandboxProvider {
             });
         }
 
-        // ── Tag the committed image with the public-facing name ───────────────
-        // Derive an image_ref from the label if provided, otherwise use digest.
-        let image_label = label
-            .as_deref()
-            .map(|l| {
-                // Sanitize: lowercase, replace non-alphanumeric with '-'
-                l.chars()
-                    .map(|c| {
-                        if c.is_alphanumeric() {
-                            c.to_ascii_lowercase()
-                        } else {
-                            '-'
-                        }
-                    })
-                    .collect::<String>()
-            })
-            .unwrap_or_else(|| digest_hex[..16].to_string());
+        // ── Tag the committed image with the canonical, content-addressed name ─
+        // The tag is derived from the tarball digest, never from the caller's
+        // human label.
+        //
+        // Docker tags are mutable and shared per daemon. When the tag was
+        // `temps-snapshot/<sanitized-label>:latest`, any tenant taking a
+        // snapshot labelled "backup" re-pointed `temps-snapshot/backup:latest`
+        // at their own image — and restore only checks whether that tag
+        // *exists*, so the next tenant to restore their own "backup" snapshot
+        // would silently run the attacker's image, with their env vars and
+        // their git credentials.
+        //
+        // A content-addressed tag removes the collision entirely: two tenants
+        // can only share a tag by having byte-identical images, in which case
+        // sharing it is correct and is what the existing
+        // `content_digest`-based dedup already does.
+        let image_label = digest_hex.clone();
         let image_ref = format!("temps-snapshot/{}:latest", image_label);
 
         // Re-tag the committed image to the canonical snapshot name.

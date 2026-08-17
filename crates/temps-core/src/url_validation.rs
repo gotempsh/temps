@@ -459,6 +459,93 @@ pub fn validate_git_url(url: &str) -> Result<Url, UrlValidationError> {
     validate_external_url(url)
 }
 
+/// Database connection schemes an importer may be pointed at.
+const ALLOWED_DATABASE_SCHEMES: &[&str] = &[
+    "postgres",
+    "postgresql",
+    "mysql",
+    "mariadb",
+    "mongodb",
+    "mongodb+srv",
+    "redis",
+    "rediss",
+];
+
+/// Validate a **database** connection URL that came from an untrusted source
+/// (e.g. a remote platform's API response during an import).
+///
+/// [`validate_external_url`] only accepts `http`/`https`, so it cannot be used
+/// for connection strings. This applies the identical host/IP rules —
+/// rejecting loopback, RFC 1918, link-local, cloud-metadata, multicast,
+/// broadcast and other reserved addresses — while allowing database schemes.
+///
+/// This matters because the importer starts an official database client
+/// container with `network_mode=host` and passes the URL straight to
+/// `pg_dump`/`mariadb-dump`/`mongodump`. A source platform that reports
+/// `external_db_url: postgres://…@127.0.0.1:5432/…` would otherwise make Temps
+/// connect to a control-plane-internal database from the Docker host network
+/// and copy its contents into a project the caller owns.
+///
+/// Like `validate_external_url`, a non-literal hostname is only checked for
+/// obvious loopback names here; callers that can afford it should also await
+/// [`validate_domain_async`] on the host.
+///
+/// # Examples
+///
+/// ```
+/// use temps_core::url_validation::validate_external_database_url;
+///
+/// assert!(validate_external_database_url("postgres://u:p@db.example.com:5432/app").is_ok());
+/// assert!(validate_external_database_url("postgres://u:p@127.0.0.1:5432/app").is_err());
+/// assert!(validate_external_database_url("postgres://u:p@10.0.0.5:5432/app").is_err());
+/// assert!(validate_external_database_url("postgres://u:p@169.254.169.254/app").is_err());
+/// assert!(validate_external_database_url("file:///etc/passwd").is_err());
+/// ```
+pub fn validate_external_database_url(url: &str) -> Result<Url, UrlValidationError> {
+    let parsed =
+        Url::parse(url).map_err(|e| UrlValidationError::InvalidFormat(format!("{}", e)))?;
+
+    if !ALLOWED_DATABASE_SCHEMES.contains(&parsed.scheme()) {
+        return Err(UrlValidationError::InvalidScheme);
+    }
+
+    // NOTE: do not use `parsed.host()` here. The `url` crate only parses hosts
+    // into `Host::Ipv4`/`Host::Ipv6` for *special* schemes (http, https, ws,
+    // wss, ftp, file). Database schemes are not special, so
+    // `postgres://u:p@127.0.0.1/app` yields `Host::Domain("127.0.0.1")` and an
+    // IP-shaped host would sail straight past the domain branch. Parse the
+    // host string as an address ourselves.
+    let Some(host) = parsed.host_str() else {
+        return Err(UrlValidationError::InvalidFormat(
+            "database URL must have a valid host".to_string(),
+        ));
+    };
+
+    // `[::1]` — strip the brackets the URL form requires before parsing.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V4(ip)) => validate_ipv4(&ip)?,
+        Ok(IpAddr::V6(ip)) => validate_ipv6(&ip)?,
+        Err(_) => {
+            let lower = bare.to_lowercase();
+            if lower.is_empty() {
+                return Err(UrlValidationError::InvalidFormat(
+                    "database URL must have a valid host".to_string(),
+                ));
+            }
+            if lower == "localhost" || lower.ends_with(".localhost") {
+                return Err(UrlValidationError::LoopbackIp);
+            }
+        }
+    }
+
+    Ok(parsed)
+}
+
 /// Redact the userinfo portion of a URL so it is safe to include in
 /// error messages and structured logs (Fix #12 — credentials in errors).
 ///
@@ -545,6 +632,73 @@ pub async fn resolve_and_validate_domain(
     }
 
     Ok(addrs)
+}
+
+#[cfg(test)]
+mod database_url_tests {
+    use super::validate_external_database_url;
+
+    /// The importer starts a database client container with
+    /// `network_mode=host` and hands it this URL, so an address the control
+    /// plane can reach but the public internet cannot is exactly the SSRF the
+    /// guard exists to stop.
+    #[test]
+    fn rejects_internal_targets() {
+        for url in [
+            "postgres://u:p@127.0.0.1:5432/app",
+            "postgres://u:p@localhost:5432/app",
+            "postgres://u:p@db.localhost:5432/app",
+            "postgres://u:p@10.1.2.3:5432/app",
+            "postgres://u:p@172.16.0.9:5432/app",
+            "postgres://u:p@192.168.1.10:5432/app",
+            "postgres://u:p@169.254.169.254:5432/app",
+            "mysql://u:p@127.0.0.1:3306/app",
+            "mongodb://u:p@10.0.0.1:27017/app",
+            "postgres://u:p@[::1]:5432/app",
+        ] {
+            assert!(
+                validate_external_database_url(url).is_err(),
+                "{url} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn accepts_public_database_endpoints() {
+        for url in [
+            "postgres://u:p@db.example.com:5432/app",
+            "postgresql://u:p@db.example.com/app",
+            "mysql://u:p@db.example.com:3306/app",
+            "mariadb://u:p@db.example.com:3306/app",
+            "mongodb://u:p@db.example.com:27017/app",
+            "mongodb+srv://u:p@cluster.example.com/app",
+            "redis://u:p@cache.example.com:6379",
+            "postgres://u:p@93.184.216.34:5432/app",
+        ] {
+            assert!(
+                validate_external_database_url(url).is_ok(),
+                "{url} must be accepted"
+            );
+        }
+    }
+
+    /// Non-database schemes must not slip through — `file://` would make the
+    /// dump container read the host filesystem.
+    #[test]
+    fn rejects_non_database_schemes() {
+        for url in [
+            "file:///etc/passwd",
+            "http://example.com",
+            "https://example.com",
+            "gopher://example.com",
+            "not a url",
+        ] {
+            assert!(
+                validate_external_database_url(url).is_err(),
+                "{url} must be rejected"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
