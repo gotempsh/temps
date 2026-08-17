@@ -1,6 +1,6 @@
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
-    EntityTrait, QueryFilter, QuerySelect, Set, TransactionTrait,
+    EntityTrait, QueryFilter, QuerySelect, Set, TransactionError, TransactionTrait,
 };
 use std::sync::Arc;
 use temps_core::url_validation;
@@ -576,64 +576,80 @@ impl CustomDomainService {
         target_project_id: i32,
         target_environment_id: i32,
     ) -> Result<project_custom_domains::Model, CustomDomainError> {
-        let map_database_error = |operation, source| CustomDomainError::ReassignmentDatabase {
-            operation,
-            domain_id: id,
-            source_project_id,
-            target_project_id,
-            target_environment_id,
-            source,
-        };
-
-        let transaction = self
+        let database_backend = self.db.get_database_backend();
+        let updated_domain = self
             .db
-            .begin()
-            .await
-            .map_err(|source| map_database_error("begin transaction", source))?;
+            .transaction::<_, project_custom_domains::Model, CustomDomainError>(|transaction| {
+                Box::pin(async move {
+                    let map_database_error =
+                        |operation, source| CustomDomainError::ReassignmentDatabase {
+                            operation,
+                            domain_id: id,
+                            source_project_id,
+                            target_project_id,
+                            target_environment_id,
+                            source,
+                        };
 
-        let query = project_custom_domains::Entity::find()
-            .filter(project_custom_domains::Column::Id.eq(id))
-            .filter(project_custom_domains::Column::ProjectId.eq(source_project_id));
-        let query = if self.db.get_database_backend() == DatabaseBackend::Postgres {
-            query.lock_exclusive()
-        } else {
-            query
-        };
-        let custom_domain = query
-            .one(&transaction)
+                    let query = project_custom_domains::Entity::find()
+                        .filter(project_custom_domains::Column::Id.eq(id))
+                        .filter(project_custom_domains::Column::ProjectId.eq(source_project_id));
+                    let query = if database_backend == DatabaseBackend::Postgres {
+                        query.lock_exclusive()
+                    } else {
+                        query
+                    };
+                    let custom_domain = query
+                        .one(transaction)
+                        .await
+                        .map_err(|source| {
+                            map_database_error("load and lock custom domain", source)
+                        })?
+                        .ok_or_else(|| {
+                            CustomDomainError::NotFound(format!(
+                                "Custom domain with ID {id} not found in source project {source_project_id}"
+                            ))
+                        })?;
+
+                    let target_environment_exists = environments::Entity::find()
+                        .filter(environments::Column::Id.eq(target_environment_id))
+                        .filter(environments::Column::ProjectId.eq(target_project_id))
+                        .filter(environments::Column::DeletedAt.is_null())
+                        .one(transaction)
+                        .await
+                        .map_err(|source| {
+                            map_database_error("load target environment", source)
+                        })?
+                        .is_some();
+                    if !target_environment_exists {
+                        return Err(CustomDomainError::NotFound(format!(
+                            "Environment {target_environment_id} not found in target project {target_project_id}"
+                        )));
+                    }
+
+                    let mut active_model: project_custom_domains::ActiveModel =
+                        custom_domain.into();
+                    active_model.project_id = Set(target_project_id);
+                    active_model.environment_id = Set(target_environment_id);
+                    active_model.update(transaction).await.map_err(|source| {
+                        map_database_error("update domain assignment", source)
+                    })
+                })
+            })
             .await
-            .map_err(|source| map_database_error("load and lock custom domain", source))?
-            .ok_or_else(|| {
-                CustomDomainError::NotFound(format!(
-                    "Custom domain with ID {id} not found in source project {source_project_id}"
-                ))
+            .map_err(|error| match error {
+                TransactionError::Connection(source) => {
+                    CustomDomainError::ReassignmentDatabase {
+                        operation: "begin, commit, or rollback transaction",
+                        domain_id: id,
+                        source_project_id,
+                        target_project_id,
+                        target_environment_id,
+                        source,
+                    }
+                }
+                TransactionError::Transaction(error) => error,
             })?;
-
-        let target_environment_exists = environments::Entity::find()
-            .filter(environments::Column::Id.eq(target_environment_id))
-            .filter(environments::Column::ProjectId.eq(target_project_id))
-            .filter(environments::Column::DeletedAt.is_null())
-            .one(&transaction)
-            .await
-            .map_err(|source| map_database_error("load target environment", source))?
-            .is_some();
-        if !target_environment_exists {
-            return Err(CustomDomainError::NotFound(format!(
-                "Environment {target_environment_id} not found in target project {target_project_id}"
-            )));
-        }
-
-        let mut active_model: project_custom_domains::ActiveModel = custom_domain.into();
-        active_model.project_id = Set(target_project_id);
-        active_model.environment_id = Set(target_environment_id);
-        let updated_domain = active_model
-            .update(&transaction)
-            .await
-            .map_err(|source| map_database_error("update domain assignment", source))?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| map_database_error("commit transaction", source))?;
 
         info!(
             "Reassigned custom domain {} from project {} to project {} environment {}",

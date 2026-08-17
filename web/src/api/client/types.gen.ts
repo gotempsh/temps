@@ -9791,6 +9791,22 @@ export type KvStatusResponse = {
     version?: string | null;
 };
 
+export type LatestDeploymentMediaResponse = {
+    /**
+     * Latest deployment media keyed by project ID. Projects with no
+     * deployments are omitted.
+     */
+    projects: {
+        [key: string]: LatestDeploymentMediaResponseItem;
+    };
+};
+
+export type LatestDeploymentMediaResponseItem = {
+    project_id: number;
+    screenshot_location?: string | null;
+    url?: string | null;
+};
+
 export type LemonSqueezyConfig = {
     product_allowlist?: Array<string>;
     variant_allowlist?: Array<string>;
@@ -13046,7 +13062,7 @@ export type ProjectEnvVarInput = {
 };
 
 /**
- * Health summary for a single project (last 1 hour)
+ * Health summary for a single project over the requested time range.
  */
 export type ProjectHealthSummary = {
     /**
@@ -13057,6 +13073,10 @@ export type ProjectHealthSummary = {
      * Error rate as a percentage (0-100)
      */
     error_rate: number;
+    /**
+     * Hourly request counts ordered by bucket start.
+     */
+    hourly_requests: Array<ProjectHourlyRequestCount>;
     project_id: number;
     /**
      * Health status: "healthy", "degraded", "down", "unknown"
@@ -13070,6 +13090,17 @@ export type ProjectHealthSummary = {
      * Total requests in the period
      */
     total_requests: number;
+};
+
+/**
+ * One hourly request-count point in a project health summary.
+ */
+export type ProjectHourlyRequestCount = {
+    /**
+     * Start of the UTC hour in RFC 3339 format.
+     */
+    bucket: string;
+    request_count: number;
 };
 
 export type ProjectInfo = {
@@ -26485,6 +26516,48 @@ export type GetActivityGraphResponses = {
 };
 
 export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
+
+export type GetLatestDeploymentMediaData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Comma-separated project IDs. At most 100 IDs are accepted.
+         */
+        project_ids: string;
+    };
+    url: '/deployments/latest-media';
+};
+
+export type GetLatestDeploymentMediaErrors = {
+    /**
+     * Invalid project IDs
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permission or project access
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestDeploymentMediaError = GetLatestDeploymentMediaErrors[keyof GetLatestDeploymentMediaErrors];
+
+export type GetLatestDeploymentMediaResponses = {
+    /**
+     * Latest deployment media keyed by project ID
+     */
+    200: LatestDeploymentMediaResponse;
+};
+
+export type GetLatestDeploymentMediaResponse = GetLatestDeploymentMediaResponses[keyof GetLatestDeploymentMediaResponses];
 
 export type GetScanByDeploymentData = {
     body?: never;

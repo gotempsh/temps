@@ -386,11 +386,11 @@ Si Temps te ahorra una factura de SaaS, [una estrella](https://github.com/gotemp
 
 ## Historial de estrellas
 
-<a href="https://www.star-history.com/#gotempsh/temps&Date">
+<a href="https://star-history.dera.page/#gotempsh/temps&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
-    <img alt="Gráfico del historial de estrellas" src="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
+    <img alt="Gráfico del historial de estrellas" src="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
   </picture>
 </a>
 

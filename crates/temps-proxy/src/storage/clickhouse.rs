@@ -57,8 +57,8 @@ use super::ProxyLogStorage;
 use crate::handler::proxy_logs::ProxyLogsQuery;
 use crate::service::proxy_log_service::{
     AiAgentBreakdownRow, AiAgentTimelineRow, AiPageBreakdownRow, AiStatusBreakdownRow,
-    AiTimelineGroupBy, CreateProxyLogRequest, ProjectHealthSummary, ProxyLogService,
-    ProxyLogServiceError, StatsFilters, TimeBucketStats,
+    AiTimelineGroupBy, CreateProxyLogRequest, ProjectHealthSummary, ProjectHourlyRequestCount,
+    ProxyLogService, ProxyLogServiceError, StatsFilters, TimeBucketStats,
 };
 use crate::traffic_aggregation::{
     TrafficAggregationRequest, TrafficAggregationResponse, TrafficAggregationRow, TrafficDimension,
@@ -508,8 +508,10 @@ struct ChTimeBucketRow {
 #[derive(::clickhouse::Row, Deserialize, Debug)]
 struct ChProjectHealthRow {
     project_id: i32,
-    total_requests: u64,
-    total_errors: u64,
+    hour_ms: i64,
+    request_count: u64,
+    error_count: u64,
+    latency_count: u64,
     avg_response_time_ms: f64,
 }
 
@@ -1443,12 +1445,15 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         let sql = format!(
             "SELECT \
                 assumeNotNull(project_id) AS project_id, \
-                count() AS total_requests, \
-                countIf(status_code >= 500) AS total_errors, \
+                toUnixTimestamp64Milli(toStartOfHour(timestamp)) AS hour_ms, \
+                count() AS request_count, \
+                countIf(status_code >= 500) AS error_count, \
+                countIf(response_time_ms IS NOT NULL) AS latency_count, \
                 ifNull(avg(response_time_ms), 0) AS avg_response_time_ms \
              FROM proxy_logs \
              WHERE {} \
-             GROUP BY project_id",
+             GROUP BY project_id, hour_ms \
+             ORDER BY project_id, hour_ms",
             clauses.join(" AND ")
         );
 
@@ -1474,53 +1479,45 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         let mut summaries: std::collections::HashMap<i32, ProjectHealthSummary> =
             std::collections::HashMap::new();
         for row in rows {
-            let total_requests = row.total_requests as i64;
-            let total_errors = row.total_errors as i64;
+            let request_count = row.request_count as i64;
+            let error_count = row.error_count as i64;
             // SQL coerces NULL avg → 0 via ifNull; guard is defensive only.
             let avg = if row.avg_response_time_ms.is_nan() {
                 0.0
             } else {
                 row.avg_response_time_ms
             };
-            let error_rate = if total_requests > 0 {
-                (total_errors as f64 / total_requests as f64) * 100.0
-            } else {
-                0.0
-            };
-            let status = if total_requests == 0 {
-                "unknown".to_string()
-            } else if error_rate > 50.0 {
-                "down".to_string()
-            } else if error_rate > 10.0 {
-                "degraded".to_string()
-            } else {
-                "healthy".to_string()
-            };
-            summaries.insert(
-                row.project_id,
-                ProjectHealthSummary {
-                    project_id: row.project_id,
-                    total_requests,
-                    total_errors,
-                    avg_response_time_ms: (avg * 10.0).round() / 10.0,
-                    error_rate: (error_rate * 10.0).round() / 10.0,
-                    status,
-                },
-            );
+            let summary = summaries
+                .entry(row.project_id)
+                .or_insert_with(|| ProjectHealthSummary::empty(row.project_id));
+            summary.total_requests += request_count;
+            summary.total_errors += error_count;
+            summary.latency_count += row.latency_count as i64;
+            summary.weighted_response_time_ms += avg * row.latency_count as f64;
+            let hour = Utc
+                .timestamp_millis_opt(row.hour_ms)
+                .single()
+                .ok_or_else(|| ProxyLogServiceError::ClickHouse {
+                    operation: "get_projects_health_summary".to_string(),
+                    reason: format!(
+                        "invalid hourly bucket {} for project {}",
+                        row.hour_ms, row.project_id
+                    ),
+                })?;
+            summary.hourly_requests.push(ProjectHourlyRequestCount {
+                bucket: hour.to_rfc3339(),
+                request_count,
+            });
         }
-
         // Preserve input order; missing projects → "unknown".
         let result = project_ids
             .iter()
             .map(|&id| {
-                summaries.remove(&id).unwrap_or(ProjectHealthSummary {
-                    project_id: id,
-                    total_requests: 0,
-                    total_errors: 0,
-                    avg_response_time_ms: 0.0,
-                    error_rate: 0.0,
-                    status: "unknown".to_string(),
-                })
+                let mut summary = summaries
+                    .remove(&id)
+                    .unwrap_or_else(|| ProjectHealthSummary::empty(id));
+                summary.finish_aggregation(start_time, end_time);
+                summary
             })
             .collect();
 

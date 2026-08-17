@@ -386,11 +386,11 @@ Wenn Temps dir eine SaaS-Rechnung erspart, hilft [ein Stern](https://github.com/
 
 ## Star-Verlauf
 
-<a href="https://www.star-history.com/#gotempsh/temps&Date">
+<a href="https://star-history.dera.page/#gotempsh/temps&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
-    <img alt="Star-History-Diagramm" src="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
+    <img alt="Star-History-Diagramm" src="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
   </picture>
 </a>
 

@@ -4,7 +4,6 @@ import type {
   ProjectResponse,
 } from '@/api/client'
 import { PresetIcon } from '@/components/presets/PresetIcon'
-import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
 import { Badge } from '@/components/ui/badge'
 import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
@@ -21,6 +20,8 @@ import {
 } from 'lucide-react'
 import { Link } from 'react-router'
 import { VisitorSparkline } from './VisitorSparkline'
+import { ProjectCardMedia } from './ProjectCardMedia'
+import { projectCardTraffic } from './project-card-traffic'
 import {
   deploymentLabel,
   projectBuildSource,
@@ -38,6 +39,10 @@ interface ProjectCardProps {
   healthLoading?: boolean
   healthError?: boolean
   health?: ProjectHealthSummary
+  latestDeploymentMedia?: {
+    url?: string | null
+    screenshot_location?: string | null
+  }
 }
 
 function HealthStatusDot({ status }: { status: string }) {
@@ -101,25 +106,21 @@ export function ProjectCard({
   healthLoading = false,
   healthError = false,
   health,
+  latestDeploymentMedia,
 }: ProjectCardProps) {
   const repository = projectRepository(project)
   const buildSource = projectBuildSource(project)
   const totalVisitors = analytics?.unique_visitors ?? 0
   const apiRequests = health?.total_requests ?? 0
-  const hasApiTraffic = apiRequests > 0
-  const hasVisitorTraffic = (analytics?.hourly_visits ?? []).some(
-    (point) => point.count > 0
+  const traffic = projectCardTraffic(
+    analytics?.hourly_visits,
+    health?.hourly_requests,
+    apiRequests
   )
-  const useVisitorTraffic = hasVisitorTraffic || !hasApiTraffic
-  const trafficSparklineData = useVisitorTraffic
-    ? (analytics?.hourly_visits ?? []).map((point) => ({
-        hour: point.date,
-        count: point.count,
-      }))
-    : []
-  const trafficSparklineLabel = useVisitorTraffic
-    ? 'Visitor traffic over the last 24 hours'
-    : 'API request total over the last 24 hours'
+  const trafficSparklineLabel =
+    traffic.kind === 'visitors'
+      ? 'Visitor traffic over the last 24 hours'
+      : 'API request traffic over the last 24 hours'
 
   const activityContent =
     analyticsLoading && healthLoading ? (
@@ -156,7 +157,7 @@ export function ProjectCard({
           aria-label={trafficSparklineLabel}
         >
           <VisitorSparkline
-            data={trafficSparklineData}
+            data={traffic.data}
             className="w-full"
             height={30}
           />
@@ -172,12 +173,11 @@ export function ProjectCard({
       >
         <div className="flex min-w-0 items-start justify-between gap-3">
           <div className="flex min-w-0 items-center gap-3">
-            <Avatar className="size-10 shrink-0 rounded-md">
-              <AvatarImage src={`/api/projects/${project.id}/favicon`} />
-              <AvatarFallback className="rounded-md">
-                {project.name.charAt(0)}
-              </AvatarFallback>
-            </Avatar>
+            <ProjectCardMedia
+              name={project.name}
+              deploymentUrl={latestDeploymentMedia?.url}
+              screenshotLocation={latestDeploymentMedia?.screenshot_location}
+            />
             <div className="min-w-0">
               <div className="flex items-center gap-2">
                 <span className="truncate font-semibold group-hover:underline">
@@ -250,12 +250,12 @@ export function ProjectCard({
         className="group grid gap-3 px-3 py-2.5 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring md:grid-cols-[minmax(12rem,1fr)_minmax(12rem,1fr)_minmax(13rem,1fr)_minmax(10rem,0.8fr)] md:items-center"
       >
         <div className="flex min-w-0 items-center gap-2.5">
-          <Avatar className="size-8 shrink-0 rounded-md">
-            <AvatarImage src={`/api/projects/${project.id}/favicon`} />
-            <AvatarFallback className="rounded-md text-xs">
-              {project.name.charAt(0)}
-            </AvatarFallback>
-          </Avatar>
+          <ProjectCardMedia
+            name={project.name}
+            deploymentUrl={latestDeploymentMedia?.url}
+            screenshotLocation={latestDeploymentMedia?.screenshot_location}
+            className="size-8"
+          />
           <div className="min-w-0">
             <div className="flex items-center gap-2">
               <span className="truncate text-sm font-medium group-hover:underline">
@@ -305,12 +305,12 @@ export function ProjectCard({
       className="group grid gap-4 px-4 py-3.5 transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring lg:grid-cols-[minmax(14rem,0.8fr)_minmax(30rem,1.7fr)_minmax(11rem,0.65fr)] lg:items-center"
     >
       <div className="flex min-w-0 items-center gap-3">
-        <Avatar className="size-9 shrink-0 rounded-md">
-          <AvatarImage src={`/api/projects/${project.id}/favicon`} />
-          <AvatarFallback className="rounded-md">
-            {project.name.charAt(0)}
-          </AvatarFallback>
-        </Avatar>
+        <ProjectCardMedia
+          name={project.name}
+          deploymentUrl={latestDeploymentMedia?.url}
+          screenshotLocation={latestDeploymentMedia?.screenshot_location}
+          className="size-9"
+        />
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span className="truncate font-medium group-hover:underline">

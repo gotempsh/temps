@@ -1,7 +1,7 @@
 use futures::Stream;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder,
-    QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set,
 };
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -27,6 +27,7 @@ pub struct RemoteTerminalTarget {
 
 use crate::services::types::{
     Deployment, DeploymentDomain, DeploymentEnvironment, DeploymentListResponse,
+    LatestDeploymentMedia,
 };
 use crate::UpdateDeploymentSettingsRequest;
 use temps_core::PublicHostnameStrategy;
@@ -165,7 +166,158 @@ pub struct DeploymentService {
     compose_executor: std::sync::OnceLock<Arc<temps_deployer::compose::ComposeExecutor>>,
 }
 
+fn deployment_url_from_settings(
+    settings: &temps_core::AppSettings,
+    proxy_port: u16,
+    deployment_slug: &str,
+) -> String {
+    let domain = PublicHostnameStrategy::Standard
+        .deployment_hostname(&settings.preview_domain, deployment_slug);
+    let (protocol, port) = if let Some(external_url) = settings.external_url.as_deref() {
+        if let Ok(parsed_url) = url::Url::parse(external_url) {
+            let protocol = match parsed_url.scheme() {
+                "https" => "https",
+                _ => "http",
+            };
+            (protocol, parsed_url.port())
+        } else {
+            let protocol = if external_url.starts_with("https://") {
+                "https"
+            } else {
+                "http"
+            };
+            (protocol, None)
+        }
+    } else {
+        ("http", Some(proxy_port))
+    };
+
+    match port {
+        Some(port)
+            if !((protocol == "https" && port == 443) || (protocol == "http" && port == 80)) =>
+        {
+            format!("{protocol}://{domain}:{port}")
+        }
+        _ => format!("{protocol}://{domain}"),
+    }
+}
+
 impl DeploymentService {
+    /// Return the currently served deployment media for each requested project.
+    ///
+    /// Deployment rows are selected in one ranked `DISTINCT ON` query. A
+    /// non-preview production current deployment wins, followed by another
+    /// current deployment, then the newest historical deployment with a
+    /// screenshot. Historical fallbacks omit their URL because they are not
+    /// guaranteed to be routable.
+    pub async fn get_latest_deployment_media(
+        &self,
+        project_ids: &[i32],
+    ) -> Result<Vec<LatestDeploymentMedia>, DeploymentError> {
+        const MAX_PROJECT_IDS: usize = 100;
+
+        if project_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        if project_ids.len() > MAX_PROJECT_IDS {
+            return Err(DeploymentError::InvalidInput(format!(
+                "latest deployment media accepts at most {MAX_PROJECT_IDS} project IDs; received {}",
+                project_ids.len()
+            )));
+        }
+
+        let placeholders = (1..=project_ids.len())
+            .map(|index| format!("${index}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let statement = sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            format!(
+                "WITH candidates AS ( \
+                    SELECT d.project_id, d.slug, d.screenshot_location, TRUE AS is_current, \
+                        CASE WHEN e.slug = 'production' AND NOT e.is_preview THEN 0 ELSE 1 END AS priority, \
+                        e.updated_at AS candidate_updated_at, d.created_at, d.id \
+                    FROM environments e \
+                    JOIN deployments d \
+                      ON d.id = e.current_deployment_id \
+                     AND d.project_id = e.project_id \
+                    WHERE e.project_id IN ({placeholders}) \
+                      AND e.deleted_at IS NULL \
+                    UNION ALL \
+                    SELECT d.project_id, d.slug, d.screenshot_location, FALSE AS is_current, \
+                        2 AS priority, d.created_at AS candidate_updated_at, d.created_at, d.id \
+                    FROM deployments d \
+                    WHERE d.project_id IN ({placeholders}) \
+                      AND d.screenshot_location IS NOT NULL \
+                 ) \
+                 SELECT DISTINCT ON (project_id) \
+                    project_id, slug, screenshot_location, is_current \
+                 FROM candidates \
+                 ORDER BY project_id, priority, candidate_updated_at DESC, created_at DESC, id DESC"
+            ),
+            project_ids.iter().copied().map(Into::into),
+        );
+        let rows = self.db.query_all(statement).await.map_err(|error| {
+            DeploymentError::DatabaseError {
+                reason: format!(
+                    "Failed to query latest deployment media for project IDs {project_ids:?}: {error}"
+                ),
+            }
+        })?;
+
+        let settings = self.config_service.get_settings().await.map_err(|error| {
+            DeploymentError::DeploymentError(format!(
+                "Failed to load application settings for latest deployment media for project IDs {project_ids:?}: {error}"
+            ))
+        })?;
+        let proxy_port = self.config_service.proxy_port();
+        let mut media_by_project = HashMap::with_capacity(rows.len());
+        for row in rows {
+            let project_id = row.try_get("", "project_id").map_err(|error| {
+                DeploymentError::DatabaseError {
+                    reason: format!(
+                        "Failed to decode project_id in latest deployment media query for project IDs {project_ids:?}: {error}"
+                    ),
+                }
+            })?;
+            let slug: String =
+                row.try_get("", "slug")
+                    .map_err(|error| DeploymentError::DatabaseError {
+                        reason: format!(
+                            "Failed to decode deployment slug for project {project_id}: {error}"
+                        ),
+                    })?;
+            let screenshot_location = row.try_get("", "screenshot_location").map_err(|error| {
+                DeploymentError::DatabaseError {
+                    reason: format!(
+                        "Failed to decode screenshot location for project {project_id}: {error}"
+                    ),
+                }
+            })?;
+            let is_current: bool = row.try_get("", "is_current").map_err(|error| {
+                DeploymentError::DatabaseError {
+                    reason: format!(
+                        "Failed to decode current-deployment state for project {project_id}: {error}"
+                    ),
+                }
+            })?;
+            media_by_project.insert(
+                project_id,
+                LatestDeploymentMedia {
+                    project_id,
+                    url: is_current
+                        .then(|| deployment_url_from_settings(&settings, proxy_port, &slug)),
+                    screenshot_location,
+                },
+            );
+        }
+
+        Ok(project_ids
+            .iter()
+            .filter_map(|project_id| media_by_project.remove(project_id))
+            .collect())
+    }
+
     pub async fn container_presentation_context(
         &self,
         project_id: i32,
@@ -3290,51 +3442,11 @@ impl DeploymentService {
 
     async fn compute_deployment_url(&self, deployment_slug: &str) -> anyhow::Result<String> {
         let settings = self.config_service.get_settings().await.unwrap_or_default();
-
-        let domain = PublicHostnameStrategy::Standard
-            .deployment_hostname(&settings.preview_domain, deployment_slug);
-
-        // Determine protocol and port from external_url if set, otherwise default to http
-        let (protocol, port) = if let Some(ref url) = settings.external_url {
-            if let Ok(parsed_url) = url::Url::parse(url) {
-                let scheme = match parsed_url.scheme() {
-                    "https" => "https",
-                    "http" => "http",
-                    _ => "http",
-                };
-                (scheme, parsed_url.port())
-            } else {
-                // Fallback for malformed URLs - detect protocol from prefix
-                let protocol = if url.starts_with("https://") {
-                    "https"
-                } else {
-                    "http"
-                };
-                (protocol, None)
-            }
-        } else {
-            // No external_url: the public port IS the proxy listener port from
-            // the Rust server config (e.g. :8080 on a local instance). Without
-            // this the URL drops to :80 and is unreachable on a non-standard
-            // port. `proxy_port()` is the single source of truth.
-            ("http", Some(self.config_service.proxy_port()))
-        };
-
-        // Construct the URL with port if present
-        // Only include port if it's non-standard (not 443 for https, not 80 for http)
-        let url = if let Some(port) = port {
-            let is_standard_port =
-                (protocol == "https" && port == 443) || (protocol == "http" && port == 80);
-            if is_standard_port {
-                format!("{}://{}", protocol, domain)
-            } else {
-                format!("{}://{}:{}", protocol, domain, port)
-            }
-        } else {
-            format!("{}://{}", protocol, domain)
-        };
-
-        Ok(url)
+        Ok(deployment_url_from_settings(
+            &settings,
+            self.config_service.proxy_port(),
+            deployment_slug,
+        ))
     }
 
     pub async fn compute_environment_url(&self, env_subdomain: &str) -> anyhow::Result<String> {
@@ -4711,6 +4823,87 @@ mod tests {
         let deployment = deployment.insert(db.as_ref()).await?;
 
         Ok((project, environment, deployment))
+    }
+
+    #[tokio::test]
+    async fn latest_deployment_media_returns_current_deployment_per_project() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc().clone();
+        let (project, environment, old_deployment) = setup_test_data(&db)
+            .await
+            .expect("create deployment fixtures");
+        let old_screenshot = "screenshots/old.webp".to_string();
+        let mut old: deployments::ActiveModel = old_deployment.into();
+        old.screenshot_location = Set(Some(old_screenshot));
+        old.created_at = Set(Utc::now() - chrono::Duration::hours(1));
+        old.update(db.as_ref())
+            .await
+            .expect("update old deployment");
+
+        let newest_slug = "newest-deployment".to_string();
+        let newest_screenshot = "screenshots/newest.webp".to_string();
+        let newest = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(newest_slug.clone()),
+            state: Set("completed".to_string()),
+            screenshot_location: Set(Some(newest_screenshot.clone())),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert newest deployment");
+        let mut environment: environments::ActiveModel = environment.into();
+        environment.current_deployment_id = Set(Some(newest.id));
+        let environment = environment
+            .update(db.as_ref())
+            .await
+            .expect("set current deployment");
+
+        let service = create_deployment_service_for_test(db.clone());
+        let media = service
+            .get_latest_deployment_media(&[project.id, i32::MAX])
+            .await
+            .expect("query latest deployment media");
+
+        assert_eq!(media.len(), 1);
+        assert_eq!(media[0].project_id, project.id);
+        assert_eq!(
+            media[0].screenshot_location.as_deref(),
+            Some(newest_screenshot.as_str())
+        );
+        assert!(media[0]
+            .url
+            .as_deref()
+            .is_some_and(|url| url.contains(&newest_slug)));
+
+        let mut environment: environments::ActiveModel = environment.into();
+        environment.current_deployment_id = Set(None);
+        environment
+            .update(db.as_ref())
+            .await
+            .expect("clear current deployment");
+        let historical_media = service
+            .get_latest_deployment_media(&[project.id])
+            .await
+            .expect("query historical screenshot fallback");
+        assert_eq!(historical_media.len(), 1);
+        assert_eq!(historical_media[0].url, None);
+        assert_eq!(
+            historical_media[0].screenshot_location.as_deref(),
+            Some(newest_screenshot.as_str())
+        );
     }
 
     async fn setup_test_environment_variables(

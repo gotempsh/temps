@@ -44,6 +44,10 @@ import {
 } from './schemas'
 import { AlertRulesManagement } from './AlertRulesManagement'
 import { Alarms } from '@/pages/Alarms'
+import {
+  MONITORING_SECTIONS,
+  monitoringSectionLabel,
+} from './monitoring-sections'
 
 interface AlertComponentProps<T> {
   onSave: (data: T) => Promise<void>
@@ -855,12 +859,6 @@ export function MonitoringSettings() {
     navigate(`/monitoring/${value}`)
   }
 
-  const settingsSections = [
-    { id: 'alerts', label: 'Alerts' },
-    { id: 'alarms', label: 'Alarms' },
-    { id: 'notifications', label: 'Notifications' },
-  ] as const
-
   const handleProjectSave = async (data: ProjectAlertsFormData) => {
     if (!preferences) return
 
@@ -1018,6 +1016,14 @@ export function MonitoringSettings() {
   }
 
   const renderContent = () => {
+    if (currentSection === 'rules') {
+      return <AlertRulesManagement />
+    }
+
+    if (currentSection === 'alarms') {
+      return <Alarms embedded />
+    }
+
     if (isLoading) {
       return (
         <div className="flex items-center justify-center py-6">
@@ -1093,36 +1099,33 @@ export function MonitoringSettings() {
     switch (currentSection) {
       case 'alerts':
         return (
-          <div className="space-y-8">
-            <Card className="p-6">
+          <div className="grid items-start gap-4 xl:grid-cols-2">
+            <Card className="p-5 sm:p-6">
               <ProjectAlerts
                 onSave={handleProjectSave}
                 defaultValues={projectDefaults}
               />
             </Card>
-            <Card className="p-6">
+            <Card className="p-5 sm:p-6">
               <DomainAlerts
                 onSave={handleDomainSave}
                 defaultValues={domainDefaults}
               />
             </Card>
-            <Card className="p-6">
+            <Card className="p-5 sm:p-6">
               <BackupAlerts
                 onSave={handleBackupSave}
                 defaultValues={backupDefaults}
               />
             </Card>
-            <Card className="p-6">
+            <Card className="p-5 sm:p-6">
               <RouteAlerts
                 onSave={handleRouteSave}
                 defaultValues={routeDefaults}
               />
             </Card>
-            <AlertRulesManagement />
           </div>
         )
-      case 'alarms':
-        return <Alarms embedded />
       case 'notifications':
         return (
           <div className="space-y-8">
@@ -1159,12 +1162,11 @@ export function MonitoringSettings() {
         <Select value={currentSection} onValueChange={handleSectionChange}>
           <SelectTrigger className="w-full">
             <SelectValue>
-              {settingsSections.find((section) => section.id === currentSection)
-                ?.label || 'Select section'}
+              {monitoringSectionLabel(currentSection) || 'Select section'}
             </SelectValue>
           </SelectTrigger>
           <SelectContent>
-            {settingsSections.map((section) => (
+            {MONITORING_SECTIONS.map((section) => (
               <SelectItem key={section.id} value={section.id}>
                 {section.label}
               </SelectItem>
@@ -1181,7 +1183,7 @@ export function MonitoringSettings() {
           className="space-y-4"
         >
           <TabsList>
-            {settingsSections.map((section) => (
+            {MONITORING_SECTIONS.map((section) => (
               <TabsTrigger key={section.id} value={section.id}>
                 {section.label}
               </TabsTrigger>

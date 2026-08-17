@@ -202,6 +202,30 @@ pub struct DeploymentListResponse {
     pub per_page: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LatestDeploymentMediaResponseItem {
+    pub project_id: i32,
+    pub url: Option<String>,
+    pub screenshot_location: Option<String>,
+}
+
+impl From<crate::services::types::LatestDeploymentMedia> for LatestDeploymentMediaResponseItem {
+    fn from(media: crate::services::types::LatestDeploymentMedia) -> Self {
+        Self {
+            project_id: media.project_id,
+            url: media.url,
+            screenshot_location: media.screenshot_location,
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct LatestDeploymentMediaResponse {
+    /// Latest deployment media keyed by project ID. Projects with no
+    /// deployments are omitted.
+    pub projects: std::collections::HashMap<String, LatestDeploymentMediaResponseItem>,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct DeploymentResponse {
     pub id: i32,

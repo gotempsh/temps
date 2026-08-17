@@ -2,10 +2,12 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
+import { useLatestDeploymentMedia } from '@/hooks/useLatestDeploymentMedia'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { FirstProjectOnboarding } from '@/components/dashboard/FirstProjectOnboarding'
 import { SIMULATE_EMPTY_INSTALL } from '@/lib/devSimulate'
 import { ProjectCard } from '@/components/dashboard/ProjectCard'
+import { OnboardingNextStepCard } from '@/components/dashboard/OnboardingNextStepCard'
 import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
@@ -96,6 +98,7 @@ export function Projects() {
   )
 
   const dashboardHealth = useDashboardHealth(projectIds, startDate, endDate)
+  const latestDeploymentMedia = useLatestDeploymentMedia(projectIds)
 
   const renderProjectCards = () =>
     visibleProjects.map((project) => (
@@ -109,6 +112,9 @@ export function Projects() {
         healthLoading={dashboardHealth.isLoading}
         healthError={dashboardHealth.isError}
         health={dashboardHealth.data?.projects?.[String(project.id)]}
+        latestDeploymentMedia={
+          latestDeploymentMedia.data?.projects?.[String(project.id)]
+        }
       />
     ))
 
@@ -129,6 +135,8 @@ export function Projects() {
           </>
         }
       />
+
+      {(projectsData?.projects.length ?? 0) > 0 && <OnboardingNextStepCard />}
 
       {isLoading || gitProvidersLoading ? (
         <div className="overflow-hidden rounded-xl border bg-card divide-y">

@@ -1413,8 +1413,10 @@ impl ProxyLogService {
                 r#"
                 SELECT
                     project_id,
-                    COALESCE(SUM(request_count), 0)::bigint as total_requests,
-                    COALESCE(SUM(error_5xx_plus_count), 0)::bigint as total_errors,
+                    date_trunc('hour', bucket) AS hour,
+                    COALESCE(SUM(request_count), 0)::bigint as request_count,
+                    COALESCE(SUM(error_5xx_plus_count), 0)::bigint as error_count,
+                    COALESCE(SUM(response_time_count), 0)::bigint as latency_count,
                     COALESCE(
                         SUM(sum_response_time_ms)::float8
                             / NULLIF(SUM(response_time_count), 0)::float8,
@@ -1424,7 +1426,8 @@ impl ProxyLogService {
                 WHERE bucket >= $1
                   AND bucket < $2
                   AND project_id IN ({}){}
-                GROUP BY project_id
+                GROUP BY project_id, date_trunc('hour', bucket)
+                ORDER BY project_id, hour
                 "#,
                 placeholders_str, bot_clause
             )
@@ -1433,14 +1436,17 @@ impl ProxyLogService {
                 r#"
                 SELECT
                     project_id,
-                    COALESCE(COUNT(*), 0) as total_requests,
-                    COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) as total_errors,
+                    date_trunc('hour', timestamp) AS hour,
+                    COALESCE(COUNT(*), 0) as request_count,
+                    COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) as error_count,
+                    COUNT(response_time_ms) as latency_count,
                     COALESCE(AVG(response_time_ms)::float8, 0) as avg_response_time_ms
                 FROM proxy_logs
                 WHERE timestamp >= $1
                   AND timestamp < $2
                   AND project_id IN ({}){}
-                GROUP BY project_id
+                GROUP BY project_id, date_trunc('hour', timestamp)
+                ORDER BY project_id, hour
                 "#,
                 placeholders_str, bot_clause
             )
@@ -1458,57 +1464,67 @@ impl ProxyLogService {
         let stmt = sea_orm::Statement::from_sql_and_values(db_backend, &sql, values);
         let results = self.db.query_all(stmt).await?;
 
-        // Build a map from query results
+        // Build each summary and its hourly request-count series from the same
+        // grouped query. This keeps the dashboard batch endpoint at one
+        // telemetry query regardless of the number of projects requested.
         let mut summaries: std::collections::HashMap<i32, ProjectHealthSummary> =
             std::collections::HashMap::new();
 
-        for row in &results {
-            let project_id: i32 = row.try_get("", "project_id").unwrap_or(0);
-            let total_requests: i64 = row.try_get("", "total_requests").unwrap_or(0);
-            let total_errors: i64 = row.try_get("", "total_errors").unwrap_or(0);
-            let avg_response_time_ms: f64 = row.try_get("", "avg_response_time_ms").unwrap_or(0.0);
+        for row in results {
+            let project_id: i32 = row.try_get("", "project_id").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode project_id in projects health query: {error}"
+                )))
+            })?;
+            let hour: DateTime<Utc> = row.try_get("", "hour").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode hourly bucket for project {project_id}: {error}"
+                )))
+            })?;
+            let request_count: i64 = row.try_get("", "request_count").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode request count for project {project_id}: {error}"
+                )))
+            })?;
+            let error_count: i64 = row.try_get("", "error_count").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode error count for project {project_id}: {error}"
+                )))
+            })?;
+            let latency_count: i64 = row.try_get("", "latency_count").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode latency count for project {project_id}: {error}"
+                )))
+            })?;
+            let bucket_avg_response_time_ms: f64 =
+                row.try_get("", "avg_response_time_ms").map_err(|error| {
+                    ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                        "Failed to decode average response time for project {project_id}: {error}"
+                    )))
+                })?;
 
-            let error_rate = if total_requests > 0 {
-                (total_errors as f64 / total_requests as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            let status = if total_requests == 0 {
-                "unknown".to_string()
-            } else if error_rate > 50.0 {
-                "down".to_string()
-            } else if error_rate > 10.0 {
-                "degraded".to_string()
-            } else {
-                "healthy".to_string()
-            };
-
-            summaries.insert(
-                project_id,
-                ProjectHealthSummary {
-                    project_id,
-                    total_requests,
-                    total_errors,
-                    avg_response_time_ms: (avg_response_time_ms * 10.0).round() / 10.0,
-                    error_rate: (error_rate * 10.0).round() / 10.0,
-                    status,
-                },
-            );
+            let summary = summaries
+                .entry(project_id)
+                .or_insert_with(|| ProjectHealthSummary::empty(project_id));
+            summary.total_requests += request_count;
+            summary.total_errors += error_count;
+            summary.latency_count += latency_count;
+            summary.weighted_response_time_ms += bucket_avg_response_time_ms * latency_count as f64;
+            summary.hourly_requests.push(ProjectHourlyRequestCount {
+                bucket: hour.to_rfc3339(),
+                request_count,
+            });
         }
 
         // Include projects with no data as "unknown"
         let result: Vec<ProjectHealthSummary> = project_ids
             .iter()
             .map(|&id| {
-                summaries.remove(&id).unwrap_or(ProjectHealthSummary {
-                    project_id: id,
-                    total_requests: 0,
-                    total_errors: 0,
-                    avg_response_time_ms: 0.0,
-                    error_rate: 0.0,
-                    status: "unknown".to_string(),
-                })
+                let mut summary = summaries
+                    .remove(&id)
+                    .unwrap_or_else(|| ProjectHealthSummary::empty(id));
+                summary.finish_aggregation(start_time, end_time);
+                summary
             })
             .collect();
 
@@ -2857,7 +2873,16 @@ pub struct AiStatusBreakdownRow {
     pub request_count: i64,
 }
 
-/// Health summary for a single project (last 1 hour)
+/// One hourly request-count point in a project health summary.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProjectHourlyRequestCount {
+    /// Start of the UTC hour in RFC 3339 format.
+    #[schema(example = "2026-08-16T12:00:00Z")]
+    pub bucket: String,
+    pub request_count: i64,
+}
+
+/// Health summary for a single project over the requested time range.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProjectHealthSummary {
     pub project_id: i32,
@@ -2871,11 +2896,105 @@ pub struct ProjectHealthSummary {
     pub error_rate: f64,
     /// Health status: "healthy", "degraded", "down", "unknown"
     pub status: String,
+    /// Hourly request counts ordered by bucket start.
+    pub hourly_requests: Vec<ProjectHourlyRequestCount>,
+    /// Internal accumulator used to combine hourly latency averages without a
+    /// second query. It is never part of API serialization or OpenAPI.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) weighted_response_time_ms: f64,
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) latency_count: i64,
+}
+
+impl ProjectHealthSummary {
+    pub(crate) fn empty(project_id: i32) -> Self {
+        Self {
+            project_id,
+            total_requests: 0,
+            total_errors: 0,
+            avg_response_time_ms: 0.0,
+            error_rate: 0.0,
+            status: "unknown".to_string(),
+            hourly_requests: Vec::new(),
+            weighted_response_time_ms: 0.0,
+            latency_count: 0,
+        }
+    }
+
+    pub(crate) fn finish_aggregation(&mut self, start_time: UtcDateTime, end_time: UtcDateTime) {
+        let observed = std::mem::take(&mut self.hourly_requests)
+            .into_iter()
+            .map(|point| (point.bucket, point.request_count))
+            .collect::<HashMap<_, _>>();
+        let mut bucket_seconds = start_time.timestamp().div_euclid(3_600) * 3_600;
+        while bucket_seconds < end_time.timestamp() {
+            let Some(bucket) = DateTime::<Utc>::from_timestamp(bucket_seconds, 0) else {
+                break;
+            };
+            let bucket = bucket.to_rfc3339();
+            self.hourly_requests.push(ProjectHourlyRequestCount {
+                request_count: observed.get(&bucket).copied().unwrap_or(0),
+                bucket,
+            });
+            bucket_seconds += 3_600;
+        }
+
+        if self.total_requests == 0 {
+            return;
+        }
+        if self.latency_count > 0 {
+            self.avg_response_time_ms =
+                ((self.weighted_response_time_ms / self.latency_count as f64) * 10.0).round()
+                    / 10.0;
+        }
+        self.error_rate =
+            ((self.total_errors as f64 / self.total_requests as f64) * 1_000.0).round() / 10.0;
+        self.status = if self.error_rate > 50.0 {
+            "down".to_string()
+        } else if self.error_rate > 10.0 {
+            "degraded".to_string()
+        } else {
+            "healthy".to_string()
+        };
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_health_uses_latency_sample_count_and_gapfills_24_hours() {
+        let start = DateTime::parse_from_rfc3339("2026-08-15T12:00:00Z")
+            .expect("valid start")
+            .with_timezone(&Utc);
+        let end = start + chrono::Duration::hours(24);
+        let mut summary = ProjectHealthSummary::empty(7);
+        summary.total_requests = 12;
+        summary.total_errors = 1;
+        summary.latency_count = 2;
+        summary.weighted_response_time_ms = 300.0;
+        summary.hourly_requests = vec![ProjectHourlyRequestCount {
+            bucket: (start + chrono::Duration::hours(5)).to_rfc3339(),
+            request_count: 12,
+        }];
+
+        summary.finish_aggregation(start, end);
+
+        assert_eq!(summary.avg_response_time_ms, 150.0);
+        assert_eq!(summary.hourly_requests.len(), 24);
+        assert_eq!(summary.hourly_requests[5].request_count, 12);
+        assert_eq!(
+            summary
+                .hourly_requests
+                .iter()
+                .filter(|point| point.request_count == 0)
+                .count(),
+            23
+        );
+    }
 
     #[test]
     fn traffic_aggregation_project_budget_is_bounded_and_recovers() {

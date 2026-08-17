@@ -28,6 +28,7 @@ import {
   type GettingStartedItem,
 } from '@/hooks/useGettingStarted'
 import { useActivationSignals } from '@/hooks/useActivationSignals'
+import { nextIncompleteGettingStartedItem } from '@/components/dashboard/onboarding-next-step'
 
 // Per-step icon so the checklist reads visually, not just as text rows.
 const STEP_ICONS: Record<string, LucideIcon> = {
@@ -136,7 +137,7 @@ export function Setup() {
   usePageTitle('Finish setting up')
 
   const pct = Math.round((completedCount / totalCount) * 100)
-  const nextStep = items.find((i) => !i.done)
+  const nextStep = nextIncompleteGettingStartedItem(items)
   const recommendations = buildRecommendations(signals)
 
   function goToStep(item: GettingStartedItem) {

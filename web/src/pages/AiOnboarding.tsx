@@ -331,25 +331,40 @@ export function AiOnboarding() {
             for confirmation and finish with read-only proof.
           </p>
         </div>
-        <div className="grid gap-3 md:grid-cols-3">
+        <div className="grid gap-3 lg:grid-cols-3">
           {STARTER_PROMPTS.map((example) => (
-            <Card key={example.title} className="group h-full">
-              <CardContent className="flex h-full flex-col p-4">
-                <div className="flex items-center justify-between gap-3">
-                  <div className="flex size-8 items-center justify-center rounded-lg bg-muted text-muted-foreground">
-                    <example.icon className="size-4" />
+            <Card key={example.title} className="h-full overflow-hidden">
+              <CardContent className="flex h-full flex-col p-0">
+                <div className="flex items-center gap-3 border-b px-4 py-3">
+                  <div className="flex size-8 items-center justify-center rounded-lg border bg-muted/50 text-muted-foreground">
+                    <example.icon className="size-3.5" />
                   </div>
-                  <CopyButton
-                    value={example.prompt}
-                    minimal
-                    className="size-8 rounded-md text-muted-foreground"
-                    label={`Copy ${example.title} prompt`}
-                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-[10px] font-medium uppercase tracking-[0.16em] text-muted-foreground">
+                      Prompt for your agent
+                    </p>
+                    <h3 className="mt-0.5 truncate text-sm font-semibold">
+                      {example.title}
+                    </h3>
+                  </div>
                 </div>
-                <h3 className="mt-4 text-sm font-semibold">{example.title}</h3>
-                <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                  {example.prompt}
-                </p>
+
+                <div className="flex flex-1 p-3">
+                  <div className="relative flex min-h-36 w-full flex-col rounded-xl border bg-muted/25 p-4 pr-14 shadow-inner">
+                    <p className="text-sm leading-6 text-foreground">
+                      {example.prompt}
+                    </p>
+                    <CopyButton
+                      value={example.prompt}
+                      className="absolute right-3 top-3 size-9 rounded-lg border bg-background text-muted-foreground shadow-sm hover:text-foreground"
+                      label={`Copy ${example.title} prompt`}
+                    />
+                    <div className="mt-auto flex items-center gap-1.5 pt-5 text-[11px] text-muted-foreground">
+                      <Terminal className="size-3" />
+                      Paste into Claude Code, Codex, Cursor, or your harness
+                    </div>
+                  </div>
+                </div>
               </CardContent>
             </Card>
           ))}

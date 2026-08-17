@@ -765,6 +765,55 @@ pub struct ProjectsHealthResponse {
     pub projects: std::collections::HashMap<String, ProjectHealthSummary>,
 }
 
+const MAX_PROJECTS_HEALTH_IDS: usize = 100;
+const MAX_PROJECTS_HEALTH_WINDOW_DAYS: i64 = 31;
+
+fn parse_projects_health_project_ids(project_ids: &str) -> Result<Vec<i32>, Problem> {
+    let mut ids = Vec::new();
+    for value in project_ids.split(',').map(str::trim) {
+        let project_id = value.parse::<i32>().map_err(|_| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Parameters")
+                .with_detail(format!("'{value}' is not a valid project ID"))
+        })?;
+        if !ids.contains(&project_id) {
+            ids.push(project_id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("project_ids must contain at least one project ID"));
+    }
+    if ids.len() > MAX_PROJECTS_HEALTH_IDS {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail(format!(
+                "Maximum {MAX_PROJECTS_HEALTH_IDS} project IDs allowed"
+            )));
+    }
+    Ok(ids)
+}
+
+fn validate_projects_health_window(
+    start_time: UtcDateTime,
+    end_time: UtcDateTime,
+) -> Result<(), Problem> {
+    if start_time >= end_time {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("start_time must be before end_time"));
+    }
+    if end_time - start_time > chrono::Duration::days(MAX_PROJECTS_HEALTH_WINDOW_DAYS) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail(format!(
+                "projects-health time range cannot exceed {MAX_PROJECTS_HEALTH_WINDOW_DAYS} days"
+            )));
+    }
+    Ok(())
+}
+
 /// Get health summaries for multiple projects (last 1 hour)
 #[utoipa::path(
     get,
@@ -785,23 +834,12 @@ async fn get_projects_health(
     State(service): State<Arc<ProxyLogsState>>,
     Query(query): Query<ProjectsHealthQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    let project_ids: Vec<i32> = query
-        .project_ids
-        .split(',')
-        .filter_map(|s| s.trim().parse().ok())
-        .collect();
-
-    if project_ids.is_empty() {
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Parameters")
-            .with_detail("project_ids must contain at least one valid ID"));
-    }
-
-    if project_ids.len() > 100 {
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Parameters")
-            .with_detail("Maximum 100 project IDs allowed"));
-    }
+    let project_ids = parse_projects_health_project_ids(&query.project_ids)?;
+    let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
+    let start_time = query
+        .start_time
+        .unwrap_or_else(|| end_time - chrono::Duration::hours(1));
+    validate_projects_health_window(start_time, end_time)?;
 
     for project_id in &project_ids {
         authorize_proxy_analytics_scope(
@@ -810,17 +848,6 @@ async fn get_projects_health(
             Some(*project_id),
         )
         .await?;
-    }
-
-    let end_time = query.end_time.unwrap_or_else(chrono::Utc::now);
-    let start_time = query
-        .start_time
-        .unwrap_or_else(|| end_time - chrono::Duration::hours(1));
-
-    if start_time >= end_time {
-        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-            .with_title("Invalid Parameters")
-            .with_detail("start_time must be before end_time"));
     }
 
     let summaries = service
@@ -1423,6 +1450,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
             TimeBucketStats,
             StatsFilters,
             ProjectHealthSummary,
+            crate::service::proxy_log_service::ProjectHourlyRequestCount,
             ProjectsHealthResponse,
             AiAgentBreakdownResponse,
             AiAgentBreakdownRow,
@@ -1526,6 +1554,64 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let end = start + chrono::Duration::hours(hours);
         (start, end)
+    }
+
+    #[test]
+    fn projects_health_ids_are_strict_deduplicated_and_bounded() {
+        assert_eq!(
+            parse_projects_health_project_ids("7, 8,7").expect("valid project IDs"),
+            vec![7, 8]
+        );
+
+        let malformed = parse_projects_health_project_ids("7,not-an-id")
+            .expect_err("malformed ID must reject the whole request");
+        assert_eq!(malformed.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            malformed
+                .body
+                .get("detail")
+                .and_then(|value| value.as_str()),
+            Some("'not-an-id' is not a valid project ID")
+        );
+
+        let repeated = std::iter::repeat_n("7", MAX_PROJECTS_HEALTH_IDS + 1)
+            .collect::<Vec<_>>()
+            .join(",");
+        assert_eq!(
+            parse_projects_health_project_ids(&repeated).expect("duplicates do not consume cap"),
+            vec![7]
+        );
+
+        let too_many = (1..=MAX_PROJECTS_HEALTH_IDS + 1)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let error = parse_projects_health_project_ids(&too_many)
+            .expect_err("more than 100 distinct IDs must be rejected");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn projects_health_window_is_limited_to_31_days() {
+        let (start, _) = window(1);
+        assert!(validate_projects_health_window(
+            start,
+            start + chrono::Duration::days(MAX_PROJECTS_HEALTH_WINDOW_DAYS)
+        )
+        .is_ok());
+
+        let error = validate_projects_health_window(
+            start,
+            start
+                + chrono::Duration::days(MAX_PROJECTS_HEALTH_WINDOW_DAYS)
+                + chrono::Duration::seconds(1),
+        )
+        .expect_err("a range beyond 31 days must be rejected before gap-fill");
+        assert_eq!(error.status_code, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            error.body.get("detail").and_then(|value| value.as_str()),
+            Some("projects-health time range cannot exceed 31 days")
+        );
     }
 
     #[tokio::test]
