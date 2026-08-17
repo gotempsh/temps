@@ -358,6 +358,13 @@ pub struct DockerCleanupService {
     /// that construct the service directly, which fall back to the
     /// constructor/builder-supplied values.
     config_service: Option<Arc<temps_config::ConfigService>>,
+    /// (enabled, default_hours) from the most recent successful read —
+    /// either the constructor/builder snapshot, or the latest live read via
+    /// `config_service`. Used as the fallback on a *failed* live read
+    /// instead of always reverting to the boot-time snapshot: an operator
+    /// who disabled retention, followed by a transient settings-read error,
+    /// must not have deletions silently resume under the stale boot policy.
+    last_known_image_retention: std::sync::Mutex<(bool, i64)>,
 }
 
 impl DockerCleanupService {
@@ -383,6 +390,7 @@ impl DockerCleanupService {
             default_image_retention_hours: 336,
             image_retention_enabled: true,
             config_service: None,
+            last_known_image_retention: std::sync::Mutex::new((true, 336)),
         }
     }
 
@@ -417,11 +425,15 @@ impl DockerCleanupService {
     }
 
     /// Apply the operator-configured retention policy from `AppSettings`.
-    /// Used as the boot-time value and as the fallback when a live re-read
-    /// (see `with_config_service`) fails.
+    /// Used as the boot-time value and, until the first live read completes,
+    /// as the `last_known_image_retention` fallback.
     pub fn with_image_retention(mut self, settings: &temps_core::ImageRetentionSettings) -> Self {
         self.image_retention_enabled = settings.enabled;
         self.default_image_retention_hours = settings.effective_default_hours();
+        self.last_known_image_retention = std::sync::Mutex::new((
+            self.image_retention_enabled,
+            self.default_image_retention_hours,
+        ));
         self
     }
 
@@ -435,30 +447,41 @@ impl DockerCleanupService {
     }
 
     /// Current retention policy: the fresh settings-row value when a
-    /// `ConfigService` is wired up, falling back to the constructor/builder
-    /// snapshot otherwise (all existing tests) or on a read error (matches
-    /// the same fail-safe fallback used at boot in `plugin.rs`).
+    /// `ConfigService` is wired up, falling back to `last_known_image_retention`
+    /// otherwise (all existing tests, before the first live read) or on a
+    /// read error. Deliberately the *last successful* read rather than the
+    /// boot-time snapshot: an operator who disabled retention and then hit a
+    /// transient settings-read error must not have deletions silently resume
+    /// under a stale "enabled" policy from startup.
     async fn current_image_retention(&self) -> (bool, i64) {
         let Some(config_service) = &self.config_service else {
-            return (
-                self.image_retention_enabled,
-                self.default_image_retention_hours,
-            );
+            return *self
+                .last_known_image_retention
+                .lock()
+                .expect("last_known_image_retention mutex poisoned");
         };
         match config_service.get_settings().await {
-            Ok(settings) => (
-                settings.image_retention.enabled,
-                settings.image_retention.effective_default_hours(),
-            ),
+            Ok(settings) => {
+                let fresh = (
+                    settings.image_retention.enabled,
+                    settings.image_retention.effective_default_hours(),
+                );
+                *self
+                    .last_known_image_retention
+                    .lock()
+                    .expect("last_known_image_retention mutex poisoned") = fresh;
+                fresh
+            }
             Err(e) => {
+                let last_known = *self
+                    .last_known_image_retention
+                    .lock()
+                    .expect("last_known_image_retention mutex poisoned");
                 error!(
                     error = %e,
                     "Could not read image retention settings; using last-known values"
                 );
-                (
-                    self.image_retention_enabled,
-                    self.default_image_retention_hours,
-                )
+                last_known
             }
         }
     }
@@ -729,6 +752,19 @@ impl DockerCleanupService {
     /// `max_deployment_images_per_run`, the same bound already used for the
     /// removal step, so both the candidate scan and the removal batch share
     /// one ceiling; any remainder is picked up on the following night's run.
+    ///
+    /// The two `NOT EXISTS` clauses re-check the *permanent* protection
+    /// predicates from `unrebuildable_image_names`/`remote_node_image_names`
+    /// right here, before `LIMIT` — not just downstream via `protect_image`.
+    /// An install with `max_deployment_images_per_run` or more old,
+    /// permanently-protected images (uploads, external pulls, remote-node
+    /// containers) would otherwise fill the entire `ORDER BY MIN(created_at)
+    /// ASC LIMIT` window with rows every subsequent `protect_image` call
+    /// throws away, reclaiming zero bytes on every run forever rather than
+    /// the intended "remainder picked up next run". Recency-based
+    /// protections (keep-recent-N, actively-served) don't need the same
+    /// treatment: by definition they're among the *newest* deployments, so
+    /// they never compete for the oldest-first slots this query selects.
     async fn expired_image_candidates(
         &self,
         default_hours: i64,
@@ -756,6 +792,25 @@ impl DockerCleanupService {
                 WHERE d.image_name IS NOT NULL
                   AND d.image_name LIKE 'temps-%'
                   AND d.image_name NOT LIKE '%/%'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM deployments du
+                      JOIN projects pu ON pu.id = du.project_id
+                      WHERE du.image_name = d.image_name
+                        AND (
+                              du.context_vars ->> 'trigger' = 'image_upload'
+                           OR du.metadata ->> 'externalImageRef' IS NOT NULL
+                           OR du.metadata ->> 'externalImageId' IS NOT NULL
+                           OR pu.source_type <> 'git'
+                        )
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM deployment_containers dcr
+                      JOIN deployments dr ON dr.id = dcr.deployment_id
+                      WHERE dr.image_name = d.image_name
+                        AND dcr.node_id IS NOT NULL
+                  )
                 GROUP BY d.image_name
                 HAVING BOOL_AND(
                     d.created_at < NOW() - (
@@ -860,6 +915,17 @@ impl DockerCleanupService {
     ///
     /// Matched on the deployment's own provenance rather than on the tag text,
     /// because the upload endpoint lets the caller supply an arbitrary `tag`.
+    ///
+    /// `source_type <> 'git'` is deliberately broader than strictly necessary:
+    /// a `Manual`-source project (`SourceType::Manual`, "accepts any
+    /// deployment method") *can* deploy from a rebuildable git-built image,
+    /// but the project row doesn't distinguish that case from a genuinely
+    /// unrebuildable one, so every image from a non-`Git` project is
+    /// protected. This costs disk on `Manual` projects that happen to be
+    /// rebuildable; the alternative — trying to infer rebuildability from
+    /// something other than the source_type column — risks a false negative
+    /// that permanently deletes an image with no way back. Over-retention is
+    /// the safe direction here; under-retention is not.
     async fn unrebuildable_image_names(&self) -> Result<Vec<String>, sea_orm::DbErr> {
         use sea_orm::{ConnectionTrait, Statement};
 
@@ -1847,6 +1913,131 @@ mod tests {
         assert!(
             still_present.is_some(),
             "pruning must never delete the deployment row, only the image"
+        );
+
+        Ok(())
+    }
+
+    /// Regression test for a livelock the `ORDER BY ... LIMIT` bound on
+    /// `expired_image_candidates` could otherwise introduce: if permanently
+    /// protected images (here, uploads) outnumber
+    /// `max_deployment_images_per_run` and are older than a genuinely
+    /// removable image, a LIMIT applied *before* protection would fill the
+    /// entire candidate window with rows `protect_image` immediately
+    /// discards — reclaiming zero bytes forever instead of "the remainder
+    /// next run". The `NOT EXISTS` clauses in `expired_image_candidates`
+    /// exclude permanently-protected images from the SQL side, so the
+    /// removable image must still surface even with a `LIMIT` far smaller
+    /// than the protected count.
+    #[tokio::test]
+    async fn test_permanently_protected_images_do_not_starve_the_limit_window(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use chrono::{Duration, Utc};
+        use sea_orm::{ActiveModelTrait, ActiveValue::Set};
+        use temps_entities::preset::Preset;
+        use temps_entities::upstream_config::UpstreamList;
+        use temps_entities::{deployments, environments, projects};
+
+        if !cleanup_integration_tests_available().await {
+            eprintln!("Docker/Postgres unavailable; skipping livelock regression test");
+            return Ok(());
+        }
+
+        let test_db = temps_database::test_utils::TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let now = Utc::now();
+        let very_old = now - Duration::hours(200);
+        let old = now - Duration::hours(72);
+
+        let project = projects::ActiveModel {
+            name: Set("Livelock Test Project".to_string()),
+            slug: Set("livelock-test-project".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            preset: Set(Preset::Dockerfile),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            image_retention_hours: Set(Some(1)),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test".to_string()),
+            host: Set("livelock-test.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            current_deployment_id: Set(None),
+            subdomain: Set("livelock-test.example.com".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Three permanently-protected uploaded images, older than the one
+        // genuinely-removable image below — enough to fill a LIMIT of 2 on
+        // their own if protection isn't excluded before the LIMIT applies.
+        for i in 0..3 {
+            deployments::ActiveModel {
+                project_id: Set(project.id),
+                environment_id: Set(environment.id),
+                slug: Set(format!("uploaded-deployment-{i}")),
+                state: Set("success".to_string()),
+                image_name: Set(Some(format!("temps-livelock-test:uploaded-{i}"))),
+                metadata: Set(Some(deployments::DeploymentMetadata {
+                    external_image_ref: Some(format!("registry.internal/uploaded-{i}:1")),
+                    ..Default::default()
+                })),
+                created_at: Set(very_old),
+                updated_at: Set(very_old),
+                ..Default::default()
+            }
+            .insert(db.as_ref())
+            .await?;
+        }
+
+        // The one image that should actually be removed — newer than the
+        // protected uploads (so it would lose an oldest-first LIMIT race
+        // against them) but still expired against the 1h retention window.
+        deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("removable-deployment".to_string()),
+            state: Set("success".to_string()),
+            image_name: Set(Some("temps-livelock-test:removable".to_string())),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(old),
+            updated_at: Set(old),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let docker = Arc::new(RecordingDockerClient::default());
+        let service = DockerCleanupService::new(docker.clone(), db.clone(), mock_file_store())
+            .with_keep_recent_deployment_images(0)
+            // Smaller than the protected-image count: without the
+            // NOT EXISTS fix, the 3 protected uploads alone would exhaust
+            // this and the removable image would never be considered.
+            .with_max_deployment_images_per_run(2)
+            .with_image_retention(&temps_core::ImageRetentionSettings {
+                enabled: true,
+                default_hours: 336,
+            });
+
+        service.prune_old_deployment_images().await;
+
+        assert_eq!(
+            docker.removed_sorted(),
+            vec!["temps-livelock-test:removable".to_string()],
+            "a removable image must not be starved out of the LIMIT window by \
+             permanently-protected images that will never actually be removed"
         );
 
         Ok(())
