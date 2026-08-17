@@ -1289,6 +1289,10 @@ mod tests {
         let expected_crates: &[&str] = &[
             "temps-deployments",
             "temps-environments",
+            // Feature-flag mutations are project-scoped writes: a read-only
+            // member of a project could otherwise flip that project's flags
+            // with the instance-wide FlagsWrite the default role carries.
+            "temps-flags",
             "temps-projects",
             "temps-proxy",
         ];
