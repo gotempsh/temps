@@ -32,6 +32,17 @@ services:
     # of real DNS. PEBBLE_VA_NOSLEEP skips Pebble's artificial validation
     # delay (present by default to mimic real-world latency) so runs aren't
     # slower than they need to be.
+    #
+    # PEBBLE_WFE_NONCEREJECT turns off Pebble's other piece of deliberate fault
+    # injection: by default it rejects a percentage of otherwise-valid
+    # anti-replay nonces to prove ACME *clients* retry on `badNonce`. That
+    # makes the DNS-01 and HTTP-01 scenarios randomly fail on a step that has
+    # nothing to do with what they assert — a rejected nonce surfaces as
+    # "Failed to fetch authorization: JWS has an invalid anti-replay nonce",
+    # `request_challenge` gives up (it is best-effort at domain creation), and
+    # the next call 400s with "No ACME order found". The client's nonce
+    # handling belongs to instant-acme, not to these scenarios, so the noise is
+    # removed here rather than retried around.
     # ENTRYPOINT is already the `pebble` binary -- `command:` supplies only
     # its flags, not the binary name again.
     command:
@@ -43,6 +54,7 @@ services:
       ]
     environment:
       PEBBLE_VA_NOSLEEP: "1"
+      PEBBLE_WFE_NONCEREJECT: "0"
     ports:
       # 14000: ACME directory (what ACME_DIRECTORY_URL points at).
       # 15000: management API, unused here but harmless to expose.
