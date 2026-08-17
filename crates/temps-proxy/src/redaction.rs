@@ -45,14 +45,20 @@ pub const REDACTED: &str = "[REDACTED]";
 /// lowercase so the fast path is a plain byte comparison. Sorted purely for
 /// readability — the list is short enough that a linear scan beats the branch
 /// cost of a binary search.
+/// `www-authenticate` / `proxy-authenticate` are deliberately absent: they are
+/// challenges telling the client *how* to authenticate, not credentials, and
+/// redacting them would cost debugging information for no security gain.
 const SENSITIVE_HEADERS: &[&str] = &[
+    "apikey",
+    "authentication",
     "authorization",
     "cookie",
     "proxy-authorization",
     "set-cookie",
-    "www-authenticate",
     "x-access-token",
+    "x-amz-security-token",
     "x-api-key",
+    "x-auth",
     "x-auth-token",
     "x-csrf-token",
     "x-refresh-token",
@@ -104,22 +110,41 @@ const SENSITIVE_QUERY_PARAMS: &[&str] = &[
     "x-amz-signature",
 ];
 
+/// Case-insensitive comparison that also treats `-` and `_` as equivalent.
+///
+/// Without this, `?api-key=` slips past an `api_key` entry and `?access-token=`
+/// past `access_token` — both spellings are in real-world use, and listing every
+/// permutation by hand is exactly the kind of list that grows a hole. Allocates
+/// nothing, so it stays usable on the request path.
+fn matches_name(name: &str, candidate: &str) -> bool {
+    if name.len() != candidate.len() {
+        return false;
+    }
+    name.bytes().zip(candidate.bytes()).all(|(a, b)| {
+        let norm = |c: u8| match c {
+            b'-' => b'_',
+            other => other.to_ascii_lowercase(),
+        };
+        norm(a) == norm(b)
+    })
+}
+
 fn is_sensitive_header(name: &str) -> bool {
     SENSITIVE_HEADERS
         .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        .any(|candidate| matches_name(name, candidate))
 }
 
 fn is_url_valued_header(name: &str) -> bool {
     URL_VALUED_HEADERS
         .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        .any(|candidate| matches_name(name, candidate))
 }
 
 fn is_sensitive_query_param(name: &str) -> bool {
     SENSITIVE_QUERY_PARAMS
         .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+        .any(|candidate| matches_name(name, candidate))
 }
 
 /// Replace the values of credential-bearing query parameters with
@@ -301,6 +326,26 @@ mod tests {
             redact_query_string("Token=abc&ACCESS_TOKEN=def"),
             "Token=[REDACTED]&ACCESS_TOKEN=[REDACTED]"
         );
+    }
+
+    #[test]
+    fn matches_hyphen_and_underscore_spellings_interchangeably() {
+        // Both spellings occur in the wild; listing every permutation by hand is
+        // how a denylist grows a hole.
+        assert_eq!(
+            redact_query_string("api-key=abc&access-token=def&refresh_token=ghi"),
+            "api-key=[REDACTED]&access-token=[REDACTED]&refresh_token=[REDACTED]"
+        );
+    }
+
+    #[test]
+    fn does_not_over_match_on_length_or_prefix() {
+        // Guards the normalizing comparison: these are NOT credentials and must
+        // survive, or the logs lose their most-used fields.
+        let query = "code_of_conduct=1&stateful=no&tokenizer=bpe&keyboard=us";
+        let redacted = redact_query_string(query);
+        assert_eq!(redacted, query);
+        assert!(matches!(redacted, Cow::Borrowed(_)));
     }
 
     #[test]
