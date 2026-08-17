@@ -695,6 +695,15 @@ pub struct DockerSandboxProvider {
     config: DockerSandboxConfig,
 }
 
+/// PATH used for every command Temps runs as root inside a sandbox.
+///
+/// System directories only, and deliberately not the image's own PATH: the
+/// sandbox user can write to `~/.local/bin` and `~/.bun/bin`, which the image
+/// puts *ahead* of `/usr/bin`. Inheriting that would let sandbox-controlled
+/// binaries run as container root during ownership normalisation or recovery.
+pub(crate) const ROOT_EXEC_PATH: &str =
+    "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 impl DockerSandboxProvider {
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
         Self { docker, config }
@@ -721,6 +730,15 @@ impl DockerSandboxProvider {
                 bollard::models::ExecConfig {
                     user: Some("0:0".to_string()),
                     cmd: Some(cmd),
+                    // Root maintenance commands (`chown`, `su`, `cp`, `curl`,
+                    // `sh`) are resolved through PATH. The sandbox image puts
+                    // user-writable directories — `{home}/.local/bin`,
+                    // `{home}/.bun/bin` — ahead of the system ones, so a
+                    // sandbox user could drop their own `chown` there and have
+                    // it executed as container root on the next recovery or
+                    // restart. Pin PATH to system directories only; nothing
+                    // Temps runs as root lives in the sandbox user's tree.
+                    env: Some(vec![format!("PATH={ROOT_EXEC_PATH}")]),
                     attach_stdout: Some(true),
                     attach_stderr: Some(true),
                     ..Default::default()
@@ -3496,6 +3514,50 @@ mod tests {
     fn docker_image_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    /// Root maintenance commands resolve `chown`/`su`/`cp` through PATH. The
+    /// sandbox image places user-writable bin directories ahead of the system
+    /// ones, so the PATH handed to a root exec must contain system
+    /// directories only — otherwise a sandbox user can drop `~/.local/bin/chown`
+    /// and have it executed as container root on the next recovery.
+    #[test]
+    fn root_exec_path_excludes_sandbox_writable_directories() {
+        let entries: Vec<&str> = ROOT_EXEC_PATH.split(':').collect();
+        assert!(!entries.is_empty());
+
+        for entry in &entries {
+            assert!(
+                entry.starts_with('/'),
+                "PATH entry {entry:?} must be absolute"
+            );
+            assert!(
+                !entry.contains(SANDBOX_HOME),
+                "PATH entry {entry:?} is inside the sandbox user's home"
+            );
+            assert!(
+                !entry.contains('~') && !entry.is_empty() && *entry != ".",
+                "PATH entry {entry:?} must not be relative or home-relative"
+            );
+        }
+
+        // The specific directories the sandbox image prepends and the user can write.
+        for writable in [
+            "/home/temps/.local/bin",
+            "/home/temps/.bun/bin",
+            "/home/temps/.opencode/bin",
+        ] {
+            assert!(
+                !entries.contains(&writable),
+                "{writable} must not be on the root exec PATH"
+            );
+        }
+
+        // And it must still be able to find the commands we actually run.
+        assert!(entries.contains(&"/usr/bin"));
+        assert!(entries.contains(&"/bin"));
+        assert!(entries.contains(&"/usr/sbin"));
+        assert!(entries.contains(&"/sbin"));
     }
 
     #[test]
