@@ -1,4 +1,4 @@
-import { ReactNode } from 'react'
+import { ReactNode, useCallback, useRef, useState } from 'react'
 import {
   Area,
   CartesianGrid,
@@ -16,6 +16,7 @@ import {
   ChartTooltipContent,
 } from '@/components/ui/chart'
 import { cn } from '@/lib/utils'
+import { orderedChartDateRange } from '@/lib/chart-range-selection'
 import type { MetricTone } from './metric-sparkline'
 
 export type ThresholdLineSeries = {
@@ -98,10 +99,17 @@ interface ThresholdLineChartProps {
    * to draw a line. Defaults to a generic fallback.
    */
   emptyMessage?: ReactNode
+  /** Raw timestamp key used when the user drags across the chart. */
+  selectionKey?: string
+  /** Called with the ordered timestamp range after a multi-point drag. */
+  onRangeSelect?: (from: Date, to: Date) => void
   className?: string
 }
 
-const SERIES_STROKE: Record<NonNullable<ThresholdLineSeries['tone']>, string> = {
+const SERIES_STROKE: Record<
+  NonNullable<ThresholdLineSeries['tone']>,
+  string
+> = {
   good: 'var(--chart-2)',
   warn: 'var(--chart-3)',
   poor: 'var(--chart-4)',
@@ -150,10 +158,107 @@ export function ThresholdLineChart({
   tooltipValueFormatter,
   tooltipFooter,
   emptyMessage,
+  selectionKey,
+  onRangeSelect,
   className,
 }: ThresholdLineChartProps) {
   const isMulti = Array.isArray(series)
   const seriesList = isMulti ? series : [series]
+  const [selectionStartX, setSelectionStartX] = useState<
+    string | number | null
+  >(null)
+  const [selectionEndX, setSelectionEndX] = useState<string | number | null>(
+    null
+  )
+  const selectionStartValue = useRef<unknown>(null)
+  const selectionEndValue = useRef<unknown>(null)
+  const isSelecting = useRef(false)
+
+  const clearSelection = useCallback(() => {
+    isSelecting.current = false
+    selectionStartValue.current = null
+    selectionEndValue.current = null
+    setSelectionStartX(null)
+    setSelectionEndX(null)
+  }, [])
+
+  const selectionPointFromEvent = useCallback(
+    (event: any) => {
+      const payload = event?.activePayload?.[0]?.payload
+      if (payload) return payload
+
+      const activeIndex = Number(event?.activeIndex)
+      if (
+        Number.isInteger(activeIndex) &&
+        activeIndex >= 0 &&
+        activeIndex < data.length
+      ) {
+        return data[activeIndex]
+      }
+
+      if (event?.activeLabel != null) {
+        return data.find((point) => point?.[xKey] === event.activeLabel)
+      }
+
+      return undefined
+    },
+    [data, xKey]
+  )
+
+  const handleMouseDown = useCallback(
+    (event: any) => {
+      if (!selectionKey || !onRangeSelect) return
+      const payload = selectionPointFromEvent(event)
+      const xValue = payload?.[xKey]
+      const selectionValue = payload?.[selectionKey]
+      if (
+        (typeof xValue !== 'string' && typeof xValue !== 'number') ||
+        selectionValue == null
+      ) {
+        return
+      }
+
+      isSelecting.current = true
+      selectionStartValue.current = selectionValue
+      selectionEndValue.current = null
+      setSelectionStartX(xValue)
+      setSelectionEndX(null)
+    },
+    [onRangeSelect, selectionKey, selectionPointFromEvent, xKey]
+  )
+
+  const handleMouseMove = useCallback(
+    (event: any) => {
+      if (!isSelecting.current || !selectionKey) return
+      const payload = selectionPointFromEvent(event)
+      const xValue = payload?.[xKey]
+      const selectionValue = payload?.[selectionKey]
+      if (
+        (typeof xValue !== 'string' && typeof xValue !== 'number') ||
+        selectionValue == null
+      ) {
+        return
+      }
+
+      selectionEndValue.current = selectionValue
+      setSelectionEndX(xValue)
+    },
+    [selectionKey, selectionPointFromEvent, xKey]
+  )
+
+  const handleMouseUp = useCallback(() => {
+    if (!isSelecting.current || !onRangeSelect) {
+      clearSelection()
+      return
+    }
+
+    const range = orderedChartDateRange(
+      selectionStartValue.current,
+      selectionEndValue.current
+    )
+    clearSelection()
+    if (range) onRangeSelect(range.from, range.to)
+  }, [clearSelection, onRangeSelect])
 
   const config: ChartConfig = {}
   seriesList.forEach((s, i) => {
@@ -171,7 +276,7 @@ export function ThresholdLineChart({
     data.reduce((n, p) => {
       const v = p?.[s.dataKey]
       return v === null || v === undefined ? n : n + 1
-    }, 0),
+    }, 0)
   )
   const maxValidCount = Math.max(0, ...validCounts)
 
@@ -180,7 +285,7 @@ export function ThresholdLineChart({
       <div
         className={cn(
           'flex w-full items-center justify-center rounded-md border border-dashed text-sm text-muted-foreground',
-          className,
+          className
         )}
         style={{ height }}
       >
@@ -206,13 +311,13 @@ export function ThresholdLineChart({
   const numericValues = data.flatMap((p) =>
     seriesList
       .map((s) => p?.[s.dataKey])
-      .filter((v): v is number => typeof v === 'number'),
+      .filter((v): v is number => typeof v === 'number')
   )
   const dataMax = numericValues.length ? Math.max(...numericValues) : 0
   const dataMin = numericValues.length ? Math.min(...numericValues) : 0
   const thresholdMax = thresholds.reduce(
     (m, t) => Math.max(m, t.value),
-    dataMax,
+    dataMax
   )
   // Keep shaded band edges inside the visible Y range too.
   const bandMax = bands.reduce((m, b) => Math.max(m, b.upper), thresholdMax)
@@ -231,18 +336,26 @@ export function ThresholdLineChart({
       }
     }
   }
-  const yMax = envMax * 1.1
   const yMin = Math.min(0, envMin)
+  const yMax = envMax === yMin ? yMin + 1 : envMax * 1.1
 
   return (
     <ChartContainer
       config={config}
-      className={cn('aspect-auto w-full', className)}
+      className={cn(
+        'aspect-auto w-full',
+        selectionKey && onRangeSelect && 'cursor-crosshair select-none',
+        className
+      )}
       style={{ height }}
     >
       <ComposedChart
         data={data}
         margin={{ top: 12, right: 24, left: 8, bottom: 0 }}
+        onMouseDown={handleMouseDown}
+        onMouseMove={handleMouseMove}
+        onMouseUp={handleMouseUp}
+        onMouseLeave={clearSelection}
       >
         <CartesianGrid
           strokeDasharray="3 3"
@@ -313,9 +426,7 @@ export function ThresholdLineChart({
                 // Only the breakdown case needs a per-line label — a single
                 // series already conveys "what" via the tile title.
                 const seriesLabel = isMulti
-                  ? (config[String(item?.dataKey)]?.label as
-                      | string
-                      | undefined)
+                  ? (config[String(item?.dataKey)]?.label as string | undefined)
                   : undefined
                 return (
                   <div className="flex flex-col gap-0.5">
@@ -360,6 +471,16 @@ export function ThresholdLineChart({
             }
           />
         ))}
+        {selectionStartX != null && selectionEndX != null && (
+          <ReferenceArea
+            x1={selectionStartX}
+            x2={selectionEndX}
+            fill="var(--primary)"
+            fillOpacity={0.1}
+            stroke="var(--primary)"
+            strokeOpacity={0.35}
+          />
+        )}
         {thresholds.map((t, idx) => (
           <ReferenceLine
             key={`${t.tone}-${idx}`}
@@ -408,7 +529,9 @@ export function ThresholdLineChart({
             // A breakdown can have many overlapping lines — per-point dots
             // just add clutter there; the single-series dot-when-sparse
             // behavior is unchanged.
-            dot={!isMulti && validCounts[i] <= 8 ? { r: 3, strokeWidth: 0 } : false}
+            dot={
+              !isMulti && validCounts[i] <= 8 ? { r: 3, strokeWidth: 0 } : false
+            }
             activeDot={{ r: 4, strokeWidth: 0 }}
             connectNulls
             isAnimationActive={false}
@@ -428,7 +551,6 @@ export function ThresholdLineChart({
             tooltipType="none"
             isAnimationActive={false}
             activeDot={false}
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
             dot={(props: any) => {
               const breaching =
                 props?.payload?.[bandSeries.breachKey as string] != null
