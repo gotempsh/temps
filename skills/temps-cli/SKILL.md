@@ -59,7 +59,7 @@ For common multi-command journeys, read
 Verify the immutable registry artifact before its first execution in a task:
 
 ```bash
-expected_temps_cli_integrity='sha512-nz1MrIyi2hxcTmY4isY9MN44lclmgQdtifiAXaCNc+A5ZS9MqoDkwZL/NpEMNeld0PoAubCyyim+NvLou1eqHg=='
+expected_temps_cli_integrity='sha512-y8k0npyL16Ue1C6OExexSI6o4sCjR9VOtUy+PWelSIZPEAOMg6a2C2RSYk1m48DS4ZyjkZsFRcd+hNQKv5zYag=='
 actual_temps_cli_integrity="$(npm view @temps-sdk/cli@0.1.34 dist.integrity)"
 test "$actual_temps_cli_integrity" = "$expected_temps_cli_integrity" || {
   echo "Refusing to install: @temps-sdk/cli@0.1.34 integrity mismatch" >&2
