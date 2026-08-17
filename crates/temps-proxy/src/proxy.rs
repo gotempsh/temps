@@ -1061,9 +1061,30 @@ impl LoadBalancer {
 
     /// Returns true when a page view should be tracked (visitor/session created).
     /// This replaces the old `VisitorManager::should_track_visitor` trait method.
-    pub fn should_track_page(path: &str, content_type: Option<&str>, status_code: u16) -> bool {
-        // Don't track internal API calls
-        if path.starts_with(ROUTE_PREFIX_TEMPS) {
+    pub fn should_track_page(
+        path: &str,
+        content_type: Option<&str>,
+        method: &str,
+        accept: Option<&str>,
+        fetch_destination: Option<&str>,
+    ) -> bool {
+        // API responses never represent a browser page, even when a framework
+        // returns an HTML error document for an API-prefixed route.
+        if path == "/api"
+            || path.starts_with("/api/")
+            || path == "/_temps"
+            || path.starts_with("/_temps/")
+            || path.starts_with(ROUTE_PREFIX_TEMPS)
+        {
+            return false;
+        }
+
+        // Visitor analytics describe browser navigations, not every HTTP
+        // client that happens to receive HTML. Browsers advertise document
+        // navigation with both an HTML Accept value and Fetch Metadata that
+        // identifies a top-level document. Requiring both excludes generic
+        // HTTP clients, framework data fetches, and embedded resources.
+        if !is_browser_document_request(method, accept, fetch_destination) {
             return false;
         }
 
@@ -1079,12 +1100,40 @@ impl LoadBalancer {
             return false;
         }
 
-        // Track HTML pages or error pages
-        let is_html = content_type
-            .map(|ct| ct.starts_with("text/html"))
-            .unwrap_or(false);
+        // A status code cannot distinguish a browser document from an API
+        // response. Only HTML documents create visitor/session state; this
+        // still includes genuine HTML 4xx/5xx error pages.
+        content_type
+            .and_then(|value| value.split(';').next())
+            .is_some_and(|mime| mime.trim().eq_ignore_ascii_case("text/html"))
+    }
 
-        is_html || status_code >= 400
+    async fn ensure_static_visitor_session(
+        &self,
+        session: &PingoraSession,
+        ctx: &mut ProxyContext,
+        content_type: &str,
+    ) {
+        let request_accept = session
+            .req_header()
+            .headers
+            .get("accept")
+            .and_then(|value| value.to_str().ok());
+        let fetch_destination = session
+            .req_header()
+            .headers
+            .get("sec-fetch-dest")
+            .and_then(|value| value.to_str().ok());
+
+        if Self::should_track_page(
+            &ctx.path,
+            Some(content_type),
+            &ctx.method,
+            request_accept,
+            fetch_destination,
+        ) {
+            self.ensure_visitor_session(ctx).await;
+        }
     }
 
     async fn finalize_response(
@@ -1892,11 +1941,11 @@ impl LoadBalancer {
         use std::path::PathBuf;
         use tokio::fs;
 
-        let mut requested_path = ctx.path.trim_start_matches('/');
+        let mut requested_path = ctx.path.trim_start_matches('/').to_owned();
 
         // Handle root path -> index.html
         if requested_path.is_empty() {
-            requested_path = "index.html";
+            requested_path = "index.html".to_owned();
         }
 
         // Security: ALWAYS join with base static directory
@@ -1912,7 +1961,7 @@ impl LoadBalancer {
         // Always join with base static directory from config
         let absolute_static_dir = self.config_service.static_dir().join(relative_static_dir);
 
-        let file_path = absolute_static_dir.join(requested_path);
+        let file_path = absolute_static_dir.join(&requested_path);
 
         // Security check: ensure the resolved path is still within static_dir
         let canonical_static_dir = fs::canonicalize(&absolute_static_dir).await.map_err(|e| {
@@ -1967,6 +2016,13 @@ impl LoadBalancer {
             )
         })?;
 
+        // Resolve the actual response MIME before creating analytics state.
+        // Static SPA fallbacks and extensionless paths otherwise look like
+        // pages from the request path alone, including /api-style requests.
+        let content_type = Self::infer_content_type(final_path.to_str().unwrap_or("index.html"));
+        self.ensure_static_visitor_session(session, ctx, content_type)
+            .await;
+
         // Generate ETag for cache validation
         let etag = Self::generate_etag(&file_content);
 
@@ -1984,7 +2040,7 @@ impl LoadBalancer {
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
                 // Add cache headers
-                if Self::is_cacheable_static_asset(requested_path) {
+                if Self::is_cacheable_static_asset(&requested_path) {
                     resp.insert_header(
                         header::CACHE_CONTROL,
                         "public, max-age=31536000, immutable",
@@ -2005,9 +2061,6 @@ impl LoadBalancer {
                 return Ok(true);
             }
         }
-
-        // Infer content type
-        let content_type = Self::infer_content_type(final_path.to_str().unwrap_or("index.html"));
 
         // Check if we should compress the content
         let client_accepts_gzip = Self::accepts_gzip(session);
@@ -2061,7 +2114,7 @@ impl LoadBalancer {
         }
 
         // Add cache headers for static assets
-        if Self::is_cacheable_static_asset(requested_path) {
+        if Self::is_cacheable_static_asset(&requested_path) {
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
         } else {
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
@@ -2553,6 +2606,22 @@ fn is_event_stream_content_type(value: &str) -> bool {
         .split(';')
         .next()
         .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn is_browser_document_request(
+    method: &str,
+    accept: Option<&str>,
+    fetch_destination: Option<&str>,
+) -> bool {
+    method == "GET"
+        && accept.is_some_and(|value| {
+            value.split(',').any(|part| {
+                part.split(';')
+                    .next()
+                    .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("text/html"))
+            })
+        })
+        && fetch_destination.is_some_and(|destination| destination.eq_ignore_ascii_case("document"))
 }
 
 /// Console/control-plane traffic always gets a fixed timeout, regardless of
@@ -4651,34 +4720,6 @@ impl ProxyHttp for LoadBalancer {
             // IMPORTANT: Skip static file serving for /api/_temps/* paths
             // These must ALWAYS be proxied to the console address (admin API)
             if !ctx.path.starts_with("/api/_temps/") {
-                // Only create visitor/session for HTML page requests, not static assets.
-                // Without this guard, concurrent requests for JS/CSS/images on first visit
-                // (before the browser has received the Set-Cookie response) each create a
-                // separate visitor record, causing duplicate "live visitors".
-                let is_static_asset = ctx.path.contains('.')
-                    && (ctx.path.ends_with(".js")
-                        || ctx.path.ends_with(".css")
-                        || ctx.path.ends_with(".png")
-                        || ctx.path.ends_with(".jpg")
-                        || ctx.path.ends_with(".jpeg")
-                        || ctx.path.ends_with(".gif")
-                        || ctx.path.ends_with(".svg")
-                        || ctx.path.ends_with(".ico")
-                        || ctx.path.ends_with(".woff")
-                        || ctx.path.ends_with(".woff2")
-                        || ctx.path.ends_with(".ttf")
-                        || ctx.path.ends_with(".eot")
-                        || ctx.path.ends_with(".map")
-                        || ctx.path.ends_with(".webp")
-                        || ctx.path.ends_with(".avif")
-                        || ctx.path.ends_with(".json")
-                        || ctx.path.ends_with(".xml")
-                        || ctx.path.ends_with(".txt"));
-
-                if !is_static_asset {
-                    self.ensure_visitor_session(ctx).await;
-                }
-
                 // Serve static file
                 match self.serve_static_file(session, ctx, &static_dir).await {
                     Ok(served) => {
@@ -4717,6 +4758,9 @@ impl ProxyHttp for LoadBalancer {
                             );
                             let mut resp = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
                             resp.insert_header(header::CONTENT_TYPE, "text/html")?;
+
+                            self.ensure_static_visitor_session(session, ctx, "text/html")
+                                .await;
 
                             // Set tracking cookies for 404 response
                             self.set_tracking_cookies(session, &mut resp, ctx).await?;
@@ -4757,6 +4801,9 @@ impl ProxyHttp for LoadBalancer {
                         let mut resp =
                             ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
                         resp.insert_header(header::CONTENT_TYPE, "text/html")?;
+
+                        self.ensure_static_visitor_session(session, ctx, "text/html")
+                            .await;
 
                         // Set tracking cookies for 500 response
                         self.set_tracking_cookies(session, &mut resp, ctx).await?;
@@ -5082,42 +5129,30 @@ impl ProxyHttp for LoadBalancer {
         }
 
         // Determine if this needs visitor tracking
-        let is_html_content = ctx
-            .content_type
-            .as_ref()
-            .map(|ct| ct.starts_with("text/html"))
-            .unwrap_or(false);
-
         let status_code = upstream_response.status.as_u16();
-        let is_error_page = status_code >= 400;
-
-        let is_static_asset = ctx.path.contains(".")
-            && (ctx.path.ends_with(".js")
-                || ctx.path.ends_with(".css")
-                || ctx.path.ends_with(".png")
-                || ctx.path.ends_with(".jpg")
-                || ctx.path.ends_with(".jpeg")
-                || ctx.path.ends_with(".gif")
-                || ctx.path.ends_with(".svg")
-                || ctx.path.ends_with(".ico")
-                || ctx.path.ends_with(".woff")
-                || ctx.path.ends_with(".woff2")
-                || ctx.path.ends_with(".ttf")
-                || ctx.path.ends_with(".eot"));
-
-        let is_api_endpoint = ctx.path.starts_with("/api/") || ctx.path.starts_with("/_temps/");
+        let request_accept = ctx
+            .request_headers
+            .as_ref()
+            .and_then(|headers| headers.get("accept"))
+            .map(String::as_str);
+        let fetch_destination = ctx
+            .request_headers
+            .as_ref()
+            .and_then(|headers| headers.get("sec-fetch-dest"))
+            .map(String::as_str);
 
         // Check if we should track this page view
-        let should_track =
-            Self::should_track_page(&ctx.path, ctx.content_type.as_deref(), status_code);
+        let should_track = Self::should_track_page(
+            &ctx.path,
+            ctx.content_type.as_deref(),
+            &ctx.method,
+            request_accept,
+            fetch_destination,
+        );
 
-        // Only create visitor/session for appropriate requests (skip for SSE)
-        if !ctx.skip_tracking
-            && should_track
-            && (is_html_content || is_error_page)
-            && !is_static_asset
-            && !is_api_endpoint
-        {
+        // Only browser HTML documents create visitor/session state (skip SSE,
+        // API responses, assets, and other non-document traffic).
+        if !ctx.skip_tracking && should_track {
             self.ensure_visitor_session(ctx).await;
         } else {
             debug!(

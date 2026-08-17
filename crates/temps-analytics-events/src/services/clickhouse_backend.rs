@@ -917,6 +917,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
                   AND timestamp >= fromUnixTimestamp64Milli(?)
                   AND timestamp <= fromUnixTimestamp64Milli(?)
                   AND visitor_id IS NOT NULL
+                  AND event_type = 'page_view'
                   AND is_crawler = 0
                   AND (? = 0 OR environment_id = ?)
                   AND (? = 0 OR deployment_id = ?)
@@ -926,6 +927,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
                       WHERE project_id = ?
                         AND timestamp < fromUnixTimestamp64Milli(?)
                         AND visitor_id IS NOT NULL
+                        AND event_type = 'page_view'
+                        AND is_crawler = 0
                         AND (? = 0 OR environment_id = ?)
                         AND (? = 0 OR deployment_id = ?)
                   )
@@ -959,8 +962,10 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
         // The Timescale impl validates the metric here; do the same so behavior
         // is identical.
         let count_expr = match q.metric.as_str() {
-            "sessions" => "uniq(session_id)",
-            "visitors" => "uniq(visitor_id)",
+            "sessions" => {
+                "uniqIf(if(startsWith(session_id, 'v2|'), splitByChar('|', session_id)[2], session_id), event_type = 'page_view' AND notEmpty(session_id))"
+            }
+            "visitors" => "uniqIf(visitor_id, event_type = 'page_view')",
             "page_views" => "countIf(event_type = 'page_view')",
             "paths" => "uniqIf(page_path, event_type = 'page_view')",
             other => {
@@ -1046,6 +1051,8 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
             WHERE has(?, project_id)
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
+              AND event_type = 'page_view'
+              AND is_crawler = 0
             GROUP BY project_id
         "#;
 
@@ -1100,6 +1107,7 @@ impl AnalyticsEvents for ClickHouseEventsBackend {
               AND timestamp >= fromUnixTimestamp64Milli(?)
               AND timestamp <= fromUnixTimestamp64Milli(?)
               AND event_type = 'page_view'
+              AND is_crawler = 0
             GROUP BY project_id, bucket_ms
             ORDER BY project_id, bucket_ms
         "#;
@@ -1561,6 +1569,8 @@ mod tests {
         // Project 7, visitor 100: 1 visit before the reporting range, then
         // session A with 2 page_views + 1 signup inside it.
         // Project 7, session B, visitor 101: 1 page_view, 1 click.
+        // Project 7 also has one API-only session which must not count as a
+        // browser analytics session.
         // Project 8, session C, visitor 102: 1 page_view (different project — must
         // not leak into project 7 queries).
         let rows = [
@@ -1578,6 +1588,15 @@ mod tests {
             make_row(3, 7, "sess-a", Some(100), "signup", "signup", t(45)),
             make_row(4, 7, "sess-b", Some(101), "page_view", "page_view", t(30)),
             make_row(5, 7, "sess-b", Some(101), "click", "click", t(25)),
+            make_row(
+                11,
+                7,
+                "sess-api-only",
+                Some(199),
+                "api_request",
+                "api_request",
+                t(20),
+            ),
             make_row(6, 8, "sess-c", Some(102), "page_view", "page_view", t(20)),
             // Project 9 is dedicated to the include_crawlers gate so these
             // rows perturb none of the project 7/8 assertions above: one human
@@ -1689,8 +1708,8 @@ mod tests {
             .await
             .expect("query_events_count all");
         let total_events: i64 = counts_all.iter().map(|c| c.count).sum();
-        // 5 events on project 7. Project 8's row must not leak in.
-        assert_eq!(total_events, 5, "got {:?}", counts_all);
+        // 6 events on project 7. Project 8's row must not leak in.
+        assert_eq!(total_events, 6, "got {:?}", counts_all);
 
         // ---- query_event_type_breakdown ----
         let by_type = backend
@@ -1731,6 +1750,19 @@ mod tests {
             .expect("query_unique_counts visitors");
         // 2 distinct visitor_ids on project 7 (100, 101).
         assert_eq!(visitors.count, 2);
+
+        // ---- query_unique_counts: sessions ----
+        let sessions = backend
+            .query_unique_counts(UniqueCountsSpec {
+                range: full_range(),
+                scope: project_scope(7).with_deployment(None),
+                metric: "sessions".to_string(),
+            })
+            .await
+            .expect("query_unique_counts sessions");
+        // Only sessions with a page view are browser sessions. The API-only
+        // event must not inflate the analytics headline.
+        assert_eq!(sessions.count, 2);
 
         // ---- query_unique_counts: returning visitors ----
         let returning_visitors = backend
@@ -1834,11 +1866,11 @@ mod tests {
             })
             .await
             .expect("query_aggregated_buckets");
-        assert_eq!(aggr.total, 5);
+        assert_eq!(aggr.total, 6);
 
         // ---- query_property_breakdown ----
-        // Group by channel; all 5 project-7 events have channel="direct".
-        // events level = 5 raw events, all under one bucket.
+        // Group by channel; all 6 project-7 events have channel="direct".
+        // events level = 6 raw events, all under one bucket.
         let pb = backend
             .query_property_breakdown(PropertyBreakdownSpec::new(
                 full_range(),
@@ -1891,10 +1923,10 @@ mod tests {
         let on_total: i64 = bots_on.items.iter().map(|i| i.count).sum();
         assert_eq!(off_total, 1, "default must count only the human visitor");
         assert_eq!(on_total, 2, "opt-in must also count the crawler visitor");
-        assert_eq!(pb.total, 5);
+        assert_eq!(pb.total, 6);
         assert!(
-            pb.items.iter().any(|i| i.value == "direct" && i.count == 5),
-            "expected channel=direct count=5, got {:?}",
+            pb.items.iter().any(|i| i.value == "direct" && i.count == 6),
+            "expected channel=direct count=6, got {:?}",
             pb.items
         );
 
@@ -1932,7 +1964,7 @@ mod tests {
             .expect("query_property_timeline");
         assert_eq!(pt.property, "channel");
         let pt_total: i64 = pt.items.iter().map(|i| i.count).sum();
-        assert_eq!(pt_total, 5, "got {:?}", pt.items);
+        assert_eq!(pt_total, 6, "got {:?}", pt.items);
 
         // The timeline must honour include_crawlers exactly like the breakdown.
         // It previously accepted the flag and silently discarded it, so the

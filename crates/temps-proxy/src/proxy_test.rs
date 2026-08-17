@@ -485,35 +485,114 @@ pub mod proxy_tests {
     async fn test_proxy_visitor_tracking_decisions() -> Result<()> {
         use crate::proxy::LoadBalancer;
 
-        // HTML page → track
-        assert!(LoadBalancer::should_track_page("/", Some("text/html"), 200));
+        let browser_accept = Some("text/html,application/xhtml+xml");
+        let document = Some("document");
+
+        // Browser HTML navigation → track
+        assert!(LoadBalancer::should_track_page(
+            "/",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            document,
+        ));
 
         // Internal API → do not track
         assert!(!LoadBalancer::should_track_page(
             "/api/_temps/health",
             Some("application/json"),
-            200
+            "GET",
+            browser_accept,
+            document,
         ));
 
         // CSS static asset → do not track
         assert!(!LoadBalancer::should_track_page(
             "/assets/style.css",
             Some("text/css"),
-            200
+            "GET",
+            Some("text/css,*/*;q=0.1"),
+            Some("style"),
         ));
 
-        // Error page (404) → track regardless of extension
+        // HTML error page (404) → track
         assert!(LoadBalancer::should_track_page(
             "/some-page",
             Some("text/html"),
-            404
+            "GET",
+            browser_accept,
+            document,
+        ));
+
+        // API-style errors outside /api must not create visitor sessions.
+        assert!(!LoadBalancer::should_track_page(
+            "/graphql",
+            Some("application/json"),
+            "POST",
+            Some("application/json"),
+            Some("empty"),
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/v1/users",
+            Some("application/problem+json"),
+            "GET",
+            Some("application/json"),
+            Some("empty"),
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/missing-content-type",
+            None,
+            "GET",
+            browser_accept,
+            document,
+        ));
+
+        // API-prefixed routes are never browser pages, even if misconfigured
+        // to return HTML.
+        assert!(!LoadBalancer::should_track_page(
+            "/api/report",
+            Some("text/html; charset=utf-8"),
+            "GET",
+            browser_accept,
+            document,
+        ));
+
+        // A generic HTTP client receiving HTML is not a browser page view.
+        assert!(!LoadBalancer::should_track_page(
+            "/docs",
+            Some("text/html"),
+            "GET",
+            Some("*/*"),
+            None,
+        ));
+
+        // Accept alone is spoofable and does not prove a browser document
+        // navigation; Fetch Metadata must explicitly identify the document.
+        assert!(!LoadBalancer::should_track_page(
+            "/docs",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            None,
+        ));
+
+        // Browser background fetches must not create sessions even if an
+        // upstream mistakenly responds with HTML.
+        assert!(!LoadBalancer::should_track_page(
+            "/data",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            Some("empty"),
         ));
 
         // PNG image → do not track
         assert!(!LoadBalancer::should_track_page(
             "/images/logo.png",
             Some("image/png"),
-            200
+            "GET",
+            Some("image/avif,image/webp,*/*"),
+            Some("image"),
         ));
 
         Ok(())

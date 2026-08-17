@@ -165,21 +165,57 @@ mod integration_tests {
         // Visitor tracking decisions are now a pure static function — no DB needed.
         use crate::proxy::LoadBalancer;
 
-        assert!(LoadBalancer::should_track_page("/", Some("text/html"), 200));
+        let browser_accept = Some("text/html,application/xhtml+xml");
+        let document = Some("document");
+
+        assert!(LoadBalancer::should_track_page(
+            "/",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            document,
+        ));
         assert!(!LoadBalancer::should_track_page(
             "/api/_temps/health",
             Some("application/json"),
-            200
+            "GET",
+            browser_accept,
+            document,
         ));
         assert!(!LoadBalancer::should_track_page(
             "/assets/style.css",
             Some("text/css"),
-            200
+            "GET",
+            Some("text/css,*/*;q=0.1"),
+            Some("style"),
         ));
         assert!(LoadBalancer::should_track_page(
             "/some-page",
             Some("text/html"),
-            404
+            "GET",
+            browser_accept,
+            document,
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/graphql",
+            Some("application/json"),
+            "POST",
+            Some("application/json"),
+            Some("empty"),
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/v1/users",
+            Some("application/problem+json"),
+            "GET",
+            Some("application/json"),
+            Some("empty"),
+        ));
+        assert!(!LoadBalancer::should_track_page(
+            "/missing-content-type",
+            None,
+            "GET",
+            browser_accept,
+            document,
         ));
         Ok(())
     }

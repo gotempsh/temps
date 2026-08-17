@@ -3645,10 +3645,14 @@ mod tests {
             })
         };
         let (cagg_reqs, cagg_errs, cagg_req_bytes, cagg_resp_bytes) = sum(&via_cagg);
-        assert_eq!(cagg_reqs, 4);
-        assert_eq!(cagg_errs, 2); // 404 + 500 (time-bucket errors are >= 400)
-        assert_eq!(cagg_req_bytes, 400);
-        assert_eq!(cagg_resp_bytes, 800);
+        // Generic time-bucket queries include system traffic unless callers
+        // explicitly request synthetic exclusion. This keeps the aggregate
+        // and raw backends equivalent; project health summaries above apply
+        // their own trusted-system exclusion.
+        assert_eq!(cagg_reqs, 5);
+        assert_eq!(cagg_errs, 3); // 404 + both 500s
+        assert_eq!(cagg_req_bytes, 500);
+        assert_eq!(cagg_resp_bytes, 1000);
         assert_eq!(
             sum(&via_raw),
             (cagg_reqs, cagg_errs, cagg_req_bytes, cagg_resp_bytes)
@@ -3663,14 +3667,14 @@ mod tests {
             .iter()
             .find(|b| b.request_count > 0)
             .expect("populated raw bucket");
-        assert!((cagg_busy.avg_response_time_ms - 50.0).abs() < 1e-9);
+        assert!((cagg_busy.avg_response_time_ms - 220.0).abs() < 1e-9);
         assert!((cagg_busy.avg_response_time_ms - raw_busy.avg_response_time_ms).abs() < 1e-9);
 
         // Percentiles are computed from raw response_time_ms on both paths
-        // ([20, 30, 50, 100] → p50=40, p95=92.5, p99=98.5 via percentile_cont).
-        assert!((cagg_busy.p50_response_time_ms - 40.0).abs() < 1e-9);
-        assert!((cagg_busy.p95_response_time_ms - 92.5).abs() < 1e-9);
-        assert!((cagg_busy.p99_response_time_ms - 98.5).abs() < 1e-9);
+        // ([20, 30, 50, 100, 900] → p50=50, p95=740, p99=868 via percentile_cont).
+        assert!((cagg_busy.p50_response_time_ms - 50.0).abs() < 1e-9);
+        assert!((cagg_busy.p95_response_time_ms - 740.0).abs() < 1e-9);
+        assert!((cagg_busy.p99_response_time_ms - 868.0).abs() < 1e-9);
         assert!((cagg_busy.p50_response_time_ms - raw_busy.p50_response_time_ms).abs() < 1e-9);
         assert!((cagg_busy.p95_response_time_ms - raw_busy.p95_response_time_ms).abs() < 1e-9);
         assert!((cagg_busy.p99_response_time_ms - raw_busy.p99_response_time_ms).abs() < 1e-9);

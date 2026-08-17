@@ -2957,12 +2957,26 @@ WHERE project_id = $1
                 unique_visitors AS (
                     SELECT COUNT(DISTINCT e.visitor_id) AS n
                     FROM events e
-                    WHERE e.timestamp >= $1 AND e.timestamp < $2
+                    WHERE e.event_type = 'page_view'
+                      AND e.is_crawler = false
+                      AND e.timestamp >= $1 AND e.timestamp < $2
                 ),
                 total_visits AS (
-                    SELECT COUNT(*) AS n
-                    FROM request_sessions rs
-                    WHERE rs.started_at >= $1 AND rs.started_at < $2
+                    -- Sessions shown in analytics must have a real browser
+                    -- page view. Proxy-only request sessions (for example API
+                    -- traffic created by older versions) are intentionally
+                    -- excluded so historical polluted rows cannot inflate the
+                    -- dashboard after the proxy-side fix is deployed.
+                    SELECT COUNT(DISTINCT CASE
+                        WHEN e.session_id LIKE 'v2|%'
+                            THEN split_part(e.session_id, '|', 2)
+                        ELSE e.session_id
+                    END) AS n
+                    FROM events e
+                    WHERE e.event_type = 'page_view'
+                      AND e.is_crawler = false
+                      AND e.session_id IS NOT NULL
+                      AND e.timestamp >= $1 AND e.timestamp < $2
                 ),
                 total_events AS (
                     SELECT COUNT(*) AS n
@@ -2973,6 +2987,7 @@ WHERE project_id = $1
                     SELECT COUNT(*) AS n
                     FROM events e
                     WHERE e.event_type = 'page_view'
+                      AND e.is_crawler = false
                       AND e.timestamp >= $1 AND e.timestamp < $2
                 ),
                 total_projects AS (
@@ -2987,17 +3002,31 @@ WHERE project_id = $1
                 -- column is never populated by the ingest path.
                 session_stats AS (
                     SELECT
-                        session_id,
-                        COUNT(*) FILTER (WHERE event_type = 'page_view') AS page_views,
+                        CASE
+                            WHEN session_id LIKE 'v2|%'
+                                THEN split_part(session_id, '|', 2)
+                            ELSE session_id
+                        END AS session_id,
+                        COUNT(*) FILTER (
+                            WHERE event_type = 'page_view' AND is_crawler = false
+                        ) AS page_views,
                         COUNT(*) FILTER (
                             WHERE event_type NOT IN ('page_view', 'page_leave')
                               AND event_type NOT LIKE '%\_viewed' ESCAPE '\'
+                              AND is_crawler = false
                         ) AS interaction_events,
                         EXTRACT(EPOCH FROM (MAX(timestamp) - MIN(timestamp))) AS duration_seconds
                     FROM events
                     WHERE timestamp >= $1 AND timestamp < $2
                       AND session_id IS NOT NULL
-                    GROUP BY session_id
+                    GROUP BY CASE
+                        WHEN session_id LIKE 'v2|%'
+                            THEN split_part(session_id, '|', 2)
+                        ELSE session_id
+                    END
+                    HAVING COUNT(*) FILTER (
+                        WHERE event_type = 'page_view' AND is_crawler = false
+                    ) > 0
                 ),
                 session_rates AS (
                     SELECT
@@ -5090,6 +5119,126 @@ mod tests {
 
         // If this test compiles, it proves our parameterized query pattern is correct
         // No assertion needed - compilation itself is the test
+    }
+
+    /// Regression test for proxy-created API sessions polluting the analytics
+    /// dashboard. A request session is not an analytics visit until a
+    /// non-crawler browser page-view event exists for it.
+    #[tokio::test]
+    async fn test_general_stats_excludes_sessions_without_human_page_views() -> anyhow::Result<()> {
+        use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+        use temps_entities::{
+            deployments, environments, events, projects, request_sessions, visitor,
+        };
+
+        let (service, db, _container) =
+            create_test_analytics_service!("test_general_stats_human_sessions");
+
+        let project = projects::Entity::find()
+            .filter(projects::Column::Slug.eq("test_project"))
+            .one(db.as_ref())
+            .await?
+            .expect("test project must exist from insert_test_data");
+        let environment = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test environment must exist from insert_test_data");
+        let deployment = deployments::Entity::find()
+            .filter(deployments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await?
+            .expect("test deployment must exist from insert_test_data");
+
+        let now = chrono::Utc::now();
+        let human_visitor = visitor::ActiveModel {
+            visitor_id: Set("human-session-visitor".to_string()),
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            first_seen: Set(now),
+            last_seen: Set(now),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let human_session_id = "11111111-1111-4111-8111-111111111111";
+
+        // A mixed-version session can contain both bare and legacy cookie
+        // formats during a rolling upgrade. They still represent one visit.
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(human_visitor.id)),
+            session_id: Set(Some(format!("v2|{human_session_id}|1786982400"))),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/settings".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/settings".to_string()),
+            href: Set("https://example.com/settings".to_string()),
+            timestamp: Set(now + chrono::Duration::seconds(1)),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        request_sessions::ActiveModel {
+            session_id: Set(human_session_id.to_string()),
+            started_at: Set(now),
+            last_accessed_at: Set(now),
+            visitor_id: Set(Some(human_visitor.id)),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        events::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            deployment_id: Set(Some(deployment.id)),
+            visitor_id: Set(Some(human_visitor.id)),
+            session_id: Set(Some(human_session_id.to_string())),
+            event_type: Set("page_view".to_string()),
+            page_path: Set("/dashboard".to_string()),
+            hostname: Set("example.com".to_string()),
+            pathname: Set("/dashboard".to_string()),
+            href: Set("https://example.com/dashboard".to_string()),
+            timestamp: Set(now),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        // Simulates a row created by the old proxy behavior for an API call.
+        // It has no analytics page-view event and must never count as a visit.
+        request_sessions::ActiveModel {
+            session_id: Set("22222222-2222-4222-8222-222222222222".to_string()),
+            started_at: Set(now),
+            last_accessed_at: Set(now),
+            visitor_id: Set(None),
+            data: Set("{}".to_string()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let stats = service
+            .get_general_stats(
+                now - chrono::Duration::minutes(1),
+                now + chrono::Duration::minutes(1),
+            )
+            .await?;
+
+        assert_eq!(stats.total_visits, 1);
+        assert_eq!(stats.total_unique_visitors, 1);
+        assert_eq!(stats.total_page_views, 2);
+
+        cleanup_test_analytics!(db);
+        Ok(())
     }
 
     /// Regression test: `get_session_details` must return correct
