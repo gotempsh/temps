@@ -4293,7 +4293,8 @@ export type CreateProjectRequest = {
  * Request to create a new project secret.
  *
  * Project secrets are mounted into the container as files under
- * `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+ * `/run/secrets/<KEY>` as a read-only mount, instead of as environment
+ * variables, so they do not appear in `docker inspect`.
  * Values are always encrypted at rest and never returned in plaintext from
  * the API after create. Distinct from agent secrets (global `/settings/secrets`).
  */

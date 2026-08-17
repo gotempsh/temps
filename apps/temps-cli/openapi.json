@@ -8813,7 +8813,7 @@
         "type": "object"
       },
       "CreateProjectSecretRequest": {
-        "description": "Request to create a new project secret.\n\nProject secrets are mounted into the container as files under\n`/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.\nValues are always encrypted at rest and never returned in plaintext from\nthe API after create. Distinct from agent secrets (global `/settings/secrets`).",
+        "description": "Request to create a new project secret.\n\nProject secrets are mounted into the container as files under\n`/run/secrets/<KEY>` as a read-only mount, instead of as environment\nvariables, so they do not appear in `docker inspect`.\nValues are always encrypted at rest and never returned in plaintext from\nthe API after create. Distinct from agent secrets (global `/settings/secrets`).",
         "properties": {
           "environment_ids": {
             "items": {
