@@ -222,6 +222,7 @@ impl TempsPlugin for BackupPlugin {
                 db.clone(),
                 Arc::clone(&executor),
                 telemetry,
+                context.get_service::<dyn temps_core::ProjectAccessChecker>(),
             );
 
             context.register_service(backup_app_state_inner);

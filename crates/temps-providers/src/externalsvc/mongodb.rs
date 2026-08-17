@@ -115,6 +115,57 @@ fn default_docker_image() -> String {
     "gotempsh/mongodb-walg:8.0".to_string()
 }
 
+/// Repositories a restore-time `docker_image` override may name, in addition
+/// to whatever repository the source service already runs.
+///
+/// Exact repository match, never a prefix test: `mongo-evil` must not be
+/// accepted because it starts with `mongo`.
+const RESTORE_IMAGE_REPOSITORIES: &[&str] = &["mongo", "gotempsh/mongodb-walg"];
+
+/// Repository part of an image reference — everything before the tag/digest.
+///
+/// A `:` only introduces a tag when it appears after the last `/`, otherwise
+/// it is a registry port (`registry.internal:5000/team/mongo`).
+fn image_repository(image: &str) -> &str {
+    let image = match image.split_once('@') {
+        Some((repo, _digest)) => repo,
+        None => image,
+    };
+    match image.rsplit_once(':') {
+        Some((repo, tag)) if !repo.is_empty() && !tag.contains('/') => repo,
+        _ => image,
+    }
+}
+
+/// Validate a restore-time `docker_image` override.
+///
+/// Restoring into a new service clones the source's root credentials into the
+/// new container's environment, so the image that receives them must be one we
+/// already trust: either the same repository the source service runs, or a
+/// known MongoDB repository. Only the tag is the caller's choice.
+fn restore_image_override<'a>(source_image: &str, requested: &'a str) -> Result<&'a str> {
+    let requested_repo = image_repository(requested);
+    if requested_repo.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Invalid docker_image override '{}': no repository",
+            requested
+        ));
+    }
+    if requested_repo == image_repository(source_image)
+        || RESTORE_IMAGE_REPOSITORIES.contains(&requested_repo)
+    {
+        return Ok(requested);
+    }
+    Err(anyhow::anyhow!(
+        "docker_image override '{}' is not permitted for a restore: the new service inherits the \
+         source service's credentials, so the image must stay on the source's repository ('{}') \
+         or one of: {}",
+        requested,
+        image_repository(source_image),
+        RESTORE_IMAGE_REPOSITORIES.join(", ")
+    ))
+}
+
 fn example_docker_image() -> &'static str {
     "gotempsh/mongodb-walg:8.0"
 }
@@ -3018,7 +3069,14 @@ impl ExternalService for MongodbService {
                 new_config.port = port.to_string();
             }
             if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
-                new_config.docker_image = image.to_string();
+                // The new service inherits the SOURCE service's credentials
+                // (root user/password are cloned above), and they are handed
+                // to the container as `MONGO_INITDB_ROOT_*` env vars. An
+                // arbitrary caller-chosen image would therefore be handed the
+                // source database's password on startup — so the override may
+                // only re-tag a repository we already run.
+                let validated = restore_image_override(&new_config.docker_image, image)?;
+                new_config.docker_image = validated.to_string();
             }
             if let Some(db) = overrides.get("database").and_then(|v| v.as_str()) {
                 new_config.database = db.to_string();
@@ -3345,6 +3403,57 @@ impl ExternalService for MongodbService {
 
 #[cfg(test)]
 mod tests {
+
+    /// Restoring into a new service clones the source's root credentials, so
+    /// a caller-chosen image must not be able to receive them.
+    #[test]
+    fn restore_image_override_rejects_foreign_repository() {
+        let err = restore_image_override("gotempsh/mongodb-walg:8.0", "attacker/exfil:latest")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not permitted"), "unexpected error: {err}");
+    }
+
+    /// Re-tagging the repository the source already runs is the legitimate
+    /// use of the override (restore into a newer patch release).
+    #[test]
+    fn restore_image_override_allows_retagging_source_repository() {
+        assert_eq!(
+            restore_image_override("gotempsh/mongodb-walg:8.0", "gotempsh/mongodb-walg:7.0")
+                .unwrap(),
+            "gotempsh/mongodb-walg:7.0"
+        );
+        assert_eq!(
+            restore_image_override("gotempsh/mongodb-walg:8.0", "mongo:7.0").unwrap(),
+            "mongo:7.0"
+        );
+    }
+
+    /// Exact repository match, never a prefix test.
+    #[test]
+    fn restore_image_override_does_not_match_by_prefix() {
+        for image in ["mongo-evil:1", "evil/mongo:1", "mongodb:1"] {
+            assert!(
+                restore_image_override("gotempsh/mongodb-walg:8.0", image).is_err(),
+                "{image} must not be accepted"
+            );
+        }
+    }
+
+    /// A registry port is not a tag separator.
+    #[test]
+    fn image_repository_handles_registry_ports_and_digests() {
+        assert_eq!(image_repository("mongo:7.0"), "mongo");
+        assert_eq!(
+            image_repository("registry.internal:5000/team/mongo"),
+            "registry.internal:5000/team/mongo"
+        );
+        assert_eq!(
+            image_repository("registry.internal:5000/team/mongo:7.0"),
+            "registry.internal:5000/team/mongo"
+        );
+        assert_eq!(image_repository("mongo@sha256:abc"), "mongo");
+    }
     use super::*;
 
     #[test]

@@ -12,7 +12,7 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use sea_orm::EntityTrait;
+use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use temps_auth::permission_guard;
@@ -194,6 +194,125 @@ async fn list_restore_runs_for_service(
     Ok(Json(runs))
 }
 
+// ---------------------------------------------------------------------------
+// Restore authorization
+// ---------------------------------------------------------------------------
+//
+// A restore reads one service's data and writes it into another. Both halves
+// are privileged: the source half discloses the backup's contents, the target
+// half destroys whatever is already there. Cross-service restore is a
+// deliberate disaster-recovery feature (see `services::restore`), so the fix
+// for "any caller can restore any backup into any service" is authorization on
+// *both* endpoints of the copy, not a block on the copy itself.
+
+/// Projects an external service is linked to, via the `project_services`
+/// join table. An empty result means the service is linked to no project.
+async fn linked_project_ids(
+    db: &sea_orm::DatabaseConnection,
+    service_id: i32,
+) -> Result<Vec<i32>, Problem> {
+    let links = temps_entities::project_services::Entity::find()
+        .filter(temps_entities::project_services::Column::ServiceId.eq(service_id))
+        .all(db)
+        .await
+        .map_err(|e| {
+            error!(service_id, error = %e, "restore authz: failed to resolve linked projects");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("Failed to verify service access")
+        })?;
+    Ok(links.into_iter().map(|link| link.project_id).collect())
+}
+
+/// Services that produced `backup_id`, via `external_service_backups`.
+async fn backup_source_service_ids(
+    db: &sea_orm::DatabaseConnection,
+    backup_id: i32,
+) -> Result<Vec<i32>, Problem> {
+    let rows = temps_entities::external_service_backups::Entity::find()
+        .filter(temps_entities::external_service_backups::Column::BackupId.eq(backup_id))
+        .all(db)
+        .await
+        .map_err(|e| {
+            error!(backup_id, error = %e, "restore authz: failed to resolve backup source services");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("Failed to verify backup access")
+        })?;
+    Ok(rows.into_iter().map(|row| row.service_id).collect())
+}
+
+/// A deployment token is minted for exactly one project, so it may only reach
+/// services linked to that project. Pure so the rule is testable without a
+/// database; a service linked to no project is reachable by no token.
+fn deployment_token_may_access(token_project_id: i32, project_ids: &[i32]) -> bool {
+    project_ids.contains(&token_project_id)
+}
+
+fn restore_access_denied(what: &str, id: i32) -> Problem {
+    problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("Insufficient Permissions")
+        .with_detail(format!(
+            "You do not have access to the {} ({}) involved in this restore",
+            what, id
+        ))
+}
+
+/// Deny unless the caller may act on `service_id`.
+///
+/// * Instance-wide Admin/PlatformAdmin bypass, matching the documented
+///   contract of [`temps_core::ProjectAccessChecker`].
+/// * A deployment token is confined to its own project — enforced here even
+///   when no checker is registered, since it needs no external policy.
+/// * Otherwise, if a checker is registered, the caller must be able to reach
+///   at least one project the service is linked to. With no checker (plain
+///   OSS) this is a no-op, which is the documented fail-open-when-unconfigured
+///   behaviour of the extension point.
+async fn require_service_access(
+    app_state: &BackupAppState,
+    auth: &temps_auth::AuthContext,
+    service_id: i32,
+    what: &str,
+) -> Result<(), Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return Ok(());
+    }
+
+    if let Some(token_project_id) = auth.project_id() {
+        let project_ids = linked_project_ids(app_state.db.as_ref(), service_id).await?;
+        if !deployment_token_may_access(token_project_id, &project_ids) {
+            return Err(restore_access_denied(what, service_id));
+        }
+        return Ok(());
+    }
+
+    let Some(checker) = app_state.project_access_checker.as_deref() else {
+        return Ok(());
+    };
+
+    let project_ids = linked_project_ids(app_state.db.as_ref(), service_id).await?;
+    let mut infrastructure_error = None;
+    for project_id in &project_ids {
+        match checker
+            .user_can_access_project(auth.user_id(), *project_id)
+            .await
+        {
+            Ok(true) => return Ok(()),
+            Ok(false) => {}
+            Err(error) => infrastructure_error = Some(error),
+        }
+    }
+
+    if let Some(error) = infrastructure_error {
+        error!(service_id, error = %error, "restore authz: project access check failed");
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Project Access Check Failed")
+            .with_detail("Could not verify project access; please try again"));
+    }
+
+    Err(restore_access_denied(what, service_id))
+}
+
 #[utoipa::path(
     tag = "Restore",
     post,
@@ -228,11 +347,19 @@ async fn start_restore(
         }
     }
 
+    // The target service is where the data lands — and where whatever is
+    // there now gets overwritten.
+    require_service_access(&app_state, &auth, id, "target service").await?;
+
     // Resolve which backup the caller is pointing at. The URL's `{id}`
     // is the TARGET service — where the data will land. The backup
     // itself may have been produced by a completely different (or no
     // longer existing) service, so we do NOT validate source/target
-    // linkage here. The orchestrator enforces engine compatibility.
+    // linkage here — cross-service restore is a supported disaster-recovery
+    // path. We *do* require the caller to be entitled to the source as well,
+    // otherwise a restore is an arbitrary read of another project's data into
+    // a service the caller controls. The orchestrator enforces engine
+    // compatibility.
     let selector = match (request.backup_id, request.backup_location.as_ref()) {
         (Some(backup_id), _) => crate::services::BackupSelector::Id(backup_id),
         (None, Some(loc)) => {
@@ -261,6 +388,33 @@ async fn start_restore(
             }));
         }
     };
+
+    match &selector {
+        crate::services::BackupSelector::Id(backup_id) => {
+            // Every service that produced this backup must be reachable by the
+            // caller — restoring it anywhere else discloses its contents.
+            for source_service_id in
+                backup_source_service_ids(app_state.db.as_ref(), *backup_id).await?
+            {
+                require_service_access(&app_state, &auth, source_service_id, "source service")
+                    .await?;
+            }
+        }
+        crate::services::BackupSelector::Location { .. } => {
+            // Orphan restore reads a caller-supplied key out of a configured
+            // S3 source, so there is no source service to authorize against.
+            // A deployment token is a machine credential scoped to a single
+            // project and has no business naming arbitrary bucket keys.
+            if auth.project_id().is_some() {
+                return Err(problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Insufficient Permissions")
+                    .with_detail(
+                        "Deployment tokens cannot restore from a raw backup location; \
+                         reference a backup by id instead",
+                    ));
+            }
+        }
+    }
 
     let mode_str = match &request.mode {
         RestoreRequestMode::InPlace => "in_place".to_string(),
@@ -432,6 +586,22 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
 mod tests {
     use super::*;
     use axum::http::StatusCode;
+
+    /// A deployment token is minted for one project; a restore that touches a
+    /// service outside it must be refused even before any plugin-provided
+    /// project-access checker is consulted.
+    #[test]
+    fn deployment_token_confined_to_its_own_project() {
+        assert!(deployment_token_may_access(7, &[3, 7]));
+        assert!(!deployment_token_may_access(7, &[3, 9]));
+    }
+
+    /// A service linked to no project is reachable by no deployment token —
+    /// an empty link set must never read as "unrestricted".
+    #[test]
+    fn deployment_token_denied_for_unlinked_service() {
+        assert!(!deployment_token_may_access(7, &[]));
+    }
 
     fn status_for(err: RestoreError) -> StatusCode {
         let p: Problem = err.into();
