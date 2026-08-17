@@ -1640,6 +1640,19 @@ impl ProxyLogService {
             where_clauses.push(format!("request_source = ${}", param_index));
             *param_index += 1;
         }
+        // System requests are Temps' own status checks — one per project per
+        // minute. Counting them makes an idle project report 1,440 requests a
+        // day, which is the exact distortion `is_system_request` was added to
+        // the aggregate as a grouping dimension to remove. The health summary
+        // already hardcodes this; the time-bucket queries feed the same
+        // dashboard's chart and must agree, or the headline total and the
+        // chart beneath it disagree with each other.
+        //
+        // A literal rather than a parameter: `StatsFilters` has no
+        // `is_system_request` dimension, so there is nothing for a caller to
+        // override, and adding a placeholder here would shift every
+        // subsequent parameter index for no gain.
+        where_clauses.push("is_system_request = FALSE".to_string());
         if filters.is_bot.is_some() {
             where_clauses.push(format!("is_bot = ${}", param_index));
             *param_index += 1;
@@ -3213,8 +3226,10 @@ mod tests {
 
         ProxyLogService::build_filter_sql(&filters, &mut param_index, &mut where_clauses);
 
-        // No filters means no WHERE clauses added
-        assert_eq!(where_clauses.len(), 0);
+        // Even with no caller filters, Temps' own status checks are excluded —
+        // otherwise an idle project charts 1,440 requests a day of its own
+        // monitoring. It is a literal, so it consumes no parameter slot.
+        assert_eq!(where_clauses, vec!["is_system_request = FALSE".to_string()]);
         assert_eq!(param_index, 1); // Parameter index unchanged
     }
 
@@ -3229,8 +3244,9 @@ mod tests {
 
         ProxyLogService::build_filter_sql(&filters, &mut param_index, &mut where_clauses);
 
-        assert_eq!(where_clauses.len(), 1);
+        assert_eq!(where_clauses.len(), 2);
         assert_eq!(where_clauses[0], "method = $1");
+        assert!(where_clauses.contains(&"is_system_request = FALSE".to_string()));
         assert_eq!(param_index, 2); // Incremented by 1
     }
 
@@ -3248,11 +3264,12 @@ mod tests {
 
         ProxyLogService::build_filter_sql(&filters, &mut param_index, &mut where_clauses);
 
-        assert_eq!(where_clauses.len(), 4);
+        assert_eq!(where_clauses.len(), 5);
         assert!(where_clauses.contains(&"method = $3".to_string()));
         assert!(where_clauses.contains(&"client_ip = $4".to_string()));
         assert!(where_clauses.contains(&"project_id = $5".to_string()));
         assert!(where_clauses.contains(&"status_code = $6".to_string()));
+        assert!(where_clauses.contains(&"is_system_request = FALSE".to_string()));
         assert_eq!(param_index, 7); // Incremented by 4
     }
 
@@ -3279,8 +3296,10 @@ mod tests {
 
         ProxyLogService::build_filter_sql(&filters, &mut param_index, &mut where_clauses);
 
-        // Should have 11 filters
-        assert_eq!(where_clauses.len(), 11);
+        // 11 caller filters, plus the always-on system-request exclusion,
+        // which is a literal and so does not advance the parameter index.
+        assert_eq!(where_clauses.len(), 12);
+        assert!(where_clauses.contains(&"is_system_request = FALSE".to_string()));
         assert_eq!(param_index, 12); // Incremented by 11
     }
 
@@ -3369,9 +3388,19 @@ mod tests {
         let mut values: Vec<sea_orm::Value> = vec![];
         ProxyLogService::add_filter_values(&mut values, &filters);
 
-        // Number of WHERE clauses should match number of values
-        assert_eq!(where_clauses.len(), values.len());
-        assert_eq!(where_clauses.len(), 4);
+        // The invariant that matters is placeholder/value parity, not
+        // clause/value parity: some predicates are literals with no bound
+        // value (`is_system_request = FALSE`, `has_project`,
+        // `exclude_synthetic`). Counting clauses instead would either forbid
+        // literal predicates or, worse, pass while the parameters are
+        // off-by-one and every filter binds to the wrong column.
+        let placeholders = where_clauses
+            .iter()
+            .flat_map(|clause| clause.match_indices('$'))
+            .count();
+        assert_eq!(placeholders, values.len());
+        assert_eq!(param_index as usize, 1 + values.len());
+        assert_eq!(where_clauses.len(), 5); // 4 filters + the system exclusion
     }
 
     #[test]
