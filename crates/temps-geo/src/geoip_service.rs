@@ -215,7 +215,9 @@ fn get_or_load<T, F>(
 where
     F: FnOnce() -> Result<T, GeoIpError>,
 {
-    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(existing) = cache.get(&key).and_then(Weak::upgrade) {
         return Ok(existing);
     }
@@ -299,10 +301,7 @@ impl GeoIpService {
                 }
             };
 
-            Ok(MaxMindGeoIpService {
-                reader,
-                asn_reader,
-            })
+            Ok(MaxMindGeoIpService { reader, asn_reader })
         })?;
 
         Ok(Self::MaxMind(service))
@@ -496,10 +495,18 @@ mod tests {
     fn test_get_or_load_keys_on_path() {
         let cache: Mutex<HashMap<PathBuf, Weak<String>>> = Mutex::new(HashMap::new());
 
-        let a = get_or_load(&cache, PathBuf::from("/a/City.mmdb"), || Ok("a".to_string()))
-            .expect("load a");
-        let b = get_or_load(&cache, PathBuf::from("/b/City.mmdb"), || Ok("b".to_string()))
-            .expect("load b");
+        let a = get_or_load(
+            &cache,
+            PathBuf::from("/a/City.mmdb"),
+            || Ok("a".to_string()),
+        )
+        .expect("load a");
+        let b = get_or_load(
+            &cache,
+            PathBuf::from("/b/City.mmdb"),
+            || Ok("b".to_string()),
+        )
+        .expect("load b");
 
         assert!(!Arc::ptr_eq(&a, &b));
         assert_eq!(*a, "a");
