@@ -806,7 +806,7 @@ const CONTROL_PLANE_NODE_ID: i32 = 0;
 /// Uses `INSERT … ON CONFLICT DO NOTHING` against the unique index
 /// `(node_id, metric_name)` so concurrent calls are safe.
 pub async fn seed_default_proxy_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
-    seed_node_rules(db, &proxy_default_seeds()).await
+    seed_node_rules(db, "seed_default_proxy_rules", &proxy_default_seeds()).await
 }
 
 /// Insert default file-descriptor/socket exhaustion alert rules for the
@@ -818,7 +818,12 @@ pub async fn seed_default_proxy_rules(db: &DatabaseConnection) -> Result<(), Met
 /// data to evaluate. Uses the same `(node_id, metric_name)` unique index as
 /// [`seed_default_proxy_rules`], so this is safe to call alongside it.
 pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result<(), MetricsError> {
-    seed_node_rules(db, &node_fd_default_seeds()).await
+    seed_node_rules(
+        db,
+        "seed_default_node_resource_rules",
+        &node_fd_default_seeds(),
+    )
+    .await
 }
 
 /// Shared `INSERT … ON CONFLICT DO NOTHING` loop for control-plane-node
@@ -831,7 +836,15 @@ pub async fn seed_default_node_resource_rules(db: &DatabaseConnection) -> Result
 /// regardless of whether today's callers happen to be safe, since a future
 /// caller passing an operator-supplied `String` would silently inherit
 /// whatever escaping this function does or doesn't do.
-async fn seed_node_rules(db: &DatabaseConnection, seeds: &[RuleSeed]) -> Result<(), MetricsError> {
+///
+/// `caller` names the public wrapper that supplied `seeds` and is emitted as
+/// the log line's prefix, so operators grepping for `seed_default_proxy_rules`
+/// (the pre-refactor log text) still match.
+async fn seed_node_rules(
+    db: &DatabaseConnection,
+    caller: &str,
+    seeds: &[RuleSeed],
+) -> Result<(), MetricsError> {
     use sea_orm::ConnectionTrait;
     for seed in seeds {
         let statement = sea_orm::Statement::from_sql_and_values(
@@ -858,7 +871,7 @@ async fn seed_node_rules(db: &DatabaseConnection, seeds: &[RuleSeed]) -> Result<
 
     info!(
         rule_count = seeds.len(),
-        "seed_node_rules: seeded default control-plane node alert rules (ON CONFLICT DO NOTHING)"
+        "{caller}: seeded default control-plane node alert rules (ON CONFLICT DO NOTHING)"
     );
 
     Ok(())

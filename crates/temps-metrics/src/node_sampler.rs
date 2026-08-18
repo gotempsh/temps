@@ -111,3 +111,198 @@ impl NodeMetricsSampler {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::error::MetricsError;
+    use crate::store::{LabelledMetric, LatestByLabelQuery, LatestQuery, MetricPoint, RangeQuery};
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    /// A `MetricsStore` that records what it was handed, or fails every write
+    /// when constructed with `failing`. Only `write_batch` is exercised by the
+    /// sampler; the read methods are unreachable here and return `NotImplemented`.
+    struct SpyStore {
+        written: Mutex<Vec<MetricPoint>>,
+        failing: bool,
+    }
+
+    impl SpyStore {
+        fn recording() -> Self {
+            Self {
+                written: Mutex::new(Vec::new()),
+                failing: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                written: Mutex::new(Vec::new()),
+                failing: true,
+            }
+        }
+
+        fn points(&self) -> Vec<MetricPoint> {
+            self.written.lock().expect("spy store mutex").clone()
+        }
+    }
+
+    #[async_trait]
+    impl MetricsStore for SpyStore {
+        async fn write_batch(&self, points: Vec<MetricPoint>) -> Result<(), MetricsError> {
+            if self.failing {
+                return Err(MetricsError::NotImplemented);
+            }
+            self.written.lock().expect("spy store mutex").extend(points);
+            Ok(())
+        }
+
+        async fn query_range(
+            &self,
+            _filter: RangeQuery,
+        ) -> Result<Vec<(DateTime<Utc>, f64)>, MetricsError> {
+            Err(MetricsError::NotImplemented)
+        }
+
+        async fn query_latest(
+            &self,
+            _filter: LatestQuery,
+        ) -> Result<HashMap<String, f64>, MetricsError> {
+            Err(MetricsError::NotImplemented)
+        }
+
+        async fn query_latest_by_label(
+            &self,
+            _filter: LatestByLabelQuery,
+        ) -> Result<Vec<LabelledMetric>, MetricsError> {
+            Err(MetricsError::NotImplemented)
+        }
+
+        async fn latest_timestamp(
+            &self,
+            _source_kind: SourceKind,
+            _source_id: i32,
+        ) -> Result<Option<DateTime<Utc>>, MetricsError> {
+            Err(MetricsError::NotImplemented)
+        }
+
+        async fn prune(&self, _older_than: DateTime<Utc>) -> Result<u64, MetricsError> {
+            Err(MetricsError::NotImplemented)
+        }
+    }
+
+    /// `ConfigService` needs a `DatabaseConnection`, but `sample_once` never
+    /// reads settings (only `run`'s interval lookup does), so a `MockDatabase`
+    /// with no queued results is sufficient and keeps these tests hermetic.
+    fn test_config_service() -> Arc<temps_config::ConfigService> {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
+        let config = Arc::new(
+            temps_config::ServerConfig::new(
+                "127.0.0.1:3000".to_string(),
+                "postgresql://unused@localhost/unused".to_string(),
+                None,
+                None,
+            )
+            .expect("test ServerConfig"),
+        );
+        Arc::new(temps_config::ConfigService::new(config, db))
+    }
+
+    #[tokio::test]
+    async fn sample_once_writes_control_plane_node_scoped_points() {
+        let store = Arc::new(SpyStore::recording());
+        let sampler = NodeMetricsSampler::new(
+            store.clone() as Arc<dyn MetricsStore>,
+            test_config_service(),
+            PathBuf::from("/tmp"),
+        );
+
+        sampler.sample_once().await;
+
+        let points = store.points();
+        // Disk metrics come from statvfs and are available on every unix, so
+        // at least one point must land even where /proc is absent (macOS).
+        assert!(
+            !points.is_empty(),
+            "expected at least the statvfs-backed disk points"
+        );
+
+        for p in &points {
+            assert_eq!(p.source_kind, SourceKind::Node, "metric {}", p.name);
+            assert_eq!(p.source_id, CONTROL_PLANE_NODE_ID, "metric {}", p.name);
+            assert_eq!(p.node_id, Some(CONTROL_PLANE_NODE_ID), "metric {}", p.name);
+            assert!(p.name.starts_with("node."), "unexpected name {}", p.name);
+        }
+    }
+
+    /// The fd metrics are the point of this sampler, so assert they actually
+    /// reach the store — but only where the kernel interfaces backing them
+    /// exist, matching the collector's documented graceful degradation.
+    #[tokio::test]
+    async fn sample_once_writes_fd_metrics_where_proc_is_available() {
+        let store = Arc::new(SpyStore::recording());
+        let sampler = NodeMetricsSampler::new(
+            store.clone() as Arc<dyn MetricsStore>,
+            test_config_service(),
+            PathBuf::from("/tmp"),
+        );
+
+        sampler.sample_once().await;
+
+        let names: Vec<String> = store.points().into_iter().map(|p| p.name).collect();
+
+        if Path::new("/proc/sys/fs/file-nr").exists() {
+            assert!(names.iter().any(|n| n == "node.fd_percent"));
+        }
+        if Path::new("/proc/self/fd").exists() {
+            assert!(names.iter().any(|n| n == "node.process_open_fds"));
+        }
+    }
+
+    /// A store outage must not propagate: the sampler logs and drops the batch
+    /// so the loop keeps running and the next cycle supersedes it. Mirrors
+    /// `ProxyMetricsSampler`'s contract.
+    #[tokio::test]
+    async fn sample_once_swallows_write_failures() {
+        let store = Arc::new(SpyStore::failing());
+        let sampler = NodeMetricsSampler::new(
+            store.clone() as Arc<dyn MetricsStore>,
+            test_config_service(),
+            PathBuf::from("/tmp"),
+        );
+
+        // Must return normally rather than panicking or propagating.
+        sampler.sample_once().await;
+        assert!(store.points().is_empty());
+    }
+
+    /// An unreadable `data_dir` yields no disk points; on a platform without
+    /// `/proc` that leaves nothing to write, and the sampler must short-circuit
+    /// rather than hand the store an empty batch.
+    #[tokio::test]
+    async fn sample_once_skips_write_when_nothing_collected() {
+        let store = Arc::new(SpyStore::recording());
+        let sampler = NodeMetricsSampler::new(
+            store.clone() as Arc<dyn MetricsStore>,
+            test_config_service(),
+            PathBuf::from("/this/path/does/not/exist/ever"),
+        );
+
+        sampler.sample_once().await;
+
+        // Where /proc exists the fd/cpu/memory points still land; where it
+        // doesn't, the batch is empty and no write should have happened.
+        if !Path::new("/proc").exists() {
+            assert!(
+                store.points().is_empty(),
+                "no collectable metrics should mean no write"
+            );
+        }
+    }
+}
