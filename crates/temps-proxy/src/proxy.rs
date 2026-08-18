@@ -2630,6 +2630,16 @@ fn is_event_stream_content_type(value: &str) -> bool {
 /// HTML at a non-asset, non-API path. A browser-issued `fetch()` defaults to
 /// `Accept: */*` and is excluded by that alone, which is what keeps framework
 /// data fetches out on HTTP origins too.
+///
+/// Known cost of the fallback: on a plain-HTTP origin an `<iframe>` embed is
+/// indistinguishable from a navigation here, because the `Sec-Fetch-Dest:
+/// iframe` that would reject it is exactly what the browser withholds — the
+/// same goes for prefetch/prerender, whose `Sec-Purpose` is also absent. Those
+/// count as page views on HTTP. That is a regression against #700 but not
+/// against the behaviour before it, and it is scoped to origins that already
+/// get no Fetch Metadata at all. `Upgrade-Insecure-Requests` would tighten the
+/// generic-client case (issue #715) but does not separate an iframe from a
+/// document either.
 fn is_browser_document_request(
     method: &str,
     accept: Option<&str>,

@@ -598,6 +598,17 @@ pub mod proxy_tests {
             None,
         ));
 
+        // The GET-only rule still holds on the no-Fetch-Metadata path: a form
+        // POST that renders HTML is not a new page view, and without this the
+        // method check is only ever exercised alongside a Sec-Fetch-Dest.
+        assert!(!LoadBalancer::should_track_page(
+            "/checkout",
+            Some("text/html"),
+            "POST",
+            browser_accept,
+            None,
+        ));
+
         // Browser background fetches must not create sessions even if an
         // upstream mistakenly responds with HTML.
         assert!(!LoadBalancer::should_track_page(
