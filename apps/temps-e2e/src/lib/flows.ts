@@ -459,6 +459,31 @@ export async function pollUntil<T>(
  * (the main_url is often https on :443) and on external DNS — it always lands on
  * the same proxy that serves real traffic.
  */
+/**
+ * Headers that make a request look like a real browser *top-level navigation*
+ * to the proxy's visitor tracking.
+ *
+ * `temps-proxy`'s `is_browser_document_request` (proxy.rs) deliberately
+ * requires GET + an `Accept` advertising `text/html` + Fetch Metadata naming a
+ * `document` destination before it will create visitor/session state, so that
+ * analytics counts browser navigations rather than every HTTP client that
+ * happens to receive HTML. `fetch()` sends neither by default — a wildcard
+ * Accept, and no Fetch Metadata at all — so a scenario that wants the proxy to issue
+ * `_temps_visitor_id`/`_temps_sid` must opt in with these headers — otherwise
+ * the response legitimately carries no `Set-Cookie` and the scenario is
+ * asserting against behaviour the proxy no longer has.
+ *
+ * Spread these *after* a target's own headers so the Host header is preserved.
+ */
+export const BROWSER_DOCUMENT_HEADERS: Record<string, string> = {
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
+}
+
 export function resolveLoadTarget(
   instanceUrl: string,
   appMainUrl: string,
