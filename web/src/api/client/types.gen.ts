@@ -13187,6 +13187,14 @@ export type ProjectResponse = {
      */
     ai_write_actions_enabled: boolean;
     /**
+     * Whether this project also accepts deployments from a source other than
+     * `source_type` — chiefly, whether a Git-backed project will take an
+     * uploaded source archive (`drop`). `null` or `false` means only the
+     * configured `source_type` (plus Docker images and static bundles, which
+     * every project accepts) may be deployed.
+     */
+    allow_alternate_sources?: boolean | null;
+    /**
      * Attack mode - when enabled, requires CAPTCHA verification for all project environments
      */
     attack_mode: boolean;
@@ -16700,6 +16708,23 @@ export type SessionSummary = {
     requests_count: number;
     session_id: number;
     started_at: string;
+};
+
+/**
+ * Opt a project in or out of accepting deployments from a source other than
+ * its configured `source_type`.
+ *
+ * Unlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a
+ * Git project keeps its repository, branch, webhook auto-deploy and
+ * rollback-rebuild behaviour and merely gains the ability to also be deployed
+ * from an uploaded source archive.
+ */
+export type SetAlternateSourcesRequest = {
+    /**
+     * `true` to also accept uploaded source archives, `false` to restrict the
+     * project to its configured source again.
+     */
+    allow_alternate_sources: boolean;
 };
 
 export type SetFlagEnvironmentRequest = {
@@ -38788,6 +38813,46 @@ export type UpdateProjectResponses = {
 };
 
 export type UpdateProjectResponse = UpdateProjectResponses[keyof UpdateProjectResponses];
+
+export type SetAlternateSourcesData = {
+    body: SetAlternateSourcesRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/projects/{id}/alternate-sources';
+};
+
+export type SetAlternateSourcesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Forbidden
+     */
+    403: unknown;
+    /**
+     * Project not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetAlternateSourcesResponses = {
+    /**
+     * Alternate-source policy updated
+     */
+    200: ProjectResponse;
+};
+
+export type SetAlternateSourcesResponse = SetAlternateSourcesResponses[keyof SetAlternateSourcesResponses];
 
 export type GetProjectDeploymentsData = {
     body?: never;

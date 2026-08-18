@@ -4,6 +4,7 @@ import { create } from './create.js'
 import { show } from './show.js'
 import { remove } from './delete.js'
 import { updateProjectAction, updateSettingsAction, updateGitAction, updateConfigAction } from './update.js'
+import { projectSourceAction } from './source.js'
 import { registerProjectSecretsCommands } from './secrets.js'
 
 export function registerProjectsCommands(program: Command): void {
@@ -99,6 +100,16 @@ export function registerProjectsCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .option('-y, --yes', 'Skip prompts, use provided/existing values (for automation)')
     .action(updateGitAction)
+
+  projects
+    .command('source')
+    .description('Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)')
+    .option('-p, --project <project>', 'Project slug or ID')
+    .option('--type <type>', 'Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git)')
+    .option('--allow-alternate', 'Also accept an uploaded source archive from `drop`, keeping the current source as default')
+    .option('--no-allow-alternate', 'Only deploy from the configured source')
+    .option('--json', 'Output in JSON format')
+    .action(projectSourceAction)
 
   projects
     .command('config')

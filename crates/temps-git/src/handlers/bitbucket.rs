@@ -420,6 +420,7 @@ mod tests {
             attack_mode: false,
             ai_alert_summaries_enabled: None,
             ai_api_traffic_summary_enabled: None,
+            allow_alternate_sources: None,
             ai_debug_chat_enabled: None,
             ai_write_actions_enabled: false,
             cross_project_trace_sharing: true,

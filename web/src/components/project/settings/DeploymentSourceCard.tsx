@@ -8,6 +8,8 @@ import {
   CardHeader,
   CardTitle,
 } from '@/components/ui/card'
+import { Separator } from '@/components/ui/separator'
+import { Switch } from '@/components/ui/switch'
 import { cn } from '@/lib/utils'
 import {
   ArrowRight,
@@ -21,10 +23,38 @@ import { useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
-type SourceType = 'git' | 'docker_image' | 'static_files' | 'manual'
+type SourceType =
+  | 'git'
+  | 'docker_image'
+  | 'static_files'
+  | 'uploaded_source'
+  | 'manual'
+
+/** How each source type reads in the "keeps deploying from X" sentence. */
+const SOURCE_LABELS: Record<SourceType, string> = {
+  git: 'its Git repository',
+  docker_image: 'a Docker image',
+  static_files: 'an uploaded static bundle',
+  uploaded_source: 'an uploaded source archive',
+  manual: 'its configured source',
+}
+
+/**
+ * The source types this card can switch a project *to*.
+ *
+ * `uploaded_source` is deliberately absent: it is what `drop` sets when it
+ * creates a project, and a project should gain the ability to take archives
+ * through the alternate-sources opt-in below — which keeps its existing source
+ * intact — rather than by being converted into an upload-only project.
+ */
+type PickableSourceType = 'git' | 'docker_image' | 'static_files'
+
+function isPickable(value: SourceType): value is PickableSourceType {
+  return value === 'git' || value === 'docker_image' || value === 'static_files'
+}
 
 const SOURCE_TYPES: {
-  value: Exclude<SourceType, 'manual'>
+  value: PickableSourceType
   label: string
   desc: string
   Icon: typeof GitBranch
@@ -67,10 +97,15 @@ export function DeploymentSourceCard({
 }) {
   const navigate = useNavigate()
   const current = (project.source_type ?? 'git') as SourceType
-  const [selected, setSelected] = useState<Exclude<SourceType, 'manual'>>(
-    current === 'manual' ? 'docker_image' : current
+  const [selected, setSelected] = useState<PickableSourceType>(
+    isPickable(current) ? current : 'docker_image'
   )
   const [switching, setSwitching] = useState(false)
+  const [savingAlternates, setSavingAlternates] = useState(false)
+  const allowsAlternates = project.allow_alternate_sources === true
+  // An uploaded-source project already accepts archives by definition, so the
+  // opt-in would be a no-op control — say so rather than offering a dead toggle.
+  const alternatesAreImplicit = current === 'uploaded_source'
 
   const selectedMeta = SOURCE_TYPES.find((t) => t.value === selected)
   const isCurrent = selected === current
@@ -81,6 +116,37 @@ export function DeploymentSourceCard({
     !!project.repo_name &&
     project.repo_owner !== 'unknown' &&
     project.repo_name !== 'unknown'
+
+  const setAlternates = async (allow: boolean) => {
+    setSavingAlternates(true)
+    try {
+      const res = await fetch(`/api/projects/${project.id}/alternate-sources`, {
+        method: 'PATCH',
+        credentials: 'include',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ allow_alternate_sources: allow }),
+      })
+      if (!res.ok) {
+        const d = (await res.json().catch(() => null)) as {
+          detail?: string
+        } | null
+        throw new Error(d?.detail || 'Failed to update alternate sources')
+      }
+      toast.success(
+        allow
+          ? 'This project can now also be deployed from an uploaded folder'
+          : 'This project now only deploys from its configured source'
+      )
+      refetch()
+    } catch (e) {
+      toast.error(
+        (e as { message?: string })?.message ||
+          'Failed to update alternate sources'
+      )
+    } finally {
+      setSavingAlternates(false)
+    }
+  }
 
   const switchTo = async () => {
     setSwitching(true)
@@ -144,6 +210,32 @@ export function DeploymentSourceCard({
             )}
           </button>
         ))}
+
+        <Separator className="my-4" />
+
+        <div className="flex flex-row items-start justify-between gap-4 rounded-lg border p-4">
+          <div className="min-w-0 space-y-1">
+            <div className="text-base font-medium">Allow other sources too</div>
+            <p className="text-sm text-muted-foreground">
+              Keep deploying from {SOURCE_LABELS[current]} by default, and also
+              allow pushing a local folder straight to this project:
+            </p>
+            <code className="mt-1 block break-all rounded bg-muted px-2 py-1 text-xs">
+              bunx @temps-sdk/cli drop ./ --project {project.slug}
+            </code>
+            <p className="text-sm text-muted-foreground">
+              {alternatesAreImplicit
+                ? 'This project already deploys from uploaded source, so it always accepts one.'
+                : 'Uploading a folder re-detects the build directory and preset, which is why it is off by default. Docker images and static bundles are always accepted and are unaffected by this setting.'}
+            </p>
+          </div>
+          <Switch
+            checked={alternatesAreImplicit || allowsAlternates}
+            disabled={savingAlternates || alternatesAreImplicit}
+            onCheckedChange={setAlternates}
+            aria-label="Allow deploying this project from other sources"
+          />
+        </div>
       </CardContent>
       <CardFooter>
         {isCurrent ? (

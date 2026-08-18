@@ -83,6 +83,14 @@ pub struct Model {
     /// Defaults to 'git' for backward compatibility
     #[sea_orm(default_value = "git")]
     pub source_type: SourceType,
+    /// Opt-in: accept deployments whose source differs from `source_type`.
+    ///
+    /// `source_type` stays the project's primary/default source — a Git project
+    /// keeps its repository, webhooks and rollback-rebuild behaviour. When this
+    /// is true the project will additionally accept an uploaded source archive
+    /// (`drop`), so the same project can be shipped from git, a Docker image, or
+    /// a local folder. NULL means off.
+    pub allow_alternate_sources: Option<bool>,
     /// Bounded template provenance: a reviewed bundled slug or `custom`.
     /// NULL means the project was not created through the template catalog;
     /// operator-defined slugs are never stored in this field.

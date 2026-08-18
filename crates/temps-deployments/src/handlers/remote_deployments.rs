@@ -201,10 +201,16 @@ pub async fn deploy_from_uploaded_source(
                 .with_title("Project Not Found")
                 .with_detail(format!("Project {project_id} not found"))
         })?;
-    if project.source_type != SourceType::UploadedSource {
+    if !accepts_source_archive(project.source_type, project.allow_alternate_sources) {
         return Err(problemdetails::new(StatusCode::BAD_REQUEST)
             .with_title("Invalid Project Type")
-            .with_detail("Source archives require a project with source_type 'uploaded_source'"));
+            .with_detail(format!(
+                "Project {} deploys from '{}' and does not accept uploaded source archives. \
+                 Either enable alternate sources for it \
+                 (PATCH /projects/{}/alternate-sources with {{\"allow_alternate_sources\": true}}), \
+                 or deploy it from its configured source instead.",
+                project.id, project.source_type, project.id
+            )));
     }
     let environment = environments::Entity::find_by_id(environment_id)
         .filter(environments::Column::DeletedAt.is_null())
@@ -665,6 +671,21 @@ pub struct DeployFromImageUploadQuery {
 /// absence of information would turn a transient failure into a 400 on a valid
 /// upload, and the deploy path re-checks the architecture before the image
 /// reaches any node.
+/// Whether a project will accept an uploaded source archive (`drop`).
+///
+/// A project whose primary source already IS an uploaded archive always
+/// accepts one. Every other project — most importantly a Git-backed one — has
+/// to opt in via `allow_alternate_sources`, because deploying an archive also
+/// re-detects and rewrites the project's build directory and preset. That is a
+/// silent overwrite of build configuration if it was never asked for, which is
+/// why this is gated where Docker images and static bundles are not: those
+/// leave build configuration untouched.
+///
+/// `None` means the column predates the opt-in and reads as "off".
+fn accepts_source_archive(source_type: SourceType, allow_alternate_sources: Option<bool>) -> bool {
+    source_type == SourceType::UploadedSource || allow_alternate_sources.unwrap_or(false)
+}
+
 fn uploaded_image_is_runnable(image_platform: &str, cluster_platforms: &[String]) -> bool {
     if cluster_platforms.is_empty() {
         return true;
@@ -2651,6 +2672,47 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `uploaded_source` project is what `drop` creates; it must keep
+    /// working without anyone opting into anything.
+    #[test]
+    fn uploaded_source_projects_always_accept_an_archive() {
+        assert!(accepts_source_archive(SourceType::UploadedSource, None));
+        assert!(accepts_source_archive(
+            SourceType::UploadedSource,
+            Some(false)
+        ));
+    }
+
+    /// The behaviour this opt-in exists for: a Git project keeps its repository
+    /// and still becomes droppable once the operator asks for it.
+    #[test]
+    fn git_projects_accept_an_archive_only_after_opting_in() {
+        assert!(!accepts_source_archive(SourceType::Git, None));
+        assert!(!accepts_source_archive(SourceType::Git, Some(false)));
+        assert!(accepts_source_archive(SourceType::Git, Some(true)));
+    }
+
+    /// `None` is what every row has immediately after the migration. Existing
+    /// projects must not silently gain the ability to be overwritten by a drop.
+    #[test]
+    fn absent_opt_in_reads_as_off_for_every_non_upload_source() {
+        for source_type in [
+            SourceType::Git,
+            SourceType::DockerImage,
+            SourceType::StaticFiles,
+            SourceType::Manual,
+        ] {
+            assert!(
+                !accepts_source_archive(source_type, None),
+                "{source_type} must reject archives until explicitly opted in"
+            );
+            assert!(
+                accepts_source_archive(source_type, Some(true)),
+                "{source_type} must accept archives once opted in"
+            );
+        }
+    }
 
     #[test]
     fn uploaded_image_accepted_when_a_cluster_platform_matches() {

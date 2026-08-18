@@ -1180,6 +1180,31 @@ impl ProjectService {
         Ok(updated)
     }
 
+    /// Toggle whether the project accepts deployments from a source other than
+    /// its configured `source_type`.
+    ///
+    /// This deliberately does NOT touch `source_type`: the project keeps its
+    /// primary source (and, for a Git project, its repository, webhook-driven
+    /// auto-deploy and rollback rebuild-from-source), and simply gains the
+    /// ability to also take an uploaded source archive via `drop`.
+    pub async fn set_allow_alternate_sources(
+        &self,
+        project_id: i32,
+        allow: bool,
+    ) -> Result<Project, ProjectError> {
+        let project = projects::Entity::find_by_id(project_id)
+            .filter(projects::Column::IsDeleted.eq(false))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ProjectError::NotFound(format!("project {} not found", project_id)))?;
+
+        let mut active_project: projects::ActiveModel = project.into();
+        active_project.allow_alternate_sources = Set(Some(allow));
+        active_project.updated_at = Set(chrono::Utc::now());
+        let updated = active_project.update(self.db.as_ref()).await?;
+        Ok(Self::map_db_project_to_project(updated))
+    }
+
     /// Persist deletion intent before cancelling workflows or touching Docker.
     /// Deployment workers reject projects with this fence, closing the window
     /// where a new container could appear after the cleanup snapshot.
@@ -3171,6 +3196,7 @@ impl ProjectService {
             preview_envs_idle_timeout_seconds: db_project.preview_envs_idle_timeout_seconds,
             preview_envs_wake_timeout_seconds: db_project.preview_envs_wake_timeout_seconds,
             source_type: db_project.source_type,
+            allow_alternate_sources: db_project.allow_alternate_sources,
             gitlab_webhook_id: db_project.gitlab_webhook_id,
             cross_project_trace_sharing: db_project.cross_project_trace_sharing,
             image_retention_hours: db_project.image_retention_hours,
@@ -3991,6 +4017,62 @@ mod tests {
             .expect("project remains until container cleanup completes");
         assert!(fenced.is_deleted);
         assert!(fenced.deleted_at.is_some());
+    }
+
+    /// Opting a Git project into alternate sources must leave everything that
+    /// makes it a Git project intact. If `source_type` flipped here, the
+    /// project would lose rollback rebuild-from-source (which keys off
+    /// `source_type == Git` in temps-deployments) while still looking fine.
+    #[tokio::test]
+    async fn allowing_alternate_sources_preserves_git_configuration() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            eprintln!("Test database unavailable, skipping");
+            return;
+        };
+        let db = test_db.db.clone();
+        let service = create_test_services(db.clone(), Arc::new(MockJobQueue::new())).await;
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Flexible Project".to_string()),
+            slug: Set("flexible-project".to_string()),
+            repo_name: Set("repo".to_string()),
+            repo_owner: Set("owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            source_type: Set(temps_entities::source_type::SourceType::Git),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+        assert_eq!(project.allow_alternate_sources, None, "defaults to off");
+
+        let opted_in = service
+            .set_allow_alternate_sources(project.id, true)
+            .await
+            .unwrap();
+
+        assert_eq!(opted_in.allow_alternate_sources, Some(true));
+        assert_eq!(
+            opted_in.source_type,
+            temps_entities::source_type::SourceType::Git,
+            "the project must remain git-sourced"
+        );
+        assert_eq!(opted_in.repo_owner.as_deref(), Some("owner"));
+        assert_eq!(opted_in.repo_name.as_deref(), Some("repo"));
+        assert_eq!(opted_in.main_branch, "main");
+
+        // And it must be reversible, without disturbing git config either.
+        let opted_out = service
+            .set_allow_alternate_sources(project.id, false)
+            .await
+            .unwrap();
+        assert_eq!(opted_out.allow_alternate_sources, Some(false));
+        assert_eq!(
+            opted_out.source_type,
+            temps_entities::source_type::SourceType::Git
+        );
+        assert_eq!(opted_out.repo_owner.as_deref(), Some("owner"));
     }
 
     #[tokio::test]

@@ -80,6 +80,10 @@ pub struct Project {
     pub preview_envs_wake_timeout_seconds: i32,
     /// Source type for deployments (git, docker_image, or static_files)
     pub source_type: SourceType,
+    /// Opt-in: also accept deployments from a source other than `source_type`,
+    /// so a Git project can additionally be shipped from an uploaded archive
+    /// (`drop`) without losing its repository. NULL/false means off.
+    pub allow_alternate_sources: Option<bool>,
     /// GitLab webhook ID installed on the connected repository, if any.
     pub gitlab_webhook_id: Option<i32>,
     /// ADR-027 Phase 3: whether this project's traces appear in cross-project

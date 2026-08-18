@@ -244,6 +244,20 @@ pub struct ChangeProjectSourceRequest {
     pub source_type: SourceType,
 }
 
+/// Opt a project in or out of accepting deployments from a source other than
+/// its configured `source_type`.
+///
+/// Unlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a
+/// Git project keeps its repository, branch, webhook auto-deploy and
+/// rollback-rebuild behaviour and merely gains the ability to also be deployed
+/// from an uploaded source archive.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct SetAlternateSourcesRequest {
+    /// `true` to also accept uploaded source archives, `false` to restrict the
+    /// project to its configured source again.
+    pub allow_alternate_sources: bool,
+}
+
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct TriggerPipelinePayload {
     pub branch: Option<String>,
@@ -341,6 +355,13 @@ pub struct ProjectResponse {
     pub preview_envs_wake_timeout_seconds: i32,
     /// Source type for deployments (git, docker_image, or static_files)
     pub source_type: SourceType,
+    /// Whether this project also accepts deployments from a source other than
+    /// `source_type` — chiefly, whether a Git-backed project will take an
+    /// uploaded source archive (`drop`). `null` or `false` means only the
+    /// configured `source_type` (plus Docker images and static bundles, which
+    /// every project accepts) may be deployed.
+    #[schema(example = false)]
+    pub allow_alternate_sources: Option<bool>,
     /// GitLab webhook ID installed on the connected repository.
     /// `null` when no GitLab webhook is installed (not connected to GitLab,
     /// or webhook was removed / never created).
@@ -395,6 +416,7 @@ impl ProjectResponse {
             preview_envs_idle_timeout_seconds: project.preview_envs_idle_timeout_seconds,
             preview_envs_wake_timeout_seconds: project.preview_envs_wake_timeout_seconds,
             source_type: project.source_type,
+            allow_alternate_sources: project.allow_alternate_sources,
             gitlab_webhook_id: project.gitlab_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
             image_retention_hours: project.image_retention_hours,

@@ -24,9 +24,10 @@ use tracing::{debug, error, info, warn};
 
 use super::types::{
     ChangeProjectSourceRequest, CreateProjectRequest, PaginatedProjectList, PaginationParams,
-    ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse, TriggerPipelinePayload,
-    TriggerPipelineResponse, UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest,
-    UpdateGitSettingsRequest, UpdateProjectSettingsRequest,
+    ProjectResponse, ProjectStatisticsResponse, ReinstallWebhookResponse,
+    SetAlternateSourcesRequest, TriggerPipelinePayload, TriggerPipelineResponse,
+    UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest, UpdateGitSettingsRequest,
+    UpdateProjectSettingsRequest,
 };
 use crate::services::types::CreateProjectEnvVar;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -48,6 +49,10 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/projects/by-slug/{slug}", get(get_project_by_slug))
         .route("/projects/{id}", put(update_project))
         .route("/projects/{id}/source", patch(change_project_source))
+        .route(
+            "/projects/{id}/alternate-sources",
+            patch(set_alternate_sources),
+        )
         .route("/projects/{id}", delete(delete_project))
         .route("/projects", post(create_project))
         .route("/projects", get(get_projects))
@@ -105,6 +110,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         get_project,
         update_project,
         change_project_source,
+        set_alternate_sources,
         delete_project,
         get_projects,
         get_project_by_slug,
@@ -129,6 +135,7 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
             DropInspectionResponse,
             DropPresetCandidate,
             ChangeProjectSourceRequest,
+            SetAlternateSourcesRequest,
             ProjectResponse,
             PaginatedProjectList,
             PaginationParams,
@@ -912,6 +919,72 @@ pub async fn change_project_source(
     let updated = state
         .project_service
         .set_source_type(id, req.source_type)
+        .await?;
+
+    let audit_event = ProjectUpdatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.to_string()),
+            user_agent: metadata.user_agent,
+        },
+        project_id: updated.id,
+        project_name: updated.name.clone(),
+        project_slug: updated.slug.clone(),
+        updated_fields: ProjectUpdatedFields {
+            name: Some(updated.name.clone()),
+            repo_name: None,
+            repo_owner: None,
+            directory: None,
+            main_branch: None,
+            preset: None,
+            automatic_deploy: None,
+            compose_configuration_updated: None,
+        },
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit_event).await {
+        error!("Failed to create audit log: {:?}", e);
+    }
+
+    Ok(Json(ProjectResponse::map_from_project(updated)).into_response())
+}
+
+/// Opt a project in or out of accepting deployments from a source other than
+/// its configured `source_type`.
+///
+/// This leaves `source_type` untouched — a Git project keeps its repository,
+/// branch, webhook-driven auto-deploy and rollback rebuild-from-source — and
+/// only changes whether the project will additionally accept an uploaded
+/// source archive (`drop`). Docker images and static bundles are accepted by
+/// every project regardless of this flag.
+#[utoipa::path(
+    patch,
+    path = "/projects/{id}/alternate-sources",
+    tag = "Projects",
+    params(("id" = i32, Path, description = "Project ID")),
+    request_body = SetAlternateSourcesRequest,
+    responses(
+        (status = 200, description = "Alternate-source policy updated", body = ProjectResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Forbidden"),
+        (status = 404, description = "Project not found"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn set_alternate_sources(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+    RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(req): Json<SetAlternateSourcesRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    project_scope_guard!(auth, id);
+    project_access_guard!(auth, id, state.project_access_checker);
+
+    let updated = state
+        .project_service
+        .set_allow_alternate_sources(id, req.allow_alternate_sources)
         .await?;
 
     let audit_event = ProjectUpdatedAudit {

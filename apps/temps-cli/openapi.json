@@ -28715,6 +28715,14 @@
             "description": "Opt-in to AI propose-then-confirm write capability (false = off).",
             "type": "boolean"
           },
+          "allow_alternate_sources": {
+            "description": "Whether this project also accepts deployments from a source other than\n`source_type` — chiefly, whether a Git-backed project will take an\nuploaded source archive (`drop`). `null` or `false` means only the\nconfigured `source_type` (plus Docker images and static bundles, which\nevery project accepts) may be deployed.",
+            "example": false,
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "attack_mode": {
             "description": "Attack mode - when enabled, requires CAPTCHA verification for all project environments",
             "type": "boolean"
@@ -36754,6 +36762,19 @@
           "requests_count",
           "is_bounced",
           "is_engaged"
+        ],
+        "type": "object"
+      },
+      "SetAlternateSourcesRequest": {
+        "description": "Opt a project in or out of accepting deployments from a source other than\nits configured `source_type`.\n\nUnlike `ChangeProjectSourceRequest` this leaves `source_type` alone, so a\nGit project keeps its repository, branch, webhook auto-deploy and\nrollback-rebuild behaviour and merely gains the ability to also be deployed\nfrom an uploaded source archive.",
+        "properties": {
+          "allow_alternate_sources": {
+            "description": "`true` to also accept uploaded source archives, `false` to restrict the\nproject to its configured source again.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "allow_alternate_sources"
         ],
         "type": "object"
       },
@@ -74794,6 +74815,67 @@
             "bearer_auth": []
           }
         ],
+        "tags": [
+          "Projects"
+        ]
+      }
+    },
+    "/projects/{id}/alternate-sources": {
+      "patch": {
+        "description": "This leaves `source_type` untouched — a Git project keeps its repository,\nbranch, webhook-driven auto-deploy and rollback rebuild-from-source — and\nonly changes whether the project will additionally accept an uploaded\nsource archive (`drop`). Docker images and static bundles are accepted by\nevery project regardless of this flag.",
+        "operationId": "set_alternate_sources",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetAlternateSourcesRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectResponse"
+                }
+              }
+            },
+            "description": "Alternate-source policy updated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Forbidden"
+          },
+          "404": {
+            "description": "Project not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Opt a project in or out of accepting deployments from a source other than\nits configured `source_type`.",
         "tags": [
           "Projects"
         ]
