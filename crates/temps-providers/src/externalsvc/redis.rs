@@ -674,7 +674,40 @@ impl RedisService {
                 // Handing such a DB out would expose that data to the new
                 // resource and let `drop_database` FLUSHDB it later, so an
                 // occupied-but-unowned DB is reserved and skipped instead.
-                let key_count = Self::database_key_count(&mut conn, db_number).await?;
+                // The claim is already committed at this point, but the mapping
+                // that makes it releasable is not written until below. A `?`
+                // here would therefore leave the owner key set with no mapping,
+                // and `drop_database` skips exactly that shape ("no mapping
+                // found"), so a transient SELECT/DBSIZE failure would burn one
+                // of the 15 logical DBs permanently — fifteen such blips and
+                // every future allocation fails. Release the claim before
+                // propagating so the error costs nothing but this attempt.
+                let key_count = match Self::database_key_count(&mut conn, db_number).await {
+                    Ok(count) => count,
+                    Err(probe_error) => {
+                        if let Err(release_error) =
+                            conn.del::<_, ()>(&owner_key).await.map_err(|e| {
+                                anyhow::anyhow!(
+                                    "Failed to release Redis DB {} after a failed occupancy \
+                                     probe: {}",
+                                    db_number,
+                                    e
+                                )
+                            })
+                        {
+                            // Both failed: say so, rather than reporting only
+                            // the probe error and leaving the leak unexplained.
+                            warn!(
+                                db_number,
+                                resource = resource_name,
+                                %release_error,
+                                "Could not release the Redis DB claim after a failed occupancy \
+                                 probe; this logical DB may stay reserved until cleared manually"
+                            );
+                        }
+                        return Err(probe_error);
+                    }
+                };
                 if key_count > 0 {
                     warn!(
                         db_number,

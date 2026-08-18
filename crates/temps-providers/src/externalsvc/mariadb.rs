@@ -2339,10 +2339,20 @@ impl MariaDbService {
     ) -> Result<Vec<(std::path::PathBuf, String)>> {
         use std::io::Read;
 
+        // Propagate, don't default. `read_binlog_manifest` rejects a manifest
+        // outright when any entry has an unsafe filename, precisely so a
+        // partial replay cannot report success — and `unwrap_or_default()` here
+        // turned that rejection into a replay of *zero* segments that still
+        // completes green. A PITR restore that silently drops every
+        // transaction after the base backup is the worst possible outcome:
+        // the operator believes they recovered to the requested point.
+        //
+        // A genuinely absent manifest is a different case and is still handled
+        // below — `read_binlog_manifest` returns an empty list for that rather
+        // than an error.
         let manifest = self
             .read_binlog_manifest(s3_client, bucket, prefix, source_name)
-            .await
-            .unwrap_or_default();
+            .await?;
 
         // Contiguous segment set: every shipped file >= the base's start file,
         // in lexicographic (== chronological for fixed-width names) order.

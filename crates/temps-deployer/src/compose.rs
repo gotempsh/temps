@@ -152,12 +152,23 @@ pub enum ComposeError {
 /// bare `key: value` lines) to smuggle a whole `services:` mapping past the
 /// dotenv reader. That is a sandbox escape, so referencing these names is
 /// rejected outright rather than silently skipped.
+///
+/// This is the *single* list. `validate_compose_path_not_generated` consumed a
+/// second, longer copy of it, and the two drifted: `TEMPS_SECRETS_OVERRIDE` was
+/// on that one but not here, even though it is passed to `docker compose -f` on
+/// sight exactly like the rest. Only write ordering kept that from being
+/// exploitable — the secrets override is written or deleted unconditionally
+/// after the `env_file` loop, unlike the labels override, which is written only
+/// when labels exist and was therefore reachable. One refactor making the
+/// secrets override conditional would have reopened the escape, so the lists
+/// are now the same list.
 pub(crate) const RESERVED_GENERATED_COMPOSE_FILES: &[&str] = &[
     "docker-compose.temps-env.yml",
     "docker-compose.temps-network.yml",
     "docker-compose.temps-override.yml",
     "docker-compose.temps-labels.yml",
     "docker-compose.temps-security.yml",
+    TEMPS_SECRETS_OVERRIDE,
 ];
 
 /// Whether `path` names one of the Compose files Temps generates.
@@ -625,15 +636,6 @@ impl ComposeExecutor {
     }
 
     /// Every override filename Temps writes into the stack directory itself.
-    const GENERATED_OVERRIDES: [&'static str; 6] = [
-        "docker-compose.temps-env.yml",
-        "docker-compose.temps-network.yml",
-        "docker-compose.temps-override.yml",
-        "docker-compose.temps-labels.yml",
-        "docker-compose.temps-security.yml",
-        TEMPS_SECRETS_OVERRIDE,
-    ];
-
     /// Reject a `compose_path` that names one of Temps' own generated
     /// overrides. Those files are written unconditionally, so pointing the
     /// project at one would have Temps overwrite the user's compose document
@@ -643,7 +645,7 @@ impl ComposeExecutor {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or(compose_path);
-        if Self::GENERATED_OVERRIDES.contains(&name) {
+        if RESERVED_GENERATED_COMPOSE_FILES.contains(&name) {
             return Err(ComposeError::InvalidComposePath {
                 field: "compose_path".to_string(),
                 path: compose_path.to_string(),
@@ -6500,7 +6502,7 @@ services:
 
     #[test]
     fn test_compose_path_cannot_shadow_a_generated_override() {
-        for reserved in ComposeExecutor::GENERATED_OVERRIDES {
+        for reserved in RESERVED_GENERATED_COMPOSE_FILES.iter().copied() {
             assert!(
                 ComposeExecutor::validate_compose_path_not_generated(reserved).is_err(),
                 "{reserved} should be reserved"

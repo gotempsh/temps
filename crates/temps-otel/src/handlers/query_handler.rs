@@ -1515,6 +1515,10 @@ fn redact_unreadable_projects(
     unified: &mut UnifiedTrace,
     readable: &std::collections::HashSet<i32>,
 ) {
+    let projects_before = unified.projects.len();
+    let spans_before = unified.spans.len();
+    let truncated_before = unified.truncated_projects.len();
+
     unified
         .projects
         .retain(|project| readable.contains(&project.project_id));
@@ -1525,7 +1529,12 @@ fn redact_unreadable_projects(
         .truncated_projects
         .retain(|project_id| readable.contains(project_id));
 
-    unified.has_redacted_spans = true;
+    // Only claim redaction when something was actually removed. This function
+    // is now called on every trace, and flagging a fully-readable one would
+    // tell the UI that spans are missing when none are.
+    unified.has_redacted_spans = unified.projects.len() != projects_before
+        || unified.spans.len() != spans_before
+        || unified.truncated_projects.len() != truncated_before;
     unified.start_time = unified.spans.iter().map(|a| a.span.start_time).min();
     unified.end_time = unified.spans.iter().map(|a| a.span.end_time).max();
     unified.total_duration_ms = match (unified.start_time, unified.end_time) {
@@ -1690,15 +1699,27 @@ pub async fn get_unified_trace(
         .await
         .map_err(Problem::from)?;
 
+    // Over the union of both id sources, not just `projects`.
+    //
+    // `truncated_projects` is populated *before* fan-out, from projects dropped
+    // at the cap, so those ids never appear in `projects`. Deriving the readable
+    // set from `projects` alone meant a truncated id could never be in it, and
+    // the `len() != len()` short-circuit then skipped redaction altogether — so
+    // a caller who could read every project that contributed spans still got
+    // the ids of the ones that were dropped.
     let readable = readable_project_ids(
         &auth,
         &state,
-        unified.projects.iter().map(|project| project.project_id),
+        unified
+            .projects
+            .iter()
+            .map(|project| project.project_id)
+            .chain(unified.truncated_projects.iter().copied()),
     )
     .await;
-    if readable.len() != unified.projects.len() {
-        redact_unreadable_projects(&mut unified, &readable);
-    }
+    // Unconditional: the short-circuit above was the bug, and redaction on an
+    // already-fully-readable trace is a no-op.
+    redact_unreadable_projects(&mut unified, &readable);
 
     Ok(Json(unified))
 }

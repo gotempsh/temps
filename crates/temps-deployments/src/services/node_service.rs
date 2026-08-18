@@ -143,12 +143,17 @@ fn identity_conflict_value(
     owner_address: &str,
     owner_private_address: &str,
 ) -> Option<String> {
+    // Case-insensitive, matching the DB-side comparison. DNS name verification
+    // in rustls is case-insensitive, so `Worker-1` and `worker-1` are the same
+    // identity for mTLS server-name checking even though Postgres `=` on text
+    // says otherwise.
+    let matches = |value: &String, other: &str| value.eq_ignore_ascii_case(other);
     claimed
         .iter()
         .find(|value| {
-            value.as_str() == owner_name
-                || value.as_str() == owner_address
-                || value.as_str() == owner_private_address
+            matches(value, owner_name)
+                || matches(value, owner_address)
+                || matches(value, owner_private_address)
         })
         .cloned()
 }
@@ -194,11 +199,32 @@ impl NodeService {
             return Ok(());
         }
 
+        // Compare case-insensitively. `is_in` is Postgres `=` on text, which is
+        // case-sensitive — so registering as `Worker-1` while `worker-1` exists
+        // walked straight past this guard and still got a CA-signed certificate
+        // whose DNS SAN matches the victim's name, which is the SAN-squatting
+        // the guard exists to stop.
+        let claimed_lower: Vec<String> = claimed.iter().map(|v| v.to_lowercase()).collect();
         let mut query = nodes::Entity::find().filter(
             sea_orm::Condition::any()
-                .add(nodes::Column::Name.is_in(claimed.clone()))
-                .add(nodes::Column::Address.is_in(claimed.clone()))
-                .add(nodes::Column::PrivateAddress.is_in(claimed.clone())),
+                .add(
+                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                        sea_orm::sea_query::Expr::col(nodes::Column::Name),
+                    ))
+                    .is_in(claimed_lower.clone()),
+                )
+                .add(
+                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                        sea_orm::sea_query::Expr::col(nodes::Column::Address),
+                    ))
+                    .is_in(claimed_lower.clone()),
+                )
+                .add(
+                    sea_orm::sea_query::Expr::expr(sea_orm::sea_query::Func::lower(
+                        sea_orm::sea_query::Expr::col(nodes::Column::PrivateAddress),
+                    ))
+                    .is_in(claimed_lower.clone()),
+                ),
         );
         if let Some(self_node_id) = self_node_id {
             query = query.filter(nodes::Column::Id.ne(self_node_id));
@@ -942,6 +968,31 @@ mod tests {
                 owner_private,
             ),
             None
+        );
+    }
+
+    /// Node names are matched case-insensitively: DNS labels are, and the
+    /// database column is not `citext`, so `Worker-1` would otherwise register
+    /// alongside `worker-1` and get a certificate for the same identity.
+    #[test]
+    fn identity_conflicts_ignore_name_case() {
+        assert_eq!(
+            super::identity_conflict_value(
+                &["Worker-1".to_string()],
+                "worker-1",
+                "203.0.113.7",
+                "10.44.0.2",
+            ),
+            Some("Worker-1".to_string())
+        );
+        assert_eq!(
+            super::identity_conflict_value(
+                &["worker-1".to_string()],
+                "WORKER-1",
+                "203.0.113.7",
+                "10.44.0.2",
+            ),
+            Some("worker-1".to_string())
         );
     }
 
