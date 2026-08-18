@@ -63,7 +63,7 @@ import {
   waitForHttpReady,
   assertNotConsoleFallback,
   resolveLoadTarget,
-  BROWSER_NAVIGATION_HEADERS,
+  BROWSER_DOCUMENT_HEADERS,
   teardown,
   makeRunId,
   pollUntil,
@@ -186,9 +186,9 @@ export async function sessionReplayScenarioCommand(opts: SessionReplayScenarioOp
     })
 
     let visitorCookie: string | undefined
-    await step('a browser document navigation issues a real _temps_visitor_id cookie', async () => {
+    await step('GET / issues a real _temps_visitor_id cookie', async () => {
       const res = await fetch(target.url, {
-        headers: { ...target.headers, ...BROWSER_NAVIGATION_HEADERS },
+        headers: { ...target.headers, ...BROWSER_DOCUMENT_HEADERS },
       })
       if (res.status !== 200) throw new Error(`GET / returned HTTP ${res.status}, expected 200`)
       visitorCookie = extractSetCookieValue(res.headers.getSetCookie(), '_temps_visitor_id')

@@ -12,11 +12,11 @@
  * live GET, then replay them on `POST /api/_temps/event` the way a real
  * tracking snippet would.
  *
- * The HTML response is necessary but NOT sufficient: the REQUEST must also
- * look like a browser document navigation (`GET` + an HTML `Accept`, and no
- * contradicting `Sec-Fetch-Dest`). Callers get that from
- * `BROWSER_NAVIGATION_HEADERS` in `flows.ts` -- a bare `fetch()` is
- * deliberately not tracked.
+ * An HTML response is necessary but no longer sufficient: `should_track_page`
+ * also requires the REQUEST to look like a browser top-level navigation
+ * (`is_browser_document_request`: GET + an HTML `Accept` + `Sec-Fetch-Dest:
+ * document`), so callers must send `BROWSER_DOCUMENT_HEADERS` from
+ * `lib/flows.ts`. A bare `fetch()` gets no cookies, by design.
  *
  * No external Go dependencies (stdlib only) -- see toggle-app.ts's doc
  * comment for why that matters.

@@ -2790,6 +2790,8 @@ async fn update_service_resources(
         super::metrics_handlers::get_deployment_metrics_latest,
         super::metrics_handlers::toggle_deployment_metrics,
         super::metrics_handlers::get_node_metrics_range,
+        super::metrics_handlers::list_node_alert_rules,
+        super::metrics_handlers::update_node_alert_rule,
     ),
     components(schemas(
         ServiceTypeInfo,

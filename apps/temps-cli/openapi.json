@@ -35224,6 +35224,14 @@
           "name": {
             "type": "string"
           },
+          "node_id": {
+            "description": "Node the rule is scoped to. `0` is the synthetic control-plane node\n(see `CONTROL_PLANE_NODE_ID`), which owns the `proxy.*` and `node.*`\nrules. Exactly one of `service_id`/`deployment_id`/`node_id` is set.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "service_id": {
             "format": "int32",
             "type": [
@@ -68405,6 +68413,133 @@
         "tags": [
           "Metrics"
         ]
+      }
+    },
+    "/nodes/{id}/metrics/alert-rules": {
+      "get": {
+        "description": "Node `0` is the synthetic control-plane node, which owns the seeded\n`proxy.*` (error rate, p99 latency) and `node.*` (file-descriptor /\nsocket exhaustion) defaults. Without this endpoint those rules exist only\nin the database and the operator has no way to see that they are watching,\nlet alone retune or silence them.",
+        "operationId": "NodeMetricsGetAlertRules",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ServiceAlertRuleResponse"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "List of node alert rules"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List the monitoring alert rules scoped to a node.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/nodes/{id}/metrics/alert-rules/{rule_id}": {
+      "patch": {
+        "description": "Deliberately update-only: there is no delete. The control-plane defaults\nare re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted\nrule would silently reappear on the next restart, whereas `enabled: false`\nsurvives re-seeding — disabling is the operation that actually means\n\"stop alerting on this\".",
+        "operationId": "NodeMetricsUpdateAlertRule",
+        "parameters": [
+          {
+            "description": "Node ID (0 = control plane)",
+            "in": "path",
+            "name": "id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Alert rule ID",
+            "in": "path",
+            "name": "rule_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ServiceUpdateAlertRuleRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceAlertRuleResponse"
+                }
+              }
+            },
+            "description": "Updated alert rule"
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Alert rule not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update a node-scoped monitoring alert rule.",
+        "tags": [
+          "Metrics"
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-preferences": {

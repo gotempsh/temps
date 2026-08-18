@@ -388,11 +388,19 @@ pub fn setup_proxy_server(
     // Works identically in single-process and split (ADR-017) topologies —
     // the store is the meeting point, never in-process state. Mirrors the
     // dedicated-thread pattern of the proxy-log batch writer above.
+    //
+    // The same thread also runs `NodeMetricsSampler` (cpu/memory/disk/fd
+    // percent for the machine the proxy itself is running on) — this is the
+    // process most likely to be under connection-count stress, so it is the
+    // natural place to catch the machine approaching socket/fd exhaustion
+    // before it starts refusing new connections.
     {
         let proxy_metrics = lb.proxy_metrics();
         let sampler_config_service = config_service.clone();
         let sampler_config = config.clone();
         let sampler_db = db.clone();
+        let node_sampler_config_service = config_service.clone();
+        let node_sampler_data_dir = config.data_dir.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -405,16 +413,22 @@ pub fn setup_proxy_server(
                     sampler_db,
                 )
                 .await;
-                crate::service::metrics_sampler::ProxyMetricsSampler::new(
+                let proxy_sampler = crate::service::metrics_sampler::ProxyMetricsSampler::new(
                     proxy_metrics,
-                    store,
+                    store.clone(),
                     sampler_config_service,
                 )
-                .run()
-                .await;
+                .run();
+                let node_sampler = temps_metrics::NodeMetricsSampler::new(
+                    store,
+                    node_sampler_config_service,
+                    node_sampler_data_dir,
+                )
+                .run();
+                tokio::join!(proxy_sampler, node_sampler);
             });
         });
-        info!("Proxy metrics sampler enabled");
+        info!("Proxy and node metrics samplers enabled");
     }
 
     // Setup Pingora server with explicit configuration

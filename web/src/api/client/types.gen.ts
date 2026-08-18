@@ -16166,6 +16166,12 @@ export type ServiceAlertRuleResponse = {
     id: number;
     metric_name: string;
     name: string;
+    /**
+     * Node the rule is scoped to. `0` is the synthetic control-plane node
+     * (see `CONTROL_PLANE_NODE_ID`), which owns the `proxy.*` and `node.*`
+     * rules. Exactly one of `service_id`/`deployment_id`/`node_id` is set.
+     */
+    node_id?: number | null;
     service_id?: number | null;
     severity: string;
     silenced_until?: string | null;
@@ -35280,6 +35286,90 @@ export type NodeMetricsGetRangeResponses = {
 };
 
 export type NodeMetricsGetRangeResponse = NodeMetricsGetRangeResponses[keyof NodeMetricsGetRangeResponses];
+
+export type NodeMetricsGetAlertRulesData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules';
+};
+
+export type NodeMetricsGetAlertRulesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsGetAlertRulesResponses = {
+    /**
+     * List of node alert rules
+     */
+    200: Array<ServiceAlertRuleResponse>;
+};
+
+export type NodeMetricsGetAlertRulesResponse = NodeMetricsGetAlertRulesResponses[keyof NodeMetricsGetAlertRulesResponses];
+
+export type NodeMetricsUpdateAlertRuleData = {
+    body: ServiceUpdateAlertRuleRequest;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type NodeMetricsUpdateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsUpdateAlertRuleResponses = {
+    /**
+     * Updated alert rule
+     */
+    200: ServiceAlertRuleResponse;
+};
+
+export type NodeMetricsUpdateAlertRuleResponse = NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
 
 export type DeletePreferencesData = {
     body?: never;

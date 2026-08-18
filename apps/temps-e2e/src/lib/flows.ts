@@ -459,6 +459,31 @@ export async function pollUntil<T>(
  * (the main_url is often https on :443) and on external DNS — it always lands on
  * the same proxy that serves real traffic.
  */
+/**
+ * Headers that make a request look like a real browser *top-level navigation*
+ * to the proxy's visitor tracking.
+ *
+ * `temps-proxy`'s `is_browser_document_request` (proxy.rs) deliberately
+ * requires GET + an `Accept` advertising `text/html` + Fetch Metadata naming a
+ * `document` destination before it will create visitor/session state, so that
+ * analytics counts browser navigations rather than every HTTP client that
+ * happens to receive HTML. `fetch()` sends neither by default — a wildcard
+ * Accept, and no Fetch Metadata at all — so a scenario that wants the proxy to issue
+ * `_temps_visitor_id`/`_temps_sid` must opt in with these headers — otherwise
+ * the response legitimately carries no `Set-Cookie` and the scenario is
+ * asserting against behaviour the proxy no longer has.
+ *
+ * Spread these *after* a target's own headers so the Host header is preserved.
+ */
+export const BROWSER_DOCUMENT_HEADERS: Record<string, string> = {
+  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+  'Sec-Fetch-Dest': 'document',
+  'Sec-Fetch-Mode': 'navigate',
+  'Sec-Fetch-Site': 'none',
+  'Sec-Fetch-User': '?1',
+  'Upgrade-Insecure-Requests': '1',
+}
+
 export function resolveLoadTarget(
   instanceUrl: string,
   appMainUrl: string,
@@ -479,27 +504,6 @@ export function resolveLoadTarget(
   // Hit the proxy origin with the app's host header.
   const url = `${baseUrl.protocol}//${baseUrl.host}/`
   return { url, host: appHost, logHost, headers: { Host: appHost } }
-}
-
-/**
- * Headers that make a `fetch()` look like a browser navigating to a top-level
- * document, which is what the proxy requires before it will create a
- * visitor/session and emit `_temps_visitor_id`/`_temps_sid` cookies.
- *
- * See `temps-proxy::is_browser_document_request`. The proxy needs `GET` +
- * an HTML `Accept`, and rejects a `Sec-Fetch-Dest` that is present but isn't
- * `document` (that's how it drops framework data fetches). Bun's `fetch`
- * sends a wildcard `Accept` and no Fetch Metadata by default, so without these
- * a scenario request is correctly classified as a non-browser client and no
- * cookie is ever issued — which is exactly what a real tracked page view
- * would NOT look like.
- */
-export const BROWSER_NAVIGATION_HEADERS: Record<string, string> = {
-  Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-  'Sec-Fetch-Dest': 'document',
-  'Sec-Fetch-Mode': 'navigate',
-  'Sec-Fetch-Site': 'none',
-  'Sec-Fetch-User': '?1',
 }
 
 /**
