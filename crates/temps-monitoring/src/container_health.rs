@@ -508,15 +508,21 @@ impl ContainerHealthMonitor {
         // `stats.cpu_percent` is the raw Docker number where 100% == one core, so
         // a container *allowed* 2 cores can hit 200% while only being 100%
         // utilised. We must compare the threshold against utilisation relative to
-        // the container's CPU limit — otherwise a 2-core container fires at ~95%
-        // raw (≈47% of its limit), nowhere near saturation. `cpu_used_cores`
-        // (= raw% / 100) is surfaced alongside so the alarm is actionable.
+        // the CPU the container is allowed to use — its explicit limit when it
+        // has one (otherwise a 2-core container fires at ~95% raw, ≈47% of its
+        // limit), and the host's core count when it doesn't (otherwise an
+        // uncapped container using 1 of 8 cores fires at "100%" on an idle host).
+        // `cpu_used_cores` (= raw% / 100) is surfaced alongside so the alarm is
+        // actionable.
         let cpu_utilization = stats.cpu_utilization_percent();
         let cpu_used_cores = stats.cpu_percent / 100.0;
         if cpu_utilization > self.config.cpu_threshold_percent {
-            let limit_label = match stats.cpu_limit_cores {
-                Some(cores) if cores > 0.0 => format!("{cores:.2} core limit"),
-                _ => "no limit (per-core)".to_string(),
+            let capacity_label = match (stats.cpu_limit_cores, stats.online_cpus) {
+                (Some(cores), _) if cores > 0.0 => format!("its {cores:.2}-core limit"),
+                (_, Some(cpus)) if cpus > 0 => {
+                    format!("the {cpus} cores on this host (no CPU limit set)")
+                }
+                _ => "one core (no CPU limit set, host core count unknown)".to_string(),
             };
             self.handle_resource_threshold(
                 container,
@@ -524,25 +530,29 @@ impl ContainerHealthMonitor {
                 AlarmType::HighCpu,
                 AlarmSeverity::Warning,
                 format!(
-                    "Container '{}' CPU at {:.0}% of limit",
+                    "Container '{}' CPU at {:.0}% of available capacity",
                     container.container_name, cpu_utilization
                 ),
                 format!(
-                    "Container '{}' CPU usage is at {:.0}% of its {} ({:.2} cores in use), above the {:.0}% threshold.",
+                    "Container '{}' is using {:.2} cores — {:.0}% of {}, above the {:.0}% threshold.",
                     container.container_name,
-                    cpu_utilization,
-                    limit_label,
                     cpu_used_cores,
+                    cpu_utilization,
+                    capacity_label,
                     self.config.cpu_threshold_percent,
                 ),
                 serde_json::json!({
                     "container_name": container.container_name,
-                    // Utilisation relative to the CPU limit — what the threshold is compared against.
+                    // Utilisation relative to the CPU the container may use — what
+                    // the threshold is compared against.
                     "cpu_utilization_percent": cpu_utilization,
                     // Raw Docker percentage (100% == one core) and the cores it maps to.
                     "cpu_percent": stats.cpu_percent,
                     "cpu_used_cores": cpu_used_cores,
                     "cpu_limit_cores": stats.cpu_limit_cores,
+                    // Host cores — the ceiling used when no limit is configured.
+                    "online_cpus": stats.online_cpus,
+                    "cpu_ceiling_cores": stats.cpu_ceiling_cores(),
                     "threshold_percent": self.config.cpu_threshold_percent,
                 }),
             )
@@ -653,7 +663,8 @@ impl ContainerHealthMonitor {
                 stats.cpu_percent,
                 MetricKind::Gauge,
             ),
-            // CPU usage relative to the container's CPU limit (100% == limit
+            // CPU usage relative to the CPU the container may use — its limit
+            // when set, otherwise every core on the host (100% == that capacity
             // fully saturated). This is the metric alert rules should threshold
             // against — see `container_default_seeds()` in the evaluator.
             make_point(
@@ -885,6 +896,15 @@ mod tests {
 
         async fn set_cpu_percent(&self, percent: f64) {
             self.stats.lock().await.cpu_percent = percent;
+        }
+
+        /// Set the raw Docker CPU percentage together with the CPU the
+        /// container is allowed to use (limit if any, plus the host's cores).
+        async fn set_cpu(&self, percent: f64, limit_cores: Option<f64>, online_cpus: u32) {
+            let mut stats = self.stats.lock().await;
+            stats.cpu_percent = percent;
+            stats.cpu_limit_cores = limit_cores;
+            stats.online_cpus = Some(online_cpus);
         }
 
         async fn set_memory_percent(&self, percent: f64) {
@@ -1227,6 +1247,68 @@ mod tests {
     }
 
     // ── Resource threshold tests ──────────────────────────────────────
+
+    /// Build a monitor over a mock deployer, with no metrics store.
+    fn make_monitor(deployer: Arc<MockDeployer>) -> ContainerHealthMonitor {
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let alarm_service = make_alarm_service(db.clone());
+        ContainerHealthMonitor::new(
+            db,
+            deployer,
+            alarm_service,
+            ContainerHealthConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn test_uncapped_container_does_not_breach_at_one_core_of_many() {
+        // Regression: with no CPU limit, one saturated core used to normalise to
+        // 100% and trip the 90% threshold — on a host with 7 idle cores.
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        deployer.set_cpu(100.0, None, 8).await;
+        let container = make_container_model(1);
+        let deployment = make_deployment_model();
+
+        let monitor = make_monitor(deployer);
+        monitor.check_resource_usage(&container, &deployment).await;
+
+        let counters = monitor.resource_counters.read().await;
+        assert!(
+            counters.get(&(1, "high_cpu")).is_none(),
+            "uncapped container using 1 of 8 cores must not count as a CPU breach"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_uncapped_container_breaches_when_it_saturates_the_host() {
+        // 7.8 of 8 cores == 97.5% of what it's allowed: a real breach.
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        deployer.set_cpu(780.0, None, 8).await;
+        let container = make_container_model(1);
+        let deployment = make_deployment_model();
+
+        let monitor = make_monitor(deployer);
+        monitor.check_resource_usage(&container, &deployment).await;
+
+        let counters = monitor.resource_counters.read().await;
+        assert_eq!(*counters.get(&(1, "high_cpu")).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_capped_container_breaches_against_its_own_limit() {
+        // 0.48 cores against a 0.5-core cap == 96%, even though the 8-core host
+        // is almost entirely idle.
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Running));
+        deployer.set_cpu(48.0, Some(0.5), 8).await;
+        let container = make_container_model(1);
+        let deployment = make_deployment_model();
+
+        let monitor = make_monitor(deployer);
+        monitor.check_resource_usage(&container, &deployment).await;
+
+        let counters = monitor.resource_counters.read().await;
+        assert_eq!(*counters.get(&(1, "high_cpu")).unwrap(), 1);
+    }
 
     #[tokio::test]
     async fn test_resource_counter_increments_before_alarm() {

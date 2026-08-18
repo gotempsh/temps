@@ -27,6 +27,12 @@
 //! | `node.disk_used_bytes` | Gauge | Disk space used under `data_dir` |
 //! | `node.disk_total_bytes` | Gauge | Total disk space under `data_dir` |
 //! | `node.disk_percent` | Gauge | used / total × 100 |
+//! | `node.fd_allocated` | Gauge | System-wide allocated file handles (`/proc/sys/fs/file-nr`) |
+//! | `node.fd_max` | Gauge | System-wide file handle ceiling (`fs.file-max`) |
+//! | `node.fd_percent` | Gauge | allocated / max × 100 — sockets are file descriptors, so this is the machine-wide "running out of sockets" signal |
+//! | `node.process_open_fds` | Gauge | This process's own open file descriptor count (`/proc/self/fd`) |
+//! | `node.process_fd_limit` | Gauge | This process's soft `RLIMIT_NOFILE` |
+//! | `node.process_fd_percent` | Gauge | open / limit × 100 — this process hitting its own ceiling, independent of the system-wide one |
 //!
 //! ## Non-Linux behaviour
 //!
@@ -106,6 +112,10 @@ impl Collector for NodeMetricsCollector {
 
         // Disk — synchronous statvfs call.
         points.extend(collect_disk(source_id, config, Path::new(data_dir), now));
+
+        // File descriptors — synchronous /proc reads + getrlimit(2).
+        points.extend(collect_system_fds(source_id, config, now));
+        points.extend(collect_process_fds(source_id, config, now));
 
         debug!(
             source_id,
@@ -358,6 +368,134 @@ fn collect_disk(
     }
 }
 
+// ── File descriptors, system-wide (/proc/sys/fs/file-nr) ──────────────────────
+
+/// Read the machine-wide count of allocated file handles and the kernel
+/// ceiling on that count. Every open socket, pipe and file counts against
+/// this the same way, so it is the definitive "is this machine about to
+/// start refusing new connections with `ENFILE`" signal — independent of any
+/// single process's own limit.
+fn collect_system_fds(
+    source_id: i32,
+    config: &CollectorConfig,
+    now: DateTime<Utc>,
+) -> Vec<MetricPoint> {
+    let content = match std::fs::read_to_string("/proc/sys/fs/file-nr") {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+
+    // Format: "<allocated>\t<free (always 0 on Linux >= 2.6, unused)>\t<max>"
+    let mut fields = content.split_whitespace();
+    let allocated: f64 = match fields.next().and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => {
+            warn!(
+                source_id,
+                "could not parse allocated fd count from /proc/sys/fs/file-nr"
+            );
+            return Vec::new();
+        }
+    };
+    let _unused = fields.next();
+    let max: f64 = match fields.next().and_then(|v| v.parse().ok()) {
+        Some(v) => v,
+        None => {
+            warn!(
+                source_id,
+                "could not parse fd-max from /proc/sys/fs/file-nr"
+            );
+            return Vec::new();
+        }
+    };
+
+    let percent = if max > 0.0 {
+        (allocated / max) * 100.0
+    } else {
+        0.0
+    };
+
+    vec![
+        gauge(source_id, config, "node.fd_allocated", allocated, now),
+        gauge(source_id, config, "node.fd_max", max, now),
+        gauge(source_id, config, "node.fd_percent", percent, now),
+    ]
+}
+
+// ── File descriptors, this process (/proc/self/fd + getrlimit) ────────────────
+
+/// Read this process's own open file descriptor count against its soft
+/// `RLIMIT_NOFILE`. This is the process most likely to be holding the
+/// sockets on a temps box (the proxy), so it can hit its own ceiling well
+/// before the system-wide one is anywhere close.
+fn collect_process_fds(
+    source_id: i32,
+    config: &CollectorConfig,
+    now: DateTime<Utc>,
+) -> Vec<MetricPoint> {
+    #[cfg(unix)]
+    {
+        // Counting directory entries under /proc/self/fd is the standard way
+        // to read a process's own open-fd count on Linux. This includes the
+        // directory handle opened to perform the listing itself (a constant
+        // +1), which is negligible against real usage. Not present on
+        // non-Linux unix (e.g. macOS has no /proc): degrades gracefully.
+        let open_fds = match std::fs::read_dir("/proc/self/fd") {
+            Ok(entries) => entries.count() as f64,
+            Err(_) => return Vec::new(),
+        };
+
+        let limit = match read_nofile_soft_limit() {
+            Some(v) => v,
+            None => {
+                // RLIM_INFINITY or a getrlimit(2) failure: still report the
+                // raw count, just skip the percent metric with no ceiling to
+                // divide by.
+                return vec![gauge(
+                    source_id,
+                    config,
+                    "node.process_open_fds",
+                    open_fds,
+                    now,
+                )];
+            }
+        };
+
+        let percent = if limit > 0.0 {
+            (open_fds / limit) * 100.0
+        } else {
+            0.0
+        };
+
+        vec![
+            gauge(source_id, config, "node.process_open_fds", open_fds, now),
+            gauge(source_id, config, "node.process_fd_limit", limit, now),
+            gauge(source_id, config, "node.process_fd_percent", percent, now),
+        ]
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = (source_id, config, now);
+        Vec::new()
+    }
+}
+
+#[cfg(unix)]
+fn read_nofile_soft_limit() -> Option<f64> {
+    // SAFETY: RLIMIT_NOFILE with a zeroed, properly sized stack allocation is
+    // the standard getrlimit(2) call.
+    let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+    let rc = unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) };
+    if rc != 0 {
+        return None;
+    }
+    if limit.rlim_cur == libc::RLIM_INFINITY {
+        return None;
+    }
+    Some(limit.rlim_cur as f64)
+}
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 fn gauge(
@@ -469,6 +607,78 @@ mod tests {
         let config = make_config(1, "/this/does/not/exist/ever");
         let now = Utc::now();
         let points = collect_disk(1, &config, Path::new("/this/does/not/exist/ever"), now);
+        assert!(points.is_empty());
+    }
+
+    // ── collect_system_fds ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_collect_system_fds_on_linux() {
+        if !Path::new("/proc/sys/fs/file-nr").exists() {
+            return; // non-Linux: skip gracefully
+        }
+
+        let config = make_config(1, "/tmp");
+        let now = Utc::now();
+        let points = collect_system_fds(1, &config, now);
+
+        assert_eq!(points.len(), 3, "expected fd_allocated, fd_max, fd_percent");
+        let names: Vec<&str> = points.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"node.fd_allocated"));
+        assert!(names.contains(&"node.fd_max"));
+        assert!(names.contains(&"node.fd_percent"));
+
+        let max = points.iter().find(|p| p.name == "node.fd_max").unwrap();
+        assert!(max.value > 0.0, "fd_max must be > 0");
+
+        let pct = points.iter().find(|p| p.name == "node.fd_percent").unwrap();
+        assert!((0.0..=100.0).contains(&pct.value), "percent out of range");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_collect_system_fds_non_unix_empty() {
+        let config = make_config(1, "/tmp");
+        let points = collect_system_fds(1, &config, Utc::now());
+        assert!(points.is_empty());
+    }
+
+    // ── collect_process_fds ───────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn test_collect_process_fds_on_unix() {
+        if !Path::new("/proc/self/fd").exists() {
+            return; // unix without /proc (e.g. macOS): skip gracefully
+        }
+
+        let config = make_config(1, "/tmp");
+        let now = Utc::now();
+        let points = collect_process_fds(1, &config, now);
+
+        assert!(
+            points.iter().any(|p| p.name == "node.process_open_fds"),
+            "process_open_fds must be present when /proc/self/fd exists"
+        );
+        let open = points
+            .iter()
+            .find(|p| p.name == "node.process_open_fds")
+            .unwrap();
+        assert!(open.value >= 1.0, "the test process itself has open fds");
+
+        // The soft limit is present unless getrlimit(2) reports
+        // RLIM_INFINITY, which is rare but legal — only assert the
+        // percent's range when the limit metric is present.
+        if let Some(pct) = points.iter().find(|p| p.name == "node.process_fd_percent") {
+            assert!(pct.value >= 0.0, "percent must be non-negative");
+        }
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn test_collect_process_fds_non_unix_empty() {
+        let config = make_config(1, "/tmp");
+        let points = collect_process_fds(1, &config, Utc::now());
         assert!(points.is_empty());
     }
 

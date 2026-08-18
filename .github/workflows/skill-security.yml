@@ -65,6 +65,7 @@ jobs:
               "apps/temps-cli/package.json",
               "apps/temps-cli/src/commands/docs.ts",
               "apps/temps-cli/src/commands/docs.test.ts",
+              "skills/temps-cli/SKILL.md",
               "skills/temps-cli/references/COMMANDS.md",
           }
           name_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
@@ -139,9 +140,11 @@ jobs:
                       selected.add(validated)
 
               # The /temps command references are generated from the CLI
-              # catalog. Changes to that catalog or its generator must scan
-              # and validate both the source skill and routed skill even when
-              # only one skill directory appears in the diff.
+              # catalog, and both skills pin the same package integrity in
+              # their preflight guard. Changes to that catalog, its generator,
+              # or the guard must scan and validate both the source skill and
+              # routed skill even when only one skill directory appears in the
+              # diff.
               if temps_dependency_files.intersection(changed):
                   for dependent_skill in ("temps", "temps-cli"):
                       validated = validate_skill(skills_root / dependent_skill)

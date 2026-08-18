@@ -61,6 +61,7 @@ import {
   waitForHttpReady,
   assertNotConsoleFallback,
   resolveLoadTarget,
+  BROWSER_DOCUMENT_HEADERS,
   teardown,
   makeRunId,
   pollUntil,
@@ -187,9 +188,11 @@ export async function analyticsScenarioCommand(opts: AnalyticsScenarioOptions): 
     let visitorCookie: string | undefined
     let sessionCookie: string | undefined
     await step(
-      'GET / issues real _temps_visitor_id and _temps_sid cookies (should_track_page requires an HTML response)',
+      'GET / issues real _temps_visitor_id and _temps_sid cookies (should_track_page requires an HTML response AND browser document-navigation headers)',
       async () => {
-        const res = await fetch(target.url, { headers: target.headers })
+        const res = await fetch(target.url, {
+          headers: { ...target.headers, ...BROWSER_DOCUMENT_HEADERS },
+        })
         if (res.status !== 200) throw new Error(`GET / returned HTTP ${res.status}, expected 200`)
         const setCookies = res.headers.getSetCookie()
         visitorCookie = extractSetCookieValue(setCookies, '_temps_visitor_id')

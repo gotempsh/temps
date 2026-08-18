@@ -13,6 +13,7 @@ import {
   getSettings,
   updateSettings,
 } from '../../api/sdk.gen.js'
+import { platformAlertRulesList, platformAlertRulesSet } from './alert-rules.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { promptConfirm } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, info, keyValue, success, warning, error, formatDate } from '../../ui/output.js'
@@ -76,6 +77,44 @@ export function registerPlatformCommands(program: Command): void {
     .option('-y, --yes', 'Skip the confirmation prompt')
     .option('--json', 'Output in JSON format')
     .action(updateApplyAction)
+
+  // Node-scoped monitoring alert rules — the control-plane's own proxy and
+  // file-descriptor/socket-exhaustion alerts, which belong to no project.
+  const alertRules = platform
+    .command('alert-rules')
+    .description("Inspect and retune the control-plane's own monitoring alert rules")
+
+  alertRules
+    .command('list')
+    .description('List the alert rules watching this node (proxy health, socket exhaustion)')
+    .option('--node <id>', 'Node ID (default: 0, the control plane)')
+    .option('--json', 'Output in JSON format')
+    .action(platformAlertRulesList)
+
+  alertRules
+    .command('set <rule-id>')
+    .description('Retune, enable, or disable an alert rule on this node')
+    .option('--node <id>', 'Node ID (default: 0, the control plane)')
+    .option('--threshold <n>', 'Value the metric must cross to fire')
+    .option('--comparator <op>', 'Comparison operator: >, >=, <, <=')
+    .option('--severity <level>', 'Alert severity: warning or critical')
+    .option('--for-duration <secs>', 'Seconds the condition must hold before firing')
+    .option('--enable', 'Enable the rule')
+    .option('--disable', 'Disable the rule (survives the startup re-seed; deleting does not)')
+    .option('--json', 'Output in JSON format')
+    .action(platformAlertRulesSet)
+
+  alertRules.addHelpText(
+    'after',
+    `
+These rules are seeded automatically on server startup and are update-only:
+a deleted rule reappears on the next restart, so use --disable to stop one.
+
+Examples:
+  $ temps platform alert-rules list
+  $ temps platform alert-rules set 39 --threshold 80
+  $ temps platform alert-rules set 39 --disable`
+  )
 }
 
 async function platformInfoAction(options: { json?: boolean }): Promise<void> {

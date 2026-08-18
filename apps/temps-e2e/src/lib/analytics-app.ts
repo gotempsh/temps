@@ -5,12 +5,18 @@
  *
  * `temps-proxy::LoadBalancer::should_track_page` (proxy.rs) only calls
  * `ensure_visitor_session`/`set_tracking_cookies` for responses whose
- * content-type is `text/html` (or a 4xx/5xx status) -- a plain-text "ok"
- * response, like the other throwaway apps in this suite return, never
- * triggers cookie issuance at all. This app exists solely to be a real
- * tracked "website" so the scenario can capture genuine `_temps_visitor_id`/
- * `_temps_sid` Set-Cookie values from a live GET, then replay them on
- * `POST /api/_temps/event` the way a real tracking snippet would.
+ * content-type is `text/html` -- a plain-text "ok" response, like the other
+ * throwaway apps in this suite return, never triggers cookie issuance at all.
+ * This app exists solely to be a real tracked "website" so the scenario can
+ * capture genuine `_temps_visitor_id`/`_temps_sid` Set-Cookie values from a
+ * live GET, then replay them on `POST /api/_temps/event` the way a real
+ * tracking snippet would.
+ *
+ * An HTML response is necessary but no longer sufficient: `should_track_page`
+ * also requires the REQUEST to look like a browser top-level navigation
+ * (`is_browser_document_request`: GET + an HTML `Accept` + `Sec-Fetch-Dest:
+ * document`), so callers must send `BROWSER_DOCUMENT_HEADERS` from
+ * `lib/flows.ts`. A bare `fetch()` gets no cookies, by design.
  *
  * No external Go dependencies (stdlib only) -- see toggle-app.ts's doc
  * comment for why that matters.
