@@ -364,6 +364,47 @@ fn strip_excluded_services_value(root: &mut serde_yaml::Value, excluded: &[Strin
     }
 }
 
+/// Keys an inline override may not set because the deploy-time security
+/// policy (`temps-deployer::compose::validate_compose_security_policy`)
+/// rejects them outright, wherever they appear. Telling someone to move one of
+/// these into the repository Compose file would be sending them to do work
+/// that fails later, at deploy, with a different error.
+const NEVER_ALLOWED_SERVICE_KEYS: &[&str] = &[
+    "privileged",
+    "cgroup_parent",
+    "cap_add",
+    "devices",
+    "device_cgroup_rules",
+    "security_opt",
+    "sysctls",
+    "volumes_from",
+    "group_add",
+    "runtime",
+    "oom_kill_disable",
+    "tmpfs",
+    "ulimits",
+];
+
+/// Keys an inline override may not set, but which the repository Compose file
+/// legitimately can — the deploy-time policy admits them subject to its own
+/// checks (bind-mount path confinement for `volumes`, byte caps for
+/// `shm_size`, host-namespace rejection for `pid`/`ipc`/`network_mode` and
+/// friends). Kept separate from [`NEVER_ALLOWED_SERVICE_KEYS`] so the error
+/// can point somewhere that actually works instead of issuing the same
+/// blanket "move it to the repository" advice for every key.
+const REPO_ONLY_SERVICE_KEYS: &[&str] = &[
+    "network_mode",
+    "pid",
+    "ipc",
+    "uts",
+    "cgroup",
+    "userns_mode",
+    "cap_drop",
+    "volumes",
+    "shm_size",
+    "labels",
+];
+
 fn validate_preview_override(
     base: &serde_yaml::Value,
     override_document: &serde_yaml::Value,
@@ -407,39 +448,30 @@ fn validate_preview_override(
                 reason: format!("service '{name}' override must be a mapping"),
             });
         };
-        const FORBIDDEN_SERVICE_KEYS: &[&str] = &[
-            "privileged",
-            "network_mode",
-            "pid",
-            "ipc",
-            "uts",
-            "cgroup",
-            "cgroup_parent",
-            "cap_add",
-            "cap_drop",
-            "devices",
-            "device_cgroup_rules",
-            "security_opt",
-            "sysctls",
-            "userns_mode",
-            "volumes",
-            "volumes_from",
-            "group_add",
-            "runtime",
-            "oom_kill_disable",
-            "shm_size",
-            "tmpfs",
-            "ulimits",
-            "labels",
-        ];
         if let Some(key) = service
             .keys()
             .filter_map(serde_yaml::Value::as_str)
-            .find(|key| FORBIDDEN_SERVICE_KEYS.contains(key))
+            .find(|key| NEVER_ALLOWED_SERVICE_KEYS.contains(key))
         {
             return Err(ComposeParseError::InvalidOverride {
                 reason: format!(
-                    "service '{name}' uses forbidden inline override key '{key}'; put host-affecting Compose settings in the repository Compose file for review"
+                    "service '{name}' uses forbidden key '{key}', which Compose deployments \
+                     do not permit anywhere — the deploy-time security policy rejects it in \
+                     the repository Compose file too, so moving it there will not help"
+                ),
+            });
+        }
+        if let Some(key) = service
+            .keys()
+            .filter_map(serde_yaml::Value::as_str)
+            .find(|key| REPO_ONLY_SERVICE_KEYS.contains(key))
+        {
+            return Err(ComposeParseError::InvalidOverride {
+                reason: format!(
+                    "service '{name}' cannot set '{key}' as an inline override; declare it in \
+                     the repository Compose file instead, where it is checked against the \
+                     deployment security policy (host paths, host namespaces and resource \
+                     limits are still rejected there)"
                 ),
             });
         }
@@ -1142,9 +1174,54 @@ secrets:
 
         let error = render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap_err();
 
-        assert!(error
-            .to_string()
-            .contains("forbidden inline override key 'privileged'"));
+        assert!(error.to_string().contains("forbidden key 'privileged'"));
+    }
+
+    /// `privileged` is rejected by the deploy-time policy as well, so the
+    /// preview must not send the user off to move it into the repository
+    /// Compose file — that trip ends in a second, different failure.
+    #[test]
+    fn effective_preview_does_not_advise_moving_never_allowed_keys_to_the_repository() {
+        let base = "services:\n  web:\n    image: nginx\n";
+        let override_yaml = "services:\n  web:\n    privileged: true\n";
+
+        let error = render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("do not permit anywhere") && message.contains("will not help"),
+            "expected the message to rule out the repository Compose file, got {message}"
+        );
+    }
+
+    /// `volumes` *is* accepted in the repository Compose file (subject to
+    /// bind-path confinement), so the preview should point there.
+    #[test]
+    fn effective_preview_points_repo_only_keys_at_the_repository_compose_file() {
+        let base = "services:\n  web:\n    image: nginx\n";
+        let override_yaml = "services:\n  web:\n    volumes: ['data:/var/lib/data']\n";
+
+        let error = render_effective_compose_preview(base, Some(override_yaml), &[]).unwrap_err();
+
+        let message = error.to_string();
+        assert!(
+            message.contains("declare it in the repository Compose file"),
+            "expected the message to point at the repository Compose file, got {message}"
+        );
+        assert!(
+            !message.contains("do not permit anywhere"),
+            "'volumes' is not forbidden everywhere, got {message}"
+        );
+    }
+
+    #[test]
+    fn override_key_denylists_are_disjoint() {
+        for key in NEVER_ALLOWED_SERVICE_KEYS {
+            assert!(
+                !REPO_ONLY_SERVICE_KEYS.contains(key),
+                "'{key}' is classified both as never-allowed and as repo-only"
+            );
+        }
     }
 
     #[test]

@@ -464,12 +464,12 @@ impl WorkflowTask for DeployComposeJob {
                     type_param
                 );
                 if needs_relaxed_capabilities {
-                    message.push_str(
+                    message.push_str(&format!(
                         " It also runs with all Linux capabilities dropped by default; if \
                          it fails to start with \"Operation not permitted\" errors, enable \
-                         \"Elevated permissions\" for it in Project Settings → Git → \
-                         Compose services, then redeploy.",
-                    );
+                         \"Elevated permissions\" for it in {}, then redeploy.",
+                        temps_deployer::compose::ELEVATED_PERMISSIONS_SETTINGS_PATH,
+                    ));
                 }
                 let _ = self.log_service.log_info(log_id, &message).await;
             }
