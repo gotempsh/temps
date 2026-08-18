@@ -22,6 +22,7 @@ import {
   nodeMetricsGetRangeOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TimeBucketStats } from '@/api/client/types.gen'
+import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -320,6 +321,61 @@ const NODE_PANELS: NodePanelDef[] = [
   },
 ]
 
+/**
+ * File-descriptor panels — the socket-exhaustion signal.
+ *
+ * Every socket the proxy holds is a file descriptor, so these two series are
+ * how close the machine is to refusing new connections. They are separate from
+ * NODE_PANELS because they describe the host rather than proxy traffic, and
+ * they are what the seeded `node.fd_percent` / `node.process_fd_percent` alert
+ * rules watch.
+ *
+ * Linux-only: both are read from `/proc`, so a macOS dev box shows the empty
+ * state rather than a broken chart.
+ */
+const FD_PANELS: NodePanelDef[] = [
+  {
+    title: 'File descriptors in use',
+    description:
+      'How close the host is to running out of file descriptors — which is how it runs out of sockets. System-wide is against /proc/sys/fs/file-nr; process is the temps binary against its own RLIMIT_NOFILE',
+    series: [
+      {
+        metric: 'node.fd_percent',
+        dataKey: 'node.fd_percent',
+        label: 'System-wide',
+        color: '#dc2626',
+      },
+      {
+        metric: 'node.process_fd_percent',
+        dataKey: 'node.process_fd_percent',
+        label: 'This process',
+        color: '#d97706',
+      },
+    ],
+    valueFormatter: formatPercent,
+  },
+  {
+    title: 'Open file descriptors',
+    description:
+      'Absolute counts, for capacity planning. The process count is always reported; its percentage only exists when RLIMIT_NOFILE is finite',
+    series: [
+      {
+        metric: 'node.fd_allocated',
+        dataKey: 'node.fd_allocated',
+        label: 'System-wide',
+        color: '#2563eb',
+      },
+      {
+        metric: 'node.process_open_fds',
+        dataKey: 'node.process_open_fds',
+        label: 'This process',
+        color: '#16a34a',
+      },
+    ],
+    valueFormatter: formatCount,
+  },
+]
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -510,9 +566,11 @@ function ChartPanel({
 function NodeMetricPanel({
   panel,
   window,
+  emptyText = 'No proxy metrics yet — data appears within a minute of traffic',
 }: {
   panel: NodePanelDef
   window: ResolvedProxyWindow
+  emptyText?: string
 }) {
   const results = useQueries({
     queries: panel.series.map((s) => proxySeriesQuery(s.metric, window)),
@@ -554,7 +612,7 @@ function NodeMetricPanel({
       valueFormatter={panel.valueFormatter}
       isPending={isPending}
       errorText={errorText}
-      emptyText="No proxy metrics yet — data appears within a minute of traffic"
+      emptyText={emptyText}
     />
   )
 }
@@ -1321,6 +1379,26 @@ export default function ProxyMetrics() {
                 />
               ))}
             </div>
+            <div>
+              <h3 className="text-lg font-semibold tracking-tight">
+                Sockets &amp; file descriptors
+              </h3>
+              <p className="mb-4 text-sm text-muted-foreground">
+                Sockets are file descriptors, so descriptor exhaustion is how
+                the proxy stops accepting connections. Collected on Linux only.
+              </p>
+              <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+                {FD_PANELS.map((panel) => (
+                  <NodeMetricPanel
+                    key={panel.title}
+                    panel={panel}
+                    window={resolved}
+                    emptyText="No file-descriptor samples in this window. These are read from /proc, so they are only collected when temps runs on Linux."
+                  />
+                ))}
+              </div>
+            </div>
+            <NodeAlertRules />
           </>
         )}
 
