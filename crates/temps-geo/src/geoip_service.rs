@@ -1,7 +1,10 @@
 use maxminddb::geoip2;
 use rand::prelude::IndexedRandom;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::net::IpAddr;
+use std::path::PathBuf;
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -180,8 +183,45 @@ const MOCK_CITIES: &[MockCity] = &[
 ];
 
 pub enum GeoIpService {
-    MaxMind(Box<MaxMindGeoIpService>),
+    MaxMind(Arc<MaxMindGeoIpService>),
     Mock(MockGeoIpService),
+}
+
+/// Readers already loaded in this process, keyed by the resolved City database
+/// path and held weakly so the memo never outlives its last consumer.
+///
+/// `temps serve` builds two independent plugin registries in one process -- one
+/// for the proxy (`temps_proxy::server::setup_proxy_server`) and one for the
+/// console API (`start_console_api`) -- and each registers its own `GeoPlugin`.
+/// Without this memo each registration calls `Reader::open_readfile`, which
+/// reads the whole database into a fresh `Vec<u8>`, so a single-node instance
+/// holds two full copies of GeoLite2-City.mmdb on the heap.
+static LOADED_DATABASES: LazyLock<Mutex<HashMap<PathBuf, Weak<MaxMindGeoIpService>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Returns the cached value for `key`, or inserts what `load` produces.
+///
+/// The lock is deliberately held across `load`: the proxy and console register
+/// their geo plugins concurrently, so releasing it first would let both observe
+/// a miss and each read the database anyway -- the exact duplication this memo
+/// exists to prevent. `load` is startup-only file I/O, never on a request path.
+/// A poisoned lock only means some earlier caller panicked while loading; the
+/// map itself is still a consistent cache, so recover it rather than propagate.
+fn get_or_load<T, F>(
+    cache: &Mutex<HashMap<PathBuf, Weak<T>>>,
+    key: PathBuf,
+    load: F,
+) -> Result<Arc<T>, GeoIpError>
+where
+    F: FnOnce() -> Result<T, GeoIpError>,
+{
+    let mut cache = cache.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(existing) = cache.get(&key).and_then(Weak::upgrade) {
+        return Ok(existing);
+    }
+    let loaded = Arc::new(load()?);
+    cache.insert(key, Arc::downgrade(&loaded));
+    Ok(loaded)
 }
 
 /// Resolves an mmdb filename the same way `validate_geolite2_database`
@@ -229,39 +269,43 @@ impl GeoIpService {
         }
 
         let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
-        debug!("Loading MaxMind database from: {:?}", db_path);
-        let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
-            GeoIpError::Other(format!(
-                "Failed to open MaxMind database at '{}': {}",
-                db_path.display(),
-                e
-            ))
+        let service = get_or_load(&LOADED_DATABASES, db_path.clone(), || {
+            debug!("Loading MaxMind database from: {:?}", db_path);
+            let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
+                GeoIpError::Other(format!(
+                    "Failed to open MaxMind database at '{}': {}",
+                    db_path.display(),
+                    e
+                ))
+            })?;
+
+            // ASN database is optional: hosting-provider detection degrades gracefully
+            // (asn_org/is_hosting_provider stay None) rather than failing startup when
+            // the operator hasn't provisioned it, same as the City database's own
+            // optional-file convention in Dockerfile/docker-compose.
+            let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
+            let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
+                Ok(reader) => {
+                    info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
+                    Some(reader)
+                }
+                Err(e) => {
+                    warn!(
+                        "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
+                        asn_db_path.display(),
+                        e
+                    );
+                    None
+                }
+            };
+
+            Ok(MaxMindGeoIpService {
+                reader,
+                asn_reader,
+            })
         })?;
 
-        // ASN database is optional: hosting-provider detection degrades gracefully
-        // (asn_org/is_hosting_provider stay None) rather than failing startup when
-        // the operator hasn't provisioned it, same as the City database's own
-        // optional-file convention in Dockerfile/docker-compose.
-        let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
-        let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
-            Ok(reader) => {
-                info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
-                Some(reader)
-            }
-            Err(e) => {
-                warn!(
-                    "MaxMind ASN database not found at '{}' ({}); hosting-provider detection disabled",
-                    asn_db_path.display(),
-                    e
-                );
-                None
-            }
-        };
-
-        Ok(Self::MaxMind(Box::new(MaxMindGeoIpService {
-            reader,
-            asn_reader,
-        })))
+        Ok(Self::MaxMind(service))
     }
 
     pub async fn geolocate(&self, ip: IpAddr) -> Result<GeoLocation, GeoIpError> {
@@ -427,6 +471,73 @@ impl MockGeoIpService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second load of the same database path must reuse the first reader
+    /// rather than allocate another copy. This is the whole point of the memo:
+    /// `temps serve` registers `GeoPlugin` once for the proxy and once for the
+    /// console API, and GeoLite2-City.mmdb is ~58 MiB per copy.
+    #[test]
+    fn test_get_or_load_reuses_live_entry_for_same_path() {
+        let cache: Mutex<HashMap<PathBuf, Weak<String>>> = Mutex::new(HashMap::new());
+        let path = PathBuf::from("/data/GeoLite2-City.mmdb");
+
+        let first = get_or_load(&cache, path.clone(), || Ok("loaded once".to_string()))
+            .expect("first load should succeed");
+        let second = get_or_load(&cache, path.clone(), || {
+            panic!("second load must come from the memo, not re-read the database")
+        })
+        .expect("second load should hit the memo");
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(Arc::strong_count(&first), 2);
+    }
+
+    #[test]
+    fn test_get_or_load_keys_on_path() {
+        let cache: Mutex<HashMap<PathBuf, Weak<String>>> = Mutex::new(HashMap::new());
+
+        let a = get_or_load(&cache, PathBuf::from("/a/City.mmdb"), || Ok("a".to_string()))
+            .expect("load a");
+        let b = get_or_load(&cache, PathBuf::from("/b/City.mmdb"), || Ok("b".to_string()))
+            .expect("load b");
+
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(*a, "a");
+        assert_eq!(*b, "b");
+    }
+
+    /// The memo holds `Weak`, so once every consumer drops its handle the
+    /// database is freed and a later caller reloads it instead of resurrecting
+    /// a dangling entry.
+    #[test]
+    fn test_get_or_load_reloads_after_all_handles_dropped() {
+        let cache: Mutex<HashMap<PathBuf, Weak<String>>> = Mutex::new(HashMap::new());
+        let path = PathBuf::from("/data/GeoLite2-City.mmdb");
+
+        let first = get_or_load(&cache, path.clone(), || Ok("first".to_string()))
+            .expect("first load should succeed");
+        drop(first);
+
+        let reloaded = get_or_load(&cache, path.clone(), || Ok("second".to_string()))
+            .expect("reload after drop should succeed");
+        assert_eq!(*reloaded, "second");
+    }
+
+    /// A failed load must not poison the memo: the next caller retries.
+    #[test]
+    fn test_get_or_load_does_not_cache_failures() {
+        let cache: Mutex<HashMap<PathBuf, Weak<String>>> = Mutex::new(HashMap::new());
+        let path = PathBuf::from("/data/GeoLite2-City.mmdb");
+
+        let failed = get_or_load(&cache, path.clone(), || {
+            Err(GeoIpError::Other("database missing".to_string()))
+        });
+        assert!(failed.is_err());
+
+        let recovered = get_or_load(&cache, path.clone(), || Ok("now present".to_string()))
+            .expect("retry after a failed load should succeed");
+        assert_eq!(*recovered, "now present");
+    }
 
     #[test]
     fn test_known_hosting_orgs_detected() {
