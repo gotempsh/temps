@@ -22,6 +22,7 @@ import {
   targetLabelsToPayload,
   targetNodesToPayload,
 } from '@/lib/environment-placement'
+import { projectHasGitRepo } from '@/lib/project-git'
 import {
   Select,
   SelectContent,
@@ -367,6 +368,8 @@ export function EnvironmentConfigurationCard({
     })
   }
 
+  const hasGitRepo = projectHasGitRepo(project)
+
   return (
     <Card>
       <CardHeader>
@@ -375,55 +378,63 @@ export function EnvironmentConfigurationCard({
           Configuration
         </CardTitle>
         <CardDescription>
-          Configure Git branch, compute resources, and scaling for this
-          environment
+          {hasGitRepo
+            ? 'Configure Git branch, compute resources, and scaling for this environment'
+            : 'Configure compute resources and scaling for this environment'}
         </CardDescription>
       </CardHeader>
       <CardContent>
         <form onSubmit={handleSubmit}>
           <div className="space-y-8">
-            {/* Git Configuration Section */}
-            <div className="border-b pb-6">
-              <h3 className="text-sm font-medium mb-4">Git Configuration</h3>
-              <div>
-                <Label>Branch Name</Label>
-                <div className="mt-2">
-                  <BranchSelector
-                    repoOwner={project.repo_owner || ''}
-                    repoName={project.repo_name || ''}
-                    connectionId={project.git_provider_connection_id || 0}
-                    defaultBranch={project.main_branch}
-                    value={formData.branch}
-                    onChange={(branch) =>
-                      setFormData((prev) => ({ ...prev, branch }))
+            {/* Git Configuration Section — only for projects that deploy from
+                Git. A static-files, uploaded-source or Docker-image project has
+                no branch to deploy from and no repository to push to, so both
+                controls here are inapplicable rather than unconfigured. */}
+            {hasGitRepo && (
+              <div className="border-b pb-6">
+                <h3 className="text-sm font-medium mb-4">Git Configuration</h3>
+                <div>
+                  <Label>Branch Name</Label>
+                  <div className="mt-2">
+                    <BranchSelector
+                      repoOwner={project.repo_owner || ''}
+                      repoName={project.repo_name || ''}
+                      connectionId={project.git_provider_connection_id || 0}
+                      defaultBranch={project.main_branch}
+                      value={formData.branch}
+                      onChange={(branch) =>
+                        setFormData((prev) => ({ ...prev, branch }))
+                      }
+                    />
+                  </div>
+                  <p className="text-xs text-muted-foreground mt-2">
+                    Deployments will be triggered from this branch
+                  </p>
+                </div>
+
+                {/* Deploy on push toggle */}
+                <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg mt-4">
+                  <div className="flex-1 min-w-0">
+                    <Label className="text-sm font-medium">
+                      Deploy on push
+                    </Label>
+                    <p className="text-xs text-muted-foreground">
+                      Automatically deploy when a commit is pushed to this
+                      branch. Disable to deploy on demand only.
+                    </p>
+                  </div>
+                  <Switch
+                    checked={formData.automatic_deploy}
+                    onCheckedChange={(checked) =>
+                      setFormData((prev) => ({
+                        ...prev,
+                        automatic_deploy: checked,
+                      }))
                     }
                   />
                 </div>
-                <p className="text-xs text-muted-foreground mt-2">
-                  Deployments will be triggered from this branch
-                </p>
               </div>
-
-              {/* Deploy on push toggle */}
-              <div className="flex items-start sm:items-center gap-3 p-3 border rounded-lg mt-4">
-                <div className="flex-1 min-w-0">
-                  <Label className="text-sm font-medium">Deploy on push</Label>
-                  <p className="text-xs text-muted-foreground">
-                    Automatically deploy when a commit is pushed to this branch.
-                    Disable to deploy on demand only.
-                  </p>
-                </div>
-                <Switch
-                  checked={formData.automatic_deploy}
-                  onCheckedChange={(checked) =>
-                    setFormData((prev) => ({
-                      ...prev,
-                      automatic_deploy: checked,
-                    }))
-                  }
-                />
-              </div>
-            </div>
+            )}
 
             {/* CPU Resources */}
             <div>
