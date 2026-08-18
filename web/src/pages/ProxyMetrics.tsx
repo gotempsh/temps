@@ -22,7 +22,7 @@ import {
   nodeMetricsGetRangeOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { TimeBucketStats } from '@/api/client/types.gen'
-import { NodeAlertRules } from '@/components/monitoring/NodeAlertRules'
+import { Link } from 'react-router'
 import { Button } from '@/components/ui/button'
 import {
   Card,
@@ -621,7 +621,10 @@ function NodeMetricPanel({
 // Filtered charts (proxy-log time buckets)
 // ---------------------------------------------------------------------------
 
-function bucketChartRows(stats: TimeBucketStats[], window: ResolvedProxyWindow) {
+function bucketChartRows(
+  stats: TimeBucketStats[],
+  window: ResolvedProxyWindow
+) {
   return stats.map((b) => ({
     time: b.bucket,
     label: formatProxyTimeLabel(b.bucket, window.showDate),
@@ -658,79 +661,79 @@ function FilteredCharts({
 
   return (
     <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
-        <ChartPanel
-          title="Requests"
-          description="Requests and errors (status ≥ 400) per interval, from proxy logs"
-          series={[
-            { dataKey: 'request_count', label: 'Requests', color: '#2563eb' },
-            { dataKey: 'error_count', label: 'Errors', color: '#dc2626' },
-          ]}
-          valueFormatter={formatCount}
-          {...shared}
-        />
-        <ChartPanel
-          title="Error rate"
-          description="Errors (status ≥ 400) as a share of requests per interval"
-          series={[
-            { dataKey: 'error_rate', label: 'Error rate', color: '#dc2626' },
-          ]}
-          valueFormatter={formatPercent}
-          {...shared}
-        />
-        <ChartPanel
-          title="Latency percentiles"
-          description="Request duration p50 / p95 / p99, from proxy logs"
-          series={[
-            {
-              dataKey: 'p50_response_time_ms',
-              label: 'p50',
-              color: '#16a34a',
-            },
-            {
-              dataKey: 'p95_response_time_ms',
-              label: 'p95',
-              color: '#d97706',
-            },
-            {
-              dataKey: 'p99_response_time_ms',
-              label: 'p99',
-              color: '#dc2626',
-            },
-          ]}
-          valueFormatter={formatMs}
-          {...shared}
-        />
-        <ChartPanel
-          title="Average duration"
-          description="Mean response time per interval, from proxy logs"
-          series={[
-            {
-              dataKey: 'avg_response_time_ms',
-              label: 'avg',
-              color: '#2563eb',
-            },
-          ]}
-          valueFormatter={formatMs}
-          {...shared}
-        />
-        <ChartPanel
-          title="Bandwidth"
-          description="Request and response bytes per interval"
-          series={[
-            {
-              dataKey: 'total_request_bytes',
-              label: 'Request bytes',
-              color: '#16a34a',
-            },
-            {
-              dataKey: 'total_response_bytes',
-              label: 'Response bytes',
-              color: '#2563eb',
-            },
-          ]}
-          valueFormatter={formatBytesShort}
-          {...shared}
-        />
+      <ChartPanel
+        title="Requests"
+        description="Requests and errors (status ≥ 400) per interval, from proxy logs"
+        series={[
+          { dataKey: 'request_count', label: 'Requests', color: '#2563eb' },
+          { dataKey: 'error_count', label: 'Errors', color: '#dc2626' },
+        ]}
+        valueFormatter={formatCount}
+        {...shared}
+      />
+      <ChartPanel
+        title="Error rate"
+        description="Errors (status ≥ 400) as a share of requests per interval"
+        series={[
+          { dataKey: 'error_rate', label: 'Error rate', color: '#dc2626' },
+        ]}
+        valueFormatter={formatPercent}
+        {...shared}
+      />
+      <ChartPanel
+        title="Latency percentiles"
+        description="Request duration p50 / p95 / p99, from proxy logs"
+        series={[
+          {
+            dataKey: 'p50_response_time_ms',
+            label: 'p50',
+            color: '#16a34a',
+          },
+          {
+            dataKey: 'p95_response_time_ms',
+            label: 'p95',
+            color: '#d97706',
+          },
+          {
+            dataKey: 'p99_response_time_ms',
+            label: 'p99',
+            color: '#dc2626',
+          },
+        ]}
+        valueFormatter={formatMs}
+        {...shared}
+      />
+      <ChartPanel
+        title="Average duration"
+        description="Mean response time per interval, from proxy logs"
+        series={[
+          {
+            dataKey: 'avg_response_time_ms',
+            label: 'avg',
+            color: '#2563eb',
+          },
+        ]}
+        valueFormatter={formatMs}
+        {...shared}
+      />
+      <ChartPanel
+        title="Bandwidth"
+        description="Request and response bytes per interval"
+        series={[
+          {
+            dataKey: 'total_request_bytes',
+            label: 'Request bytes',
+            color: '#16a34a',
+          },
+          {
+            dataKey: 'total_response_bytes',
+            label: 'Response bytes',
+            color: '#2563eb',
+          },
+        ]}
+        valueFormatter={formatBytesShort}
+        {...shared}
+      />
     </div>
   )
 }
@@ -880,9 +883,7 @@ function FilteredSummaryStats({
         title="Requests/s"
         isPending={q.isPending}
         value={
-          ok
-            ? `${(totalRequests / window.durationSeconds).toFixed(2)}/s`
-            : null
+          ok ? `${(totalRequests / window.durationSeconds).toFixed(2)}/s` : null
         }
       />
       <StatCard
@@ -1386,6 +1387,14 @@ export default function ProxyMetrics() {
               <p className="mb-4 text-sm text-muted-foreground">
                 Sockets are file descriptors, so descriptor exhaustion is how
                 the proxy stops accepting connections. Collected on Linux only.
+                Temps alerts on these automatically —{' '}
+                <Link
+                  to="/monitoring/rules"
+                  className="underline underline-offset-2 hover:text-foreground"
+                >
+                  tune the thresholds in Monitoring settings
+                </Link>
+                .
               </p>
               <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
                 {FD_PANELS.map((panel) => (
@@ -1398,7 +1407,6 @@ export default function ProxyMetrics() {
                 ))}
               </div>
             </div>
-            <NodeAlertRules />
           </>
         )}
 

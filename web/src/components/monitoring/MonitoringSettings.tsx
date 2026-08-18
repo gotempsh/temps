@@ -43,6 +43,7 @@ import {
   type WeeklyDigestFormData,
 } from './schemas'
 import { AlertRulesManagement } from './AlertRulesManagement'
+import { NodeAlertRules } from './NodeAlertRules'
 import { Alarms } from '@/pages/Alarms'
 import {
   MONITORING_SECTIONS,
@@ -1017,7 +1018,12 @@ export function MonitoringSettings() {
 
   const renderContent = () => {
     if (currentSection === 'rules') {
-      return <AlertRulesManagement />
+      return (
+        <div className="space-y-8">
+          <NodeAlertRules />
+          <AlertRulesManagement />
+        </div>
+      )
     }
 
     if (currentSection === 'alarms') {
