@@ -19,7 +19,7 @@ use temps_auth::permission_guard;
 use temps_auth::RequireAuth;
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::RequestMetadata;
-use tracing::error;
+use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
 use crate::handlers::audit::{AuditContext, RestoreRunAudit};
@@ -389,32 +389,7 @@ async fn start_restore(
         }
     };
 
-    match &selector {
-        crate::services::BackupSelector::Id(backup_id) => {
-            // Every service that produced this backup must be reachable by the
-            // caller — restoring it anywhere else discloses its contents.
-            for source_service_id in
-                backup_source_service_ids(app_state.db.as_ref(), *backup_id).await?
-            {
-                require_service_access(&app_state, &auth, source_service_id, "source service")
-                    .await?;
-            }
-        }
-        crate::services::BackupSelector::Location { .. } => {
-            // Orphan restore reads a caller-supplied key out of a configured
-            // S3 source, so there is no source service to authorize against.
-            // A deployment token is a machine credential scoped to a single
-            // project and has no business naming arbitrary bucket keys.
-            if auth.project_id().is_some() {
-                return Err(problemdetails::new(StatusCode::FORBIDDEN)
-                    .with_title("Insufficient Permissions")
-                    .with_detail(
-                        "Deployment tokens cannot restore from a raw backup location; \
-                         reference a backup by id instead",
-                    ));
-            }
-        }
-    }
+    require_restore_source_access(&app_state, &auth, &selector).await?;
 
     let mode_str = match &request.mode {
         RestoreRequestMode::InPlace => "in_place".to_string(),
@@ -508,6 +483,70 @@ async fn get_restore_run(
     Ok(Json(run))
 }
 
+/// Authorize the *source* of a restore: what the caller is about to read.
+///
+/// Shared by `start_restore` and `plan_restore` so the two can never drift —
+/// the plan discloses the source's location, engine and size, which is the
+/// same disclosure the restore itself makes, and it takes the identical
+/// caller-controlled selector.
+async fn require_restore_source_access(
+    app_state: &BackupAppState,
+    auth: &temps_auth::AuthContext,
+    selector: &crate::services::BackupSelector,
+) -> Result<(), Problem> {
+    match selector {
+        crate::services::BackupSelector::Id(backup_id) => {
+            // Every service that produced this backup must be reachable by the
+            // caller — reading it anywhere else discloses its contents.
+            let source_service_ids =
+                backup_source_service_ids(app_state.db.as_ref(), *backup_id).await?;
+
+            // Fail closed on an empty set. A backup with no
+            // `external_service_backups` rows is not "a backup nobody owns, so
+            // anyone may read it" — it is the control-plane backup, Temps' own
+            // Postgres dump: every user row, password hash, API-key hash and
+            // provider token on the instance. Iterating an empty list would
+            // authorize nothing at all and let any BackupsRead/Write holder
+            // read or restore the platform database into a service they
+            // control.
+            if source_service_ids.is_empty() && !auth.is_admin() {
+                warn!(
+                    backup_id = *backup_id,
+                    user_id = ?auth.user_id(),
+                    "restore authz: denied a backup with no owning service to a non-admin"
+                );
+                return Err(problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Forbidden")
+                    .with_detail(
+                        "This backup is not owned by an external service and can only be \
+                         restored by an administrator",
+                    ));
+            }
+
+            for source_service_id in source_service_ids {
+                require_service_access(app_state, auth, source_service_id, "source service")
+                    .await?;
+            }
+        }
+        crate::services::BackupSelector::Location { .. } => {
+            // Orphan restore reads a caller-supplied key out of a configured
+            // S3 source, so there is no source service to authorize against.
+            // A deployment token is a machine credential scoped to a single
+            // project and has no business naming arbitrary bucket keys.
+            if auth.project_id().is_some() {
+                return Err(problemdetails::new(StatusCode::FORBIDDEN)
+                    .with_title("Insufficient Permissions")
+                    .with_detail(
+                        "Deployment tokens cannot restore from a raw backup location; \
+                         reference a backup by id instead",
+                    ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[utoipa::path(
     tag = "Restore",
     post,
@@ -557,6 +596,12 @@ async fn plan_restore(
             }));
         }
     };
+
+    // Same disclosure as the restore itself — the plan names the source's
+    // location, engine and size, and confirms target compatibility — so it
+    // gets the same authorization on both ends.
+    require_service_access(&app_state, &auth, id, "target service").await?;
+    require_restore_source_access(&app_state, &auth, &selector).await?;
 
     let plan = app_state
         .restore_service

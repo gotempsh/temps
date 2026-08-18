@@ -704,6 +704,22 @@ pub struct DockerSandboxProvider {
 pub(crate) const ROOT_EXEC_PATH: &str =
     "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// Whether a Docker exec `user` string runs the command as root, and therefore
+/// must have [`ROOT_EXEC_PATH`] forced on it.
+///
+/// Docker accepts `user`, `uid`, `user:group` and `uid:gid`, so the check is on
+/// the user half only — `0:0`, `0`, `root` and `root:root` are all root, while
+/// `root-ish` names like `rootless` are not. Errs toward *not* claiming root
+/// for an unrecognised value: PATH pinning is applied on top of a privilege the
+/// caller already asked for, so a false negative leaves behaviour unchanged
+/// while a false positive would silently rewrite a non-root exec's environment.
+fn exec_runs_as_root(user: Option<&str>) -> bool {
+    matches!(
+        user.map(|u| u.split(':').next().unwrap_or(u).trim()),
+        Some("0") | Some("root")
+    )
+}
+
 impl DockerSandboxProvider {
     pub fn new(docker: Arc<Docker>, config: DockerSandboxConfig) -> Self {
         Self { docker, config }
@@ -1393,7 +1409,29 @@ impl DockerSandboxProvider {
         on_event: Option<OnStreamEventCallback>,
         user: Option<String>,
     ) -> Result<SandboxExecResult, AgentError> {
-        let env_vars: Vec<String> = env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
+        // Pin PATH for every root exec, not just the one in `run_root_exec`.
+        //
+        // The image's own PATH puts sandbox-user-writable directories
+        // (`{home}/.local/bin`, `{home}/.bun/bin`) ahead of the system ones, so
+        // a root exec that inherits it will run a binary the sandbox user
+        // planted. `exec_as_root` reaches this function with the caller's env
+        // map, which never sets PATH — the credential-shred step before a
+        // snapshot is one such caller, and there a planted `sh`/`shred`/`rm`
+        // would run as container root *before* the credential file is wiped.
+        //
+        // Enforced here rather than at each call site so a new root-exec caller
+        // cannot reintroduce the hole by forgetting, and the caller's own PATH
+        // is overridden rather than merged: this is a privilege boundary, not a
+        // default.
+        let is_root_exec = exec_runs_as_root(user.as_deref());
+        let mut env_vars: Vec<String> = env
+            .iter()
+            .filter(|(k, _)| !(is_root_exec && k.eq_ignore_ascii_case("PATH")))
+            .map(|(k, v)| format!("{}={}", k, v))
+            .collect();
+        if is_root_exec {
+            env_vars.push(format!("PATH={ROOT_EXEC_PATH}"));
+        }
 
         let exec_config = bollard::models::ExecConfig {
             attach_stdout: Some(true),
@@ -3558,6 +3596,37 @@ mod tests {
         assert!(entries.contains(&"/bin"));
         assert!(entries.contains(&"/usr/sbin"));
         assert!(entries.contains(&"/sbin"));
+    }
+
+    /// Regression: the PATH pin has to cover *every* root exec, not just
+    /// `run_root_exec`.
+    ///
+    /// `exec_as_root` reaches `exec_inner` with the caller's env map, which
+    /// never sets PATH — so before this, it inherited the image PATH with the
+    /// sandbox user's writable bin directories in front. Its live caller is the
+    /// pre-snapshot credential shred, where a planted `sh`/`shred`/`rm` runs as
+    /// container root *before* the credential file is wiped.
+    #[test]
+    fn every_root_exec_form_is_recognised_for_path_pinning() {
+        // What `exec_as_root` actually passes, plus the other spellings Docker
+        // accepts for the same privilege.
+        for root in ["0:0", "0", "root", "root:root", "0:1000", "root:staff"] {
+            assert!(
+                exec_runs_as_root(Some(root)),
+                "{root:?} runs as root and must get the pinned PATH"
+            );
+        }
+
+        // Non-root execs keep their own environment untouched.
+        for non_root in ["1000:1000", "temps", "temps:temps", "rootless", "10"] {
+            assert!(
+                !exec_runs_as_root(Some(non_root)),
+                "{non_root:?} is not root and must not be rewritten"
+            );
+        }
+
+        // `None` means "the image's own user", which is the sandbox user.
+        assert!(!exec_runs_as_root(None));
     }
 
     #[test]
