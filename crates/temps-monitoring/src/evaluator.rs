@@ -1124,10 +1124,12 @@ fn proxy_default_seeds() -> Vec<RuleSeed> {
 fn container_default_seeds() -> Vec<RuleSeed> {
     vec![
         RuleSeed {
-            // Threshold against utilisation relative to the container's CPU
-            // limit (100% == limit saturated), NOT raw `container.cpu_percent`
-            // where 100% == one core — a 2-core container would otherwise fire
-            // at ~95% raw (≈47% of its limit), nowhere near saturation.
+            // Threshold against utilisation relative to the CPU the container
+            // may use — its limit when set, else the host's core count (100% ==
+            // saturated) — NOT raw `container.cpu_percent` where 100% == one
+            // core. A 2-core container would otherwise fire at ~95% raw (≈47%
+            // of its limit), and an uncapped container would fire the moment it
+            // used a single core of a many-core host.
             name: "High CPU usage",
             metric_name: "container.cpu_utilization_percent",
             threshold: 90.0,
