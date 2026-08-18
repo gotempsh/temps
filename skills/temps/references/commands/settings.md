@@ -46,6 +46,7 @@ Update platform settings
 | `--default-http-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | No |
 | `--default-sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | No |
 | `--default-websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | No |
+| `--console-force-https <mode>` | Redirect the console host to HTTPS: auto (once a cert exists), always, or never | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `settings set-external-url`

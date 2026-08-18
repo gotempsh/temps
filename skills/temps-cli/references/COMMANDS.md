@@ -255,7 +255,7 @@ Manage projects
 
 **Subcommands:**
 
-- `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY> (mode 0400), not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
+- `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 - `list` (`ls`) - List all projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
 - `show` (`get`) - Show project details
@@ -267,7 +267,7 @@ Manage projects
 
 ### `projects secrets`
 
-Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY> (mode 0400), not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
+Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 
 **Subcommands:**
 
@@ -300,6 +300,7 @@ Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
 | `-k, --key <key>` | Secret key — becomes the filename at /run/secrets/<KEY>. Letters, digits, underscore; must start with a letter or underscore. | - | Yes |
 | `-v, --value <value>` | Secret value (<=1 MiB). Prefix with @ to read from a local file, e.g. @./auth.json — never touches shell history. | - | Yes |
 | `-e, --environment <name>` | Scope to one environment (repeatable; default: all) | `` | No |
+| `-s, --service <name>` | Docker Compose service allowed to read this secret (repeatable; default: every service). Ignored for non-Compose projects, which deploy a single container. | `` | No |
 | `--include-in-preview` | Also mount this secret in preview environments | - | No |
 
 #### `projects secrets update`
@@ -314,6 +315,8 @@ Update a project secret (a redeploy is required for running containers to pick i
 | `-k, --key <key>` | Key of the secret to update | - | Yes |
 | `-v, --value <value>` | New value (<=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value. | - | No |
 | `-e, --environment <name>` | Replace environment scoping (repeatable) | `` | No |
+| `-s, --service <name>` | Replace the Docker Compose service scope (repeatable). Pass none to keep the current scope; use --all-services to widen it back to every service. | `` | No |
+| `--all-services` | Deliver to every Compose service, clearing any per-service scope | - | No |
 | `--include-in-preview` | Include in preview environments | - | No |
 | `--no-include-in-preview` | Exclude from preview environments | - | No |
 
@@ -2257,6 +2260,7 @@ Update platform settings
 | `--default-http-timeout <seconds>` | Default timeout for regular HTTP requests, in seconds | - | No |
 | `--default-sse-idle-timeout <seconds>` | Default idle timeout for SSE streams, in seconds | - | No |
 | `--default-websocket-idle-timeout <seconds>` | Default idle timeout for WebSocket connections, in seconds | - | No |
+| `--console-force-https <mode>` | Redirect the console host to HTTPS: auto (once a cert exists), always, or never | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
 
 ### `settings set-external-url`
@@ -5320,6 +5324,7 @@ View platform and server information
 - `private-ip` - Get the server private IP address
 - `public-ip` - Get the server public IP address
 - `update` - Check for and apply temps releases on the server
+- `alert-rules` - Inspect and retune the control-plane's own monitoring alert rules
 
 ### `platform info`
 
@@ -5400,6 +5405,43 @@ Install a release on the server and restart it
 |------|-------------|---------|----------|
 | `--version <version>` | Release tag to install (default: newest on this channel) | - | No |
 | `-y, --yes` | Skip the confirmation prompt | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `platform alert-rules`
+
+Inspect and retune the control-plane's own monitoring alert rules
+
+**Subcommands:**
+
+- `list` - List the alert rules watching this node (proxy health, socket exhaustion)
+- `set` - Retune, enable, or disable an alert rule on this node
+
+#### `platform alert-rules list`
+
+List the alert rules watching this node (proxy health, socket exhaustion)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (default: 0, the control plane) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `platform alert-rules set`
+
+Retune, enable, or disable an alert rule on this node
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--node <id>` | Node ID (default: 0, the control plane) | - | No |
+| `--threshold <n>` | Value the metric must cross to fire | - | No |
+| `--comparator <op>` | Comparison operator: >, >=, <, <= | - | No |
+| `--severity <level>` | Alert severity: warning or critical | - | No |
+| `--for-duration <secs>` | Seconds the condition must hold before firing | - | No |
+| `--enable` | Enable the rule | - | No |
+| `--disable` | Disable the rule (survives the startup re-seed; deleting does not) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ## `presets` (alias: `preset`)
