@@ -1,15 +1,21 @@
 //! Preview gateway supervisor.
 //!
-//! Reconciles a single shared `temps-preview-gateway` container on the local
-//! Docker host. Called from `temps serve` startup, but always runs in a
-//! background task — the proxy server (80/443) MUST NOT be blocked on this.
+//! Reconciles this instance's preview-gateway container on the local Docker
+//! host. Called from `temps serve` startup, but always runs in a background
+//! task — the proxy server (80/443) MUST NOT be blocked on this.
+//!
+//! The container is named `temps-preview-gateway` by default, which is right
+//! for a normal install that owns the whole host. It is a *setting* rather
+//! than a constant so that several Temps instances can share one Docker
+//! daemon — see `PreviewGatewaySettings::container_name` for why sharing the
+//! name silently breaks previews.
 //!
 //! What it guarantees, in order:
 //! 1. The shared sandbox network exists (so workspace sandboxes and the
 //!    gateway can resolve each other by container name via Docker DNS).
 //! 2. The pinned gateway image is present locally (pulled if missing).
-//! 3. A container named `temps-preview-gateway` is running, attached to that
-//!    network, with the right image and the right host-port publish on
+//! 3. The configured container is running, attached to that network, with
+//!    the right image and the right host-port publish on
 //!    `127.0.0.1:<port>`. Any drift causes a recreate.
 //!
 //! Failure mode: log loudly, return Err. The caller will log the error and
@@ -120,6 +126,19 @@ pub const PREVIEW_GATEWAY_CONTAINER: &str = "temps-preview-gateway";
 /// Shared docker network used for sandbox <-> gateway DNS resolution.
 pub const PREVIEW_GATEWAY_NETWORK: &str = "temps-sandbox-net";
 
+/// The container name this instance's gateway uses: the configured one, or
+/// the default. Every code path that names the container goes through here,
+/// so `inspect`, `reconcile`, `status` and `logs` can never disagree about
+/// which container they are talking about.
+pub fn container_name(settings: &PreviewGatewaySettings) -> String {
+    let name = settings.container_name.trim();
+    if name.is_empty() {
+        PREVIEW_GATEWAY_CONTAINER.to_string()
+    } else {
+        name.to_string()
+    }
+}
+
 /// Default host port the gateway publishes to. Bound on 127.0.0.1 only —
 /// the host-side Pingora reaches it via this port after authenticating.
 pub const DEFAULT_PREVIEW_GATEWAY_HOST_PORT: u16 = 8090;
@@ -168,7 +187,7 @@ impl PreviewGatewaySpec {
         };
         Self {
             image,
-            container_name: PREVIEW_GATEWAY_CONTAINER.to_string(),
+            container_name: container_name(settings),
             network: PREVIEW_GATEWAY_NETWORK.to_string(),
             host_port,
             shared_secret: settings.shared_secret.clone(),
@@ -206,6 +225,9 @@ pub async fn reconcile(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Result<
         host_port = spec.host_port,
         "reconciling preview gateway"
     );
+    // Tell the in-process proxy where to dial before we touch Docker: even if
+    // the reconcile fails, the port it should be using is the configured one.
+    export_host_port(spec.host_port);
 
     ensure_network(&docker, &spec.network).await?;
     ensure_image(&docker, &spec.image).await?;
@@ -584,6 +606,23 @@ fn export_env(secret: &str) {
     }
 }
 
+/// Publish the gateway's host port for the in-process Pingora to dial.
+///
+/// The proxy used to hardcode `127.0.0.1:8090` while the reconciler published
+/// the container on `settings.host_port`. So `host_port` was decorative:
+/// changing it moved the container and left the proxy talking to whatever
+/// still held 8090 — nothing, or on a multi-instance host, *another
+/// instance's* gateway, which rejects our token with "missing or invalid
+/// X-Temps-Preview-Token". Exported the same way the shared secret is, so
+/// both halves of this contract cross the crate boundary by the same
+/// mechanism.
+pub fn export_host_port(port: u16) {
+    #[allow(unused_unsafe)]
+    unsafe {
+        std::env::set_var("PREVIEW_GATEWAY_HOST_PORT", port.to_string());
+    }
+}
+
 /// Spawn the reconciler on the given runtime. Logs failures but never panics.
 /// Returns immediately — the actual reconcile runs in the background so the
 /// caller (the proxy server bootstrap) is never blocked.
@@ -702,8 +741,9 @@ pub async fn inspect_status(
         settings.image.clone()
     };
 
+    let name = container_name(settings);
     let inspected = docker
-        .inspect_container(PREVIEW_GATEWAY_CONTAINER, None::<InspectContainerOptions>)
+        .inspect_container(&name, None::<InspectContainerOptions>)
         .await;
 
     let inspected = match inspected {
@@ -717,7 +757,7 @@ pub async fn inspect_status(
                 health: "missing".to_string(),
                 image: None,
                 image_digest: None,
-                container_name: PREVIEW_GATEWAY_CONTAINER.to_string(),
+                container_name: name,
                 network: None,
                 host_port: None,
                 started_at: None,
@@ -798,7 +838,7 @@ pub async fn inspect_status(
         health,
         image,
         image_digest,
-        container_name: PREVIEW_GATEWAY_CONTAINER.to_string(),
+        container_name: name,
         network,
         host_port,
         started_at,
@@ -833,9 +873,9 @@ pub async fn force_restart(docker: Arc<Docker>, spec: PreviewGatewaySpec) -> Res
 
 /// Tail the gateway container's stdout+stderr. `tail` caps the number of
 /// lines returned (e.g. 200). Returns lines newest-last.
-pub async fn tail_logs(docker: &Docker, tail: usize) -> Result<Vec<String>> {
+pub async fn tail_logs(docker: &Docker, container: &str, tail: usize) -> Result<Vec<String>> {
     let stream = docker.logs(
-        PREVIEW_GATEWAY_CONTAINER,
+        container,
         Some(LogsOptions {
             stdout: true,
             stderr: true,

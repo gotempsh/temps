@@ -26,9 +26,8 @@ use crate::on_demand::OnDemandManager;
 use crate::preview_auth::{
     build_set_cookie_sandbox, check_preview_auth, combine_cookie_header_values,
     encode_preview_cookie_subject, extract_cookie_values, parse_preview_host,
-    preview_cookie_needs_refresh, preview_peer_group_key, verify_argon2, PreviewAuthLimiter,
-    PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
-    PREVIEW_GATEWAY_PEER,
+    preview_cookie_needs_refresh, preview_gateway_peer, preview_peer_group_key, verify_argon2,
+    PreviewAuthLimiter, PreviewAuthOutcome, PreviewHost, PreviewSandboxLookup, SandboxLookupCache,
 };
 use crate::service::cert_host_cache::CertHostCache;
 use crate::service::challenge_service::ChallengeService;
@@ -5256,13 +5255,14 @@ impl ProxyHttp for LoadBalancer {
             } else {
                 std::time::Duration::from_secs(60)
             };
-            let mut peer = Box::new(HttpPeer::new(PREVIEW_GATEWAY_PEER, false, String::new()));
+            let gateway_peer = preview_gateway_peer();
+            let mut peer = Box::new(HttpPeer::new(gateway_peer.as_str(), false, String::new()));
             peer.group_key = preview_peer_group_key(host);
             peer.options.connection_timeout = Some(std::time::Duration::from_secs(5));
             peer.options.read_timeout = Some(preview_io_timeout);
             peer.options.write_timeout = Some(preview_io_timeout);
             peer.options.idle_timeout = Some(preview_io_timeout);
-            ctx.upstream_host = Some(PREVIEW_GATEWAY_PEER.to_string());
+            ctx.upstream_host = Some(gateway_peer);
             return Ok(peer);
         }
 

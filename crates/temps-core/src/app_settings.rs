@@ -845,6 +845,23 @@ pub struct PreviewGatewaySettings {
     /// Pingora forwards `ws-*` traffic to this port after authenticating.
     #[schema(example = 8090)]
     pub host_port: u16,
+    /// Docker container name for this instance's gateway.
+    ///
+    /// A single Temps install owns the whole host, so the default is fine and
+    /// operators never need to touch this. It exists for the case where
+    /// several Temps instances share one Docker daemon — most obviously a
+    /// development machine with multiple checkouts running at once.
+    ///
+    /// Without it those instances silently fight: the `shared_secret` is
+    /// per-database, so each generates a different one, but they all
+    /// reconcile the *same* container name. Each start-up sees the other's
+    /// container as drifted, recreates it with its own secret, and every
+    /// other instance's previews start failing with "missing or invalid
+    /// X-Temps-Preview-Token". Giving each instance its own container name
+    /// (and `host_port`) makes them independent.
+    #[serde(default = "default_preview_gateway_container")]
+    #[schema(example = "temps-preview-gateway")]
+    pub container_name: String,
     /// When true (default), the supervisor will pull and apply the image
     /// pinned in the Temps binary on every startup. When false, the
     /// currently-running image is left alone — operators upgrade manually
@@ -862,11 +879,19 @@ pub struct PreviewGatewaySettings {
     pub shared_secret: String,
 }
 
+/// Serde default for [`PreviewGatewaySettings::container_name`], so a settings
+/// row written before this field existed deserialises to today's name rather
+/// than to an empty string (which would mean "container named ''").
+fn default_preview_gateway_container() -> String {
+    "temps-preview-gateway".to_string()
+}
+
 impl Default for PreviewGatewaySettings {
     fn default() -> Self {
         Self {
             image: "ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9".to_string(),
             host_port: 8090,
+            container_name: default_preview_gateway_container(),
             auto_upgrade: true,
             shared_secret: String::new(),
         }

@@ -54,9 +54,28 @@ pub use temps_core::{
     PREVIEW_SESSION_GRANT_TTL, PREVIEW_SESSION_GRANT_VERSION,
 };
 
+/// Default local port the preview gateway listens on, when the instance has
+/// not configured one.
+const DEFAULT_PREVIEW_GATEWAY_PORT: u16 = 8090;
+
 /// The local TCP address where the preview gateway listens. Pingora forwards
 /// authenticated preview requests to this peer.
-pub const PREVIEW_GATEWAY_PEER: &str = "127.0.0.1:8090";
+///
+/// Read per call from `PREVIEW_GATEWAY_HOST_PORT`, which the gateway
+/// supervisor exports at reconcile time from `settings.host_port` — the same
+/// way it exports the shared secret. This used to be a `const` pinned to
+/// 8090, which made `host_port` a setting that moved the container but not
+/// the proxy: previews then 403'd with "missing or invalid
+/// X-Temps-Preview-Token", because the proxy was signing for our gateway and
+/// dialling whatever else held 8090.
+pub fn preview_gateway_peer() -> String {
+    let port = std::env::var("PREVIEW_GATEWAY_HOST_PORT")
+        .ok()
+        .and_then(|v| v.trim().parse::<u16>().ok())
+        .filter(|p| *p != 0)
+        .unwrap_or(DEFAULT_PREVIEW_GATEWAY_PORT);
+    format!("127.0.0.1:{port}")
+}
 
 /// Maximum number of failed auth attempts allowed per (client_ip, sandbox_hex)
 /// inside [`RATE_LIMIT_WINDOW`] before the proxy starts rejecting with 429.
