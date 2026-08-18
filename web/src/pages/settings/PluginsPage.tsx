@@ -150,7 +150,7 @@ export function PluginsPage() {
 
                         Gated on the nav entry, not on `plugin.ui`: that field
                         describes a *declared* bundle, and a plugin can serve
-                        its UI from `/ui/` without one (vibetemps does, and
+                        its UI from `/ui/` without one (some plugins do, and
                         reports `ui: null`). What actually makes a plugin
                         reachable is a platform/settings nav entry — those are
                         what `/plugins/:pluginName` routes to. Project-scoped

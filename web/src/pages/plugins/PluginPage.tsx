@@ -12,9 +12,9 @@ import { useLocation, useNavigate, useParams } from 'react-router'
  * ## Deep linking
  *
  * A plugin's own route is mirrored into the console's address bar, so
- * `/plugins/vibetemps/app/21` is a real, copyable link that reopens the
+ * `/plugins/builder/app/21` is a real, copyable link that reopens the
  * plugin exactly where it was. Without this every plugin URL collapsed to
- * `/plugins/vibetemps`, and sharing "look at this app" meant sharing a
+ * `/plugins/builder`, and sharing "look at this app" meant sharing a
  * screenshot and a sentence of directions.
  *
  * Two mechanisms, because plugins route in two different ways:
