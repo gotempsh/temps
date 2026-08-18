@@ -68463,7 +68463,8 @@
         "summary": "List the monitoring alert rules scoped to a node.",
         "tags": [
           "Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/nodes/{id}/metrics/alert-rules/{rule_id}": {
@@ -68537,7 +68538,8 @@
         "summary": "Update a node-scoped monitoring alert rule.",
         "tags": [
           "Metrics"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/notification-preferences": {
