@@ -5,7 +5,8 @@ import { CronJobsSettings } from './settings/CronJobsSettings'
 import { DomainsSettings } from './settings/DomainsSettings'
 import { EnvironmentVariablesSettings } from './settings/EnvironmentVariablesSettings'
 import { GeneralSettings } from './settings/GeneralSettings'
-import { BuildSettings, GitSettings } from './settings/GitSettings'
+import { GitSettings } from './settings/GitSettings'
+import { BuildDeploySettings } from './settings/BuildDeploySettings'
 import { ProjectAccessSettings } from './settings/ProjectAccessSettings'
 import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { McpServersSettings } from './settings/McpServersSettings'
@@ -43,7 +44,7 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         />
         <Route
           path="build"
-          element={<BuildSettings project={project} refetch={refetch} />}
+          element={<BuildDeploySettings project={project} refetch={refetch} />}
         />
         <Route
           path="security"
