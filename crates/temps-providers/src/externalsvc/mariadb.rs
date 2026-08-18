@@ -22,6 +22,26 @@ use tracing::{debug, error, info, warn};
 
 const MARIADB_INTERNAL_PORT: &str = "3306";
 const DEFAULT_MARIADB_IMAGE: &str = "mariadb:lts";
+
+/// Repositories a restore-time `docker_image` override may name, in addition
+/// to whatever repository the source service already runs. See
+/// [`crate::externalsvc::restore_image`] for why the override is constrained.
+const RESTORE_IMAGE_REPOSITORIES: &[&str] = &["mariadb", "mysql"];
+
+/// Environment variable an operator sets to allow additional MariaDB
+/// repositories as a restore-time `docker_image` override (comma-separated).
+/// Additive — it can only widen [`RESTORE_IMAGE_REPOSITORIES`], never shrink
+/// it, so a typo cannot block a restore that worked before. Read once; restart
+/// temps to change. Mirrors `TEMPS_ALLOWED_POSTGRES_DOCKER_IMAGES`.
+pub(crate) const EXTRA_RESTORE_IMAGES_ENV: &str = "TEMPS_ALLOWED_MARIADB_DOCKER_IMAGES";
+
+/// Operator additions to [`RESTORE_IMAGE_REPOSITORIES`], read once per process.
+fn extra_restore_image_repositories() -> &'static [String] {
+    static EXTRA: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    EXTRA.get_or_init(|| {
+        crate::externalsvc::restore_image::extra_allowed_repositories(EXTRA_RESTORE_IMAGES_ENV)
+    })
+}
 const MIN_PASSWORD_LENGTH: usize = 8;
 const MARIADB_BACKUP_EXEC_TIMEOUT: Duration = Duration::from_secs(4 * 3600);
 const MARIADB_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -2594,7 +2614,22 @@ impl MariaDbService {
                 config.port = port.to_string();
             }
             if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
-                config.docker_image = image.to_string();
+                // Restoring into a new service clones the source's
+                // MARIADB_ROOT_PASSWORD into the new container's environment,
+                // so an unchecked override starts an attacker-named image
+                // holding the source database's root credentials. Unlike
+                // PostgreSQL there is no exact-image allowlist for MariaDB, so
+                // the constraint is repository-level: the source's own
+                // repository, or a known MariaDB one. Only the tag is free.
+                let validated =
+                    crate::externalsvc::restore_image::restore_image_override_with_extra(
+                        &config.docker_image,
+                        image,
+                        RESTORE_IMAGE_REPOSITORIES,
+                        extra_restore_image_repositories(),
+                        Some(EXTRA_RESTORE_IMAGES_ENV),
+                    )?;
+                config.docker_image = validated.to_string();
             }
             if let Some(db) = overrides.get("database").and_then(|v| v.as_str()) {
                 config.database = db.to_string();

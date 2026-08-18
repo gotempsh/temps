@@ -18,6 +18,7 @@ pub mod postgres_role_reconciler;
 pub mod postgres_upgrade;
 pub mod postgres_wal_health;
 pub mod redis;
+pub mod restore_image;
 pub mod rustfs;
 pub mod s3;
 pub mod s3_util;

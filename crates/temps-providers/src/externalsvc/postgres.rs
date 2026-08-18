@@ -4083,6 +4083,15 @@ impl ExternalService for PostgresService {
                 source_config.port = port.to_string();
             }
             if let Some(image) = overrides.get("docker_image").and_then(|v| v.as_str()) {
+                // Restoring into a new service clones the source's
+                // POSTGRES_PASSWORD into the new container's environment, so an
+                // unchecked override starts an attacker-named image holding the
+                // source database's root credentials. The instance's existing
+                // image allowlist is the right gate — it is exact `image:tag`
+                // equality and an operator can extend it, so this adds no new
+                // policy, it just stops the restore path from being the one
+                // place that skips it.
+                validate_postgres_docker_image(image)?;
                 source_config.docker_image = image.to_string();
             }
             if let Some(db) = overrides.get("database").and_then(|v| v.as_str()) {

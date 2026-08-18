@@ -594,6 +594,42 @@ pub async fn validate_domain_async(domain: &str) -> Result<(), UrlValidationErro
     resolve_and_validate_domain(domain, 443).await.map(|_| ())
 }
 
+/// Async counterpart to [`validate_external_database_url`]: same checks, plus
+/// DNS resolution of a non-literal host.
+///
+/// The sync version can only reject IP *literals* and `localhost`. That is not
+/// enough when the URL comes from a remote platform the attacker controls,
+/// because they also control their own DNS: one A record pointing
+/// `db.attacker.tld` at `127.0.0.1` or `169.254.169.254` walks straight past a
+/// literal-only check. Any caller that can afford a DNS lookup — i.e. anything
+/// not on a request hot path — should use this instead.
+///
+/// A resolution failure is an error, not a pass: an unresolvable host cannot be
+/// dialled anyway, and treating "we could not check" as "it is fine" is how the
+/// literal-only gap got here.
+pub async fn validate_external_database_url_async(url: &str) -> Result<Url, UrlValidationError> {
+    let parsed = validate_external_database_url(url)?;
+
+    let Some(host) = parsed.host_str() else {
+        return Err(UrlValidationError::InvalidFormat(
+            "database URL must have a valid host".to_string(),
+        ));
+    };
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    // A literal was already fully validated above; only a name needs resolving.
+    if bare.parse::<IpAddr>().is_err() {
+        // Port is irrelevant to the address check — `resolve_and_validate_domain`
+        // needs one only to form a socket address.
+        resolve_and_validate_domain(bare, parsed.port().unwrap_or(443)).await?;
+    }
+
+    Ok(parsed)
+}
+
 /// Resolve `domain:port` and return the socket addresses, **rejecting the whole
 /// domain if any resolved IP is non-public** (loopback, RFC1918, link-local,
 /// etc.).
@@ -1022,5 +1058,41 @@ mod tests {
         // https + private IP must still be rejected via the IP host check.
         assert!(validate_git_url("https://169.254.169.254/repo.git").is_err());
         assert!(validate_git_url("https://localhost/repo.git").is_err());
+    }
+    /// Regression: the literal-only check is not enough when the attacker
+    /// controls the DNS for the hostname they hand us — which is exactly the
+    /// importer's threat model, where `source_url` comes out of the remote
+    /// platform's own API response.
+    #[tokio::test]
+    async fn async_database_url_validation_rejects_a_name_resolving_to_loopback() {
+        // `localhost` is the one name every machine resolves to loopback, so
+        // this exercises the resolution path without depending on the network.
+        // The sync check rejects this name by string match; force resolution to
+        // be the thing under test by using a form the string check misses.
+        let err =
+            validate_external_database_url_async("postgres://u:p@localhost.localdomain:5432/app")
+                .await;
+        // Either it resolved to loopback (rejected) or the name does not exist
+        // on this host (also rejected) — both are the safe outcome, and a pass
+        // would mean an unresolved name was treated as public.
+        assert!(
+            err.is_err(),
+            "a name that resolves to loopback (or not at all) must not be accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_database_url_validation_still_rejects_literals_and_schemes() {
+        for hostile in [
+            "postgres://u:p@127.0.0.1:5432/app",
+            "postgres://u:p@10.0.0.5:5432/app",
+            "postgres://u:p@169.254.169.254/app",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                validate_external_database_url_async(hostile).await.is_err(),
+                "{hostile} must be rejected"
+            );
+        }
     }
 }

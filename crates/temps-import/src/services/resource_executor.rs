@@ -168,13 +168,22 @@ impl ResourceExecutor {
             // is still created, and `populate_one_service` already has a
             // "source not reachable — copy the data manually" path for a
             // missing source_url, which is exactly the right outcome here.
-            let source_url = service_plan
+            //
+            // Resolved, not just parsed. The attacker here *is* the source
+            // platform, so they also control the DNS for any hostname they
+            // return: a literal-only check is defeated by one A record pointing
+            // `db.attacker.tld` at 127.0.0.1 or 169.254.169.254.
+            let candidate_source_url = service_plan
                 .parameters
                 .get(SOURCE_URL_PARAM)
-                .and_then(|v| v.as_str())
-                .filter(|url| {
-                    match temps_core::url_validation::validate_external_database_url(url) {
-                        Ok(_) => true,
+                .and_then(|v| v.as_str());
+            let source_url = match candidate_source_url {
+                None => None,
+                Some(url) => {
+                    match temps_core::url_validation::validate_external_database_url_async(url)
+                        .await
+                    {
+                        Ok(_) => Some(url),
                         Err(e) => {
                             warn!(
                                 service = %service_plan.name,
@@ -184,10 +193,11 @@ impl ResourceExecutor {
                                  data copy: it does not point at a reachable public address. The \
                                  service will be created empty; copy its data manually."
                             );
-                            false
+                            None
                         }
                     }
-                });
+                }
+            };
             let service_name = format!(
                 "{}-{}",
                 sanitize_slug(project_name),
