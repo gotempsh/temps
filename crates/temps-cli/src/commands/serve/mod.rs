@@ -189,7 +189,20 @@ impl ServeCommand {
         let cookie_crypto = Arc::new(temps_core::CookieCrypto::new(&serve_config.auth_secret)?);
 
         debug!("Initializing database connection...");
-        // Create tokio runtime for database connection since we need async for this
+        // THE long-lived runtime for this process. It runs the startup
+        // `block_on`s just below, and later the index build, the backfill, the
+        // listeners and the console (`rt.spawn` further down). It is never
+        // dropped -- the process ends while pingora holds this thread.
+        //
+        // It is deliberately built HERE, *before* the pool, rather than as a
+        // second runtime after startup: the pool has to be created on the
+        // runtime that will keep driving it. sqlx spawns a pool-maintenance
+        // task when the pool is constructed, and every socket the pool opens
+        // (`min_connections`, plus the connection migrations run on) registers
+        // with the creating runtime's IO driver. A startup-only runtime would
+        // leave both stranded -- the maintenance task unpolled and the pooled
+        // sockets bound to a driver nothing runs -- and the first query issued
+        // from the main runtime would hang forever.
         let rt = tokio::runtime::Runtime::new()?;
         let db = rt.block_on(temps_database::establish_connection(&self.database_url))?;
 
@@ -306,8 +319,6 @@ impl ServeCommand {
         // worker nodes that don't share this queue.) Keep it alive on the stack.
         let route_reload_subscriber =
             temps_routes::RouteReloadSubscriber::new(route_table.clone(), queue.clone());
-
-        let rt = tokio::runtime::Runtime::new()?;
 
         // Run non-transactional indexes and the TimescaleDB backfill on this
         // long-lived runtime, detached. Index creation retries with capped
