@@ -191,8 +191,10 @@ impl ServeCommand {
         debug!("Initializing database connection...");
         // THE long-lived runtime for this process. It runs the startup
         // `block_on`s just below, and later the index build, the backfill, the
-        // listeners and the console (`rt.spawn` further down). It is never
-        // dropped -- the process ends while pingora holds this thread.
+        // listeners and the console (`rt.spawn` further down). It stays alive
+        // until `serve` returns: under `--role=all` that is when pingora stops
+        // blocking this thread, and under `--role=console` when the console
+        // future it is blocking on finishes.
         //
         // It is deliberately built HERE, *before* the pool, rather than as a
         // second runtime after startup: the pool has to be created on the
