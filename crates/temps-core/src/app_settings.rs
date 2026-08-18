@@ -23,6 +23,27 @@ pub struct AppSettings {
     /// disables DNS record sync regardless of per-domain opt-in.
     pub edge_target: Option<String>,
 
+    /// Whether plain-HTTP requests to the console host (`external_url`) are
+    /// redirected to HTTPS. Same tri-state contract as an environment's
+    /// `force_https`:
+    ///
+    /// - `None` (default) — inherit the per-host heuristic: redirect only once
+    ///   the console hostname has actually completed TLS provisioning. An
+    ///   HTTP-only install, and an install whose TLS is terminated upstream,
+    ///   are both left alone.
+    /// - `Some(true)` — always redirect. For operators who terminate TLS at
+    ///   Temps but have not provisioned the cert through Temps.
+    /// - `Some(false)` — never redirect, even once a certificate exists.
+    ///
+    /// Deliberately operator-set rather than inferred. Temps cannot tell
+    /// "HTTPS terminated by an upstream CDN" apart from "plain HTTP" — both
+    /// arrive as a plaintext connection, and `X-Forwarded-Proto` is not
+    /// trustworthy from an arbitrary peer — so inferring `true` from an
+    /// `https://` `external_url` would 301 a CDN-fronted console into an
+    /// infinite redirect loop with no way out but the global kill switch.
+    #[serde(default)]
+    pub console_force_https: Option<bool>,
+
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
 
@@ -1068,6 +1089,7 @@ impl Default for AppSettings {
             internal_url: None,
             preview_domain: DEFAULT_LOCAL_DOMAIN.to_string(),
             edge_target: None,
+            console_force_https: None,
             screenshots: ScreenshotSettings::default(),
             letsencrypt: LetsEncryptSettings::default(),
             dns_provider: DnsProviderSettings::default(),

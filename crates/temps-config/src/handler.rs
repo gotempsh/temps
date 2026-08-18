@@ -126,6 +126,10 @@ pub struct AppSettingsResponse {
     pub preview_domain: String,
     /// Public edge target that synced DNS records point at (IP → A/AAAA, else CNAME).
     pub edge_target: Option<String>,
+    /// Whether plain-HTTP requests to the console host are redirected to HTTPS.
+    /// `None` inherits the per-host certificate heuristic; `Some(b)` is an
+    /// explicit operator override. No sensitive content.
+    pub console_force_https: Option<bool>,
     /// Port the main Pingora proxy listens on (parsed from `--address`), the
     /// same value `ConfigService::proxy_port()` feeds into
     /// `compute_deployment_url`/`compute_environment_url` when `external_url`
@@ -353,6 +357,7 @@ impl From<AppSettings> for AppSettingsResponse {
             internal_url: settings.internal_url,
             preview_domain: settings.preview_domain,
             edge_target: settings.edge_target,
+            console_force_https: settings.console_force_https,
             // Overridden by the handler via `with_proxy_port` — this struct
             // has no access to `ConfigService` here, only the DB-backed
             // `AppSettings` row. 8080 mirrors `ConfigService::proxy_port()`'s

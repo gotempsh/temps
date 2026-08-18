@@ -217,6 +217,10 @@ export async function updatePlatformSettings(
     letsencrypt: updated.letsencrypt,
     preview_domain: updated.preview_domain,
     edge_target: updated.edge_target,
+    // Same `#[serde(default)]` reasoning as self_update/cluster_dns below:
+    // omitting this would silently reset the console's HTTPS policy back to
+    // "automatic" whenever any other settings page is saved.
+    console_force_https: updated.console_force_https,
     screenshots: updated.screenshots,
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,

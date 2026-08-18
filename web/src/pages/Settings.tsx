@@ -47,6 +47,7 @@ type SettingsFormData = Pick<
   | 'edge_target'
   | 'screenshots'
   | 'letsencrypt'
+  | 'console_force_https'
 >
 
 function optionalString(value: string | null | undefined): string | null {
@@ -73,6 +74,7 @@ export function Settings() {
       internal_url: '',
       preview_domain: 'localho.st',
       edge_target: '',
+      console_force_https: null,
       screenshots: {
         enabled: false,
         provider: 'local',
@@ -86,6 +88,15 @@ export function Settings() {
   })
 
   const screenshots = useWatch({ control, name: 'screenshots' })
+  const consoleForceHttps = useWatch({ control, name: 'console_force_https' })
+  // Tri-state, so a Switch can't represent it: null ("inherit the certificate
+  // heuristic") is a genuinely different answer from false ("never redirect").
+  const consoleForceHttpsValue =
+    consoleForceHttps === null || consoleForceHttps === undefined
+      ? 'auto'
+      : consoleForceHttps
+        ? 'always'
+        : 'never'
   const letsencryptEnvironment = useWatch({
     control,
     name: 'letsencrypt.environment',
@@ -104,6 +115,7 @@ export function Settings() {
         internal_url: settings.internal_url || '',
         preview_domain: settings.preview_domain || 'localho.st',
         edge_target: settings.edge_target || '',
+        console_force_https: settings.console_force_https ?? null,
         screenshots: settings.screenshots || {
           enabled: false,
           provider: 'local',
@@ -205,6 +217,40 @@ export function Settings() {
             )}
             <p className="text-sm text-muted-foreground">
               Used for OAuth callbacks, webhooks, and external integrations
+            </p>
+          </div>
+
+          <div className="space-y-2 pt-4">
+            <Label htmlFor="console-force-https">Redirect console to HTTPS</Label>
+            <Select
+              value={consoleForceHttpsValue}
+              onValueChange={(value) =>
+                setValue(
+                  'console_force_https',
+                  value === 'auto' ? null : value === 'always',
+                  { shouldDirty: true }
+                )
+              }
+            >
+              <SelectTrigger id="console-force-https" className="w-full sm:w-[280px]">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="auto">
+                  Automatic — once a certificate exists
+                </SelectItem>
+                <SelectItem value="always">Always redirect</SelectItem>
+                <SelectItem value="never">Never redirect</SelectItem>
+              </SelectContent>
+            </Select>
+            <p className="text-sm text-muted-foreground">
+              Applies to plain-HTTP requests for the host above.{' '}
+              <strong>Automatic</strong> redirects only once that hostname has
+              a certificate issued through Temps, so HTTP-only installs keep
+              working. Choose <strong>Always</strong> only if Temps itself
+              terminates TLS — if a CDN or reverse proxy in front of Temps does,
+              it will loop, because Temps sees a plain-HTTP connection and
+              redirects it straight back.
             </p>
           </div>
 

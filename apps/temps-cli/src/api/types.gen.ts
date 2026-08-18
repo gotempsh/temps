@@ -1352,6 +1352,27 @@ export type AppSettings = {
      */
     connection_limits?: ConnectionLimitSettings;
     /**
+     * Whether plain-HTTP requests to the console host (`external_url`) are
+     * redirected to HTTPS. Same tri-state contract as an environment's
+     * `force_https`:
+     *
+     * - `None` (default) — inherit the per-host heuristic: redirect only once
+     * the console hostname has actually completed TLS provisioning. An
+     * HTTP-only install, and an install whose TLS is terminated upstream,
+     * are both left alone.
+     * - `Some(true)` — always redirect. For operators who terminate TLS at
+     * Temps but have not provisioned the cert through Temps.
+     * - `Some(false)` — never redirect, even once a certificate exists.
+     *
+     * Deliberately operator-set rather than inferred. Temps cannot tell
+     * "HTTPS terminated by an upstream CDN" apart from "plain HTTP" — both
+     * arrive as a plaintext connection, and `X-Forwarded-Proto` is not
+     * trustworthy from an arbitrary peer — so inferring `true` from an
+     * `https://` `external_url` would 301 a CDN-fronted console into an
+     * infinite redirect loop with no way out but the global kill switch.
+     */
+    console_force_https?: boolean | null;
+    /**
      * Binary version tag (e.g. "v0.1.0") of the *console* process
      * (`temps serve`, role=all or role=console) that last started. Written
      * on console startup; read by the standalone `temps proxy` to detect
@@ -1480,6 +1501,12 @@ export type AppSettingsResponse = {
      * customer app traffic. No sensitive content. See issue #646.
      */
     connection_limits: ConnectionLimitSettings;
+    /**
+     * Whether plain-HTTP requests to the console host are redirected to HTTPS.
+     * `None` inherits the per-host certificate heuristic; `Some(b)` is an
+     * explicit operator override. No sensitive content.
+     */
+    console_force_https?: boolean | null;
     container_logs: ContainerLogSettings;
     disk_space_alert: DiskSpaceAlertSettings;
     dns_provider: DnsProviderSettingsMasked;

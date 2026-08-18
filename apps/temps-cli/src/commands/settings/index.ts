@@ -24,6 +24,7 @@ interface UpdateOptions {
   defaultHttpTimeout?: string
   defaultSseIdleTimeout?: string
   defaultWebsocketIdleTimeout?: string
+  consoleForceHttps?: string
   yes?: boolean
 }
 
@@ -81,6 +82,25 @@ export function buildAutomationSettingsUpdate(
     updates.rate_limiting = {
       enabled,
       max_requests_per_minute: options.rateLimitingRpm ? parseInt(options.rateLimitingRpm, 10) : (currentSettings?.rate_limiting?.max_requests_per_minute || 60),
+    }
+  }
+  if (options.consoleForceHttps !== undefined) {
+    // Tri-state, matching an environment's force_https: "auto" clears the
+    // override so the console inherits the per-host certificate heuristic.
+    switch (options.consoleForceHttps) {
+      case 'auto':
+        updates.console_force_https = null
+        break
+      case 'always':
+        updates.console_force_https = true
+        break
+      case 'never':
+        updates.console_force_https = false
+        break
+      default:
+        return {
+          error: `--console-force-https must be auto, always or never, got "${options.consoleForceHttps}"`,
+        }
     }
   }
   if (options.screenshotsEnabled !== undefined) {
@@ -171,6 +191,7 @@ export function registerSettingsCommands(program: Command): void {
     .option('--default-http-timeout <seconds>', 'Default timeout for regular HTTP requests, in seconds')
     .option('--default-sse-idle-timeout <seconds>', 'Default idle timeout for SSE streams, in seconds')
     .option('--default-websocket-idle-timeout <seconds>', 'Default idle timeout for WebSocket connections, in seconds')
+    .option('--console-force-https <mode>', 'Redirect the console host to HTTPS: auto (once a cert exists), always, or never')
     .option('-y, --yes', 'Skip confirmation prompts (for automation)')
     .action(updateSettingsAction)
 
@@ -214,6 +235,14 @@ async function showSettings(options: { json?: boolean }): Promise<void> {
 
   // General settings
   keyValue('External URL', appSettings.external_url || colors.muted('Not set'))
+  keyValue(
+    'Console HTTPS Redirect',
+    appSettings.console_force_https === true
+      ? 'Always'
+      : appSettings.console_force_https === false
+        ? colors.muted('Never')
+        : colors.muted('Automatic (once a certificate exists)'),
+  )
   keyValue('Preview Domain', appSettings.preview_domain || colors.muted('Not set'))
 
   // Let's Encrypt settings
@@ -307,6 +336,7 @@ async function updateSettingsAction(options: UpdateOptions): Promise<void> {
     options.defaultHttpTimeout ||
     options.defaultSseIdleTimeout ||
     options.defaultWebsocketIdleTimeout ||
+    options.consoleForceHttps ||
     (options.setting && options.value)
   )
 
