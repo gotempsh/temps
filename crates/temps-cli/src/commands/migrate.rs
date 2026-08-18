@@ -122,9 +122,53 @@ async fn run_post_migration_maintenance(
     db: &Arc<temps_database::DbConnection>,
     database_url: &str,
     backend_pid: i32,
+    use_json: bool,
 ) -> anyhow::Result<()> {
+    // Announce the phase BEFORE any work starts. Concurrent index builds and
+    // continuous-aggregate refreshes routinely take minutes on a large install;
+    // without a header and per-step lines the operator stares at a terminal that
+    // looks hung after the last migration line and has no way to tell that
+    // anything is still running.
+    if !use_json {
+        println!();
+        println!("{}", "Post-migration maintenance…".bold());
+        println!(
+            "{}",
+            "  Non-transactional work that runs outside the migrations above. \
+             Ctrl+C cancels it safely; re-run `temps migrate` to resume."
+                .dimmed()
+        );
+    }
+
+    // In-place `\r` rewriting only reads correctly on a terminal. Piped into a
+    // log file or journald it concatenates every step onto one unreadable line,
+    // so non-TTY callers get one complete line per event instead.
+    let interactive = std::io::stdout().is_terminal();
+
+    // Track the backend each maintenance phase actually runs on. The index phase
+    // uses a disposable connection, so by the time the backfill starts, the
+    // connect-time `backend_pid` is a dead PID — cancelling it on Ctrl+C would
+    // report "PID N is not a PostgreSQL backend process" while the refresh it was
+    // meant to stop kept running. Phases announce their own PID; cancel that one.
+    let phase_pid = Arc::new(std::sync::atomic::AtomicI32::new(backend_pid));
+
+    let report_progress = {
+        let phase_pid = phase_pid.clone();
+        move |progress: temps_database::MaintenanceProgress<'_>| {
+            if let temps_database::MaintenanceProgress::PhaseBackend { pid } = &progress {
+                phase_pid.store(*pid, std::sync::atomic::Ordering::SeqCst);
+            }
+            if use_json {
+                print_maintenance_json(progress);
+            } else {
+                print_maintenance(progress, interactive);
+            }
+        }
+    };
+    let current_pid = || phase_pid.load(std::sync::atomic::Ordering::SeqCst);
+
     match race_maintenance(
-        temps_database::run_post_migration_indexes(db),
+        temps_database::run_post_migration_indexes_streaming(db, &report_progress),
         tokio::signal::ctrl_c(),
     )
     .await
@@ -133,7 +177,7 @@ async fn run_post_migration_maintenance(
         MaintenanceRace::Interrupted => {
             return Err(interrupted_maintenance_error(
                 database_url,
-                backend_pid,
+                current_pid(),
                 "post-migration index creation",
             )
             .await)
@@ -141,7 +185,7 @@ async fn run_post_migration_maintenance(
     }
 
     match race_maintenance(
-        temps_database::run_post_migration_backfill(db),
+        temps_database::run_post_migration_backfill_streaming(db, &report_progress),
         tokio::signal::ctrl_c(),
     )
     .await
@@ -149,11 +193,19 @@ async fn run_post_migration_maintenance(
         MaintenanceRace::Completed(Ok(())) => {}
         MaintenanceRace::Completed(Err(error)) => {
             info!("Post-migration backfill skipped/failed (refresh policy will catch up): {error}");
+            if !use_json {
+                println!(
+                    "  {} {}",
+                    "!".yellow(),
+                    format!("Backfill skipped: {error} (the refresh policy will catch up)")
+                        .yellow()
+                );
+            }
         }
         MaintenanceRace::Interrupted => {
             return Err(interrupted_maintenance_error(
                 database_url,
-                backend_pid,
+                current_pid(),
                 "post-migration backfill",
             )
             .await)
@@ -213,7 +265,8 @@ impl MigrateCommand {
                 if !self.dry_run {
                     // Non-transactional maintenance must remain retryable even
                     // after every schema migration is already recorded.
-                    run_post_migration_maintenance(&db, &self.database_url, backend_pid).await?;
+                    run_post_migration_maintenance(&db, &self.database_url, backend_pid, use_json)
+                        .await?;
                     if !use_json {
                         println!("{}", "✓ Post-migration maintenance complete.".green());
                     }
@@ -317,7 +370,7 @@ impl MigrateCommand {
             // Tokio's process-wide signal handler remains installed after the
             // migration select above, so awaiting these phases directly would
             // swallow a later SIGINT and leave the operator unable to cancel.
-            run_post_migration_maintenance(&db, &self.database_url, backend_pid).await?;
+            run_post_migration_maintenance(&db, &self.database_url, backend_pid, use_json).await?;
 
             let total: std::time::Duration = report.results.iter().map(|r| r.elapsed).sum();
             if use_json {
@@ -470,6 +523,191 @@ fn print_progress_json(progress: temps_database::MigrationProgress<'_>) {
     let _ = std::io::stdout().flush();
 }
 
+/// Live progress callback for post-migration maintenance (human output).
+///
+/// On a terminal this uses the same in-place convention as [`print_progress`]:
+/// the in-flight line is written without a newline and rewritten via `\r` as
+/// work advances, so a 31-window backfill reports `[7/31]` as it goes instead
+/// of printing nothing for several minutes. Each rewritten line is at least as
+/// long as the one it replaces, so no characters are left behind.
+///
+/// When `interactive` is false (piped output, CI, systemd) every event gets its
+/// own complete line — `\r` rewriting is unreadable in a log file.
+fn print_maintenance(progress: temps_database::MaintenanceProgress<'_>, interactive: bool) {
+    use temps_database::MaintenanceProgress;
+    match progress {
+        // Bookkeeping for the interrupt path, not something to show an operator
+        // mid-run; the PID is surfaced in the interruption error if it matters.
+        MaintenanceProgress::PhaseBackend { .. } => {}
+        MaintenanceProgress::IndexStarted { name } => {
+            if interactive {
+                print!("  {} index {} …", "→".cyan(), name);
+                let _ = std::io::stdout().flush();
+            } else {
+                println!("  {} index {} …", "→".cyan(), name);
+            }
+        }
+        MaintenanceProgress::IndexFinished { name, elapsed } => {
+            println!(
+                "{}  {} index {} {}",
+                if interactive { "\r" } else { "" },
+                "✓".green(),
+                name,
+                format!("({})", format_elapsed(elapsed)).dimmed()
+            );
+        }
+        MaintenanceProgress::AggregateStarted { view, windows } => {
+            if interactive {
+                print!("  {} {} refresh [0/{}] …", "→".cyan(), view, windows);
+                let _ = std::io::stdout().flush();
+            } else {
+                println!(
+                    "  {} {} refresh: {} window(s) to process …",
+                    "→".cyan(),
+                    view,
+                    windows
+                );
+            }
+        }
+        MaintenanceProgress::AggregateWindow {
+            view,
+            index,
+            total,
+            elapsed,
+            error,
+        } => {
+            if let Some(error) = error {
+                // A failed window gets its own permanent line — the operator
+                // must be able to see WHICH window failed and why, even though
+                // the backfill deliberately continues.
+                println!(
+                    "{}  {} {} window {}/{} failed: {}",
+                    if interactive { "\r" } else { "" },
+                    "!".yellow(),
+                    view,
+                    index,
+                    total,
+                    error.yellow()
+                );
+            }
+            if interactive {
+                print!(
+                    "\r  {} {} refresh [{}/{}] … {}",
+                    "→".cyan(),
+                    view,
+                    index,
+                    total,
+                    format!("(last window {})", format_elapsed(elapsed)).dimmed()
+                );
+                let _ = std::io::stdout().flush();
+            } else {
+                println!(
+                    "  {} {} refresh [{}/{}] {}",
+                    "·".dimmed(),
+                    view,
+                    index,
+                    total,
+                    format!("({})", format_elapsed(elapsed)).dimmed()
+                );
+            }
+        }
+        MaintenanceProgress::AggregateFinished {
+            view,
+            windows,
+            failed,
+            elapsed,
+        } => {
+            let suffix = if failed == 0 {
+                format!("({})", format_elapsed(elapsed))
+                    .dimmed()
+                    .to_string()
+            } else {
+                format!("({}, {failed} window(s) failed)", format_elapsed(elapsed))
+                    .yellow()
+                    .to_string()
+            };
+            println!(
+                "{}  {} {} refresh [{}/{}] {}          ",
+                if interactive { "\r" } else { "" },
+                if failed == 0 {
+                    "✓".green()
+                } else {
+                    "!".yellow()
+                },
+                view,
+                windows,
+                windows,
+                suffix
+            );
+        }
+    }
+}
+
+/// Machine-readable maintenance progress for `--progress-format=json`.
+///
+/// Mirrors [`print_maintenance`] as NDJSON so the "Update Now" orchestration
+/// worker can show the same phase to the user instead of a stalled progress
+/// bar between the last migration and completion.
+fn print_maintenance_json(progress: temps_database::MaintenanceProgress<'_>) {
+    println!("{}", maintenance_json(progress));
+    let _ = std::io::stdout().flush();
+}
+
+/// The NDJSON line for one maintenance event. Split out from
+/// [`print_maintenance_json`] so the wire contract is unit-testable.
+fn maintenance_json(progress: temps_database::MaintenanceProgress<'_>) -> serde_json::Value {
+    use temps_database::MaintenanceProgress;
+    match progress {
+        // Emitted so a parent process can report/kill the exact backend if the
+        // child is terminated out from under it.
+        MaintenanceProgress::PhaseBackend { pid } => serde_json::json!({
+            "event": "maintenance_backend",
+            "pid": pid,
+        }),
+        MaintenanceProgress::IndexStarted { name } => serde_json::json!({
+            "event": "maintenance_index_started",
+            "name": name,
+        }),
+        MaintenanceProgress::IndexFinished { name, elapsed } => serde_json::json!({
+            "event": "maintenance_index_finished",
+            "name": name,
+            "elapsed_ms": elapsed.as_millis() as u64,
+        }),
+        MaintenanceProgress::AggregateStarted { view, windows } => serde_json::json!({
+            "event": "maintenance_backfill_started",
+            "view": view,
+            "windows": windows,
+        }),
+        MaintenanceProgress::AggregateWindow {
+            view,
+            index,
+            total,
+            elapsed,
+            error,
+        } => serde_json::json!({
+            "event": "maintenance_backfill_window",
+            "view": view,
+            "index": index,
+            "total": total,
+            "elapsed_ms": elapsed.as_millis() as u64,
+            "success": error.is_none(),
+            "error": error,
+        }),
+        MaintenanceProgress::AggregateFinished {
+            view,
+            windows,
+            failed,
+            elapsed,
+        } => serde_json::json!({
+            "event": "maintenance_backfill_finished",
+            "view": view,
+            "windows": windows,
+            "failed": failed,
+            "elapsed_ms": elapsed.as_millis() as u64,
+        }),
+    }
+}
+
 /// After a streaming apply, surface any planned migrations that were never
 /// attempted (everything after a failure) so the operator knows the set is
 /// incomplete. No-op on a fully successful run.
@@ -512,6 +750,52 @@ mod tests {
     async fn maintenance_race_observes_interrupts_after_migrations_finish() {
         let result = race_maintenance(std::future::pending::<()>(), std::future::ready(())).await;
         assert!(matches!(result, MaintenanceRace::Interrupted));
+    }
+
+    #[test]
+    fn maintenance_backfill_window_json_reports_progress_and_failure() {
+        use temps_database::MaintenanceProgress;
+
+        let ok = super::maintenance_json(MaintenanceProgress::AggregateWindow {
+            view: "proxy_logs_stats_1m",
+            index: 7,
+            total: 31,
+            elapsed: std::time::Duration::from_millis(1_200),
+            error: None,
+        });
+        assert_eq!(ok["event"], "maintenance_backfill_window");
+        assert_eq!(ok["view"], "proxy_logs_stats_1m");
+        assert_eq!(ok["index"], 7);
+        assert_eq!(ok["total"], 31);
+        assert_eq!(ok["elapsed_ms"], 1_200);
+        assert_eq!(ok["success"], true);
+        assert!(ok["error"].is_null());
+
+        let failed = super::maintenance_json(MaintenanceProgress::AggregateWindow {
+            view: "events_hourly",
+            index: 1,
+            total: 1,
+            elapsed: std::time::Duration::from_millis(5),
+            error: Some("lock timeout".to_string()),
+        });
+        assert_eq!(failed["success"], false);
+        assert_eq!(failed["error"], "lock timeout");
+    }
+
+    #[test]
+    fn maintenance_index_json_events_are_distinguishable() {
+        use temps_database::MaintenanceProgress;
+
+        let started = super::maintenance_json(MaintenanceProgress::IndexStarted { name: "idx_a" });
+        assert_eq!(started["event"], "maintenance_index_started");
+        assert_eq!(started["name"], "idx_a");
+
+        let finished = super::maintenance_json(MaintenanceProgress::IndexFinished {
+            name: "idx_a",
+            elapsed: std::time::Duration::from_secs(3),
+        });
+        assert_eq!(finished["event"], "maintenance_index_finished");
+        assert_eq!(finished["elapsed_ms"], 3_000);
     }
 
     #[tokio::test]

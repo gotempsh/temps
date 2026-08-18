@@ -1,6 +1,6 @@
 # CI automation
 
-Use a pinned `@temps-sdk/cli@0.1.33` invocation and the immutable package
+Use a pinned `@temps-sdk/cli@0.1.34` invocation and the immutable package
 integrity check from [the CLI runtime](../references/cli-runtime.md).
 
 - Store `TEMPS_TOKEN` and `TEMPS_API_URL` in the CI provider's secret store.

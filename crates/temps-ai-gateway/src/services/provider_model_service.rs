@@ -182,23 +182,41 @@ impl ProviderModelService {
         display_name: Option<&str>,
     ) -> Result<ai_provider_models::Model, AiGatewayError> {
         let model_id = validate_model_id(model_id)?;
+        let display_name = display_name.map(validate_display_name).transpose()?;
         let _ = self.keys.get_by_id(provider_key_id).await?;
-        let duplicate = ai_provider_models::Entity::find()
+        let existing = ai_provider_models::Entity::find()
             .filter(ai_provider_models::Column::ProviderKeyId.eq(provider_key_id))
             .filter(ai_provider_models::Column::ModelId.eq(model_id))
             .one(self.db.as_ref())
             .await?;
-        if duplicate.is_some() {
-            return Err(AiGatewayError::Validation {
-                message: format!(
-                    "Model '{model_id}' already exists for provider key {provider_key_id}"
-                ),
-            });
+        if let Some(model) = existing {
+            if model.is_enabled && model.is_available {
+                return Err(AiGatewayError::Validation {
+                    message: format!(
+                        "Model '{model_id}' already exists for provider key {provider_key_id}"
+                    ),
+                });
+            }
+            // Row already exists but was disabled/unavailable (e.g. left over
+            // from a refresh, or manually disabled): re-enable it instead of
+            // erroring, since the row is otherwise indistinguishable to the
+            // caller from "model not yet added". Mark it manual so the next
+            // refresh() doesn't zero out is_available again if the provider's
+            // discovery response happens to omit this model that time --
+            // that's the same reason the fresh-insert branch below is manual.
+            let mut active: ai_provider_models::ActiveModel = model.into();
+            active.is_enabled = Set(true);
+            active.is_available = Set(true);
+            active.source = Set(MODEL_SOURCE_MANUAL.to_string());
+            if let Some(name) = display_name {
+                active.display_name = Set(name.to_string());
+            }
+            return Ok(active.update(self.db.as_ref()).await?);
         }
         Ok(ai_provider_models::ActiveModel {
             provider_key_id: Set(provider_key_id),
             model_id: Set(model_id.to_string()),
-            display_name: Set(display_name.unwrap_or(model_id).trim().to_string()),
+            display_name: Set(display_name.unwrap_or(model_id).to_string()),
             source: Set(MODEL_SOURCE_MANUAL.to_string()),
             is_available: Set(true),
             is_enabled: Set(true),
@@ -296,6 +314,19 @@ fn validate_model_id(model_id: &str) -> Result<&str, AiGatewayError> {
     Ok(model_id)
 }
 
+fn validate_display_name(display_name: &str) -> Result<&str, AiGatewayError> {
+    let display_name = display_name.trim();
+    if display_name.is_empty()
+        || display_name.len() > 255
+        || display_name.chars().any(char::is_control)
+    {
+        return Err(AiGatewayError::Validation {
+            message: "Display name must contain 1-255 non-control characters".to_string(),
+        });
+    }
+    Ok(display_name)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,6 +366,21 @@ mod tests {
         ProviderModelService::new(db, keys, gateway)
     }
 
+    fn provider_key(id: i32) -> ai_provider_keys::Model {
+        let now = chrono::Utc::now();
+        ai_provider_keys::Model {
+            id,
+            provider: "anthropic".to_string(),
+            display_name: "Anthropic".to_string(),
+            api_key_encrypted: "encrypted".to_string(),
+            base_url: None,
+            default_model: None,
+            is_active: true,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
     #[test]
     fn manual_model_id_is_trimmed_and_validated() {
         assert_eq!(
@@ -347,6 +393,72 @@ mod tests {
         ));
         assert!(matches!(
             validate_model_id(&"x".repeat(256)),
+            Err(AiGatewayError::Validation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_manual_reenables_existing_disabled_row_instead_of_erroring() {
+        let mut reenabled = model("claude-haiku-4-5", true, true);
+        reenabled.source = MODEL_SOURCE_MANUAL.to_string();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![provider_key(2)]])
+                .append_query_results([vec![model("claude-haiku-4-5", false, false)]])
+                .append_query_results([vec![reenabled]])
+                .into_connection(),
+        );
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let keys = Arc::new(ProviderKeyService::new(db.clone(), encryption));
+        let gateway = Arc::new(GatewayService::new(keys.clone()));
+        let service = ProviderModelService::new(db, keys, gateway);
+
+        let result = service
+            .add_manual(2, "claude-haiku-4-5", None)
+            .await
+            .expect("re-adding a disabled model should re-enable it");
+        assert!(result.is_enabled);
+        assert!(result.is_available);
+        // Marked manual so the next refresh() doesn't re-disable it if that
+        // refresh's discovery response happens to omit this model again.
+        assert_eq!(result.source, MODEL_SOURCE_MANUAL);
+    }
+
+    #[test]
+    fn manual_display_name_is_trimmed_and_validated() {
+        assert_eq!(
+            validate_display_name("  Claude Haiku (fast)  ").unwrap(),
+            "Claude Haiku (fast)"
+        );
+        assert!(matches!(
+            validate_display_name("\n"),
+            Err(AiGatewayError::Validation { .. })
+        ));
+        assert!(matches!(
+            validate_display_name(&"x".repeat(256)),
+            Err(AiGatewayError::Validation { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn add_manual_rejects_already_enabled_duplicate() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![provider_key(2)]])
+                .append_query_results([vec![model("claude-haiku-4-5", true, true)]])
+                .into_connection(),
+        );
+        let encryption = Arc::new(
+            temps_core::EncryptionService::new("01234567890123456789012345678901").unwrap(),
+        );
+        let keys = Arc::new(ProviderKeyService::new(db.clone(), encryption));
+        let gateway = Arc::new(GatewayService::new(keys.clone()));
+        let service = ProviderModelService::new(db, keys, gateway);
+
+        assert!(matches!(
+            service.add_manual(2, "claude-haiku-4-5", None).await,
             Err(AiGatewayError::Validation { .. })
         ));
     }

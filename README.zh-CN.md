@@ -16,7 +16,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[官网](https://temps.sh) · [文档](https://temps.sh/docs) · [快速开始](https://temps.sh/docs/introduction) · [讨论区](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
+[官网](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=header_zh) · [文档](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=header_zh) · [快速开始](https://temps.sh/docs/introduction?utm_source=github&utm_medium=repo&utm_content=header_zh) · [讨论区](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 [English](README.md) | 简体中文 | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | [日本語](README.ja.md) | [Português](README.pt-BR.md)
 
@@ -253,7 +253,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **已测试系统：** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; macOS 也可运行
 
-不想自己维护服务器？[Temps Cloud](https://temps.sh/pricing) 可以在托管基础设施上为你运行 Temps。
+不想自己维护服务器？[Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_zh) 可以在托管基础设施上为你运行 Temps。
 
 ---
 
@@ -303,7 +303,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **这些替代方案的优势所在。** Coolify 和 Dokploy 拥有一键模板库（Coolify 上有 280+ 应用），这些 Temps 目前还没有；而且两者的社区规模远大于 Temps —— 仅 Coolify 就有 56k+ GitHub star，Temps 则是这份列表中最年轻的项目。如果你只需要通过 CLI 驱动的零停机 Docker 部署，Kamal 是更简单的选择。Vercel 和其他托管平台提供全球边缘网络、边缘函数和 DDoS 吸收能力，这些是单台 VPS 无法企及的 —— 而且它们替你运维基础设施，如果你完全不想操心服务器，这是实实在在的价值。
 
-详细且持续更新的对比：[temps.sh/compare](https://temps.sh/compare)
+详细且持续更新的对比：[temps.sh/compare](https://temps.sh/compare?utm_source=github&utm_medium=repo&utm_content=compare_zh)
 
 ---
 
@@ -386,11 +386,11 @@ const files = await blob.list({ prefix: 'avatars/' });
 
 ## Star 历史
 
-<a href="https://www.star-history.com/#gotempsh/temps&Date">
+<a href="https://star-history.dera.page/#gotempsh/temps&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
-    <img alt="Star 历史图表" src="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
+    <img alt="Star 历史图表" src="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
   </picture>
 </a>
 
@@ -416,6 +416,6 @@ cargo build --release
 
 <div align="center">
 
-[temps.sh](https://temps.sh) | [文档](https://temps.sh/docs) | [GitHub](https://github.com/gotempsh/temps)
+[temps.sh](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=footer_zh) | [文档](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=footer_zh) | [GitHub](https://github.com/gotempsh/temps)
 
 </div>

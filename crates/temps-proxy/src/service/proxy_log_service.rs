@@ -4,7 +4,7 @@ use crate::traffic_aggregation::{
 use chrono::{DateTime, Utc};
 use sea_orm::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use temps_core::UtcDateTime;
@@ -70,6 +70,39 @@ pub struct ProxyLogResponse {
     pub request_size_bytes: Option<i64>,
     pub response_size_bytes: Option<i64>,
     pub cache_status: Option<String>,
+    /// Inbound request headers, credential values already replaced with
+    /// `[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry
+    /// predates header capture or was written by a path that doesn't record
+    /// them; an empty map means "captured, but no headers", which is different
+    /// and worth being able to tell apart.
+    ///
+    /// A `BTreeMap` rather than a raw `serde_json::Value` so the schema stays
+    /// typed and the UI gets a stable alphabetical ordering for free.
+    pub request_headers: Option<BTreeMap<String, String>>,
+    /// Upstream response headers, redacted on the same terms as
+    /// [`Self::request_headers`].
+    pub response_headers: Option<BTreeMap<String, String>>,
+}
+
+/// Convert a stored header blob into a typed, sorted map.
+///
+/// Headers are persisted as a flat JSON object. A non-object blob yields `None`
+/// rather than being surfaced half-parsed — a malformed blob is a storage-layer
+/// bug, and rendering fragments of it in the console would be misleading.
+/// Non-string values shouldn't occur (the proxy writes `HashMap<String,
+/// String>`) but are stringified rather than dropped, so a surprise is visible
+/// instead of silently missing.
+fn headers_from_json(value: Option<serde_json::Value>) -> Option<BTreeMap<String, String>> {
+    let object = value?.as_object()?.clone();
+    Some(
+        object
+            .into_iter()
+            .map(|(name, value)| match value {
+                serde_json::Value::String(text) => (name, text),
+                other => (name, other.to_string()),
+            })
+            .collect(),
+    )
 }
 
 impl From<proxy_logs::Model> for ProxyLogResponse {
@@ -108,6 +141,8 @@ impl From<proxy_logs::Model> for ProxyLogResponse {
             request_size_bytes: model.request_size_bytes,
             response_size_bytes: model.response_size_bytes,
             cache_status: model.cache_status,
+            request_headers: headers_from_json(model.request_headers),
+            response_headers: headers_from_json(model.response_headers),
         }
     }
 }
@@ -311,6 +346,12 @@ impl ProxyLogService {
         &self,
         mut request: CreateProxyLogRequest,
     ) -> Result<proxy_logs::Model, ProxyLogServiceError> {
+        // Strip credentials before anything is written. The batched hot path
+        // redacts in `send_or_drop`; this is the other way a row reaches the
+        // table, so it redacts too — a caller must not be able to persist a
+        // `Cookie` header or an OAuth `?code=` by picking this entry point.
+        crate::redaction::redact_log_entry(&mut request);
+
         let now = Utc::now();
         let created_date = now.date_naive();
 
@@ -1413,8 +1454,10 @@ impl ProxyLogService {
                 r#"
                 SELECT
                     project_id,
-                    COALESCE(SUM(request_count), 0)::bigint as total_requests,
-                    COALESCE(SUM(error_5xx_plus_count), 0)::bigint as total_errors,
+                    date_trunc('hour', bucket) AS hour,
+                    COALESCE(SUM(request_count), 0)::bigint as request_count,
+                    COALESCE(SUM(error_5xx_plus_count), 0)::bigint as error_count,
+                    COALESCE(SUM(response_time_count), 0)::bigint as latency_count,
                     COALESCE(
                         SUM(sum_response_time_ms)::float8
                             / NULLIF(SUM(response_time_count), 0)::float8,
@@ -1423,8 +1466,10 @@ impl ProxyLogService {
                 FROM proxy_logs_stats_1m
                 WHERE bucket >= $1
                   AND bucket < $2
+                  AND is_system_request = FALSE
                   AND project_id IN ({}){}
-                GROUP BY project_id
+                GROUP BY project_id, date_trunc('hour', bucket)
+                ORDER BY project_id, hour
                 "#,
                 placeholders_str, bot_clause
             )
@@ -1433,14 +1478,18 @@ impl ProxyLogService {
                 r#"
                 SELECT
                     project_id,
-                    COALESCE(COUNT(*), 0) as total_requests,
-                    COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) as total_errors,
+                    date_trunc('hour', timestamp) AS hour,
+                    COALESCE(COUNT(*), 0) as request_count,
+                    COALESCE(SUM(CASE WHEN status_code >= 500 THEN 1 ELSE 0 END), 0) as error_count,
+                    COUNT(response_time_ms) as latency_count,
                     COALESCE(AVG(response_time_ms)::float8, 0) as avg_response_time_ms
                 FROM proxy_logs
                 WHERE timestamp >= $1
                   AND timestamp < $2
+                  AND is_system_request = FALSE
                   AND project_id IN ({}){}
-                GROUP BY project_id
+                GROUP BY project_id, date_trunc('hour', timestamp)
+                ORDER BY project_id, hour
                 "#,
                 placeholders_str, bot_clause
             )
@@ -1458,57 +1507,67 @@ impl ProxyLogService {
         let stmt = sea_orm::Statement::from_sql_and_values(db_backend, &sql, values);
         let results = self.db.query_all(stmt).await?;
 
-        // Build a map from query results
+        // Build each summary and its hourly request-count series from the same
+        // grouped query. This keeps the dashboard batch endpoint at one
+        // telemetry query regardless of the number of projects requested.
         let mut summaries: std::collections::HashMap<i32, ProjectHealthSummary> =
             std::collections::HashMap::new();
 
-        for row in &results {
-            let project_id: i32 = row.try_get("", "project_id").unwrap_or(0);
-            let total_requests: i64 = row.try_get("", "total_requests").unwrap_or(0);
-            let total_errors: i64 = row.try_get("", "total_errors").unwrap_or(0);
-            let avg_response_time_ms: f64 = row.try_get("", "avg_response_time_ms").unwrap_or(0.0);
+        for row in results {
+            let project_id: i32 = row.try_get("", "project_id").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode project_id in projects health query: {error}"
+                )))
+            })?;
+            let hour: DateTime<Utc> = row.try_get("", "hour").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode hourly bucket for project {project_id}: {error}"
+                )))
+            })?;
+            let request_count: i64 = row.try_get("", "request_count").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode request count for project {project_id}: {error}"
+                )))
+            })?;
+            let error_count: i64 = row.try_get("", "error_count").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode error count for project {project_id}: {error}"
+                )))
+            })?;
+            let latency_count: i64 = row.try_get("", "latency_count").map_err(|error| {
+                ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                    "Failed to decode latency count for project {project_id}: {error}"
+                )))
+            })?;
+            let bucket_avg_response_time_ms: f64 =
+                row.try_get("", "avg_response_time_ms").map_err(|error| {
+                    ProxyLogServiceError::DatabaseError(DbErr::Custom(format!(
+                        "Failed to decode average response time for project {project_id}: {error}"
+                    )))
+                })?;
 
-            let error_rate = if total_requests > 0 {
-                (total_errors as f64 / total_requests as f64) * 100.0
-            } else {
-                0.0
-            };
-
-            let status = if total_requests == 0 {
-                "unknown".to_string()
-            } else if error_rate > 50.0 {
-                "down".to_string()
-            } else if error_rate > 10.0 {
-                "degraded".to_string()
-            } else {
-                "healthy".to_string()
-            };
-
-            summaries.insert(
-                project_id,
-                ProjectHealthSummary {
-                    project_id,
-                    total_requests,
-                    total_errors,
-                    avg_response_time_ms: (avg_response_time_ms * 10.0).round() / 10.0,
-                    error_rate: (error_rate * 10.0).round() / 10.0,
-                    status,
-                },
-            );
+            let summary = summaries
+                .entry(project_id)
+                .or_insert_with(|| ProjectHealthSummary::empty(project_id));
+            summary.total_requests += request_count;
+            summary.total_errors += error_count;
+            summary.latency_count += latency_count;
+            summary.weighted_response_time_ms += bucket_avg_response_time_ms * latency_count as f64;
+            summary.hourly_requests.push(ProjectHourlyRequestCount {
+                bucket: hour.to_rfc3339(),
+                request_count,
+            });
         }
 
         // Include projects with no data as "unknown"
         let result: Vec<ProjectHealthSummary> = project_ids
             .iter()
             .map(|&id| {
-                summaries.remove(&id).unwrap_or(ProjectHealthSummary {
-                    project_id: id,
-                    total_requests: 0,
-                    total_errors: 0,
-                    avg_response_time_ms: 0.0,
-                    error_rate: 0.0,
-                    status: "unknown".to_string(),
-                })
+                let mut summary = summaries
+                    .remove(&id)
+                    .unwrap_or_else(|| ProjectHealthSummary::empty(id));
+                summary.finish_aggregation(start_time, end_time);
+                summary
             })
             .collect();
 
@@ -1751,7 +1810,8 @@ impl ProxyLogService {
 
     /// True when every set filter dimension is a grouping column of
     /// `proxy_logs_stats_1m` (`project_id`, `environment_id`, `is_bot`,
-    /// `has_project`). Any other filter forces the raw-table path.
+    /// `is_system_request`, `has_project`). Any other filter forces the
+    /// raw-table path.
     fn cagg_serves_filters(filters: Option<&StatsFilters>) -> bool {
         let Some(f) = filters else { return true };
         f.method.is_none()
@@ -2857,7 +2917,16 @@ pub struct AiStatusBreakdownRow {
     pub request_count: i64,
 }
 
-/// Health summary for a single project (last 1 hour)
+/// One hourly request-count point in a project health summary.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ProjectHourlyRequestCount {
+    /// Start of the UTC hour in RFC 3339 format.
+    #[schema(example = "2026-08-16T12:00:00Z")]
+    pub bucket: String,
+    pub request_count: i64,
+}
+
+/// Health summary for a single project over the requested time range.
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ProjectHealthSummary {
     pub project_id: i32,
@@ -2871,11 +2940,105 @@ pub struct ProjectHealthSummary {
     pub error_rate: f64,
     /// Health status: "healthy", "degraded", "down", "unknown"
     pub status: String,
+    /// Hourly request counts ordered by bucket start.
+    pub hourly_requests: Vec<ProjectHourlyRequestCount>,
+    /// Internal accumulator used to combine hourly latency averages without a
+    /// second query. It is never part of API serialization or OpenAPI.
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) weighted_response_time_ms: f64,
+    #[serde(skip)]
+    #[schema(ignore)]
+    pub(crate) latency_count: i64,
+}
+
+impl ProjectHealthSummary {
+    pub(crate) fn empty(project_id: i32) -> Self {
+        Self {
+            project_id,
+            total_requests: 0,
+            total_errors: 0,
+            avg_response_time_ms: 0.0,
+            error_rate: 0.0,
+            status: "unknown".to_string(),
+            hourly_requests: Vec::new(),
+            weighted_response_time_ms: 0.0,
+            latency_count: 0,
+        }
+    }
+
+    pub(crate) fn finish_aggregation(&mut self, start_time: UtcDateTime, end_time: UtcDateTime) {
+        let observed = std::mem::take(&mut self.hourly_requests)
+            .into_iter()
+            .map(|point| (point.bucket, point.request_count))
+            .collect::<HashMap<_, _>>();
+        let mut bucket_seconds = start_time.timestamp().div_euclid(3_600) * 3_600;
+        while bucket_seconds < end_time.timestamp() {
+            let Some(bucket) = DateTime::<Utc>::from_timestamp(bucket_seconds, 0) else {
+                break;
+            };
+            let bucket = bucket.to_rfc3339();
+            self.hourly_requests.push(ProjectHourlyRequestCount {
+                request_count: observed.get(&bucket).copied().unwrap_or(0),
+                bucket,
+            });
+            bucket_seconds += 3_600;
+        }
+
+        if self.total_requests == 0 {
+            return;
+        }
+        if self.latency_count > 0 {
+            self.avg_response_time_ms =
+                ((self.weighted_response_time_ms / self.latency_count as f64) * 10.0).round()
+                    / 10.0;
+        }
+        self.error_rate =
+            ((self.total_errors as f64 / self.total_requests as f64) * 1_000.0).round() / 10.0;
+        self.status = if self.error_rate > 50.0 {
+            "down".to_string()
+        } else if self.error_rate > 10.0 {
+            "degraded".to_string()
+        } else {
+            "healthy".to_string()
+        };
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_health_uses_latency_sample_count_and_gapfills_24_hours() {
+        let start = DateTime::parse_from_rfc3339("2026-08-15T12:00:00Z")
+            .expect("valid start")
+            .with_timezone(&Utc);
+        let end = start + chrono::Duration::hours(24);
+        let mut summary = ProjectHealthSummary::empty(7);
+        summary.total_requests = 12;
+        summary.total_errors = 1;
+        summary.latency_count = 2;
+        summary.weighted_response_time_ms = 300.0;
+        summary.hourly_requests = vec![ProjectHourlyRequestCount {
+            bucket: (start + chrono::Duration::hours(5)).to_rfc3339(),
+            request_count: 12,
+        }];
+
+        summary.finish_aggregation(start, end);
+
+        assert_eq!(summary.avg_response_time_ms, 150.0);
+        assert_eq!(summary.hourly_requests.len(), 24);
+        assert_eq!(summary.hourly_requests[5].request_count, 12);
+        assert_eq!(
+            summary
+                .hourly_requests
+                .iter()
+                .filter(|point| point.request_count == 0)
+                .count(),
+            23
+        );
+    }
 
     #[test]
     fn traffic_aggregation_project_budget_is_bounded_and_recovers() {
@@ -3405,12 +3568,17 @@ mod tests {
         async fn insert_log(
             db: &DatabaseConnection,
             ts: chrono::DateTime<Utc>,
-            n: i32,
             project_id: i32,
             status: i16,
             rt_ms: i32,
             is_bot: bool,
+            is_system_request: bool,
         ) {
+            let request_source = if is_system_request {
+                "temps_monitor"
+            } else {
+                "proxy"
+            };
             let stmt = sea_orm::Statement::from_sql_and_values(
                 sea_orm::DatabaseBackend::Postgres,
                 r#"INSERT INTO proxy_logs
@@ -3418,15 +3586,18 @@ mod tests {
                      request_source, is_system_request, routing_status, project_id,
                      request_id, is_bot, request_size_bytes, response_size_bytes,
                      created_date)
-                   VALUES ($1, 'GET', '/', 'test.local', $2, $3, 'proxy', false,
-                           'routed', $4, $5, $6, 100, 200, $7)"#,
+                   VALUES ($1, 'GET', '/', 'test.local', $2, $3, $7, $8,
+                           'routed', $4, $5, $6, 100, 200, $9)"#,
                 vec![
                     ts.into(),
                     status.into(),
                     rt_ms.into(),
                     project_id.into(),
-                    format!("cagg-test-{n}").into(),
+                    format!("cagg-test-{project_id}-{status}-{rt_ms}-{is_bot}-{is_system_request}")
+                        .into(),
                     is_bot.into(),
+                    request_source.into(),
+                    is_system_request.into(),
                     ts.date_naive().into(),
                 ],
             );
@@ -3437,11 +3608,12 @@ mod tests {
         // by real-time aggregation (the refresh policy hasn't materialized
         // them yet — exactly the state right after deploy).
         let ts = Utc::now() - chrono::Duration::minutes(5);
-        insert_log(&db, ts, 1, 1, 200, 100, false).await;
-        insert_log(&db, ts, 2, 1, 404, 50, false).await;
-        insert_log(&db, ts, 3, 1, 500, 30, false).await;
-        insert_log(&db, ts, 4, 1, 200, 20, true).await; // bot row
-        insert_log(&db, ts, 5, 2, 200, 10, false).await;
+        insert_log(&db, ts, 1, 200, 100, false, false).await;
+        insert_log(&db, ts, 1, 404, 50, false, false).await;
+        insert_log(&db, ts, 1, 500, 30, false, false).await;
+        insert_log(&db, ts, 1, 200, 20, true, false).await; // bot row
+        insert_log(&db, ts, 2, 200, 10, false, false).await;
+        insert_log(&db, ts, 1, 500, 900, false, true).await; // Temps monitor
 
         let start = Utc::now() - chrono::Duration::hours(1);
         let end = Utc::now() + chrono::Duration::minutes(1);
@@ -3454,6 +3626,8 @@ mod tests {
         assert_eq!(health.len(), 3);
 
         let p1 = health.iter().find(|h| h.project_id == 1).expect("p1");
+        // The dashboard summary excludes Temps' own status checks while still
+        // retaining ordinary crawler traffic unless is_bot is requested.
         assert_eq!(p1.total_requests, 4);
         assert_eq!(p1.total_errors, 1); // only the 500 counts (>= 500)
         assert!((p1.avg_response_time_ms - 50.0).abs() < 1e-9); // (100+50+30+20)/4
@@ -3512,10 +3686,14 @@ mod tests {
             })
         };
         let (cagg_reqs, cagg_errs, cagg_req_bytes, cagg_resp_bytes) = sum(&via_cagg);
-        assert_eq!(cagg_reqs, 4);
-        assert_eq!(cagg_errs, 2); // 404 + 500 (time-bucket errors are >= 400)
-        assert_eq!(cagg_req_bytes, 400);
-        assert_eq!(cagg_resp_bytes, 800);
+        // Generic time-bucket queries include system traffic unless callers
+        // explicitly request synthetic exclusion. This keeps the aggregate
+        // and raw backends equivalent; project health summaries above apply
+        // their own trusted-system exclusion.
+        assert_eq!(cagg_reqs, 5);
+        assert_eq!(cagg_errs, 3); // 404 + both 500s
+        assert_eq!(cagg_req_bytes, 500);
+        assert_eq!(cagg_resp_bytes, 1000);
         assert_eq!(
             sum(&via_raw),
             (cagg_reqs, cagg_errs, cagg_req_bytes, cagg_resp_bytes)
@@ -3530,14 +3708,14 @@ mod tests {
             .iter()
             .find(|b| b.request_count > 0)
             .expect("populated raw bucket");
-        assert!((cagg_busy.avg_response_time_ms - 50.0).abs() < 1e-9);
+        assert!((cagg_busy.avg_response_time_ms - 220.0).abs() < 1e-9);
         assert!((cagg_busy.avg_response_time_ms - raw_busy.avg_response_time_ms).abs() < 1e-9);
 
         // Percentiles are computed from raw response_time_ms on both paths
-        // ([20, 30, 50, 100] → p50=40, p95=92.5, p99=98.5 via percentile_cont).
-        assert!((cagg_busy.p50_response_time_ms - 40.0).abs() < 1e-9);
-        assert!((cagg_busy.p95_response_time_ms - 92.5).abs() < 1e-9);
-        assert!((cagg_busy.p99_response_time_ms - 98.5).abs() < 1e-9);
+        // ([20, 30, 50, 100, 900] → p50=50, p95=740, p99=868 via percentile_cont).
+        assert!((cagg_busy.p50_response_time_ms - 50.0).abs() < 1e-9);
+        assert!((cagg_busy.p95_response_time_ms - 740.0).abs() < 1e-9);
+        assert!((cagg_busy.p99_response_time_ms - 868.0).abs() < 1e-9);
         assert!((cagg_busy.p50_response_time_ms - raw_busy.p50_response_time_ms).abs() < 1e-9);
         assert!((cagg_busy.p95_response_time_ms - raw_busy.p95_response_time_ms).abs() < 1e-9);
         assert!((cagg_busy.p99_response_time_ms - raw_busy.p99_response_time_ms).abs() < 1e-9);

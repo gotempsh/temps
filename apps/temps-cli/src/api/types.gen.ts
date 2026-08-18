@@ -1377,6 +1377,13 @@ export type AppSettings = {
     edge_target?: string | null;
     external_url?: string | null;
     /**
+     * Retention policy for locally-built deployment images. Modeled as a
+     * settings row (not an env var) per CLAUDE.md so an operator can change
+     * the system-wide default at runtime without restarting the binary.
+     * Individual projects override it via `projects.image_retention_hours`.
+     */
+    image_retention?: ImageRetentionSettings;
+    /**
      * Skip TLS certificate verification on outbound HTTP clients built by the
      * server (deployer, agent, remote service client). Strictly opt-in for
      * operators running self-signed control plane / worker certs on a trusted
@@ -1499,6 +1506,11 @@ export type AppSettingsResponse = {
      */
     effective_observability_store: MetricsStoreKind;
     external_url?: string | null;
+    /**
+     * Deployment-image retention policy. No sensitive content, passed through
+     * as-is so the settings UI can show and edit the system-wide default.
+     */
+    image_retention: ImageRetentionSettings;
     insecure_tls: boolean;
     internal_url?: string | null;
     letsencrypt: LetsEncryptSettings;
@@ -4293,11 +4305,21 @@ export type CreateProjectRequest = {
  * Request to create a new project secret.
  *
  * Project secrets are mounted into the container as files under
- * `/run/secrets/<KEY>` (mode 0400, tmpfs) instead of as environment variables.
+ * `/run/secrets/<KEY>` as a read-only mount, instead of as environment
+ * variables, so they do not appear in `docker inspect`.
  * Values are always encrypted at rest and never returned in plaintext from
  * the API after create. Distinct from agent secrets (global `/settings/secrets`).
  */
 export type CreateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     /**
      * Include this secret in preview environments (default: false).
@@ -7826,6 +7848,13 @@ export type FailureReportPreviewResponse = {
     reporting_enabled: boolean;
 };
 
+export type FeatureMaturity = {
+    docs_path: string;
+    key: string;
+    maturity: Maturity;
+    reason: string;
+};
+
 export type FieldResponse = {
     /**
      * Field type (Int32, String, Timestamp, etc.)
@@ -9084,6 +9113,28 @@ export type HttpChallengeDebugResponse = {
 };
 
 /**
+ * System-wide retention policy for locally-built deployment images.
+ *
+ * The nightly cleanup removes a Temps-built image only once *every*
+ * deployment that references it is older than the owning project's retention
+ * window. Deleting an image makes rollback/promotion to that deployment
+ * impossible, so the default is deliberately generous: it is a rollback
+ * window, not a cache TTL.
+ */
+export type ImageRetentionSettings = {
+    /**
+     * Default hours to keep a built deployment image when the owning project
+     * has no `image_retention_hours` override. Valid range 1..=8760.
+     */
+    default_hours?: number;
+    /**
+     * Whether the nightly pass removes expired deployment images at all.
+     * Disabling it keeps every built image forever (the pre-0.1 behaviour).
+     */
+    enabled?: boolean;
+};
+
+/**
  * Platform-specific credentials for accessing the source system.
  *
  * For platforms like Vercel and Railway, this contains the API token.
@@ -9750,6 +9801,22 @@ export type KvStatusResponse = {
     version?: string | null;
 };
 
+export type LatestDeploymentMediaResponse = {
+    /**
+     * Latest deployment media keyed by project ID. Projects with no
+     * deployments are omitted.
+     */
+    projects: {
+        [key: string]: LatestDeploymentMediaResponseItem;
+    };
+};
+
+export type LatestDeploymentMediaResponseItem = {
+    project_id: number;
+    screenshot_location?: string | null;
+    url?: string | null;
+};
+
 export type LemonSqueezyConfig = {
     product_allowlist?: Array<string>;
     variant_allowlist?: Array<string>;
@@ -10247,6 +10314,8 @@ export type ManualAction = {
  * When a manual action needs to happen relative to migration
  */
 export type ManualActionTiming = 'before-migration' | 'after-migration' | 'within-hours';
+
+export type Maturity = 'stable' | 'beta' | 'experimental';
 
 export type McpDefinitionResponse = {
     config: {
@@ -13003,7 +13072,7 @@ export type ProjectEnvVarInput = {
 };
 
 /**
- * Health summary for a single project (last 1 hour)
+ * Health summary for a single project over the requested time range.
  */
 export type ProjectHealthSummary = {
     /**
@@ -13014,6 +13083,10 @@ export type ProjectHealthSummary = {
      * Error rate as a percentage (0-100)
      */
     error_rate: number;
+    /**
+     * Hourly request counts ordered by bucket start.
+     */
+    hourly_requests: Array<ProjectHourlyRequestCount>;
     project_id: number;
     /**
      * Health status: "healthy", "degraded", "down", "unknown"
@@ -13027,6 +13100,17 @@ export type ProjectHealthSummary = {
      * Total requests in the period
      */
     total_requests: number;
+};
+
+/**
+ * One hourly request-count point in a project health summary.
+ */
+export type ProjectHourlyRequestCount = {
+    /**
+     * Start of the UTC hour in RFC 3339 format.
+     */
+    bucket: string;
+    request_count: number;
 };
 
 export type ProjectInfo = {
@@ -13146,6 +13230,11 @@ export type ProjectResponse = {
     gitlab_webhook_id?: number | null;
     id: number;
     /**
+     * Hours to retain built Docker images before nightly cleanup. Null = use the
+     * system-wide default from settings.
+     */
+    image_retention_hours?: number | null;
+    /**
      * Authoritative repository visibility. A missing connection alone does
      * not imply that an incompletely configured repository is public.
      */
@@ -13193,6 +13282,11 @@ export type ProjectSecretEnvironmentInfo = {
  * must read it from the mounted file inside the container.
  */
 export type ProjectSecretResponse = {
+    /**
+     * Compose services this secret is restricted to. Empty means every
+     * service in the stack.
+     */
+    compose_services: Array<string>;
     created_at: number;
     environments: Array<ProjectSecretEnvironmentInfo>;
     id: number;
@@ -13647,9 +13741,29 @@ export type ProxyLogResponse = {
     project_id?: number | null;
     query_string?: string | null;
     referrer?: string | null;
+    /**
+     * Inbound request headers, credential values already replaced with
+     * `[REDACTED]` at ingest (see [`crate::redaction`]). `None` when the entry
+     * predates header capture or was written by a path that doesn't record
+     * them; an empty map means "captured, but no headers", which is different
+     * and worth being able to tell apart.
+     *
+     * A `BTreeMap` rather than a raw `serde_json::Value` so the schema stays
+     * typed and the UI gets a stable alphabetical ordering for free.
+     */
+    request_headers?: {
+        [key: string]: string;
+    } | null;
     request_id: string;
     request_size_bytes?: number | null;
     request_source: string;
+    /**
+     * Upstream response headers, redacted on the same terms as
+     * [`Self::request_headers`].
+     */
+    response_headers?: {
+        [key: string]: string;
+    } | null;
     response_size_bytes?: number | null;
     response_time_ms?: number | null;
     routing_status: string;
@@ -13977,6 +14091,11 @@ export type ReadRowsQuery = {
      * Sort order (asc/desc)
      */
     sort_order?: string | null;
+};
+
+export type ReassignCustomDomainRequest = {
+    target_environment_id: number;
+    target_project_id: number;
 };
 
 /**
@@ -19472,6 +19591,15 @@ export type UpdatePreferencesRequest = {
  * ciphertext.
  */
 export type UpdateProjectSecretRequest = {
+    /**
+     * Docker Compose services allowed to read this secret, by compose
+     * service name. Empty (the default) delivers it to every service in the
+     * stack, which is how secrets behaved before scoping existed.
+     *
+     * Ignored by non-Compose presets: those deploy a single container, which
+     * always receives every secret in scope for its environment.
+     */
+    compose_services?: Array<string>;
     environment_ids?: Array<number>;
     include_in_preview?: boolean;
     /**
@@ -19524,6 +19652,16 @@ export type UpdateProjectSettingsRequest = {
      */
     error_source_root?: string | null;
     git_provider_connection_id?: number | null;
+    /**
+     * How long (hours) to retain built Docker images before nightly cleanup removes them.
+     * Set to null to use the system default. Valid range: 1–8760.
+     *
+     * Omitting the key leaves the current value unchanged; sending an explicit
+     * `null` clears the per-project override. `skip_serializing_if` keeps the
+     * round-trip honest — re-serializing a request that omitted the key must
+     * not emit `"image_retention_hours": null`, which would mean "reset".
+     */
+    image_retention_hours?: number | null;
     main_branch?: string | null;
     preset?: string | null;
     preset_config?: null | PresetConfigSchema;
@@ -26428,6 +26566,48 @@ export type GetActivityGraphResponses = {
 };
 
 export type GetActivityGraphResponse = GetActivityGraphResponses[keyof GetActivityGraphResponses];
+
+export type GetLatestDeploymentMediaData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Comma-separated project IDs. At most 100 IDs are accepted.
+         */
+        project_ids: string;
+    };
+    url: '/deployments/latest-media';
+};
+
+export type GetLatestDeploymentMediaErrors = {
+    /**
+     * Invalid project IDs
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permission or project access
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetLatestDeploymentMediaError = GetLatestDeploymentMediaErrors[keyof GetLatestDeploymentMediaErrors];
+
+export type GetLatestDeploymentMediaResponses = {
+    /**
+     * Latest deployment media keyed by project ID
+     */
+    200: LatestDeploymentMediaResponse;
+};
+
+export type GetLatestDeploymentMediaResponse = GetLatestDeploymentMediaResponses[keyof GetLatestDeploymentMediaResponses];
 
 export type GetScanByDeploymentData = {
     body?: never;
@@ -38399,6 +38579,42 @@ export type GetProjectBySlugResponses = {
 
 export type GetProjectBySlugResponse = GetProjectBySlugResponses[keyof GetProjectBySlugResponses];
 
+export type GetVisibleCustomDomainByHostnameData = {
+    body?: never;
+    path: {
+        /**
+         * Domain hostname
+         */
+        hostname: string;
+    };
+    query?: never;
+    url: '/projects/custom-domains/by-host/{hostname}';
+};
+
+export type GetVisibleCustomDomainByHostnameErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Project access denied
+     */
+    403: unknown;
+    /**
+     * Domain is not assigned to a project
+     */
+    404: unknown;
+};
+
+export type GetVisibleCustomDomainByHostnameResponses = {
+    /**
+     * Custom domain assignment retrieved
+     */
+    200: CustomDomainResponse;
+};
+
+export type GetVisibleCustomDomainByHostnameResponse = GetVisibleCustomDomainByHostnameResponses[keyof GetVisibleCustomDomainByHostnameResponses];
+
 export type CreateProjectFromTemplateData = {
     body: CreateProjectFromTemplateRequest;
     path?: never;
@@ -48159,6 +48375,50 @@ export type WorkflowDryRunResponses = {
 
 export type WorkflowDryRunResponse = WorkflowDryRunResponses[keyof WorkflowDryRunResponses];
 
+export type ReassignProjectCustomDomainData = {
+    body: ReassignCustomDomainRequest;
+    path: {
+        /**
+         * Current project ID
+         */
+        source_project_id: number;
+        /**
+         * Custom domain ID
+         */
+        domain_id: number;
+    };
+    query?: never;
+    url: '/projects/{source_project_id}/custom-domains/{domain_id}/assignment';
+};
+
+export type ReassignProjectCustomDomainErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Write access required for both projects
+     */
+    403: unknown;
+    /**
+     * Custom domain or target environment not found in the authorized project scopes
+     */
+    404: unknown;
+    /**
+     * Domain assignment changed; refresh and retry
+     */
+    409: unknown;
+};
+
+export type ReassignProjectCustomDomainResponses = {
+    /**
+     * Domain assignment updated atomically
+     */
+    200: CustomDomainResponse;
+};
+
+export type ReassignProjectCustomDomainResponse = ReassignProjectCustomDomainResponses[keyof ReassignProjectCustomDomainResponses];
+
 export type GetProxyLogsData = {
     body?: never;
     path?: never;
@@ -51928,6 +52188,33 @@ export type RemoveRoleResponses = {
 };
 
 export type RemoveRoleResponse = RemoveRoleResponses[keyof RemoveRoleResponses];
+
+export type GetFeatureMaturityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/v1/platform/feature-maturity';
+};
+
+export type GetFeatureMaturityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+};
+
+export type GetFeatureMaturityResponses = {
+    /**
+     * Feature maturity registry for this build
+     */
+    200: Array<FeatureMaturity>;
+};
+
+export type GetFeatureMaturityResponse = GetFeatureMaturityResponses[keyof GetFeatureMaturityResponses];
 
 export type ListSnapshotsData = {
     body?: never;

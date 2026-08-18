@@ -21,9 +21,19 @@ export function useGettingStarted() {
 
   const items: GettingStartedItem[] = [
     {
+      key: 'ai',
+      label: 'Connect your AI harness',
+      description:
+        'Create a dedicated admin key, install the Temps skill, and verify access from your harness.',
+      done: signals.aiHarnessConfigured,
+      href: '/setup/ai',
+      cta: 'Connect harness',
+    },
+    {
       key: 'git',
       label: 'Connect a Git provider',
-      description: 'Link GitHub, GitLab, or Bitbucket to enable git-push deploys.',
+      description:
+        'Link GitHub, GitLab, or Bitbucket to enable git-push deploys.',
       done: signals.gitConnected,
       // Navigate to the full page rather than a modal — the in-modal
       // GitProviderFlow overflows on smaller viewports (horizontal scroll).
@@ -51,7 +61,8 @@ export function useGettingStarted() {
     {
       key: 'notifications',
       label: 'Configure notifications',
-      description: 'Get alerted on Slack, email, or webhook when deployments fail.',
+      description:
+        'Get alerted on Slack, email, or webhook when deployments fail.',
       done: signals.notificationsConfigured,
       href: '/settings/notifications',
       cta: 'Set up',

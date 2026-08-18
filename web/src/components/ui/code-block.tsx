@@ -139,21 +139,6 @@ export function CodeBlock({
   const [copied, setCopied] = useState(false)
   const [wrapLines, setWrapLines] = useState(defaultWrap)
   const [showLineNumbers, setShowLineNumbers] = useState(defaultShowLineNumbers)
-  const [html, setHtml] = useState<string | null>(null)
-
-  useEffect(() => {
-    let cancelled = false
-    highlight(code, language)
-      .then((result) => {
-        if (!cancelled) setHtml(result)
-      })
-      // A grammar that fails to load must not blank the snippet — the plain
-      // fallback below is already rendered and stays.
-      .catch(() => {})
-    return () => {
-      cancelled = true
-    }
-  }, [code, language])
 
   const visibleButtonCount =
     1 + (disableWrapToggle ? 0 : 1) + (showCopy ? 1 : 0)
@@ -204,33 +189,11 @@ export function CodeBlock({
               wrapLines ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
             )}
           >
-            {/* Shiki's output is HTML-escaped token markup — the only thing it
-                emits around user text is <span style="--shiki-*">. */}
-            {html ? (
-              <code
-                className={cn(
-                  'shiki-code',
-                  showLineNumbers && 'shiki-line-numbers'
-                )}
-                dangerouslySetInnerHTML={{ __html: html }}
-              />
-            ) : (
-              <code
-                className={cn(
-                  'shiki-code text-foreground dark:text-zinc-100',
-                  showLineNumbers && 'shiki-line-numbers'
-                )}
-              >
-                {/* Pre-highlight (and for `text`) the same lines render
-                    unstyled, so nothing shifts when colours arrive. */}
-                {code.split('\n').map((line, i, all) => (
-                  <span key={i} className="line">
-                    {line}
-                    {i < all.length - 1 ? '\n' : ''}
-                  </span>
-                ))}
-              </code>
-            )}
+            <HighlightedCode
+              code={code}
+              language={language}
+              showLineNumbers={showLineNumbers}
+            />
           </pre>
         </div>
         <div className="absolute top-2 right-2 flex items-center gap-0.5 opacity-0 group-hover:opacity-100 focus-within:opacity-100 transition-opacity duration-200">
@@ -299,6 +262,72 @@ export function CodeBlock({
         </div>
       </div>
     </div>
+  )
+}
+
+/**
+ * Syntax-coloured code without panel chrome or controls. This lets compact
+ * command surfaces share the same lazy Shiki instance and theme as CodeBlock.
+ */
+export function HighlightedCode({
+  code,
+  language = 'text',
+  className,
+  showLineNumbers = false,
+}: {
+  code: string
+  language?: CodeLanguage
+  className?: string
+  showLineNumbers?: boolean
+}) {
+  const highlightKey = `${language}\u0000${code}`
+  const [highlighted, setHighlighted] = useState<{
+    key: string
+    html: string | null
+  } | null>(null)
+  const html = highlighted?.key === highlightKey ? highlighted.html : null
+
+  useEffect(() => {
+    let cancelled = false
+    highlight(code, language)
+      .then((result) => {
+        if (!cancelled) setHighlighted({ key: highlightKey, html: result })
+      })
+      // A grammar that fails to load must not blank the snippet — the plain
+      // fallback below is already rendered and stays.
+      .catch(() => {})
+    return () => {
+      cancelled = true
+    }
+  }, [code, highlightKey, language])
+
+  const codeClassName = cn(
+    'shiki-code',
+    !html && 'text-foreground dark:text-zinc-100',
+    showLineNumbers && 'shiki-line-numbers',
+    className
+  )
+
+  if (html) {
+    // Shiki's output is HTML-escaped token markup — the only markup it emits
+    // around source text is a span carrying theme colour variables.
+    return (
+      <code
+        className={codeClassName}
+        dangerouslySetInnerHTML={{ __html: html }}
+      />
+    )
+  }
+
+  return (
+    <code className={codeClassName}>
+      {code.split('\n').map((line, index, lines) => (
+        <span key={index} className="line">
+          {line}
+          {index < lines.length - 1 ? '\n' : ''}
+        </span>
+      ))}
+    </code>
   )
 }
 

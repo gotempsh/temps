@@ -34,7 +34,7 @@ import {
   Edit,
 } from 'lucide-react'
 import { useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
@@ -43,10 +43,19 @@ import { sensitiveActionErrorMessage } from '@/lib/sensitiveActionProblem'
 export default function ApiKeyCreate() {
   usePageTitle('Create API Key')
   const navigate = useNavigate()
+  const [searchParams] = useSearchParams()
+  const requestedReturnTo = searchParams.get('returnTo')
+  const returnTo =
+    requestedReturnTo?.startsWith('/') && !requestedReturnTo.startsWith('//')
+      ? requestedReturnTo
+      : '/settings/keys'
+  const isHarnessSetup = returnTo === '/setup/ai'
   const [step, setStep] = useState(1)
-  const [keyName, setKeyName] = useState('')
+  const [keyName, setKeyName] = useState(searchParams.get('name') ?? '')
   const [expiresAt, setExpiresAt] = useState('')
-  const [selectedRole, setSelectedRole] = useState<string>('')
+  const [selectedRole, setSelectedRole] = useState<string>(
+    searchParams.get('role') ?? ''
+  )
   const [selectedPermissions, setSelectedPermissions] = useState<Set<string>>(
     new Set()
   )
@@ -256,8 +265,8 @@ export default function ApiKeyCreate() {
                   Edit Permissions
                 </Button>
               )}
-              <Button onClick={() => navigate('/settings/keys')}>
-                Go to API Keys
+              <Button onClick={() => navigate(returnTo)}>
+                {isHarnessSetup ? 'Continue harness setup' : 'Go to API Keys'}
               </Button>
             </div>
           </CardContent>
@@ -274,7 +283,7 @@ export default function ApiKeyCreate() {
           <Button
             variant="ghost"
             size="icon"
-            onClick={() => navigate('/settings/keys')}
+            onClick={() => navigate(returnTo)}
           >
             <ArrowLeft className="h-4 w-4" />
           </Button>
@@ -286,6 +295,17 @@ export default function ApiKeyCreate() {
           </div>
         </div>
       </div>
+
+      {isHarnessSetup && (
+        <Alert className="border-primary/20 bg-primary/5">
+          <Shield className="h-4 w-4" />
+          <AlertDescription>
+            This creates the dedicated admin credential requested by AI harness
+            setup. After copying the key, you&apos;ll return to the skill and
+            verification steps.
+          </AlertDescription>
+        </Alert>
+      )}
 
       {/* Progress Steps */}
       <div className="flex items-center justify-center mb-8">
@@ -384,7 +404,7 @@ export default function ApiKeyCreate() {
                 <Button
                   type="button"
                   variant="outline"
-                  onClick={() => navigate('/settings/keys')}
+                  onClick={() => navigate(returnTo)}
                 >
                   Cancel
                 </Button>
@@ -587,10 +607,7 @@ export default function ApiKeyCreate() {
               Back
             </Button>
             <div className="flex gap-3">
-              <Button
-                variant="outline"
-                onClick={() => navigate('/settings/keys')}
-              >
+              <Button variant="outline" onClick={() => navigate(returnTo)}>
                 Cancel
               </Button>
               <Button onClick={() => setStep(3)} disabled={!canProceed()}>
@@ -677,10 +694,7 @@ export default function ApiKeyCreate() {
                 Back
               </Button>
               <div className="flex gap-3">
-                <Button
-                  variant="outline"
-                  onClick={() => navigate('/settings/keys')}
-                >
+                <Button variant="outline" onClick={() => navigate(returnTo)}>
                   Cancel
                 </Button>
                 <Button

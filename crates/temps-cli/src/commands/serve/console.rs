@@ -1517,6 +1517,13 @@ fn ai_read_allowlist() -> Vec<String> {
         "get_funnel_metrics",
         "list_funnels",
         "get_unique_events",
+        // ── API traffic: privacy-safe investigation ──
+        // The time series contains only bounded counts and latency/error
+        // aggregates. Keep get_api_summary out because refresh=true can incur
+        // paid provider work. Keep get_api_routes and get_api_callers out of
+        // the general tool loop: paths are attacker-controlled and caller
+        // addresses are personal data.
+        "get_api_timeseries",
         // Per-visitor/session metadata — same risk class as
         // get_visitors/get_visitor_stats above (IP, geolocation,
         // user_agent, is_crawler, custom_data/event_data)
@@ -3686,6 +3693,30 @@ mod ai_tool_allowlist_tests {
         };
         let catalog = caller.run_cli("projects --help", &scope).await;
         assert!(catalog.contains("get_projects"), "catalog: {catalog}");
+    }
+
+    #[test]
+    fn test_ai_read_allowlist_api_traffic_exposes_only_privacy_safe_operations() {
+        let openapi = temps_analytics::handler::AnalyticsApiDoc::openapi();
+        let allowlist = ai_read_allowlist();
+        let allowlist_refs: Vec<&str> = allowlist.iter().map(String::as_str).collect();
+        let index = ReadOnlyApiIndex::from_openapi_allowlist(&openapi, &allowlist_refs);
+
+        assert!(
+            index.get("get_api_timeseries").is_some(),
+            "AI chat must discover the privacy-safe API traffic time series"
+        );
+
+        for operation in ["get_api_summary", "get_api_routes", "get_api_callers"] {
+            assert!(
+                !allowlist.iter().any(|entry| entry == operation),
+                "paid or sensitive API traffic operation must not enter the AI read allowlist: `{operation}`"
+            );
+            assert!(
+                index.get(operation).is_none(),
+                "paid or sensitive API traffic operation must remain invisible to AI discovery: `{operation}`"
+            );
+        }
     }
 
     #[tokio::test]

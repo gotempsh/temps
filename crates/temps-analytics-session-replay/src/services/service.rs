@@ -18,6 +18,14 @@ use tracing::{debug, error, info};
 
 use temps_entities::{ip_geolocations, session_replay_events, session_replay_sessions, visitor};
 
+/// How many `session_replay_events` rows to write per `INSERT`.
+///
+/// Bounded by PostgreSQL's 65535 bind-parameter ceiling: each row binds 5
+/// columns (`id` is generated), so the hard maximum is 13107 rows per
+/// statement. 1000 stays far below that while keeping a single statement's
+/// payload modest — rrweb full-snapshot events can each be tens of kilobytes.
+const EVENT_INSERT_CHUNK_SIZE: usize = 1000;
+
 #[derive(Error, Debug)]
 pub enum SessionReplayError {
     #[error("Database error: {0}")]
@@ -403,26 +411,38 @@ impl SessionReplayService {
 
         let events: Value = serde_json::from_str(&decompressed)?;
 
-        let mut event_count = 0;
-
         // Extract events handling both formats
         let events_to_store = self.extract_events_from_json(&events)?;
+        let event_count = events_to_store.len();
 
-        for event in &events_to_store {
-            let timestamp = event.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
-            let event_type = event.get("type").and_then(|t| t.as_i64()).map(|t| t as i32);
+        // Insert in batches rather than one round-trip per event. rrweb emits
+        // hundreds to thousands of events per flush (mousemove/scroll sampling
+        // dominates), so a row-at-a-time loop costs one network round-trip per
+        // event: a few thousand events at even 10-20ms each exceeds the
+        // proxy's upstream read timeout, the browser's retry then re-sends the
+        // same batch, and the retries stack until the endpoint collapses under
+        // its own queue. Batching turns that into a handful of statements.
+        for chunk in events_to_store.chunks(EVENT_INSERT_CHUNK_SIZE) {
+            let models = chunk.iter().map(|event| {
+                let timestamp = event.get("timestamp").and_then(|t| t.as_i64()).unwrap_or(0);
+                let event_type = event.get("type").and_then(|t| t.as_i64()).map(|t| t as i32);
 
-            let event_model = session_replay_events::ActiveModel {
-                id: sea_orm::NotSet,
-                session_id: Set(session.id),
-                data: Set(event.to_string()),
-                timestamp: Set(timestamp),
-                r#type: Set(event_type),
-                is_active: Set(true),
-            };
+                session_replay_events::ActiveModel {
+                    id: sea_orm::NotSet,
+                    session_id: Set(session.id),
+                    data: Set(event.to_string()),
+                    timestamp: Set(timestamp),
+                    r#type: Set(event_type),
+                    is_active: Set(true),
+                }
+            });
 
-            event_model.insert(self.db.as_ref()).await?;
-            event_count += 1;
+            // `exec_without_returning` skips the RETURNING clause — the
+            // generated ids are not used, and not shipping them back keeps
+            // the response for a 1000-row batch small.
+            session_replay_events::Entity::insert_many(models)
+                .exec_without_returning(self.db.as_ref())
+                .await?;
         }
 
         // Recompute duration from ALL stored events (not just this batch)
@@ -1653,6 +1673,126 @@ mod tests {
         assert!(
             matches!(result.unwrap_err(), SessionReplayError::SessionNotFound(ref s) if s == "does-not-exist"),
             "Expected SessionNotFound"
+        );
+    }
+
+    /// Build the wire payload the browser SDK sends: zlib-compressed JSON,
+    /// base64 encoded.
+    fn encode_events(events: &[Value]) -> String {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let json = serde_json::to_string(events).expect("serialize events");
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder.write_all(json.as_bytes()).expect("compress events");
+        STANDARD.encode(encoder.finish().expect("finish compression"))
+    }
+
+    fn make_events(count: usize) -> Vec<Value> {
+        (0..count)
+            .map(|i| {
+                serde_json::json!({
+                    "type": 3,
+                    "timestamp": 1_700_000_000_000i64 + i as i64,
+                    "data": { "source": 1, "positions": [{ "x": i, "y": i }] }
+                })
+            })
+            .collect()
+    }
+
+    /// Count the INSERT statements issued against `session_replay_events`.
+    fn count_event_inserts(log: &[sea_orm::Transaction]) -> usize {
+        log.iter()
+            .flat_map(|t| t.statements())
+            .filter(|stmt| {
+                let sql = &stmt.sql;
+                sql.starts_with("INSERT INTO") && sql.contains("session_replay_events")
+            })
+            .count()
+    }
+
+    /// Drive `add_session_events` against a mock DB and return the statement log.
+    async fn insert_log_for(event_count: usize) -> Vec<sea_orm::Transaction> {
+        let session = make_session_model(42, "session-batch", 1);
+
+        let mut mock = MockDatabase::new(DatabaseBackend::Postgres)
+            // 1. session lookup
+            .append_query_results(vec![vec![session]]);
+
+        // 2. one exec result per expected INSERT chunk (extra results are
+        //    harmless; too few would surface as a DB error).
+        let chunks = event_count.div_ceil(EVENT_INSERT_CHUNK_SIZE);
+        mock = mock.append_exec_results(
+            (0..chunks)
+                .map(|i| sea_orm::MockExecResult {
+                    last_insert_id: (i + 1) as u64,
+                    rows_affected: EVENT_INSERT_CHUNK_SIZE as u64,
+                })
+                .collect::<Vec<_>>(),
+        );
+
+        // 3. duration recompute aggregate — empty result means MIN/MAX are
+        //    NULL, so the follow-up session UPDATE is skipped.
+        mock = mock.append_query_results(vec![Vec::<
+            std::collections::BTreeMap<String, sea_orm::Value>,
+        >::new()]);
+
+        let db = Arc::new(mock.into_connection());
+        let service = SessionReplayService::new(db.clone());
+
+        let payload = encode_events(&make_events(event_count));
+        let result = service
+            .add_session_events(1, "session-batch", &payload)
+            .await;
+        assert_eq!(
+            result.expect("add_session_events should succeed"),
+            event_count,
+            "should report every event as stored"
+        );
+
+        drop(service);
+        Arc::try_unwrap(db)
+            .expect("service should be the only other Arc holder")
+            .into_transaction_log()
+    }
+
+    /// Regression: rrweb flushes hundreds of events per request. Storing them
+    /// one INSERT at a time cost one DB round-trip per event, which pushed a
+    /// single ingest request past the proxy's upstream read timeout and made
+    /// the endpoint 503 while the browser retried into the backlog.
+    ///
+    /// 250 events must cost exactly ONE INSERT, not 250.
+    ///
+    /// Note on the pre-fix failure mode: the old per-event loop used
+    /// `ActiveModel::insert`, which on Postgres issues `INSERT ... RETURNING`
+    /// — a *query*, not an exec. Against this mock it therefore fails on the
+    /// first event with `RecordNotFound`, rather than reaching the count
+    /// assertion below. Either way the test goes red on a reintroduced loop,
+    /// which is what matters.
+    #[tokio::test]
+    async fn add_events_batches_inserts_into_single_statement() {
+        let log = insert_log_for(250).await;
+        let inserts = count_event_inserts(&log);
+
+        assert_eq!(
+            inserts, 1,
+            "250 rrweb events must be written in 1 batched INSERT, got {inserts} \
+             (a per-event insert loop regressed)"
+        );
+    }
+
+    /// Batches larger than the chunk size are split, so a single statement
+    /// never approaches PostgreSQL's 65535 bind-parameter ceiling.
+    #[tokio::test]
+    async fn add_events_chunks_batches_above_the_limit() {
+        let event_count = EVENT_INSERT_CHUNK_SIZE * 2 + 1;
+        let log = insert_log_for(event_count).await;
+        let inserts = count_event_inserts(&log);
+
+        assert_eq!(
+            inserts, 3,
+            "{event_count} events must be split into 3 chunked INSERT statements, got {inserts}"
         );
     }
 

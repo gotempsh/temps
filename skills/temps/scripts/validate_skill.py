@@ -9,12 +9,50 @@ from pathlib import Path
 
 
 LINK = re.compile(r"\[[^]]*\]\(([^)]+)\)")
-PINNED_CLI = "@temps-sdk/cli@0.1.33"
+PINNED_CLI = "@temps-sdk/cli@0.1.34"
+# sha512 of the published tarball for PINNED_CLI, as reported by
+# `npm view @temps-sdk/cli@<version> dist.integrity`. Refresh it in the same
+# commit that bumps PINNED_CLI, once the release is actually on npm — the value
+# has no version substring, so a find-and-replace bump silently leaves it stale
+# and every preflight guard below fails closed against the new release.
+PINNED_CLI_INTEGRITY = "sha512-y8k0npyL16Ue1C6OExexSI6o4sCjR9VOtUy+PWelSIZPEAOMg6a2C2RSYk1m48DS4ZyjkZsFRcd+hNQKv5zYag=="
+INTEGRITY_PIN = re.compile(r"expected_temps_cli_integrity='([^']*)'")
+# Skills whose preflight guard installs the pinned CLI. They embed the same
+# hash independently, so they are validated together.
+GUARDED_SKILLS = ("temps", "temps-cli")
+
+
+def check_integrity_pins(
+    skills_root: Path, expected: str = PINNED_CLI_INTEGRITY
+) -> list[str]:
+    """Every CLI preflight guard must pin the same, current package integrity."""
+    errors: list[str] = []
+    pins = 0
+    for skill in GUARDED_SKILLS:
+        skill_root = skills_root / skill
+        if not skill_root.is_dir():
+            errors.append(f"guarded skill is missing: skills/{skill}")
+            continue
+        for markdown in sorted(skill_root.rglob("*.md")):
+            text = markdown.read_text(encoding="utf-8")
+            for pin in INTEGRITY_PIN.findall(text):
+                pins += 1
+                if pin != expected:
+                    errors.append(
+                        f"{markdown.relative_to(skills_root)}: integrity pin {pin} "
+                        f"does not match the published {PINNED_CLI} artifact"
+                    )
+    if not pins:
+        errors.append(
+            "no expected_temps_cli_integrity guard found in "
+            f"{', '.join(f'skills/{skill}' for skill in GUARDED_SKILLS)}"
+        )
+    return errors
 
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
-    errors: list[str] = []
+    errors: list[str] = check_integrity_pins(root.parent)
     skill = root / "SKILL.md"
     if len(skill.read_text(encoding="utf-8").splitlines()) > 500:
         errors.append("SKILL.md exceeds 500 lines")

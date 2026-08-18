@@ -2,7 +2,7 @@
 
 > Auto-generated documentation for the Temps CLI.
 >
-> Generated from: `@temps-sdk/cli@0.1.33`
+> Generated from: `@temps-sdk/cli@0.1.34`
 >
 > Apply the authorization, target-context, and secret-handling rules in
 > [the Temps CLI skill](../SKILL.md) before executing a command.
@@ -10,10 +10,10 @@
 ## Installation
 
 ```bash
-bunx @temps-sdk/cli@0.1.33 [command]
+bunx @temps-sdk/cli@0.1.34 [command]
 
 # Fallback when Bun is unavailable
-npx @temps-sdk/cli@0.1.33 [command]
+npx @temps-sdk/cli@0.1.34 [command]
 ```
 
 ## Authentication
@@ -22,10 +22,10 @@ Before using most commands, you need to authenticate:
 
 ```bash
 # Login interactively
-bunx @temps-sdk/cli@0.1.33 login
+bunx @temps-sdk/cli@0.1.34 login
 
 # Or configure with wizard
-bunx @temps-sdk/cli@0.1.33 configure
+bunx @temps-sdk/cli@0.1.34 configure
 ```
 
 ## Global Options
@@ -74,6 +74,7 @@ Use this index or search for a top-level command heading to load only the releva
 - [`errors`](#errors) - Manage error tracking and error groups
 - [`metrics`](#metrics) - Query OTel application metrics for debugging (not container/docker stats — see "temps containers metrics" for those)
 - [`traces`](#traces) - Inspect distributed traces and operation latency
+- [`facets`](#facets) - Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
 - [`otel-forward`](#otel-forward) - Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
 - [`kv`](#kv) - KV store commands (coming soon)
 - [`flags`](#flags) - Manage feature flags (runtime config that changes without a redeploy)
@@ -259,7 +260,7 @@ Manage projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
-- `settings` - Update project settings (slug, attack mode, preview environments)
+- `settings` - Update project settings (slug, attack mode, preview environments, image retention)
 - `git` - Update git repository settings
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a project
@@ -388,7 +389,7 @@ Update project name and description
 
 ### `projects settings`
 
-Update project settings (slug, attack mode, preview environments)
+Update project settings (slug, attack mode, preview environments, image retention)
 
 **Options:**
 
@@ -400,6 +401,8 @@ Update project settings (slug, attack mode, preview environments)
 | `--no-attack-mode` | Disable attack mode | - | No |
 | `--preview-envs` | Enable preview environments | - | No |
 | `--no-preview-envs` | Disable preview environments | - | No |
+| `--image-retention-hours <hours>` | Hours to keep built images before nightly cleanup removes them (1-8760). Images are needed to roll back, so this is the project rollback window | - | No |
+| `--reset-image-retention` | Clear the per-project image retention override and use the system default | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts (for automation) | - | No |
 
@@ -461,7 +464,9 @@ Detect and deploy a local source directory or ZIP without Git
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--name <name>` | Project name (slugified automatically) | - | No |
+| `--name <name>` | Name for the new project (slugified automatically) | - | No |
+| `--project <project>` | Deploy into an existing project (slug or ID) instead of creating one | - | No |
+| `--environment <env>` | Target environment (requires --project, default: production) | - | No |
 | `--preset <preset>` | Select a detected preset | - | No |
 | `--directory <directory>` | Select a detected project root | - | No |
 | `--no-wait` | Do not wait for deployment to complete | - | No |
@@ -3378,6 +3383,58 @@ Rank operations by time spent, latency percentiles, or inconsistency
 | `--offset <n>` | Page offset | - | No |
 | `--json` | Output in JSON format | - | No |
 
+## `facets`
+
+Manage OTel span attribute facets — attribute keys promoted to a fast-filterable column (ClickHouse or TimescaleDB, whichever backend is active; see ADR-039). Facets are platform-global, not per-project, since the underlying spans table is shared across every project. Historical backfill runs asynchronously — check `temps facets list` for status.
+
+**Subcommands:**
+
+- `list` (`ls`) - List registered span attribute facets
+- `create` - Register an attribute key as a facet, making it fast to filter on across all traces. Backfills existing spans that carry the attribute. Capped at 20 facets platform-wide.
+- `remove` (`rm`) - Remove a registered facet, freeing its slot for reuse
+- `retry` - Retry a failed historical backfill. Only valid when the facet's status is "failed" — resets progress and lets the background poller re-attempt from the beginning.
+
+### `facets list` (alias: `ls`)
+
+List registered span attribute facets
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `facets create`
+
+Register an attribute key as a facet, making it fast to filter on across all traces. Backfills existing spans that carry the attribute. Capped at 20 facets platform-wide.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+### `facets remove` (alias: `rm`)
+
+Remove a registered facet, freeing its slot for reuse
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+
+### `facets retry`
+
+Retry a failed historical backfill. Only valid when the facet's status is "failed" — resets progress and lets the background poller re-attempt from the beginning.
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
 ## `otel-forward`
 
 Manage OTel forwarding destinations that relay ingested traces, metrics, and logs to an external OTLP-compatible collector
@@ -4684,6 +4741,7 @@ Show proxy log details
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Proxy log ID | - | Yes |
+| `--project-id <id>` | Authorize the lookup within this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `proxy-logs by-request`
@@ -4695,6 +4753,7 @@ Get proxy log by request ID
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--request-id <id>` | Request ID | - | No |
+| `--project-id <id>` | Authorize the lookup within this project | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `proxy-logs stats`
@@ -5389,6 +5448,9 @@ View project analytics
 - `api-overview` - Show API traffic timeseries (requests, errors, latency) from /api-analytics/timeseries
 - `api-routes` - Show top API routes by request count from /api-analytics/routes
 - `api-callers` - Show top API callers by client IP from /api-analytics/callers
+- `api-ip` - Show routes called by one client IP with latency and error analytics
+- `api-path` - Show client IPs calling one path with latency and error analytics
+- `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
 
 ### `analytics overview` (alias: `o`)
@@ -5523,6 +5585,9 @@ Show top API routes by request count from /api-analytics/routes
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--limit <n>` | Number of routes to return (default: 20, max: 100) | - | No |
 | `--offset <n>` | Number of ranked routes to skip (default: 0) | - | No |
+| `--sort-by <metric>` | Sort by requests, latency_avg, or error_rate | `requests` | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics api-callers`
@@ -5538,6 +5603,66 @@ Show top API callers by client IP from /api-analytics/callers
 | `--period <period>` | Time period: today, <n>h, <n>d, <n>m (e.g. 1h, 6h, 48h, 7d, 30d, 3m) | `24h` | No |
 | `--limit <n>` | Number of callers to return (default: 20, max: 100) | - | No |
 | `--offset <n>` | Number of ranked callers to skip (default: 0) | - | No |
+| `--sort-by <metric>` | Sort by requests or error_rate | `requests` | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-ip`
+
+Show routes called by one client IP with latency and error analytics
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period (e.g. 1h, 24h, 7d, 30d) | `24h` | No |
+| `--limit <n>` | Rows per page (default: 20, max: 100) | - | No |
+| `--page <n>` | Page number | `1` | No |
+| `--sort-by <metric>` | Sort by requests, latency_avg, or error_rate | `requests` | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-path`
+
+Show client IPs calling one path with latency and error analytics
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period (e.g. 1h, 24h, 7d, 30d) | `24h` | No |
+| `--limit <n>` | Rows per page (default: 20, max: 100) | - | No |
+| `--page <n>` | Page number | `1` | No |
+| `--sort-by <metric>` | Sort by requests or error_rate | `requests` | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
+| `--json` | Output in JSON format | - | No |
+
+### `analytics api-query`
+
+Run a typed multi-dimensional API traffic aggregation
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--group-by <dimensions>` | Comma-separated dimensions (omit for one overall rollup) | - | No |
+| `--metrics <metrics>` | Comma-separated metrics (e.g. requests,error_rate,latency_p95) | - | Yes |
+| `--filter <dimension:operator:value>` | Repeatable filter (operators: eq, not_eq, contains, starts_with, in) | `` | No |
+| `--sort-by <field>` | Requested dimension or metric to sort by | - | No |
+| `--order <direction>` | Sort direction: asc or desc | `desc` | No |
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--environment-id <id>` | Restrict traffic to one environment ID | - | No |
+| `--period <period>` | Time period (e.g. 1h, 24h, 7d, 30d) | `24h` | No |
+| `--page <n>` | Page number | `1` | No |
+| `--limit <n>` | Rows per page (default: 20, max: 100) | - | No |
+| `--include-synthetic` | Include Temps status-monitor checks | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `analytics api-summary`
@@ -6705,48 +6830,48 @@ Upgrade your plan
 
 ```bash
 # Login to Temps
-bunx @temps-sdk/cli@0.1.33 login
+bunx @temps-sdk/cli@0.1.34 login
 
 # Create a new project on the intended server
-bunx @temps-sdk/cli@0.1.33 --target-context production projects create --name my-app
+bunx @temps-sdk/cli@0.1.34 --target-context production projects create --name my-app
 
 # Deploy to production
-bunx @temps-sdk/cli@0.1.33 --target-context production deploy --project my-app --environment production
+bunx @temps-sdk/cli@0.1.34 --target-context production deploy --project my-app --environment production
 
 # View deployment logs
-bunx @temps-sdk/cli@0.1.33 deployments logs --project my-app --follow
+bunx @temps-sdk/cli@0.1.34 deployments logs --project my-app --follow
 
 # Stream runtime container logs
-bunx @temps-sdk/cli@0.1.33 runtime-logs --project my-app
+bunx @temps-sdk/cli@0.1.34 runtime-logs --project my-app
 
 # List containers
-bunx @temps-sdk/cli@0.1.33 containers list --project-id 1 --environment-id 1
+bunx @temps-sdk/cli@0.1.34 containers list --project-id 1 --environment-id 1
 ```
 
 ### Managing Environments
 
 ```bash
 # List environments
-bunx @temps-sdk/cli@0.1.33 environments list --project my-app
+bunx @temps-sdk/cli@0.1.34 environments list --project my-app
 
 # Set environment variables on the intended server
-bunx @temps-sdk/cli@0.1.33 --target-context production environments vars set --project my-app --key DATABASE_URL
+bunx @temps-sdk/cli@0.1.34 --target-context production environments vars set --project my-app --key DATABASE_URL
 
 # View environment variables
-bunx @temps-sdk/cli@0.1.33 environments vars list --project my-app
+bunx @temps-sdk/cli@0.1.34 environments vars list --project my-app
 ```
 
 ### Managing Domains
 
 ```bash
 # Add a custom domain on the intended server
-bunx @temps-sdk/cli@0.1.33 --target-context production domains add --project my-app --domain app.example.com
+bunx @temps-sdk/cli@0.1.34 --target-context production domains add --project my-app --domain app.example.com
 
 # List domains
-bunx @temps-sdk/cli@0.1.33 domains list --project my-app
+bunx @temps-sdk/cli@0.1.34 domains list --project my-app
 
 # Remove a domain from the intended server
-bunx @temps-sdk/cli@0.1.33 --target-context production domains remove --project my-app --domain app.example.com
+bunx @temps-sdk/cli@0.1.34 --target-context production domains remove --project my-app --domain app.example.com
 ```
 
 ## Environment Variables
@@ -6766,7 +6891,7 @@ Configuration is stored in:
 - **Config file**: `~/.temps/config.json`
 - **Credentials**: Stored securely in `~/.temps/` with restricted file permissions
 
-Use `bunx @temps-sdk/cli@0.1.33 configure show` to view current configuration.
+Use `bunx @temps-sdk/cli@0.1.34 configure show` to view current configuration.
 
 ## Support
 

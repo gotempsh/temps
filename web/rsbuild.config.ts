@@ -5,7 +5,10 @@ import { pluginReact } from '@rsbuild/plugin-react'
 const rsbuildOutputPath = process.env.RSBUILD_OUTPUT_PATH as string | undefined
 const nodeEnv = process.env.NODE_ENV as string | undefined
 const tempsVersion = process.env.TEMPS_VERSION || 'dev'
-const consoleKitEntry = path.resolve(__dirname, 'packages/console-kit/src/index.ts')
+const consoleKitEntry = path.resolve(
+  __dirname,
+  'packages/console-kit/src/index.ts'
+)
 
 export default defineConfig({
   plugins: [pluginReact()],

@@ -19,7 +19,8 @@ import Github from '@/icons/Github'
 import Gitlab from '@/icons/Gitlab'
 import Gitea from '@/icons/Gitea'
 
-export type ProjectSource = 'templates' | 'browse' | 'git-url' | 'manual'
+export type ProjectSource =
+  'templates' | 'browse' | 'git-url' | 'manual' | 'drop'
 
 /**
  * Shared page shell for every step of project creation — the source picker,
@@ -85,6 +86,7 @@ export function NewProjectShell({
     { key: 'templates', icon: LayoutTemplate, title: 'Template' },
     { key: 'git-url', icon: LinkIcon, title: 'Git URL' },
     { key: 'manual', icon: Container, title: 'Docker Image' },
+    { key: 'drop', icon: UploadCloud, title: 'Drop files' },
   ]
 
   return (
@@ -147,13 +149,6 @@ export function NewProjectShell({
             </button>
           )
         })}
-        <Link
-          to="/drop"
-          className="flex items-center gap-2 rounded-md px-3 py-2 text-sm font-medium text-muted-foreground transition-colors hover:bg-muted/60 hover:text-foreground"
-        >
-          <UploadCloud className="h-4 w-4 shrink-0" />
-          Drop files
-        </Link>
       </div>
 
       {children}

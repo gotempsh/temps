@@ -352,6 +352,10 @@ pub struct ProjectResponse {
     /// OSS global-observability model where any OtelRead holder can query any
     /// project's telemetry).
     pub cross_project_trace_sharing: bool,
+    /// Hours to retain built Docker images before nightly cleanup. Null = use the
+    /// system-wide default from settings.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_retention_hours: Option<i32>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -393,6 +397,7 @@ impl ProjectResponse {
             source_type: project.source_type,
             gitlab_webhook_id: project.gitlab_webhook_id,
             cross_project_trace_sharing: project.cross_project_trace_sharing,
+            image_retention_hours: project.image_retention_hours,
             deployment_config: DeploymentConfig {
                 cpu_request: project
                     .deployment_config
@@ -506,6 +511,12 @@ pub struct CustomDomainRequest {
     pub environment_id: i32,
     /// Docker Compose service name this domain routes to (only for docker-compose projects)
     pub service_name: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ReassignCustomDomainRequest {
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -641,6 +652,17 @@ pub struct UpdateDeploymentConfigRequest {
     pub max_concurrent_connections: Option<i32>,
 }
 
+/// Deserialize a PATCH integer field while preserving the distinction between
+/// an omitted key (`None`) and an explicit JSON null (`Some(None)`).
+fn deserialize_optional_optional_i32<'de, D>(
+    deserializer: D,
+) -> Result<Option<Option<i32>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(Option::<i32>::deserialize(deserializer)?))
+}
+
 #[derive(Serialize, Deserialize, Clone, ToSchema)]
 pub struct UpdateProjectSettingsRequest {
     pub slug: Option<String>,
@@ -675,6 +697,19 @@ pub struct UpdateProjectSettingsRequest {
     pub preview_envs_idle_timeout_seconds: Option<i32>,
     /// Wake timeout (seconds, 5..=120) for on-demand preview environments.
     pub preview_envs_wake_timeout_seconds: Option<i32>,
+    /// How long (hours) to retain built Docker images before nightly cleanup removes them.
+    /// Set to null to use the system default. Valid range: 1–8760.
+    ///
+    /// Omitting the key leaves the current value unchanged; sending an explicit
+    /// `null` clears the per-project override. `skip_serializing_if` keeps the
+    /// round-trip honest — re-serializing a request that omitted the key must
+    /// not emit `"image_retention_hours": null`, which would mean "reset".
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_optional_i32",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub image_retention_hours: Option<Option<i32>>,
     /// Preset-specific configuration (e.g., Dockerfile path for Docker preset)
     ///
     /// Example for Dockerfile preset:
@@ -1027,10 +1062,10 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
         use crate::services::custom_domains::CustomDomainError;
 
         match error {
-            CustomDomainError::Database(msg) => {
+            CustomDomainError::Database(_) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Database Error")
-                    .with_detail(msg.to_string())
+                    .with_detail("A database operation failed while managing custom domains")
             }
             CustomDomainError::NotFound(msg) => problemdetails::new(StatusCode::NOT_FOUND)
                 .with_title("Custom Domain Not Found")
@@ -1051,6 +1086,49 @@ impl From<crate::services::custom_domains::CustomDomainError> for Problem {
                     .with_title("Invalid Redirect URL")
                     .with_detail(msg)
             }
+            CustomDomainError::AssignmentChanged {
+                domain_id,
+                source_project_id,
+            } => problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Domain Assignment Changed")
+                .with_detail(format!(
+                    "Custom domain {domain_id} is no longer assigned to source project {source_project_id}; refresh and try again"
+                )),
+            CustomDomainError::AuditIntentFailed {
+                domain_id,
+                source_project_id,
+                target_project_id,
+                ..
+            } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Domain Reassignment Audit Failed")
+                    .with_detail(format!(
+                        "Custom domain {domain_id} could not be reassigned from project {source_project_id} to project {target_project_id} because the required audit record could not be persisted; no ownership change was made"
+                    ))
+            }
+            CustomDomainError::EnrichmentDatabase {
+                operation,
+                domain_id,
+                certificate_id,
+                environment_id,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Custom Domain Metadata Unavailable")
+                .with_detail(format!(
+                    "Could not {operation} for custom domain {domain_id} (certificate {certificate_id:?}, environment {environment_id})"
+                )),
+            CustomDomainError::ReassignmentDatabase {
+                operation,
+                domain_id,
+                source_project_id,
+                target_project_id,
+                target_environment_id,
+                ..
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Domain Reassignment Failed")
+                .with_detail(format!(
+                    "Database operation '{operation}' failed while reassigning custom domain {domain_id} from project {source_project_id} to project {target_project_id} environment {target_environment_id}"
+                )),
             CustomDomainError::Internal(msg) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -1136,4 +1214,46 @@ pub struct ReinstallWebhookResponse {
     pub hook_id: i32,
     /// Human-readable status message.
     pub message: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::services::custom_domains::CustomDomainError;
+    use axum::response::IntoResponse;
+
+    #[test]
+    fn test_custom_domain_error_assignment_changed_maps_to_conflict_with_context() {
+        let problem: Problem = CustomDomainError::AssignmentChanged {
+            domain_id: 41,
+            source_project_id: 7,
+        }
+        .into();
+
+        assert_eq!(problem.status_code, StatusCode::CONFLICT);
+        assert_eq!(
+            problem.body.get("title"),
+            Some(&serde_json::json!("Domain Assignment Changed"))
+        );
+        assert_eq!(
+            problem.body.get("detail"),
+            Some(&serde_json::json!(
+                "Custom domain 41 is no longer assigned to source project 7; refresh and try again"
+            ))
+        );
+        assert_eq!(problem.into_response().status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn image_retention_patch_distinguishes_omitted_null_and_value() {
+        let omitted: UpdateProjectSettingsRequest = serde_json::from_str("{}").unwrap();
+        let cleared: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"image_retention_hours":null}"#).unwrap();
+        let set: UpdateProjectSettingsRequest =
+            serde_json::from_str(r#"{"image_retention_hours":72}"#).unwrap();
+
+        assert_eq!(omitted.image_retention_hours, None);
+        assert_eq!(cleared.image_retention_hours, Some(None));
+        assert_eq!(set.image_retention_hours, Some(Some(72)));
+    }
 }

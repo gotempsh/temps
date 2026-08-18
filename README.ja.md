@@ -16,7 +16,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)
 [![GitHub Stars](https://img.shields.io/github/stars/gotempsh/temps?style=social)](https://github.com/gotempsh/temps)
 
-[ウェブサイト](https://temps.sh) · [ドキュメント](https://temps.sh/docs) · [クイックスタート](https://temps.sh/docs/introduction) · [ディスカッション](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
+[ウェブサイト](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=header_ja) · [ドキュメント](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=header_ja) · [クイックスタート](https://temps.sh/docs/introduction?utm_source=github&utm_medium=repo&utm_content=header_ja) · [ディスカッション](https://github.com/gotempsh/temps/discussions) · [Contributing](CONTRIBUTING.md)
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [Español](README.es.md) | [Français](README.fr.md) | [Deutsch](README.de.md) | 日本語 | [Português](README.pt-BR.md)
 
@@ -253,7 +253,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **動作確認済み:** Ubuntu 24.04 / 22.04 &nbsp;|&nbsp; macOS でも動作します
 
-サーバーの管理はしたくない？ [Temps Cloud](https://temps.sh/pricing) なら、マネージドインフラ上で Temps をあなたの代わりに運用します。
+サーバーの管理はしたくない？ [Temps Cloud](https://temps.sh/pricing?utm_source=github&utm_medium=repo&utm_content=cloud_cta_ja) なら、マネージドインフラ上で Temps をあなたの代わりに運用します。
 
 ---
 
@@ -303,7 +303,7 @@ curl -fsSL https://temps.sh/deploy.sh | bash
 
 **代替ツールが勝る点。** Coolify と Dokploy には、Temps がまだ持っていないワンクリックテンプレートライブラリ（Coolify は280以上のアプリ）があり、コミュニティの規模もはるかに大きい —— Coolify だけで GitHub スター56k超を誇る一方、Temps はこのリストで最も新しいプロジェクトです。CLI からのゼロダウンタイム Docker デプロイだけが必要なら、Kamal のほうがシンプルな選択肢です。Vercel をはじめとするマネージドプラットフォームは、単一の VPS では太刀打ちできないグローバルエッジネットワーク、エッジ関数、DDoS 吸収能力を提供し、しかもインフラの運用まで代行してくれます —— サーバーのことを一切考えたくないなら、それは確かな価値です。
 
-詳細で定期的に更新される比較はこちら: [temps.sh/compare](https://temps.sh/compare)
+詳細で定期的に更新される比較はこちら: [temps.sh/compare](https://temps.sh/compare?utm_source=github&utm_medium=repo&utm_content=compare_ja)
 
 ---
 
@@ -386,11 +386,11 @@ Temps のおかげで SaaS の請求が減ったなら、[スター](https://git
 
 ## スター履歴
 
-<a href="https://www.star-history.com/#gotempsh/temps&Date">
+<a href="https://star-history.dera.page/#gotempsh/temps&Date">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date&theme=dark" />
-    <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
-    <img alt="スター履歴チャート" src="https://api.star-history.com/svg?repos=gotempsh/temps&type=Date" />
+    <source media="(prefers-color-scheme: dark)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date&theme=dark" />
+    <source media="(prefers-color-scheme: light)" srcset="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
+    <img alt="スター履歴チャート" src="https://star-history.dera.page/svg?repos=gotempsh/temps&type=Date" />
   </picture>
 </a>
 
@@ -416,6 +416,6 @@ cargo build --release
 
 <div align="center">
 
-[temps.sh](https://temps.sh) | [ドキュメント](https://temps.sh/docs) | [GitHub](https://github.com/gotempsh/temps)
+[temps.sh](https://temps.sh/?utm_source=github&utm_medium=repo&utm_content=footer_ja) | [ドキュメント](https://temps.sh/docs?utm_source=github&utm_medium=repo&utm_content=footer_ja) | [GitHub](https://github.com/gotempsh/temps)
 
 </div>

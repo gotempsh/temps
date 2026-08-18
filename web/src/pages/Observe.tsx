@@ -56,7 +56,7 @@ const DEFAULT_KINDS: readonly EventKind[] = ['request', 'error', 'revenue']
  *  the `kinds` URL param when filters match the defaults. */
 function sameKindSet(
   a: readonly EventKind[],
-  b: readonly EventKind[],
+  b: readonly EventKind[]
 ): boolean {
   if (a.length !== b.length) return false
   const set = new Set(a)
@@ -82,8 +82,9 @@ function sameKindSet(
 export default function Observe({ project }: ObserveProps) {
   usePageTitle(`Observe · ${project.name}`)
   const [searchParams, setSearchParams] = useSearchParams()
-  const [selectedEvent, setSelectedEvent] =
-    useState<ObservabilityEvent | null>(null)
+  const [selectedEvent, setSelectedEvent] = useState<ObservabilityEvent | null>(
+    null
+  )
 
   const filters: ObserveFilters = useMemo(() => {
     const kindsParam = searchParams.get('kinds')
@@ -92,7 +93,7 @@ export default function Observe({ project }: ObserveProps) {
           .split(',')
           .map((k) => k.trim())
           .filter((k): k is EventKind =>
-            (ALL_KINDS as readonly string[]).includes(k),
+            (ALL_KINDS as readonly string[]).includes(k)
           ) as EventKind[])
       : ([...DEFAULT_KINDS] as EventKind[])
 
@@ -102,7 +103,7 @@ export default function Observe({ project }: ObserveProps) {
         ? timeRangeParam
         : '24h'
 
-    // Bots hidden by default (mirrors ResourceMonitoring). Only the
+    // Bots are hidden by default. Only the
     // explicit `hide_bots=false` URL param flips it off so the default
     // URL stays clean.
     const hideBots = searchParams.get('hide_bots') !== 'false'
@@ -152,7 +153,7 @@ export default function Observe({ project }: ObserveProps) {
 
   const fromDate = useMemo(
     () => timeRangeToFromDate(filters.timeRange),
-    [filters.timeRange],
+    [filters.timeRange]
   )
 
   const query = useObserveQuery({
@@ -304,9 +305,7 @@ function CockpitHeader({
         <p className="text-xs uppercase tracking-wide text-muted-foreground">
           Observe
         </p>
-        <h1 className="text-lg font-semibold tracking-tight">
-          {project.name}
-        </h1>
+        <h1 className="text-lg font-semibold tracking-tight">{project.name}</h1>
       </div>
 
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-2 lg:grid-cols-4">
@@ -331,7 +330,7 @@ function CockpitHeader({
                 'group flex flex-col gap-2 rounded-lg border p-3 text-left transition-colors',
                 active
                   ? 'border-border bg-card'
-                  : 'border-dashed border-border bg-background opacity-60 hover:opacity-100',
+                  : 'border-dashed border-border bg-background opacity-60 hover:opacity-100'
               )}
             >
               <div className="flex items-center justify-between gap-2">
@@ -358,9 +357,7 @@ function CockpitHeader({
             type="search"
             placeholder="grep path / class / event…"
             value={filters.search}
-            onChange={(e) =>
-              onChange({ ...filters, search: e.target.value })
-            }
+            onChange={(e) => onChange({ ...filters, search: e.target.value })}
             className="pl-9 font-mono"
           />
         </div>
@@ -391,9 +388,7 @@ function CockpitHeader({
               ? 'Bot/crawler requests hidden — click to show'
               : 'Bot/crawler requests visible — click to hide'
           }
-          onClick={() =>
-            onChange({ ...filters, hideBots: !filters.hideBots })
-          }
+          onClick={() => onChange({ ...filters, hideBots: !filters.hideBots })}
           className="gap-1.5"
         >
           <Bot className="size-3.5" />
@@ -404,13 +399,7 @@ function CockpitHeader({
   )
 }
 
-function Sparkline({
-  values,
-  accent,
-}: {
-  values: number[]
-  accent: string
-}) {
+function Sparkline({ values, accent }: { values: number[]; accent: string }) {
   const max = Math.max(1, ...values)
   return (
     <div
@@ -423,7 +412,7 @@ function Sparkline({
           key={i}
           className={cn(
             'flex-1 rounded-sm bg-current opacity-40 transition-opacity group-hover:opacity-70',
-            accent,
+            accent
           )}
           style={{ height: `${Math.max(8, (v / max) * 100)}%` }}
         />
@@ -435,7 +424,7 @@ function Sparkline({
 /** Group events into N evenly spaced time buckets per kind. Cheap O(n). */
 function bucketByKind(
   events: ObservabilityEvent[],
-  bucketCount: number,
+  bucketCount: number
 ): Record<EventKind, number[]> {
   const out: Record<EventKind, number[]> = {
     request: new Array(bucketCount).fill(0),
@@ -454,7 +443,7 @@ function bucketByKind(
     const ts = new Date(e.ts).getTime()
     const idx = Math.min(
       bucketCount - 1,
-      Math.floor(((ts - min) / span) * bucketCount),
+      Math.floor(((ts - min) / span) * bucketCount)
     )
     out[e.type][idx] += 1
   }
@@ -479,7 +468,7 @@ function ConsoleRow({
       onClick={onClick}
       className={cn(
         'group flex w-full items-baseline gap-3 border-b border-border border-l-2 px-4 py-1.5 text-left text-foreground hover:bg-muted/60',
-        meta.gutter,
+        meta.gutter
       )}
     >
       <time
@@ -494,7 +483,9 @@ function ConsoleRow({
       </span>
       <span className="min-w-0 flex-1 truncate">{primary}</span>
       {suffix && (
-        <span className="shrink-0 text-muted-foreground tabular-nums">{suffix}</span>
+        <span className="shrink-0 text-muted-foreground tabular-nums">
+          {suffix}
+        </span>
       )}
     </button>
   )
@@ -586,9 +577,7 @@ function EmptyState() {
 function ErrorState({ message }: { message: string }) {
   return (
     <div className="flex flex-1 flex-col items-center justify-center gap-2 p-12 text-center">
-      <p className="text-sm font-medium text-rose-500">
-        Failed to load events
-      </p>
+      <p className="text-sm font-medium text-rose-500">Failed to load events</p>
       <p className="text-xs text-muted-foreground">{message}</p>
     </div>
   )

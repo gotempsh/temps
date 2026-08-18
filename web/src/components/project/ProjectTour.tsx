@@ -15,10 +15,10 @@ import { useNavigate, useParams } from 'react-router'
 /**
  * A lightweight, dependency-free guided tour for new projects. It walks the user
  * through the "sites of interest" by navigating to each page — Overview,
- * Analytics, Traces, Error tracking, Logs, Metrics — while a coachmark card,
- * anchored next to the relevant sidebar item (top-left, where the eye is), and a
- * highlight ring point at where each one lives. Auto-runs once per browser on the
- * first project visit; re-launch by dispatching a `temps:project-tour` event.
+ * Analytics, Traces, Error tracking, Logs, Metrics — while a coachmark card and
+ * highlight ring point at either the direct destination or the grouped project
+ * tools menu. Auto-runs once per browser on the first project visit; re-launch by
+ * dispatching a `temps:project-tour` event.
  */
 
 const SEEN_KEY = 'temps.project-tour.v1'
@@ -63,25 +63,25 @@ const STEPS: TourStep[] = [
   },
   {
     route: 'analytics',
-    anchor: 'analytics',
+    anchor: 'all-tools',
     title: 'Analytics',
     body: 'Pageviews, visitors, funnels and session replays from your app.',
   },
   {
     route: 'traces',
-    anchor: 'observe',
+    anchor: 'all-tools',
     title: 'Traces',
     body: 'Distributed OpenTelemetry traces — every request, span by span.',
   },
   {
     route: 'errors',
-    anchor: 'observe',
+    anchor: 'errors',
     title: 'Error tracking',
     body: 'Exceptions with stack traces, grouped and alertable.',
   },
   {
     route: 'metrics',
-    anchor: 'observe',
+    anchor: 'all-tools',
     title: 'Metrics',
     body: 'Counters, histograms and gauges — with anomaly alerts.',
   },

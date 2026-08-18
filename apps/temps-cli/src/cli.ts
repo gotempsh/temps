@@ -5,6 +5,7 @@ import { setQuietMode } from './ui/spinner.js'
 import { handleError } from './utils/errors.js'
 import { createRequire } from 'module'
 import { listContexts, contextExists } from './config/contexts.js'
+import { announceCommandMaturity } from './lib/feature-maturity.js'
 
 // Import command modules
 import { registerAuthCommands } from './commands/auth/index.js'
@@ -150,6 +151,9 @@ export function createProgram(): Command {
       // can pipe stdout to `jq` or parse it directly.
       if (actionCommand?.opts().json) {
         setQuietMode(true)
+      }
+      if (actionCommand) {
+        await announceCommandMaturity(actionCommand, thisCommand)
       }
     })
 

@@ -1114,6 +1114,7 @@ impl PluginManager {
             }
         }
 
+        apply_feature_maturity_extensions(&mut combined_openapi);
         Ok(combined_openapi)
     }
 
@@ -1240,6 +1241,42 @@ impl PluginManager {
         }
 
         router
+    }
+}
+
+fn apply_feature_maturity_extensions(openapi: &mut utoipa::openapi::OpenApi) {
+    use crate::feature_maturity::{feature_key_for_api_path, feature_maturity, Maturity};
+
+    for (path, item) in &mut openapi.paths.paths {
+        let Some(feature_key) = feature_key_for_api_path(path) else {
+            continue;
+        };
+        let Some(feature) = feature_maturity(feature_key) else {
+            continue;
+        };
+        if feature.maturity == Maturity::Stable {
+            continue;
+        }
+
+        for operation in [
+            &mut item.get,
+            &mut item.put,
+            &mut item.post,
+            &mut item.delete,
+            &mut item.options,
+            &mut item.head,
+            &mut item.patch,
+            &mut item.trace,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let extensions = operation.extensions.get_or_insert_default();
+            extensions.insert(
+                "x-maturity".to_string(),
+                serde_json::Value::String(feature.maturity.as_str().to_string()),
+            );
+        }
     }
 }
 
@@ -1873,5 +1910,42 @@ mod split_application_tests {
             probe_status(split.admin.clone(), "/admin-marker").await,
             axum::http::StatusCode::OK
         );
+    }
+
+    #[test]
+    fn openapi_operations_include_non_stable_maturity() {
+        use utoipa::openapi::{
+            path::Operation, HttpMethod, OpenApiBuilder, PathItem, PathsBuilder,
+        };
+
+        let mut openapi = OpenApiBuilder::new()
+            .paths(
+                PathsBuilder::new()
+                    .path(
+                        "/analytics/visitors",
+                        PathItem::new(HttpMethod::Get, Operation::new()),
+                    )
+                    .path(
+                        "/projects",
+                        PathItem::new(HttpMethod::Get, Operation::new()),
+                    )
+                    .build(),
+            )
+            .build();
+
+        apply_feature_maturity_extensions(&mut openapi);
+
+        let analytics = openapi.paths.paths["/analytics/visitors"]
+            .get
+            .as_ref()
+            .and_then(|operation| operation.extensions.as_ref())
+            .and_then(|extensions| extensions.get("x-maturity"));
+        assert_eq!(analytics, Some(&serde_json::Value::String("beta".into())));
+
+        assert!(openapi.paths.paths["/projects"]
+            .get
+            .as_ref()
+            .and_then(|operation| operation.extensions.as_ref())
+            .is_none());
     }
 }

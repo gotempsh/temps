@@ -1,11 +1,16 @@
 import { describe, expect, test } from 'bun:test'
+import type { TrafficAggregationRequest } from '@/api/client/types.gen'
 import { parseStructuredSseFrame } from '@/hooks/useStructuredAi'
 import {
   apiTrafficSummaryCacheKey,
   canStartApiTrafficSummary,
   shouldRequestApiTrafficSummary,
 } from '@/lib/ai-summary'
-import { nextTrafficSort, trafficPageCount } from '@/lib/api-traffic-sort'
+import {
+  nextTrafficSort,
+  trafficPageCount,
+  trafficQueryNeedsCompatibilityRetry,
+} from '@/lib/api-traffic-sort'
 
 describe('API traffic server-side sorting', () => {
   test('toggles an active metric from descending to ascending', () => {
@@ -23,6 +28,32 @@ describe('API traffic server-side sorting', () => {
   test('paginates high-cardinality route and caller drilldowns', () => {
     expect(trafficPageCount(100_000, 20)).toBe(5_000)
     expect(trafficPageCount(1_000, 20)).toBe(50)
+  })
+})
+
+describe('API traffic rolling-upgrade compatibility', () => {
+  const request: TrafficAggregationRequest = {
+    start_time: '2026-08-15T00:00:00Z',
+    end_time: '2026-08-16T00:00:00Z',
+    dimensions: ['path'],
+    metrics: ['requests', 'bot_requests'],
+  }
+
+  test('retries when an older backend rejects an optional crawler metric', () => {
+    expect(
+      trafficQueryNeedsCompatibilityRetry(request, {
+        detail:
+          'metrics[1]: unknown variant `bot_requests`, expected one of `requests`, `errors`',
+      })
+    ).toBe(true)
+  })
+
+  test('does not hide unrelated aggregation errors', () => {
+    expect(
+      trafficQueryNeedsCompatibilityRetry(request, {
+        detail: 'database query timed out',
+      })
+    ).toBe(false)
   })
 })
 

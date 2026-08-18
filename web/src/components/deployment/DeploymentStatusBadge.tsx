@@ -21,7 +21,7 @@ export function DeploymentStatusBadge({
   return (
     <Badge
       variant="outline"
-      className={`${statusStyles[deployment.status as keyof typeof statusStyles]} ${className}`}
+      className={`shrink-0 whitespace-nowrap tabular-nums ${statusStyles[deployment.status as keyof typeof statusStyles]} ${className ?? ''}`}
     >
       <DeploymentStatus deployment={deployment} />
     </Badge>

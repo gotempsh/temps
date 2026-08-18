@@ -1,6 +1,6 @@
 ---
 name: temps
-description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@0.1.33`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use pinned `bunx` or `npx` CLI invocations with explicit target contexts.
+description: Manage, deploy, operate, and instrument applications with Temps. Use this skill whenever the user mentions Temps, `@temps-sdk/cli@0.1.34`, deploying or migrating an app to Temps, projects, environments, services, domains, backups, logs, monitoring, analytics, browser Performance Insights/Core Web Vitals, observability, error tracking, OpenTelemetry, tracing, session replay, or Temps Cloud. Also use it when preparing an application for production on Temps even if the user does not explicitly ask for the CLI. Route to focused references, proactively detect missing observability during create/link/deploy journeys, and use pinned `bunx` or `npx` CLI invocations with explicit target contexts.
 ---
 
 # Temps
@@ -93,10 +93,10 @@ Do not read a monolithic CLI manual. Open
 command-group file, and confirm uncertain syntax with runtime help:
 
 ```bash
-bunx @temps-sdk/cli@0.1.33 <group> <command> --help
+bunx @temps-sdk/cli@0.1.34 <group> <command> --help
 ```
 
-Use `npx @temps-sdk/cli@0.1.33` only when Bun is unavailable. Never omit the
+Use `npx @temps-sdk/cli@0.1.34` only when Bun is unavailable. Never omit the
 reviewed version and never assume a global `temps` binary exists.
 
 For Performance Insights, confirm `analytics performance --help` exists in the

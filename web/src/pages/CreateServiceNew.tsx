@@ -220,14 +220,20 @@ function ClusterMemberConfig({
       {members.length > 0 && (!hasMonitor || !hasEnoughReplicas) && (
         <div className="rounded-lg border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
           A PostgreSQL cluster requires at least:{' '}
-          <span className={hasMonitor ? 'line-through opacity-50' : 'font-medium'}>
+          <span
+            className={hasMonitor ? 'line-through opacity-50' : 'font-medium'}
+          >
             1 monitor
           </span>
           ,{' '}
-          <span className={hasEnoughReplicas ? 'line-through opacity-50' : 'font-medium'}>
+          <span
+            className={
+              hasEnoughReplicas ? 'line-through opacity-50' : 'font-medium'
+            }
+          >
             2 replicas
-          </span>
-          {' '}(pg_auto_failover elects one as primary at runtime).
+          </span>{' '}
+          (pg_auto_failover elects one as primary at runtime).
         </div>
       )}
 
@@ -290,13 +296,6 @@ export function CreateService() {
   )
   const hasWorkerNodes = useMemo(() => nodes.length > 0, [nodes])
 
-  // Reset to standalone if no worker nodes are available
-  useEffect(() => {
-    if (!hasWorkerNodes && topology === 'cluster') {
-      setTopology('standalone')
-    }
-  }, [hasWorkerNodes, topology])
-
   // When switching to cluster topology, pre-populate default members:
   //   - 1 monitor on the control plane (node_id = null)
   //   - 1 replica per active worker node, pinned to that node
@@ -306,29 +305,22 @@ export function CreateService() {
   // least 2 replicas for a viable failover quorum; with 0 or 1 worker
   // nodes we fall back to the previous single-replica scaffold and
   // surface the warning blocks below.
-  useEffect(() => {
-    if (topology === 'cluster' && clusterMembers.length === 0 && serviceType) {
-      if (DEFAULT_CLUSTER_ROLES[serviceType]) {
-        const seeded: ClusterMemberRequest[] = [
-          { role: 'monitor', node_id: null },
-        ]
-        if (nodes.length > 0) {
-          for (const n of nodes) {
-            seeded.push({ role: 'replica', node_id: n.id })
-          }
-        } else {
-          // No worker nodes yet — leave a single empty replica row so
-          // the operator sees what the cluster would look like, with
-          // the warning block prompting them to add more.
-          seeded.push({ role: 'replica', node_id: null })
-        }
-        setClusterMembers(seeded)
-      }
-    }
-    if (topology === 'standalone') {
+  const selectTopology = (nextTopology: 'standalone' | 'cluster') => {
+    setTopology(nextTopology)
+    if (nextTopology === 'standalone') {
       setClusterMembers([])
+      return
     }
-  }, [topology, serviceType, nodes])
+
+    if (clusterMembers.length > 0 || !serviceType) return
+    if (!DEFAULT_CLUSTER_ROLES[serviceType]) return
+
+    const seeded: ClusterMemberRequest[] = [
+      { role: 'monitor', node_id: null },
+      ...nodes.map((node) => ({ role: 'replica', node_id: node.id })),
+    ]
+    setClusterMembers(seeded)
+  }
 
   useEffect(() => {
     setBreadcrumbs([
@@ -419,7 +411,7 @@ export function CreateService() {
   if (!serviceType) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="sm:p-4 space-y-6 md:p-6 max-w-4xl mx-auto">
+        <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
           <div className="space-y-1">
             <Link to="/storage">
               <Button variant="ghost" size="sm" className="gap-2 -ml-2 mb-2">
@@ -428,12 +420,17 @@ export function CreateService() {
               </Button>
             </Link>
             <h1 className="text-2xl font-semibold">Create Service</h1>
-            <p className="text-muted-foreground">Choose a service type to get started.</p>
+            <p className="text-muted-foreground">
+              Choose a service type to get started.
+            </p>
           </div>
           {isLoadingProviders ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-4">
               {[...Array(6)].map((_, i) => (
-                <div key={i} className="h-24 bg-muted animate-pulse rounded-lg" />
+                <div
+                  key={i}
+                  className="h-24 bg-muted animate-pulse rounded-lg"
+                />
               ))}
             </div>
           ) : (
@@ -442,7 +439,9 @@ export function CreateService() {
                 <button
                   key={provider.service_type}
                   type="button"
-                  onClick={() => navigate(`/storage/create?type=${provider.service_type}`)}
+                  onClick={() =>
+                    navigate(`/storage/create?type=${provider.service_type}`)
+                  }
                   className="flex items-center gap-4 rounded-lg border p-4 text-left hover:bg-accent transition-colors"
                 >
                   <div
@@ -459,7 +458,9 @@ export function CreateService() {
                   </div>
                   <div className="min-w-0">
                     <p className="font-medium">{provider.display_name}</p>
-                    <p className="text-xs text-muted-foreground truncate">{provider.description}</p>
+                    <p className="text-xs text-muted-foreground truncate">
+                      {provider.description}
+                    </p>
                   </div>
                 </button>
               ))}
@@ -473,7 +474,7 @@ export function CreateService() {
   if (isLoadingSchema) {
     return (
       <div className="flex-1 overflow-auto">
-        <div className="sm:p-4 space-y-6 md:p-6 max-w-4xl mx-auto">
+        <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
           <div className="space-y-4">
             <div className="h-8 w-1/3 bg-muted animate-pulse rounded" />
             <div className="space-y-3">
@@ -496,7 +497,7 @@ export function CreateService() {
 
   return (
     <div className="flex-1 overflow-auto">
-      <div className="sm:p-4 space-y-6 md:p-6 max-w-4xl mx-auto">
+      <div className="mx-auto max-w-6xl space-y-6 sm:p-4 md:p-6">
         {/* Header with provider info */}
         <div className="space-y-4">
           <Link to="/storage">
@@ -562,7 +563,7 @@ export function CreateService() {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <button
                 type="button"
-                onClick={() => setTopology('standalone')}
+                onClick={() => selectTopology('standalone')}
                 className={`flex flex-col gap-1.5 rounded-lg border-2 p-4 text-left transition-colors ${
                   topology === 'standalone'
                     ? 'border-primary bg-primary/5'
@@ -576,16 +577,14 @@ export function CreateService() {
               </button>
               <button
                 type="button"
-                onClick={() => setTopology('cluster')}
+                onClick={() => selectTopology('cluster')}
                 className={`flex flex-col gap-1.5 rounded-lg border-2 p-4 text-left transition-colors ${
                   topology === 'cluster'
                     ? 'border-primary bg-primary/5'
                     : 'border-border hover:border-muted-foreground/50'
                 }`}
               >
-                <span className="font-medium text-sm">
-                  Cluster (HA)
-                </span>
+                <span className="font-medium text-sm">Cluster (HA)</span>
                 <span className="text-xs text-muted-foreground">
                   Multi-node with pg_auto_failover. Requires 3+ nodes.
                 </span>
@@ -599,7 +598,8 @@ export function CreateService() {
                   <code className="font-mono text-xs bg-muted px-1 py-0.5 rounded">
                     gotempsh/postgres-ha:18-bookworm-walg
                   </code>{' '}
-                  automatically (includes pg_auto_failover and WAL-G for backups).
+                  automatically (includes pg_auto_failover and WAL-G for
+                  backups).
                 </p>
                 <ClusterMemberConfig
                   members={clusterMembers}
@@ -645,9 +645,7 @@ export function CreateService() {
             topology === 'standalone' ? preset.ownedFields : undefined
           }
           hiddenFields={
-            topology === 'cluster'
-              ? ['host', 'port', 'docker_image']
-              : []
+            topology === 'cluster' ? ['host', 'port', 'docker_image'] : []
           }
         />
       </div>

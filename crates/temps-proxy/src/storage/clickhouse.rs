@@ -57,8 +57,8 @@ use super::ProxyLogStorage;
 use crate::handler::proxy_logs::ProxyLogsQuery;
 use crate::service::proxy_log_service::{
     AiAgentBreakdownRow, AiAgentTimelineRow, AiPageBreakdownRow, AiStatusBreakdownRow,
-    AiTimelineGroupBy, CreateProxyLogRequest, ProjectHealthSummary, ProxyLogService,
-    ProxyLogServiceError, StatsFilters, TimeBucketStats,
+    AiTimelineGroupBy, CreateProxyLogRequest, ProjectHealthSummary, ProjectHourlyRequestCount,
+    ProxyLogService, ProxyLogServiceError, StatsFilters, TimeBucketStats,
 };
 use crate::traffic_aggregation::{
     TrafficAggregationRequest, TrafficAggregationResponse, TrafficAggregationRow, TrafficDimension,
@@ -379,6 +379,12 @@ impl From<&CreateProxyLogRequest> for ChProxyLogRow {
 ///
 /// Column aliases in the SELECT list must match these field names. Timestamp
 /// columns are aliased to `*_ms` (Unix milliseconds) so they decode as `i64`.
+///
+/// The two header columns are read only by the single-row detail lookups. The
+/// list queries alias a literal `''` in their place: headers run to kilobytes
+/// per row and no list view renders them, so selecting them for a 100-row page
+/// would move megabytes to display nothing. The literal costs no disk read
+/// while keeping one row struct for every query.
 #[derive(::clickhouse::Row, Deserialize, Debug)]
 struct ChProxyLogReadRow {
     timestamp_ms: i64,
@@ -413,6 +419,21 @@ struct ChProxyLogReadRow {
     request_size_bytes: Option<i64>,
     response_size_bytes: Option<i64>,
     cache_status: String,
+    request_headers: String,
+    response_headers: String,
+}
+
+/// Parse a stored header blob into JSON for the entity model.
+///
+/// ClickHouse stores these as `String` defaulting to `'{}'`, and the list
+/// queries substitute `''`. Both mean "nothing to show" and map to `None`, as
+/// does anything that fails to parse — a malformed blob is not worth
+/// propagating into the API response.
+fn opt_headers_json(raw: String) -> Option<serde_json::Value> {
+    if raw.is_empty() || raw == "{}" {
+        return None;
+    }
+    serde_json::from_str(&raw).ok()
 }
 
 /// Map a `""` sentinel column back to `Option::None` for the `Model` fields the
@@ -430,11 +451,13 @@ impl ChProxyLogReadRow {
     /// `ProxyLogResponse::from(model)` mapping is reused unchanged.
     ///
     /// The columns NOT part of `ProxyLogResponse` (`id`, `created_date`,
-    /// `request_headers`, `response_headers`, `trace_id`, `error_group_id`) are
-    /// filled with backend-neutral placeholders — they are never read by the
-    /// response mapping. `id` has no CH equivalent (no serial); see the
-    /// module-level note. We surface `id = 0`; the response carries it but the
-    /// UI keys rows by `request_id`.
+    /// `trace_id`, `error_group_id`) are filled with backend-neutral
+    /// placeholders — they are never read by the response mapping. `id` has no
+    /// CH equivalent (no serial); see the module-level note. We surface
+    /// `id = 0`; the response carries it but the UI keys rows by `request_id`.
+    ///
+    /// Headers ARE mapped through: they are part of the detail response, and
+    /// resolve to `None` for the list queries that don't select them.
     fn into_model(self) -> proxy_logs::Model {
         let timestamp = Utc
             .timestamp_millis_opt(self.timestamp_ms)
@@ -472,8 +495,8 @@ impl ChProxyLogReadRow {
             request_size_bytes: self.request_size_bytes,
             response_size_bytes: self.response_size_bytes,
             cache_status: opt_str(self.cache_status),
-            request_headers: None,
-            response_headers: None,
+            request_headers: opt_headers_json(self.request_headers),
+            response_headers: opt_headers_json(self.response_headers),
             created_date: timestamp.date_naive(),
             session_id: self.session_id,
             visitor_id: self.visitor_id,
@@ -508,8 +531,10 @@ struct ChTimeBucketRow {
 #[derive(::clickhouse::Row, Deserialize, Debug)]
 struct ChProjectHealthRow {
     project_id: i32,
-    total_requests: u64,
-    total_errors: u64,
+    hour_ms: i64,
+    request_count: u64,
+    error_count: u64,
+    latency_count: u64,
     avg_response_time_ms: f64,
 }
 
@@ -1106,7 +1131,8 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 routing_status, project_id, environment_id, deployment_id, session_id, visitor_id, \
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
-                device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
+                device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
+                cache_status, '' AS request_headers, '' AS response_headers \
              FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_col} {order_dir} \
@@ -1167,7 +1193,8 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 routing_status, project_id, environment_id, deployment_id, session_id, visitor_id, \
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
-                device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
+                device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
+                cache_status, '' AS request_headers, '' AS response_headers \
              FROM proxy_logs \
              {where_clause} \
              ORDER BY {order_col} {order_dir} \
@@ -1230,7 +1257,8 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
                 routing_status, project_id, environment_id, deployment_id, session_id, visitor_id, \
                 container_id, upstream_host, error_message, client_ip, user_agent, referrer, \
                 request_id, ip_geolocation_id, browser, browser_version, operating_system, \
-                device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, cache_status \
+                device_type, is_bot, bot_name, request_size_bytes, response_size_bytes, \
+                cache_status, request_headers, response_headers \
              FROM proxy_logs \
              WHERE request_id = ?{time_clause} \
              ORDER BY timestamp DESC \
@@ -1432,6 +1460,7 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         let mut clauses: Vec<String> = vec![
             "timestamp >= fromUnixTimestamp64Milli(?)".to_string(),
             "timestamp < fromUnixTimestamp64Milli(?)".to_string(),
+            "is_system_request = 0".to_string(),
             "project_id IN ?".to_string(),
         ];
         let project_id_array: Vec<i32> = project_ids.to_vec();
@@ -1440,15 +1469,22 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
             clauses.push("is_bot = ?".to_string());
         }
 
+        // toStartOfHour(DateTime64) returns a second-precision DateTime, which
+        // toUnixTimestamp64Milli rejects (it only accepts DateTime64). Go
+        // through toUnixTimestamp * 1000 instead — same shape the time-bucket
+        // queries above use — so the bucket stays an Int64 of epoch millis.
         let sql = format!(
             "SELECT \
                 assumeNotNull(project_id) AS project_id, \
-                count() AS total_requests, \
-                countIf(status_code >= 500) AS total_errors, \
+                toInt64(toUnixTimestamp(toStartOfHour(timestamp))) * 1000 AS hour_ms, \
+                count() AS request_count, \
+                countIf(status_code >= 500) AS error_count, \
+                countIf(response_time_ms IS NOT NULL) AS latency_count, \
                 ifNull(avg(response_time_ms), 0) AS avg_response_time_ms \
              FROM proxy_logs \
              WHERE {} \
-             GROUP BY project_id",
+             GROUP BY project_id, hour_ms \
+             ORDER BY project_id, hour_ms",
             clauses.join(" AND ")
         );
 
@@ -1474,53 +1510,45 @@ impl ProxyLogStorage for ClickHouseProxyLogStore {
         let mut summaries: std::collections::HashMap<i32, ProjectHealthSummary> =
             std::collections::HashMap::new();
         for row in rows {
-            let total_requests = row.total_requests as i64;
-            let total_errors = row.total_errors as i64;
+            let request_count = row.request_count as i64;
+            let error_count = row.error_count as i64;
             // SQL coerces NULL avg → 0 via ifNull; guard is defensive only.
             let avg = if row.avg_response_time_ms.is_nan() {
                 0.0
             } else {
                 row.avg_response_time_ms
             };
-            let error_rate = if total_requests > 0 {
-                (total_errors as f64 / total_requests as f64) * 100.0
-            } else {
-                0.0
-            };
-            let status = if total_requests == 0 {
-                "unknown".to_string()
-            } else if error_rate > 50.0 {
-                "down".to_string()
-            } else if error_rate > 10.0 {
-                "degraded".to_string()
-            } else {
-                "healthy".to_string()
-            };
-            summaries.insert(
-                row.project_id,
-                ProjectHealthSummary {
-                    project_id: row.project_id,
-                    total_requests,
-                    total_errors,
-                    avg_response_time_ms: (avg * 10.0).round() / 10.0,
-                    error_rate: (error_rate * 10.0).round() / 10.0,
-                    status,
-                },
-            );
+            let summary = summaries
+                .entry(row.project_id)
+                .or_insert_with(|| ProjectHealthSummary::empty(row.project_id));
+            summary.total_requests += request_count;
+            summary.total_errors += error_count;
+            summary.latency_count += row.latency_count as i64;
+            summary.weighted_response_time_ms += avg * row.latency_count as f64;
+            let hour = Utc
+                .timestamp_millis_opt(row.hour_ms)
+                .single()
+                .ok_or_else(|| ProxyLogServiceError::ClickHouse {
+                    operation: "get_projects_health_summary".to_string(),
+                    reason: format!(
+                        "invalid hourly bucket {} for project {}",
+                        row.hour_ms, row.project_id
+                    ),
+                })?;
+            summary.hourly_requests.push(ProjectHourlyRequestCount {
+                bucket: hour.to_rfc3339(),
+                request_count,
+            });
         }
-
         // Preserve input order; missing projects → "unknown".
         let result = project_ids
             .iter()
             .map(|&id| {
-                summaries.remove(&id).unwrap_or(ProjectHealthSummary {
-                    project_id: id,
-                    total_requests: 0,
-                    total_errors: 0,
-                    avg_response_time_ms: 0.0,
-                    error_rate: 0.0,
-                    status: "unknown".to_string(),
-                })
+                let mut summary = summaries
+                    .remove(&id)
+                    .unwrap_or_else(|| ProjectHealthSummary::empty(id));
+                summary.finish_aggregation(start_time, end_time);
+                summary
             })
             .collect();
 
@@ -2469,6 +2497,60 @@ mod tests {
         );
     }
 
+    /// Regression: the hourly bucket used to be built with
+    /// `toUnixTimestamp64Milli(toStartOfHour(timestamp))`, which ClickHouse
+    /// rejects because `toStartOfHour` returns a second-precision `DateTime`
+    /// (`ILLEGAL_TYPE_OF_ARGUMENT`), so the whole projects-health query failed.
+    #[tokio::test]
+    async fn clickhouse_projects_health_summary_buckets_by_hour() {
+        let Some((store, _container)) = setup_clickhouse_store().await else {
+            return;
+        };
+
+        let mut ok = make_entry("health-ok");
+        ok.project_id = Some(7);
+        let mut failed = make_entry("health-error");
+        failed.project_id = Some(7);
+        failed.status_code = 503;
+        store
+            .write_batch(vec![ok, failed])
+            .await
+            .expect("insert proxy-log fixtures");
+
+        let start = Utc::now() - chrono::Duration::minutes(2);
+        let end = Utc::now() + chrono::Duration::minutes(2);
+        let summaries = store
+            .get_projects_health_summary(&[7, 999], start, end, None)
+            .await
+            .expect("hourly bucket must be a valid millisecond expression");
+
+        // Input order is preserved and unseen projects come back as "unknown".
+        assert_eq!(
+            summaries.iter().map(|s| s.project_id).collect::<Vec<_>>(),
+            vec![7, 999]
+        );
+        let project = &summaries[0];
+        assert_eq!(project.total_requests, 2);
+        assert_eq!(project.total_errors, 1);
+        assert_eq!(
+            project
+                .hourly_requests
+                .iter()
+                .map(|h| h.request_count)
+                .sum::<i64>(),
+            2
+        );
+        assert!(
+            project.hourly_requests.iter().all(|h| h
+                .bucket
+                .parse::<chrono::DateTime<Utc>>()
+                .is_ok_and(|b| b.timestamp() % 3600 == 0)),
+            "buckets must be parseable and aligned to the hour: {:?}",
+            project.hourly_requests
+        );
+        assert_eq!(summaries[1].status, "unknown");
+    }
+
     #[tokio::test]
     async fn clickhouse_traffic_aggregation_returns_drilldowns_and_excludes_monitor() {
         let Some((store, _container)) = setup_clickhouse_store().await else {
@@ -2801,6 +2883,9 @@ mod tests {
             request_size_bytes: None,
             response_size_bytes: Some(10),
             cache_status: String::new(),
+            request_headers: r#"{"accept":"text/html"}"#.into(),
+            // `''` is what the list queries alias in place of the column.
+            response_headers: String::new(),
         };
         let model = read.into_model();
         assert_eq!(model.id, 0);
@@ -2820,6 +2905,26 @@ mod tests {
         assert_eq!(model.is_bot, Some(true));
         // timestamp round-trips.
         assert_eq!(model.timestamp.timestamp_millis(), 1_717_200_000_000);
+        // Headers parse into JSON when selected...
+        assert_eq!(
+            model.request_headers,
+            Some(serde_json::json!({"accept": "text/html"}))
+        );
+        // ...and stay None for the list queries that alias `''` instead.
+        assert_eq!(model.response_headers, None);
+    }
+
+    #[test]
+    fn header_blobs_that_carry_nothing_become_none() {
+        // `''` is the list-query alias, `{}` is the ClickHouse column default,
+        // and unparsable content is a storage bug we refuse to propagate.
+        assert_eq!(opt_headers_json(String::new()), None);
+        assert_eq!(opt_headers_json("{}".to_string()), None);
+        assert_eq!(opt_headers_json("not json".to_string()), None);
+        assert_eq!(
+            opt_headers_json(r#"{"a":"b"}"#.to_string()),
+            Some(serde_json::json!({"a": "b"}))
+        );
     }
 
     #[test]

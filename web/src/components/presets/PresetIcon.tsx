@@ -1,7 +1,10 @@
 import { Boxes } from 'lucide-react'
 import { useState } from 'react'
 import { cn } from '@/lib/utils'
-import { presetIconPath } from '@/components/presets/preset-icon-paths'
+import {
+  presetIconNeedsDarkInvert,
+  presetIconPath,
+} from '@/components/presets/preset-icon-paths'
 
 export function PresetIcon({
   preset,
@@ -29,7 +32,11 @@ export function PresetIcon({
         <img
           src={iconPath}
           alt={`${label || preset} logo`}
-          className={cn('size-full object-contain', imageClassName)}
+          className={cn(
+            'size-full object-contain',
+            presetIconNeedsDarkInvert(preset) && 'dark:invert',
+            imageClassName
+          )}
           onError={() => setFailedPreset(preset)}
         />
       ) : (

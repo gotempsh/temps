@@ -39,6 +39,16 @@ const PRESET_ICON_PATHS: Record<string, string> = {
   vue: '/presets/vue.svg',
 }
 
+const DARK_MODE_INVERT_PRESETS = new Set(['deno', 'nextjs', 'remix', 'rust'])
+
+function normalizedPreset(preset: string): string {
+  return preset.toLowerCase().replace(/[^a-z0-9]/g, '')
+}
+
 export function presetIconPath(preset: string): string | undefined {
-  return PRESET_ICON_PATHS[preset.toLowerCase().replace(/[^a-z0-9]/g, '')]
+  return PRESET_ICON_PATHS[normalizedPreset(preset)]
+}
+
+export function presetIconNeedsDarkInvert(preset: string): boolean {
+  return DARK_MODE_INVERT_PRESETS.has(normalizedPreset(preset))
 }

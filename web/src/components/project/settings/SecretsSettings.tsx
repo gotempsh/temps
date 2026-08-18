@@ -101,6 +101,8 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
 
   const secrets = secretsQuery.data ?? []
   const environments = environmentsQuery.data ?? []
+  const composeServiceNames = composeServiceNamesFor(project)
+  const isComposeProject = project.preset === 'docker-compose'
 
   return (
     <div className="space-y-6">
@@ -115,7 +117,7 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
             <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
               /run/secrets/&lt;KEY&gt;
             </code>{' '}
-            (mode 0400, tmpfs). They are never visible via{' '}
+            as a read-only mount. They are never visible via{' '}
             <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
               docker inspect
             </code>{' '}
@@ -123,7 +125,8 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
             <code className="text-xs bg-muted px-1.5 py-0.5 rounded">
               fs.readFileSync('/run/secrets/DB_PASSWORD', 'utf8')
             </code>
-            . A redeploy is required for new or updated secrets to take effect.
+            . Docker Compose projects get the same mount in every service. A
+            redeploy is required for new or updated secrets to take effect.
           </p>
         </div>
         <Button onClick={() => setIsCreateOpen(true)}>
@@ -160,10 +163,31 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
         onOpenChange={setIsCreateOpen}
         projectId={project.id}
         environments={environments}
+        composeServiceNames={composeServiceNames}
+        isComposeProject={isComposeProject}
         onCreated={refetchSecrets}
       />
     </div>
   )
+}
+
+/** Compose service names the project last synced from its compose file.
+ *  Empty for non-Compose presets, which deploy a single container. */
+function composeServiceNamesFor(project: {
+  preset?: string | null
+  preset_config?: unknown
+}): string[] {
+  const cfg = (project.preset_config ?? {}) as Record<string, unknown>
+  const services = (cfg.composeServices ?? cfg.compose_services ?? []) as Array<{
+    name?: string
+  }>
+  return Array.from(
+    new Set(
+      services
+        .map((service) => service?.name)
+        .filter((name): name is string => typeof name === 'string' && !!name),
+    ),
+  ).sort()
 }
 
 interface SecretRowProps {
@@ -174,6 +198,7 @@ interface SecretRowProps {
     created_at: number
     updated_at: number
     environments: Array<{ id: number; name: string; main_url: string }>
+    compose_services?: string[]
   }
   projectId: number
   onDeleted: () => void
@@ -203,6 +228,9 @@ function SecretRow({ secret, projectId, onDeleted }: SecretRowProps) {
             ? 'All environments'
             : secret.environments.map((e) => e.name).join(', ')}
           {secret.include_in_preview ? ' • preview enabled' : ''}
+          {secret.compose_services && secret.compose_services.length > 0
+            ? ` • only ${secret.compose_services.join(', ')}`
+            : ''}
         </div>
       </div>
       <span className="text-xs text-muted-foreground font-mono">••••••••</span>
@@ -249,6 +277,8 @@ interface CreateSecretDialogProps {
   onOpenChange: (open: boolean) => void
   projectId: number
   environments: Array<{ id: number; name: string }>
+  composeServiceNames: string[]
+  isComposeProject: boolean
   onCreated: () => void
 }
 
@@ -270,6 +300,8 @@ function CreateSecretDialog({
   onOpenChange,
   projectId,
   environments,
+  composeServiceNames,
+  isComposeProject,
   onCreated,
 }: CreateSecretDialogProps) {
   const [key, setKey] = useState('')
@@ -278,6 +310,9 @@ function CreateSecretDialog({
     defaultEnvironmentSelection(environments),
   )
   const [includeInPreview, setIncludeInPreview] = useState(false)
+  // Empty means every service, matching the API. Restricting is opt-in so an
+  // untouched form never withholds a secret from the service that needs it.
+  const [composeServices, setComposeServices] = useState<string[]>([])
   const [keyError, setKeyError] = useState<string | null>(null)
   const [valueError, setValueError] = useState<string | null>(null)
 
@@ -304,6 +339,7 @@ function CreateSecretDialog({
       setEnvironmentIds(defaultEnvironmentSelection(environments))
       setHasUserEditedEnvs(false)
       setIncludeInPreview(false)
+      setComposeServices([])
       setKeyError(null)
       setValueError(null)
       onOpenChange(false)
@@ -339,6 +375,7 @@ function CreateSecretDialog({
         value,
         environment_ids: environmentIds,
         include_in_preview: includeInPreview,
+        compose_services: composeServices,
       },
     })
   }
@@ -420,6 +457,48 @@ function CreateSecretDialog({
               </p>
             </div>
           </div>
+          {isComposeProject && composeServiceNames.length === 0 && (
+            <div>
+              <Label>Compose services</Label>
+              <p className="text-xs text-muted-foreground mt-2">
+                This secret will be mounted in every service. To restrict it to
+                specific containers — so a database or sidecar can't read an
+                application's credentials — sync this project's compose
+                services from Git settings, then edit the secret.
+              </p>
+            </div>
+          )}
+          {composeServiceNames.length > 0 && (
+            <div>
+              <Label>Compose services</Label>
+              <div className="mt-2 space-y-2">
+                {composeServiceNames.map((name) => (
+                  <label
+                    key={name}
+                    className="flex items-center gap-2 text-sm cursor-pointer"
+                  >
+                    <Checkbox
+                      checked={composeServices.includes(name)}
+                      onCheckedChange={(checked) =>
+                        setComposeServices((prev) =>
+                          checked
+                            ? [...prev, name]
+                            : prev.filter((s) => s !== name),
+                        )
+                      }
+                    />
+                    <span className="font-mono text-xs">{name}</span>
+                  </label>
+                ))}
+                <p className="text-xs text-muted-foreground">
+                  Leave empty to mount this secret in every service. Selecting
+                  services restricts it to those containers — the others get no
+                  file at all, so a database or sidecar can't read an
+                  application's credentials.
+                </p>
+              </div>
+            </div>
+          )}
           <label className="flex items-center gap-2 text-sm cursor-pointer">
             <Checkbox
               checked={includeInPreview}

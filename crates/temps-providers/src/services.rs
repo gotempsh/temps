@@ -21,7 +21,7 @@ use bollard::Docker;
 use chrono::Utc;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, Set, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -1940,6 +1940,46 @@ impl ExternalServiceManager {
             .await?;
 
         let mut result = Vec::new();
+        for service in services {
+            result.push(self.get_service_info(service.id).await?);
+        }
+
+        Ok(result)
+    }
+
+    /// List services linked to at least one project visible to the caller.
+    ///
+    /// `hidden_project_ids` comes from the registered `ProjectAccessChecker`.
+    /// The join deliberately excludes unlinked services and applies the access
+    /// filter before pagination, so restricted callers cannot enumerate a
+    /// service through sparse or misleading pages. `DISTINCT` prevents a
+    /// service linked to multiple visible projects from appearing twice.
+    pub async fn list_project_accessible_services_paginated(
+        &self,
+        page: u64,
+        page_size: u64,
+        hidden_project_ids: &[i32],
+    ) -> Result<Vec<ExternalServiceInfo>, ExternalServiceError> {
+        let mut query = external_services::Entity::find()
+            .inner_join(project_services::Entity)
+            .distinct()
+            .order_by_desc(external_services::Column::CreatedAt);
+
+        if !hidden_project_ids.is_empty() {
+            query = query.filter(
+                project_services::Column::ProjectId.is_not_in(hidden_project_ids.iter().copied()),
+            );
+        }
+
+        let services = query
+            .paginate(self.db.as_ref(), page_size)
+            .fetch_page(page - 1)
+            .await
+            .map_err(|error| ExternalServiceError::DatabaseError {
+                reason: format!("failed to list project-accessible external services: {error}"),
+            })?;
+
+        let mut result = Vec::with_capacity(services.len());
         for service in services {
             result.push(self.get_service_info(service.id).await?);
         }
@@ -12707,6 +12747,48 @@ mod tests {
             ),
             Arc::new(temps_dns::DnsRegistry::new(db)),
         )
+    }
+
+    #[tokio::test]
+    async fn project_accessible_service_list_filters_links_before_pagination() {
+        let model = encrypted_service_model(17, serde_json::json!({}));
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                // Filtered page query.
+                .append_query_results([vec![model.clone()]])
+                // Existing service-info hydration query.
+                .append_query_results([vec![model]])
+                .into_connection(),
+        );
+        let manager = mock_service_manager_with_db(db.clone());
+
+        let services = manager
+            .list_project_accessible_services_paginated(1, 25, &[10, 11])
+            .await
+            .expect("project-scoped external-service list should succeed");
+        assert_eq!(services.len(), 1);
+        assert_eq!(services[0].id, 17);
+
+        drop(manager);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("test database still has owners"));
+        let log = db.into_transaction_log();
+        let list_sql = &log[0].statements()[0].sql;
+        assert!(
+            list_sql.contains("INNER JOIN \"project_services\""),
+            "unlinked services must be excluded by the database query: {list_sql}"
+        );
+        assert!(
+            list_sql.contains("\"project_services\".\"project_id\" NOT IN ($1, $2)"),
+            "hidden projects must be excluded before pagination: {list_sql}"
+        );
+        assert!(
+            list_sql.contains("SELECT DISTINCT"),
+            "services linked to multiple accessible projects must be deduplicated: {list_sql}"
+        );
+        assert!(
+            list_sql.contains("LIMIT $3 OFFSET $4"),
+            "access filtering must be part of the paginated query: {list_sql}"
+        );
     }
 
     /// `check_service_health` backed `GET /external-services/{id}/health` with

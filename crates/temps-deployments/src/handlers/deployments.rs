@@ -35,7 +35,8 @@ use crate::handlers::types::{
     ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
     DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
     DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
-    EnvVarResponse, FailureReportPreviewResponse, PromoteDeploymentRequest, ResourceLimitsResponse,
+    EnvVarResponse, FailureReportPreviewResponse, LatestDeploymentMediaResponse,
+    LatestDeploymentMediaResponseItem, PromoteDeploymentRequest, ResourceLimitsResponse,
     SendFailureReportRequest,
 };
 use temps_core::problemdetails;
@@ -114,6 +115,7 @@ fn public_compose_service_url(
 #[openapi(
     paths(
         get_last_deployment,
+        get_latest_deployment_media,
         get_project_deployments,
         get_deployment,
         get_deployment_jobs,
@@ -146,6 +148,8 @@ fn public_compose_service_url(
     components(schemas(
         DeploymentListResponse,
         DeploymentResponse,
+        LatestDeploymentMediaResponse,
+        LatestDeploymentMediaResponseItem,
         DeploymentStateResponse,
         DeploymentJobsResponse,
         DeploymentJobResponse,
@@ -223,6 +227,10 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
     Router::new()
         // Deployment management
         .route("/projects/{id}/last-deployment", get(get_last_deployment))
+        .route(
+            "/deployments/latest-media",
+            get(get_latest_deployment_media),
+        )
         .route("/projects/{id}/deployments", get(get_project_deployments))
         .route(
             "/projects/{project_id}/deployments/{deployment_id}",
@@ -432,6 +440,84 @@ pub async fn get_last_deployment(
     debug!("Getting last deployment for project with id: {}", id);
     let deployment = state.deployment_service.get_last_deployment(id).await?;
     Ok(Json(DeploymentResponse::from_service_deployment(deployment)).into_response())
+}
+
+#[derive(Debug, serde::Deserialize, utoipa::IntoParams)]
+pub struct LatestDeploymentMediaQuery {
+    /// Comma-separated project IDs. At most 100 IDs are accepted.
+    pub project_ids: String,
+}
+
+fn parse_project_ids(project_ids: &str) -> Result<Vec<i32>, Problem> {
+    let mut ids = Vec::new();
+    for value in project_ids.split(',').map(str::trim) {
+        let project_id = value.parse::<i32>().map_err(|_| {
+            problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid Parameters")
+                .with_detail(format!("'{value}' is not a valid project ID"))
+        })?;
+        if !ids.contains(&project_id) {
+            ids.push(project_id);
+        }
+    }
+    if ids.is_empty() {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("project_ids must contain at least one project ID"));
+    }
+    if ids.len() > 100 {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Parameters")
+            .with_detail("Maximum 100 project IDs allowed"));
+    }
+    Ok(ids)
+}
+
+/// Get the latest deployment URL and screenshot location for multiple projects.
+#[utoipa::path(
+    tag = "Deployments",
+    get,
+    path = "/deployments/latest-media",
+    params(LatestDeploymentMediaQuery),
+    responses(
+        (status = 200, description = "Latest deployment media keyed by project ID", body = LatestDeploymentMediaResponse),
+        (status = 400, description = "Invalid project IDs", body = temps_core::problemdetails::ProblemDetails),
+        (status = 401, description = "Unauthorized", body = temps_core::problemdetails::ProblemDetails),
+        (status = 403, description = "Insufficient permission or project access", body = temps_core::problemdetails::ProblemDetails),
+        (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_latest_deployment_media(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<LatestDeploymentMediaQuery>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    let project_ids = parse_project_ids(&query.project_ids)?;
+    for project_id in &project_ids {
+        project_permission_guard!(
+            auth,
+            DeploymentsRead,
+            *project_id,
+            state.project_access_checker
+        );
+        project_scope_guard!(auth, *project_id);
+    }
+
+    let projects = state
+        .deployment_service
+        .get_latest_deployment_media(&project_ids)
+        .await?
+        .into_iter()
+        .map(|media| {
+            (
+                media.project_id.to_string(),
+                LatestDeploymentMediaResponseItem::from(media),
+            )
+        })
+        .collect();
+
+    Ok(Json(LatestDeploymentMediaResponse { projects }))
 }
 
 use super::types::GetDeploymentsParams;
@@ -2418,11 +2504,33 @@ mod tests {
     use futures::StreamExt;
     use std::sync::Arc;
     use temps_config::ConfigService;
+    use temps_core::ProjectAccessChecker;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::upstream_config::UpstreamList;
     use temps_logs::{DockerLogService, LogService};
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
+
+    struct MediaWithoutDeploymentsRead;
+
+    #[async_trait]
+    impl ProjectAccessChecker for MediaWithoutDeploymentsRead {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(true)
+        }
+
+        async fn effective_project_permissions(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(Some(vec!["projects:read".to_string()]))
+        }
+    }
 
     fn websocket_origin_headers(origin: &str, host: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -2453,6 +2561,27 @@ mod tests {
     #[test]
     fn websocket_origin_allows_non_browser_clients_without_origin() {
         assert!(validate_websocket_origin(&HeaderMap::new()).is_ok());
+    }
+
+    #[test]
+    fn latest_deployment_media_project_ids_are_validated_and_deduplicated() {
+        assert_eq!(parse_project_ids("3, 2,3").expect("valid IDs"), vec![3, 2]);
+        assert!(parse_project_ids("").is_err());
+        assert!(parse_project_ids("1,not-an-id").is_err());
+        let too_many = (1..=101)
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(parse_project_ids(&too_many).is_err());
+    }
+
+    #[test]
+    fn latest_deployment_media_is_registered_in_openapi() {
+        let document = DeploymentsApiDoc::openapi();
+        assert!(document
+            .paths
+            .paths
+            .contains_key("/deployments/latest-media"));
     }
 
     #[test]
@@ -4148,6 +4277,196 @@ mod tests {
 
         println!("✅ GET /projects/{{id}}/last-deployment test passed");
         std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    #[tokio::test]
+    async fn test_latest_deployment_media_endpoint_requires_auth_and_batches_projects() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployments, environments, projects};
+
+        if !database_test_prerequisites_available().await {
+            println!("Docker/test database not available, skipping");
+            return;
+        }
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let temp_dir = std::env::temp_dir().join(format!(
+            "test_latest_deployment_media_http_{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&temp_dir).expect("create temporary data directory");
+        let mut app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+        Arc::get_mut(&mut app_state)
+            .expect("test app state is not shared yet")
+            .project_access_checker = Some(Arc::new(MediaWithoutDeploymentsRead));
+
+        let project = projects::ActiveModel {
+            name: Set("Media Project".to_string()),
+            slug: Set("media-project".to_string()),
+            repo_name: Set("media-repo".to_string()),
+            repo_owner: Set("example-owner".to_string()),
+            directory: Set("/tmp/media-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("insert project");
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set(format!("media-project-{}", project.id)),
+            host: Set(format!("media-project-{}.localhost", project.id)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("insert environment");
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("media-deployment".to_string()),
+            state: Set("completed".to_string()),
+            screenshot_location: Set(Some("screenshots/media.webp".to_string())),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("insert deployment");
+        let mut environment: environments::ActiveModel = environment.into();
+        environment.current_deployment_id = Set(Some(deployment.id));
+        let environment = environment
+            .update(&*db)
+            .await
+            .expect("set current deployment");
+
+        async fn serve(app: Router) -> std::net::SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind test server");
+            let address = listener.local_addr().expect("read test server address");
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .await
+                    .expect("serve test application");
+            });
+            address
+        }
+
+        let unauthorized_address = serve(configure_routes().with_state(app_state.clone())).await;
+        let unauthorized = reqwest::get(format!(
+            "http://{unauthorized_address}/deployments/latest-media?project_ids={}",
+            project.id
+        ))
+        .await
+        .expect("request unauthenticated endpoint");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let auth_middleware = middleware::from_fn(
+            |mut request: Request, next: axum::middleware::Next| async move {
+                request.extensions_mut().insert(create_test_auth_context());
+                next.run(request).await
+            },
+        );
+        let authorized_address = serve(
+            configure_routes()
+                .layer(auth_middleware)
+                .with_state(app_state.clone()),
+        )
+        .await;
+        let authorized = reqwest::get(format!(
+            "http://{authorized_address}/deployments/latest-media?project_ids={},{}",
+            project.id,
+            i32::MAX
+        ))
+        .await
+        .expect("request authenticated endpoint");
+        assert_eq!(authorized.status(), StatusCode::OK);
+        let body: LatestDeploymentMediaResponse =
+            authorized.json().await.expect("decode endpoint response");
+        assert_eq!(body.projects.len(), 1);
+        let media = body
+            .projects
+            .get(&project.id.to_string())
+            .expect("project media present");
+        assert_eq!(
+            media.screenshot_location.as_deref(),
+            Some("screenshots/media.webp")
+        );
+        assert!(media
+            .url
+            .as_deref()
+            .is_some_and(|url| url.contains("media-deployment")));
+
+        let restricted_auth = middleware::from_fn(
+            |mut request: Request, next: axum::middleware::Next| async move {
+                request
+                    .extensions_mut()
+                    .insert(create_test_auth_context_for_role(temps_auth::Role::Reader));
+                next.run(request).await
+            },
+        );
+        let restricted_address = serve(
+            configure_routes()
+                .layer(restricted_auth)
+                .with_state(app_state.clone()),
+        )
+        .await;
+        let restricted = reqwest::get(format!(
+            "http://{restricted_address}/deployments/latest-media?project_ids={}",
+            project.id
+        ))
+        .await
+        .expect("request media without project deployments:read");
+        assert_eq!(restricted.status(), StatusCode::FORBIDDEN);
+        let restricted_body: serde_json::Value = restricted
+            .json()
+            .await
+            .expect("decode project permission denial");
+        assert!(restricted_body.get("projects").is_none());
+
+        let mut environment: environments::ActiveModel = environment.into();
+        environment.current_deployment_id = Set(None);
+        environment
+            .update(&*db)
+            .await
+            .expect("clear current deployment");
+        let historical = reqwest::get(format!(
+            "http://{authorized_address}/deployments/latest-media?project_ids={}",
+            project.id
+        ))
+        .await
+        .expect("request historical screenshot fallback");
+        assert_eq!(historical.status(), StatusCode::OK);
+        let historical_body: LatestDeploymentMediaResponse = historical
+            .json()
+            .await
+            .expect("decode historical fallback response");
+        let historical_media = historical_body
+            .projects
+            .get(&project.id.to_string())
+            .expect("historical project media present");
+        assert_eq!(historical_media.url, None);
+        assert_eq!(
+            historical_media.screenshot_location.as_deref(),
+            Some("screenshots/media.webp")
+        );
+
+        std::fs::remove_dir_all(temp_dir).ok();
     }
 
     #[tokio::test]

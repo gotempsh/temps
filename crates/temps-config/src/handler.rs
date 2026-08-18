@@ -2,7 +2,7 @@ use crate::disk_status::DiskSpaceCheckResult;
 use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
     extract::{Extension, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{delete, get, post, put},
     Json, Router,
@@ -16,10 +16,10 @@ use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AppSettings, AuditContext,
     AuditLogger, AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, LetsEncryptSettings, MetricsStoreKind, MonitoringSettings,
-    ObservabilityCompressionSettings, ObservabilityRetentionSettings, PublicHostnameStrategy,
-    RateLimitSettings, RequestMetadata, RequestTimeoutSettings, ScreenshotSettings,
-    SecurityHeadersSettings,
+    DiskSpaceAlertSettings, ImageRetentionSettings, LetsEncryptSettings, MetricsStoreKind,
+    MonitoringSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
+    PublicHostnameStrategy, RateLimitSettings, RequestMetadata, RequestTimeoutSettings,
+    ScreenshotSettings, SecurityHeadersSettings,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -228,6 +228,9 @@ pub struct AppSettingsResponse {
     /// `--disable-self-update` refuses regardless of what this says, which
     /// `GET /settings/update` reports as the authoritative answer.
     pub self_update: temps_core::SelfUpdateSettings,
+    /// Deployment-image retention policy. No sensitive content, passed through
+    /// as-is so the settings UI can show and edit the system-wide default.
+    pub image_retention: ImageRetentionSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -452,6 +455,7 @@ impl From<AppSettings> for AppSettingsResponse {
             request_timeouts: settings.request_timeouts,
             connection_limits: settings.connection_limits,
             self_update,
+            image_retention: settings.image_retention,
         }
     }
 }
@@ -541,6 +545,7 @@ impl AppSettingsResponse {
         start_update,
         check_for_update,
         get_disk_status,
+        get_feature_maturity,
         update_settings,
         generate_join_token,
         revoke_join_token,
@@ -589,6 +594,8 @@ impl AppSettingsResponse {
         temps_core::SelfUpdateStatus,
         temps_core::ReleaseCheckResult,
         temps_core::SupervisorKind,
+        temps_core::feature_maturity::FeatureMaturity,
+        temps_core::feature_maturity::Maturity,
     )),
     info(
         title = "Settings API",
@@ -610,6 +617,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
         )
         .route("/settings/update/check", post(check_for_update))
         .route("/settings/disk-status", get(get_disk_status))
+        .route("/v1/platform/feature-maturity", get(get_feature_maturity))
         .route("/settings/join-token/generate", post(generate_join_token))
         .route("/settings/join-token", delete(revoke_join_token))
         .route("/settings/join-token/status", get(get_join_token_status))
@@ -622,6 +630,28 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
             delete(revoke_enrollment_token),
         )
         .route("/settings/routes/refresh", post(refresh_route_table))
+}
+
+/// Return the build-time compatibility promise for every user-facing feature.
+#[utoipa::path(
+    tag = "Platform",
+    get,
+    path = "/v1/platform/feature-maturity",
+    responses(
+        (status = 200, description = "Feature maturity registry for this build", body = [temps_core::feature_maturity::FeatureMaturity]),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_feature_maturity(
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, PlatformInfoRead);
+    Ok((
+        [(header::CACHE_CONTROL, "private, max-age=3600")],
+        Json(temps_core::feature_maturity::FEATURE_MATURITY),
+    ))
 }
 
 // ── Node enrollment tokens (ADR-020 WS-1.1) ──────────────────────────────────

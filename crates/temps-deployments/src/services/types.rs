@@ -37,6 +37,16 @@ pub struct DeploymentListResponse {
     pub per_page: i64,
 }
 
+/// Minimal deployment presentation data used by batch project-card queries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct LatestDeploymentMedia {
+    pub project_id: i32,
+    /// Public deployment URL when this is a currently served deployment.
+    /// Historical screenshot fallbacks deliberately omit the URL.
+    pub url: Option<String>,
+    pub screenshot_location: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct DeploymentDomain {
     pub id: i32,

@@ -1,14 +1,21 @@
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { monitoringSectionLabel } from '@/components/monitoring/monitoring-sections'
 import { useEffect } from 'react'
-import { Outlet } from 'react-router'
+import { Outlet, useLocation } from 'react-router'
 
 export function Monitoring() {
   const { setBreadcrumbs } = useBreadcrumbs()
+  const location = useLocation()
+  const sectionId = location.pathname.split('/')[2] || 'alerts'
+  const sectionLabel = monitoringSectionLabel(sectionId)
 
   useEffect(() => {
-    setBreadcrumbs([{ label: 'Monitoring & Alerts' }])
-  }, [setBreadcrumbs])
+    setBreadcrumbs([
+      { label: 'Monitoring & Alerts', href: '/monitoring/alerts' },
+      ...(sectionLabel ? [{ label: sectionLabel }] : []),
+    ])
+  }, [sectionLabel, setBreadcrumbs])
 
   usePageTitle('Monitoring & Alerts')
 

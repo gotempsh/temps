@@ -12,6 +12,11 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router'
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import { useCallback, useState } from 'react'
+import {
+  resolveEnvironmentView,
+  updateEnvironmentSearchParams,
+  type EnvironmentView,
+} from '@/lib/environment-navigation'
 
 interface EnvironmentDashboardProps {
   project: ProjectResponse
@@ -31,12 +36,12 @@ export function EnvironmentDashboard({
   onDelete,
 }: EnvironmentDashboardProps) {
   const [searchParams, setSearchParams] = useSearchParams()
-  const activeView = (searchParams.get('view') || 'containers') as string
+  const activeView = resolveEnvironmentView(searchParams.get('view'))
 
   const handleViewChange = useCallback(
-    (view: string) => {
-      searchParams.set('view', view)
-      setSearchParams(searchParams)
+    (view: EnvironmentView) => {
+      const nextParams = updateEnvironmentSearchParams(searchParams, { view })
+      setSearchParams(nextParams)
     },
     [searchParams, setSearchParams]
   )

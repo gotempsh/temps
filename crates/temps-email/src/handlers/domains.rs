@@ -629,9 +629,29 @@ pub async fn setup_dns(
                 .build()
         })?;
 
+    // `email_domain` and `base_domain` are already in scope from the
+    // provider-authorization check above (derived from the caller-verified
+    // DNS zone, not re-derived here) — do not shadow them.
+
+    // Create each DNS record — except DMARC. Unlike SPF/DKIM/MX, DMARC isn't
+    // additive: publishing `_dmarc.<root-domain>` sets a `p=quarantine`
+    // policy for the *entire* domain, which can affect mail from senders
+    // other than Temps (e.g. the company's regular Google Workspace/M365
+    // mail) if their SPF/DKIM alignment isn't already clean. Bundling that
+    // into the same "create all records" click as the purely-additive
+    // records would be exactly the kind of silent-on-the-user's-behalf
+    // change CLAUDE.md's operator-control rule warns against, so DMARC stays
+    // informational-only here — surfaced for the operator to add manually
+    // once they've confirmed it's safe for their domain.
+    let auto_creatable_records: Vec<_> = domain_with_dns
+        .dns_records
+        .iter()
+        .filter(|r| !r.name.starts_with("_dmarc."))
+        .collect();
+
     info!(
         "Setting up {} DNS records for {} using provider {}",
-        domain_with_dns.dns_records.len(),
+        auto_creatable_records.len(),
         email_domain,
         dns_provider.name
     );
@@ -639,8 +659,7 @@ pub async fn setup_dns(
     let mut results = Vec::new();
     let mut records_created: u32 = 0;
 
-    // Create each DNS record
-    for dns_record in &domain_with_dns.dns_records {
+    for dns_record in auto_creatable_records {
         let result = create_dns_record(provider_instance.as_ref(), &base_domain, dns_record).await;
 
         if result.success {
@@ -650,7 +669,7 @@ pub async fn setup_dns(
         results.push(result);
     }
 
-    let total_records = domain_with_dns.dns_records.len() as u32;
+    let total_records = results.len() as u32;
     let all_success = records_created == total_records;
 
     let message = if all_success {

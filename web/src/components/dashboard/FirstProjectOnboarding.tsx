@@ -13,10 +13,13 @@ import {
   Network,
   Play,
   ScrollText,
+  Sparkles,
   Terminal,
   UploadCloud,
 } from 'lucide-react'
 import { useEffect, useRef, useState } from 'react'
+import { useQuery } from '@tanstack/react-query'
+import { listApiKeysOptions } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
 import { CopyButton } from '@/components/ui/copy-button'
 import { ConnectionList } from '@/components/dashboard/ConnectionList'
@@ -24,6 +27,7 @@ import { InlineGitConnect } from '@/components/dashboard/InlineGitConnect'
 import { cn } from '@/lib/utils'
 import { filesFromDrop, filesFromInput } from '@/lib/drop-files'
 import { handOffDropFiles } from '@/lib/drop-handoff'
+import { getAiHarnessStatus } from '@/lib/ai-onboarding'
 
 interface FirstProjectOnboardingProps {
   /**
@@ -129,9 +133,62 @@ export function FirstProjectOnboarding({
 }: FirstProjectOnboardingProps) {
   const origin = typeof window !== 'undefined' ? window.location.origin : ''
   const cliCommands = buildCliCommands(origin)
+  const { data: apiKeysData } = useQuery({
+    ...listApiKeysOptions({ query: { page: 1, page_size: 100 } }),
+    retry: false,
+  })
+  const harnessStatus = getAiHarnessStatus(apiKeysData?.api_keys)
+  const harnessCta =
+    harnessStatus === 'missing'
+      ? 'Connect AI harness'
+      : harnessStatus === 'waiting'
+        ? 'Finish verification'
+        : 'Open harness guide'
 
   return (
     <div className="col-span-full min-w-0 space-y-6 animate-in fade-in-50">
+      <div className="relative overflow-hidden rounded-2xl border border-primary/25 bg-card p-5 sm:p-6">
+        <div
+          aria-hidden="true"
+          className="absolute inset-y-0 right-0 w-1/2 opacity-70"
+          style={{
+            backgroundImage:
+              'radial-gradient(circle at 100% 0%, color-mix(in oklch, var(--primary) 13%, transparent), transparent 64%)',
+          }}
+        />
+        <div className="relative flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
+          <div className="flex min-w-0 items-start gap-3.5">
+            <div className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-primary text-primary-foreground">
+              <Sparkles className="size-5" />
+            </div>
+            <div>
+              <p className="text-xs font-medium uppercase tracking-[0.16em] text-primary">
+                Start with your AI agent
+              </p>
+              <h2 className="mt-1 text-lg font-semibold tracking-tight">
+                Ask your harness to build the first resource
+              </h2>
+              <p className="mt-1 max-w-2xl text-sm leading-relaxed text-muted-foreground">
+                Connect Codex, Claude Code, Cursor, or another harness, then ask
+                it to create a project or PostgreSQL database and verify the
+                result in Temps.
+              </p>
+              <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+                <span>Create a project</span>
+                <span>Add PostgreSQL</span>
+                <span>Verify deployments</span>
+              </div>
+            </div>
+          </div>
+          <Button asChild className="relative shrink-0">
+            <Link to="/setup/ai">
+              {harnessCta}
+              <ArrowRight className="ml-1.5 size-4" />
+            </Link>
+          </Button>
+        </div>
+      </div>
+
       {/* Hero. Deliberately one band, not a screen: the demo CTA and the list
           of what lights up carry the pitch, and the ways to get an app on
           Temps sit directly below without scrolling. Flat bg-card, same as
@@ -253,7 +310,7 @@ function EmptyStateDropCard() {
   const continueToDrop = (files: ReturnType<typeof filesFromInput>) => {
     if (files.length === 0) return
     handOffDropFiles(files)
-    navigate('/drop')
+    navigate('/projects/new?source=drop')
   }
 
   return (
@@ -281,7 +338,7 @@ function EmptyStateDropCard() {
           if (files.length === 0)
             throw new Error('Choose a project folder or ZIP')
           handOffDropFiles(files)
-          navigate('/drop')
+          navigate('/projects/new?source=drop')
         } catch (caught) {
           setError(
             caught instanceof Error
@@ -334,7 +391,7 @@ function EmptyStateDropCard() {
 
       {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
       <Button asChild variant="ghost" size="sm" className="mt-2">
-        <Link to="/drop">Open Drop without files</Link>
+        <Link to="/projects/new?source=drop">Open Drop without files</Link>
       </Button>
 
       <input

@@ -48,6 +48,75 @@ pub struct ProjectUpdatedFields {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct CustomDomainReassignmentRequestedAudit {
+    pub context: AuditContext,
+    pub custom_domain_id: i32,
+    pub source_project_id: i32,
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
+}
+
+impl AuditOperation for CustomDomainReassignmentRequestedAudit {
+    fn operation_type(&self) -> String {
+        "CUSTOM_DOMAIN_REASSIGNMENT_REQUESTED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        // AuditOperation's shared contract currently returns anyhow::Result;
+        // preserve the serialization source while adding operation context.
+        serde_json::to_string(self).map_err(|error| {
+            anyhow::anyhow!("Failed to serialize domain reassignment request: {error}")
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CustomDomainReassignedAudit {
+    pub context: AuditContext,
+    pub custom_domain_id: i32,
+    pub domain: String,
+    pub source_project_id: i32,
+    pub target_project_id: i32,
+    pub target_environment_id: i32,
+}
+
+impl AuditOperation for CustomDomainReassignedAudit {
+    fn operation_type(&self) -> String {
+        "CUSTOM_DOMAIN_REASSIGNED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        // AuditOperation's shared contract currently returns anyhow::Result.
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize domain reassignment: {error}"))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct PipelineTriggeredAudit {
     pub context: AuditContext,
     pub project_id: i32,
@@ -110,6 +179,16 @@ pub struct ProjectSettingsUpdatedFields {
     /// Security-relevant Compose settings changed; values are deliberately
     /// omitted because preset_config may contain credentials.
     pub compose_configuration_updated: Option<bool>,
+    /// New image-retention window, in hours. `Some(None)` records a reset back
+    /// to the system default. Audited because shortening retention permanently
+    /// destroys the project's ability to roll back to older deployments.
+    pub image_retention_hours: Option<Option<i32>>,
+    /// The project's `image_retention_hours` value immediately before this
+    /// update, when `image_retention_hours` above is `Some`. `None` when the
+    /// value is either not being changed or genuinely was unset. Recorded
+    /// because the new value alone can't answer "how much rollback history
+    /// did this just cost" during an incident review.
+    pub previous_image_retention_hours: Option<i32>,
 }
 
 impl AuditOperation for ProjectCreatedAudit {
@@ -259,6 +338,8 @@ mod tests {
                 memory_limit: None,
                 performance_metrics_enabled: None,
                 compose_configuration_updated: Some(true),
+                image_retention_hours: None,
+                previous_image_retention_hours: None,
             },
         };
 

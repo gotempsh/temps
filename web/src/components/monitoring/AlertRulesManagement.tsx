@@ -7,12 +7,7 @@ import {
 import { AlertRuleResponse } from '@/api/client/types.gen'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
-import {
-  Card,
-  CardContent,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -31,7 +26,12 @@ import {
 import { Switch } from '@/components/ui/switch'
 import { Badge } from '@/components/ui/badge'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertTriangle, EllipsisVertical, Plus, ShieldAlert } from 'lucide-react'
+import {
+  AlertTriangle,
+  EllipsisVertical,
+  Plus,
+  ShieldAlert,
+} from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
@@ -49,12 +49,18 @@ function triggerTypeLabel(type: string): string {
   return TRIGGER_TYPES.find((t) => t.value === type)?.label ?? type
 }
 
-function priorityVariant(priority: string): 'default' | 'secondary' | 'destructive' | 'outline' {
+function priorityVariant(
+  priority: string
+): 'default' | 'secondary' | 'destructive' | 'outline' {
   switch (priority) {
-    case 'Critical': return 'destructive'
-    case 'High': return 'default'
-    case 'Normal': return 'secondary'
-    default: return 'outline'
+    case 'Critical':
+      return 'destructive'
+    case 'High':
+      return 'default'
+    case 'Normal':
+      return 'secondary'
+    default:
+      return 'outline'
   }
 }
 
@@ -64,7 +70,8 @@ function renderTriggerConfig(rule: AlertRuleResponse) {
     case 'frequency':
       return (
         <p>
-          Threshold: {String(config.count ?? '—')} events / {String(config.window_minutes ?? '—')} min
+          Threshold: {String(config.count ?? '—')} events /{' '}
+          {String(config.window_minutes ?? '—')} min
         </p>
       )
     case 'user_count':
@@ -78,10 +85,14 @@ interface AlertRulesManagementProps {
   projectId?: number
 }
 
-export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesManagementProps = {}) {
+export function AlertRulesManagement({
+  projectId: fixedProjectId,
+}: AlertRulesManagementProps = {}) {
   const queryClient = useQueryClient()
   const navigate = useNavigate()
-  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(null)
+  const [selectedProjectId, setSelectedProjectId] = useState<number | null>(
+    null
+  )
 
   const { data: projects, isLoading: projectsLoading } = useQuery({
     ...getProjectsOptions(),
@@ -89,8 +100,22 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
   })
 
   const projectList = projects?.projects
-  const projectId = fixedProjectId ?? selectedProjectId ?? projectList?.[0]?.id ?? null
+  const projectId =
+    fixedProjectId ?? selectedProjectId ?? projectList?.[0]?.id ?? null
+  const selectedProject = projectList?.find(
+    (project) => project.id === projectId
+  )
   const showProjectSelector = !fixedProjectId && (projectList?.length ?? 0) > 1
+
+  const navigateToRule = (suffix: 'new' | `${number}/edit`) => {
+    if (fixedProjectId) {
+      navigate(suffix)
+      return
+    }
+
+    if (!selectedProject) return
+    navigate(`/projects/${selectedProject.slug}/errors/alert-rules/${suffix}`)
+  }
 
   const { data: rules, isLoading: rulesLoading } = useQuery({
     ...listAlertRulesOptions({
@@ -103,7 +128,11 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
     ...updateAlertRuleMutation(),
     meta: { errorTitle: 'Failed to update alert rule' },
     onSuccess: () => {
-      queryClient.invalidateQueries({ predicate: (query) => (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlertRules' })
+      queryClient.invalidateQueries({
+        predicate: (query) =>
+          (query.queryKey[0] as Record<string, unknown>)?._id ===
+          'listAlertRules',
+      })
     },
   })
 
@@ -112,7 +141,11 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
     meta: { errorTitle: 'Failed to delete alert rule' },
     onSuccess: () => {
       toast.success('Alert rule deleted')
-      queryClient.invalidateQueries({ predicate: (query) => (query.queryKey[0] as Record<string, unknown>)?._id === 'listAlertRules' })
+      queryClient.invalidateQueries({
+        predicate: (query) =>
+          (query.queryKey[0] as Record<string, unknown>)?._id ===
+          'listAlertRules',
+      })
     },
   })
 
@@ -157,7 +190,8 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
         <div>
           <h3 className="text-lg font-medium">Error Alert Rules</h3>
           <p className="text-sm text-muted-foreground">
-            Configure rules that trigger notifications when errors match certain conditions.
+            Configure rules that trigger notifications when errors match certain
+            conditions.
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -179,7 +213,7 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
             </Select>
           )}
           <CreateActionButton
-            onClick={() => navigate('new')}
+            onClick={() => navigateToRule('new')}
             disabled={!projectId}
             label="Add Rule"
           />
@@ -196,7 +230,7 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
           title="No alert rules configured"
           description="Create your first error alert rule to get notified when errors match specific conditions."
           action={
-            <Button onClick={() => navigate('new')}>
+            <Button onClick={() => navigateToRule('new')}>
               <Plus className="h-4 w-4 mr-2" />
               Add Rule
             </Button>
@@ -205,7 +239,11 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
       ) : (
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-3">
           {rules?.map((rule) => (
-            <Card key={rule.id} className="cursor-pointer hover:border-primary/50 transition-colors" onClick={() => navigate(`${rule.id}/edit`)}>
+            <Card
+              key={rule.id}
+              className="cursor-pointer hover:border-primary/50 transition-colors"
+              onClick={() => navigateToRule(`${rule.id}/edit`)}
+            >
               <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <div className="space-y-1 min-w-0 flex-1">
                   <CardTitle className="text-base font-medium leading-none truncate">
@@ -215,7 +253,10 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
                     {triggerTypeLabel(rule.trigger_type)}
                   </p>
                 </div>
-                <div className="flex items-center gap-1 shrink-0" onClick={(e) => e.stopPropagation()}>
+                <div
+                  className="flex items-center gap-1 shrink-0"
+                  onClick={(e) => e.stopPropagation()}
+                >
                   <Switch
                     checked={rule.enabled}
                     onCheckedChange={() => handleToggleEnabled(rule)}
@@ -228,7 +269,9 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
                       </Button>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end">
-                      <DropdownMenuItem onClick={() => navigate(`${rule.id}/edit`)}>
+                      <DropdownMenuItem
+                        onClick={() => navigateToRule(`${rule.id}/edit`)}
+                      >
                         Edit
                       </DropdownMenuItem>
                       <DropdownMenuSeparator />
@@ -251,9 +294,7 @@ export function AlertRulesManagement({ projectId: fixedProjectId }: AlertRulesMa
                     {triggerTypeLabel(rule.trigger_type)}
                   </Badge>
                   {rule.error_level_filter && (
-                    <Badge variant="secondary">
-                      {rule.error_level_filter}
-                    </Badge>
+                    <Badge variant="secondary">{rule.error_level_filter}</Badge>
                   )}
                 </div>
                 <div className="space-y-1 text-xs text-muted-foreground">
