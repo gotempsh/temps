@@ -38,7 +38,7 @@ use axum::{
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
-use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
+use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, QueryOrder, Set};
 use serde::{Deserialize, Serialize};
 use temps_auth::{permission_guard, RequireAuth};
 use temps_core::{
@@ -51,7 +51,7 @@ use temps_metrics::{
     duration_to_step, is_monotonic_counter, range_to_step, LatestByLabelQuery, LatestQuery,
     RangeQuery, SourceKind,
 };
-use tracing::error;
+use tracing::{error, info};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
 use super::types::AppState;
@@ -211,6 +211,10 @@ pub struct AlertRuleResponse {
     pub id: i32,
     pub service_id: Option<i32>,
     pub deployment_id: Option<i32>,
+    /// Node the rule is scoped to. `0` is the synthetic control-plane node
+    /// (see `CONTROL_PLANE_NODE_ID`), which owns the `proxy.*` and `node.*`
+    /// rules. Exactly one of `service_id`/`deployment_id`/`node_id` is set.
+    pub node_id: Option<i32>,
     pub name: String,
     pub metric_name: String,
     pub threshold: f64,
@@ -227,6 +231,7 @@ impl From<monitoring_alert_rules::Model> for AlertRuleResponse {
             id: m.id,
             service_id: m.service_id,
             deployment_id: m.deployment_id,
+            node_id: m.node_id,
             name: m.name,
             metric_name: m.metric_name,
             threshold: m.threshold,
@@ -1257,6 +1262,171 @@ async fn get_node_metrics_range(
 }
 
 // ---------------------------------------------------------------------------
+// Nodes — alert rules
+// ---------------------------------------------------------------------------
+
+/// List the monitoring alert rules scoped to a node.
+///
+/// Node `0` is the synthetic control-plane node, which owns the seeded
+/// `proxy.*` (error rate, p99 latency) and `node.*` (file-descriptor /
+/// socket exhaustion) defaults. Without this endpoint those rules exist only
+/// in the database and the operator has no way to see that they are watching,
+/// let alone retune or silence them.
+#[utoipa::path(
+    get,
+    path = "/nodes/{id}/metrics/alert-rules",
+    operation_id = "NodeMetricsGetAlertRules",
+    tag = "Metrics",
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+    ),
+    responses(
+        (status = 200, description = "List of node alert rules", body = Vec<AlertRuleResponse>),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn list_node_alert_rules(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    // Node metrics are platform-level, not project-scoped — same guard as
+    // `get_node_metrics_range`.
+    permission_guard!(auth, SettingsRead);
+
+    let rules = monitoring_alert_rules::Entity::find()
+        .filter(monitoring_alert_rules::Column::NodeId.eq(id))
+        .order_by_asc(monitoring_alert_rules::Column::MetricName)
+        .all(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!(node_id = id, error = %e, "Failed to list node alert rules");
+            internal_server_error()
+                .detail(format!("Failed to list node alert rules: {}", e))
+                .build()
+        })?;
+
+    let response: Vec<AlertRuleResponse> = rules.into_iter().map(AlertRuleResponse::from).collect();
+    Ok((StatusCode::OK, Json(response)))
+}
+
+/// Update a node-scoped monitoring alert rule.
+///
+/// Deliberately update-only: there is no delete. The control-plane defaults
+/// are re-seeded on every startup (`ON CONFLICT DO NOTHING`), so a deleted
+/// rule would silently reappear on the next restart, whereas `enabled: false`
+/// survives re-seeding — disabling is the operation that actually means
+/// "stop alerting on this".
+#[utoipa::path(
+    patch,
+    path = "/nodes/{id}/metrics/alert-rules/{rule_id}",
+    operation_id = "NodeMetricsUpdateAlertRule",
+    tag = "Metrics",
+    request_body = UpdateAlertRuleRequest,
+    params(
+        ("id" = i32, Path, description = "Node ID (0 = control plane)"),
+        ("rule_id" = i32, Path, description = "Alert rule ID"),
+    ),
+    responses(
+        (status = 200, description = "Updated alert rule", body = AlertRuleResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alert rule not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn update_node_alert_rule(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((id, rule_id)): Path<(i32, i32)>,
+    Json(request): Json<UpdateAlertRuleRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+
+    if let Some(ref comp) = request.comparator {
+        validate_comparator(comp)?;
+    }
+    if let Some(ref sev) = request.severity {
+        validate_severity(sev)?;
+    }
+    // SECURITY(metrics-security-1): validate updated metric_name if provided —
+    // metric names reach the metrics store's query builder.
+    if let Some(ref mn) = request.metric_name {
+        temps_metrics::store::timescale::validate_metric_name(mn).map_err(|_| {
+            bad_request()
+                .detail(format!(
+                    "metric_name '{}' contains invalid characters; \
+                     only [a-zA-Z0-9_.:−] are allowed",
+                    mn
+                ))
+                .build()
+        })?;
+    }
+
+    let rule = monitoring_alert_rules::Entity::find_by_id(rule_id)
+        .filter(monitoring_alert_rules::Column::NodeId.eq(id))
+        .one(state.db.as_ref())
+        .await
+        .map_err(|e| {
+            error!(rule_id, node_id = id, error = %e, "Failed to load node alert rule");
+            internal_server_error()
+                .detail(format!("Failed to load node alert rule: {}", e))
+                .build()
+        })?
+        .ok_or_else(|| {
+            not_found()
+                .detail(format!("Alert rule {rule_id} not found on node {id}"))
+                .build()
+        })?;
+
+    let mut active: monitoring_alert_rules::ActiveModel = rule.into();
+    if let Some(name) = request.name {
+        active.name = Set(name);
+    }
+    if let Some(metric_name) = request.metric_name {
+        active.metric_name = Set(metric_name);
+    }
+    if let Some(threshold) = request.threshold {
+        active.threshold = Set(threshold);
+    }
+    if let Some(comparator) = request.comparator {
+        active.comparator = Set(comparator);
+    }
+    if let Some(severity) = request.severity {
+        active.severity = Set(severity);
+    }
+    if let Some(for_duration_secs) = request.for_duration_secs {
+        active.for_duration_secs = Set(for_duration_secs);
+    }
+    if let Some(enabled) = request.enabled {
+        active.enabled = Set(enabled);
+    }
+
+    let updated = active.update(state.db.as_ref()).await.map_err(|e| {
+        error!(rule_id, node_id = id, error = %e, "Failed to update node alert rule");
+        internal_server_error()
+            .detail(format!("Failed to update node alert rule: {}", e))
+            .build()
+    })?;
+
+    info!(
+        rule_id,
+        node_id = id,
+        metric_name = %updated.metric_name,
+        threshold = updated.threshold,
+        enabled = updated.enabled,
+        "Node alert rule updated"
+    );
+
+    Ok((StatusCode::OK, Json(AlertRuleResponse::from(updated))))
+}
+
+// ---------------------------------------------------------------------------
 // Validation helpers
 // ---------------------------------------------------------------------------
 
@@ -1567,6 +1737,14 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         )
         // Node metrics
         .route("/nodes/{id}/metrics", get(get_node_metrics_range))
+        .route(
+            "/nodes/{id}/metrics/alert-rules",
+            get(list_node_alert_rules),
+        )
+        .route(
+            "/nodes/{id}/metrics/alert-rules/{rule_id}",
+            patch(update_node_alert_rule),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -1589,6 +1767,8 @@ pub fn configure_metrics_routes() -> Router<Arc<AppState>> {
         get_deployment_metrics_latest,
         toggle_deployment_metrics,
         get_node_metrics_range,
+        list_node_alert_rules,
+        update_node_alert_rule,
     ),
     components(schemas(
         MetricDataPoint,
@@ -1846,6 +2026,74 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    // ── OpenAPI registration ───────────────────────────────────────────────
+    //
+    // `MetricsApiDoc` is NOT the document the server serves. The plugin
+    // contributes `ExternalServiceApiDoc` (handlers.rs), which re-lists every
+    // metrics operation by hand. A handler added to `MetricsApiDoc` alone
+    // compiles, routes, and answers requests — but is absent from
+    // `/api-docs/openapi.json`, so `bun run openapi-ts` generates no binding
+    // for it and neither the console nor the CLI can call it. That is a silent
+    // failure with no compile error and no runtime error; these tests are the
+    // only thing that catches it.
+
+    /// `operation_id`s declared by an OpenAPI document, keyed by the path they
+    /// sit on so a failure message points at the endpoint, not just the name.
+    fn operation_keys(doc: &utoipa::openapi::OpenApi) -> std::collections::BTreeSet<String> {
+        doc.paths
+            .paths
+            .iter()
+            .flat_map(|(path, item)| {
+                [
+                    &item.get,
+                    &item.put,
+                    &item.post,
+                    &item.delete,
+                    &item.patch,
+                    &item.head,
+                    &item.options,
+                    &item.trace,
+                ]
+                .into_iter()
+                .flatten()
+                .filter_map(move |op| op.operation_id.as_ref().map(|id| format!("{id} ({path})")))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn served_openapi_doc_declares_every_metrics_operation() {
+        use utoipa::OpenApi as _;
+
+        let metrics = operation_keys(&MetricsApiDoc::openapi());
+        let served = operation_keys(&crate::handlers::handlers::ExternalServiceApiDoc::openapi());
+
+        let missing: Vec<_> = metrics.difference(&served).cloned().collect();
+        assert!(
+            missing.is_empty(),
+            "these metrics operations are routed but absent from the served OpenAPI \
+             document (ExternalServiceApiDoc in handlers.rs), so no SDK binding is \
+             generated for them: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn node_alert_rule_endpoints_are_in_the_served_openapi_doc() {
+        use utoipa::OpenApi as _;
+
+        let served = operation_keys(&crate::handlers::handlers::ExternalServiceApiDoc::openapi());
+        for expected in [
+            "NodeMetricsGetAlertRules (/nodes/{id}/metrics/alert-rules)",
+            "NodeMetricsUpdateAlertRule (/nodes/{id}/metrics/alert-rules/{rule_id})",
+        ] {
+            assert!(
+                served.contains(expected),
+                "{expected} missing from the served OpenAPI document; \
+                 declared operations: {served:?}"
+            );
+        }
     }
 
     #[tokio::test]

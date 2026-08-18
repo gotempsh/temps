@@ -8069,8 +8069,8 @@ export type GatewayStatus = {
      */
     host_port?: number | null;
     /**
-     * Image reference the container was created with (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`).
+     * Image reference the container was created with (e.g. an immutable
+     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
      */
     image?: string | null;
     /**
@@ -12801,7 +12801,7 @@ export type PreviewGatewaySettings = {
      */
     host_port?: number;
     /**
-     * Docker image reference for the gateway. Pinned per Temps release.
+     * Docker image reference for the gateway. Pinned by digest per Temps release.
      * Operators can override this to test a custom build.
      */
     image?: string;
@@ -16047,6 +16047,12 @@ export type ServiceAlertRuleResponse = {
     id: number;
     metric_name: string;
     name: string;
+    /**
+     * Node the rule is scoped to. `0` is the synthetic control-plane node
+     * (see `CONTROL_PLANE_NODE_ID`), which owns the `proxy.*` and `node.*`
+     * rules. Exactly one of `service_id`/`deployment_id`/`node_id` is set.
+     */
+    node_id?: number | null;
     service_id?: number | null;
     severity: string;
     silenced_until?: string | null;
@@ -19812,7 +19818,8 @@ export type UpgradeExternalServiceRequest = {
 export type UpgradeRequest = {
     /**
      * Image reference to pull and run (e.g.
-     * `ghcr.io/gotempsh/temps-preview-gateway@sha256:a16d4346f2f857470fdd28c9ed46809f6db4f7e577888d6250338f8d5dcf04b9`). Empty resets to default.
+     * an immutable `ghcr.io/gotempsh/temps-preview-gateway@sha256:…` reference).
+     * Empty resets to default.
      */
     image: string;
 };
@@ -35099,6 +35106,90 @@ export type NodeMetricsGetRangeResponses = {
 };
 
 export type NodeMetricsGetRangeResponse = NodeMetricsGetRangeResponses[keyof NodeMetricsGetRangeResponses];
+
+export type NodeMetricsGetAlertRulesData = {
+    body?: never;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules';
+};
+
+export type NodeMetricsGetAlertRulesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsGetAlertRulesResponses = {
+    /**
+     * List of node alert rules
+     */
+    200: Array<ServiceAlertRuleResponse>;
+};
+
+export type NodeMetricsGetAlertRulesResponse = NodeMetricsGetAlertRulesResponses[keyof NodeMetricsGetAlertRulesResponses];
+
+export type NodeMetricsUpdateAlertRuleData = {
+    body: ServiceUpdateAlertRuleRequest;
+    path: {
+        /**
+         * Node ID (0 = control plane)
+         */
+        id: number;
+        /**
+         * Alert rule ID
+         */
+        rule_id: number;
+    };
+    query?: never;
+    url: '/nodes/{id}/metrics/alert-rules/{rule_id}';
+};
+
+export type NodeMetricsUpdateAlertRuleErrors = {
+    /**
+     * Invalid request
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alert rule not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type NodeMetricsUpdateAlertRuleResponses = {
+    /**
+     * Updated alert rule
+     */
+    200: ServiceAlertRuleResponse;
+};
+
+export type NodeMetricsUpdateAlertRuleResponse = NodeMetricsUpdateAlertRuleResponses[keyof NodeMetricsUpdateAlertRuleResponses];
 
 export type DeletePreferencesData = {
     body?: never;
