@@ -127,16 +127,29 @@ async function resolveExistingProject(reference: string): Promise<ProjectRespons
   return result.data as ProjectResponse
 }
 
-/** Reject targets whose deployments come from somewhere other than an upload. */
-export function assertUploadable(project: Pick<ProjectResponse, 'slug' | 'source_type'>): void {
+/**
+ * Reject targets whose deployments come from somewhere other than an upload.
+ *
+ * A project that has opted into alternate sources is accepted whatever its
+ * `source_type` is — that opt-in exists precisely so a Git project can also be
+ * shipped from a local folder while keeping its repository. Mirrors the
+ * server's check in `deploy_from_uploaded_source`; failing here first just
+ * turns a round trip and a 400 into an immediate, more specific message.
+ */
+export function assertUploadable(
+  project: Pick<ProjectResponse, 'slug' | 'source_type' | 'allow_alternate_sources'>,
+): void {
   if (UPLOADABLE_SOURCE_TYPES.includes(project.source_type)) return
+  if (project.allow_alternate_sources) return
   const command = COMMAND_BY_SOURCE_TYPE[project.source_type]
   const alternative = command
-    ? `\nUse: bunx @temps-sdk/cli ${command} --project ${project.slug}`
+    ? `\nDeploy it from its configured source: bunx @temps-sdk/cli ${command} --project ${project.slug}`
     : ''
   throw new Error(
     `Project "${project.slug}" deploys from ${project.source_type}, ` +
-    `so it cannot take an uploaded source archive.${alternative}`
+    `so it cannot take an uploaded source archive.\n` +
+    `Allow it to: bunx @temps-sdk/cli projects source --project ${project.slug} --allow-alternate` +
+    alternative
   )
 }
 
@@ -193,6 +206,18 @@ async function syncBuildConfig(project: ProjectResponse, candidate: Candidate): 
   })
   if (updated.error) throw new Error(JSON.stringify(updated.error))
   succeedSpinner(`Build config updated: ${changes.join(', ')}`)
+
+  // Build config is shared with the project's primary source, so on a project
+  // that normally builds from somewhere else (a Git repo, typically) this drop
+  // has just changed how the NEXT ordinary deploy builds too. Say so — finding
+  // that out from a surprising build later is exactly the kind of silent
+  // change the alternate-sources opt-in is meant to keep deliberate.
+  if (!UPLOADABLE_SOURCE_TYPES.includes(project.source_type)) {
+    warning(
+      `These build settings also apply to ${project.slug}'s ${project.source_type} deployments. ` +
+      `Re-run \`projects settings\` if the next non-drop deploy should build differently.`
+    )
+  }
 }
 
 /** Human-readable list of what re-detection would change about the project. */

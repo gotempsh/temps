@@ -122,6 +122,46 @@ describe('drop target selection', () => {
     )
   })
 
+  test('a rejected project is told how to allow the drop, not just that it cannot', () => {
+    expect(() => assertUploadable({ slug: 'paseo-hub', source_type: 'git' })).toThrow(
+      /projects source --project paseo-hub --allow-alternate/
+    )
+  })
+
+  test('opting into alternate sources makes any project droppable', () => {
+    // The whole point of the opt-in: a Git project keeps its repository and
+    // still accepts an archive.
+    expect(() =>
+      assertUploadable({
+        slug: 'paseo-hub',
+        source_type: 'git',
+        allow_alternate_sources: true,
+      })
+    ).not.toThrow()
+    expect(() =>
+      assertUploadable({
+        slug: 'paseo-hub',
+        source_type: 'docker_image',
+        allow_alternate_sources: true,
+      })
+    ).not.toThrow()
+    // Explicitly off, and absent, both still reject.
+    expect(() =>
+      assertUploadable({
+        slug: 'paseo-hub',
+        source_type: 'git',
+        allow_alternate_sources: false,
+      })
+    ).toThrow()
+    expect(() =>
+      assertUploadable({
+        slug: 'paseo-hub',
+        source_type: 'git',
+        allow_alternate_sources: null,
+      })
+    ).toThrow()
+  })
+
   test('reports only the build settings that actually changed', () => {
     const project = { directory: './web', preset: 'nextjs' }
     expect(buildConfigChanges(project, candidate('web', 'nextjs'))).toEqual([])

@@ -10,19 +10,20 @@ Manage projects
 
 **Subcommands:**
 
-- `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY> (mode 0400), not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
+- `secrets` - Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 - `list` (`ls`) - List all projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
 - `settings` - Update project settings (slug, attack mode, preview environments, image retention)
 - `git` - Update git repository settings
+- `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
 - `config` - Update deployment configuration (resources, replicas)
 - `delete` (`rm`) - Delete a project
 
 ### `projects secrets`
 
-Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY> (mode 0400), not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
+Manage project secrets — mounted into the deployed container as files at /run/secrets/<KEY>, not environment variables. Distinct from `temps secrets` (agent/MCP-sandbox-scoped).
 
 **Subcommands:**
 
@@ -55,6 +56,7 @@ Create a project secret (mounted at /run/secrets/<KEY> on the next deployment)
 | `-k, --key <key>` | Secret key — becomes the filename at /run/secrets/<KEY>. Letters, digits, underscore; must start with a letter or underscore. | - | Yes |
 | `-v, --value <value>` | Secret value (<=1 MiB). Prefix with @ to read from a local file, e.g. @./auth.json — never touches shell history. | - | Yes |
 | `-e, --environment <name>` | Scope to one environment (repeatable; default: all) | `` | No |
+| `-s, --service <name>` | Docker Compose service allowed to read this secret (repeatable; default: every service). Ignored for non-Compose projects, which deploy a single container. | `` | No |
 | `--include-in-preview` | Also mount this secret in preview environments | - | No |
 
 #### `projects secrets update`
@@ -69,6 +71,8 @@ Update a project secret (a redeploy is required for running containers to pick i
 | `-k, --key <key>` | Key of the secret to update | - | Yes |
 | `-v, --value <value>` | New value (<=1 MiB). Prefix with @ to read from a local file. Omit to keep the existing value. | - | No |
 | `-e, --environment <name>` | Replace environment scoping (repeatable) | `` | No |
+| `-s, --service <name>` | Replace the Docker Compose service scope (repeatable). Pass none to keep the current scope; use --all-services to widen it back to every service. | `` | No |
+| `--all-services` | Deliver to every Compose service, clearing any per-service scope | - | No |
 | `--include-in-preview` | Include in preview environments | - | No |
 | `--no-include-in-preview` | Exclude from preview environments | - | No |
 
@@ -178,6 +182,20 @@ Update git repository settings
 | `--connection <id>` | Git connection ID (links the project to an actual clone-access connection; omit to leave the existing connection unchanged) | - | No |
 | `--json` | Output in JSON format | - | No |
 | `-y, --yes` | Skip prompts, use provided/existing values (for automation) | - | No |
+
+### `projects source`
+
+Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--type <type>` | Set the primary source: docker_image, static_files, uploaded_source or manual (use `projects git` to switch to git) | - | No |
+| `--allow-alternate` | Also accept an uploaded source archive from `drop`, keeping the current source as default | - | No |
+| `--no-allow-alternate` | Only deploy from the configured source | - | No |
+| `--json` | Output in JSON format | - | No |
 
 ### `projects config`
 
