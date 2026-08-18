@@ -25,10 +25,10 @@ import { EnvironmentVariablesSettings } from '@/components/project/settings/Envi
 import { ProjectFeatureFlags } from '@/components/project/flags/ProjectFeatureFlags'
 import { DomainsSettings } from '@/components/project/settings/DomainsSettings'
 import {
-  BuildSettings,
   ChangeRepositoryPage,
   GitSettings,
 } from '@/components/project/settings/GitSettings'
+import { BuildDeploySettings } from '@/components/project/settings/BuildDeploySettings'
 import { ProjectSpeedInsights } from '@/components/project/ProjectSpeedInsights'
 import { ProjectStorage } from '@/components/project/ProjectStorage'
 import { ProjectMonitors } from '@/components/project/ProjectMonitors'
@@ -465,7 +465,9 @@ export function ProjectDetail() {
             />
             <Route
               path="build"
-              element={<BuildSettings project={project} refetch={refetch} />}
+              element={
+                <BuildDeploySettings project={project} refetch={refetch} />
+              }
             />
             <Route
               path="git/change-repository"

@@ -45,30 +45,41 @@ export function BuildDeploySettings({
   }
 
   return (
-    <Tabs value={active} onValueChange={selectTab} className="space-y-6">
-      <TabsList>
-        <TabsTrigger value="source">Source</TabsTrigger>
-        <TabsTrigger value="build">Build</TabsTrigger>
-        <TabsTrigger value="deploy">Deploy</TabsTrigger>
-        <TabsTrigger value="previews">Previews</TabsTrigger>
-      </TabsList>
+    <div className="space-y-6">
+      <div className="space-y-1">
+        <h2 className="text-xl font-semibold text-balance">
+          Build and deployment
+        </h2>
+        <p className="max-w-[72ch] text-pretty text-base/7 text-muted-foreground sm:text-sm/6">
+          Configure how Temps turns your source into a running application.
+        </p>
+      </div>
 
-      <TabsContent value="source" className="space-y-6">
-        <DeploymentSourceCard project={project} refetch={refetch} />
-      </TabsContent>
+      <Tabs value={active} onValueChange={selectTab} className="space-y-6">
+        <TabsList>
+          <TabsTrigger value="source">Source</TabsTrigger>
+          <TabsTrigger value="build">Build</TabsTrigger>
+          <TabsTrigger value="deploy">Deploy</TabsTrigger>
+          <TabsTrigger value="previews">Previews</TabsTrigger>
+        </TabsList>
 
-      <TabsContent value="build" className="space-y-6">
-        <BuildSettings project={project} refetch={refetch} />
-      </TabsContent>
+        <TabsContent value="source" className="space-y-6">
+          <DeploymentSourceCard project={project} refetch={refetch} />
+        </TabsContent>
 
-      <TabsContent value="deploy" className="space-y-6">
-        <DeployDefaultsCard project={project} refetch={refetch} />
-        <ImageRetentionCard project={project} refetch={refetch} />
-      </TabsContent>
+        <TabsContent value="build" className="space-y-6">
+          <BuildSettings project={project} refetch={refetch} embedded />
+        </TabsContent>
 
-      <TabsContent value="previews" className="space-y-6">
-        <PreviewEnvironmentsCard project={project} refetch={refetch} />
-      </TabsContent>
-    </Tabs>
+        <TabsContent value="deploy" className="space-y-6">
+          <DeployDefaultsCard project={project} refetch={refetch} />
+          <ImageRetentionCard project={project} refetch={refetch} />
+        </TabsContent>
+
+        <TabsContent value="previews" className="space-y-6">
+          <PreviewEnvironmentsCard project={project} refetch={refetch} />
+        </TabsContent>
+      </Tabs>
+    </div>
   )
 }

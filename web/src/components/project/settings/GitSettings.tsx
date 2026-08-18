@@ -151,9 +151,20 @@ interface GitSettingsProps {
 
 interface GitSettingsInlineProps extends GitSettingsProps {
   view: ProjectSettingsView
+  /**
+   * Rendered inside a tab that already supplies the page heading, and beside a
+   * Source tab that owns the deployment source. Suppresses this component's own
+   * heading and its deployment-source summary so neither appears twice.
+   */
+  embedded?: boolean
 }
 
-function GitSettingsInline({ project, refetch, view }: GitSettingsInlineProps) {
+function GitSettingsInline({
+  project,
+  refetch,
+  view,
+  embedded,
+}: GitSettingsInlineProps) {
   const { resolvedTheme } = useTheme()
   const composeEditorTheme = resolvedTheme === 'dark' ? 'vs-dark' : 'light'
   const updateGitSettings = useMutation({
@@ -626,18 +637,20 @@ function GitSettingsInline({ project, refetch, view }: GitSettingsInlineProps) {
 
   return (
     <div className="space-y-6">
-      <div className="space-y-1">
-        <h2 className="text-xl font-semibold text-balance">
-          {view === 'git' ? 'Git repository' : 'Build and deployment'}
-        </h2>
-        <p className="max-w-[72ch] text-pretty text-base/7 text-muted-foreground sm:text-sm/6">
-          {view === 'git'
-            ? 'Manage the source repository and the Git events that trigger deployments.'
-            : 'Configure how Temps turns your source into a running application.'}
-        </p>
-      </div>
+      {!embedded && (
+        <div className="space-y-1">
+          <h2 className="text-xl font-semibold text-balance">
+            {view === 'git' ? 'Git repository' : 'Build and deployment'}
+          </h2>
+          <p className="max-w-[72ch] text-pretty text-base/7 text-muted-foreground sm:text-sm/6">
+            {view === 'git'
+              ? 'Manage the source repository and the Git events that trigger deployments.'
+              : 'Configure how Temps turns your source into a running application.'}
+          </p>
+        </div>
+      )}
 
-      {view === 'build' && (
+      {view === 'build' && !embedded && (
         <div className="flex flex-col gap-4 rounded-lg border p-4 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0 space-y-1">
             <div className="flex flex-wrap items-center gap-2">
@@ -2540,8 +2553,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
   const [connectionRepositoryMode, setConnectionRepositoryMode] = useState<
     'synced' | 'manual'
   >('synced')
-  const [manualRepositoryReference, setManualRepositoryReference] =
-    useState('')
+  const [manualRepositoryReference, setManualRepositoryReference] = useState('')
   const manualRepository = useMemo(
     () => parseRepositoryCoordinates(manualRepositoryReference),
     [manualRepositoryReference]
@@ -2872,7 +2884,10 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                     setSelectedRepoState(null)
                     setBranch('')
                     navigate(
-                      repositoryConnectionPath(project.slug, selectedConnectionId)
+                      repositoryConnectionPath(
+                        project.slug,
+                        selectedConnectionId
+                      )
                     )
                   }}
                 >
@@ -3062,6 +3077,8 @@ export function GitSettings(props: GitSettingsProps) {
   return <GitSettingsInline {...props} view="git" />
 }
 
-export function BuildSettings(props: GitSettingsProps) {
+export function BuildSettings(
+  props: GitSettingsProps & { embedded?: boolean }
+) {
   return <GitSettingsInline {...props} view="build" />
 }
