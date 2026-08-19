@@ -58,7 +58,7 @@ RUN set -eux; \
 # Install the Rust-native WASM tooling. The npm wrapper tries to download a
 # prebuilt wasm-bindgen binary that does not exist for every Alpine architecture
 # (notably arm64), so pin and compile the matching CLI instead.
-RUN cargo install wasm-pack --version 0.13.1 --locked && \
+RUN cargo install wasm-pack --version 0.15.0 --locked && \
     cargo install wasm-bindgen-cli --version 0.2.121 --locked
 
 # Install wasm32 target for Rust (needed for WASM compilation)

@@ -139,7 +139,7 @@ wasm_pack_installs = release_steps.flat_map do |step|
   step.fetch("run", "").lines.map(&:strip).select { |line| line.include?("cargo install wasm-pack") }
 end
 abort "release workflow uses an unpinned wasm-pack version" unless
-  wasm_pack_installs == ["cargo install wasm-pack --version 0.13.1 --locked"]
+  wasm_pack_installs == ["cargo install wasm-pack --version 0.15.0 --locked"]
 
 expected_sandbox_permissions = {
   "prepare-context" => read_contents,
