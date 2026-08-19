@@ -22,7 +22,7 @@ Thank you for your interest in contributing to Temps. Whether you are reporting 
 - **OpenSSL development headers** -- required by Pingora/OpenSSL and Git dependencies
 - **protobuf compiler** (`protoc`) -- required by the `temps-otel` crate to compile OpenTelemetry `.proto` files
 - **rustfmt** -- required by generated-code build scripts
-- **wasm-pack** 0.13.1 -- required to build the `temps-captcha-wasm` crate
+- **wasm-pack** 0.15.0 -- required to build the `temps-captcha-wasm` crate
 - **wasm32-unknown-unknown Rust target** -- required by the `temps-captcha-wasm` crate
 
 #### Amazon Linux 2023 build prerequisites
@@ -34,7 +34,7 @@ sudo dnf install -y \
   cmake pkgconf-pkg-config openssl-devel protobuf-compiler \
   perl-FindBin perl-IPC-Cmd perl-File-Compare perl-File-Copy perl-Time-Piece
 
-cargo install wasm-pack --version 0.13.1 --locked
+cargo install wasm-pack --version 0.15.0 --locked
 ```
 
 If `cargo install` places `wasm-pack` in `~/.cargo/bin`, make sure that directory is on your `PATH`.
@@ -48,7 +48,7 @@ sudo apt-get install -y \
 
 rustup component add rustfmt
 rustup target add wasm32-unknown-unknown
-cargo install wasm-pack --version 0.13.1 --locked
+cargo install wasm-pack --version 0.15.0 --locked
 ```
 
 #### macOS build prerequisites
@@ -58,7 +58,7 @@ brew install cmake openssl pkg-config protobuf
 
 rustup component add rustfmt
 rustup target add wasm32-unknown-unknown
-cargo install wasm-pack --version 0.13.1 --locked
+cargo install wasm-pack --version 0.15.0 --locked
 ```
 
 ### Clone and Build

@@ -108,7 +108,7 @@ jobs:
 
       - name: Install wasm-pack and Build WASM
         run: |
-          cargo install wasm-pack --version 0.13.1 --locked
+          cargo install wasm-pack --version 0.15.0 --locked
           cd crates/temps-captcha-wasm
           bun run build
 
