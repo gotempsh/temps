@@ -1,5 +1,6 @@
 import { Badge } from '@/components/ui/badge'
 import { cn } from '@/lib/utils'
+import { sentryTimestampToMillis } from '@/lib/sentry-timestamp'
 import { SentryEvent } from '@/types/sentry'
 import { format } from 'date-fns'
 import { Clock, Code, Globe, Layers, Monitor } from 'lucide-react'
@@ -18,6 +19,7 @@ export function SentryListItem({
   const sentryData = event.sentry
   const mainException = sentryData.exception?.values?.[0]
   const contexts = sentryData.contexts || {}
+  const timestampMs = sentryTimestampToMillis(sentryData.timestamp)
 
   const getSeverityColor = (level: string) => {
     switch (level?.toLowerCase()) {
@@ -49,7 +51,9 @@ export function SentryListItem({
             <div className="flex items-center gap-2 mb-1">
               <Clock className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
               <span className="text-sm font-medium">
-                {format(new Date(sentryData.timestamp * 1000), 'PPpp')}
+                {timestampMs !== null
+                  ? format(new Date(timestampMs), 'PPpp')
+                  : 'Unknown time'}
               </span>
               {sentryData.level && (
                 <Badge variant={getSeverityColor(sentryData.level)}>

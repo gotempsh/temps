@@ -10,6 +10,7 @@ import {
 import { Label } from '@/components/ui/label'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { Switch } from '@/components/ui/switch'
+import { sentryTimestampToMillis } from '@/lib/sentry-timestamp'
 import { cn } from '@/lib/utils'
 import { SentryEvent, SentryException } from '@/types/sentry'
 import { format, formatDistanceToNow } from 'date-fns'
@@ -76,6 +77,14 @@ export function SentryEventDetail({
   const mainException = exceptions[0]
   const breadcrumbs = sentryData.breadcrumbs?.values || []
   const contexts = sentryData.contexts || {}
+  const eventTimestampMs = sentryTimestampToMillis(sentryData.timestamp)
+  const eventStartTimestampMs = sentryTimestampToMillis(
+    sentryData.start_timestamp
+  )
+  const eventDurationMs =
+    eventTimestampMs !== null && eventStartTimestampMs !== null
+      ? eventTimestampMs - eventStartTimestampMs
+      : null
 
   // Helper function to convert Sentry stack frames to our StackTrace component format
   const convertStackFrames = (exception: SentryException) => {
@@ -113,7 +122,11 @@ export function SentryEventDetail({
             </h2>
           </div>
           <div className="flex items-center gap-4 text-sm text-muted-foreground">
-            <span>{format(new Date(sentryData.timestamp * 1000), 'PPpp')}</span>
+            <span>
+              {eventTimestampMs !== null
+                ? format(new Date(eventTimestampMs), 'PPpp')
+                : 'Unknown time'}
+            </span>
             <span>•</span>
             <span className="font-mono">ID: {sentryData.event_id}</span>
             {sentryData.transaction && (
@@ -465,61 +478,68 @@ export function SentryEventDetail({
               <CardContent>
                 <ScrollArea className="h-[400px]">
                   <div className="space-y-3">
-                    {sentryData.spans.map((span, index) => (
-                      <div
-                        key={index}
-                        className="border rounded-lg p-3 hover:bg-muted/50 transition-colors"
-                      >
-                        <div className="space-y-2">
-                          <div className="flex items-center justify-between">
-                            <div className="flex items-center gap-2">
-                              <Badge variant="outline" className="text-xs">
-                                {span.op || 'unknown'}
-                              </Badge>
-                              {span.status && (
-                                <Badge
-                                  variant={
-                                    span.status === 'ok'
-                                      ? 'outline'
-                                      : 'destructive'
-                                  }
-                                  className="text-xs"
-                                >
-                                  {span.status}
+                    {sentryData.spans.map((span, index) => {
+                      const spanStartMs = sentryTimestampToMillis(
+                        span.start_timestamp
+                      )
+                      const spanEndMs = sentryTimestampToMillis(span.timestamp)
+                      const spanDurationMs =
+                        spanStartMs !== null && spanEndMs !== null
+                          ? spanEndMs - spanStartMs
+                          : null
+
+                      return (
+                        <div
+                          key={index}
+                          className="border rounded-lg p-3 hover:bg-muted/50 transition-colors"
+                        >
+                          <div className="space-y-2">
+                            <div className="flex items-center justify-between">
+                              <div className="flex items-center gap-2">
+                                <Badge variant="outline" className="text-xs">
+                                  {span.op || 'unknown'}
                                 </Badge>
+                                {span.status && (
+                                  <Badge
+                                    variant={
+                                      span.status === 'ok'
+                                        ? 'outline'
+                                        : 'destructive'
+                                    }
+                                    className="text-xs"
+                                  >
+                                    {span.status}
+                                  </Badge>
+                                )}
+                              </div>
+                              {spanDurationMs !== null && (
+                                <span className="text-xs text-muted-foreground">
+                                  {spanDurationMs.toFixed(2)} ms
+                                </span>
                               )}
                             </div>
-                            {span.start_timestamp && span.timestamp && (
-                              <span className="text-xs text-muted-foreground">
-                                {(
-                                  (span.timestamp - span.start_timestamp) *
-                                  1000
-                                ).toFixed(2)}
-                                ms
+                            {span.description && (
+                              <p className="text-sm font-mono">
+                                {span.description}
+                              </p>
+                            )}
+                            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                              <span className="font-mono">
+                                Span: {span.span_id.slice(0, 8)}
                               </span>
-                            )}
-                          </div>
-                          {span.description && (
-                            <p className="text-sm font-mono">
-                              {span.description}
-                            </p>
-                          )}
-                          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                            <span className="font-mono">
-                              Span: {span.span_id.slice(0, 8)}
-                            </span>
-                            {span.parent_span_id && (
-                              <>
-                                <span>→</span>
-                                <span className="font-mono">
-                                  Parent: {span.parent_span_id.slice(0, 8)}
-                                </span>
-                              </>
-                            )}
+                              {span.parent_span_id && (
+                                <>
+                                  <span>→</span>
+                                  <span className="font-mono">
+                                    Parent: {span.parent_span_id.slice(0, 8)}
+                                  </span>
+                                </>
+                              )}
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    ))}
+                      )
+                    })}
                   </div>
                 </ScrollArea>
               </CardContent>
@@ -542,12 +562,23 @@ export function SentryEventDetail({
                       .map((breadcrumb, originalIndex) => ({
                         ...breadcrumb,
                         originalIndex,
+                        timestampMs: sentryTimestampToMillis(
+                          breadcrumb.timestamp
+                        ),
                       }))
                       .sort((a, b) => {
-                        const timeDiff = (b.timestamp || 0) - (a.timestamp || 0)
-                        return timeDiff !== 0
-                          ? timeDiff
-                          : b.originalIndex - a.originalIndex
+                        if (a.timestampMs !== null && b.timestampMs !== null) {
+                          const timeDiff = b.timestampMs - a.timestampMs
+                          if (timeDiff !== 0) {
+                            return timeDiff
+                          }
+                        } else if (a.timestampMs !== null) {
+                          return -1
+                        } else if (b.timestampMs !== null) {
+                          return 1
+                        }
+
+                        return b.originalIndex - a.originalIndex
                       })
                       .map((breadcrumb, index) => (
                         <div
@@ -571,9 +602,9 @@ export function SentryEventDetail({
                                 </Badge>
                               )}
                               <span className="text-xs text-muted-foreground">
-                                {breadcrumb.timestamp
+                                {breadcrumb.timestampMs !== null
                                   ? formatDistanceToNow(
-                                      new Date(breadcrumb.timestamp * 1000),
+                                      new Date(breadcrumb.timestampMs),
                                       { addSuffix: true }
                                     )
                                   : 'Unknown time'}
@@ -758,17 +789,13 @@ export function SentryEventDetail({
                     </Badge>
                   </div>
                 )}
-                {sentryData.start_timestamp && (
+                {eventDurationMs !== null && (
                   <div className="text-sm">
                     <div className="text-muted-foreground text-xs">
                       Duration
                     </div>
                     <div className="font-mono">
-                      {(
-                        (sentryData.timestamp - sentryData.start_timestamp) *
-                        1000
-                      ).toFixed(2)}{' '}
-                      ms
+                      {eventDurationMs.toFixed(2)} ms
                     </div>
                   </div>
                 )}
