@@ -478,7 +478,7 @@ export function SentryEventDetail({
               <CardContent>
                 <ScrollArea className="h-[400px]">
                   <div className="space-y-3">
-                    {sentryData.spans.map((span, index) => {
+                    {sentryData.spans.map((span) => {
                       const spanStartMs = sentryTimestampToMillis(
                         span.start_timestamp
                       )
@@ -490,7 +490,7 @@ export function SentryEventDetail({
 
                       return (
                         <div
-                          key={index}
+                          key={span.span_id}
                           className="border rounded-lg p-3 hover:bg-muted/50 transition-colors"
                         >
                           <div className="space-y-2">
@@ -580,9 +580,9 @@ export function SentryEventDetail({
 
                         return b.originalIndex - a.originalIndex
                       })
-                      .map((breadcrumb, index) => (
+                      .map((breadcrumb) => (
                         <div
-                          key={index}
+                          key={breadcrumb.originalIndex}
                           className="flex items-start gap-3 p-2 hover:bg-muted/50 rounded transition-colors"
                         >
                           <div className="flex-shrink-0 mt-0.5">
