@@ -202,9 +202,10 @@ pub enum SmartFilter {
     OperatingSystem(String),
     /// Match language
     Language(String),
-    /// Match custom event_data by JSON path
+    /// Match custom event properties by JSON path
     /// Format: {"path": "user.plan", "value": "premium"}
-    /// This will match events where event_data->'user'->>'plan' = 'premium'
+    /// This will match events where props->'user'->>'plan' = 'premium',
+    /// falling back to the legacy `event_data` column when `props` is NULL
     CustomData { path: String, value: String },
 }
 
@@ -242,9 +243,14 @@ impl SmartFilter {
                     return None;
                 }
 
-                // Build JSON path: event_data::jsonb->'key1'->'key2'->>'key3'
-                // Cast text to jsonb first since event_data is stored as text
-                let mut json_path = "event_data::jsonb".to_string();
+                // Build JSON path: <props>->'key1'->'key2'->>'key3'
+                //
+                // Event properties live in `props` (jsonb) for anything written by
+                // the ingest path; `event_data` (text) is the legacy column and is
+                // left NULL by current writers. Read both, newest first, so filters
+                // match regardless of which column carries the payload. Mirrors the
+                // COALESCE used by the analytics read paths.
+                let mut json_path = "COALESCE(props, event_data::jsonb, '{}'::jsonb)".to_string();
 
                 for (i, part) in parts.iter().enumerate() {
                     // Validate part is safe (alphanumeric + underscore only)
@@ -1782,6 +1788,43 @@ mod tests {
         .expect("Failed to insert event");
     }
 
+    // Helper mirroring create_event_with_data, but writing the payload to `props`
+    // (jsonb) instead of the legacy `event_data` (text) column. This is the shape
+    // the ingest path actually produces, so filter tests built on it exercise the
+    // same rows production does.
+    #[allow(clippy::too_many_arguments)]
+    async fn create_event_with_props(
+        db: &DatabaseConnection,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: i32,
+        session_id: &str,
+        event_type: &str,
+        event_name: Option<&str>,
+        pathname: &str,
+        timestamp: UtcDateTime,
+        props: Option<serde_json::Value>,
+    ) {
+        events::Entity::insert(events::ActiveModel {
+            project_id: Set(project_id),
+            environment_id: Set(Some(environment_id)),
+            deployment_id: Set(Some(deployment_id)),
+            session_id: Set(Some(session_id.to_string())),
+            event_type: Set(event_type.to_string()),
+            event_name: Set(event_name.map(|s| s.to_string())),
+            pathname: Set(pathname.to_string()),
+            timestamp: Set(timestamp),
+            hostname: Set("test.com".to_string()),
+            page_path: Set(pathname.to_string()),
+            href: Set(format!("http://test.com{}", pathname)),
+            props: Set(props),
+            ..Default::default()
+        })
+        .exec(db)
+        .await
+        .expect("Failed to insert event");
+    }
+
     #[tokio::test]
     async fn test_multi_visitor_funnel_real_scenario() {
         let test_db = TestDatabase::with_migrations()
@@ -2501,6 +2544,98 @@ mod tests {
 
         // Overall conversion: 2 premium signups out of 5 entries
         assert_eq!(metrics.overall_conversion_rate, 40.0);
+    }
+
+    /// Regression: CustomData filters must match events whose properties live in
+    /// the `props` jsonb column. The ingest path writes `props` and leaves the
+    /// legacy `event_data` text column NULL, so a filter reading only `event_data`
+    /// silently matches nothing and the step reports zero completions.
+    #[tokio::test]
+    async fn test_custom_data_filtering_matches_props_column() {
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.db.clone();
+        let (project_id, environment_id, deployment_id) = create_test_project(db.clone()).await;
+        let service = FunnelService::new(db.clone());
+
+        let funnel_request = CreateFunnelRequest {
+            name: "Migration Platform Funnel".to_string(),
+            description: None,
+            steps: vec![
+                CreateFunnelStep {
+                    event_name: "page_view".to_string(),
+                    event_filter: vec![],
+                },
+                CreateFunnelStep {
+                    event_name: "migration_platform_clicked".to_string(),
+                    event_filter: vec![SmartFilter::CustomData {
+                        path: "platform".to_string(),
+                        value: "Coolify".to_string(),
+                    }],
+                },
+            ],
+        };
+
+        let funnel_id = service
+            .create_funnel(project_id, funnel_request)
+            .await
+            .expect("Failed to create funnel");
+
+        let now = Utc::now();
+
+        // Two sessions land, each clicks a different platform logo. Only the
+        // Coolify click should satisfy step 2.
+        for (session, platform) in [("session_coolify", "Coolify"), ("session_vercel", "Vercel")] {
+            create_event(
+                db.as_ref(),
+                project_id,
+                environment_id,
+                deployment_id,
+                session,
+                "page_view",
+                None,
+                "/",
+                now,
+                None,
+            )
+            .await;
+            create_event_with_props(
+                db.as_ref(),
+                project_id,
+                environment_id,
+                deployment_id,
+                session,
+                "custom",
+                Some("migration_platform_clicked"),
+                "/",
+                now + chrono::Duration::seconds(10),
+                Some(serde_json::json!({ "platform": platform })),
+            )
+            .await;
+        }
+
+        let metrics = service
+            .get_funnel_metrics(
+                funnel_id,
+                FunnelFilter {
+                    project_id: Some(project_id),
+                    environment_id: None,
+                    country_code: None,
+                    start_date: None,
+                    end_date: None,
+                },
+            )
+            .await
+            .expect("Failed to get funnel metrics");
+
+        assert_eq!(metrics.total_entries, 2, "Both sessions viewed the page");
+
+        let step2 = &metrics.step_conversions[1];
+        assert_eq!(
+            step2.completions, 1,
+            "Only the Coolify click should match the props filter"
+        );
     }
 
     #[tokio::test]
