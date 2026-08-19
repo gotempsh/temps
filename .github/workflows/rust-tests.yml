@@ -158,6 +158,22 @@ jobs:
           chmod +x ci-prebuilt/temps
           file ci-prebuilt/temps
 
+      # temps-captcha-wasm/pkg/ is a checked-in build artifact (embedded into
+      # the proxy binary via include_bytes!/include_str!, see
+      # crates/temps-proxy/src/handler/captcha.rs). The toolchain container
+      # above just rebuilt it from source with the Dockerfile's pinned
+      # wasm-pack/wasm-bindgen-cli versions, so any drift here means the
+      # committed artifact was NOT produced by that pinned toolchain — either
+      # someone forgot to rebuild after a source change, or the committed
+      # binary can't be trusted as a rebuild of what's in git.
+      - name: Verify committed WASM package matches a reproducible rebuild
+        run: |
+          if ! git diff --quiet -- crates/temps-captcha-wasm/pkg/; then
+            echo "::error::crates/temps-captcha-wasm/pkg/ does not match a fresh rebuild with the pinned toolchain from the Dockerfile. Run 'cd crates/temps-captcha-wasm && wasm-pack build --target web --release' locally and commit the regenerated pkg/ files."
+            git diff --stat -- crates/temps-captcha-wasm/pkg/
+            exit 1
+          fi
+
       - name: Save cargo target dir (musl, fast profile)
         if: github.ref == 'refs/heads/main' && steps.musl-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
