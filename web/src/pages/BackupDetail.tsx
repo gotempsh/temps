@@ -342,7 +342,7 @@ export function BackupDetail() {
     )
   }
 
-  if (error) {
+  if (error && !backup) {
     return (
       <div className="flex flex-col items-center justify-center gap-4 py-16">
         <AlertCircle className="h-8 w-8 text-destructive" />

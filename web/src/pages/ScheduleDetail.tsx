@@ -553,7 +553,7 @@ export function ScheduleDetail() {
     )
   }
 
-  if (scheduleError) {
+  if (scheduleError && !schedule) {
     return (
       <div className="flex flex-col items-center justify-center gap-4 px-4 py-12 text-center">
         <AlertCircle className="h-8 w-8 text-destructive" />
