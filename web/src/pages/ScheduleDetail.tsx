@@ -71,6 +71,7 @@ import {
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
+  AlertCircle,
   ArrowLeft,
   CalendarDays,
   ChevronLeft,
@@ -84,6 +85,7 @@ import {
   Pencil,
   Play,
   Plus,
+  RotateCcw,
   Trash2,
   X,
 } from 'lucide-react'
@@ -234,7 +236,12 @@ export function ScheduleDetail() {
 
   // ── Data fetching ──────────────────────────────────────────────────────────
 
-  const { data: schedule, isLoading: isLoadingSchedule } = useQuery({
+  const {
+    data: schedule,
+    isLoading: isLoadingSchedule,
+    error: scheduleError,
+    refetch: refetchSchedule,
+  } = useQuery({
     ...getBackupScheduleOptions({ path: { id: scheduleId! } }),
     enabled: !!scheduleId,
   })
@@ -542,6 +549,34 @@ export function ScheduleDetail() {
         <Skeleton className="h-8 w-48" />
         <Skeleton className="h-48 w-full" />
         <Skeleton className="h-96 w-full" />
+      </div>
+    )
+  }
+
+  if (scheduleError) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-4 px-4 py-12 text-center">
+        <AlertCircle className="h-8 w-8 text-destructive" />
+        <div>
+          <h2 className="text-lg font-semibold">Failed to load schedule</h2>
+          <p className="mt-1 text-base text-muted-foreground sm:text-sm">
+            {scheduleError instanceof Error
+              ? scheduleError.message
+              : 'An unexpected error occurred. Please try again.'}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={() => void refetchSchedule()}>
+            <RotateCcw className="mr-2 h-4 w-4" />
+            Retry
+          </Button>
+          <Button variant="ghost" asChild>
+            <Link to="/backups">
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back to Backups
+            </Link>
+          </Button>
+        </div>
       </div>
     )
   }
