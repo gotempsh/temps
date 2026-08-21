@@ -46,6 +46,7 @@ import { extractSentryEvent } from '@/lib/sentry-utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
+  AlertCircle,
   AlertTriangle,
   ArrowLeft,
   Check,
@@ -68,7 +69,12 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   const [selectedTab, setSelectedTab] = useState('overview')
 
   // Fetch error group details
-  const { data: errorGroup, isLoading: isLoadingGroup } = useQuery({
+  const {
+    data: errorGroup,
+    isLoading: isLoadingGroup,
+    error: errorGroupError,
+    refetch: refetchErrorGroup,
+  } = useQuery({
     ...getErrorGroupOptions({
       path: { group_id: parseInt(errorGroupId!), project_id: project.id },
     }),
@@ -89,6 +95,7 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
 
   const statusMutation = useMutation({
     ...updateErrorGroupMutation(),
+    meta: { errorTitle: 'Failed to update error status' },
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: getErrorGroupOptions({
@@ -162,12 +169,12 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
   // Tell the assistant which error the user is looking at.
   const assistantContext = errorGroup
     ? [
-        'The user is viewing an error group (error tracking) in the Temps console.',
-        `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
-        `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
-        `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
-        'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',
-      ].join('\n')
+      'The user is viewing an error group (error tracking) in the Temps console.',
+      `Project: "${project.name}" (slug: ${project.slug}, id: ${project.id}).`,
+      `Error group #${errorGroupId}: "${errorGroup.title}" (type: ${errorGroup.error_type ?? 'unknown'}).`,
+      `Seen ${errorGroup.total_count} time(s); first ${errorGroup.first_seen}, last ${errorGroup.last_seen}.`,
+      'Fetch details via the temps CLI: `error-tracking get_error_group --group_id` and `list_error_events --group_id`.',
+    ].join('\n')
     : null
   useAssistantPageContext(assistantContext, 'this error')
 
@@ -208,6 +215,36 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
             </div>
           </CardContent>
         </Card>
+      </div>
+    )
+  }
+
+  const isNotFound =
+    (errorGroupError as any)?.status === 404 ||
+    (errorGroupError as any)?.title === 'Not Found'
+
+  if (!errorGroup && errorGroupError && !isNotFound) {
+    return (
+      <div className="flex flex-col items-center justify-center gap-4 min-h-[400px]">
+        <AlertCircle className="h-8 w-8 text-destructive" />
+        <div className="text-center">
+          <h2 className="text-lg font-semibold">Failed to load error group</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {errorGroupError instanceof Error
+              ? errorGroupError.message
+              : 'An unexpected error occurred. Please try again.'}
+          </p>
+        </div>
+        <div className="flex gap-2">
+          <Button variant="outline" onClick={() => void refetchErrorGroup()}>
+            <RotateCcw className="mr-2 h-4 w-4" />
+            Retry
+          </Button>
+          <Button variant="ghost" onClick={() => navigate(`/projects/${project.slug}/errors`)}>
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back to Error Tracking
+          </Button>
+        </div>
       </div>
     )
   }
@@ -321,16 +358,16 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
               )}
             {((errorGroup as any).status === 'resolved' ||
               (errorGroup as any).status === 'ignored') && (
-              <Button
-                variant="outline"
-                size="sm"
-                onClick={() => updateStatus('unresolved')}
-                disabled={statusMutation.isPending}
-              >
-                <RotateCcw className="h-4 w-4 mr-1.5" />
-                Unresolve
-              </Button>
-            )}
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => updateStatus('unresolved')}
+                  disabled={statusMutation.isPending}
+                >
+                  <RotateCcw className="h-4 w-4 mr-1.5" />
+                  Unresolve
+                </Button>
+              )}
           </div>
 
           {/* Mobile: actions collapsed behind a kebab menu */}
@@ -362,11 +399,11 @@ export function ErrorGroupDetail({ project }: { project: ProjectResponse }) {
                   )}
                 {((errorGroup as any).status === 'resolved' ||
                   (errorGroup as any).status === 'ignored') && (
-                  <DropdownMenuItem onClick={() => updateStatus('unresolved')}>
-                    <RotateCcw className="mr-2 h-4 w-4" />
-                    Unresolve
-                  </DropdownMenuItem>
-                )}
+                    <DropdownMenuItem onClick={() => updateStatus('unresolved')}>
+                      <RotateCcw className="mr-2 h-4 w-4" />
+                      Unresolve
+                    </DropdownMenuItem>
+                  )}
               </DropdownMenuContent>
             </DropdownMenu>
           </div>
