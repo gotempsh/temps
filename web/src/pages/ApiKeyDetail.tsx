@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import {
@@ -30,13 +30,15 @@ import {
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import {
-  ArrowLeft,
-  Shield,
-  Key,
-  Calendar,
-  Activity,
+  AlertCircle,
   AlertTriangle,
+  ArrowLeft,
+  Calendar,
   Check,
+  Key,
+  RotateCcw,
+  Shield,
+  Activity,
   X,
 } from 'lucide-react'
 import { format } from 'date-fns'
@@ -88,7 +90,12 @@ export default function ApiKeyDetail() {
   const queryClient = useQueryClient()
   const [deleteModalOpen, setDeleteModalOpen] = useState(false)
 
-  const { data: apiKey, isLoading } = useQuery({
+  const {
+    data: apiKey,
+    isLoading,
+    error: apiKeyError,
+    refetch: refetchApiKey,
+  } = useQuery({
     queryKey: ['apiKey', id],
     queryFn: async () => {
       if (!id) throw new Error('API Key ID is required')
@@ -97,6 +104,14 @@ export default function ApiKeyDetail() {
     },
     enabled: !!id,
   })
+
+  useEffect(() => {
+    if (apiKey && apiKeyError) {
+      toast.error('Failed to refresh API key', {
+        action: { label: 'Retry', onClick: () => void refetchApiKey() },
+      })
+    }
+  }, [apiKey, apiKeyError, refetchApiKey])
 
   const { data: permissionsData } = useApiKeyPermissions()
 
@@ -139,6 +154,38 @@ export default function ApiKeyDetail() {
     return (
       <div className="container max-w-4xl mx-auto py-6">
         <div className="text-center py-8">Loading API key details...</div>
+      </div>
+    )
+  }
+
+  const isNotFound =
+    (apiKeyError as any)?.status === 404 ||
+    (apiKeyError as any)?.title === 'API Key Not Found'
+
+  if (!apiKey && apiKeyError && !isNotFound) {
+    return (
+      <div className="container max-w-4xl mx-auto py-6">
+        <div className="flex flex-col items-center justify-center gap-4 py-8 text-center">
+          <AlertCircle className="h-8 w-8 text-destructive" />
+          <div>
+            <h2 className="text-lg font-semibold">Failed to load API key</h2>
+            <p className="mt-1 text-sm text-muted-foreground">
+              {apiKeyError instanceof Error
+                ? apiKeyError.message
+                : 'An unexpected error occurred. Please try again.'}
+            </p>
+          </div>
+          <div className="flex gap-2">
+            <Button variant="outline" onClick={() => void refetchApiKey()}>
+              <RotateCcw className="mr-2 h-4 w-4" />
+              Retry
+            </Button>
+            <Button variant="ghost" onClick={() => navigate('/settings/keys')}>
+              <ArrowLeft className="mr-2 h-4 w-4" />
+              Back to API Keys
+            </Button>
+          </div>
+        </div>
       </div>
     )
   }
