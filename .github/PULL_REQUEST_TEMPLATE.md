@@ -15,6 +15,7 @@
 - [ ] All new and existing tests pass (`cargo test --lib`)
 - [ ] `cargo check --lib` passes with no warnings
 - [ ] My commits follow the [Conventional Commits](https://www.conventionalcommits.org/) format
+- [ ] Every commit is signed off (`git commit -s`) per the [DCO](../DCO)
 - [ ] I have updated documentation where necessary
 
 ## Related issues

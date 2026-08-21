@@ -1,0 +1,95 @@
+name: DCO
+
+# Every commit must carry a `Signed-off-by:` trailer certifying the Developer
+# Certificate of Origin (see the `DCO` file at the repository root). This is how
+# we get an on-the-record statement that a contributor has the right to submit
+# the code they are submitting — it is a provenance record, not a copyright
+# assignment, and it costs a contributor exactly one `-s` flag.
+#
+# Implemented as a workflow rather than the third-party DCO GitHub App so the
+# rule lives in this repository, is reviewable in a PR, and needs no org-level
+# app install to work on forks.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches:
+      - main
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  dco:
+    name: Check sign-off
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - name: Verify Signed-off-by on every commit
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ github.base_ref }}" --quiet || true
+          base="$(git merge-base "origin/${{ github.base_ref }}" HEAD 2>/dev/null || echo '${{ github.event.pull_request.base.sha }}')"
+          echo "PR commit range: $base..HEAD"
+
+          fail=0
+          # --no-merges: a merge commit has no authored content to certify.
+          for sha in $(git log --no-merges --format='%H' "$base..HEAD"); do
+            subject="$(git log -1 --format='%s' "$sha")"
+            author_name="$(git log -1 --format='%an' "$sha")"
+            author_email="$(git log -1 --format='%ae' "$sha")"
+
+            # Bot-authored commits (dependabot, renovate) can't sign off and
+            # aren't contributions from a person whose rights need certifying.
+            case "$author_name$author_email" in
+              *'[bot]'*) echo "⏭️  ${sha:0:8} skipped (bot author: $author_name)"; continue ;;
+            esac
+
+            expected="Signed-off-by: $author_name <$author_email>"
+            if git log -1 --format='%B' "$sha" | grep -qixF "$expected"; then
+              echo "✅ ${sha:0:8} $subject"
+            else
+              echo "::error::Missing or mismatched sign-off on ${sha:0:8}: $subject"
+              echo "   expected trailer: $expected"
+              echo "   found:            $(git log -1 --format='%B' "$sha" | grep -i '^Signed-off-by:' || echo '(none)')"
+              fail=1
+            fi
+          done
+
+          if [ "$fail" -ne 0 ]; then
+            cat <<'EOF'
+
+          ─────────────────────────────────────────────────────────────
+          Every commit needs a Developer Certificate of Origin sign-off.
+
+          The trailer must match the commit author exactly:
+
+              Signed-off-by: Your Name <your@email.example>
+
+          Sign new commits automatically:
+
+              git commit -s -m "fix(scope): ..."
+              git config --global format.signOff true   # do it for every repo
+
+          Fix commits you already pushed — sign off the whole PR branch, then
+          force-push:
+
+              git rebase --signoff origin/main
+              git push --force-with-lease
+
+          The certification you are making is in the DCO file at the root of
+          this repository. See CONTRIBUTING.md for the full explanation.
+          ─────────────────────────────────────────────────────────────
+          EOF
+            exit 1
+          fi
+          echo "✅ All commits are signed off"
