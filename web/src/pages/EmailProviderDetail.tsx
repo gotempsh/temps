@@ -42,7 +42,7 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { AlertCircle, ArrowLeft, Globe, Plus, Send, Trash2 } from 'lucide-react'
+import { AlertCircle, ArrowLeft, Globe, Plus, RotateCcw, Send, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router'
 import { toast } from 'sonner'
@@ -50,9 +50,14 @@ import { toast } from 'sonner'
 async function fetchProvider(id: number): Promise<EmailProviderResponse> {
   const response = await getEmailProvider({ path: { id } })
   if (response.error || !response.data) {
-    throw new Error(
+    const error = new Error(
       problemMessage(response.error, 'Failed to fetch email provider')
-    )
+    ) as Error & { status?: number; title?: string }
+    if (response.error) {
+      error.status = (response.error as any).status
+      error.title = (response.error as any).title
+    }
+    throw error
   }
   return response.data
 }
@@ -98,11 +103,20 @@ export function EmailProviderDetail() {
     data: provider,
     isLoading,
     error: fetchError,
+    refetch: refetchProvider,
   } = useQuery({
     queryKey: ['email-provider', id],
     queryFn: () => fetchProvider(id!),
     enabled: !!id,
   })
+
+  useEffect(() => {
+    if (provider && fetchError) {
+      toast.error('Failed to refresh email provider', {
+        action: { label: 'Retry', onClick: () => void refetchProvider() },
+      })
+    }
+  }, [provider, fetchError, refetchProvider])
 
   const {
     data: domains,
@@ -189,7 +203,40 @@ export function EmailProviderDetail() {
     )
   }
 
-  if (fetchError || !provider) {
+  const isNotFound =
+    (fetchError as any)?.status === 404 ||
+    (fetchError as any)?.title === 'Not Found' ||
+    (fetchError as any)?.title === 'Provider Not Found'
+
+  if (!provider && fetchError && !isNotFound) {
+    return (
+      <div className="flex-1 overflow-auto">
+        <div className="flex flex-col items-center justify-center py-16 text-center">
+          <AlertCircle className="size-8 text-destructive" />
+          <h2 className="mt-3 text-lg font-semibold">Failed to load email provider</h2>
+          <p className="mt-1 text-sm text-muted-foreground">
+            {fetchError instanceof Error
+              ? fetchError.message
+              : 'An unexpected error occurred. Please try again.'}
+          </p>
+          <div className="mt-4 flex gap-2">
+            <Button variant="outline" onClick={() => void refetchProvider()}>
+              <RotateCcw className="mr-2 size-4" />
+              Retry
+            </Button>
+            <Button variant="ghost" asChild>
+              <Link to="/email?tab=providers">
+                <ArrowLeft className="mr-2 size-4" />
+                Back to providers
+              </Link>
+            </Button>
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  if (!provider) {
     return (
       <div className="flex-1 overflow-auto">
         <div className="flex flex-col items-center justify-center py-16 text-center">
