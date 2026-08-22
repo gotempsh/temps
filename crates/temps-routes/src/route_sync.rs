@@ -116,6 +116,24 @@ pub async fn get_routes_snapshot(
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     authenticate_node(&app_state.db, &headers, node_id).await?;
 
+    // Arm the notifier BEFORE checking the generation. `Notify::notified()`
+    // captures the current notify epoch at construction time, so a reload
+    // that races between our check and the wait is still observed instead
+    // of being silently missed — the same lost-wakeup hazard
+    // `CachedPeerTable::wait_until_loaded` already avoids the same way.
+    // Constructing the `Notified` future only *after* the fast-path check
+    // (the previous shape of this function) leaves a window where a
+    // `load_routes()` reload that lands in that window is invisible to
+    // this request: `notify_waiters()` only wakes waiters already armed
+    // when it's called, so we'd then wait out the full
+    // `LONG_POLL_TIMEOUT` (25s) instead of returning almost immediately.
+    // `mark_deployment_complete`'s worker-apply gate only allows 10s, so
+    // any occurrence of this race causes a spurious deployment revert even
+    // though the worker is perfectly healthy.
+    let notifier = app_state.peer_table.generation_notifier();
+    let armed = notifier.notified();
+    tokio::pin!(armed);
+
     // Fast path: generation already moved past `since` — return now.
     let mut current = app_state.peer_table.current_generation();
     if current > q.since {
@@ -127,17 +145,21 @@ pub async fn get_routes_snapshot(
     // intermediate proxies (and the agent's HTTP client) drop idle
     // connections after ~30 s, so we return a same-generation snapshot
     // before that point and let the agent reconnect cleanly.
-    let notifier = app_state.peer_table.generation_notifier();
     let _ = tokio::time::timeout(LONG_POLL_TIMEOUT, async {
+        // First wait uses the future armed above (before the fast-path
+        // check) so it can't miss a reload that raced the check.
+        armed.await;
         // Loop guards against spurious wakeups: keep waiting until the
-        // generation actually moves.
+        // generation actually moves. Subsequent iterations arm fresh —
+        // by this point we're already inside the wait, so a race here
+        // only costs another loop iteration, bounded by the outer timeout.
         loop {
-            let notified = notifier.notified();
-            tokio::pin!(notified);
-            notified.await;
             if app_state.peer_table.current_generation() > q.since {
                 break;
             }
+            let notified = notifier.notified();
+            tokio::pin!(notified);
+            notified.await;
         }
     })
     .await;
