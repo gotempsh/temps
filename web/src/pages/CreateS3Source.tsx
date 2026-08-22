@@ -61,24 +61,26 @@ export function CreateS3Source() {
   })
 
   const handleTestConnection = () => {
-    if (
-      !formData.name ||
-      !formData.bucket_name ||
-      !formData.region ||
-      !formData.access_key_id ||
-      !formData.secret_key
-    ) {
+    if (testConnectionMutation.isPending || createMutation.isPending) return
+
+    const name = formData.name?.trim()
+    const bucket_name = formData.bucket_name?.trim()
+    const region = formData.region?.trim()
+    const access_key_id = formData.access_key_id?.trim()
+    const secret_key = formData.secret_key?.trim()
+
+    if (!name || !bucket_name || !region || !access_key_id || !secret_key) {
       toast.error('Fill all required fields to test the connection')
       return
     }
     testConnectionMutation.mutate({
-      name: formData.name,
-      bucket_name: formData.bucket_name,
+      name,
+      bucket_name,
       bucket_path: '/',
-      region: formData.region,
-      access_key_id: formData.access_key_id,
-      secret_key: formData.secret_key,
-      endpoint: formData.endpoint || undefined,
+      region,
+      access_key_id,
+      secret_key,
+      endpoint: formData.endpoint?.trim() || undefined,
       force_path_style: formData.force_path_style ?? undefined,
     })
   }
@@ -86,13 +88,15 @@ export function CreateS3Source() {
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault()
 
-    if (
-      !formData.name ||
-      !formData.bucket_name ||
-      !formData.region ||
-      !formData.access_key_id ||
-      !formData.secret_key
-    ) {
+    if (createMutation.isPending || testConnectionMutation.isPending) return
+
+    const name = formData.name?.trim()
+    const bucket_name = formData.bucket_name?.trim()
+    const region = formData.region?.trim()
+    const access_key_id = formData.access_key_id?.trim()
+    const secret_key = formData.secret_key?.trim()
+
+    if (!name || !bucket_name || !region || !access_key_id || !secret_key) {
       toast.error('Please fill in all required fields')
       return
     }
@@ -100,17 +104,23 @@ export function CreateS3Source() {
     createMutation.mutate({
       body: {
         ...(formData as NewS3Source),
+        name,
+        bucket_name,
+        region,
+        access_key_id,
+        secret_key,
+        endpoint: formData.endpoint?.trim() || undefined,
         bucket_path: '/',
       },
     })
   }
 
   const isFormValid =
-    formData.name &&
-    formData.bucket_name &&
-    formData.region &&
-    formData.access_key_id &&
-    formData.secret_key
+    Boolean(formData.name?.trim()) &&
+    Boolean(formData.bucket_name?.trim()) &&
+    Boolean(formData.region?.trim()) &&
+    Boolean(formData.access_key_id?.trim()) &&
+    Boolean(formData.secret_key?.trim())
 
   return (
     <div className="container mx-auto max-w-2xl py-6">
@@ -188,13 +198,13 @@ export function CreateS3Source() {
                   className="flex items-baseline justify-between"
                 >
                   <span>Endpoint URL</span>
-                   <span className="text-xs text-muted-foreground">
+                  <span className="text-xs text-muted-foreground">
                     (Optional, for RustFS/MinIO)
                   </span>
                 </Label>
                 <Input
                   id="endpoint"
-                   placeholder="http://rustfs.example.com:9000"
+                  placeholder="http://rustfs.example.com:9000"
                   value={formData.endpoint || ''}
                   onChange={(e) =>
                     setFormData({ ...formData, endpoint: e.target.value })
@@ -262,6 +272,9 @@ export function CreateS3Source() {
                 type="button"
                 variant="outline"
                 onClick={() => navigate('/backups')}
+                disabled={
+                  createMutation.isPending || testConnectionMutation.isPending
+                }
               >
                 Cancel
               </Button>
@@ -287,7 +300,11 @@ export function CreateS3Source() {
                 </Button>
                 <Button
                   type="submit"
-                  disabled={createMutation.isPending || !isFormValid}
+                  disabled={
+                    createMutation.isPending ||
+                    testConnectionMutation.isPending ||
+                    !isFormValid
+                  }
                 >
                   {createMutation.isPending
                     ? 'Creating...'
