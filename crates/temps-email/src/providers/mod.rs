@@ -15,4 +15,4 @@ pub use smtp::{SmtpCredentials, SmtpEncryption, SmtpProvider};
 pub use traits::*;
 
 #[cfg(test)]
-pub use mock::MockEmailProvider;
+pub use mock::{MockEmailProvider, MockSendResult};

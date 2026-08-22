@@ -57,19 +57,46 @@ fn extract_ses_error_details<E: std::fmt::Display + std::fmt::Debug>(
     }
 }
 
-fn map_ses_send_error<E: std::fmt::Display + std::fmt::Debug>(
-    error: aws_sdk_sesv2::error::SdkError<E>,
+/// Classify the result of an SES `send_email` call with retryability information.
+///
+/// Unlike the generic `map_ses_send_error`, this function has access to the
+/// concrete `SendEmailError` variants so it can distinguish retryable throttles
+/// (TooManyRequestsException, LimitExceededException) from permanent rejections
+/// (MessageRejected, SendingPausedException, AccountSuspendedException, etc.).
+///
+/// The retryability classification uses typed enum variant matching, never
+/// string-matching on error message text.
+fn classify_ses_send_retryability(
+    error: aws_sdk_sesv2::error::SdkError<aws_sdk_sesv2::operation::send_email::SendEmailError>,
 ) -> EmailError {
     use aws_sdk_sesv2::error::SdkError;
 
     let details = extract_ses_error_details(&error);
-    match error {
+    match &error {
         SdkError::TimeoutError(_) | SdkError::DispatchFailure(_) | SdkError::ResponseError(_) => {
             EmailError::ProviderDeliveryUnknown(format!(
                 "AWS SES request may have been accepted: {details}"
             ))
         }
-        SdkError::ServiceError(_) | SdkError::ConstructionFailure(_) => EmailError::AwsSes(details),
+        SdkError::ConstructionFailure(_) => {
+            // Request was never sent — definitively not accepted, configuration error.
+            EmailError::SendFailed {
+                provider: "ses".to_string(),
+                retryable: false,
+                message: details,
+            }
+        }
+        SdkError::ServiceError(service_err) => {
+            // TooManyRequestsException and LimitExceededException are transient
+            // throttles; every other service error is a definitive rejection.
+            let retryable = service_err.err().is_too_many_requests_exception()
+                || service_err.err().is_limit_exceeded_exception();
+            EmailError::SendFailed {
+                provider: "ses".to_string(),
+                retryable,
+                message: details,
+            }
+        }
         _ => EmailError::ProviderDeliveryUnknown(format!(
             "AWS SES request returned an indeterminate transport result: {details}"
         )),
@@ -496,7 +523,7 @@ impl EmailProvider for SesProvider {
         send_request = send_request.configuration_set_name(&self.configuration_set_name);
 
         let result = send_request.send().await.map_err(|error| {
-            let mapped = map_ses_send_error(error);
+            let mapped = classify_ses_send_retryability(error);
             error!("Failed to send email via SES: {mapped}");
             mapped
         })?;
@@ -526,6 +553,44 @@ mod tests {
             Err(EmailError::ProviderDeliveryUnknown(reason))
                 if reason.contains("returned no message ID")
         ));
+    }
+
+    #[test]
+    fn ses_construction_failure_is_non_retryable_send_failed() {
+        use aws_sdk_sesv2::error::SdkError;
+
+        let error: SdkError<aws_sdk_sesv2::operation::send_email::SendEmailError> =
+            SdkError::construction_failure(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "missing required field",
+            ));
+        let result = classify_ses_send_retryability(error);
+        assert!(
+            matches!(
+                result,
+                EmailError::SendFailed {
+                    retryable: false,
+                    ..
+                }
+            ),
+            "ConstructionFailure must be non-retryable SendFailed, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn ses_timeout_error_is_delivery_unknown() {
+        use aws_sdk_sesv2::error::SdkError;
+
+        let error: SdkError<aws_sdk_sesv2::operation::send_email::SendEmailError> =
+            SdkError::timeout_error(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "timed out",
+            ));
+        let result = classify_ses_send_retryability(error);
+        assert!(
+            matches!(result, EmailError::ProviderDeliveryUnknown(_)),
+            "TimeoutError must be ProviderDeliveryUnknown (ambiguous), got: {result:?}"
+        );
     }
 
     #[test]

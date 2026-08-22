@@ -71,6 +71,18 @@ pub enum EmailError {
 
     #[error("Tracking rewrite failed for email {email_id}: {reason}")]
     TrackingRewrite { email_id: String, reason: String },
+
+    /// A definitive provider rejection where the provider confirmed it did not
+    /// accept the message. `retryable` distinguishes transient throttles
+    /// (e.g. TooManyRequestsException, 4xx SMTP reply codes) from permanent
+    /// rejections (MessageRejected, 5xx SMTP). Only constructed inside each
+    /// provider's `send()` method; never used for domain-verification paths.
+    #[error("Provider '{provider}' send rejected: {message}")]
+    SendFailed {
+        provider: String,
+        retryable: bool,
+        message: String,
+    },
 }
 
 impl From<serde_json::Error> for EmailError {

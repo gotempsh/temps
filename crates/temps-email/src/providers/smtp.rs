@@ -9,7 +9,9 @@
 use async_trait::async_trait;
 use lettre::{
     message::{header::ContentType, Mailbox, MultiPart, SinglePart},
-    transport::smtp::{authentication::Credentials, client::TlsParametersBuilder},
+    transport::smtp::{
+        authentication::Credentials, client::TlsParametersBuilder, Error as SmtpError,
+    },
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
 use serde::{Deserialize, Serialize};
@@ -134,6 +136,39 @@ impl BuilderExt for lettre::transport::smtp::AsyncSmtpTransportBuilder {
             }
             _ => self,
         }
+    }
+}
+
+/// Classify a lettre SMTP transport error into a typed `EmailError` with
+/// retryability information.
+///
+/// - `is_permanent()` (5xx SMTP reply): the server definitively rejected the
+///   message — non-retryable.
+/// - `is_transient()` (4xx SMTP reply): the server signalled a temporary
+///   failure (e.g. mailbox busy, service unavailable) — retryable.
+/// - All other variants (connection dropped, DNS failure, TLS error, response
+///   parse error): genuinely ambiguous — we do not know whether the server
+///   received the message, so we return `ProviderDeliveryUnknown` to prevent
+///   automatic retry and possible duplicate delivery.
+fn classify_smtp_send_error(error: &SmtpError) -> EmailError {
+    if error.is_permanent() {
+        EmailError::SendFailed {
+            provider: "smtp".to_string(),
+            retryable: false,
+            message: format!("SMTP server permanently rejected: {error}"),
+        }
+    } else if error.is_transient() {
+        EmailError::SendFailed {
+            provider: "smtp".to_string(),
+            retryable: true,
+            message: format!("SMTP transient error (4xx): {error}"),
+        }
+    } else {
+        // Connection, network, TLS, or response-parsing errors are ambiguous:
+        // the TCP frame may have reached the server before the failure.
+        EmailError::ProviderDeliveryUnknown(format!(
+            "SMTP transport failed with ambiguous outcome: {error}"
+        ))
     }
 }
 
@@ -293,9 +328,7 @@ impl EmailProvider for SmtpProvider {
 
         self.transport.send(message).await.map_err(|e| {
             error!("Failed to send email via SMTP: {}", e);
-            EmailError::ProviderDeliveryUnknown(format!(
-                "SMTP transport failed after delivery began: {e}"
-            ))
+            classify_smtp_send_error(&e)
         })?;
 
         debug!("Email sent via SMTP, message_id: {}", message_id);
@@ -310,6 +343,15 @@ impl EmailProvider for SmtpProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // NOTE: `lettre::transport::smtp::Error` constructors (e.g. `code(...)`,
+    // `network(...)`, `connection(...)`) are `pub(crate)` inside the lettre
+    // crate and cannot be invoked from external code. Direct unit tests for
+    // `classify_smtp_send_error` with specific SMTP reply codes require either
+    // a live SMTP server or lettre's internal test helpers. The logic is
+    // correct (it delegates to `error.is_permanent()` / `error.is_transient()`
+    // which are part of lettre's public API) and is covered end-to-end when
+    // SmtpProvider::send() is exercised against a real relay.
 
     #[test]
     fn test_smtp_credentials_serialization_roundtrip() {

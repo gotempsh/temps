@@ -76,7 +76,8 @@ impl From<EmailError> for Problem {
             | EmailError::ScalewayClientBuild { .. }
             | EmailError::Smtp(_)
             | EmailError::Serialization(_)
-            | EmailError::TrackingRewrite { .. } => {
+            | EmailError::TrackingRewrite { .. }
+            | EmailError::SendFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
                     .with_detail(error.to_string())

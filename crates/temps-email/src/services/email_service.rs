@@ -119,6 +119,121 @@ fn classify_provider_result(
 const DELIVERY_LEASE_SECONDS: i64 = 60;
 const PROVIDER_SEND_TIMEOUT_SECONDS: u64 = 20;
 
+/// Hard ceiling on the entire retry sequence: first attempt + 500 ms delay +
+/// second attempt.  Worst case: 2 × 20 s + 0.5 s ≈ 40.5 s, well inside this
+/// cap.  The fenced delivery path leases the claim for DELIVERY_LEASE_SECONDS
+/// (60 s); 45 s stays safely below that so a timed-out retry cannot let
+/// another worker steal the claim mid-send.
+const RETRY_OUTER_TIMEOUT_SECS: u64 = 45;
+
+/// Attempt `provider.send(request)` up to two times when the first attempt
+/// yields a retryable rejection.
+///
+/// # Safety invariant
+///
+/// `ProviderDeliveryUnknown` is **never** retried.  Once a request has left
+/// the process, a transport failure cannot prove the provider did not accept
+/// it; retrying that outcome risks delivering the same email twice.
+///
+/// # Timeout budget
+///
+/// Each attempt is individually wrapped in `PROVIDER_SEND_TIMEOUT_SECONDS`
+/// (20 s) for defense in depth.  The entire sequence — both attempts and the
+/// 500 ms inter-attempt delay — is further bounded by `RETRY_OUTER_TIMEOUT_SECS`
+/// (45 s).  If the outer deadline fires we return `Unknown` because we cannot
+/// know whether an in-flight attempt was accepted.
+///
+/// Returns the final outcome and the number of provider calls actually made.
+async fn send_with_retry(
+    provider: &dyn crate::providers::EmailProvider,
+    request: &crate::providers::SendEmailRequest,
+) -> (ProviderDeliveryOutcome, u32) {
+    let inner = async {
+        // ── Attempt 1 ───────────────────────────────────────────────────────
+        let attempt1 = tokio::time::timeout(
+            std::time::Duration::from_secs(PROVIDER_SEND_TIMEOUT_SECONDS),
+            provider.send(request),
+        )
+        .await;
+
+        let first_result = match attempt1 {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                return (
+                    ProviderDeliveryOutcome::Unknown(format!(
+                        "Provider did not return within {PROVIDER_SEND_TIMEOUT_SECONDS}s (attempt 1)"
+                    )),
+                    1u32,
+                );
+            }
+        };
+
+        match first_result {
+            Ok(response) => return (ProviderDeliveryOutcome::Accepted(response), 1u32),
+            Err(EmailError::ProviderDeliveryUnknown(reason)) => {
+                // Ambiguous outcome — never retry.
+                return (ProviderDeliveryOutcome::Unknown(reason), 1u32);
+            }
+            Err(ref err)
+                if matches!(
+                    err,
+                    EmailError::SendFailed {
+                        retryable: true,
+                        ..
+                    }
+                ) =>
+            {
+                // Retryable throttle — fall through to attempt 2.
+            }
+            Err(err) => {
+                // Non-retryable rejection.
+                return (ProviderDeliveryOutcome::Rejected(err), 1u32);
+            }
+        }
+
+        // ── 500 ms back-off ─────────────────────────────────────────────────
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // ── Attempt 2 ───────────────────────────────────────────────────────
+        let attempt2 = tokio::time::timeout(
+            std::time::Duration::from_secs(PROVIDER_SEND_TIMEOUT_SECONDS),
+            provider.send(request),
+        )
+        .await;
+
+        let second_result = match attempt2 {
+            Ok(result) => result,
+            Err(_elapsed) => {
+                return (
+                    ProviderDeliveryOutcome::Unknown(format!(
+                        "Provider did not return within {PROVIDER_SEND_TIMEOUT_SECONDS}s (attempt 2)"
+                    )),
+                    2u32,
+                );
+            }
+        };
+
+        (classify_provider_result(second_result), 2u32)
+    };
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(RETRY_OUTER_TIMEOUT_SECS),
+        inner,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_elapsed) => (
+            ProviderDeliveryOutcome::Unknown(format!(
+                "Provider retry sequence did not complete within {RETRY_OUTER_TIMEOUT_SECS}s"
+            )),
+            // We know at least one attempt was started when the outer deadline
+            // fired, but we cannot determine how many completed.
+            1u32,
+        ),
+    }
+}
+
 /// Validate caller-supplied headers before any authorization or provider work.
 ///
 /// SMTP headers such as `From`, `To`, and `Bcc` are security-sensitive: lettre
@@ -533,6 +648,28 @@ impl EmailService {
 
         let provider = provider.unwrap();
 
+        // An inactive provider must never be used for delivery.  Treat it
+        // exactly like "no provider configured" so callers get a predictable
+        // `captured` state rather than a mysterious send failure.
+        if !provider.is_active {
+            info!(
+                "Provider {} is inactive for domain '{}', capturing email without sending",
+                provider.id, domain.domain
+            );
+            let mut active_model: emails::ActiveModel = email_model.into();
+            active_model.status = Set("captured".to_string());
+            active_model.error_message =
+                Set(Some(format!("Email provider {} is inactive", provider.id)));
+            active_model.sent_at = Set(Some(Utc::now()));
+            active_model.update(self.db.as_ref()).await?;
+
+            return Ok(SendEmailResponse {
+                id: email_id,
+                status: "captured".to_string(),
+                provider_message_id: None,
+            });
+        }
+
         let provider_instance = match self
             .provider_service
             .create_provider_instance(&provider)
@@ -579,14 +716,19 @@ impl EmailService {
                 .send_project_email_with_fence(
                     email_id,
                     provider_instance.as_ref(),
+                    Some(provider.id),
                     &provider_request,
                 )
                 .await;
         }
 
+        let (outcome, attempt_count) =
+            send_with_retry(provider_instance.as_ref(), &provider_request).await;
         self.finalize_unfenced_delivery(
             email_model,
-            classify_provider_result(provider_instance.send(&provider_request).await),
+            outcome,
+            Some(provider.id),
+            Some(attempt_count as i32),
         )
         .await
     }
@@ -595,6 +737,8 @@ impl EmailService {
         &self,
         email_model: emails::Model,
         outcome: ProviderDeliveryOutcome,
+        provider_id: Option<i32>,
+        attempt_count: Option<i32>,
     ) -> Result<SendEmailResponse, EmailError> {
         let email_id = email_model.id;
         match outcome {
@@ -604,6 +748,8 @@ impl EmailService {
                 active_model.status = Set("sent".to_string());
                 active_model.provider_message_id = Set(Some(response.message_id.clone()));
                 active_model.sent_at = Set(Some(Utc::now()));
+                active_model.provider_id = Set(provider_id);
+                active_model.attempt_count = Set(attempt_count);
 
                 let _email_model = active_model.update(self.db.as_ref()).await?;
 
@@ -629,6 +775,8 @@ impl EmailService {
                 active_model.status = Set("captured".to_string());
                 active_model.error_message = Set(Some(format!("Send failed: {}", e)));
                 active_model.sent_at = Set(Some(Utc::now()));
+                active_model.provider_id = Set(provider_id);
+                active_model.attempt_count = Set(attempt_count);
 
                 active_model.update(self.db.as_ref()).await?;
 
@@ -649,6 +797,8 @@ impl EmailService {
                 active_model.status = Set("delivery_unknown".to_string());
                 active_model.error_message = Set(Some(reason));
                 active_model.sent_at = Set(Some(Utc::now()));
+                active_model.provider_id = Set(provider_id);
+                active_model.attempt_count = Set(attempt_count);
                 active_model.update(self.db.as_ref()).await?;
 
                 Ok(SendEmailResponse {
@@ -671,6 +821,7 @@ impl EmailService {
         &self,
         email_id: Uuid,
         provider: &dyn EmailProvider,
+        provider_id: Option<i32>,
         request: &ProviderSendRequest,
     ) -> Result<SendEmailResponse, EmailError> {
         let attempt_token = match self.claim_project_email_delivery(email_id).await? {
@@ -678,20 +829,16 @@ impl EmailService {
             DeliveryClaim::Return(response) => return Ok(response),
         };
 
-        let provider_outcome = match tokio::time::timeout(
-            std::time::Duration::from_secs(PROVIDER_SEND_TIMEOUT_SECONDS),
-            provider.send(request),
+        let (provider_outcome, attempt_count) = send_with_retry(provider, request).await;
+
+        self.finalize_project_email_delivery(
+            email_id,
+            attempt_token,
+            provider_outcome,
+            provider_id,
+            Some(attempt_count as i32),
         )
         .await
-        {
-            Ok(result) => classify_provider_result(result),
-            Err(_) => ProviderDeliveryOutcome::Unknown(format!(
-                "Provider did not return within {PROVIDER_SEND_TIMEOUT_SECONDS} seconds"
-            )),
-        };
-
-        self.finalize_project_email_delivery(email_id, attempt_token, provider_outcome)
-            .await
     }
 
     /// Atomically move a retryable email into `sending` and return a freshly
@@ -755,6 +902,8 @@ impl EmailService {
         email_id: Uuid,
         attempt_token: chrono::DateTime<Utc>,
         provider_outcome: ProviderDeliveryOutcome,
+        provider_id: Option<i32>,
+        attempt_count: Option<i32>,
     ) -> Result<SendEmailResponse, EmailError> {
         let transaction = self.db.begin().await?;
         let claim = email_idempotency_keys::Entity::find()
@@ -786,6 +935,8 @@ impl EmailService {
                 active.status = Set("sent".to_string());
                 active.provider_message_id = Set(Some(provider_response.message_id.clone()));
                 active.sent_at = Set(Some(Utc::now()));
+                active.provider_id = Set(provider_id);
+                active.attempt_count = Set(attempt_count);
                 active.update(&transaction).await?;
 
                 SendEmailResponse {
@@ -804,6 +955,8 @@ impl EmailService {
                 active.status = Set("captured".to_string());
                 active.error_message = Set(Some(format!("Send failed: {error}")));
                 active.sent_at = Set(Some(Utc::now()));
+                active.provider_id = Set(provider_id);
+                active.attempt_count = Set(attempt_count);
                 active.update(&transaction).await?;
 
                 SendEmailResponse {
@@ -815,8 +968,7 @@ impl EmailService {
             ProviderDeliveryOutcome::Unknown(reason) => {
                 warn!(
                     email_id = %email_id,
-                    timeout_seconds = PROVIDER_SEND_TIMEOUT_SECONDS,
-                    "Project-scoped provider delivery timed out with an unknown outcome; automatic retry disabled"
+                    "Project-scoped provider delivery resulted in an unknown outcome; automatic retry disabled"
                 );
                 let message = format!(
                     "Provider outcome unknown ({reason}); automatic retry disabled to avoid duplicate delivery"
@@ -825,6 +977,8 @@ impl EmailService {
                 active.status = Set("delivery_unknown".to_string());
                 active.error_message = Set(Some(message));
                 active.sent_at = Set(Some(Utc::now()));
+                active.provider_id = Set(provider_id);
+                active.attempt_count = Set(attempt_count);
                 active.update(&transaction).await?;
 
                 SendEmailResponse {
@@ -1102,11 +1256,112 @@ mod tests {
                 if reason.contains("connection closed while reading provider response")
         ));
     }
-    use crate::providers::{EmailProviderType, MockEmailProvider, SesCredentials};
+    use crate::providers::{EmailProviderType, MockEmailProvider, MockSendResult, SesCredentials};
     use crate::services::provider_service::{CreateProviderRequest, ProviderCredentials};
     use crate::services::TrackingService;
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
+
+    fn test_provider_send_request() -> ProviderSendRequest {
+        ProviderSendRequest {
+            from: "sender@example.test".to_string(),
+            from_name: None,
+            to: vec!["recipient@example.test".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "retry unit test".to_string(),
+            html: None,
+            text: Some("body".to_string()),
+            headers: None,
+        }
+    }
+
+    // ── send_with_retry unit tests (no database needed) ─────────────────────
+
+    #[tokio::test]
+    async fn send_with_retry_success_on_first_attempt_returns_one_attempt() {
+        let provider = MockEmailProvider::new();
+        let request = test_provider_send_request();
+
+        let (outcome, attempts) = send_with_retry(&provider, &request).await;
+
+        assert!(matches!(outcome, ProviderDeliveryOutcome::Accepted(_)));
+        assert_eq!(attempts, 1, "no retry needed when first attempt succeeds");
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_non_retryable_rejection_stops_after_one_attempt() {
+        let provider = MockEmailProvider::new()
+            .with_scripted_responses([MockSendResult::Fail { retryable: false }]);
+        let request = test_provider_send_request();
+
+        let (outcome, attempts) = send_with_retry(&provider, &request).await;
+
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::Rejected(_)),
+            "non-retryable rejection must not retry"
+        );
+        assert_eq!(
+            attempts, 1,
+            "non-retryable rejection must not make a second call"
+        );
+        assert_eq!(provider.send_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_unknown_outcome_stops_immediately_without_retry() {
+        let provider = MockEmailProvider::new().with_scripted_responses([MockSendResult::Unknown]);
+        let request = test_provider_send_request();
+
+        let (outcome, attempts) = send_with_retry(&provider, &request).await;
+
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::Unknown(_)),
+            "unknown outcome must never be retried"
+        );
+        assert_eq!(
+            attempts, 1,
+            "ProviderDeliveryUnknown must abort after one attempt"
+        );
+        assert_eq!(provider.send_call_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_retryable_failure_then_success_returns_two_attempts_and_accepted() {
+        let provider = MockEmailProvider::new().with_scripted_responses([
+            MockSendResult::Fail { retryable: true },
+            MockSendResult::Succeed,
+        ]);
+        let request = test_provider_send_request();
+
+        let (outcome, attempts) = send_with_retry(&provider, &request).await;
+
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::Accepted(_)),
+            "second attempt succeeds"
+        );
+        assert_eq!(attempts, 2, "retry path must record both attempts");
+        assert_eq!(provider.send_call_count(), 2);
+    }
+
+    #[tokio::test]
+    async fn send_with_retry_two_retryable_failures_returns_two_attempts_and_rejected() {
+        let provider = MockEmailProvider::new().with_scripted_responses([
+            MockSendResult::Fail { retryable: true },
+            MockSendResult::Fail { retryable: true },
+        ]);
+        let request = test_provider_send_request();
+
+        let (outcome, attempts) = send_with_retry(&provider, &request).await;
+
+        assert!(
+            matches!(outcome, ProviderDeliveryOutcome::Rejected(_)),
+            "exhausted retries must yield a final Rejected outcome"
+        );
+        assert_eq!(attempts, 2, "both attempts must be counted");
+        assert_eq!(provider.send_call_count(), 2);
+    }
 
     fn test_send_request(subject: &str) -> SendEmailRequest {
         SendEmailRequest {
@@ -1650,6 +1905,8 @@ mod tests {
                 ProviderDeliveryOutcome::Unknown(
                     "provider disconnected after request upload".to_string(),
                 ),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -2027,13 +2284,14 @@ mod tests {
             headers: None,
         };
 
-        let first = email_service.send_project_email_with_fence(email_id, &provider, &request);
+        let first =
+            email_service.send_project_email_with_fence(email_id, &provider, None, &request);
         let second = async {
             while provider.send_call_count() == 0 {
                 tokio::task::yield_now().await;
             }
             email_service
-                .send_project_email_with_fence(email_id, &provider, &request)
+                .send_project_email_with_fence(email_id, &provider, None, &request)
                 .await
         };
         let (first, second) = tokio::join!(first, second);
@@ -2117,6 +2375,8 @@ mod tests {
                 email_id,
                 attempt_token,
                 ProviderDeliveryOutcome::Unknown("test timeout".to_string()),
+                None,
+                None,
             )
             .await
             .unwrap();
@@ -2199,5 +2459,297 @@ mod tests {
 
         assert!(emails.is_empty());
         assert_eq!(total, 0);
+    }
+
+    /// Emails addressed to a domain whose provider is inactive must be
+    /// captured without any provider call.
+    #[tokio::test]
+    async fn inactive_provider_captures_without_calling_send() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let Some((db, email_service, provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+
+        // Create a provider and immediately deactivate it.
+        let provider = create_test_provider(&provider_service).await;
+        db.db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "UPDATE email_providers SET is_active = false WHERE id = {}",
+                    provider.id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        // Create a verified domain pointing at the inactive provider.
+        let domain_name = format!("inactive-provider-{}.example.test", uuid::Uuid::new_v4());
+        let domain = create_test_domain(&db.db, provider.id, &domain_name).await;
+        db.db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "UPDATE email_domains SET status = 'verified' WHERE id = {}",
+                    domain.id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let request = SendEmailRequest {
+            from: format!("sender@{domain_name}"),
+            from_name: None,
+            to: vec!["recipient@example.test".to_string()],
+            cc: None,
+            bcc: None,
+            reply_to: None,
+            subject: "inactive provider test".to_string(),
+            html: None,
+            text: Some("body".to_string()),
+            headers: None,
+            tags: None,
+            track_opens: false,
+            track_clicks: false,
+        };
+
+        let response = email_service.send(request).await.unwrap();
+        assert_eq!(
+            response.status, "captured",
+            "emails must be captured when the provider is inactive"
+        );
+    }
+
+    /// A retryable error on the first attempt followed by success on the second
+    /// must record `status = sent` and `attempt_count = 2`.
+    #[tokio::test]
+    async fn retryable_error_then_success_records_attempt_count_two() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let Some((db, email_service, provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+
+        // We test send_with_retry directly (unit style, no real provider I/O)
+        // and then verify the persisted attempt_count via finalize_unfenced_delivery.
+        let provider = create_test_provider(&provider_service).await;
+        let domain_name = format!("retry-success-{}.example.test", uuid::Uuid::new_v4());
+        let domain = create_test_domain(&db.db, provider.id, &domain_name).await;
+        db.db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "UPDATE email_domains SET status = 'verified' WHERE id = {}",
+                    domain.id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        // Insert an email row directly so we can call finalize_unfenced_delivery.
+        let email_id = uuid::Uuid::new_v4();
+        emails::ActiveModel {
+            id: Set(email_id),
+            from_address: Set(format!("sender@{domain_name}")),
+            to_addresses: Set(serde_json::json!(["recipient@example.test"])),
+            subject: Set("retry attempt count test".to_string()),
+            status: Set("queued".to_string()),
+            track_opens: Set(false),
+            track_clicks: Set(false),
+            open_count: Set(0),
+            click_count: Set(0),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let email_model = emails::Entity::find_by_id(email_id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Use a scripted mock so we don't need a live provider.
+        let mock = MockEmailProvider::new().with_scripted_responses([
+            MockSendResult::Fail { retryable: true },
+            MockSendResult::Succeed,
+        ]);
+        let (outcome, attempt_count) = send_with_retry(&mock, &test_provider_send_request()).await;
+        assert!(matches!(outcome, ProviderDeliveryOutcome::Accepted(_)));
+        assert_eq!(attempt_count, 2);
+
+        email_service
+            .finalize_unfenced_delivery(
+                email_model,
+                outcome,
+                Some(provider.id),
+                Some(attempt_count as i32),
+            )
+            .await
+            .unwrap();
+
+        let stored = emails::Entity::find_by_id(email_id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "sent");
+        assert_eq!(stored.attempt_count, Some(2));
+        assert_eq!(stored.provider_id, Some(provider.id));
+    }
+
+    /// A non-retryable rejection on the first attempt must record
+    /// `status = captured` and `attempt_count = 1`.
+    #[tokio::test]
+    async fn non_retryable_rejection_records_attempt_count_one() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let Some((db, email_service, provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+
+        let provider = create_test_provider(&provider_service).await;
+        let domain_name = format!("non-retry-reject-{}.example.test", uuid::Uuid::new_v4());
+        let domain = create_test_domain(&db.db, provider.id, &domain_name).await;
+        db.db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "UPDATE email_domains SET status = 'verified' WHERE id = {}",
+                    domain.id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let email_id = uuid::Uuid::new_v4();
+        emails::ActiveModel {
+            id: Set(email_id),
+            from_address: Set(format!("sender@{domain_name}")),
+            to_addresses: Set(serde_json::json!(["recipient@example.test"])),
+            subject: Set("non-retryable rejection test".to_string()),
+            status: Set("queued".to_string()),
+            track_opens: Set(false),
+            track_clicks: Set(false),
+            open_count: Set(0),
+            click_count: Set(0),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let email_model = emails::Entity::find_by_id(email_id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mock = MockEmailProvider::new()
+            .with_scripted_responses([MockSendResult::Fail { retryable: false }]);
+        let (outcome, attempt_count) = send_with_retry(&mock, &test_provider_send_request()).await;
+        assert!(matches!(outcome, ProviderDeliveryOutcome::Rejected(_)));
+        assert_eq!(attempt_count, 1);
+
+        email_service
+            .finalize_unfenced_delivery(
+                email_model,
+                outcome,
+                Some(provider.id),
+                Some(attempt_count as i32),
+            )
+            .await
+            .unwrap();
+
+        let stored = emails::Entity::find_by_id(email_id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "captured");
+        assert_eq!(stored.attempt_count, Some(1));
+        assert_eq!(stored.provider_id, Some(provider.id));
+    }
+
+    /// `ProviderDeliveryUnknown` must produce `delivery_unknown` and
+    /// `attempt_count = 1`; the provider must not be called twice.
+    #[tokio::test]
+    async fn delivery_unknown_records_attempt_count_one_and_is_not_retried() {
+        use sea_orm::{ConnectionTrait, DatabaseBackend, Statement};
+
+        let Some((db, email_service, provider_service, _domain_service)) = setup_test_env().await
+        else {
+            return;
+        };
+
+        let provider = create_test_provider(&provider_service).await;
+        let domain_name = format!("unknown-outcome-{}.example.test", uuid::Uuid::new_v4());
+        let domain = create_test_domain(&db.db, provider.id, &domain_name).await;
+        db.db
+            .execute(Statement::from_string(
+                DatabaseBackend::Postgres,
+                format!(
+                    "UPDATE email_domains SET status = 'verified' WHERE id = {}",
+                    domain.id
+                ),
+            ))
+            .await
+            .unwrap();
+
+        let email_id = uuid::Uuid::new_v4();
+        emails::ActiveModel {
+            id: Set(email_id),
+            from_address: Set(format!("sender@{domain_name}")),
+            to_addresses: Set(serde_json::json!(["recipient@example.test"])),
+            subject: Set("delivery unknown test".to_string()),
+            status: Set("queued".to_string()),
+            track_opens: Set(false),
+            track_clicks: Set(false),
+            open_count: Set(0),
+            click_count: Set(0),
+            ..Default::default()
+        }
+        .insert(db.db.as_ref())
+        .await
+        .unwrap();
+
+        let email_model = emails::Entity::find_by_id(email_id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+
+        let mock = MockEmailProvider::new().with_scripted_responses([MockSendResult::Unknown]);
+        let (outcome, attempt_count) = send_with_retry(&mock, &test_provider_send_request()).await;
+        assert!(matches!(outcome, ProviderDeliveryOutcome::Unknown(_)));
+        assert_eq!(attempt_count, 1);
+        assert_eq!(
+            mock.send_call_count(),
+            1,
+            "unknown outcome must never retry"
+        );
+
+        email_service
+            .finalize_unfenced_delivery(
+                email_model,
+                outcome,
+                Some(provider.id),
+                Some(attempt_count as i32),
+            )
+            .await
+            .unwrap();
+
+        let stored = emails::Entity::find_by_id(email_id)
+            .one(db.db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.status, "delivery_unknown");
+        assert_eq!(stored.attempt_count, Some(1));
     }
 }

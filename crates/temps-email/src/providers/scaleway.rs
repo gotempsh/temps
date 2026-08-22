@@ -414,10 +414,15 @@ impl EmailProvider for ScalewayProvider {
                 .await
                 .unwrap_or_else(|_| "Unknown error".to_string());
             error!("Failed to send email via Scaleway ({}): {}", status, body);
-            return Err(EmailError::Scaleway(format!(
-                "Failed to send email ({}): {}",
-                status, body
-            )));
+            // 5xx and 429 are transient and safe to retry; 4xx rejections are
+            // definitive (bad recipient, quota exceeded on account level, etc.).
+            let retryable =
+                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+            return Err(EmailError::SendFailed {
+                provider: "scaleway".to_string(),
+                retryable,
+                message: format!("Scaleway rejected send (HTTP {status}): {body}"),
+            });
         }
 
         let email_response: ScalewayEmailResponse = response.json().await.map_err(|e| {
@@ -450,6 +455,72 @@ impl EmailProvider for ScalewayProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Build an `EmailError::SendFailed` as the live Scaleway `send()` path
+    /// does for a given HTTP status, so we can assert retryability without a
+    /// real HTTP server.
+    fn make_scaleway_send_error(status: reqwest::StatusCode, body: &str) -> EmailError {
+        let retryable =
+            status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS;
+        EmailError::SendFailed {
+            provider: "scaleway".to_string(),
+            retryable,
+            message: format!("Scaleway rejected send (HTTP {status}): {body}"),
+        }
+    }
+
+    #[test]
+    fn scaleway_5xx_is_retryable() {
+        let err =
+            make_scaleway_send_error(reqwest::StatusCode::INTERNAL_SERVER_ERROR, "server error");
+        assert!(
+            matches!(
+                err,
+                EmailError::SendFailed {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "5xx must be retryable, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn scaleway_429_is_retryable() {
+        let err = make_scaleway_send_error(reqwest::StatusCode::TOO_MANY_REQUESTS, "rate limited");
+        assert!(
+            matches!(
+                err,
+                EmailError::SendFailed {
+                    retryable: true,
+                    ..
+                }
+            ),
+            "429 must be retryable, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn scaleway_4xx_non_429_is_not_retryable() {
+        for status in [
+            reqwest::StatusCode::BAD_REQUEST,
+            reqwest::StatusCode::FORBIDDEN,
+            reqwest::StatusCode::NOT_FOUND,
+            reqwest::StatusCode::UNPROCESSABLE_ENTITY,
+        ] {
+            let err = make_scaleway_send_error(status, "client error");
+            assert!(
+                matches!(
+                    err,
+                    EmailError::SendFailed {
+                        retryable: false,
+                        ..
+                    }
+                ),
+                "4xx (status={status}) must not be retryable, got: {err:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_scaleway_credentials_serialization() {
