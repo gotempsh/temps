@@ -38,13 +38,19 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Loader2 } from 'lucide-react'
+import { Check, Loader2, X } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { toast } from 'sonner'
 import { z } from 'zod'
 import { MfaSetupResponse } from '@/api/client'
 import { useAuth } from '@/contexts/AuthContext'
+import { cn } from '@/lib/utils'
+import {
+  PASSWORD_REQUIREMENTS,
+  passwordRequirementResults,
+  passwordSchema as passwordPolicySchema,
+} from '@/lib/password-policy'
 
 const formSchema = z.object({
   name: z.string().min(2, 'Name must be at least 2 characters'),
@@ -60,7 +66,7 @@ type FormValues = z.infer<typeof formSchema>
 const passwordSchema = z
   .object({
     current_password: z.string().min(1, 'Current password is required'),
-    new_password: z.string().min(8, 'Password must be at least 8 characters'),
+    new_password: passwordPolicySchema,
     confirm_password: z.string().min(1, 'Please confirm your new password'),
     mfa_code: z
       .string()
@@ -147,6 +153,8 @@ export function Account() {
       revoke_other_sessions: false,
     },
   })
+  const newPassword = passwordForm.watch('new_password')
+  const requirementResults = passwordRequirementResults(newPassword)
 
   const { mutate: changePassword, isPending: isChangingPassword } = useMutation(
     {
@@ -351,6 +359,7 @@ export function Account() {
                       <Input
                         type="password"
                         autoComplete="current-password"
+                        disabled={isChangingPassword}
                         {...field}
                       />
                     </FormControl>
@@ -368,10 +377,38 @@ export function Account() {
                       <Input
                         type="password"
                         autoComplete="new-password"
+                        disabled={isChangingPassword}
                         {...field}
                       />
                     </FormControl>
                     <FormMessage />
+                    <ul
+                      role="list"
+                      className="grid gap-1.5 pt-2 sm:grid-cols-2"
+                    >
+                      {PASSWORD_REQUIREMENTS.map((requirement, index) => {
+                        const met =
+                          requirementResults[index]?.met ?? false
+                        return (
+                          <li
+                            key={requirement.id}
+                            className={cn(
+                              'flex items-center gap-1.5 text-xs transition-colors',
+                              met
+                                ? 'text-emerald-600 dark:text-emerald-400 font-medium'
+                                : 'text-rose-500 font-medium'
+                            )}
+                          >
+                            {met ? (
+                              <Check className="h-3.5 w-3.5 shrink-0 stroke-[2.5]" />
+                            ) : (
+                              <X className="h-3.5 w-3.5 shrink-0 stroke-[2.5]" />
+                            )}
+                            <span>{requirement.label}</span>
+                          </li>
+                        )
+                      })}
+                    </ul>
                   </FormItem>
                 )}
               />
@@ -385,6 +422,7 @@ export function Account() {
                       <Input
                         type="password"
                         autoComplete="new-password"
+                        disabled={isChangingPassword}
                         {...field}
                       />
                     </FormControl>
@@ -404,6 +442,7 @@ export function Account() {
                           inputMode="numeric"
                           autoComplete="one-time-code"
                           placeholder="6-digit TOTP or recovery code"
+                          disabled={isChangingPassword}
                           {...field}
                         />
                       </FormControl>
@@ -421,6 +460,7 @@ export function Account() {
                       <Checkbox
                         checked={field.value}
                         onCheckedChange={field.onChange}
+                        disabled={isChangingPassword}
                       />
                     </FormControl>
                     <div className="space-y-0.5 leading-none">
