@@ -37249,6 +37249,19 @@
         ],
         "type": "object"
       },
+      "SetupMfaRequest": {
+        "properties": {
+          "current_password": {
+            "description": "Required to enroll MFA on an account that has a password set.\nOmit (or leave empty) for SSO-only accounts with no local password.",
+            "example": "current_password_value",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "SiblingRef": {
         "description": "A sibling project that shares the same `trace_id` and has opted in to\ncross-project trace sharing (`cross_project_trace_sharing = TRUE`).\n\nReturned by `CrossProjectTraceService::find_sibling_projects` and exposed\nby the Phase 1 `GET /otel/traces/cross-project/{trace_id}` endpoint.",
         "properties": {
@@ -96266,6 +96279,16 @@
     "/users/me/mfa/setup": {
       "post": {
         "operationId": "setup_mfa",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetupMfaRequest"
+              }
+            }
+          },
+          "required": true
+        },
         "responses": {
           "200": {
             "content": {
@@ -96277,8 +96300,11 @@
             },
             "description": "MFA setup data"
           },
+          "400": {
+            "description": "Current password is required but was not provided"
+          },
           "401": {
-            "description": "Unauthorized"
+            "description": "Unauthorized or current password is incorrect"
           },
           "409": {
             "description": "MFA is already enabled; verify and disable it before re-enrollment"

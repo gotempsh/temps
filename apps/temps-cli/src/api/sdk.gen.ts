@@ -8021,10 +8021,14 @@ export const disableMfa = <ThrowOnError extends boolean = false>(options: Option
     }
 });
 
-export const setupMfa = <ThrowOnError extends boolean = false>(options?: Options<SetupMfaData, ThrowOnError>): RequestResult<SetupMfaResponses, SetupMfaErrors, ThrowOnError> => (options?.client ?? client).post<SetupMfaResponses, SetupMfaErrors, ThrowOnError>({
+export const setupMfa = <ThrowOnError extends boolean = false>(options: Options<SetupMfaData, ThrowOnError>): RequestResult<SetupMfaResponses, SetupMfaErrors, ThrowOnError> => (options.client ?? client).post<SetupMfaResponses, SetupMfaErrors, ThrowOnError>({
     security: [{ scheme: 'bearer', type: 'http' }],
     url: '/users/me/mfa/setup',
-    ...options
+    ...options,
+    headers: {
+        'Content-Type': 'application/json',
+        ...options.headers
+    }
 });
 
 export const verifyAndEnableMfa = <ThrowOnError extends boolean = false>(options: Options<VerifyAndEnableMfaData, ThrowOnError>): RequestResult<VerifyAndEnableMfaResponses, VerifyAndEnableMfaErrors, ThrowOnError> => (options.client ?? client).post<VerifyAndEnableMfaResponses, VerifyAndEnableMfaErrors, ThrowOnError>({
