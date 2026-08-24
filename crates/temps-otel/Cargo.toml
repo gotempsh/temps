@@ -78,7 +78,7 @@ moka = { version = "0.12", features = ["future"] }
 arc-swap = "1.7"
 
 [build-dependencies]
-prost-build = "0.13"
+prost-build = "0.14"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
