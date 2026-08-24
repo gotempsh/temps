@@ -50,6 +50,7 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { Plus, Trash2, Users } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
@@ -226,6 +227,8 @@ export function Teams() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const [searchParams, setSearchParams] = useSearchParams()
   const [teamToDelete, setTeamToDelete] = useState<TeamResponse | null>(null)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   usePageTitle('Teams')
 
@@ -257,8 +260,17 @@ export function Teams() {
       toast.success(`Team "${teamToDelete?.name}" deleted`)
       setTeamToDelete(null)
     },
-    onError: (err: Error) => {
-      toast.error(err.message || 'Failed to delete team')
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          deleteMutation.mutate(variables)
+        )
+      ) {
+        setTeamToDelete(null)
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(problem.detail || problem.message || 'Failed to delete team')
     },
   })
 
@@ -364,6 +376,8 @@ export function Teams() {
       </Card>
 
       <CreateTeamDialog open={createOpen} onOpenChange={setCreateOpen} />
+
+      {verificationDialog}
 
       <AlertDialog
         open={teamToDelete !== null}

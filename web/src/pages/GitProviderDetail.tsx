@@ -42,6 +42,7 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useFeedback } from '@/hooks/useFeedback'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -72,6 +73,8 @@ export default function GitProviderDetail() {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
   const [showCredentialsDialog, setShowCredentialsDialog] = useState(false)
   const queryClient = useQueryClient()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const providerId = parseInt(id || '0', 10)
 
@@ -157,16 +160,27 @@ export default function GitProviderDetail() {
 
   const deleteMutation = useMutation({
     ...deleteGitProviderMutation(),
-    // Failures surface via the global mutation error handler in App.tsx,
-    // which renders Problem Details as a toast: errorTitle becomes the
-    // toast title and the API's `detail` becomes the description (e.g.
-    // "Cannot delete provider X because it is used by N project(s): ...").
-    meta: { errorTitle: 'Failed to delete provider' },
     onSuccess: () => {
       toast.success('Git provider deleted successfully')
       queryClient.invalidateQueries({ queryKey: ['listGitProviders'] })
       queryClient.invalidateQueries({ queryKey: ['listConnections'] })
       navigate('/git-providers')
+    },
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          deleteMutation.mutate(variables)
+        )
+      ) {
+        setShowDeleteDialog(false)
+        return
+      }
+      // Failures that aren't a step-up challenge surface via toast.
+      // RFC 7807 Problem Details puts the human message in `detail`.
+      const problem = error as { detail?: string; title?: string; message?: string }
+      const detail =
+        problem.detail || problem.title || problem.message || 'Unknown error'
+      toast.error(`Failed to delete provider: ${detail}`)
     },
     onSettled: () => setShowDeleteDialog(false),
   })
@@ -571,6 +585,8 @@ export default function GitProviderDetail() {
         open={showCredentialsDialog}
         onOpenChange={setShowCredentialsDialog}
       />
+
+      {verificationDialog}
 
       {/* Delete Confirmation Dialog */}
       <Dialog open={showDeleteDialog} onOpenChange={setShowDeleteDialog}>

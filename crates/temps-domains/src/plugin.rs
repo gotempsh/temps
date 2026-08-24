@@ -125,6 +125,11 @@ impl TempsPlugin for DomainsPlugin {
                     std::sync::Arc::new(temps_core::telemetry::NoopTelemetryReporter)
                 });
 
+            // Central sensitive-action policy (MFA step-up), used to gate
+            // destructive domain operations like delete.
+            let sensitive_action_authorizer =
+                context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
             // Create DomainAppState for handlers
             let domain_app_state = create_domain_app_state_with_dns(
                 tls_service,
@@ -133,6 +138,7 @@ impl TempsPlugin for DomainsPlugin {
                 dns_provider_service,
                 audit_service,
                 telemetry,
+                sensitive_action_authorizer,
             );
             context.register_service(domain_app_state);
 

@@ -47,6 +47,7 @@ import {
 } from 'lucide-react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { toast } from 'sonner'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 
 type Variant = 'single-line' | 'two-line' | 'avatar'
 
@@ -68,6 +69,8 @@ export function ConnectionsCompactList({
   variant,
 }: ConnectionsCompactListProps) {
   const queryClient = useQueryClient()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const [updateTokenDialog, setUpdateTokenDialog] = useState<{
     open: boolean
     connectionId: number
@@ -90,10 +93,19 @@ export function ConnectionsCompactList({
     // The server refuses when projects still deploy from this connection and
     // says which ones in the Problem Details `detail`. Swallowing that left the
     // user with a bare "Failed to delete connection" and nothing to act on.
-    onError: (error: any) =>
+    onError: (error: any, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          deleteConnectionMut.mutate(variables)
+        )
+      ) {
+        setDeleteDialog({ open: false, connectionId: 0, connectionName: '' })
+        return
+      }
       toast.error('Failed to delete connection', {
         description: error?.detail || error?.title || error?.message,
-      }),
+      })
+    },
   })
 
   const [healthCheckInFlight, setHealthCheckInFlight] = useState<number | null>(
@@ -469,6 +481,8 @@ export function ConnectionsCompactList({
           setUpdateTokenDialog({ ...updateTokenDialog, open })
         }
       />
+
+      {verificationDialog}
 
       <AlertDialog
         open={deleteDialog.open}

@@ -199,6 +199,11 @@ impl TempsPlugin for GitPlugin {
                 .get_service::<dyn temps_core::telemetry::TelemetryReporter>()
                 .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
+            // Central sensitive-action policy (MFA step-up), used to gate
+            // destructive git provider and connection operations like delete.
+            let sensitive_action_authorizer =
+                context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
             let git_app_state = crate::handlers::types::create_git_app_state(
                 repository_service,
                 git_provider_manager,
@@ -208,6 +213,7 @@ impl TempsPlugin for GitPlugin {
                 cache_manager,
                 connection_health_service,
                 telemetry,
+                sensitive_action_authorizer,
             );
             context.register_plugin_state("git", git_app_state);
 

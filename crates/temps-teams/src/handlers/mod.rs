@@ -36,6 +36,10 @@ pub struct TeamsAppState {
     /// trait object the rest of the platform sees, so the access handlers
     /// can guard themselves with the very checker this crate registers.
     pub checker: Arc<TeamProjectAccessChecker>,
+    /// Central policy evaluator for sensitive mutations (e.g. deleting a
+    /// team) — challenges with MFA step-up when the acting user has one
+    /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 impl TeamsAppState {
@@ -43,11 +47,13 @@ impl TeamsAppState {
         team_service: Arc<dyn TeamService>,
         audit: Arc<dyn AuditLogger>,
         checker: Arc<TeamProjectAccessChecker>,
+        sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
     ) -> Self {
         Self {
             team_service,
             audit,
             checker,
+            sensitive_action_authorizer,
         }
     }
 }

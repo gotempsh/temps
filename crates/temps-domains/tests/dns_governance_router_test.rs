@@ -77,6 +77,22 @@ impl AuditLogger for RecordingAudit {
     }
 }
 
+/// Test double for handlers unrelated to sensitive-action gating -- always
+/// allows, so these permission/routing tests don't need to know about it.
+struct AllowAllSensitiveActions;
+
+#[async_trait]
+impl temps_core::SensitiveActionAuthorizer for AllowAllSensitiveActions {
+    async fn authorize(
+        &self,
+        _action: &temps_core::SensitiveAction,
+        _principal: &temps_core::SensitiveActionPrincipal,
+    ) -> Result<temps_core::SensitiveActionDecision, temps_core::SensitiveActionAuthorizationError>
+    {
+        Ok(temps_core::SensitiveActionDecision::Allow)
+    }
+}
+
 fn test_user() -> temps_entities::users::Model {
     let now = chrono::Utc::now();
     temps_entities::users::Model {
@@ -148,6 +164,7 @@ fn permission_router() -> axum::Router {
         dns_provider_service: None,
         audit_service: Arc::new(RecordingAudit::default()),
         telemetry: Arc::new(NoopTelemetryReporter),
+        sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
     });
     temps_domains::configure_routes().with_state(state)
 }
@@ -274,6 +291,7 @@ async fn test_setup_dns_inactive_provider_rejects_without_dns_or_audit_touch() {
         dns_provider_service: Some(dns_provider_service),
         audit_service: audit.clone(),
         telemetry: Arc::new(NoopTelemetryReporter),
+        sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
     });
 
     let mut request = Request::builder()
@@ -403,6 +421,7 @@ async fn test_setup_dns_normalized_zone_ambiguity_returns_conflict() {
         dns_provider_service: Some(dns_provider_service),
         audit_service: Arc::new(RecordingAudit::default()),
         telemetry: Arc::new(NoopTelemetryReporter),
+        sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
     });
     let mut request = Request::builder()
         .method(Method::POST)

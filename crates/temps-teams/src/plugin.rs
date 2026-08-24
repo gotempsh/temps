@@ -68,7 +68,15 @@ impl TempsPlugin for TeamsPlugin {
 
             let audit = context.require_service::<dyn temps_core::AuditLogger>();
 
-            let app_state = Arc::new(TeamsAppState::new(team_service, audit, checker.clone()));
+            let sensitive_action_authorizer =
+                context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
+            let app_state = Arc::new(TeamsAppState::new(
+                team_service,
+                audit,
+                checker.clone(),
+                sensitive_action_authorizer,
+            ));
             context.register_service(app_state);
 
             // Registering this activates `project_access_guard!` and
