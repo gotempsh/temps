@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::{body_full, Docker};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use schemars::JsonSchema;
 use sea_orm::{prelude::*, *};
 use serde::{Deserialize, Serialize};
@@ -648,25 +648,9 @@ impl PostgresService {
         // Pull image first
         info!("Pulling PostgreSQL image {}", config.docker_image);
 
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (config.docker_image.clone(), "latest".to_string())
-        };
-
-        docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await?;
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let container_name = self.get_container_name();
         let volume_name = format!("{}_data", container_name);
@@ -1891,32 +1875,13 @@ impl PostgresService {
     /// Verify that a Docker image can be pulled without actually downloading the full image
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (image.to_string(), "latest".to_string())
-        };
-
         info!("Attempting to pull Docker image: {}", image);
 
-        // Try to pull the image - this will fail if it doesn't exist
-        let result = self
-            .docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name.clone()),
-                    tag: Some(tag.clone()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await;
-
-        match result {
-            Ok(_) => {
+        // Try to pull the image - this will fail if it doesn't exist. Retries
+        // transient stream errors so a dropped connection isn't mistaken for
+        // the image genuinely being unavailable.
+        match crate::utils::pull_image_with_retry(&self.docker, image, None).await {
+            Ok(()) => {
                 info!("Docker image {} is available and pullable", image);
                 Ok(())
             }
@@ -2673,22 +2638,7 @@ impl PostgresService {
         let sidecar_image = postgres_config.docker_image.clone();
 
         info!("Pulling sidecar image {} for pg_dump", sidecar_image);
-        let (image_name, image_tag) = sidecar_image
-            .split_once(':')
-            .map(|(n, t)| (n.to_string(), t.to_string()))
-            .unwrap_or_else(|| (sidecar_image.clone(), "latest".to_string()));
-
-        self.docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(image_tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
+        crate::utils::pull_image_with_retry(&self.docker, &sidecar_image, None)
             .await
             .map_err(|e| {
                 anyhow::anyhow!(

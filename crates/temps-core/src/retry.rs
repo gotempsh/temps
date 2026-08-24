@@ -118,7 +118,13 @@ impl RetryConfig {
     }
 
     /// Compute the delay for the given attempt using exponential backoff.
-    fn compute_delay(&self, attempt: u32) -> Duration {
+    ///
+    /// `pub` (not just crate-internal) so callers that need early-exit
+    /// semantics `retry()` doesn't support — e.g. stopping immediately on a
+    /// terminal error instead of retrying it — can hand-roll their own loop
+    /// while still reusing this config's backoff math instead of duplicating
+    /// it.
+    pub fn compute_delay(&self, attempt: u32) -> Duration {
         let delay = self.base_delay.saturating_mul(1 << attempt);
         std::cmp::min(delay, self.max_delay)
     }

@@ -340,25 +340,9 @@ echo '[restore] complete'"#;
         // Pull the image first
         info!("Pulling MinIO image {}", config.docker_image);
 
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (config.docker_image.to_string(), "latest".to_string())
-        };
-
-        docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await?;
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let container_name = self.get_container_name();
         // Add volume name construction
@@ -527,25 +511,9 @@ echo '[restore] complete'"#;
     async fn pull_mc_image(&self, docker: &Docker) -> Result<()> {
         info!("Pulling MinIO Client image {}", Self::MC_IMAGE);
 
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = Self::MC_IMAGE.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (Self::MC_IMAGE.to_string(), "latest".to_string())
-        };
-
-        docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await?;
+        crate::utils::pull_image_with_retry(docker, Self::MC_IMAGE, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
 
@@ -685,32 +653,13 @@ echo '[restore] complete'"#;
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
     #[allow(dead_code)]
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (image.to_string(), "latest".to_string())
-        };
-
         info!("Attempting to pull Docker image: {}", image);
 
-        // Try to pull the image - this will fail if it doesn't exist
-        let result = self
-            .docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name.clone()),
-                    tag: Some(tag.clone()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await;
-
-        match result {
-            Ok(_) => {
+        // Try to pull the image - this will fail if it doesn't exist. Retries
+        // transient stream errors so a dropped connection isn't mistaken for
+        // the image genuinely being unavailable.
+        match crate::utils::pull_image_with_retry(&self.docker, image, None).await {
+            Ok(()) => {
                 info!("Docker image {} is available and pullable", image);
                 Ok(())
             }

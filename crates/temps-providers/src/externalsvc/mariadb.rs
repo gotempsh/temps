@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::{body_full, Docker};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -527,26 +527,11 @@ impl MariaDbService {
             );
         } else {
             info!("Pulling MariaDB image {}", config.docker_image);
-            let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
-                (name.to_string(), tag.to_string())
-            } else {
-                (config.docker_image.clone(), "latest".to_string())
-            };
 
-            tokio::time::timeout(MARIADB_IMAGE_PULL_TIMEOUT, async {
-                docker
-                    .create_image(
-                        Some(bollard::query_parameters::CreateImageOptions {
-                            from_image: Some(image_name),
-                            tag: Some(tag),
-                            ..Default::default()
-                        }),
-                        None,
-                        None,
-                    )
-                    .try_collect::<Vec<_>>()
-                    .await
-            })
+            tokio::time::timeout(
+                MARIADB_IMAGE_PULL_TIMEOUT,
+                crate::utils::pull_image_with_retry(docker, &config.docker_image, None),
+            )
             .await
             .map_err(|_| {
                 anyhow::anyhow!(

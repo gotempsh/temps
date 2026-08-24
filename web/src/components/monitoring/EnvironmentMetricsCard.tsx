@@ -21,6 +21,7 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Button } from '@/components/ui/button'
 import { format } from 'date-fns'
 import { Link } from 'react-router'
 import { LineChart as LineChartIcon } from 'lucide-react'
@@ -131,6 +132,11 @@ export function EnvironmentMetricsCharts({
   environmentId,
 }: EnvironmentMetricsChartsProps) {
   const [range, setRange] = useState<RangeValue>('1h')
+  // Long-lived environments accumulate one history entry per past redeploy;
+  // charting all of them by default turns the legend into unreadable noise
+  // (one line + label per replaced container). Default to the current
+  // container(s) only, with an explicit toggle to bring the rest back.
+  const [showReplaced, setShowReplaced] = useState(false)
 
   const historyQuery = useQuery({
     ...listContainerHistoryOptions({
@@ -147,9 +153,25 @@ export function EnvironmentMetricsCharts({
     [historyQuery.data]
   )
 
+  const currentCount = useMemo(
+    () => entries.filter((c) => c.is_current).length,
+    [entries]
+  )
+  const replacedCount = entries.length - currentCount
+
+  // If nothing is currently running there's no "current" set to fall back
+  // to, so show full history rather than an empty chart.
+  const visibleEntries = useMemo(
+    () =>
+      showReplaced || currentCount === 0
+        ? entries
+        : entries.filter((c) => c.is_current),
+    [entries, showReplaced, currentCount]
+  )
+
   const containerSeries = useMemo(() => {
     const map = new Map<string, ContainerSeries>()
-    entries.forEach((c, i) => {
+    visibleEntries.forEach((c, i) => {
       map.set(c.container_id, {
         key: `c${i}`,
         label:
@@ -159,7 +181,7 @@ export function EnvironmentMetricsCharts({
       })
     })
     return map
-  }, [entries])
+  }, [visibleEntries])
 
   const historyOptionsFor = (containerId: string, metric: string) => ({
     ...containerMetricsGetHistoryOptions({
@@ -178,30 +200,30 @@ export function EnvironmentMetricsCharts({
   })
 
   const cpuQueries = useQueries({
-    queries: entries.map((c) =>
+    queries: visibleEntries.map((c) =>
       historyOptionsFor(c.container_id, 'container.cpu_percent')
     ),
   })
   const memQueries = useQueries({
-    queries: entries.map((c) =>
+    queries: visibleEntries.map((c) =>
       historyOptionsFor(c.container_id, 'container.memory_used_bytes')
     ),
   })
   const netRxQueries = useQueries({
-    queries: entries.map((c) =>
+    queries: visibleEntries.map((c) =>
       historyOptionsFor(c.container_id, 'container.network_rx_bytes_delta')
     ),
   })
   const netTxQueries = useQueries({
-    queries: entries.map((c) =>
+    queries: visibleEntries.map((c) =>
       historyOptionsFor(c.container_id, 'container.network_tx_bytes_delta')
     ),
   })
 
   const isLoading = historyQuery.isLoading
   const notConfigured =
-    entries.length > 0 &&
-    cpuQueries.length === entries.length &&
+    visibleEntries.length > 0 &&
+    cpuQueries.length === visibleEntries.length &&
     cpuQueries.every(
       (q) =>
         q.isError &&
@@ -242,18 +264,18 @@ export function EnvironmentMetricsCharts({
   const cpuData = useMemo(
     () =>
       mergeHistory(
-        entries.map((c, i) => ({
+        visibleEntries.map((c, i) => ({
           key: `cpu_${containerSeries.get(c.container_id)!.key}`,
           points: cpuQueries[i]?.data ?? [],
         }))
       ),
-    [entries, cpuQueries, containerSeries]
+    [visibleEntries, cpuQueries, containerSeries]
   )
 
   const memData = useMemo(
     () =>
       mergeHistory(
-        entries.map((c, i) => ({
+        visibleEntries.map((c, i) => ({
           key: `mem_${containerSeries.get(c.container_id)!.key}`,
           points: (memQueries[i]?.data ?? []).map((p) => ({
             time: p.time,
@@ -261,20 +283,20 @@ export function EnvironmentMetricsCharts({
           })),
         }))
       ),
-    [entries, memQueries, containerSeries]
+    [visibleEntries, memQueries, containerSeries]
   )
 
   const netData = useMemo(
     () =>
       mergeHistory([
-        ...entries.map((c, i) => ({
+        ...visibleEntries.map((c, i) => ({
           key: `rx_${containerSeries.get(c.container_id)!.key}`,
           points: (netRxQueries[i]?.data ?? []).map((p) => ({
             time: p.time,
             value: p.value / 1024,
           })),
         })),
-        ...entries.map((c, i) => ({
+        ...visibleEntries.map((c, i) => ({
           key: `tx_${containerSeries.get(c.container_id)!.key}`,
           points: (netTxQueries[i]?.data ?? []).map((p) => ({
             time: p.time,
@@ -282,7 +304,7 @@ export function EnvironmentMetricsCharts({
           })),
         })),
       ]),
-    [entries, netRxQueries, netTxQueries, containerSeries]
+    [visibleEntries, netRxQueries, netTxQueries, containerSeries]
   )
 
   if (isLoading) {
@@ -329,14 +351,26 @@ export function EnvironmentMetricsCharts({
     )
   }
 
-  const currentCount = entries.filter((c) => c.is_current).length
-
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-wrap items-center justify-between gap-2">
         <p className="text-xs text-muted-foreground">
-          {currentCount} running · {entries.length - currentCount} replaced by
-          earlier redeploys
+          {currentCount} running
+          {replacedCount > 0 && (
+            <>
+              {' · '}
+              <Button
+                type="button"
+                variant="link"
+                size="sm"
+                className="h-auto p-0 text-xs text-muted-foreground underline decoration-dotted underline-offset-2 hover:text-foreground"
+                onClick={() => setShowReplaced((v) => !v)}
+              >
+                {replacedCount} replaced by earlier redeploys —{' '}
+                {showReplaced ? 'hide' : 'show'}
+              </Button>
+            </>
+          )}
         </p>
         <Select value={range} onValueChange={(v) => setRange(v as RangeValue)}>
           <SelectTrigger className="w-[160px]">

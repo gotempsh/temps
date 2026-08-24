@@ -171,7 +171,13 @@ pub struct UpgradeCommand {
     /// is also copied to `<data-dir>/data/license.jwt` and, if a systemd
     /// unit exists, the unit's `TEMPS_EE_LICENSE_PATH` env is updated so
     /// the binary finds its license on every restart.
-    #[arg(long)]
+    ///
+    /// Also readable from `TEMPS_EE_LICENSE_PATH` -- the same env var an
+    /// EE binary's own startup gate reads, so one value covers both "the
+    /// license this running binary starts with" and "the license to
+    /// install for this upgrade" when they're the same file, which they
+    /// almost always are.
+    #[arg(long, env = "TEMPS_EE_LICENSE_PATH")]
     pub license_path: Option<PathBuf>,
 
     /// Base URL of the Temps Cloud EE proxy (`--tier ee` only). Defaults to

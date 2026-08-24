@@ -6,7 +6,7 @@ use bollard::query_parameters::{
     StopContainerOptions, WaitContainerOptionsBuilder,
 };
 use bollard::{body_full, Docker};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use mongodb::bson::doc;
 use mongodb::options::ClientOptions;
 use mongodb::Client as MongoClient;
@@ -478,18 +478,9 @@ impl MongodbService {
 
         // Pull the image first
         info!("Pulling MongoDB image: {}", image_tag);
-        let mut stream = docker.create_image(
-            Some(bollard::query_parameters::CreateImageOptions {
-                from_image: Some(image_tag.clone()),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-
-        while let Some(result) = stream.next().await {
-            result.map_err(|e| anyhow::anyhow!("Failed to pull MongoDB image: {}", e))?;
-        }
+        crate::utils::pull_image_with_retry(docker, &image_tag, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to pull MongoDB image: {}", e))?;
 
         let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(crate::utils::local_port_binding("27017/tcp", &config.port)),
@@ -951,32 +942,13 @@ impl MongodbService {
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
     #[allow(dead_code)]
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (image.to_string(), "latest".to_string())
-        };
-
         info!("Attempting to pull Docker image: {}", image);
 
-        // Try to pull the image - this will fail if it doesn't exist
-        let result = self
-            .docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name.clone()),
-                    tag: Some(tag.clone()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await;
-
-        match result {
-            Ok(_) => {
+        // Try to pull the image - this will fail if it doesn't exist. Retries
+        // transient stream errors so a dropped connection isn't mistaken for
+        // the image genuinely being unavailable.
+        match crate::utils::pull_image_with_retry(&self.docker, image, None).await {
+            Ok(()) => {
                 info!("Docker image {} is available and pullable", image);
                 Ok(())
             }
@@ -1745,23 +1717,15 @@ impl MongodbService {
         password: &str,
     ) -> Result<()> {
         // Pull the sidecar image (no-op if already present).
-        let mut pull_stream = self.docker.create_image(
-            Some(bollard::query_parameters::CreateImageOptions {
-                from_image: Some(MONGO_SIDECAR_IMAGE.to_string()),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        while let Some(result) = pull_stream.next().await {
-            result.map_err(|e| {
+        crate::utils::pull_image_with_retry(&self.docker, MONGO_SIDECAR_IMAGE, None)
+            .await
+            .map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to pull sidecar image {}: {}",
                     MONGO_SIDECAR_IMAGE,
                     e
                 )
             })?;
-        }
 
         let container_archive_path = format!("/backup/{}", archive_filename);
         let sidecar_name = format!(
@@ -4239,6 +4203,7 @@ mod tests {
         use super::super::test_utils::{
             create_mock_backup, create_mock_db, create_mock_external_service, MinioTestContainer,
         };
+        use futures::TryStreamExt;
 
         // Check if Docker is available
         let docker = match Docker::connect_with_local_defaults() {

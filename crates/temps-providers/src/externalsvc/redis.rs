@@ -8,7 +8,6 @@ use async_trait::async_trait;
 use bollard::query_parameters::{InspectContainerOptions, StopContainerOptions};
 use bollard::Docker;
 use flate2::read::GzDecoder;
-use futures::TryStreamExt;
 use redis::{aio::ConnectionManager, AsyncCommands, Client};
 use schemars::JsonSchema;
 use sea_orm::prelude::*;
@@ -339,24 +338,7 @@ impl RedisService {
         // Use the docker_image from config
         info!("Pulling Redis image {}", config.docker_image);
 
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (config.docker_image.to_string(), "latest".to_string())
-        };
-
-        docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to pull Redis image: {}", e))?;
 
@@ -875,32 +857,13 @@ impl RedisService {
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
     #[allow(dead_code)]
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (image.to_string(), "latest".to_string())
-        };
-
         info!("Attempting to pull Docker image: {}", image);
 
-        // Try to pull the image - this will fail if it doesn't exist
-        let result = self
-            .docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name.clone()),
-                    tag: Some(tag.clone()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await;
-
-        match result {
-            Ok(_) => {
+        // Try to pull the image - this will fail if it doesn't exist. Retries
+        // transient stream errors so a dropped connection isn't mistaken for
+        // the image genuinely being unavailable.
+        match crate::utils::pull_image_with_retry(&self.docker, image, None).await {
+            Ok(()) => {
                 info!("Docker image {} is available and pullable", image);
                 Ok(())
             }

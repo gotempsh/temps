@@ -409,23 +409,7 @@ impl PostgresContainerLifecycle for PostgresLifecycleAdapter {
         let pgdata_path = Self::pgdata_path_for(image)?;
 
         // Pull image first for clear fail-fast errors.
-        let (image_name, tag) = match image.split_once(':') {
-            Some((n, t)) => (n.to_string(), t.to_string()),
-            None => (image.to_string(), "latest".to_string()),
-        };
-        self.docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| format!("pull image '{}' failed: {}", image, e))?;
+        crate::utils::pull_image_with_retry(&self.docker, image, None).await?;
 
         // Create volume if missing — idempotent.
         self.docker

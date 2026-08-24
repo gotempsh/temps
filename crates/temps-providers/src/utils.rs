@@ -1,6 +1,11 @@
+use bollard::auth::DockerCredentials;
+use bollard::query_parameters::CreateImageOptions;
 use bollard::{models::NetworkCreateRequest, query_parameters::ListNetworksOptions, Docker};
+use futures::StreamExt;
 use std::collections::HashMap;
-use tracing::{error, info};
+use std::time::Duration;
+use temps_core::retry::RetryConfig;
+use tracing::{error, info, warn};
 
 pub(crate) async fn ensure_network_exists(
     docker: &Docker,
@@ -80,9 +85,137 @@ pub(crate) fn local_port_binding(
     )])
 }
 
+/// True for a definitive "this image cannot be pulled, ever" response from
+/// the registry (image doesn't exist, access denied, bad reference) — a 4xx
+/// `DockerResponseServerError`. Everything else (a mid-stream drop like
+/// "bytes remaining on stream", a hyper/IO error, a request timeout, or a
+/// 5xx from the registry) is presumed transient. Matches this project's own
+/// resilience rule: retry transient failures, not not-found/auth errors.
+fn is_terminal_pull_error(e: &bollard::errors::Error) -> bool {
+    matches!(
+        e,
+        bollard::errors::Error::DockerResponseServerError { status_code, .. }
+            if (400..500).contains(status_code)
+    )
+}
+
+/// Pull a Docker image, retrying transient stream failures (e.g. "bytes
+/// remaining on stream" from a connection dropped mid-transfer) instead of
+/// failing the whole provisioning attempt on the first hiccup. Does NOT
+/// retry a terminal failure (image not found, access denied) — see
+/// `is_terminal_pull_error` — so a typo'd image name fails fast instead of
+/// burning ~20s on backoff for something that will never succeed.
+///
+/// `image` is the full reference including tag (e.g. `"mongo:8"`), matching
+/// how every call site already builds it. Docker's daemon caches layers by
+/// digest, so a retried pull only re-fetches whatever didn't finish, not the
+/// whole image — cheap even for large images like MongoDB's. This is why a
+/// bare retry (no attempt to resume mid-stream) is the right fix here rather
+/// than something more elaborate.
+///
+/// Returns `Err(String)` with the image name and last error already folded
+/// in, so callers can pass it straight to their existing error type/message
+/// via `.map_err(...)` without needing to know the retry happened.
+pub(crate) async fn pull_image_with_retry(
+    docker: &Docker,
+    image: &str,
+    registry_credentials: Option<DockerCredentials>,
+) -> Result<(), String> {
+    let retry = RetryConfig::new(3)
+        .with_base_delay(Duration::from_secs(2))
+        .with_max_delay(Duration::from_secs(15));
+
+    for attempt in 0..retry.max_attempts {
+        let mut stream = docker.create_image(
+            Some(CreateImageOptions {
+                from_image: Some(image.to_string()),
+                ..Default::default()
+            }),
+            None,
+            registry_credentials.clone(),
+        );
+
+        let mut pull_err = None;
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                pull_err = Some(e);
+                break;
+            }
+        }
+
+        let Some(e) = pull_err else {
+            return Ok(());
+        };
+
+        let is_last_attempt = attempt + 1 >= retry.max_attempts;
+        if is_terminal_pull_error(&e) || is_last_attempt {
+            warn!("Failed to pull image '{}': {}", image, e);
+            return Err(format!("failed to pull image '{}': {}", image, e));
+        }
+
+        let delay = retry.compute_delay(attempt);
+        warn!(
+            "Pull attempt {}/{} for image '{}' failed, retrying in {:?}: {}",
+            attempt + 1,
+            retry.max_attempts,
+            image,
+            delay,
+            e
+        );
+        tokio::time::sleep(delay).await;
+    }
+
+    unreachable!("loop always returns Ok or Err before exhausting max_attempts")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn test_pull_image_with_retry_pulls_a_real_image() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker unavailable, skipping: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+
+        let result = pull_image_with_retry(&docker, "busybox:latest", None).await;
+        assert!(result.is_ok(), "expected pull to succeed: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn test_pull_image_with_retry_reports_the_image_name_on_failure() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                println!("Docker unavailable, skipping: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping");
+            return;
+        }
+
+        let result = pull_image_with_retry(
+            &docker,
+            "temps-nonexistent-image-fixture:does-not-exist",
+            None,
+        )
+        .await;
+        let err = result.expect_err("pulling a nonexistent image must fail");
+        assert!(
+            err.contains("temps-nonexistent-image-fixture:does-not-exist"),
+            "error should name the image that failed to pull: {err}"
+        );
+    }
 
     #[test]
     fn test_local_port_binding_binds_to_loopback_only() {

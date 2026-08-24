@@ -7421,7 +7421,6 @@ echo "[restore] Pre-seed complete"
     ) -> Result<(String, Option<i32>, Option<String>), ExternalServiceError> {
         use bollard::models::*;
         use bollard::query_parameters::*;
-        use futures::TryStreamExt;
 
         // Ensure network exists
         crate::utils::ensure_network_exists(&self.docker)
@@ -7432,21 +7431,9 @@ echo "[restore] Pre-seed complete"
             })?;
 
         // Pull image
-        self.docker
-            .create_image(
-                Some(CreateImageOptions {
-                    from_image: Some(params.image.clone()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
+        crate::utils::pull_image_with_retry(&self.docker, &params.image, None)
             .await
-            .map_err(|e| ExternalServiceError::DockerError {
-                id: 0,
-                reason: format!("Failed to pull image {}: {}", params.image, e),
-            })?;
+            .map_err(|e| ExternalServiceError::DockerError { id: 0, reason: e })?;
 
         // Create volume
         let volume_name = format!("{}_data", container_name);
