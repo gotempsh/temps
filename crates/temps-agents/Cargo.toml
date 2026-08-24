@@ -43,7 +43,7 @@ http-body-util = { workspace = true }
 tar = "0.4"
 flate2 = { workspace = true }
 walkdir = { workspace = true }
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 libc = { workspace = true }
 rand = { workspace = true }
 hex = "0.4"
