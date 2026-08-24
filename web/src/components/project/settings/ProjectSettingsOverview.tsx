@@ -91,6 +91,12 @@ const settingsGroups: SettingsGroup[] = [
         url: 'settings/access',
         icon: Users,
       },
+      {
+        title: 'Deployment tokens',
+        description: 'Manage API tokens injected into deployed applications.',
+        url: 'settings/deployment-tokens',
+        icon: KeyRound,
+      },
     ],
   },
   {

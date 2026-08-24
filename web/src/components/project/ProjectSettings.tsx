@@ -17,6 +17,7 @@ import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
 import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
 import { WebhookDetail } from './settings/webhooks/WebhookDetail'
 import { ProjectSettingsOverview } from './settings/ProjectSettingsOverview'
+import { DeploymentTokensSettings } from './settings/DeploymentTokensSettings'
 
 interface ProjectSettingsProps {
   project: ProjectResponse
@@ -79,6 +80,10 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         <Route
           path="mcp-servers"
           element={<McpServersSettings project={project} />}
+        />
+        <Route
+          path="deployment-tokens"
+          element={<DeploymentTokensSettings project={project} />}
         />
         <Route path="*" element={<Navigate to="." replace />} />
       </Routes>

@@ -523,6 +523,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 deployment_token_service,
                 audit_service: audit_service.clone(),
                 project_access_checker: project_access_checker.clone(),
+                sensitive_action_authorizer: sensitive_action_authorizer.clone(),
             });
 
         // Get data directory for local file storage
