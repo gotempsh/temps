@@ -69,11 +69,15 @@ pub const STEP_UP_TTL_MINUTES: i64 = 5;
 /// incentive; it does not remove a barrier the attacker could not already
 /// cross.
 ///
-/// **That reasoning is load-bearing.** If enrolment is ever put behind
-/// re-authentication (current password, or a step-up for re-enrolment), the
-/// pre-existing behaviour *would* become a real control, and this policy must
-/// be revisited at the same time — otherwise the fix to enrolment silently
-/// leaves this hole open behind it.
+/// **Update:** `POST /users/me/mfa/setup` now requires the caller's current
+/// password when the account has one set (see `UserService::setup_mfa`), so
+/// the attack this section describes is closed for password-backed accounts
+/// — a stolen session alone can no longer self-enrol without also knowing
+/// the password. SSO-only accounts (no local password) still skip that
+/// check, so the reasoning above still applies to them, and revisiting this
+/// policy for password-backed accounts (e.g. requiring step-up before
+/// unenrolled principals can act) is a reasonable follow-up now that the
+/// premise has changed.
 ///
 /// # Operators who want the stricter posture
 ///
