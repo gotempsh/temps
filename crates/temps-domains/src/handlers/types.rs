@@ -6,6 +6,7 @@ use temps_dns::services::DnsProviderService;
 
 use utoipa::ToSchema;
 
+#[derive(Clone)]
 pub struct DomainAppState {
     pub tls_service: Arc<TlsService>,
     pub repository: Arc<dyn CertificateRepository>,

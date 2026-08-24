@@ -9,6 +9,7 @@ use temps_config::ConfigService;
 use temps_core::AuditLogger;
 use utoipa::ToSchema;
 
+#[derive(Clone)]
 pub struct GitAppState {
     pub git_provider_manager: Arc<GitProviderManager>,
     pub audit_service: Arc<dyn AuditLogger>,

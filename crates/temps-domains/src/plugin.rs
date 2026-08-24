@@ -151,6 +151,20 @@ impl TempsPlugin for DomainsPlugin {
         // Get the DomainAppState
         let domain_app_state = context.require_service::<DomainAppState>();
 
+        // Rebind the authorizer here rather than trust the one captured in
+        // `register_services`: an EE/custom `SensitiveActionAuthorizer` may
+        // be registered by a plugin later in registration order, and
+        // last-write-wins service registration means the earliest-registered
+        // instance otherwise wins silently. `configure_routes` runs only
+        // after every plugin's `register_services` has completed, so
+        // re-resolving here always sees the final policy — same pattern as
+        // AuthPlugin's `with_sensitive_action_authorizer`.
+        let domain_app_state = Arc::new(DomainAppState {
+            sensitive_action_authorizer: context
+                .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+            ..(*domain_app_state).clone()
+        });
+
         // Configure routes
         let domains_routes = handlers::configure_routes().with_state(domain_app_state);
 

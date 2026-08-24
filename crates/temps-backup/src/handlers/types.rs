@@ -7,6 +7,7 @@ use temps_providers::postgres_upgrade_service::PostgresUpgradeService;
 use crate::services::{BackupService, RestoreService};
 
 /// Application state shared across all backup HTTP handlers.
+#[derive(Clone)]
 pub struct BackupAppState {
     pub backup_service: Arc<BackupService>,
     pub restore_service: Arc<RestoreService>,

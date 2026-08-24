@@ -407,6 +407,21 @@ impl TempsPlugin for BackupPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let backup_app_state = context.require_service::<BackupAppState>();
+
+        // Rebind the authorizer here rather than trust the one captured in
+        // `register_services`: an EE/custom `SensitiveActionAuthorizer` may
+        // be registered by a plugin later in registration order, and
+        // last-write-wins service registration means the earliest-registered
+        // instance otherwise wins silently. `configure_routes` runs only
+        // after every plugin's `register_services` has completed, so
+        // re-resolving here always sees the final policy — same pattern as
+        // AuthPlugin's `with_sensitive_action_authorizer`.
+        let backup_app_state = Arc::new(BackupAppState {
+            sensitive_action_authorizer: context
+                .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+            ..(*backup_app_state).clone()
+        });
+
         let routes = handlers::configure_routes()
             .merge(handlers::pg_upgrade_handler::configure_routes())
             .merge(handlers::restore_handler::configure_routes())
