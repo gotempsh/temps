@@ -10,7 +10,7 @@ use axum::{
 use cookie::Cookie;
 use serde::{Deserialize, Serialize};
 use temps_core::problemdetails::Problem;
-use temps_core::{AuditContext, RequestMetadata};
+use temps_core::{AuditContext, RequestMetadata, SensitiveAction};
 use tracing::{error, warn};
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
@@ -496,6 +496,12 @@ pub async fn create_oidc_provider(
     Json(request): Json<CreateOidcProviderRequest>,
 ) -> Result<(StatusCode, Json<OidcProviderResponse>), Problem> {
     permission_guard!(auth, SettingsWrite);
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::CreateOidcProvider,
+    )
+    .await?;
     let provider = state.oidc_service.create_provider(request).await?;
 
     if let Err(e) = state
@@ -572,6 +578,12 @@ pub async fn update_oidc_provider(
     Json(request): Json<UpdateOidcProviderRequest>,
 ) -> Result<Json<OidcProviderResponse>, Problem> {
     permission_guard!(auth, SettingsWrite);
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::UpdateOidcProvider { provider_id },
+    )
+    .await?;
 
     // Capture which fields the PATCH touched *before* moving the
     // request into the service. The audit row is most useful when an
@@ -774,6 +786,12 @@ pub async fn create_oidc_role_mapping(
     Json(request): Json<CreateOidcRoleMappingRequest>,
 ) -> Result<(StatusCode, Json<OidcRoleMappingResponse>), Problem> {
     permission_guard!(auth, SettingsWrite);
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::CreateOidcRoleMapping { provider_id },
+    )
+    .await?;
     let mapping = state
         .oidc_service
         .create_role_mapping(provider_id, request)
@@ -815,6 +833,12 @@ pub async fn delete_oidc_role_mapping(
     Path(mapping_id): Path<i32>,
 ) -> Result<StatusCode, Problem> {
     permission_guard!(auth, SettingsWrite);
+    crate::require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteOidcRoleMapping { mapping_id },
+    )
+    .await?;
     state.oidc_service.delete_role_mapping(mapping_id).await?;
 
     if let Err(e) = state

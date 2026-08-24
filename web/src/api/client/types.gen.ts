@@ -10637,6 +10637,14 @@ export type MfaSetupResponse = {
     secret_key: string;
 };
 
+export type SetupMfaRequest = {
+    /**
+     * Required to enroll MFA on an account that has a password set.
+     * Omit (or leave empty) for SSO-only accounts with no local password.
+     */
+    current_password?: string | null;
+};
+
 export type MfaVerificationRequest = {
     code: string;
 };
@@ -52192,7 +52200,7 @@ export type DisableMfaResponses = {
 export type DisableMfaResponse = DisableMfaResponses[keyof DisableMfaResponses];
 
 export type SetupMfaData = {
-    body?: never;
+    body?: SetupMfaRequest;
     path?: never;
     query?: never;
     url: '/users/me/mfa/setup';

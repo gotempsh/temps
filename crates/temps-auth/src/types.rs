@@ -152,6 +152,14 @@ pub struct ChangePasswordRequest {
 
 // Add new request/response types
 #[derive(Deserialize, utoipa::ToSchema)]
+pub struct SetupMfaRequest {
+    /// Required to enroll MFA on an account that has a password set.
+    /// Omit (or leave empty) for SSO-only accounts with no local password.
+    #[schema(example = "current_password_value")]
+    pub current_password: Option<String>,
+}
+
+#[derive(Deserialize, utoipa::ToSchema)]
 pub struct VerifyMfaRequest {
     pub code: String,
 }

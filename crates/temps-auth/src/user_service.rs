@@ -114,6 +114,12 @@ pub enum UserServiceError {
     #[error("Serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 
+    #[error("Current password is required to enroll MFA for user {user_id}")]
+    CurrentPasswordRequired { user_id: i32 },
+
+    #[error("Current password is incorrect for user {user_id}")]
+    InvalidCurrentPassword { user_id: i32 },
+
     #[error("Internal error: {0}")]
     Internal(String),
 }
@@ -843,7 +849,11 @@ impl UserService {
         Ok(user_with_roles)
     }
 
-    pub async fn setup_mfa(&self, user_id: i32) -> Result<MfaSetupData, UserServiceError> {
+    pub async fn setup_mfa(
+        &self,
+        user_id: i32,
+        current_password: Option<&str>,
+    ) -> Result<MfaSetupData, UserServiceError> {
         // Serialize setup per user and cap total Argon2 work across accounts.
         // This guard is acquired before any database or CPU work so repeated
         // requests cannot amplify password hashing for one account.
@@ -859,6 +869,35 @@ impl UserService {
 
         if initial_user.mfa_enabled {
             return Err(UserServiceError::MfaAlreadyEnabled(user_id));
+        }
+
+        // Re-authenticate via current password before generating any new
+        // credentials. Accounts with no password set (SSO-only) skip this
+        // check entirely — there is nothing to re-verify.
+        if let Some(hash) = &initial_user.password_hash {
+            let provided = current_password
+                .filter(|p| !p.is_empty())
+                .ok_or(UserServiceError::CurrentPasswordRequired { user_id })?;
+            // Only Argon2 hashes are acceptable. A legacy bcrypt row would
+            // already have been migrated at login, so this path should never
+            // be reached in practice; treat it as a mismatch to be safe.
+            if !hash.starts_with("$argon2") {
+                warn!(
+                    user_id,
+                    "MFA enrollment blocked: unsupported password hash format"
+                );
+                return Err(UserServiceError::InvalidCurrentPassword { user_id });
+            }
+            use argon2::PasswordVerifier;
+            let parsed = argon2::password_hash::PasswordHash::new(hash)
+                .map_err(|_| UserServiceError::InvalidCurrentPassword { user_id })?;
+            if argon2::Argon2::default()
+                .verify_password(provided.as_bytes(), &parsed)
+                .is_err()
+            {
+                warn!(user_id, "MFA enrollment blocked: current password mismatch");
+                return Err(UserServiceError::InvalidCurrentPassword { user_id });
+            }
         }
 
         // Argon2 and PNG encoding are intentionally kept off Tokio's async
@@ -1473,7 +1512,7 @@ mod tests {
         let service = UserService::new(db.clone());
 
         let setup = service
-            .setup_mfa(7)
+            .setup_mfa(7, None)
             .await
             .expect("pending MFA setup should be resumable");
 
@@ -1512,7 +1551,7 @@ mod tests {
         );
         let service = UserService::new(db.clone());
 
-        let result = service.setup_mfa(7).await;
+        let result = service.setup_mfa(7, None).await;
 
         assert!(matches!(
             result,

@@ -37,8 +37,8 @@ use crate::types::{
     AssignRoleRequest, AuthStatusResponse, AuthTokenResponse, ChangePasswordRequest,
     CliLoginRequest, CreateUserRequest, DisableMfaRequest, InitAuthResponse, MfaRequiredResponse,
     MfaSetupResponse, MfaVerificationRequest, RouteRole, RouteUser, RouteUserWithRoles,
-    StepUpResponse, TokenRenewalRequest, UpdateSelfRequest, UpdateUserRequest, UserResponse,
-    VerifyMfaRequest, VerifyStepUpRequest,
+    SetupMfaRequest, StepUpResponse, TokenRenewalRequest, UpdateSelfRequest, UpdateUserRequest,
+    UserResponse, VerifyMfaRequest, VerifyStepUpRequest,
 };
 use temps_core::problemdetails::{new as problem_new, Problem};
 
@@ -1775,6 +1775,16 @@ impl From<UserServiceError> for Problem {
                     .with_title("Internal Error")
                     .with_detail("An unexpected error occurred. Please try again.")
             }
+            UserServiceError::CurrentPasswordRequired { .. } => {
+                problem_new(StatusCode::BAD_REQUEST)
+                    .with_title("Current Password Required")
+                    .with_detail("Provide your current password to enroll MFA.")
+            }
+            UserServiceError::InvalidCurrentPassword { .. } => {
+                problem_new(StatusCode::UNAUTHORIZED)
+                    .with_title("Invalid Current Password")
+                    .with_detail("The current password you entered is incorrect.")
+            }
         }
     }
 }
@@ -1795,7 +1805,7 @@ impl From<UserServiceError> for Problem {
         disable_mfa
     ),
     components(
-        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
+        schemas(RouteUser, RouteRole, RouteUserWithRoles, AssignRoleRequest, CreateUserRequest, UpdateUserRequest, UpdateSelfRequest, SetupMfaRequest, VerifyMfaRequest, MfaSetupResponse, DisableMfaRequest)
     ),
     tags(
         (name = "Users", description = "User management API")
@@ -1966,6 +1976,13 @@ async fn assign_role(
                 }
             }
         })?;
+
+    crate::require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        temps_core::SensitiveAction::AssignRole { user_id },
+    )
+    .await?;
 
     // Verify role type is valid
     let role_type = match RoleType::from_str(&assign_req.role_type) {
@@ -2274,6 +2291,18 @@ async fn update_self(
             .build());
     }
 
+    // Email change is security-sensitive: it redirects account recovery and
+    // notification email. Require a step-up challenge when the request
+    // contains a new email address. Name-only edits are safe without it.
+    if update_req.email.is_some() {
+        crate::require_sensitive_action(
+            app_state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            temps_core::SensitiveAction::UpdateAccountEmail,
+        )
+        .await?;
+    }
+
     let updated_user = app_state
         .user_service
         .update_user(
@@ -2457,9 +2486,11 @@ async fn restore_user(
     tag = "Users",
     post,
     path = "/users/me/mfa/setup",
+    request_body = SetupMfaRequest,
     responses(
         (status = 200, description = "MFA setup data", body = MfaSetupResponse),
-        (status = 401, description = "Unauthorized"),
+        (status = 400, description = "Current password is required but was not provided"),
+        (status = 401, description = "Unauthorized or current password is incorrect"),
         (status = 409, description = "MFA is already enabled; verify and disable it before re-enrollment"),
         (status = 500, description = "Internal server error")
     ),
@@ -2470,10 +2501,14 @@ async fn restore_user(
 async fn setup_mfa(
     State(app_state): State<Arc<AuthState>>,
     RequireAuth(auth): RequireAuth,
+    Json(req): Json<SetupMfaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, UsersWrite);
 
-    let setup_data = app_state.user_service.setup_mfa(auth.user_id()).await?;
+    let setup_data = app_state
+        .user_service
+        .setup_mfa(auth.user_id(), req.current_password.as_deref())
+        .await?;
     Ok(Json(MfaSetupResponse {
         secret_key: setup_data.secret_key,
         qr_code: setup_data.qr_code,

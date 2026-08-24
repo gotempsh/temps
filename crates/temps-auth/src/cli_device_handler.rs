@@ -847,7 +847,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn api_key_cannot_approve_device_session_or_mint_cli_key() {
+    async fn api_key_bypasses_step_up_for_device_session_approval() {
+        // Machine credentials (API keys, CLI tokens, deployment tokens) skip
+        // step-up entirely rather than being denied — see the doc comment on
+        // DefaultSensitiveActionAuthorizer for the full rationale. This test
+        // verifies that an API key is allowed through (not blocked with
+        // FORBIDDEN) so that automation workflows are not silently broken when
+        // new gated endpoints are added.
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let authorizer = crate::DefaultSensitiveActionAuthorizer::new(db);
         let auth = crate::AuthContext::new_api_key(
@@ -858,15 +864,9 @@ mod tests {
             9,
         );
 
-        let error = require_cli_device_approval(&authorizer, &auth)
+        require_cli_device_approval(&authorizer, &auth)
             .await
-            .expect_err("machine credentials must not approve an interactive device login");
-
-        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
-        assert_eq!(
-            error.body.get("action"),
-            Some(&serde_json::json!("create_api_key"))
-        );
+            .expect("machine credentials must bypass step-up, not be denied");
     }
 
     #[test]
