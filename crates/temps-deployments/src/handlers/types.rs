@@ -64,6 +64,10 @@ pub struct AppState {
     /// Builds and sends deploy-failure reports (redacted trace, user-edited,
     /// sent on request) -- see [`crate::services::failure_report_service`].
     pub failure_report_service: Arc<crate::services::FailureReportService>,
+    /// Central policy evaluator for sensitive mutations (e.g. draining a
+    /// node) -- challenges with MFA step-up when the acting user has one
+    /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 use crate::services::types::Deployment;

@@ -2511,6 +2511,25 @@ mod tests {
     use tokio::time::{timeout, Duration};
     use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 
+    /// Test double for handlers unrelated to sensitive-action gating --
+    /// always allows, so existing tests built before that gate was added
+    /// don't need to know about it.
+    struct AllowAllSensitiveActions;
+
+    #[async_trait]
+    impl temps_core::SensitiveActionAuthorizer for AllowAllSensitiveActions {
+        async fn authorize(
+            &self,
+            _action: &temps_core::SensitiveAction,
+            _principal: &temps_core::SensitiveActionPrincipal,
+        ) -> Result<
+            temps_core::SensitiveActionDecision,
+            temps_core::SensitiveActionAuthorizationError,
+        > {
+            Ok(temps_core::SensitiveActionDecision::Allow)
+        }
+    }
+
     struct MediaWithoutDeploymentsRead;
 
     #[async_trait]
@@ -4165,6 +4184,7 @@ mod tests {
                 as Arc<dyn temps_core::PublicHostnameResolver>,
             metrics_store: None,
             failure_report_service,
+            sensitive_action_authorizer: Arc::new(AllowAllSensitiveActions),
         })
     }
 

@@ -508,6 +508,11 @@ impl TempsPlugin for DeploymentsPlugin {
         // When absent (plain OSS binary), project_access_guard! is a no-op.
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
 
+        // Central sensitive-action policy (MFA step-up), used to gate
+        // destructive node operations like drain.
+        let sensitive_action_authorizer =
+            context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
         // Deployment-token management routes carry their own app state
         // (`DeploymentTokenAppState`), so build it here and mount the router as
         // a sub-router below. Without this wiring the token endpoints -- create,
@@ -583,6 +588,7 @@ impl TempsPlugin for DeploymentsPlugin {
             hostname_resolver,
             metrics_store,
             failure_report_service,
+            sensitive_action_authorizer,
         });
 
         let deployments_routes = handlers::deployments::configure_routes();

@@ -17,6 +17,7 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   adminListNodesOptions,
   adminGetNodeOptions,
@@ -845,6 +846,8 @@ function NodeDetail({
   const [drainPending, setDrainPending] = useState(false)
   const [removePending, setRemovePending] = useState(false)
   const [undrainPending, setUndrainPending] = useState(false)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const { data: node, isLoading: nodeLoading } = useQuery({
     ...adminGetNodeOptions({ path: { node_id: nodeId } }),
@@ -887,6 +890,9 @@ function NodeDetail({
         path: { node_id: nodeId },
       })
       if (resp.error) {
+        if (handleSensitiveActionError(resp.error, () => handleDrain())) {
+          return
+        }
         toast.error('Failed to drain node')
         return
       }
@@ -970,6 +976,7 @@ function NodeDetail({
 
   return (
     <div className="space-y-6">
+      {verificationDialog}
       {/* Header */}
       <div className="flex items-center gap-3">
         <Button variant="ghost" size="icon" onClick={onBack} className="h-8 w-8">

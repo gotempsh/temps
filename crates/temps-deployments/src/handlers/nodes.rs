@@ -17,7 +17,7 @@ use axum::{
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -29,7 +29,7 @@ use crate::services::node_service::{
 };
 use temps_core::problemdetails::{self, Problem};
 use temps_core::AuditContext;
-use temps_core::{AppSettings, PublicHostnameStrategy};
+use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
@@ -2032,6 +2032,13 @@ async fn admin_drain_node(
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DrainNode { node_id },
+    )
+    .await?;
+
     let node = app_state
         .node_service
         .get_by_id(node_id)
