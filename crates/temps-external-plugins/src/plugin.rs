@@ -89,6 +89,7 @@ impl TempsPlugin for ExternalPluginsPlugin {
             // Register the handler app state
             let app_state = Arc::new(ExternalPluginsAppState {
                 service: service.clone(),
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
             });
 
             // External plugin OpenAPI schemas would normally be merged into

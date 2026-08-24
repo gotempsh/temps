@@ -992,6 +992,15 @@ impl ExternalPluginManager {
         self.start_plugin(&binary_path).await
     }
 
+    /// Start a plugin binary at the given path directly (without requiring it
+    /// to already be running). Used by the install flow after dropping a new
+    /// binary into the plugins directory.
+    ///
+    /// Returns the new manifest on success, or an error string on failure.
+    pub async fn start_plugin_by_path(&self, binary_path: &Path) -> Result<PluginManifest, String> {
+        self.start_plugin(binary_path).await
+    }
+
     /// Get the config.
     pub fn config(&self) -> &ExternalPluginConfig {
         &self.config

@@ -226,6 +226,84 @@ impl ExternalPluginsService {
         new_manifests
     }
 
+    /// Start or reload a single plugin.
+    ///
+    /// `plugin_name` is the plugin's own manifest-declared identity (e.g.
+    /// `"vibetemps"`) — `ExternalPluginManager` indexes running processes by
+    /// exactly this string, so it is what `is_running`/`reload_plugin` must
+    /// be called with. `binary_name` is the filename inside the plugins
+    /// directory, used only to locate the binary when starting it fresh.
+    /// Passing the same value for both is a bug: the binary filename and the
+    /// plugin's declared name are not required to match (and for VibeTemps
+    /// they don't — `temps-vibetemps-plugin` vs `vibetemps`), so keying the
+    /// running-process lookup on the binary filename makes an already-running
+    /// plugin permanently report as not running, and makes install/reload
+    /// silently leak the old process instead of shutting it down (a fresh
+    /// `insert` into the manager's process map overwrites the old entry
+    /// without ever calling `.shutdown()` on it).
+    ///
+    /// If the plugin is already running, it is restarted in-place (shutdown +
+    /// re-start from the same binary path). If it is not yet running, the
+    /// plugins directory's `binary_name` file is started fresh. After a
+    /// successful start the proxy router is rebuilt so the new plugin becomes
+    /// reachable immediately without a full server restart.
+    ///
+    /// Returns the new manifest on success, or an error string on failure.
+    pub async fn start_or_reload_plugin(
+        &self,
+        plugin_name: &str,
+        binary_name: &str,
+    ) -> Result<temps_core::external_plugin::PluginManifest, String> {
+        let result = if self.manager.is_running(plugin_name).await {
+            self.manager.reload_plugin(plugin_name).await
+        } else {
+            // Plugin binary was just installed — start it fresh from the
+            // known binary filename inside the plugins directory.
+            let binary_path = self.manager.config().plugins_dir.join(binary_name);
+            self.manager.start_plugin_by_path(&binary_path).await
+        };
+
+        // `start_plugin` indexes the process under the name the *running
+        // binary* declares in its own manifest, but every later lookup —
+        // `is_running`, `reload_plugin`, the status endpoint — uses
+        // `plugin_name`. If the two disagree the process is live but
+        // unreachable through the only key we ever query: status reports
+        // "not configured" forever, and the next install takes the
+        // fresh-start branch and leaks another process on top.
+        //
+        // Fail loudly instead. The process is shut down via the name it
+        // actually registered under, so a wrong registry entry leaves
+        // nothing running rather than an orphan nobody can address.
+        if let Ok(ref manifest) = result {
+            if let Some(message) = identity_mismatch(plugin_name, &manifest.name, binary_name) {
+                error!(
+                    expected = %plugin_name,
+                    declared = %manifest.name,
+                    "Plugin declares a different name than its registry entry; shutting it down"
+                );
+                self.manager.shutdown_plugin(&manifest.name).await;
+                return Err(message);
+            }
+        }
+
+        if let Ok(ref manifest) = result {
+            // Rebuild the proxy router so the (re)started plugin is immediately reachable.
+            let manifests = self.manager.manifests().await;
+            let new_router = Self::build_proxy_router_from(&self.manager, &manifests).await;
+            {
+                let mut router = self.proxy_router.write().await;
+                *router = new_router;
+            }
+            {
+                let mut cached = self.manifests.write().await;
+                *cached = manifests;
+            }
+            info!(plugin = %manifest.name, version = %manifest.version, "Plugin started/reloaded via install flow");
+        }
+
+        result
+    }
+
     /// Shut down all external plugins gracefully.
     pub async fn shutdown_all(&self) {
         let mut listener = self.event_listener.write().await;
@@ -298,6 +376,70 @@ impl ExternalPluginsService {
                 manifests.iter().filter(|m| !m.events.is_empty()).count()
             );
             Some(listener)
+        }
+    }
+}
+
+/// Decide whether a freshly-started plugin registered under a usable identity.
+///
+/// `start_plugin` indexes the process under the name the running binary
+/// declares in its own manifest, while `is_running`, `reload_plugin` and the
+/// status endpoint all look it up by the name this instance knows it as. When
+/// those disagree the process is live but unaddressable, so the only safe
+/// outcome is to refuse it.
+///
+/// Split out from `start_or_reload_plugin` so the rule is testable without
+/// spawning a real plugin process — this identity conflation has already
+/// produced two separate bugs in this code path (first binary-filename vs
+/// manifest-name, then registry-declared vs locally-known), and it is silent
+/// every time: everything reports success while status reports "not
+/// installed".
+///
+/// Returns `None` when the identities agree, or the operator-facing
+/// explanation when they don't.
+fn identity_mismatch(expected: &str, declared: &str, binary_name: &str) -> Option<String> {
+    if expected == declared {
+        return None;
+    }
+    Some(format!(
+        "Plugin binary '{binary_name}' declares the name '{declared}', but this instance knows \
+         it as '{expected}'. The process was shut down because it would otherwise run \
+         unreachable — status would report it as not installed and reinstalling would start a \
+         second copy. This is a packaging mismatch: the registry entry and the plugin's own \
+         manifest must agree."
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::identity_mismatch;
+
+    #[test]
+    fn matching_identities_are_accepted() {
+        assert!(identity_mismatch("vibetemps", "vibetemps", "temps-vibetemps-plugin").is_none());
+    }
+
+    #[test]
+    fn a_differing_declared_name_is_refused_and_explained() {
+        let message = identity_mismatch("vibetemps", "something-else", "temps-vibetemps-plugin")
+            .expect("a name the manager will index differently must be refused");
+        // Both identities belong in the message: the operator has to know
+        // which side to correct, and "install failed" alone doesn't say.
+        assert!(message.contains("vibetemps"), "{message}");
+        assert!(message.contains("something-else"), "{message}");
+        assert!(message.contains("temps-vibetemps-plugin"), "{message}");
+    }
+
+    /// Names are compared exactly. The manager's process map is a plain
+    /// `HashMap` lookup, so a case or whitespace variant is a different key
+    /// and would strand the process just as effectively.
+    #[test]
+    fn near_miss_names_are_still_a_mismatch() {
+        for declared in ["VibeTemps", "vibetemps ", " vibetemps"] {
+            assert!(
+                identity_mismatch("vibetemps", declared, "bin").is_some(),
+                "{declared:?} must not be treated as equal to \"vibetemps\""
+            );
         }
     }
 }

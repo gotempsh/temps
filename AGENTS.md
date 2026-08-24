@@ -163,6 +163,55 @@ check. `git revert` defaults to `Revert "original message"`, which is
 not conventional. Never use `git revert --no-edit` and leave it —
 either pass an explicit conventional `-m`, or amend right after.
 
+## Every feature carries the same horizontal requirements
+
+A feature is not done when the happy path works. Thirteen requirements
+apply to *every* feature regardless of what it does, and skipping one is
+the single most common reason work gets sent back in review. The full
+rules with rationale live in
+[`CLAUDE.md` → Cross-Cutting Requirements](./CLAUDE.md#cross-cutting-requirements-every-feature);
+the condensed list is
+[`CLAUDE.md` → Every Feature Checklist](./CLAUDE.md#every-feature-checklist).
+
+The short version:
+
+1. **Auth + permissions** — `RequireAuth` and the *narrowest*
+   `permission_guard!` on every handler. A permission says "may they do
+   this kind of thing"; a route scoped to a row also needs a check that
+   they may do it to *that* row. Missing the second one is an IDOR.
+2. **Audit logging** — every write, and every action that changes host
+   state. Record enough to reconstruct what is running and why, not just
+   who called what. Never let an audit failure fail the operation, and
+   never audit a rejected call as though it happened.
+3. **Typed errors** — `thiserror` enums mapped exhaustively to `Problem`.
+   Never recover an error's kind by substring-matching its message; that
+   silently degrades the moment someone rewords the string.
+4. **Bounded inputs** — explicit size limits and timeouts on anything
+   crossing a trust boundary. Stream instead of buffering remote bodies,
+   and bound decompression separately: a checksum over compressed bytes
+   says nothing about how far the archive expands.
+5. **Scales small** — classify hot path vs control plane and design to
+   the budget (see the section below).
+6. **Discoverable** — visible surface, and an onboarding state when
+   unconfigured rather than rendering nothing.
+7. **Config as columns** — entity columns, encrypted if sensitive; not
+   `TEMPS_*` env vars (see the section below).
+8. **Secrets stay in** — masked in responses, absent from logs and URLs.
+9. **Lists paginate** — 20/100, `created_at DESC`, time-bounded on
+   hypertables.
+10. **Failures are actionable** — self-hosted operators debug alone. No
+    silent failures, no permanent spinners, no restart-to-notice.
+11. **Structured logs** — with IDs, at the right level.
+12. **Complete API surface** — registered in the central `ApiDoc`,
+    clients regenerated and committed, `apps/temps-cli` parity added. A
+    route only reachable by hand-written `curl` is unfinished.
+13. **Tests for failure paths** — unauthorized, insufficient-permission,
+    not-found, validation and edge cases, not just the happy path.
+
+If one of these genuinely doesn't apply to what you built, say so in the
+PR description. Don't leave it silently unmet — a reviewer can't tell
+"considered and not applicable" from "forgotten".
+
 ## Per-record config columns, not env vars
 
 When adding a new runtime knob, default to a column on the relevant

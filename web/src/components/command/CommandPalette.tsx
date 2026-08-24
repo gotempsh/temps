@@ -1142,7 +1142,7 @@ export function CommandPalette() {
   // Build plugin navigation items for the command palette.
   //
   // These come from the context's *resolved* entries, not from
-  // `plugins[].nav` — a manifest's own path (`/builder`) matches no console
+  // `plugins[].nav` — a manifest's own path (`/vibe`) matches no console
   // route, so mapping the manifests here sent every plugin command to a 404
   // while the sidebar, which uses the resolved entries, worked.
   const pluginNavItems: NavigationItem[] = useMemo(

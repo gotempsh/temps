@@ -65,6 +65,7 @@ import { registerSandboxCommands } from './commands/sandbox/index.js'
 import { registerWorkflowCommands } from './commands/workflow/index.js'
 import { registerRevenueCommands } from './commands/revenue/index.js'
 import { registerSessionReplayCommands } from './commands/session-replay/index.js'
+import { registerPluginsCommands } from './commands/plugins/index.js'
 
 // Developer workflow commands
 import { registerInitCommand } from './commands/init/index.js'
@@ -214,6 +215,7 @@ export function createProgram(): Command {
   registerWorkflowCommands(program)
   registerRevenueCommands(program)
   registerSessionReplayCommands(program)
+  registerPluginsCommands(program)
 
   // Developer workflow commands
   registerInitCommand(program)

@@ -3,6 +3,7 @@
 pub mod admin_gate;
 pub mod ai_tool_call;
 pub mod audit;
+pub mod checksum;
 pub mod client_ip;
 pub mod config;
 pub mod deployment;

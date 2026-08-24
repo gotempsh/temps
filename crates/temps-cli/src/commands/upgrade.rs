@@ -1104,29 +1104,11 @@ pub(crate) async fn download_asset_text(url: &str) -> anyhow::Result<String> {
 }
 
 /// Verify SHA256 checksum of downloaded data.
+///
+/// Delegates to [`temps_core::checksum::verify_checksum`], which is the
+/// shared implementation used by both self-update and plugin-install flows.
 pub(crate) fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
-    use sha2::{Digest, Sha256};
-
-    let mut hasher = Sha256::new();
-    hasher.update(data);
-    let computed = hex::encode(hasher.finalize());
-
-    // Checksum file format: "<hash>  <filename>" or "<hash> <filename>"
-    let expected = checksum_text
-        .split_whitespace()
-        .next()
-        .ok_or_else(|| anyhow::anyhow!("Invalid checksum file format"))?
-        .to_lowercase();
-
-    if computed != expected {
-        return Err(anyhow::anyhow!(
-            "Checksum mismatch!\n  Expected: {}\n  Got:      {}",
-            expected,
-            computed
-        ));
-    }
-
-    Ok(())
+    temps_core::checksum::verify_checksum(data, checksum_text)
 }
 
 /// Extract the `temps` binary from a gzipped tarball.

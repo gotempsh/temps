@@ -24,7 +24,7 @@ export interface NavEntry {
  * A nav entry whose `path` has been rewritten to a route the console can
  * actually navigate to.
  *
- * A manifest's `path` is the plugin's *own* route (`/builder`), which matches
+ * A manifest's `path` is the plugin's *own* route (`/vibe`), which matches
  * nothing in the console's router — platform and settings entries are served
  * by `/plugins/:pluginName`. Consumers must use these, never `PluginManifest.nav`
  * directly, or they send the user to a 404. `pluginName` is carried along so a

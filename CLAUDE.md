@@ -333,6 +333,83 @@ A `404`/`500` leaves the client unable to distinguish "this feature does not exi
 
 ---
 
+## Cross-Cutting Requirements (every feature)
+
+These are **horizontal**: they apply to every feature regardless of what it does. A feature is not "done" when the happy path works — it is done when all of the following hold. Most production incidents and review rejections in this repo trace back to one of these being skipped, not to the feature logic being wrong.
+
+Treat this as the definition of done. If one genuinely doesn't apply, say so explicitly in the PR rather than leaving it silently unmet.
+
+### 1. Authentication and authorization
+
+Every handler starts with `RequireAuth` and a `permission_guard!`. There are no "internal" or "obviously admin-only" endpoints — the guard is what makes it admin-only.
+
+- Choose the *narrowest* permission that fits. `SystemAdmin` is for host-level operations (installing binaries, reloading processes), not for ordinary CRUD.
+- Anything scoped to a resource must also verify the caller can reach *that* resource, not merely that they hold the permission — the permission answers "may they do this kind of thing", not "may they do it to this row". Missing that second check is an IDOR.
+- Plugin routes are served under `/api`; hand-rolled client paths must include the prefix.
+
+### 2. Audit logging on every write
+
+Every CREATE / UPDATE / DELETE, and every privileged action that changes host state, writes an audit entry via `create_audit_log`.
+
+- Record enough to answer "what is running now and who made that true" — not just the actor and the verb. For an install that means the resolved version and the artifact digest; for a config change, the field that changed.
+- Audit failure must **not** fail the operation. Log at ERROR and continue: the write already happened, and returning an error would tell the operator the opposite.
+- Never audit an action that was rejected as though it occurred. Guard failures return before the audit write.
+
+### 3. Typed errors, mapped to Problem Details
+
+Domain errors are `thiserror` enums with contextual identifiers; the handler module maps them to `Problem` with an exhaustive `match`. No `anyhow` in the service layer, no `.context()`, no `.unwrap()`.
+
+- **Never recover an error's kind by matching on its rendered message.** `detail.contains("Checksum mismatch")` compiles, passes review by eye, and silently degrades to a generic 500 the first time someone rewords the message. Match the variant.
+- Distinguish "the caller sent something wrong" (4xx) from "an upstream we depend on misbehaved" (502) from "we broke" (500). Collapsing all three into 500 makes triage guesswork.
+
+### 4. Bounded inputs and resources
+
+Anything that crosses a trust boundary — an HTTP body, a downloaded artifact, a decompressed archive, a user-supplied count — needs an explicit limit, and the limit needs a constant with a comment explaining the number.
+
+- Never buffer an unbounded remote response. Stream with a running total and abort on exceeding the cap; a declared `Content-Length` is a hint from an untrusted party, useful as a fast reject but never as the enforcement.
+- A checksum over compressed bytes says nothing about the decompressed size. Bound the expansion separately or you have a decompression bomb.
+- Set explicit timeouts on every external call.
+- Validate the *shape* of security-critical values (a SHA-256 is 64 hex characters) before using them, so malformed input is diagnosed as malformed rather than as a mismatch.
+- Never interpolate caller-supplied values into a path, key, or SQL fragment without an allowlist.
+
+### 5. Scales on small resources
+
+See [Scalability & Efficiency](#scalability--efficiency). Classify the code as hot path or control plane and design to that budget. Constant memory over per-item memory, batch writes, bounded channels with a documented overflow policy, background loops that are O(changes) not O(total).
+
+### 6. Discoverable, and onboards when unconfigured
+
+See [Feature Discoverability](#feature-discoverability). A visible surface at the point of use, and a `configured: false` + reason + setup path capability response so the client can tell "not built" from "not set up".
+
+### 7. Configuration as per-record columns
+
+New runtime knobs are columns on the relevant entity, not `TEMPS_*` env vars. Sensitive values are encrypted at rest via `EncryptionService`, never plaintext. The only exception is bootstrap config needed before a database exists.
+
+### 8. Secrets never leak outward
+
+API keys, tokens and passwords are masked (`***`) in every response DTO, never logged, and never placed in a URL.
+
+### 9. Pagination and sorting on every list
+
+Default 20, max 100, default order `created_at DESC`. Time-series and hypertable queries must additionally be time-bounded.
+
+### 10. Actionable failure states
+
+Self-hosted operators debug alone — assume no support channel. Every failure path surfaces a real message, a visible retry, or an honest "this didn't work". Never fail silently, never require a restart to notice, never leave the UI in a permanent loading state.
+
+### 11. Observability
+
+Structured logging with explicit levels and contextual identifiers on every branch that matters. Business events at INFO, degradation at WARN, unrecoverable at ERROR.
+
+### 12. Complete API surface
+
+A new endpoint is not finished until it is registered in the central `ApiDoc`, the generated clients are regenerated and committed, and the `apps/temps-cli` command exists. A route reachable only by hand-written `curl` is an unfinished feature.
+
+### 13. Tests for the failure paths, not just the happy path
+
+Success, not-found, validation, database error, and edge cases for every service method; unauthorized, insufficient-permission, success and error-shape for every handler. Behaviour changes come with a test that fails without the change. Docker-dependent tests skip gracefully — never `#[ignore]`.
+
+---
+
 ## Resilience Patterns
 
 ### Retry with Exponential Backoff
@@ -1079,6 +1156,25 @@ Process-wide ops/debug toggles (not bootstrap config, not per-tenant -- see the 
 ---
 
 ## Quick Reference Checklists
+
+### Every Feature Checklist
+
+The horizontal requirements, condensed. Full rationale in
+[Cross-Cutting Requirements](#cross-cutting-requirements-every-feature).
+
+- [ ] `RequireAuth` + narrowest `permission_guard!`, plus a resource-ownership check where the route is scoped to a row
+- [ ] Audit log on every write, recording enough to reconstruct what changed
+- [ ] Typed `thiserror` errors, exhaustive `Problem` mapping, no kind-by-substring
+- [ ] Explicit bounds and timeouts on every untrusted input, download, and expansion
+- [ ] Hot path vs control plane classified; memory bounded; writes batched
+- [ ] Visible surface; unconfigured state onboards instead of disappearing
+- [ ] New config as an entity column (encrypted if sensitive), not an env var
+- [ ] Secrets masked in responses, absent from logs and URLs
+- [ ] Lists paginated (20/100, `created_at DESC`) and time-bounded on hypertables
+- [ ] Every failure path surfaces an actionable state
+- [ ] Structured logs with IDs at the right levels
+- [ ] Registered in `ApiDoc`, clients regenerated, `apps/temps-cli` parity added
+- [ ] Tests cover unauthorized, insufficient-permission, not-found, validation, and edge cases
 
 ### New Service Checklist
 - [ ] Define typed error enum with contextual messages
