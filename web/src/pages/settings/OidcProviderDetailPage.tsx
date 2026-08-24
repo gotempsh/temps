@@ -41,6 +41,7 @@ import {
 } from '@/components/ui/card'
 import { Skeleton } from '@/components/ui/skeleton'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -70,6 +71,8 @@ export function OidcProviderDetailPage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const [testResult, setTestResult] =
     useState<OidcTestConnectionResponse | null>(null)
   const [deleteOpen, setDeleteOpen] = useState(false)
@@ -93,7 +96,14 @@ export function OidcProviderDetailPage() {
         queryKey: listOidcProvidersQueryKey(),
       })
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          updateProvider.mutate(variables)
+        )
+      ) {
+        return
+      }
       toast.error(problemMessage(error, 'Failed to update SSO provider'))
     },
   })
@@ -180,6 +190,7 @@ export function OidcProviderDetailPage() {
 
   return (
     <div className="space-y-6">
+      {verificationDialog}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
         <div className="flex items-start gap-3">
           <Button

@@ -21,6 +21,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { ArrowRight, Loader2, Plus, Trash2 } from 'lucide-react'
 import { useMemo, useState } from 'react'
@@ -39,6 +40,8 @@ export function OidcRoleMappingsCard({
   defaultRole: string
 }) {
   const queryClient = useQueryClient()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const queryKey = listOidcRoleMappingsQueryKey({
     path: { provider_id: providerId },
   })
@@ -64,7 +67,12 @@ export function OidcRoleMappingsCard({
       setDraftPriority(nextDefaultPriority(mappings) + 10)
       await queryClient.invalidateQueries({ queryKey })
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () => createMapping.mutate(variables))
+      ) {
+        return
+      }
       toast.error(error instanceof Error ? error.message : 'Failed to add rule')
     },
   })
@@ -75,7 +83,12 @@ export function OidcRoleMappingsCard({
       toast.success('Rule removed')
       await queryClient.invalidateQueries({ queryKey })
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () => deleteMapping.mutate(variables))
+      ) {
+        return
+      }
       toast.error(
         error instanceof Error ? error.message : 'Failed to delete rule',
       )
@@ -96,9 +109,11 @@ export function OidcRoleMappingsCard({
   }
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Group → role mapping</CardTitle>
+    <>
+      {verificationDialog}
+      <Card>
+        <CardHeader>
+          <CardTitle>Group → role mapping</CardTitle>
         <CardDescription>
           IdP groups from the configured group claim are matched in priority
           order; first match wins. Use <code className="rounded bg-muted px-1">*</code>{' '}
@@ -204,6 +219,7 @@ export function OidcRoleMappingsCard({
           </div>
         </div>
       </CardContent>
-    </Card>
+      </Card>
+    </>
   )
 }

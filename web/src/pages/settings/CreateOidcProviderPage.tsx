@@ -21,6 +21,7 @@ import {
   CardTitle,
 } from '@/components/ui/card'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft } from 'lucide-react'
@@ -50,6 +51,8 @@ export function CreateOidcProviderPage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const [form, setForm] = useState<OidcProviderFormValues>(() => {
     const defaults = createDefaultOidcProviderForm()
     return {
@@ -79,7 +82,14 @@ export function CreateOidcProviderPage() {
       })
       navigate('/settings/auth')
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          createProvider.mutate(variables)
+        )
+      ) {
+        return
+      }
       toast.error(problemMessage(error, 'Failed to save SSO provider'))
     },
   })
@@ -102,6 +112,7 @@ export function CreateOidcProviderPage() {
 
   return (
     <div className="w-full space-y-6 py-2">
+      {verificationDialog}
       <div className="flex items-start gap-4">
         <Button
           variant="ghost"

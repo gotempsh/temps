@@ -35,6 +35,7 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -117,6 +118,8 @@ export function Account() {
     ...getCurrentUserOptions(),
   })
   const { refetch } = useAuth()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const [showMfaDialog, setShowMfaDialog] = useState(false)
   const [mfaSetupData, setMfaSetupData] = useState<MfaSetupResponse | null>(
     null
@@ -145,6 +148,17 @@ export function Account() {
     onSuccess: () => {
       toast.success('Account updated successfully')
       refetch()
+    },
+    onError: (error, variables) => {
+      // Only email changes are step-up gated server-side, but it's safe to
+      // intercept unconditionally — this only fires on an actual 428.
+      if (handleSensitiveActionError(error, () => updateUser(variables))) {
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(
+        problem.detail || problem.message || 'Failed to update account'
+      )
     },
   })
 
@@ -293,6 +307,7 @@ export function Account() {
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
+      {verificationDialog}
       <Card>
         <CardHeader>
           <CardTitle>Account Settings</CardTitle>
