@@ -2215,6 +2215,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(encryption_service.clone());
     service_context.register_service(cookie_crypto.clone());
     service_context.register_service(docker.clone());
+    // Pre-registered here (rather than left solely to AuthPlugin, which also
+    // registers an equivalent instance) because TeamsPlugin, GitPlugin,
+    // DomainsPlugin, and DeploymentsPlugin all gate sensitive mutations via
+    // `require_sensitive_action` and are registered before AuthPlugin in the
+    // ordered list below. Only depends on `db`, so it's safe to construct
+    // this early.
+    let sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer> = Arc::new(
+        temps_auth::DefaultSensitiveActionAuthorizer::new(db.clone()),
+    );
+    service_context.register_service(sensitive_action_authorizer);
     // Background DNS mutation is fail-closed until an optional policy plugin
     // claims this slot. DomainsPlugin captures the slot before later plugins
     // register, so the indirection must exist before plugin initialization.
