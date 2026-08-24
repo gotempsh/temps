@@ -445,10 +445,32 @@ debug = false
 #
 # 4. astral-tokio-tar: RESOLVED by upgrading testcontainers 0.27.1 → 0.27.2
 #
+# 5. RUSTSEC-2026-0253: lru 0.16.4 (unsound use-after-free in LruCache::pop())
+#    - Path: aws-sdk-s3 1.138.1 → lru 0.16.4 (aws-sdk-s3 declares `lru = "^0.16.3"`)
+#    - Fix: patched in lru 0.18.2.
+#    - Upstream status (checked 2026-08-24): BLOCKED. aws-sdk-s3 1.143.0
+#      (crates.io latest as of that date) still declares `lru = "^0.16.3"` --
+#      confirmed via `cargo update -p aws-sdk-s3 --precise 1.143.0 --dry-run
+#      --verbose`, which does not touch the lru entry. No newer aws-sdk-s3
+#      release has moved past lru 0.16 yet. A [patch.crates-io] override to
+#      0.18.2 would violate aws-sdk-s3's own semver requirement and risks
+#      breaking whatever internal caching it does with the crate.
+#    - Reachability: the bug requires a panicking `Drop` impl on a cache key
+#      type, unwound through `catch_unwind`, during `LruCache::pop()`. Not
+#      yet audited which key type aws-sdk-s3/aws-smithy-runtime uses for this
+#      cache or whether panicking-Drop keys are reachable from request
+#      handling -- re-verify this before renewing the exception long-term.
+#
 # Previously resolved:
 # - atty 0.2.14: RESOLVED in Pingora 0.7.0 (upgraded to clap 4.5)
 # - idna 0.2.3: RESOLVED by upgrading check-if-email-exists 0.9 → 0.11
 # - lru 0.12.5: RESOLVED by upgrading aws-sdk-s3 (new version dropped lru 0.12)
+# - get_if_addrs 0.5.3 (RUSTSEC-2025-0121, gcc build-dep unmaintained):
+#     RESOLVED by replacing get_if_addrs with the maintained if-addrs 0.15.0
+#     fork in temps-infra (single call site, platform_info.rs). Same API
+#     (`if_addrs::get_if_addrs()`, `Interface.name/.ip()/.is_loopback()`),
+#     depends only on libc/windows-sys -- no C build step, so gcc/cc drop
+#     out of the tree entirely.
 # - aws-lc-sys 0.38.0 (RUSTSEC-2026-0044, RUSTSEC-2026-0048): RESOLVED by cargo update aws-lc-rs → 1.16.2
 # - rustls-webpki 0.103.7 (RUSTSEC-2026-0049): RESOLVED by cargo update rustls-webpki → 0.103.10
 # - tar 0.4.44 (RUSTSEC-2026-0067, RUSTSEC-2026-0068): RESOLVED by bumping tar to 0.4.45

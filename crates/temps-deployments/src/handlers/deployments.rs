@@ -33,14 +33,14 @@ use utoipa::OpenApi;
 use crate::handlers::failure_report::*;
 use crate::handlers::types::{
     ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
-    ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerInfoResponse,
-    ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
-    ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
-    DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
-    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
-    EnvVarResponse, FailureReportPreviewResponse, LatestDeploymentMediaResponse,
-    LatestDeploymentMediaResponseItem, PromoteDeploymentRequest, ResourceLimitsResponse,
-    SendFailureReportRequest,
+    ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerHistoryEntry,
+    ContainerHistoryListResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
+    ContainerMetricHistoryPoint, ContainerMetricsHistoryQuery, ContainerMetricsResponse,
+    DeploymentContainerLogContentResponse, DeploymentContainerLogResponse,
+    DeploymentContainerLogsListResponse, DeploymentJobResponse, DeploymentJobsResponse,
+    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
+    FailureReportPreviewResponse, LatestDeploymentMediaResponse, LatestDeploymentMediaResponseItem,
+    PromoteDeploymentRequest, ResourceLimitsResponse, SendFailureReportRequest,
 };
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -136,6 +136,7 @@ fn public_compose_service_url(
         teardown_deployment,
         teardown_environment,
         list_containers,
+        list_container_history,
         get_container_logs_by_id,
         get_container_logs,
         get_container_detail,
@@ -167,6 +168,8 @@ fn public_compose_service_url(
         ContainerMetricsResponse,
         ContainerMetricsHistoryQuery,
         ContainerMetricHistoryPoint,
+        ContainerHistoryEntry,
+        ContainerHistoryListResponse,
         ContainerActionResponse,
         ActivityGraphQuery,
         ActivityGraphResponse,
@@ -345,6 +348,10 @@ pub fn configure_routes() -> Router<Arc<super::types::AppState>> {
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics",
             get(get_container_metrics),
+        )
+        .route(
+            "/projects/{project_id}/environments/{environment_id}/container-history",
+            get(list_container_history),
         )
         .route(
             "/projects/{project_id}/environments/{environment_id}/containers/{container_id}/metrics/history",
@@ -2257,9 +2264,11 @@ pub async fn get_container_metrics_history(
 
     // Resolves the docker container ID to its `deployment_containers` row and
     // verifies it belongs to this project/environment (404 otherwise).
-    let (container, _) = state
+    // Uses `get_container_row_any` (not `get_container_detail`) so history is
+    // still available for containers replaced by a later redeploy.
+    let container = state
         .deployment_service
-        .get_container_detail(project_id, environment_id, container_id.clone())
+        .get_container_row_any(project_id, environment_id, container_id.clone())
         .await?;
 
     let (window, step) = temps_metrics::range_to_step(&params.range);
@@ -2300,6 +2309,57 @@ pub async fn get_container_metrics_history(
     Ok(Json(response).into_response())
 }
 
+/// List every container that has ever run for an environment — current and
+/// replaced by a later redeploy. Use each entry's `container_id` (or `id`)
+/// with the `/containers/{container_id}/metrics/history` endpoint to fetch
+/// persisted metrics for a specific container generation, including ones
+/// that no longer exist because a redeploy replaced them.
+#[utoipa::path(
+    tag = "Deployments",
+    get,
+    path = "/projects/{project_id}/environments/{environment_id}/container-history",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("environment_id" = i32, Path, description = "Environment ID")
+    ),
+    responses(
+        (status = 200, description = "Every container that has ever run for this environment, current and replaced", body = ContainerHistoryListResponse),
+        (status = 404, description = "Environment not found", body = temps_core::problemdetails::ProblemDetails),
+        (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_container_history(
+    State(state): State<Arc<AppState>>,
+    Path((project_id, environment_id)): Path<(i32, i32)>,
+    RequireAuth(auth): RequireAuth,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, EnvironmentsRead);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    let rows = state
+        .deployment_service
+        .list_environment_container_history(project_id, environment_id)
+        .await?;
+
+    let containers = rows
+        .into_iter()
+        .map(|c| ContainerHistoryEntry {
+            id: c.id,
+            container_id: c.container_id,
+            container_name: c.container_name,
+            service_name: c.service_name,
+            deployment_id: c.deployment_id,
+            deployed_at: c.deployed_at.to_rfc3339(),
+            finished_at: c.finished_at.map(|t| t.to_rfc3339()),
+            deleted_at: c.deleted_at.map(|t| t.to_rfc3339()),
+            is_current: c.deleted_at.is_none(),
+        })
+        .collect();
+
+    Ok(Json(ContainerHistoryListResponse { containers }).into_response())
+}
+
 /// Stream container metrics via Server-Sent Events (SSE)
 #[utoipa::path(
     tag = "Containers",
@@ -2336,10 +2396,14 @@ pub async fn stream_container_metrics(
         .and_then(|i| i.parse::<u64>().ok())
         .unwrap_or(1000); // Default: 1 second
 
-    // Verify container exists and get initial stats
-    let _stats = state
+    // Verify container exists and is accessible before opening the stream.
+    // A DB-only lookup, not `get_container_metrics` — that would pay for a
+    // full Docker two-sample CPU read (~1s, see `sample_container_stats_twice`)
+    // just to discard the result, adding needless latency before the first
+    // real tick.
+    let _detail = state
         .deployment_service
-        .get_container_metrics(project_id, environment_id, container_id.clone())
+        .get_container_detail(project_id, environment_id, container_id.clone())
         .await?;
 
     let service = state.deployment_service.clone();

@@ -148,7 +148,6 @@ export function EnvironmentConfigurationCard({
       environment.deployment_config?.memoryRequest?.toString() ?? '',
     memory_limit: environment.deployment_config?.memoryLimit?.toString() ?? '',
     replicas: environment.deployment_config?.replicas?.toString() ?? '1',
-    exposed_port: environment.deployment_config?.exposedPort?.toString() ?? '',
     // Tri-state attack mode: 'inherit' (null → use the project setting),
     // 'on' (true → force on) or 'off' (false → force off). Map the nullable
     // boolean from the API to the select value.
@@ -221,8 +220,6 @@ export function EnvironmentConfigurationCard({
       memory_limit:
         environment.deployment_config?.memoryLimit?.toString() ?? '',
       replicas: environment.deployment_config?.replicas?.toString() ?? '1',
-      exposed_port:
-        environment.deployment_config?.exposedPort?.toString() ?? '',
       attack_mode: attackModeToSelect(environment.attack_mode),
       force_https: forceHttpsToSelect(environment.force_https),
       protected: environment.protected ?? false,
@@ -315,9 +312,9 @@ export function EnvironmentConfigurationCard({
           ? parseInt(formData.memory_limit)
           : null,
         replicas: formData.replicas ? parseInt(formData.replicas) : null,
-        exposed_port: formData.exposed_port
-          ? parseInt(formData.exposed_port)
-          : null,
+        // Exposed port is managed by EnvironmentPortOverrideCard under
+        // Build & Deploy → Deploy, not this form — omit it so submitting
+        // the rest of this form never clobbers that override.
         protected: formData.protected,
         automatic_deploy: formData.automatic_deploy,
         // Tri-state: null clears the override (inherit project), true/false force it.
@@ -600,28 +597,11 @@ export function EnvironmentConfigurationCard({
                     Number of container instances
                   </p>
                 </div>
-
-                <div>
-                  <Label>Exposed Port (Override)</Label>
-                  <Input
-                    type="number"
-                    min="1"
-                    max="65535"
-                    value={formData.exposed_port}
-                    onChange={(e) =>
-                      setFormData((prev) => ({
-                        ...prev,
-                        exposed_port: e.target.value,
-                      }))
-                    }
-                    placeholder="Auto-detected from image"
-                  />
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Override the port for this environment. Priority: Image
-                    EXPOSE → This value → Project port → Default (3000)
-                  </p>
-                </div>
               </div>
+              <p className="text-xs text-muted-foreground mt-4">
+                Exposed port for this environment is configured under{' '}
+                <strong>Build &amp; Deploy → Deploy</strong>.
+              </p>
             </div>
 
             {/* On-Demand (Scale-to-Zero) */}

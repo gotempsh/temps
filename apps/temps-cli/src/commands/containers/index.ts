@@ -3,6 +3,7 @@ import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   listContainers,
+  listContainerHistory,
   getContainerDetail,
   startContainer,
   stopContainer,
@@ -10,7 +11,7 @@ import {
   getContainerMetrics,
   getEnvironments,
 } from '../../api/sdk.gen.js'
-import type { ContainerInfoResponse } from '../../api/types.gen.js'
+import type { ContainerInfoResponse, ContainerHistoryEntry } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -64,6 +65,14 @@ export function registerContainersCommands(program: Command): void {
     .requiredOption('-e, --environment-id <id>', 'Environment ID')
     .requiredOption('-c, --container-id <id>', 'Container ID')
     .action(restartContainerAction)
+
+  containers
+    .command('history')
+    .description('List every container that has ever run in an environment, including ones replaced by a later redeploy')
+    .requiredOption('-p, --project-id <id>', 'Project ID')
+    .requiredOption('-e, --environment-id <id>', 'Environment ID')
+    .option('--json', 'Output in JSON format')
+    .action(listContainerHistoryAction)
 
   containers
     .command('metrics')
@@ -173,6 +182,62 @@ async function listContainersAction(
   )
 
   printTable(all, baseColumns, { style: 'minimal' })
+  newline()
+}
+
+async function listContainerHistoryAction(
+  options: { projectId: string; environmentId: string; json?: boolean }
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projId = parseInt(options.projectId, 10)
+  const envId = parseInt(options.environmentId, 10)
+  if (isNaN(projId) || isNaN(envId)) {
+    warning('Invalid project or environment ID')
+    return
+  }
+
+  const containers = await withSpinner('Fetching container history...', async () => {
+    const { data, error } = await listContainerHistory({
+      client,
+      path: { project_id: projId, environment_id: envId },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    return data?.containers ?? []
+  })
+
+  if (options.json) {
+    json(containers)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Container history (${containers.length})`)
+
+  if (containers.length === 0) {
+    info('No containers have ever run in this environment')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<ContainerHistoryEntry>[] = [
+    { header: 'ID', key: 'container_id', width: 16, color: (v) => colors.muted(v.slice(0, 12) + '...') },
+    { header: 'Name', key: 'container_name', color: (v) => colors.bold(v) },
+    {
+      header: 'Status',
+      accessor: (c) => (c.is_current ? 'current' : 'replaced'),
+      color: (v) => statusBadge(v === 'current' ? 'active' : 'inactive'),
+    },
+    { header: 'Deployed', key: 'deployed_at', color: (v) => colors.muted(new Date(v).toLocaleString()) },
+    {
+      header: 'Removed',
+      accessor: (c) => (c.deleted_at ? new Date(c.deleted_at).toLocaleString() : '—'),
+      color: (v) => colors.muted(v),
+    },
+  ]
+
+  printTable(containers, columns, { style: 'minimal' })
   newline()
 }
 

@@ -6382,6 +6382,76 @@
         ],
         "type": "object"
       },
+      "ContainerHistoryEntry": {
+        "description": "One container that has ever run for an environment — current or replaced\nby a later redeploy. `id` is the internal row ID to pass as the\n`container_id` path segment when calling the metrics/history endpoint for\nthis specific container generation (its docker `container_id` also works\nsince the history handler now resolves either).",
+        "properties": {
+          "container_id": {
+            "type": "string"
+          },
+          "container_name": {
+            "type": "string"
+          },
+          "deleted_at": {
+            "example": "2025-10-12T12:15:47.609192Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "deployed_at": {
+            "example": "2025-10-12T12:15:47.609192Z",
+            "type": "string"
+          },
+          "deployment_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "finished_at": {
+            "example": "2025-10-12T12:15:47.609192Z",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_current": {
+            "description": "True if this row is the environment's currently-active container\n(deleted_at is null) — false for containers replaced by a later\nredeploy.",
+            "type": "boolean"
+          },
+          "service_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "id",
+          "container_id",
+          "container_name",
+          "deployment_id",
+          "deployed_at",
+          "is_current"
+        ],
+        "type": "object"
+      },
+      "ContainerHistoryListResponse": {
+        "properties": {
+          "containers": {
+            "items": {
+              "$ref": "#/components/schemas/ContainerHistoryEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "containers"
+        ],
+        "type": "object"
+      },
       "ContainerInfoResponse": {
         "properties": {
           "container_id": {
@@ -8286,7 +8356,7 @@
             "type": "string"
           },
           "ip_address": {
-            "description": "IP address in CIDR notation (e.g., \"192.168.1.1\" or \"10.0.0.0/24\")",
+            "description": "IPv4 or IPv6 address, in CIDR notation for ranges (e.g., \"192.168.1.1\",\n\"10.0.0.0/24\", \"2001:db8::1\", or \"2001:db8::/32\")",
             "example": "192.168.1.100",
             "type": "string"
           },
@@ -82187,6 +82257,74 @@
         "summary": "Wake a sleeping on-demand environment",
         "tags": [
           "Environments"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/container-history": {
+      "get": {
+        "operationId": "list_container_history",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Environment ID",
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ContainerHistoryListResponse"
+                }
+              }
+            },
+            "description": "Every container that has ever run for this environment, current and replaced"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Environment not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List every container that has ever run for an environment — current and\nreplaced by a later redeploy. Use each entry's `container_id` (or `id`)\nwith the `/containers/{container_id}/metrics/history` endpoint to fetch\npersisted metrics for a specific container generation, including ones\nthat no longer exist because a redeploy replaced them.",
+        "tags": [
+          "Deployments"
         ]
       }
     },

@@ -39,6 +39,7 @@ import {
   SheetHeader,
   SheetTitle,
 } from '@/components/ui/sheet'
+import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import {
   Table,
   TableBody,
@@ -237,6 +238,13 @@ function formatBucketLabel(bucket: string): string {
   })
 }
 
+type MainChartMetric = 'latency' | 'traffic'
+
+const MAIN_CHART_METRICS: { value: MainChartMetric; label: string }[] = [
+  { value: 'latency', label: 'Latency' },
+  { value: 'traffic', label: 'Traffic' },
+]
+
 export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   const [searchParams, setSearchParams] = useSearchParams()
   const { open: openAssistant } = useAiAssistant()
@@ -261,6 +269,8 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
   )
   const [pendingChartRange, setPendingChartRange] =
     React.useState<ChartDateRange | null>(null)
+  const [mainChartMetric, setMainChartMetric] =
+    React.useState<MainChartMetric>('latency')
   const [selectedEnvironment, setSelectedEnvironment] = React.useState<
     number | undefined
   >(undefined)
@@ -895,18 +905,47 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
 
       <Card>
         <CardHeader>
-          <CardTitle>Latency (p95 / p99)</CardTitle>
-          <CardDescription>
-            Deploy markers show where a release may have shifted latency. Drag
-            across the chart to select a timeframe.
-          </CardDescription>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle>
+                {mainChartMetric === 'latency'
+                  ? 'Latency (p95 / p99)'
+                  : 'Traffic'}
+              </CardTitle>
+              <CardDescription>
+                {mainChartMetric === 'latency'
+                  ? 'Deploy markers show where a release may have shifted latency. Drag across the chart to select a timeframe.'
+                  : 'Requests and errors per interval. Drag across the chart to select a timeframe.'}
+              </CardDescription>
+            </div>
+            <Tabs
+              value={mainChartMetric}
+              onValueChange={(v) => setMainChartMetric(v as MainChartMetric)}
+            >
+              <TabsList className="h-8">
+                {MAIN_CHART_METRICS.map((m) => (
+                  <TabsTrigger
+                    key={m.value}
+                    value={m.value}
+                    className="h-6 px-2.5 text-xs"
+                  >
+                    {m.label}
+                  </TabsTrigger>
+                ))}
+              </TabsList>
+            </Tabs>
+          </div>
         </CardHeader>
         <CardContent>
           {timeseriesQuery.isPending ? (
             <Skeleton className="h-[300px] w-full" />
           ) : timeseriesQuery.isError ? (
-            <QueryErrorState label="latency data" />
-          ) : (
+            <QueryErrorState
+              label={
+                mainChartMetric === 'latency' ? 'latency data' : 'traffic data'
+              }
+            />
+          ) : mainChartMetric === 'latency' ? (
             <ThresholdLineChart
               data={chartData}
               xKey="bucket"
@@ -917,6 +956,21 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
               markers={deployMarkers}
               yTickFormatter={(v) => `${v.toFixed(0)}ms`}
               tooltipValueFormatter={(v) => `${v.toFixed(0)}ms`}
+              selectionKey="timestamp"
+              selectedRange={pendingChartRange}
+              onRangeSelect={(from, to) => setPendingChartRange({ from, to })}
+            />
+          ) : (
+            <ThresholdLineChart
+              data={chartData}
+              xKey="bucket"
+              series={[
+                { dataKey: 'requests', label: 'Requests', tone: 'primary' },
+                { dataKey: 'errors', label: 'Errors', tone: 'poor' },
+              ]}
+              markers={deployMarkers}
+              yTickFormatter={(v) => formatNumber(v)}
+              tooltipValueFormatter={(v) => formatNumber(v)}
               selectionKey="timestamp"
               selectedRange={pendingChartRange}
               onRangeSelect={(from, to) => setPendingChartRange({ from, to })}
@@ -946,10 +1000,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
             {routesQuery.isPending ? (
               <Skeleton className="h-[240px] w-full" />
             ) : routesQuery.isError ? (
-              <QueryErrorState
-                label="route data"
-                error={routesQuery.error}
-              />
+              <QueryErrorState label="route data" error={routesQuery.error} />
             ) : (routesQuery.data?.rows.length ?? 0) === 0 ? (
               <p className="text-sm text-muted-foreground">
                 No API traffic for this period.
@@ -1064,10 +1115,7 @@ export function ApiTrafficTab({ project }: ApiTrafficTabProps) {
             {callersQuery.isPending ? (
               <Skeleton className="h-[240px] w-full" />
             ) : callersQuery.isError ? (
-              <QueryErrorState
-                label="caller data"
-                error={callersQuery.error}
-              />
+              <QueryErrorState label="caller data" error={callersQuery.error} />
             ) : (callersQuery.data?.rows.length ?? 0) === 0 ? (
               <p className="text-sm text-muted-foreground">
                 No API traffic for this period.
@@ -1575,13 +1623,7 @@ function StatTile({
   )
 }
 
-function QueryErrorState({
-  label,
-  error,
-}: {
-  label: string
-  error?: unknown
-}) {
+function QueryErrorState({ label, error }: { label: string; error?: unknown }) {
   const problem = error instanceof TrafficQueryError ? error : undefined
   // A rejected request states its own reason far better than a generic
   // fallback can — the server knows which cap was exceeded and by what.

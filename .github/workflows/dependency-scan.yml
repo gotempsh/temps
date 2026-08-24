@@ -92,8 +92,24 @@ jobs:
       #   separately, not a drop-in version bump.
       # - RUSTSEC-2018-0017 (tempdir): transitive via nixpacks, no newer
       #   nixpacks release drops it yet.
+      # - RUSTSEC-2024-0436 (paste): transitive via clickhouse ->
+      #   higher-kinded-types -> polonius-the-crab -> paste. Proc-macro only
+      #   (compile-time codegen, not linked into the binary); clickhouse
+      #   0.15.1 is already the latest release and doesn't drop it.
+      # - RUSTSEC-2026-0173 (proc-macro-error2): transitive via sea-orm ->
+      #   sea-orm-macros -> sea-bae -> proc-macro-error2 (distinct from the
+      #   already-ignored RUSTSEC-2024-0370, which is the original
+      #   proc-macro-error crate via a different path). Proc-macro only;
+      #   sea-orm 1.1.20 is the pinned major, 2.0 is a breaking migration.
+      # - RUSTSEC-2024-0388 (derivative): transitive via pingora-core ->
+      #   derivative. Proc-macro only; pingora-core 0.8.1 is already latest.
+      # - RUSTSEC-2025-0069 (daemonize): transitive via pingora-core ->
+      #   daemonize. Runtime dep in pingora-core, but temps-proxy/server.rs
+      #   explicitly sets `daemon: false` (systemd owns process lifecycle),
+      #   so pingora never calls into daemonize's fork/detach path -- the
+      #   code is compiled in but never executed.
       #
-      # The three below are real vulnerabilities (not just "unmaintained"
+      # The four below are real vulnerabilities (not just "unmaintained"
       # notices), blocked on upstream fixes with no non-forking workaround.
       # Full reachability analysis for each lives in the root Cargo.toml
       # under "Dependency Overrides - Security Fixes" -- re-verify that
@@ -128,12 +144,17 @@ jobs:
       #   rather than what is built. Switching this gate to cargo-auditable
       #   (`cargo audit bin` against the compiled binary) would drop it
       #   without an exception -- see the PR that added this line.
+      # - RUSTSEC-2026-0253 (lru 0.16.4, unsound UAF in LruCache::pop()):
+      #   transitive via aws-sdk-s3, which pins `lru = "^0.16.3"`. Verified
+      #   2026-08-24 against aws-sdk-s3 1.143.0 (crates.io latest as of that
+      #   date) that the requirement is unchanged -- upgrading aws-sdk-s3
+      #   does not pull the fixed lru 0.18.2.
       # Remove an entry once its upstream is fixed/replaced.
       - name: Run cargo-audit
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071,RUSTSEC-2026-0235
+          ignore: RUSTSEC-2024-0370,RUSTSEC-2025-0134,RUSTSEC-2018-0017,RUSTSEC-2024-0437,RUSTSEC-2023-0018,RUSTSEC-2023-0071,RUSTSEC-2026-0235,RUSTSEC-2024-0436,RUSTSEC-2026-0173,RUSTSEC-2024-0388,RUSTSEC-2025-0069,RUSTSEC-2026-0253
 
   web-audit:
     name: Web Dependency Audit (bun audit)

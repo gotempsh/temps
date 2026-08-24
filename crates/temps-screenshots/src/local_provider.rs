@@ -2,11 +2,30 @@
 
 use async_trait::async_trait;
 use headless_chrome::{Browser, LaunchOptions};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+use tokio::sync::Mutex as AsyncMutex;
 use tracing::{debug, error, info};
 
 use crate::error::{ScreenshotError, ScreenshotResult};
 use crate::provider::ScreenshotProvider;
+
+/// headless_chrome's `fetch` feature (enabled in Cargo.toml) downloads and
+/// caches a Chrome build to a shared path on first use when no local Chrome
+/// is installed. Launching two browsers concurrently before that download
+/// completes races on the same cached executable and can fail with a
+/// `Text file busy` exec error, or duplicate the download. This can happen
+/// in production, not just in tests: `ScreenshotService::new()` probes
+/// availability from a background task, and a `TakeScreenshotJob` can call
+/// `check_provider_availability()`/`capture_screenshot()` around the same
+/// time. Serialize every real Chrome launch process-wide so concurrent
+/// callers can't race on it.
+///
+/// `Arc`-wrapped (rather than a bare `&'static AsyncMutex`) so a guard can be
+/// moved into a detached task and held for as long as the actual launch is
+/// running -- see `check_availability`'s use of `lock_owned()`.
+static CHROME_LAUNCH_LOCK: LazyLock<Arc<AsyncMutex<()>>> =
+    LazyLock::new(|| Arc::new(AsyncMutex::new(())));
 
 /// Local screenshot provider using headless Chrome
 pub struct LocalScreenshotProvider {
@@ -56,6 +75,11 @@ impl ScreenshotProvider for LocalScreenshotProvider {
         if url::Url::parse(url).is_err() {
             return Err(ScreenshotError::InvalidUrl(format!("Invalid URL: {}", url)));
         }
+
+        // Hold this for the whole capture (not just the launch): the closure
+        // below is fully synchronous, so there's no cheaper point to release it
+        // at without splitting Browser::new() out of spawn_blocking.
+        let _launch_guard = CHROME_LAUNCH_LOCK.lock().await;
 
         // Launch browser in a blocking context since headless_chrome is sync
         let browser = tokio::task::spawn_blocking({
@@ -176,35 +200,57 @@ impl ScreenshotProvider for LocalScreenshotProvider {
     }
 
     async fn check_availability(&self) -> ScreenshotResult<()> {
-        // Try to launch browser to check if Chrome is available
-        // Use a 10-second timeout to prevent hanging on VPS/servers without Chrome
-        let check_result = tokio::time::timeout(
-            Duration::from_secs(10),
-            tokio::task::spawn_blocking(|| {
-                let options = LaunchOptions::default_builder()
-                    .headless(true)
-                    .sandbox(false)
-                    .idle_browser_timeout(Duration::from_secs(5))
-                    .build();
+        // See CHROME_LAUNCH_LOCK: serialize this probe launch against any
+        // concurrent real capture (or another probe) on this provider.
+        //
+        // An owned guard, not a plain `.lock().await`: `spawn_blocking`
+        // tasks are NOT cancelled when the `JoinHandle` future stops being
+        // polled/is dropped (e.g. by the 10s `timeout` below elapsing) --
+        // the launch keeps running on its blocking thread regardless. If the
+        // guard lived on this function's stack, it would be dropped the
+        // moment we give up waiting, letting a second caller start a second
+        // launch while the first is still executing -- the exact race this
+        // lock exists to prevent. Instead, hand the owned guard to a
+        // detached supervisor that releases it only once the real launch
+        // attempt truly finishes; `timeout` below races the supervisor's
+        // *report* of that outcome, not the launch itself.
+        let launch_guard = CHROME_LAUNCH_LOCK.clone().lock_owned().await;
+        let handle = tokio::task::spawn_blocking(|| {
+            let options = LaunchOptions::default_builder()
+                .headless(true)
+                .sandbox(false)
+                .idle_browser_timeout(Duration::from_secs(5))
+                .build();
 
-                match options {
-                    Ok(opts) => match Browser::new(opts) {
-                        Ok(_) => Ok(()),
-                        Err(e) => Err(format!("Failed to launch Chrome browser: {}", e)),
-                    },
-                    Err(e) => Err(format!("Failed to build launch options: {}", e)),
-                }
-            }),
-        )
-        .await;
+            match options {
+                Ok(opts) => match Browser::new(opts) {
+                    Ok(_) => Ok(()),
+                    Err(e) => Err(format!("Failed to launch Chrome browser: {}", e)),
+                },
+                Err(e) => Err(format!("Failed to build launch options: {}", e)),
+            }
+        });
+
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let outcome = handle.await;
+            drop(launch_guard);
+            let _ = done_tx.send(outcome);
+        });
+
+        // Use a 10-second timeout to prevent hanging on VPS/servers without Chrome
+        let check_result = tokio::time::timeout(Duration::from_secs(10), done_rx).await;
 
         let reason = match check_result {
-            Ok(Ok(Ok(()))) => {
+            Ok(Ok(Ok(Ok(())))) => {
                 debug!("Chrome browser is available");
                 return Ok(());
             }
-            Ok(Ok(Err(e))) => e,
-            Ok(Err(e)) => format!("Chrome availability check task failed: {}", e),
+            Ok(Ok(Ok(Err(e)))) => e,
+            Ok(Ok(Err(e))) => format!("Chrome availability check task failed: {}", e),
+            Ok(Err(_)) => "Chrome availability check task failed: supervisor task dropped before \
+                 reporting an outcome"
+                .to_string(),
             Err(_) => {
                 "Chrome availability check timed out after 10 seconds; Chrome is most likely \
                  installed but missing shared libraries (check `ldd <chrome-binary> | grep \
@@ -229,14 +275,12 @@ impl ScreenshotProvider for LocalScreenshotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::LazyLock;
-    use tokio::sync::Mutex as AsyncMutex;
 
-    // headless_chrome's `fetch` feature races on a shared cached Chrome binary
-    // when two tests launch a browser concurrently, causing an intermittent
-    // "Text file busy" exec error. Serialize the tests that launch a real
-    // browser so only one Chrome instance starts up at a time.
-    static CHROME_LAUNCH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+    // Concurrent real-Chrome-launch tests used to race on headless_chrome's
+    // shared cached `fetch` binary and need their own lock. That's now
+    // handled by CHROME_LAUNCH_LOCK inside LocalScreenshotProvider itself
+    // (production callers can race on it too, not just tests), so these
+    // tests no longer need to serialize themselves.
 
     /// Returns `false` (and prints why) when this machine cannot launch Chrome
     /// at all, so a browser-dependent test can skip instead of failing.
@@ -293,7 +337,6 @@ mod tests {
     async fn test_capture_screenshot_example_com() {
         use std::fs;
 
-        let _guard = CHROME_LAUNCH_LOCK.lock().await;
         let provider = LocalScreenshotProvider::new();
         if !chrome_available(&provider).await {
             return;
@@ -327,7 +370,6 @@ mod tests {
     async fn test_capture_screenshot_github() {
         use std::fs;
 
-        let _guard = CHROME_LAUNCH_LOCK.lock().await;
         let provider = LocalScreenshotProvider::with_config(30, 1920, 1080);
         if !chrome_available(&provider).await {
             return;
@@ -364,7 +406,6 @@ mod tests {
     async fn test_capture_screenshot_mobile_viewport() {
         use std::fs;
 
-        let _guard = CHROME_LAUNCH_LOCK.lock().await;
         // Test with mobile viewport dimensions
         let provider = LocalScreenshotProvider::with_config(30, 375, 812); // iPhone X dimensions
         if !chrome_available(&provider).await {

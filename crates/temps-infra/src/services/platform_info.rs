@@ -144,7 +144,7 @@ impl PlatformInfoService {
         info!("Getting private IP address");
 
         // Get all network interfaces
-        let interfaces = get_if_addrs::get_if_addrs()?;
+        let interfaces = if_addrs::get_if_addrs()?;
 
         // Collect all non-loopback IPv4 and IPv6 addresses
         let mut ipv4_addresses = Vec::new();

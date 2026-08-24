@@ -20,7 +20,7 @@ log = { workspace = true }
 anyhow = { workspace = true }
 
 # Crate-specific dependencies
-get_if_addrs = "0.5"
+if-addrs = "0.15"
 parking_lot = "0.12"
 hickory-resolver = "0.26"
 

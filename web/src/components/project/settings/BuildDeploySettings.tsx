@@ -4,6 +4,7 @@ import { useSearchParams } from 'react-router'
 import { BuildSettings } from './GitSettings'
 import { DeployDefaultsCard } from './DeployDefaultsCard'
 import { DeploymentSourceCard } from './DeploymentSourceCard'
+import { EnvironmentPortOverrideCard } from './EnvironmentPortOverrideCard'
 import { ImageRetentionCard } from './ImageRetentionCard'
 import { PreviewEnvironmentsCard } from './PreviewEnvironmentsCard'
 
@@ -73,6 +74,7 @@ export function BuildDeploySettings({
 
         <TabsContent value="deploy" className="space-y-6">
           <DeployDefaultsCard project={project} refetch={refetch} />
+          <EnvironmentPortOverrideCard project={project} />
           <ImageRetentionCard project={project} refetch={refetch} />
         </TabsContent>
 

@@ -297,15 +297,17 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     commit,
     tag,
     environmentId,
+    imageRef: editedImageRef,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
+    imageRef?: string
   }) => {
-    // docker_image projects re-pull the prebuilt image; git projects run the pipeline.
+    // docker_image projects re-pull the given image; git projects run the pipeline.
     if (project.source_type === 'docker_image') {
-      const ref = resolveImageRef()
+      const ref = editedImageRef?.trim() || resolveImageRef()
       if (!ref) {
         toast.error('No image reference found for this project')
         return

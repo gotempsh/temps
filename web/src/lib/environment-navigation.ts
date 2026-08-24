@@ -1,7 +1,9 @@
-export type EnvironmentView = 'containers' | 'settings'
+export type EnvironmentView = 'containers' | 'metrics' | 'settings'
 
 export function resolveEnvironmentView(value: string | null): EnvironmentView {
-  return value === 'settings' ? 'settings' : 'containers'
+  if (value === 'settings') return 'settings'
+  if (value === 'metrics') return 'metrics'
+  return 'containers'
 }
 
 export function resolveEnvironmentId(
@@ -44,8 +46,8 @@ export function updateEnvironmentSearchParams(
     next.set('environment', change.environmentId.toString())
   }
 
-  if (change.view === 'settings') {
-    next.set('view', 'settings')
+  if (change.view === 'settings' || change.view === 'metrics') {
+    next.set('view', change.view)
   } else if (change.view === 'containers') {
     next.delete('view')
   }

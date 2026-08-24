@@ -8,6 +8,7 @@ import { ContainerList } from '@/components/containers/ContainerList'
 import { ContainerActionDialog } from '@/components/containers/ContainerActionDialog'
 import { EnvironmentSettingsContent } from '@/components/environments/EnvironmentSettingsContent'
 import { EnvironmentHeaderBar } from '@/components/environments/EnvironmentHeaderBar'
+import { EnvironmentMetricsCharts } from '@/components/monitoring/EnvironmentMetricsCard'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { useSearchParams } from 'react-router'
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
@@ -111,7 +112,7 @@ export function EnvironmentDashboard({
     )
   }
 
-  const isStatic = project?.preset === 'custom'
+  const isStatic = project?.source_type === 'static_files'
 
   return (
     <div className="flex flex-col h-full bg-white dark:bg-neutral-950">
@@ -142,6 +143,11 @@ export function EnvironmentDashboard({
                 This project does not have running containers to manage.
               </p>
             </div>
+          ) : activeView === 'metrics' ? (
+            <EnvironmentMetricsCharts
+              projectId={project.id}
+              environmentId={environmentId}
+            />
           ) : (
             <ContainerPanel
               project={project}

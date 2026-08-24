@@ -1,4 +1,5 @@
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
+import type { EnvironmentView } from '@/lib/environment-navigation'
 import {
   sleepEnvironmentMutation,
   wakeEnvironmentMutation,
@@ -27,6 +28,7 @@ import {
   Clock,
   ExternalLink,
   GitBranch,
+  LineChart,
   Loader2,
   Moon,
   Play,
@@ -40,8 +42,8 @@ import { toast } from 'sonner'
 interface EnvironmentHeaderBarProps {
   environment: EnvironmentResponse
   project: ProjectResponse
-  activeView: 'containers' | 'settings'
-  onViewChange: (view: 'containers' | 'settings') => void
+  activeView: EnvironmentView
+  onViewChange: (view: EnvironmentView) => void
   environments?: EnvironmentResponse[]
   onEnvironmentChange?: (id: number) => void
   onCreateEnvironment?: () => void
@@ -341,6 +343,22 @@ export function EnvironmentHeaderBar({
             <Boxes className="size-4" aria-hidden="true" />
             Containers
             {activeView === 'containers' && (
+              <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-neutral-950 dark:bg-white" />
+            )}
+          </button>
+          <button
+            type="button"
+            onClick={() => onViewChange('metrics')}
+            aria-current={activeView === 'metrics' ? 'page' : undefined}
+            className={`relative inline-flex h-10 items-center gap-2 px-3 text-sm font-medium transition-colors ${
+              activeView === 'metrics'
+                ? 'text-neutral-950 dark:text-white'
+                : 'text-neutral-500 hover:text-neutral-900 dark:text-neutral-400 dark:hover:text-neutral-100'
+            }`}
+          >
+            <LineChart className="size-4" aria-hidden="true" />
+            Metrics
+            {activeView === 'metrics' && (
               <span className="absolute inset-x-2 -bottom-px h-0.5 rounded-full bg-neutral-950 dark:bg-white" />
             )}
           </button>

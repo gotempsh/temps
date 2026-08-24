@@ -952,6 +952,36 @@ pub struct ContainerMetricHistoryPoint {
     pub value: f64,
 }
 
+/// One container that has ever run for an environment — current or replaced
+/// by a later redeploy. `id` is the internal row ID to pass as the
+/// `container_id` path segment when calling the metrics/history endpoint for
+/// this specific container generation (its docker `container_id` also works
+/// since the history handler now resolves either).
+#[derive(Serialize, ToSchema)]
+pub struct ContainerHistoryEntry {
+    pub id: i32,
+    pub container_id: String,
+    pub container_name: String,
+    #[schema(nullable = true)]
+    pub service_name: Option<String>,
+    pub deployment_id: i32,
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub deployed_at: String,
+    #[schema(nullable = true, example = "2025-10-12T12:15:47.609192Z")]
+    pub finished_at: Option<String>,
+    #[schema(nullable = true, example = "2025-10-12T12:15:47.609192Z")]
+    pub deleted_at: Option<String>,
+    /// True if this row is the environment's currently-active container
+    /// (deleted_at is null) — false for containers replaced by a later
+    /// redeploy.
+    pub is_current: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ContainerHistoryListResponse {
+    pub containers: Vec<ContainerHistoryEntry>,
+}
+
 /// Response indicating success of container state change
 #[derive(Serialize, ToSchema)]
 pub struct ContainerActionResponse {

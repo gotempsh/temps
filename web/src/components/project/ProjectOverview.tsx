@@ -6,12 +6,15 @@ import type {
   ProjectResponse,
 } from '@/api/client'
 import {
+  containerMetricsGetHistoryOptions,
   getApiRoutesOptions,
   getApiTimeseriesOptions,
+  getEnvironmentsOptions,
   getErrorDashboardStatsOptions,
   getHourlyVisitsOptions,
   getUniqueCountsOptions,
   hasAnalyticsEventsOptions,
+  listContainerHistoryOptions,
   listErrorGroupsOptions,
   queryTraceSummariesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -26,7 +29,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { cn } from '@/lib/utils'
 import { buildProjectAnalyticsCountRequest } from '@/lib/project-analytics-summary'
-import { useQuery } from '@tanstack/react-query'
+import { useQueries, useQuery } from '@tanstack/react-query'
 import { format, subDays } from 'date-fns'
 import { ArrowRight, Sparkles } from 'lucide-react'
 import { useMemo } from 'react'
@@ -318,6 +321,10 @@ export function ProjectOverview({
         </div>
 
         <div className="mt-4 grid gap-4 @5xl/overview:grid-cols-5">
+          <EnvironmentHealthCard project={project} />
+        </div>
+
+        <div className="mt-4 grid gap-4 @5xl/overview:grid-cols-5">
           <TopRoutesCard
             projectSlug={project.slug}
             routes={topRoutes}
@@ -456,6 +463,170 @@ function VisitorAnalyticsCard({
                 value={`${returningRate.toFixed(0)}%`}
               />
             </dl>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  )
+}
+
+function EnvironmentHealthCard({ project }: { project: ProjectResponse }) {
+  const environmentsQuery = useQuery({
+    ...getEnvironmentsOptions({ path: { project_id: project.id } }),
+    enabled: !!project.id,
+  })
+  // Same "first environment" convention environment-navigation.ts uses when
+  // no environment is explicitly selected in the URL.
+  const environment = environmentsQuery.data?.[0]
+
+  const historyQuery = useQuery({
+    ...listContainerHistoryOptions({
+      path: { project_id: project.id, environment_id: environment?.id ?? 0 },
+    }),
+    enabled: !!environment?.id,
+  })
+
+  const currentContainers = useMemo(
+    () => (historyQuery.data?.containers ?? []).filter((c) => c.is_current),
+    [historyQuery.data]
+  )
+
+  const historyOptionsFor = (containerId: string, metric: string) => ({
+    ...containerMetricsGetHistoryOptions({
+      path: {
+        project_id: project.id,
+        environment_id: environment?.id ?? 0,
+        container_id: containerId,
+      },
+      query: { metric, range: '1h' },
+    }),
+    enabled: !!environment?.id,
+    staleTime: 30_000,
+    retry: false,
+  })
+
+  const cpuQueries = useQueries({
+    queries: currentContainers.map((c) =>
+      historyOptionsFor(c.container_id, 'container.cpu_percent')
+    ),
+  })
+  const memQueries = useQueries({
+    queries: currentContainers.map((c) =>
+      historyOptionsFor(c.container_id, 'container.memory_used_bytes')
+    ),
+  })
+
+  const cpuData = useMemo(
+    () =>
+      sumMetricSeries(cpuQueries.map((q) => q.data ?? [])).map((point) => ({
+        time: format(new Date(point.time), 'HH:mm'),
+        value: point.value,
+      })),
+    [cpuQueries]
+  )
+  const memData = useMemo(
+    () =>
+      sumMetricSeries(memQueries.map((q) => q.data ?? [])).map((point) => ({
+        time: format(new Date(point.time), 'HH:mm'),
+        value: point.value / (1024 * 1024),
+      })),
+    [memQueries]
+  )
+
+  const isLoading =
+    environmentsQuery.isPending || (!!environment?.id && historyQuery.isPending)
+  const notConfigured =
+    currentContainers.length > 0 &&
+    cpuQueries.length === currentContainers.length &&
+    cpuQueries.every(
+      (q) =>
+        q.isError &&
+        metricsErrorDetail(q.error).toLowerCase().includes('not enabled')
+    )
+  const hasCpuTrend = cpuData.length >= 4
+  const hasMemTrend = memData.length >= 4
+
+  return (
+    <Card className="@5xl/overview:col-span-5">
+      <CardHeader className="flex flex-row items-start justify-between gap-4 pb-2">
+        <div className="min-w-0">
+          <h2 className="truncate text-base font-semibold">
+            {environment ? `${environment.name} environment` : 'Environment'}{' '}
+            health
+          </h2>
+          <p className="text-base text-pretty text-muted-foreground sm:text-sm">
+            {currentContainers.length === 0
+              ? 'CPU and memory usage over the last hour.'
+              : `${currentContainers.length} running container${currentContainers.length === 1 ? '' : 's'} over the last hour.`}
+          </p>
+        </div>
+        <Button variant="ghost" size="sm" asChild>
+          <Link to={`/projects/${project.slug}/environments?view=metrics`}>
+            Explore
+            <ArrowRight className="size-4 shrink-0" />
+          </Link>
+        </Button>
+      </CardHeader>
+      <CardContent>
+        {isLoading ? (
+          <Skeleton className="h-52 w-full" />
+        ) : !environment ? (
+          <SignalError message="No environments found for this project." />
+        ) : notConfigured ? (
+          <div className="flex h-52 flex-col items-start justify-center gap-3 rounded-md border border-dashed p-5">
+            <div>
+              <p className="font-medium">Track CPU and memory over time</p>
+              <p className="mt-1 text-base text-pretty text-muted-foreground sm:text-sm">
+                Once enabled, this card shows CPU and memory usage for{' '}
+                {environment.name} sampled over the last hour.
+              </p>
+            </div>
+            <Button variant="outline" size="sm" asChild>
+              <Link to="/settings/metrics-monitoring">
+                Enable metrics collection
+              </Link>
+            </Button>
+          </div>
+        ) : currentContainers.length === 0 ? (
+          <CompactEmpty label="No running containers in this environment" />
+        ) : (
+          <div className="grid gap-5 @3xl/overview:grid-cols-2">
+            <div className="min-w-0">
+              <h3 className="truncate text-sm font-medium">CPU usage</h3>
+              {hasCpuTrend ? (
+                <ThresholdLineChart
+                  data={cpuData}
+                  xKey="time"
+                  series={{ dataKey: 'value', label: 'CPU', tone: 'neutral' }}
+                  height={150}
+                  yTickFormatter={(value) => `${Math.round(value)}%`}
+                  tooltipValueFormatter={(value) => `${value.toFixed(1)}%`}
+                  emptyMessage={<CompactEmpty label="No CPU samples" />}
+                />
+              ) : (
+                <SparseTrendState samples={cpuData.length} label="CPU" />
+              )}
+            </div>
+            <div className="min-w-0">
+              <h3 className="truncate text-sm font-medium">Memory usage</h3>
+              {hasMemTrend ? (
+                <ThresholdLineChart
+                  data={memData}
+                  xKey="time"
+                  series={{
+                    dataKey: 'value',
+                    label: 'Memory',
+                    tone: 'neutral',
+                  }}
+                  height={150}
+                  yTickFormatter={(value) => `${Math.round(value)} MB`}
+                  tooltipValueFormatter={(value) => `${value.toFixed(0)} MB`}
+                  emptyMessage={<CompactEmpty label="No memory samples" />}
+                />
+              ) : (
+                <SparseTrendState samples={memData.length} label="memory" />
+              )}
+            </div>
           </div>
         )}
       </CardContent>
@@ -719,6 +890,31 @@ function SignalError({ message }: { message: string }) {
       <p className="text-base text-muted-foreground sm:text-sm">{message}</p>
     </div>
   )
+}
+
+/** Sums same-timestamp points across containers into one aggregate series. */
+function sumMetricSeries(
+  seriesList: { time: string; value: number }[][]
+): { time: string; value: number }[] {
+  const sums = new Map<string, number>()
+  for (const points of seriesList) {
+    for (const point of points) {
+      sums.set(point.time, (sums.get(point.time) ?? 0) + point.value)
+    }
+  }
+  return Array.from(sums.entries())
+    .map(([time, value]) => ({ time, value }))
+    .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime())
+}
+
+/** `@hey-api/client-fetch` throws the parsed RFC 7807 Problem body
+ *  ({ detail, title, status }) on a failed request. */
+function metricsErrorDetail(err: unknown): string {
+  if (err == null) return ''
+  if (typeof err === 'string') return err
+  if (err instanceof Error) return err.message
+  const problem = err as { detail?: string; title?: string }
+  return problem.detail ?? problem.title ?? ''
 }
 
 function formatNumber(value: number | null | undefined): string {

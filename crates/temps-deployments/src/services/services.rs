@@ -4168,6 +4168,102 @@ impl DeploymentService {
         Ok((container, env_info))
     }
 
+    /// List every container that has ever run for an environment — current
+    /// and replaced by a later redeploy. Unlike `get_container_detail`, this
+    /// does NOT filter out rows with `deleted_at` set, since a redeploy soft
+    /// deletes the previous container row and we still want its history
+    /// available for metrics lookups.
+    pub async fn list_environment_container_history(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<Vec<deployment_containers::Model>, DeploymentError> {
+        // Verify environment exists and belongs to project
+        environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        let deployment_ids: Vec<i32> = deployments::Entity::find()
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .all(self.db.as_ref())
+            .await?
+            .into_iter()
+            .map(|d| d.id)
+            .collect();
+
+        if deployment_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let containers = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::DeploymentId.is_in(deployment_ids))
+            .order_by_asc(deployment_containers::Column::DeployedAt)
+            .all(self.db.as_ref())
+            .await?;
+
+        Ok(containers)
+    }
+
+    /// Resolve a container row by docker container_id, including containers
+    /// replaced by a later redeploy (`deleted_at` set). Duplicates the
+    /// lookup logic of `get_container_detail` minus the `DeletedAt.is_null()`
+    /// filters — intended ONLY for read-only historical lookups (e.g.
+    /// persisted metrics history) where the container no longer needs to be
+    /// live-operable. `stop_container`/`start_container` and similar
+    /// operational paths must keep using `get_container_detail`, which
+    /// correctly excludes deleted containers.
+    pub async fn get_container_row_any(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<deployment_containers::Model, DeploymentError> {
+        // Verify environment belongs to project
+        environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        // Find the container — supports both short (12-char) and full (64-char) IDs.
+        // Compose deployments store short IDs from `docker compose ps`, but
+        // `docker inspect` returns full IDs which the frontend may pass back.
+        // Try exact match first, then prefix match in both directions.
+        let container = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::ContainerId.eq(&container_id))
+            .one(self.db.as_ref())
+            .await?;
+
+        let container = match container {
+            Some(c) => c,
+            None => {
+                // Full ID passed but DB has short ID: query starts with DB value
+                // Short ID passed but DB has full ID: DB value starts with query
+                let short_id = &container_id[..container_id.len().min(12)];
+                deployment_containers::Entity::find()
+                    .filter(deployment_containers::Column::ContainerId.starts_with(short_id))
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or_else(|| {
+                        DeploymentError::NotFound(format!("Container {} not found", container_id))
+                    })?
+            }
+        };
+
+        // Verify container belongs to a deployment in this environment
+        deployments::Entity::find_by_id(container.deployment_id)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+
+        Ok(container)
+    }
+
     /// Check whether container exec/terminal access is enabled for an
     /// environment after applying project-level defaults and environment-level
     /// overrides.

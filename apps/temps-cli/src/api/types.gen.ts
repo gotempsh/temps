@@ -3140,6 +3140,34 @@ export type ContainerEnvironmentVariableValueResponse = {
     value: string;
 };
 
+/**
+ * One container that has ever run for an environment — current or replaced
+ * by a later redeploy. `id` is the internal row ID to pass as the
+ * `container_id` path segment when calling the metrics/history endpoint for
+ * this specific container generation (its docker `container_id` also works
+ * since the history handler now resolves either).
+ */
+export type ContainerHistoryEntry = {
+    container_id: string;
+    container_name: string;
+    deleted_at?: string | null;
+    deployed_at: string;
+    deployment_id: number;
+    finished_at?: string | null;
+    id: number;
+    /**
+     * True if this row is the environment's currently-active container
+     * (deleted_at is null) — false for containers replaced by a later
+     * redeploy.
+     */
+    is_current: boolean;
+    service_name?: string | null;
+};
+
+export type ContainerHistoryListResponse = {
+    containers: Array<ContainerHistoryEntry>;
+};
+
 export type ContainerInfoResponse = {
     container_id: string;
     container_name: string;
@@ -4043,7 +4071,8 @@ export type CreateIpAccessControlRequest = {
      */
     action: string;
     /**
-     * IP address in CIDR notation (e.g., "192.168.1.1" or "10.0.0.0/24")
+     * IPv4 or IPv6 address, in CIDR notation for ranges (e.g., "192.168.1.1",
+     * "10.0.0.0/24", "2001:db8::1", or "2001:db8::/32")
      */
     ip_address: string;
     /**
@@ -43778,6 +43807,44 @@ export type WakeEnvironmentResponses = {
 };
 
 export type WakeEnvironmentResponse = WakeEnvironmentResponses[keyof WakeEnvironmentResponses];
+
+export type ListContainerHistoryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Environment ID
+         */
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/container-history';
+};
+
+export type ListContainerHistoryErrors = {
+    /**
+     * Environment not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type ListContainerHistoryError = ListContainerHistoryErrors[keyof ListContainerHistoryErrors];
+
+export type ListContainerHistoryResponses = {
+    /**
+     * Every container that has ever run for this environment, current and replaced
+     */
+    200: ContainerHistoryListResponse;
+};
+
+export type ListContainerHistoryResponse = ListContainerHistoryResponses[keyof ListContainerHistoryResponses];
 
 export type GetContainerLogsData = {
     body?: never;

@@ -986,14 +986,17 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     commit,
     tag,
     environmentId,
+    imageRef: editedImageRef,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
+    imageRef?: string
   }) => {
     if (project.source_type === 'docker_image') {
-      const ref = deployment?.metadata?.externalImageRef
+      const ref =
+        editedImageRef?.trim() || deployment?.metadata?.externalImageRef
       if (!ref) {
         toast.error('No image reference found for this deployment')
         return
