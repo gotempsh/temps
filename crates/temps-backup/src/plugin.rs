@@ -214,6 +214,9 @@ impl TempsPlugin for BackupPlugin {
             // orchestrators it spawns can emit PgMajorUpgradeCompleted.
             pg_upgrade_service.set_telemetry(Arc::clone(&telemetry));
 
+            let sensitive_action_authorizer =
+                context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
             let backup_app_state_inner = create_backup_app_state(
                 backup_service,
                 restore_service,
@@ -223,6 +226,7 @@ impl TempsPlugin for BackupPlugin {
                 Arc::clone(&executor),
                 telemetry,
                 context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+                sensitive_action_authorizer,
             );
 
             context.register_service(backup_app_state_inner);

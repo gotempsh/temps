@@ -1,4 +1,14 @@
 import { Alert, AlertDescription } from '@/components/ui/alert'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
@@ -10,6 +20,7 @@ import {
 } from '@/components/ui/card'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import {
   cancelPgUpgrade,
   getPgUpgrade,
@@ -19,6 +30,7 @@ import {
   PHASE_LABELS,
   phaseIndex,
   retryPgUpgrade,
+  rollbackPgUpgrade,
   type PgUpgrade,
   type PgUpgradePhase,
 } from '@/lib/pg-upgrades'
@@ -31,9 +43,10 @@ import {
   Circle,
   Loader2,
   RefreshCcw,
+  RotateCcw,
   XCircle,
 } from 'lucide-react'
-import { useEffect } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { toast } from 'sonner'
 
@@ -93,6 +106,9 @@ export function MajorUpgradeDetail() {
   const upgradeIdNum = upgradeId ? parseInt(upgradeId, 10) : NaN
   const queryClient = useQueryClient()
   const { setBreadcrumbs } = useBreadcrumbs()
+  const [showRollbackDialog, setShowRollbackDialog] = useState(false)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   usePageTitle(`Upgrade #${upgradeId}`)
 
@@ -147,6 +163,33 @@ export function MajorUpgradeDetail() {
     },
     onError: (error: Error) => {
       toast.error('Failed to cancel upgrade', { description: error.message })
+    },
+  })
+
+  const rollbackMutation = useMutation({
+    mutationFn: () => rollbackPgUpgrade(serviceIdNum, upgradeIdNum),
+    onSuccess: () => {
+      toast.success('Rollback complete', {
+        description:
+          'The service has been restored to its pre-upgrade PGDATA volume.',
+      })
+      queryClient.invalidateQueries({
+        queryKey: ['pg-upgrades', serviceIdNum, upgradeIdNum],
+      })
+      setShowRollbackDialog(false)
+    },
+    onError: (error: unknown) => {
+      if (
+        handleSensitiveActionError(error, () => rollbackMutation.mutate())
+      ) {
+        setShowRollbackDialog(false)
+        return
+      }
+      const msg =
+        error instanceof Error
+          ? error.message
+          : (error as { detail?: string })?.detail ?? 'Unknown error'
+      toast.error('Failed to roll back upgrade', { description: msg })
     },
   })
 
@@ -241,6 +284,21 @@ export function MajorUpgradeDetail() {
                 <RefreshCcw className="h-4 w-4 mr-2" />
               )}
               Retry
+            </Button>
+          ) : null}
+          {upgrade.status === 'completed' && upgrade.rollback_volume_name ? (
+            <Button
+              size="sm"
+              variant="destructive"
+              onClick={() => setShowRollbackDialog(true)}
+              disabled={rollbackMutation.isPending}
+            >
+              {rollbackMutation.isPending ? (
+                <Loader2 className="h-4 w-4 mr-2 animate-spin" />
+              ) : (
+                <RotateCcw className="h-4 w-4 mr-2" />
+              )}
+              Roll back
             </Button>
           ) : null}
         </div>
@@ -349,6 +407,42 @@ export function MajorUpgradeDetail() {
           </p>
         </CardContent>
       </Card>
+
+      <AlertDialog
+        open={showRollbackDialog}
+        onOpenChange={(open: boolean) => {
+          if (!rollbackMutation.isPending) setShowRollbackDialog(open)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Roll back this upgrade?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will stop the live PostgreSQL container and replace its data
+              volume with the pre-upgrade snapshot. The upgrade is reversed and
+              all data written after the upgrade was applied will be
+              permanently lost. This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={rollbackMutation.isPending}>
+              Keep upgraded version
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e: { preventDefault: () => void }) => {
+                e.preventDefault()
+                rollbackMutation.mutate()
+              }}
+              disabled={rollbackMutation.isPending}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {rollbackMutation.isPending ? 'Rolling back…' : 'Roll back'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {verificationDialog}
     </div>
   )
 }

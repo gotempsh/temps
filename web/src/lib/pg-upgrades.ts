@@ -123,6 +123,34 @@ export async function cancelPgUpgrade(
   return readJsonOrThrow<PgUpgrade>(response)
 }
 
+/**
+ * Roll back a completed major upgrade to the pre-upgrade PGDATA volume.
+ *
+ * Throws the raw problem-details object rather than a plain `Error` so that
+ * `handleSensitiveActionError` can detect a STEP_UP_REQUIRED response and
+ * open the MFA verification dialog.
+ */
+export async function rollbackPgUpgrade(
+  serviceId: number,
+  upgradeId: number,
+): Promise<PgUpgrade> {
+  const response = await fetch(
+    `/api/external-services/${serviceId}/upgrades/${upgradeId}/rollback`,
+    { method: 'POST', credentials: 'include' },
+  )
+  if (!response.ok) {
+    let problem: Record<string, unknown> = { status: response.status }
+    try {
+      problem = (await response.json()) as Record<string, unknown>
+    } catch {
+      problem['detail'] = response.statusText
+    }
+    // eslint-disable-next-line @typescript-eslint/no-throw-literal
+    throw problem
+  }
+  return (await response.json()) as PgUpgrade
+}
+
 // ---- Phase timeline helpers -------------------------------------------
 
 export const PG_UPGRADE_PHASES = [

@@ -46,6 +46,17 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from '@/components/ui/alert-dialog'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
+import {
   AlertCircle,
   AlertTriangle,
   ArrowLeft,
@@ -130,6 +141,9 @@ export function ServiceRestore() {
   const [confirmText, setConfirmText] = useState('')
   const [search, setSearch] = useState('')
   const [runningRunId, setRunningRunId] = useState<number | null>(null)
+  const [showDestructiveConfirm, setShowDestructiveConfirm] = useState(false)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   // Breadcrumbs
   useEffect(() => {
@@ -279,6 +293,24 @@ export function ServiceRestore() {
         description: `Run ${r.id} (phase: ${r.phase}).`,
       })
     },
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          startMutation.mutate(variables)
+        )
+      ) {
+        setShowDestructiveConfirm(false)
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(
+        'Failed to start restore',
+        {
+          description:
+            problem.detail || problem.message || 'Unknown error',
+        }
+      )
+    },
   })
 
   const planMutation = useMutation({
@@ -372,7 +404,7 @@ export function ServiceRestore() {
     return true
   })()
 
-  const handleStart = () => {
+  const doStart = () => {
     if (!selectedBackup) return
     const base: Record<string, unknown> = isOrphan
       ? {
@@ -406,6 +438,16 @@ export function ServiceRestore() {
       path: { id: serviceId },
       body: body as never,
     })
+  }
+
+  const handleStart = () => {
+    // Destructive modes (in-place or PITR into the same service) require an
+    // explicit confirmation dialog before the request is sent.
+    if (needsTypedConfirm) {
+      setShowDestructiveConfirm(true)
+    } else {
+      doStart()
+    }
   }
 
   // ---------- Render --------------------------------------------------------
@@ -1002,6 +1044,43 @@ export function ServiceRestore() {
           Start restore
         </Button>
       </div>
+
+      {/* Destructive-restore confirmation dialog */}
+      <AlertDialog
+        open={showDestructiveConfirm}
+        onOpenChange={(open: boolean) => {
+          if (!startMutation.isPending) setShowDestructiveConfirm(open)
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Overwrite live database?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This restore will stop <strong>{service?.name ?? 'the service'}</strong>{' '}
+              and replace its entire dataset with the selected backup. All data
+              written since the backup was taken will be permanently lost.
+              This action cannot be undone.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={startMutation.isPending}>
+              Go back
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e: { preventDefault: () => void }) => {
+                e.preventDefault()
+                doStart()
+              }}
+              disabled={startMutation.isPending}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {startMutation.isPending ? 'Starting restore…' : 'Yes, overwrite database'}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+
+      {verificationDialog}
     </div>
   )
 }

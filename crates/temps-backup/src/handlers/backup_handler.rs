@@ -23,11 +23,11 @@ use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
+use temps_core::SensitiveAction;
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
@@ -2134,6 +2134,14 @@ async fn delete_backup(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsDelete);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteBackup {
+            backup_id: id.clone(),
+        },
+    )
+    .await?;
 
     let existing = app_state
         .backup_service

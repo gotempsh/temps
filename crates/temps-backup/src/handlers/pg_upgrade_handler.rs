@@ -26,9 +26,9 @@ use axum::{
 };
 use sea_orm::{ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder};
 use serde::{Deserialize, Serialize};
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_core::problemdetails::Problem;
+use temps_core::SensitiveAction;
 use temps_entities::postgres_major_upgrades;
 use temps_providers::externalsvc::postgres_upgrade::PostgresUpgradeError;
 use temps_providers::postgres_upgrade_service::StartMajorUpgradeRequest;
@@ -311,6 +311,15 @@ async fn rollback_pg_upgrade(
     Path((service_id, id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesWrite);
+    require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::RollbackPgUpgrade {
+            service_id,
+            upgrade_id: id,
+        },
+    )
+    .await?;
 
     let _ = load_upgrade_for_service(&state, service_id, id).await?;
 

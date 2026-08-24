@@ -15,10 +15,10 @@ use axum::{
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::RequestMetadata;
+use temps_core::SensitiveAction;
 use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
@@ -345,6 +345,25 @@ async fn start_restore(
                 permission_guard!(auth, ExternalServicesWrite);
             }
         }
+    }
+
+    // Destructive restore modes overwrite the live service — require step-up
+    // verification. Non-destructive modes (NewService, Pitr into a new
+    // service) provision a fresh container and do not destroy anything.
+    if matches!(
+        &request.mode,
+        RestoreRequestMode::InPlace
+            | RestoreRequestMode::Pitr {
+                to_new_service: false,
+                ..
+            }
+    ) {
+        require_sensitive_action(
+            app_state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            SensitiveAction::RestoreExternalService { service_id: id },
+        )
+        .await?;
     }
 
     // The target service is where the data lands — and where whatever is
