@@ -94,8 +94,23 @@ pub fn start_proxy_server(
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> anyhow::Result<()> {
     let console_address = config.console_address.clone();
-    // Create tokio runtime to fetch preview_domain from config service
-    let rt = tokio::runtime::Runtime::new()?;
+    // Runtime for the startup settings fetch AND, when ADR-018 on-demand TLS is
+    // enabled, the long-lived home of `OnDemandCertManager`'s issuance consumer
+    // (`OnDemandCertManager::new` calls `tokio::spawn` on whatever runtime is
+    // current). It therefore has to outlive this fetch and it has to stay
+    // multi-threaded: on a `current_thread` runtime, a thread parked by Pingora
+    // would leave the consumer unpolled and silently break issuance.
+    //
+    // `Runtime::new()` sizes itself to the host (one worker per core), which on
+    // a big box means ~24 idle worker threads costing ~100 kB of anonymous RSS
+    // each for a runtime whose entire steady-state workload is one consumer
+    // task draining a bounded channel. Two workers keep the "a blocked thread
+    // can't stall the consumer" property at a fixed cost.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_name("temps-proxy-ctl")
+        .enable_all()
+        .build()?;
 
     // Fetch settings once: we need `preview_domain` for routing AND the full
     // `AppSettings` to decide whether to wire ADR-018 on-demand TLS.

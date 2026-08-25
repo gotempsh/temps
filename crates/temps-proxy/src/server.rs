@@ -215,6 +215,54 @@ impl pingora::server::ShutdownSignalWatch for ShutdownSignalBridge {
     }
 }
 
+/// Process-wide runtime hosting the proxy's periodic control-plane refresh
+/// loops (custom-route snapshot, IP block list, cert-host set).
+///
+/// Each of those loops is the same shape — sleep 60s, run one query, swap an
+/// in-memory snapshot — and each used to own an OS thread plus a
+/// `current_thread` runtime of its own. Three threads and three runtimes
+/// idling on the same timer costs ~430 kB of anonymous RSS on a box where the
+/// whole budget is 4 GB, so they share one single-worker runtime instead.
+///
+/// Deliberately NOT shared with the proxy-log batch writer or the metrics
+/// samplers: the batch writer drains a bounded channel fed by the request
+/// path and must never queue behind a sampler's disk/`sysinfo` work, so those
+/// two keep their own threads. Nothing here runs on the Pingora request path.
+static REFRESH_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
+
+/// Handle to [`REFRESH_RUNTIME`], creating it on first use.
+fn refresh_runtime() -> Result<tokio::runtime::Handle> {
+    if let Some(runtime) = REFRESH_RUNTIME.get() {
+        return Ok(runtime.handle().clone());
+    }
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("temps-proxy-refresh")
+        .enable_all()
+        .build()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create the shared tokio runtime for proxy refresh loops: {}",
+                e
+            )
+        })?;
+    let handle = runtime.handle().clone();
+
+    // A concurrent first caller may have won the race; its runtime is the one
+    // that stays, and the loser's is dropped here without ever having run a
+    // task. Both callers end up with a handle to the same runtime.
+    match REFRESH_RUNTIME.set(runtime) {
+        Ok(()) => Ok(handle),
+        Err(_) => REFRESH_RUNTIME
+            .get()
+            .map(|runtime| runtime.handle().clone())
+            .ok_or_else(|| {
+                anyhow::anyhow!("Shared proxy refresh runtime disappeared after being set")
+            }),
+    }
+}
+
 /// Setup and configure the proxy server with all services
 #[allow(clippy::too_many_arguments)]
 pub fn setup_proxy_server(
@@ -245,7 +293,13 @@ pub fn setup_proxy_server(
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<()> {
     // Setup plugin system (async operation in sync context)
-    let context = tokio::runtime::Runtime::new()?
+    // A `current_thread` runtime is enough here: plugin registration awaits a
+    // bounded file-existence poll and does sync work, and it spawns nothing
+    // that outlives this call. `Runtime::new()` would stand up (and tear down)
+    // one worker thread per core purely to drive that.
+    let context = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
         .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
 
     // Create service implementations
@@ -253,21 +307,12 @@ pub fn setup_proxy_server(
 
     // Keep the custom-route snapshot in memory so `has_custom_route` and
     // `has_route_for_host` never query Postgres on the request hot path (WS6-G).
-    // A dedicated thread owns the periodic 60-second refresh, which is the sole
-    // propagation mechanism for this instance: admin-API writes (create/update/
-    // delete) are handled by the separate console-owned LbService and never reach
-    // this object directly. Route changes become visible to real traffic within at
-    // most 60 seconds via the loop below.
-    {
-        let lb_refresher = lb_service.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for custom-route snapshot refresh");
-            rt.block_on(lb_refresher.run_refresh_loop());
-        });
-    }
+    // The shared refresh runtime owns the periodic 60-second refresh, which is
+    // the sole propagation mechanism for this instance: admin-API writes
+    // (create/update/delete) are handled by the separate console-owned
+    // LbService and never reach this object directly. Route changes become
+    // visible to real traffic within at most 60 seconds via that loop.
+    refresh_runtime()?.spawn(lb_service.clone().run_refresh_loop());
 
     let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
         Arc::new(proxy_config.clone()),
@@ -313,34 +358,15 @@ pub fn setup_proxy_server(
     );
 
     // Keep the IP block list in memory so `is_blocked` never queries Postgres on
-    // the request hot path. A dedicated thread owns the periodic refresh, mirroring
-    // the proxy-log batch writer above.
-    {
-        let ip_access_refresher = ip_access_control_service.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for IP block-list refresh");
-            rt.block_on(ip_access_refresher.run_refresh_loop());
-        });
-    }
+    // the request hot path. The shared refresh runtime owns the periodic refresh.
+    refresh_runtime()?.spawn(ip_access_control_service.clone().run_refresh_loop());
 
     let cert_host_cache = Arc::new(CertHostCache::new(db.clone()));
 
     // Keep the cert-host set in memory so the HTTP→HTTPS redirect check never
-    // queries Postgres on the request hot path (WS3). A dedicated thread owns the
-    // periodic refresh, mirroring the IP block-list loop above.
-    {
-        let cert_host_refresher = cert_host_cache.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for cert-host refresh");
-            rt.block_on(cert_host_refresher.run_refresh_loop());
-        });
-    }
+    // queries Postgres on the request hot path (WS3). The shared refresh runtime
+    // owns the periodic refresh, alongside the IP block-list loop above.
+    refresh_runtime()?.spawn(cert_host_cache.clone().run_refresh_loop());
 
     let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
         db.clone(),
@@ -543,7 +569,13 @@ pub fn create_proxy_service(
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<LoadBalancer> {
     // Setup plugin system (async operation in sync context)
-    let context = tokio::runtime::Runtime::new()?
+    // A `current_thread` runtime is enough here: plugin registration awaits a
+    // bounded file-existence poll and does sync work, and it spawns nothing
+    // that outlives this call. `Runtime::new()` would stand up (and tear down)
+    // one worker thread per core purely to drive that.
+    let context = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
         .block_on(setup_proxy_plugins(db.clone(), config.clone()))?;
 
     // Create service implementations
@@ -551,16 +583,7 @@ pub fn create_proxy_service(
 
     // Keep the custom-route snapshot in memory so `has_custom_route` and
     // `has_route_for_host` never query Postgres on the request hot path (WS6-G).
-    {
-        let lb_refresher = lb_service.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for custom-route snapshot refresh");
-            rt.block_on(lb_refresher.run_refresh_loop());
-        });
-    }
+    refresh_runtime()?.spawn(lb_service.clone().run_refresh_loop());
 
     let upstream_resolver = Arc::new(UpstreamResolverImpl::new(
         Arc::new(proxy_config.clone()),
@@ -606,34 +629,15 @@ pub fn create_proxy_service(
     );
 
     // Keep the IP block list in memory so `is_blocked` never queries Postgres on
-    // the request hot path. A dedicated thread owns the periodic refresh, mirroring
-    // the proxy-log batch writer above.
-    {
-        let ip_access_refresher = ip_access_control_service.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for IP block-list refresh");
-            rt.block_on(ip_access_refresher.run_refresh_loop());
-        });
-    }
+    // the request hot path. The shared refresh runtime owns the periodic refresh.
+    refresh_runtime()?.spawn(ip_access_control_service.clone().run_refresh_loop());
 
     let cert_host_cache = Arc::new(CertHostCache::new(db.clone()));
 
     // Keep the cert-host set in memory so the HTTP→HTTPS redirect check never
-    // queries Postgres on the request hot path (WS3). A dedicated thread owns the
-    // periodic refresh, mirroring the IP block-list loop above.
-    {
-        let cert_host_refresher = cert_host_cache.clone();
-        std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("Failed to create tokio runtime for cert-host refresh");
-            rt.block_on(cert_host_refresher.run_refresh_loop());
-        });
-    }
+    // queries Postgres on the request hot path (WS3). The shared refresh runtime
+    // owns the periodic refresh, alongside the IP block-list loop above.
+    refresh_runtime()?.spawn(cert_host_cache.clone().run_refresh_loop());
 
     let challenge_service = Arc::new(crate::service::challenge_service::ChallengeService::new(
         db.clone(),
