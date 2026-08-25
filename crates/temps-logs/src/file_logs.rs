@@ -25,6 +25,78 @@ use crate::structured_logs::{LogEntry, LogLevel, StructuredLogService};
 /// generous backlog is safe across reconnects.
 pub const DEFAULT_TAIL_REPLAY_LINES: usize = 100_000;
 
+/// Size of each block read while scanning backwards for the tail offset.
+///
+/// The scan holds exactly one of these at a time, so the memory cost of
+/// locating the replay window is O(1) (~64 KB) regardless of file size or of
+/// how long individual lines are.
+const TAIL_SCAN_CHUNK: usize = 64 * 1024;
+
+/// Byte offset of the first of the last `replay_lines` lines of `file_size`
+/// bytes, found by scanning backwards in fixed blocks.
+///
+/// Returns 0 when the file holds at most `replay_lines` lines, and
+/// `file_size` when `replay_lines` is 0 (attach at EOF, no backlog).
+/// A trailing
+/// '\n' terminates the last line rather than starting an empty one, so it is
+/// not counted; a file whose final line is unterminated still counts as a
+/// line. The reader's cursor is left unspecified — callers seek afterwards.
+async fn find_tail_offset<R>(
+    reader: &mut R,
+    file_size: u64,
+    replay_lines: usize,
+) -> Result<u64, std::io::Error>
+where
+    R: tokio::io::AsyncRead + tokio::io::AsyncSeek + Unpin,
+{
+    // No backlog at all: attach at EOF and stream only what arrives next.
+    if replay_lines == 0 {
+        return Ok(file_size);
+    }
+    // Replaying everything means starting at the beginning; skip the scan.
+    if replay_lines == usize::MAX {
+        return Ok(0);
+    }
+
+    let mut buffer = vec![0u8; TAIL_SCAN_CHUNK];
+    // Offset of the byte just past the region still to be scanned.
+    let mut end = file_size;
+    // Newlines seen so far that *start* a line (i.e. excluding a trailing one).
+    let mut line_starts = 0usize;
+    // A file ending in '\n' terminates its last line; that newline does not
+    // begin another one, so it must not be counted.
+    let mut skip_final_newline = true;
+
+    while end > 0 {
+        let chunk_len = std::cmp::min(TAIL_SCAN_CHUNK as u64, end) as usize;
+        let start = end - chunk_len as u64;
+
+        reader.seek(SeekFrom::Start(start)).await?;
+        reader.read_exact(&mut buffer[..chunk_len]).await?;
+
+        for (index, byte) in buffer[..chunk_len].iter().enumerate().rev() {
+            if *byte != b'\n' {
+                continue;
+            }
+            if skip_final_newline && start + index as u64 == file_size - 1 {
+                skip_final_newline = false;
+                continue;
+            }
+            skip_final_newline = false;
+            line_starts += 1;
+            if line_starts == replay_lines {
+                // The line begins immediately after this newline.
+                return Ok(start + index as u64 + 1);
+            }
+        }
+
+        end = start;
+    }
+
+    // Fewer lines in the file than requested: replay from the beginning.
+    Ok(0)
+}
+
 pub struct LogService {
     log_base_path: PathBuf,
     structured_service: StructuredLogService,
@@ -134,28 +206,7 @@ impl LogService {
 
         // If file has content, seek to the start of the last `replay_lines` lines.
         if file_size > 0 {
-            let mut buffer = Vec::new();
-            reader.read_to_end(&mut buffer).await?;
-
-            // Split on newlines. A file ending in '\n' yields a trailing empty
-            // segment that is not a real line — drop it so the replay backlog
-            // counts actual lines (otherwise we'd skip one real line too many).
-            let mut lines = buffer.split(|&b| b == b'\n').collect::<Vec<_>>();
-            if lines.last().is_some_and(|last| last.is_empty()) {
-                lines.pop();
-            }
-            let start_pos = if lines.len() > replay_lines {
-                // Skip everything before the last `replay_lines` lines.
-                let skip_lines = lines.len() - replay_lines;
-                lines
-                    .iter()
-                    .take(skip_lines)
-                    .map(|line| line.len() + 1) // +1 for newline
-                    .sum::<usize>() as u64
-            } else {
-                0
-            };
-
+            let start_pos = find_tail_offset(&mut reader, file_size, replay_lines).await?;
             reader.seek(SeekFrom::Start(start_pos)).await?;
         }
 
@@ -549,6 +600,156 @@ mod tests {
         assert_eq!(received.len(), 10, "expected last 10 lines only");
         assert_eq!(received.first().unwrap(), "line 90");
         assert_eq!(received.last().unwrap(), "line 99");
+    }
+
+    /// Run the reverse tail scan over `content` and return the byte offset it
+    /// picks for `replay_lines`, exercising the same `BufReader<File>` path
+    /// `tail_log_with_replay` uses.
+    async fn tail_offset_for(content: &[u8], replay_lines: usize) -> u64 {
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("scan.log");
+        let mut file = File::create(&path).await.unwrap();
+        file.write_all(content).await.unwrap();
+        file.flush().await.unwrap();
+        drop(file);
+
+        let file = File::open(&path).await.unwrap();
+        let file_size = file.metadata().await.unwrap().len();
+        let mut reader = BufReader::new(file);
+        find_tail_offset(&mut reader, file_size, replay_lines)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_empty_file() {
+        assert_eq!(tail_offset_for(b"", 10).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_fewer_lines_than_requested() {
+        // 3 lines, 10 requested -> replay from the very beginning.
+        assert_eq!(tail_offset_for(b"a\nbb\nccc\n", 10).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_exact_line_count() {
+        // Exactly `replay_lines` lines: still the whole file.
+        assert_eq!(tail_offset_for(b"a\nbb\nccc\n", 3).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_trailing_newline_not_counted_as_line() {
+        // "a\nbb\nccc\n": the final '\n' terminates "ccc", it does not start a
+        // fourth (empty) line. Last line therefore begins at offset 5.
+        assert_eq!(tail_offset_for(b"a\nbb\nccc\n", 1).await, 5);
+        assert_eq!(tail_offset_for(b"a\nbb\nccc\n", 2).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_unterminated_final_line() {
+        // No trailing newline: "ccc" is still a line.
+        assert_eq!(tail_offset_for(b"a\nbb\nccc", 1).await, 5);
+        assert_eq!(tail_offset_for(b"a\nbb\nccc", 2).await, 2);
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_counts_empty_lines() {
+        // "a\n\nb\n" is three lines: "a", "", "b".
+        assert_eq!(tail_offset_for(b"a\n\nb\n", 2).await, 2);
+        assert_eq!(tail_offset_for(b"a\n\nb\n", 1).await, 3);
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_replay_all_sentinel() {
+        // usize::MAX means "replay everything".
+        assert_eq!(tail_offset_for(b"a\nbb\nccc\n", usize::MAX).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_zero_replay_attaches_at_eof() {
+        // A zero backlog must yield no replayed lines at all, i.e. EOF.
+        assert_eq!(tail_offset_for(b"a\nbb\nccc\n", 0).await, 9);
+        assert_eq!(tail_offset_for(b"", 0).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_lines_longer_than_scan_chunk() {
+        // Lines far longer than TAIL_SCAN_CHUNK force the backwards scan to
+        // cross several blocks without finding a newline.
+        let long = "x".repeat(TAIL_SCAN_CHUNK * 2 + 7);
+        let content = format!("{long}\n{long}\n{long}\n");
+        let line_len = long.len() as u64 + 1;
+
+        assert_eq!(tail_offset_for(content.as_bytes(), 1).await, line_len * 2);
+        assert_eq!(tail_offset_for(content.as_bytes(), 2).await, line_len);
+        assert_eq!(tail_offset_for(content.as_bytes(), 3).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_find_tail_offset_newline_on_chunk_boundary() {
+        // Place a newline exactly at the first byte of the final scan block so
+        // the match is found at index 0 of a chunk.
+        let mut content = vec![b'x'; TAIL_SCAN_CHUNK];
+        content[0] = b'\n';
+        content.push(b'\n');
+        // File is: "\n" + x*(CHUNK-1) + "\n" -> lines "" and "xxx...".
+        assert_eq!(tail_offset_for(&content, 1).await, 1);
+        assert_eq!(tail_offset_for(&content, 2).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_tail_log_replay_then_live_lines() {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        let temp_dir = TempDir::new().unwrap();
+        let log_service = LogService::new(temp_dir.path().to_path_buf());
+
+        let log_id = "test-replay-then-live";
+        let log_path = log_service.get_log_path(log_id);
+        let mut file = File::create(&log_path).await.unwrap();
+        for i in 0..50 {
+            file.write_all(format!("old {}\n", i).as_bytes())
+                .await
+                .unwrap();
+        }
+        file.flush().await.unwrap();
+
+        let stream = log_service.tail_log_with_replay(log_id, 3).await.unwrap();
+        tokio::pin!(stream);
+
+        // Backlog: the last 3 lines only.
+        let mut received = Vec::new();
+        for _ in 0..3 {
+            if let Ok(Some(Ok(line))) =
+                tokio::time::timeout(Duration::from_millis(500), stream.next()).await
+            {
+                received.push(line);
+            }
+        }
+        assert_eq!(received, vec!["old 47", "old 48", "old 49"]);
+
+        // Lines appended after the stream attached must still arrive live.
+        let mut appender = tokio::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .await
+            .unwrap();
+        appender.write_all(b"new 0\nnew 1\n").await.unwrap();
+        appender.flush().await.unwrap();
+
+        let mut live = Vec::new();
+        for _ in 0..2 {
+            if let Ok(Some(Ok(line))) =
+                tokio::time::timeout(Duration::from_secs(2), stream.next()).await
+            {
+                live.push(line);
+            }
+        }
+        assert_eq!(live, vec!["new 0", "new 1"]);
     }
 
     #[tokio::test]
