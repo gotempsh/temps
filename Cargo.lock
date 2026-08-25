@@ -5879,18 +5879,6 @@ dependencies = [
 
 [[package]]
 name = "netlink-packet-route"
-version = "0.30.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "be8919612f6028ab4eacbbfe1234a9a43e3722c6e0915e7ff519066991905092"
-dependencies = [
- "bitflags 2.11.1",
- "libc",
- "log",
- "netlink-packet-core 0.8.2",
-]
-
-[[package]]
-name = "netlink-packet-route"
 version = "0.31.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2288fcb784eb3defd5fb16f4c4160d5f477de192eac730f43e1d11c24d9a007"
@@ -12110,7 +12098,7 @@ dependencies = [
  "libc",
  "mockall",
  "netlink-packet-core 0.9.0",
- "netlink-packet-route 0.30.0",
+ "netlink-packet-route 0.33.0",
  "nix 0.31.3",
  "rtnetlink",
  "sea-orm",
