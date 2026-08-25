@@ -1298,13 +1298,9 @@ pub(crate) fn extract_binary_from_tarball_file(
     let decoder = GzDecoder::new(std::io::BufReader::new(file));
     let mut archive = tar::Archive::new(decoder);
 
-    let entries = archive.entries().map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to read tarball {}: {}",
-            tarball_path.display(),
-            e
-        )
-    })?;
+    let entries = archive
+        .entries()
+        .map_err(|e| anyhow::anyhow!("Failed to read tarball {}: {}", tarball_path.display(), e))?;
 
     for entry in entries {
         let mut entry = entry.map_err(|e| {
