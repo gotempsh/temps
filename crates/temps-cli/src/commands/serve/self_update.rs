@@ -37,10 +37,10 @@ use temps_core::{
 use tracing::{error, info, warn};
 
 use crate::commands::upgrade::{
-    check_write_permission, current_version_tag, download_asset, download_asset_text,
-    extract_binary_from_tarball, fetch_latest_release_in_channel, fetch_specific_release,
-    is_newer_version, platform_target, replace_binary, verify_checksum, GitHubRelease,
-    UpgradeChannel,
+    check_write_permission, create_upgrade_temp_file, current_version_tag, download_asset_text,
+    download_asset_to_file, extract_binary_from_tarball_file, fetch_latest_release_in_channel,
+    fetch_specific_release, finalize_staged_binary, is_newer_version, platform_target,
+    verify_computed_checksum, GitHubRelease, UpgradeChannel,
 };
 
 /// Grace period between accepting the update and exiting the process. Long
@@ -783,11 +783,11 @@ impl UpdateJob {
 
     /// Download, verify, swap the binary and run database migrations.
     ///
-    /// Everything up to and including `replace_binary` is the "pre-swap" zone:
-    /// a failure there leaves the running binary untouched and is returned as
-    /// `ExecuteError::PreSwap`. Once the binary is on disk, any failure is
-    /// `ExecuteError::PostSwapMigration` — the operator is told exactly what
-    /// state the install is in and what to do next.
+    /// Everything up to and including `finalize_staged_binary` is the
+    /// "pre-swap" zone: a failure there leaves the running binary untouched
+    /// and is returned as `ExecuteError::PreSwap`. Once the binary is on
+    /// disk, any failure is `ExecuteError::PostSwapMigration` — the operator
+    /// is told exactly what state the install is in and what to do next.
     async fn execute(&self, started_at: chrono::DateTime<Utc>) -> Result<String, ExecuteError> {
         let (to_version, backup_path) = self
             .download_verify_swap()
@@ -877,8 +877,27 @@ impl UpdateJob {
             size_mb = format!("{:.1}", asset.size as f64 / 1_048_576.0),
             "Downloading release asset"
         );
+
+        // Streamed through disk, exactly like `temps upgrade`: this runs
+        // INSIDE the already-serving `temps serve` process, so buffering the
+        // ~110 MB tarball and ~270 MB extracted binary in memory here is the
+        // same swap-thrashing risk on a small host — arguably worse, since
+        // the server is live and handling requests while it happens.
+        let parent = self
+            .binary_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine the binary's directory"))?
+            .to_path_buf();
+
         self.set_phase(SelfUpdatePhase::Downloading, None);
-        let tarball = download_asset(&asset.browser_download_url).await?;
+        let mut download_file = create_upgrade_temp_file(&parent, ".temps-selfupdate-dl.")?;
+        let download_path = download_file.path().to_path_buf();
+        let computed = download_asset_to_file(
+            &asset.browser_download_url,
+            download_file.as_file_mut(),
+            &download_path,
+        )
+        .await?;
 
         self.set_phase(SelfUpdatePhase::Verifying, None);
         // Fail closed on a missing checksum. `temps upgrade` merely warns
@@ -898,16 +917,26 @@ impl UpdateJob {
                 )
             })?;
         let expected = download_asset_text(&checksum_asset.browser_download_url).await?;
-        verify_checksum(&tarball, &expected)?;
+        verify_computed_checksum(&computed, &expected)?;
 
-        let new_binary = extract_binary_from_tarball(&tarball)?;
-        preflight_binary(&self.binary_path, &new_binary)?;
+        let mut staged_file = create_upgrade_temp_file(&parent, ".temps-selfupdate-bin.")?;
+        let staged_path = staged_file.path().to_path_buf();
+        extract_binary_from_tarball_file(
+            download_file.as_file_mut(),
+            &download_path,
+            staged_file.as_file_mut(),
+            &staged_path,
+        )?;
+
+        // Preflight against the staged file itself rather than writing a
+        // second full copy just to exec it.
+        preflight_staged_binary(&staged_path, staged_file.as_file())?;
 
         self.set_phase(SelfUpdatePhase::Installing, None);
         // Keep the outgoing binary next to the new one so a release that boots
         // but misbehaves can be reverted with a single `mv`, without network.
         let backup_path = backup_current_binary(&self.binary_path)?;
-        replace_binary(&self.binary_path, &new_binary)?;
+        finalize_staged_binary(&self.binary_path, staged_file)?;
 
         Ok((to_version, backup_path))
     }
@@ -1199,45 +1228,30 @@ fn running_under_systemd_service() -> bool {
     }
 }
 
-/// Run the downloaded binary's `--version` before trusting it.
+/// Run the staged binary's `--version` before trusting it.
 ///
 /// Catches the failures a checksum cannot: a build for the wrong libc, a
 /// missing shared library, a corrupted extraction. Cheap insurance — without
 /// it, a binary that cannot exec turns a one-click update into an outage that
 /// only a console on the host can fix.
-fn preflight_binary(binary_path: &Path, new_binary: &[u8]) -> anyhow::Result<()> {
-    let parent = binary_path
-        .parent()
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine the binary's directory"))?;
-    // Unique per process: a stale probe from another temps (or a crashed run)
-    // must never be executed or overwritten mid-flight by a concurrent one.
-    let probe_path = parent.join(format!(".temps-update-probe.{}", std::process::id()));
-
-    std::fs::write(&probe_path, new_binary).map_err(|e| {
-        anyhow::anyhow!(
-            "Failed to stage the new binary at {}: {}",
-            probe_path.display(),
-            e
-        )
-    })?;
+///
+/// Runs directly against the already-staged extraction file (the same one
+/// `finalize_staged_binary` will persist) instead of writing a second full
+/// copy just to exec it — that second copy is exactly the kind of extra
+/// in-memory/on-disk buffering the streaming rewrite of this flow removed
+/// everywhere else.
+fn preflight_staged_binary(staged_path: &Path, staged_file: &std::fs::File) -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) =
-            std::fs::set_permissions(&probe_path, std::fs::Permissions::from_mode(0o755))
-        {
-            let _ = std::fs::remove_file(&probe_path);
-            return Err(anyhow::anyhow!(
-                "Failed to make the staged binary executable: {}",
-                e
-            ));
-        }
+        staged_file
+            .set_permissions(std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| anyhow::anyhow!("Failed to make the staged binary executable: {}", e))?;
     }
 
-    let output = std::process::Command::new(&probe_path)
+    let output = std::process::Command::new(staged_path)
         .arg("--version")
         .output();
-    let _ = std::fs::remove_file(&probe_path);
 
     let output = output.map_err(|e| {
         anyhow::anyhow!(
@@ -1749,15 +1763,14 @@ mod tests {
     #[test]
     fn test_preflight_rejects_a_binary_that_cannot_run() {
         let dir = temp_dir("preflight");
+        let staged_path = dir.join("staged");
+        std::fs::write(&staged_path, b"definitely not an executable").unwrap();
+        let staged_file = std::fs::File::open(&staged_path).unwrap();
+
         // Not a valid executable — exec must fail, and the error must say the
         // running version is untouched.
-        let err = preflight_binary(&dir.join("temps"), b"definitely not an executable")
-            .expect_err("must reject");
+        let err = preflight_staged_binary(&staged_path, &staged_file).expect_err("must reject");
         assert!(err.to_string().contains("left untouched"), "{err}");
-        // The probe file must not be left behind.
-        assert!(!dir
-            .join(format!(".temps-update-probe.{}", std::process::id()))
-            .exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

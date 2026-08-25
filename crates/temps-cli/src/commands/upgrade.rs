@@ -1285,6 +1285,12 @@ pub(crate) fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Resul
 }
 
 /// Extract the `temps` binary from a gzipped tarball.
+///
+/// No production caller remains — both `temps upgrade` and the in-process
+/// self-updater stream through disk via [`extract_binary_from_tarball_file`].
+/// Kept `#[cfg(test)]` as the byte-identical baseline the streaming path is
+/// checked against.
+#[cfg(test)]
 pub(crate) fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Result<Vec<u8>> {
     use flate2::read::GzDecoder;
     use std::io::Read;
@@ -1563,6 +1569,12 @@ pub(crate) fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()
 /// 1. Securely create and write a random temp file next to the target
 /// 2. Set executable permissions
 /// 3. Sync it, persist it over the target, and sync the parent directory
+///
+/// No production caller remains — both `temps upgrade` and the in-process
+/// self-updater stage into a file via [`create_upgrade_temp_file`] and commit
+/// with [`finalize_staged_binary`] directly. Kept `#[cfg(test)]` to exercise
+/// the write-then-finalize sequence from an in-memory buffer.
+#[cfg(test)]
 pub(crate) fn replace_binary(binary_path: &Path, new_binary: &[u8]) -> anyhow::Result<()> {
     let parent = binary_path
         .parent()
