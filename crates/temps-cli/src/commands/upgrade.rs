@@ -1480,7 +1480,7 @@ pub(crate) fn check_write_permission(binary_path: &PathBuf) -> anyhow::Result<()
 /// 1. Write new binary to a temp file next to the target
 /// 2. Set executable permissions
 /// 3. Rename temp file over the target (atomic on the same filesystem)
-pub(crate) fn replace_binary(binary_path: &PathBuf, new_binary: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn replace_binary(binary_path: &Path, new_binary: &[u8]) -> anyhow::Result<()> {
     let parent = binary_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory"))?;
