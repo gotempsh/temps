@@ -2685,7 +2685,7 @@ dependencies = [
  "netlink-packet-route 0.31.0",
  "netlink-packet-utils",
  "netlink-packet-wireguard",
- "netlink-sys",
+ "netlink-sys 0.8.8",
  "regex",
  "serde",
  "thiserror 2.0.20",
@@ -5902,6 +5902,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "netlink-packet-route"
+version = "0.33.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "59d48ffc8b73a506e1ff0878528c72668f2bfbc3d875b6be890a96be5d0d5576"
+dependencies = [
+ "bitflags 2.11.1",
+ "libc",
+ "log",
+ "netlink-packet-core 0.9.0",
+ "zerocopy",
+]
+
+[[package]]
 name = "netlink-packet-utils"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5927,15 +5940,16 @@ dependencies = [
 
 [[package]]
 name = "netlink-proto"
-version = "0.12.0"
+version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b65d130ee111430e47eed7896ea43ca693c387f097dd97376bffafbf25812128"
+checksum = "97e03ae6247c6cdb499e8f14e98c72b83954d85822b687056e3a21150b438f2b"
 dependencies = [
  "bytes",
- "futures",
+ "futures-channel",
+ "futures-util",
  "log",
- "netlink-packet-core 0.8.2",
- "netlink-sys",
+ "netlink-packet-core 0.9.0",
+ "netlink-sys 0.9.0",
  "thiserror 2.0.20",
 ]
 
@@ -5944,6 +5958,17 @@ name = "netlink-sys"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd6c30ed10fa69cc491d491b85cc971f6bdeb8e7367b7cde2ee6cc878d583fae"
+dependencies = [
+ "bytes",
+ "libc",
+ "log",
+]
+
+[[package]]
+name = "netlink-sys"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c99d38e00b420df49e940fe0826e667c3dad82ac68eb4c2bbf754c1c14a83a10"
 dependencies = [
  "bytes",
  "futures-util",
@@ -8420,19 +8445,19 @@ dependencies = [
 
 [[package]]
 name = "rtnetlink"
-version = "0.21.0"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc19f84f710fa2f337617f9bc0400260a94224bde7bae28fd8879f3771ca5784"
+checksum = "90f60a3ee149005c5819e03e3d73ba4a470bc18b52b0c8422cfe1bea2cae63c6"
 dependencies = [
  "futures-channel",
  "futures-util",
  "log",
- "netlink-packet-core 0.8.2",
- "netlink-packet-route 0.30.0",
+ "netlink-packet-core 0.9.0",
+ "netlink-packet-route 0.33.0",
  "netlink-proto",
- "netlink-sys",
+ "netlink-sys 0.9.0",
  "nix 0.30.1",
- "thiserror 1.0.69",
+ "thiserror 2.0.20",
  "tokio",
 ]
 
