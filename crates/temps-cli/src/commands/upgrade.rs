@@ -1327,13 +1327,24 @@ pub(crate) fn extract_binary_from_tarball_file(
             continue;
         }
 
-        let declared = entry.header().size().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to read entry size in tarball {}: {}",
+        // An entry can carry the right name and still not be a binary: an
+        // empty file, a symlink or a hard link named `temps` would copy zero
+        // bytes and pass a size check of 0 == 0, landing on the executable the
+        // whole system runs.
+        let entry_type = entry.header().entry_type();
+        if !entry_type.is_file() {
+            return Err(anyhow::anyhow!(
+                "Entry 'temps' in tarball {} is not a regular file ({:?})",
                 tarball_path.display(),
-                e
-            )
-        })?;
+                entry_type
+            ));
+        }
+
+        // `Entry::size`, not `Header::size`: the former is the number of bytes
+        // the entry reader yields, honouring a PAX size override, while the
+        // latter reports the logical size and disagrees for PAX and sparse
+        // entries, which would read as a truncation that never happened.
+        let declared = entry.size();
 
         let mut out = fs::File::create(dest).map_err(|e| {
             anyhow::anyhow!("Failed to create staged binary {}: {}", dest.display(), e)
@@ -1354,6 +1365,13 @@ pub(crate) fn extract_binary_from_tarball_file(
                 declared,
                 written,
                 dest.display()
+            ));
+        }
+        if written == 0 {
+            let _ = fs::remove_file(dest);
+            return Err(anyhow::anyhow!(
+                "Entry 'temps' in tarball {} is empty",
+                tarball_path.display()
             ));
         }
         // Durability before the rename: see `finalize_staged_binary`.
@@ -1486,6 +1504,9 @@ pub(crate) fn replace_binary(binary_path: &Path, new_binary: &[u8]) -> anyhow::R
         .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory"))?;
 
     let tmp_path = staged_binary_path(parent);
+    // A failed write or fsync (most plausibly a full disk) would otherwise
+    // leave the partial staged file holding the space needed to retry.
+    let mut staged_guard = ScopedTempFile::new(tmp_path.clone());
 
     // Write the new binary to temp file, then force it to the platter before
     // the rename: the rename is atomic for the metadata, but without the fsync
@@ -1499,7 +1520,9 @@ pub(crate) fn replace_binary(binary_path: &Path, new_binary: &[u8]) -> anyhow::R
         .map_err(|e| anyhow::anyhow!("Failed to flush temporary file: {}", e))?;
     drop(file);
 
-    finalize_staged_binary(binary_path, &tmp_path)
+    finalize_staged_binary(binary_path, &tmp_path)?;
+    staged_guard.disarm();
+    Ok(())
 }
 
 // ── EE proxy helpers ────────────────────────────────────────────────────────
@@ -2047,6 +2070,64 @@ mod tests {
         let in_memory = extract_binary_from_tarball(&tarball).unwrap();
         assert_eq!(streamed, in_memory);
         assert_eq!(streamed, content);
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_rejects_symlink_named_temps() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tarball_path = dir.path().join("temps.tar.gz");
+        let dest = dir.path().join("staged");
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o777);
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, "temps", "/etc/passwd")
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        std::fs::write(&tarball_path, encoder.finish().unwrap()).unwrap();
+
+        let err = extract_binary_from_tarball_file(&tarball_path, &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not a regular file"), "error was: {err}");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_rejects_empty_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball_path = dir.path().join("temps.tar.gz");
+        let dest = dir.path().join("staged");
+
+        std::fs::write(&tarball_path, tarball_with_binary(b"")).unwrap();
+
+        let err = extract_binary_from_tarball_file(&tarball_path, &dest)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("is empty"), "error was: {err}");
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_replace_binary_removes_staged_file_when_rename_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory cannot be replaced by a file rename, so finalize fails
+        // after the staged file is written and synced.
+        let target = dir.path().join("temps");
+        std::fs::create_dir(&target).unwrap();
+
+        assert!(replace_binary(&target, b"new-binary").is_err());
+        assert!(!staged_binary_path(dir.path()).exists());
     }
 
     #[test]
