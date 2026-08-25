@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::env::consts::{ARCH, OS};
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{debug, info};
 
@@ -354,9 +354,27 @@ impl UpgradeCommand {
         // Check write permissions before downloading
         check_write_permission(&binary_path)?;
 
+        let parent = binary_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory of binary"))?
+            .to_path_buf();
+
+        // The whole upgrade streams through disk. The tarball is ~110 MB and
+        // the binary inside it ~270 MB; buffering either one meant a peak well
+        // past half a gigabyte, which on a 1 GB host with the server running
+        // pushes the box into swap thrashing.
+        //
+        // The tarball is staged to disk rather than piped straight into the
+        // untar because the checksum has to be verified BEFORE any of those
+        // bytes are unpacked. A direct download -> gunzip -> tar -> binary
+        // pipeline would save the 110 MB of scratch disk but would write
+        // unverified content over the live executable.
+        let download_path = download_tmp_path(&parent);
+        let _download_guard = ScopedTempFile::new(download_path.clone());
+
         // Download the tarball
         println!("  Downloading {}...", tarball_name);
-        let tarball_bytes = download_asset(&asset.browser_download_url).await?;
+        let computed = download_asset_to_file(&asset.browser_download_url, &download_path).await?;
 
         // Also download the checksum
         let checksum_name = format!("{}.sha256", tarball_name);
@@ -365,19 +383,23 @@ impl UpgradeCommand {
         if let Some(checksum_asset) = checksum_asset {
             debug!("Verifying checksum...");
             let checksum_text = download_asset_text(&checksum_asset.browser_download_url).await?;
-            verify_checksum(&tarball_bytes, &checksum_text)?;
+            verify_computed_checksum(&computed, &checksum_text)?;
             println!("  Checksum verified.");
         } else {
             debug!("No checksum asset found, skipping verification");
         }
 
-        // Extract the binary from the tarball
+        // Extract the binary from the tarball, straight into the staging file
+        // that the atomic rename below consumes.
         println!("  Extracting binary...");
-        let new_binary = extract_binary_from_tarball(&tarball_bytes)?;
+        let staged_path = staged_binary_path(&parent);
+        let mut staged_guard = ScopedTempFile::new(staged_path.clone());
+        extract_binary_from_tarball_file(&download_path, &staged_path)?;
 
         // Replace the binary atomically
         println!("  Replacing binary at {}...", binary_path.display());
-        replace_binary(&binary_path, &new_binary)?;
+        finalize_staged_binary(&binary_path, &staged_path)?;
+        staged_guard.disarm();
 
         println!();
         println!(
@@ -508,16 +530,30 @@ impl UpgradeCommand {
         println!("  Verifying checksum...");
         let expected = fetch_ee_checksum(&api, &version, &asset, &license_jwt).await?;
 
+        let parent = binary_path
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory of binary"))?
+            .to_path_buf();
+
+        // Same streaming shape as the OSS path, and for the same reason: see
+        // the comment in `run_oss`.
+        let download_path = download_tmp_path(&parent);
+        let _download_guard = ScopedTempFile::new(download_path.clone());
+
         println!("  Downloading {}...", asset);
-        let tarball = download_ee_asset(&api, &version, &asset, &license_jwt).await?;
-        verify_checksum(&tarball, &expected)?;
+        let computed =
+            download_ee_asset_to_file(&api, &version, &asset, &license_jwt, &download_path).await?;
+        verify_computed_checksum(&computed, &expected)?;
         println!("  Checksum verified.");
 
         println!("  Extracting binary...");
-        let new_binary = extract_binary_from_tarball(&tarball)?;
+        let staged_path = staged_binary_path(&parent);
+        let mut staged_guard = ScopedTempFile::new(staged_path.clone());
+        extract_binary_from_tarball_file(&download_path, &staged_path)?;
 
         println!("  Replacing binary at {}...", binary_path.display());
-        replace_binary(&binary_path, &new_binary)?;
+        finalize_staged_binary(&binary_path, &staged_path)?;
+        staged_guard.disarm();
 
         // Install the license into the data dir so the binary finds it.
         let data_dir = resolve_data_dir(&self.data_dir)?;
@@ -1103,20 +1139,94 @@ pub(crate) async fn download_asset_text(url: &str) -> anyhow::Result<String> {
         .map_err(|e| anyhow::anyhow!("Failed to read checksum response: {}", e))
 }
 
-/// Verify SHA256 checksum of downloaded data.
-pub(crate) fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
+/// Stream a release asset to `dest`, hashing it in the same pass.
+///
+/// Returns the lowercase hex SHA256 of everything written, so the caller can
+/// verify the download without reading the file back. The whole point is that
+/// the artifact never exists in memory: the release tarball is ~110 MB and the
+/// binary inside it ~270 MB, which does not fit alongside a running server on
+/// a 1 GB host.
+pub(crate) async fn download_asset_to_file(url: &str, dest: &Path) -> anyhow::Result<String> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(url)
+        .header("User-Agent", "temps-self-upgrade")
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to download asset: {}", e))?;
+
+    if !response.status().is_success() {
+        return Err(anyhow::anyhow!(
+            "Failed to download asset: HTTP {}",
+            response.status()
+        ));
+    }
+
+    stream_response_to_file(response, dest).await
+}
+
+/// Shared body of the streaming downloads (OSS release and EE proxy).
+///
+/// Peak memory here is one HTTP chunk (tens of KB), not the asset size.
+async fn stream_response_to_file(
+    mut response: reqwest::Response,
+    dest: &Path,
+) -> anyhow::Result<String> {
     use sha2::{Digest, Sha256};
 
+    let mut file = fs::File::create(dest).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create download file at {}: {}",
+            dest.display(),
+            e
+        )
+    })?;
     let mut hasher = Sha256::new();
-    hasher.update(data);
-    let computed = hex::encode(hasher.finalize());
+    let mut written: u64 = 0;
 
-    // Checksum file format: "<hash>  <filename>" or "<hash> <filename>"
-    let expected = checksum_text
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to read download response: {}", e))?
+    {
+        hasher.update(&chunk);
+        file.write_all(&chunk).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to write download to {} (after {} bytes): {}",
+                dest.display(),
+                written,
+                e
+            )
+        })?;
+        written += chunk.len() as u64;
+    }
+
+    file.flush()
+        .map_err(|e| anyhow::anyhow!("Failed to flush download to {}: {}", dest.display(), e))?;
+
+    debug!("Downloaded {} bytes to {}", written, dest.display());
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// Parse the expected hash out of a `.sha256` file body.
+///
+/// Format: `"<hash>  <filename>"` or `"<hash> <filename>"`.
+fn parse_expected_checksum(checksum_text: &str) -> anyhow::Result<String> {
+    Ok(checksum_text
         .split_whitespace()
         .next()
         .ok_or_else(|| anyhow::anyhow!("Invalid checksum file format"))?
-        .to_lowercase();
+        .to_lowercase())
+}
+
+/// Compare an already-computed SHA256 against a `.sha256` file body.
+///
+/// Split out from [`verify_checksum`] so the streaming download can verify the
+/// digest it accumulated on the way to disk, instead of re-reading the file (or
+/// keeping it in memory) just to hash it a second time.
+pub(crate) fn verify_computed_checksum(computed: &str, checksum_text: &str) -> anyhow::Result<()> {
+    let expected = parse_expected_checksum(checksum_text)?;
+    let computed = computed.to_lowercase();
 
     if computed != expected {
         return Err(anyhow::anyhow!(
@@ -1127,6 +1237,17 @@ pub(crate) fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Resul
     }
 
     Ok(())
+}
+
+/// Verify SHA256 checksum of downloaded data.
+pub(crate) fn verify_checksum(data: &[u8], checksum_text: &str) -> anyhow::Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(data);
+    let computed = hex::encode(hasher.finalize());
+
+    verify_computed_checksum(&computed, checksum_text)
 }
 
 /// Extract the `temps` binary from a gzipped tarball.
@@ -1151,6 +1272,178 @@ pub(crate) fn extract_binary_from_tarball(tarball_bytes: &[u8]) -> anyhow::Resul
     Err(anyhow::anyhow!(
         "Binary 'temps' not found in the downloaded tarball"
     ))
+}
+
+/// Extract the `temps` binary from a gzipped tarball on disk, straight into
+/// `dest`.
+///
+/// The streaming counterpart of [`extract_binary_from_tarball`]: the gunzip and
+/// untar run over the file, and the entry is copied out with `std::io::copy`,
+/// so memory stays at one copy buffer instead of holding the ~270 MB
+/// uncompressed binary (which `read_to_end` would additionally double while
+/// growing its `Vec`).
+pub(crate) fn extract_binary_from_tarball_file(
+    tarball_path: &Path,
+    dest: &Path,
+) -> anyhow::Result<u64> {
+    use flate2::read::GzDecoder;
+
+    let file = fs::File::open(tarball_path).map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to open downloaded tarball {}: {}",
+            tarball_path.display(),
+            e
+        )
+    })?;
+    let decoder = GzDecoder::new(std::io::BufReader::new(file));
+    let mut archive = tar::Archive::new(decoder);
+
+    let entries = archive.entries().map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to read tarball {}: {}",
+            tarball_path.display(),
+            e
+        )
+    })?;
+
+    for entry in entries {
+        let mut entry = entry.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read entry in tarball {}: {}",
+                tarball_path.display(),
+                e
+            )
+        })?;
+        let is_binary = entry
+            .path()
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read entry path in tarball {}: {}",
+                    tarball_path.display(),
+                    e
+                )
+            })?
+            .file_name()
+            .map(|n| n == "temps")
+            .unwrap_or(false);
+
+        if !is_binary {
+            continue;
+        }
+
+        let declared = entry.header().size().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read entry size in tarball {}: {}",
+                tarball_path.display(),
+                e
+            )
+        })?;
+
+        let mut out = fs::File::create(dest).map_err(|e| {
+            anyhow::anyhow!("Failed to create staged binary {}: {}", dest.display(), e)
+        })?;
+        let written = std::io::copy(&mut entry, &mut out).map_err(|e| {
+            anyhow::anyhow!("Failed to extract binary to {}: {}", dest.display(), e)
+        })?;
+
+        // Validate before the rename, not after. The verified checksum covers
+        // the tarball, so a short read here (full disk, truncated gzip stream)
+        // would otherwise put a valid-looking but incomplete file over the live
+        // executable. Comparing against the tar header's declared size is free
+        // and catches exactly that.
+        if written != declared {
+            let _ = fs::remove_file(dest);
+            return Err(anyhow::anyhow!(
+                "Extracted binary is truncated: expected {} bytes, wrote {} to {}",
+                declared,
+                written,
+                dest.display()
+            ));
+        }
+        // Durability before the rename: see `finalize_staged_binary`.
+        out.sync_all().map_err(|e| {
+            anyhow::anyhow!("Failed to flush staged binary {}: {}", dest.display(), e)
+        })?;
+
+        debug!("Extracted {} bytes to {}", written, dest.display());
+        return Ok(written);
+    }
+
+    Err(anyhow::anyhow!(
+        "Binary 'temps' not found in the downloaded tarball"
+    ))
+}
+
+/// Path of the staged binary written next to the target before the rename.
+///
+/// Unique per process so a concurrent upgrader (another temps, or the CLI run
+/// alongside the server) cannot half-write the file this one is about to rename
+/// over the live binary.
+pub(crate) fn staged_binary_path(parent: &Path) -> PathBuf {
+    parent.join(format!(".temps-upgrade-tmp.{}", std::process::id()))
+}
+
+/// Path of the downloaded tarball, kept next to the target binary.
+///
+/// Deliberately NOT in `std::env::temp_dir()`: on the small hosts this matters
+/// for, `/tmp` is frequently a tmpfs, which would put the 110 MB tarball right
+/// back in RAM. The binary's own directory is already known-writable here
+/// (`check_write_permission`).
+pub(crate) fn download_tmp_path(parent: &Path) -> PathBuf {
+    parent.join(format!(".temps-upgrade-dl.{}", std::process::id()))
+}
+
+/// Removes a temporary file when it goes out of scope, unless disarmed.
+///
+/// Covers the ordinary failure paths (bad checksum, truncated download,
+/// extraction error) so a failed upgrade does not leave a 100 MB+ file next to
+/// the binary. It cannot cover a kill -9 / OOM kill; reaping those orphans needs
+/// a liveness check against the PID suffix and is left for a follow-up.
+pub(crate) struct ScopedTempFile {
+    path: PathBuf,
+    armed: bool,
+}
+
+impl ScopedTempFile {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path, armed: true }
+    }
+
+    /// Give up ownership: the file was consumed (renamed into place).
+    pub(crate) fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ScopedTempFile {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Move an already-staged binary over the target with an atomic rename.
+///
+/// Shared tail of both the streaming path and [`replace_binary`].
+pub(crate) fn finalize_staged_binary(binary_path: &Path, tmp_path: &Path) -> anyhow::Result<()> {
+    // Set executable permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perms = fs::Permissions::from_mode(0o755);
+        fs::set_permissions(tmp_path, perms)
+            .map_err(|e| anyhow::anyhow!("Failed to set executable permissions: {}", e))?;
+    }
+
+    // Atomic rename
+    fs::rename(tmp_path, binary_path).map_err(|e| {
+        // Clean up temp file on failure
+        let _ = fs::remove_file(tmp_path);
+        anyhow::anyhow!("Failed to replace binary: {}", e)
+    })?;
+
+    Ok(())
 }
 
 /// Check we have write permission to the binary path.
@@ -1196,32 +1489,21 @@ pub(crate) fn replace_binary(binary_path: &PathBuf, new_binary: &[u8]) -> anyhow
         .parent()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine parent directory"))?;
 
-    // Unique per process so a concurrent upgrader (another temps, or the CLI
-    // run alongside the server) cannot half-write the file this one is about to
-    // rename over the live binary.
-    let tmp_path = parent.join(format!(".temps-upgrade-tmp.{}", std::process::id()));
+    let tmp_path = staged_binary_path(parent);
 
-    // Write the new binary to temp file
-    fs::write(&tmp_path, new_binary)
+    // Write the new binary to temp file, then force it to the platter before
+    // the rename: the rename is atomic for the metadata, but without the fsync
+    // a power cut can leave a correctly-sized file full of zeroes where the
+    // system's own executable used to be.
+    let mut file = fs::File::create(&tmp_path)
         .map_err(|e| anyhow::anyhow!("Failed to write temporary file: {}", e))?;
+    file.write_all(new_binary)
+        .map_err(|e| anyhow::anyhow!("Failed to write temporary file: {}", e))?;
+    file.sync_all()
+        .map_err(|e| anyhow::anyhow!("Failed to flush temporary file: {}", e))?;
+    drop(file);
 
-    // Set executable permissions
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = fs::Permissions::from_mode(0o755);
-        fs::set_permissions(&tmp_path, perms)
-            .map_err(|e| anyhow::anyhow!("Failed to set executable permissions: {}", e))?;
-    }
-
-    // Atomic rename
-    fs::rename(&tmp_path, binary_path).map_err(|e| {
-        // Clean up temp file on failure
-        let _ = fs::remove_file(&tmp_path);
-        anyhow::anyhow!("Failed to replace binary: {}", e)
-    })?;
-
-    Ok(())
+    finalize_staged_binary(binary_path, &tmp_path)
 }
 
 // ── EE proxy helpers ────────────────────────────────────────────────────────
@@ -1387,13 +1669,18 @@ async fn fetch_ee_checksum(
         .map_err(|e| anyhow::anyhow!("Failed to read EE checksum: {}", e))
 }
 
-/// Download an EE binary tarball through the license-gated proxy.
-async fn download_ee_asset(
+/// Stream an EE binary tarball through the license-gated proxy into `dest`,
+/// returning its lowercase hex SHA256.
+///
+/// Streaming counterpart of the OSS `download_asset_to_file`; the EE tarball is
+/// the same size and would blow the same memory budget.
+async fn download_ee_asset_to_file(
     api: &str,
     version: &str,
     asset: &str,
     license_jwt: &str,
-) -> anyhow::Result<Vec<u8>> {
+    dest: &Path,
+) -> anyhow::Result<String> {
     let url = format!("{}/api/ee/download/{}/{}", api, version, asset);
     let client = reqwest::Client::new();
     let resp = client
@@ -1410,10 +1697,7 @@ async fn download_ee_asset(
             url
         ));
     }
-    resp.bytes()
-        .await
-        .map(|b| b.to_vec())
-        .map_err(|e| anyhow::anyhow!("Failed to read EE download: {}", e))
+    stream_response_to_file(resp, dest).await
 }
 
 /// Resolve the data dir: explicit flag/env > `~/.temps`.
@@ -1698,6 +1982,177 @@ mod tests {
         let result = extract_binary_from_tarball(&tarball);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), b"fake-binary-content");
+    }
+
+    /// Build a gzipped tarball containing a single `temps` entry.
+    fn tarball_with_binary(content: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, "temps", content).unwrap();
+            builder.finish().unwrap();
+        }
+        encoder.finish().unwrap()
+    }
+
+    #[test]
+    fn test_verify_computed_checksum_matches_case_insensitively() {
+        let computed = "AABBCC";
+        let checksum_text = "aabbcc  temps-linux-amd64.tar.gz";
+        assert!(verify_computed_checksum(computed, checksum_text).is_ok());
+    }
+
+    #[test]
+    fn test_verify_computed_checksum_reports_both_hashes_on_mismatch() {
+        let err = verify_computed_checksum("aaaa", "bbbb  temps.tar.gz")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Checksum mismatch"));
+        assert!(err.contains("aaaa"));
+        assert!(err.contains("bbbb"));
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_streams_to_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball_path = dir.path().join("temps.tar.gz");
+        let dest = dir.path().join("staged");
+
+        std::fs::write(&tarball_path, tarball_with_binary(b"fake-binary-content")).unwrap();
+
+        let written = extract_binary_from_tarball_file(&tarball_path, &dest).unwrap();
+        assert_eq!(written, b"fake-binary-content".len() as u64);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"fake-binary-content");
+    }
+
+    /// The streaming path must produce exactly what the in-memory path does,
+    /// byte for byte, for the same tarball.
+    #[test]
+    fn test_extract_binary_from_tarball_file_matches_in_memory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let tarball_path = dir.path().join("temps.tar.gz");
+        let dest = dir.path().join("staged");
+
+        // Big enough that `read_to_end` would have grown its Vec more than once.
+        let content: Vec<u8> = (0..600_000u32).map(|i| (i % 251) as u8).collect();
+        let tarball = tarball_with_binary(&content);
+        std::fs::write(&tarball_path, &tarball).unwrap();
+
+        extract_binary_from_tarball_file(&tarball_path, &dest).unwrap();
+
+        let streamed = std::fs::read(&dest).unwrap();
+        let in_memory = extract_binary_from_tarball(&tarball).unwrap();
+        assert_eq!(streamed, in_memory);
+        assert_eq!(streamed, content);
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_not_found() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tarball_path = dir.path().join("temps.tar.gz");
+        let dest = dir.path().join("staged");
+
+        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+        {
+            let mut builder = tar::Builder::new(&mut encoder);
+            let content = b"not-temps";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, "other-file", &content[..])
+                .unwrap();
+            builder.finish().unwrap();
+        }
+        std::fs::write(&tarball_path, encoder.finish().unwrap()).unwrap();
+
+        let err = extract_binary_from_tarball_file(&tarball_path, &dest).unwrap_err();
+        assert!(err.to_string().contains("not found"));
+        // Nothing was staged, so nothing can be renamed over the live binary.
+        assert!(!dest.exists());
+    }
+
+    #[test]
+    fn test_extract_binary_from_tarball_file_missing_tarball_reports_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.tar.gz");
+        let err = extract_binary_from_tarball_file(&missing, &dir.path().join("staged"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("nope.tar.gz"), "error was: {err}");
+    }
+
+    #[test]
+    fn test_scoped_temp_file_removes_on_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch");
+        std::fs::write(&path, b"junk").unwrap();
+
+        {
+            let _guard = ScopedTempFile::new(path.clone());
+        }
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn test_scoped_temp_file_disarm_keeps_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch");
+        std::fs::write(&path, b"junk").unwrap();
+
+        {
+            let mut guard = ScopedTempFile::new(path.clone());
+            guard.disarm();
+        }
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn test_temp_paths_carry_pid_suffix() {
+        let parent = std::path::Path::new("/opt/temps/bin");
+        let pid = std::process::id();
+        assert_eq!(
+            staged_binary_path(parent),
+            parent.join(format!(".temps-upgrade-tmp.{pid}"))
+        );
+        assert_eq!(
+            download_tmp_path(parent),
+            parent.join(format!(".temps-upgrade-dl.{pid}"))
+        );
+        // Concurrent upgraders must not collide on the same staging file.
+        assert_ne!(staged_binary_path(parent), download_tmp_path(parent));
+    }
+
+    #[test]
+    fn test_finalize_staged_binary_renames_and_marks_executable() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("temps");
+        let staged = dir.path().join("staged");
+        std::fs::write(&target, b"old").unwrap();
+        std::fs::write(&staged, b"new").unwrap();
+
+        finalize_staged_binary(&target, &staged).unwrap();
+
+        assert!(!staged.exists());
+        assert_eq!(std::fs::read(&target).unwrap(), b"new");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o755);
+        }
     }
 
     #[test]
