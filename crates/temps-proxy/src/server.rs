@@ -269,7 +269,8 @@ fn shared_runtime(
         .map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create the '{}' tokio runtime for proxy refresh loops: {}",
-                thread_name, e
+                thread_name,
+                e
             )
         })?;
     let handle = runtime.handle().clone();
