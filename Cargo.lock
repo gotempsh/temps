@@ -5428,6 +5428,7 @@ checksum = "a7bd67e2f5d65937ff283e418fcad53c8e2eeda0719e455508b62dad8ffe6180"
 dependencies = [
  "ipnetwork",
  "memchr",
+ "memmap2",
  "serde",
  "thiserror 2.0.20",
 ]

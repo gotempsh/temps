@@ -1,4 +1,5 @@
 use maxminddb::geoip2;
+use maxminddb::Mmap;
 use rand::prelude::IndexedRandom;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -258,6 +259,34 @@ fn resolve_mmdb_path_from(
     data_dir.map(|path| path.join(filename)).unwrap_or(cwd_path)
 }
 
+/// Open an `.mmdb` database as a read-only memory map.
+///
+/// The GeoLite2 City database is ~70 MB and the ASN database ~10 MB.
+/// `Reader::open_readfile` would `read_to_end` both into `Vec<u8>`, i.e.
+/// ~80 MB of anonymous heap (`RssAnon`) that the kernel can only reclaim
+/// through swap. Mapping the files instead moves those pages to `RssFile`
+/// (clean page cache), which the kernel can evict and re-fault on demand —
+/// the working set of an mmdb lookup is a handful of pages along one search
+/// tree path, so resident usage tracks actual traffic instead of file size.
+///
+/// # Safety
+///
+/// `Reader::open_mmap` is `unsafe` because a mapped file that is modified
+/// *in place* under the process yields torn reads or `SIGBUS`. Every writer
+/// of these files in this codebase downloads to a `.mmdb.tmp` sibling and
+/// then `rename(2)`s it over the destination (see
+/// `temps-cli::commands::serve::console::download_geolite2_database` and
+/// `temps-cli::commands::setup`). A rename replaces the *directory entry*,
+/// not the inode, so an existing mapping keeps referring to the unlinked
+/// old inode and stays valid and self-consistent for the life of the
+/// process; the new file is picked up on the next restart. No code path
+/// truncates or rewrites an mmdb in place.
+fn open_mmdb(path: &std::path::Path) -> Result<maxminddb::Reader<Mmap>, maxminddb::MaxMindDbError> {
+    // SAFETY: see the doc comment above — all writers swap the file in
+    // atomically via rename(2), never mutating the mapped inode.
+    unsafe { maxminddb::Reader::open_mmap(path) }
+}
+
 impl GeoIpService {
     pub fn new() -> Result<Self, GeoIpError> {
         // Check if we should use mock service for local development
@@ -273,7 +302,7 @@ impl GeoIpService {
         let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
         let service = get_or_load(&LOADED_DATABASES, db_path.clone(), || {
             debug!("Loading MaxMind database from: {:?}", db_path);
-            let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
+            let reader = open_mmdb(&db_path).map_err(|e| {
                 GeoIpError::Other(format!(
                     "Failed to open MaxMind database at '{}': {}",
                     db_path.display(),
@@ -286,7 +315,7 @@ impl GeoIpService {
             // the operator hasn't provisioned it, same as the City database's own
             // optional-file convention in Dockerfile/docker-compose.
             let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
-            let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
+            let asn_reader = match open_mmdb(&asn_db_path) {
                 Ok(reader) => {
                     info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
                     Some(reader)
@@ -316,8 +345,8 @@ impl GeoIpService {
 }
 
 pub struct MaxMindGeoIpService {
-    reader: maxminddb::Reader<Vec<u8>>,
-    asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
+    reader: maxminddb::Reader<Mmap>,
+    asn_reader: Option<maxminddb::Reader<Mmap>>,
 }
 
 impl MaxMindGeoIpService {
@@ -544,6 +573,16 @@ mod tests {
         let recovered = get_or_load(&cache, path.clone(), || Ok("now present".to_string()))
             .expect("retry after a failed load should succeed");
         assert_eq!(*recovered, "now present");
+    }
+
+    #[test]
+    fn test_open_mmdb_missing_file_is_a_recoverable_error() {
+        // The ASN database is optional and its absence must stay a plain
+        // `Err` the caller can degrade on, not a panic. `open_mmap` is
+        // `unsafe`, so this also pins that a missing path is rejected before
+        // any mapping is attempted.
+        let missing = std::path::Path::new("/nonexistent/definitely-not-here.mmdb");
+        assert!(open_mmdb(missing).is_err());
     }
 
     #[test]
