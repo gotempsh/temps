@@ -230,21 +230,46 @@ impl pingora::server::ShutdownSignalWatch for ShutdownSignalBridge {
 /// two keep their own threads. Nothing here runs on the Pingora request path.
 static REFRESH_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> = std::sync::OnceLock::new();
 
+/// Runtime for the IP block-list refresh, deliberately NOT the one above.
+///
+/// `LbService::refresh_snapshot` and `CertHostCache::refresh` await their query
+/// and then rebuild their collections in a synchronous loop, so on an instance
+/// with a large `domains` or `custom_routes` table either can hold a worker
+/// without yielding. The block list is the only cross-process propagation path
+/// for a new block and starts empty (fail-open), so delaying its refresh has a
+/// security consequence the other two loops do not. Giving it its own worker
+/// costs one thread and removes that coupling entirely.
+static SECURITY_REFRESH_RUNTIME: std::sync::OnceLock<tokio::runtime::Runtime> =
+    std::sync::OnceLock::new();
+
 /// Handle to [`REFRESH_RUNTIME`], creating it on first use.
 fn refresh_runtime() -> Result<tokio::runtime::Handle> {
-    if let Some(runtime) = REFRESH_RUNTIME.get() {
+    shared_runtime(&REFRESH_RUNTIME, "temps-refresh")
+}
+
+/// Handle to [`SECURITY_REFRESH_RUNTIME`], creating it on first use.
+fn security_refresh_runtime() -> Result<tokio::runtime::Handle> {
+    shared_runtime(&SECURITY_REFRESH_RUNTIME, "temps-ipblock")
+}
+
+/// Single-worker runtime held in `slot`, built on first use.
+fn shared_runtime(
+    slot: &'static std::sync::OnceLock<tokio::runtime::Runtime>,
+    thread_name: &str,
+) -> Result<tokio::runtime::Handle> {
+    if let Some(runtime) = slot.get() {
         return Ok(runtime.handle().clone());
     }
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
-        .thread_name("temps-proxy-refresh")
+        .thread_name(thread_name)
         .enable_all()
         .build()
         .map_err(|e| {
             anyhow::anyhow!(
-                "Failed to create the shared tokio runtime for proxy refresh loops: {}",
-                e
+                "Failed to create the '{}' tokio runtime for proxy refresh loops: {}",
+                thread_name, e
             )
         })?;
     let handle = runtime.handle().clone();
@@ -252,9 +277,9 @@ fn refresh_runtime() -> Result<tokio::runtime::Handle> {
     // A concurrent first caller may have won the race; its runtime is the one
     // that stays, and the loser's is dropped here without ever having run a
     // task. Both callers end up with a handle to the same runtime.
-    match REFRESH_RUNTIME.set(runtime) {
+    match slot.set(runtime) {
         Ok(()) => Ok(handle),
-        Err(_) => REFRESH_RUNTIME
+        Err(_) => slot
             .get()
             .map(|runtime| runtime.handle().clone())
             .ok_or_else(|| {
@@ -294,9 +319,16 @@ pub fn setup_proxy_server(
 ) -> Result<()> {
     // Setup plugin system (async operation in sync context)
     // A `current_thread` runtime is enough here: plugin registration awaits a
-    // bounded file-existence poll and does sync work, and it spawns nothing
-    // that outlives this call. `Runtime::new()` would stand up (and tear down)
-    // one worker thread per core purely to drive that.
+    // bounded file-existence poll and otherwise does sync work, so a worker
+    // thread per core would be stood up and torn down purely to drive that.
+    //
+    // Registration is not entirely free of spawns: `ConfigPlugin` starts the
+    // `settings_change` LISTEN/NOTIFY task with `tokio::spawn`. That task does
+    // not survive this runtime being dropped at the end of the statement, and
+    // did not survive the previous multi-threaded one either -- the settings
+    // cache falls back to its 5s TTL, which is the documented non-fatal
+    // behaviour. This is pre-existing and unchanged here; it is called out so
+    // the lifetime is not mistaken for something this runtime guarantees.
     let context = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -359,7 +391,7 @@ pub fn setup_proxy_server(
 
     // Keep the IP block list in memory so `is_blocked` never queries Postgres on
     // the request hot path. The shared refresh runtime owns the periodic refresh.
-    refresh_runtime()?.spawn(ip_access_control_service.clone().run_refresh_loop());
+    security_refresh_runtime()?.spawn(ip_access_control_service.clone().run_refresh_loop());
 
     let cert_host_cache = Arc::new(CertHostCache::new(db.clone()));
 
@@ -630,7 +662,7 @@ pub fn create_proxy_service(
 
     // Keep the IP block list in memory so `is_blocked` never queries Postgres on
     // the request hot path. The shared refresh runtime owns the periodic refresh.
-    refresh_runtime()?.spawn(ip_access_control_service.clone().run_refresh_loop());
+    security_refresh_runtime()?.spawn(ip_access_control_service.clone().run_refresh_loop());
 
     let cert_host_cache = Arc::new(CertHostCache::new(db.clone()));
 
