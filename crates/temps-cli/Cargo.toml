@@ -128,6 +128,7 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 libc = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true }
@@ -137,7 +138,6 @@ tikv-jemallocator = { workspace = true }
 # console health router through a single request in unit tests without binding
 # a real listener. Already present transitively; pinned here for test use.
 tower = { workspace = true }
-tempfile = { workspace = true }
 # Only for `tests/plugin_sdk_conformance.rs`: proves the SDK's hand-written
 # endpoint table still matches the handlers this crate assembles into the API.
 temps-plugin-sdk = { path = "../temps-plugin-sdk" }
