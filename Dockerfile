@@ -19,7 +19,11 @@ ARG TEMPS_ARTIFACTS=artifacts-source
 # (compiling wasm-pack/wasm-bindgen-cli from source dominates a cold build).
 FROM rust:1.98-alpine AS toolchain
 
-# Install required build dependencies
+# Install required build dependencies.
+#
+# python3 is required by crates/temps-captcha-wasm's `build`/`build:dev` npm
+# scripts, which run scripts/source_attribution.py to annotate the generated
+# wasm-pack output — not by anything in this Dockerfile directly.
 RUN apk add --no-cache \
     bash \
     build-base \
@@ -34,7 +38,8 @@ RUN apk add --no-cache \
     curl \
     tar \
     gzip \
-    unzip
+    unzip \
+    python3
 
 # Install Node.js and npm (needed for wasm-pack and bun)
 RUN apk add --no-cache nodejs npm
@@ -132,6 +137,14 @@ FROM ${TEMPS_ARTIFACTS} AS artifacts
 
 # Stage 3: Runtime
 FROM alpine:3.22
+
+# `apk add` only installs the packages listed below -- it does not touch
+# packages already present in the base image (busybox, musl, ssl_client),
+# so those stay at whatever patch level was current the day this tag was
+# pulled. Upgrading them explicitly here means a base image security patch
+# (e.g. a musl or busybox CVE fix) lands on the next build, not only on the
+# next manual Alpine version bump.
+RUN apk update && apk upgrade --no-cache
 
 # Install runtime dependencies
 RUN apk add --no-cache \
