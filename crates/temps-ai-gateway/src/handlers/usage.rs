@@ -296,16 +296,13 @@ fn parse_time_range(
     Ok((from, to))
 }
 
-/// Confine AI usage queries so ordinary callers cannot read instance-wide or
-/// cross-user aggregates. Mirrors unscoped proxy-log authorization: only
-/// `SystemAdmin` may omit a user scope; everyone else is pinned to their own
-/// `user_id` (and cannot request someone else's).
-fn scope_usage_filter_for_caller(
-    auth: &AuthContext,
-    filter: &mut UsageFilter,
-) -> Result<(), Problem> {
+/// Resolve the scope a caller is authorized to query: `Ok(None)` means the
+/// caller (a `SystemAdmin`) may run instance-wide queries; `Ok(Some(id))`
+/// pins the caller to their own `user_id`. Errors if the credential has no
+/// user identity to scope to (e.g. a deployment token) and isn't an admin.
+fn resolve_caller_scope(auth: &AuthContext) -> Result<Option<i32>, Problem> {
     if auth.has_permission(&Permission::SystemAdmin) {
-        return Ok(());
+        return Ok(None);
     }
 
     let Some(caller_id) = auth.user_id_opt() else {
@@ -322,6 +319,21 @@ fn scope_usage_filter_for_caller(
             Some(Permission::SystemAdmin.to_string()),
         )
         .build());
+    };
+
+    Ok(Some(caller_id))
+}
+
+/// Confine AI usage queries so ordinary callers cannot read instance-wide or
+/// cross-user aggregates. Mirrors unscoped proxy-log authorization: only
+/// `SystemAdmin` may omit a user scope; everyone else is pinned to their own
+/// `user_id` (and cannot request someone else's).
+fn scope_usage_filter_for_caller(
+    auth: &AuthContext,
+    filter: &mut UsageFilter,
+) -> Result<(), Problem> {
+    let Some(caller_id) = resolve_caller_scope(auth)? else {
+        return Ok(());
     };
 
     match filter.user_id {
@@ -442,7 +454,8 @@ async fn get_usage_timeseries(
 
     let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
     let bucket = params.bucket.as_deref().unwrap_or("day");
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let timeseries = app_state
         .usage_service
         .get_timeseries_filtered(from, to, bucket, &filter)
@@ -477,7 +490,8 @@ async fn get_usage_top_models(
 
     let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
     let limit = std::cmp::min(params.limit.unwrap_or(10), 100);
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let models = app_state
         .usage_service
         .get_top_models_filtered(from, to, limit, &filter)
@@ -521,7 +535,8 @@ async fn get_usage_recent(
 
     let limit = params.resolved_limit();
     let offset = params.offset.unwrap_or(0);
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let page = app_state
         .usage_service
         .get_recent_filtered(limit, offset, &filter)
@@ -559,7 +574,8 @@ async fn get_conversations(
 
     let (from, to) = parse_time_range(params.from.as_deref(), params.to.as_deref())?;
     let limit = std::cmp::min(params.limit.unwrap_or(50), 100);
-    let filter = params.to_filter();
+    let mut filter = params.to_filter();
+    scope_usage_filter_for_caller(&auth, &mut filter)?;
     let conversations = app_state
         .usage_service
         .get_conversations(from, to, &filter, limit)
@@ -591,10 +607,11 @@ async fn get_conversation_detail(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, AiGatewayRead);
 
+    let caller_scope = resolve_caller_scope(&auth)?;
     let limit = std::cmp::min(params.limit.unwrap_or(100), 500);
     let entries = app_state
         .usage_service
-        .get_conversation_detail(&conversation_id, limit)
+        .get_conversation_detail(&conversation_id, limit, caller_scope)
         .await?;
 
     Ok(Json(entries))
@@ -846,6 +863,35 @@ mod tests {
         let mut filter = UsageFilter::default();
         let err = scope_usage_filter_for_caller(&auth, &mut filter)
             .expect_err("deployment tokens lack a user scope");
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn resolve_caller_scope_pins_ordinary_user_to_self() {
+        let auth = test_auth(Role::User);
+        let scope = resolve_caller_scope(&auth).expect("ordinary user has a scope");
+        assert_eq!(scope, Some(42));
+    }
+
+    #[test]
+    fn resolve_caller_scope_is_unscoped_for_admin() {
+        let auth = test_auth(Role::Admin);
+        let scope = resolve_caller_scope(&auth).expect("admin may query instance-wide");
+        assert_eq!(scope, None);
+    }
+
+    #[test]
+    fn resolve_caller_scope_denies_deployment_token() {
+        use temps_entities::deployment_tokens::DeploymentTokenPermission;
+        let auth = AuthContext::new_deployment_token(
+            7,
+            None,
+            None,
+            1,
+            "tok".to_string(),
+            vec![DeploymentTokenPermission::AiGatewayExecute],
+        );
+        let err = resolve_caller_scope(&auth).expect_err("deployment tokens lack a user scope");
         assert_eq!(err.status_code, StatusCode::FORBIDDEN);
     }
 }
