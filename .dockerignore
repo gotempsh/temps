@@ -36,8 +36,10 @@ bun.lockb
 docs/
 README.md
 CHANGELOG.md
-LICENSE
 *.md
+
+# NOTE: LICENSE is intentionally NOT excluded -- Dockerfile's runtime stage
+# COPYs LICENSE, LICENSE-MIT and NOTICE into the image for attribution.
 
 # Development files
 .env
