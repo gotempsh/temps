@@ -6,6 +6,7 @@ import {
   parsePageSizeForTest,
   parseTrafficFilterForTest,
   parseTrafficMetricsForTest,
+  resolveApiQueryFiltersForTest,
   trafficOffsetPlanForTest,
 } from './api-traffic.js'
 
@@ -80,6 +81,16 @@ describe('traffic filters', () => {
     expect(() => parseTrafficFilterForTest('raw_sql:eq:anything')).toThrow(
       'Unknown filter dimension',
     )
+  })
+
+  test('reaches the request body from commander options.filter (regression: options.filters was always undefined)', () => {
+    expect(
+      resolveApiQueryFiltersForTest({ filter: ['path:eq:/pricing'] }),
+    ).toEqual([{ dimension: 'path', operator: 'eq', values: ['/pricing'] }])
+  })
+
+  test('defaults to no filters when none are passed', () => {
+    expect(resolveApiQueryFiltersForTest({})).toEqual([])
   })
 })
 
