@@ -29,6 +29,7 @@ use utoipa::{OpenApi, ToSchema};
 
 pub struct SettingsState {
     pub config_service: Arc<ConfigService>,
+    pub encryption_service: Arc<temps_core::EncryptionService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub route_table_refresher: Option<Arc<dyn temps_core::route_table::RouteTableRefresher>>,
     /// Node enrollment token minting/listing/revocation (ADR-020 WS-1.1).
@@ -48,6 +49,33 @@ pub struct SettingsState {
 #[derive(Debug, Clone, serde::Serialize)]
 struct SettingsUpdatedAudit {
     context: AuditContext,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterCaRotatedAudit {
+    context: AuditContext,
+    previous_fingerprint: String,
+    new_fingerprint: String,
+    revoked_enrollment_tokens: u64,
+}
+
+impl AuditOperation for ClusterCaRotatedAudit {
+    fn operation_type(&self) -> String {
+        "CLUSTER_CA_ROTATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation {error}"))
+    }
 }
 
 impl AuditOperation for SettingsUpdatedAudit {
@@ -574,6 +602,7 @@ impl AppSettingsResponse {
         mint_enrollment_token,
         list_enrollment_tokens,
         revoke_enrollment_token,
+        rotate_cluster_ca,
         refresh_route_table,
     ),
     components(schemas(
@@ -603,6 +632,8 @@ impl AppSettingsResponse {
         MintEnrollmentTokenResponse,
         EnrollmentTokenInfo,
         EnrollmentTokenListResponse,
+        RotateClusterCaRequest,
+        RotateClusterCaResponse,
         RouteRefreshResponse,
         UpdateStatusResponse,
         UpdateCapabilityResponse,
@@ -651,6 +682,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
             "/settings/enrollment-tokens/{id}",
             delete(revoke_enrollment_token),
         )
+        .route("/settings/cluster-ca/rotate", post(rotate_cluster_ca))
         .route("/settings/routes/refresh", post(refresh_route_table))
 }
 
@@ -695,8 +727,8 @@ pub struct MintEnrollmentTokenResponse {
     pub token: String,
     pub expires_at: String,
     pub max_uses: i32,
-    /// SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
-    /// worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+    /// SHA-256 fingerprint of the cluster CA. Token issuance initializes the
+    /// CA when needed, so every newly minted token carries a trust pin.
     pub ca_fingerprint: Option<String>,
     pub message: String,
 }
@@ -714,6 +746,124 @@ pub struct EnrollmentTokenInfo {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnrollmentTokenListResponse {
     pub tokens: Vec<EnrollmentTokenInfo>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RotateClusterCaRequest {
+    /// Fingerprint observed through a trusted operator channel immediately
+    /// before rotation. The request fails if the active root changed.
+    pub expected_fingerprint: String,
+    /// Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
+    pub confirmation: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RotateClusterCaResponse {
+    pub previous_fingerprint: String,
+    pub new_fingerprint: String,
+    pub revoked_enrollment_tokens: u64,
+    pub message: String,
+}
+
+/// Replace a compromised cluster CA and invalidate outstanding enrollment
+/// tokens. Existing workers fail closed until they are re-enrolled.
+#[utoipa::path(
+    tag = "Settings",
+    post,
+    path = "/settings/cluster-ca/rotate",
+    request_body = RotateClusterCaRequest,
+    responses(
+        (status = 200, description = "Cluster CA rotated", body = RotateClusterCaResponse),
+        (status = 400, description = "Invalid confirmation or CA state"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "Expected fingerprint is stale"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn rotate_cluster_ca(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(req): Json<RotateClusterCaRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+
+    if req.confirmation != "ROTATE CLUSTER CA" {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Confirmation Required")
+            .detail("confirmation must be exactly ROTATE CLUSTER CA")
+            .build());
+    }
+
+    let (replacement, result) = crate::cluster_ca::rotate_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+        req.expected_fingerprint.trim(),
+    )
+    .await
+    .map_err(|error| {
+        use crate::cluster_ca::ClusterCaError;
+        use crate::ConfigServiceError;
+        match error {
+            ClusterCaError::Settings(ConfigServiceError::ClusterCaFingerprintMismatch) => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .title("Cluster CA Changed")
+                    .detail("The active cluster CA no longer matches expected_fingerprint. Read the current fingerprint through a trusted channel before retrying.")
+                    .build()
+            }
+            ClusterCaError::Settings(ConfigServiceError::ClusterCaNotInitialized) => {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Cluster CA Not Initialized")
+                    .detail("Mint an enrollment token to initialize the cluster CA before rotating it.")
+                    .build()
+            }
+            ClusterCaError::Settings(ConfigServiceError::InvalidConfiguration { .. }) => {
+                error!(%error, "Refused cluster CA rotation from an incomplete or invalid state");
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Invalid Cluster CA State")
+                    .detail("The active cluster CA state is incomplete or invalid. Check the server logs and restore the control-plane settings backup before retrying.")
+                    .build()
+            }
+            error => {
+                error!(%error, "Failed to rotate cluster CA");
+                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .title("Cluster CA Rotation Failed")
+                    .detail("The cluster CA was not rotated. Check the server logs for details.")
+                    .build()
+            }
+        }
+    })?;
+    let new_fingerprint = temps_core::node_pki::ca_fingerprint_sha256(&replacement.cert_pem)
+        .map_err(|error| {
+            error!(%error, "Failed to fingerprint newly committed cluster CA");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Cluster CA Rotation Incomplete")
+                .detail("The new CA was committed but its fingerprint response could not be generated. Read the current fingerprint from authenticated settings before re-enrolling workers.")
+                .build()
+        })?;
+
+    let audit = ClusterCaRotatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        previous_fingerprint: result.previous_fingerprint.clone(),
+        new_fingerprint: new_fingerprint.clone(),
+        revoked_enrollment_tokens: result.revoked_enrollment_tokens,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(%error, "Failed to record cluster CA rotation audit log");
+    }
+
+    Ok(Json(RotateClusterCaResponse {
+        previous_fingerprint: result.previous_fingerprint,
+        new_fingerprint,
+        revoked_enrollment_tokens: result.revoked_enrollment_tokens,
+        message: "Cluster CA rotated. Every worker must now be re-enrolled with a new single-use token and the new fingerprint.".to_string(),
+    }))
 }
 
 fn enrollment_error_to_problem(e: crate::enrollment_tokens::EnrollmentError) -> Problem {
@@ -765,21 +915,30 @@ async fn mint_enrollment_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
-    // If a cluster CA already exists, embed its SHA-256 fingerprint so a joining
-    // node can verify the control plane's CA out of band (ADR-020 WS-2.2). The
-    // CA is minted lazily on the first mTLS enrollment, so the very first token
-    // may carry no fingerprint; subsequent tokens do.
-    let settings = app_state.config_service.get_settings().await.map_err(|e| {
+    // Initialize the cluster CA before minting the token. This makes the first
+    // enrollment as strongly pinned as every subsequent enrollment and avoids
+    // trust-on-first-use against the registration response.
+    let cluster_ca = crate::cluster_ca::ensure_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await
+    .map_err(|error| {
+        error!(%error, "Failed to initialize cluster CA before enrollment-token minting");
         ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .title("Settings Error")
-            .detail(format!("Failed to read settings: {e}"))
+            .title("Cluster CA Initialization Failed")
+            .detail("The enrollment token was not created because the cluster trust root could not be initialized. Check the server logs for details.")
             .build()
     })?;
-    let ca_fingerprint = settings
-        .multi_node
-        .cluster_ca_cert_pem
-        .as_deref()
-        .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok());
+    let ca_fingerprint = Some(
+        temps_core::node_pki::ca_fingerprint_sha256(&cluster_ca.cert_pem).map_err(|error| {
+            error!(%error, "Failed to fingerprint initialized cluster CA");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Cluster CA Initialization Failed")
+                .detail("The enrollment token was not created because the cluster trust root could not be fingerprinted. Check the server logs for details.")
+                .build()
+        })?,
+    );
 
     let params = crate::enrollment_tokens::MintParams {
         max_uses: req.max_uses.unwrap_or(1),

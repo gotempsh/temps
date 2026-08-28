@@ -64,6 +64,7 @@ impl TempsPlugin for ConfigPlugin {
         // Get the ConfigService from the context
         let config_service = context.require_service::<ConfigService>();
         let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
+        let encryption_service = context.require_service::<temps_core::EncryptionService>();
         let db = context.require_service::<sea_orm::DatabaseConnection>();
         let enrollment_token_service =
             Arc::new(crate::enrollment_tokens::EnrollmentTokenService::new(db));
@@ -84,6 +85,7 @@ impl TempsPlugin for ConfigPlugin {
         // Create SettingsState
         let settings_state = Arc::new(SettingsState {
             config_service,
+            encryption_service,
             audit_service,
             route_table_refresher,
             enrollment_token_service,
