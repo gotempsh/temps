@@ -60,7 +60,7 @@ pub enum NodeError {
 
     #[error(
         "Placement constraints selected node(s) that cannot run this image ({excluded}); \
-         refusing to fall back to the control plane"
+         refusing to ignore the requested placement"
     )]
     PlacementConstraintsUnsatisfied {
         /// Constrained nodes that were dropped from the pool and why.

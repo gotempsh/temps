@@ -318,6 +318,7 @@ impl AgentCommand {
         let tls_cert_path = saved.as_ref().and_then(|c| c.tls_cert_path.clone());
         let tls_key_path = saved.as_ref().and_then(|c| c.tls_key_path.clone());
         let cluster_ca_path = saved.as_ref().and_then(|c| c.cluster_ca_path.clone());
+        let require_mtls = saved.as_ref().is_some_and(|c| c.require_mtls);
 
         let underlay_dev = self
             .underlay_dev
@@ -341,15 +342,16 @@ impl AgentCommand {
             tls_cert_path,
             tls_key_path,
             cluster_ca_path,
+            require_mtls,
             underlay_dev,
             underlay_mtu,
         })
     }
 
-    /// Try to load `~/.temps/agent.json`. Returns None if not found or unparsable.
+    /// Try to load `agent.json` from the configured agent data directory.
+    /// Returns None if not found or unparsable.
     fn load_saved_config(&self) -> Option<temps_agent::AgentConfig> {
-        let home = dirs::home_dir()?;
-        let config_path = home.join(".temps").join("agent.json");
+        let config_path = agent_data_dir().join("agent.json");
         let data = std::fs::read_to_string(&config_path).ok()?;
         match serde_json::from_str::<temps_agent::AgentConfig>(&data) {
             Ok(config) => {

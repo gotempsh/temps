@@ -16,6 +16,6 @@ pub use enrollment_tokens::{EnrollmentError, EnrollmentTokenService, MintParams}
 pub use handler::{configure_routes, SettingsApiDoc, SettingsState};
 pub use plugin::ConfigPlugin;
 pub use service::{
-    ClusterCaRotationResult, ConfigService, ConfigServiceError, EffectiveTelemetryPolicies,
-    ServerConfig,
+    ClusterCaRotationResult, ClusterNetworkState, ConfigService, ConfigServiceError,
+    EffectiveTelemetryPolicies, ServerConfig,
 };

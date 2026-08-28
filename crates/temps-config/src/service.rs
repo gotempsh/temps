@@ -11,7 +11,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use temps_database::DbConnection;
-use temps_entities::{external_services, node_enrollment_tokens, settings};
+use temps_entities::{external_services, network_config, node_enrollment_tokens, nodes, settings};
 use thiserror::Error;
 use tokio::{
     fs as tokio_fs,
@@ -108,6 +108,18 @@ pub struct EffectiveTelemetryPolicies {
     pub otel_spans_retention_days: Option<u32>,
     pub otel_logs_retention_days: Option<u32>,
     pub otel_metrics_retention_days: Option<u32>,
+}
+
+/// Effective cluster-wide container-network allocation state.
+///
+/// The pool is mutable only before the first control-plane or worker subnet is
+/// allocated. Keeping that lock state beside the values lets operator surfaces
+/// explain why an established cluster cannot be edited in place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterNetworkState {
+    pub compute_pool_cidr: String,
+    pub subnet_prefix_len: u8,
+    pub allocation_count: u64,
 }
 
 #[derive(Debug, FromQueryResult)]
@@ -731,6 +743,39 @@ WHERE proc_name IN ('policy_compression', 'policy_retention')
             .count(self.db.as_ref())
             .await
             .map_err(ConfigServiceError::from)
+    }
+
+    /// Read the cluster-wide overlay pool and whether any node already owns a
+    /// subnet. This is deliberately read-only: changes must go through the
+    /// allocator's exclusive-lock and no-existing-allocation guard.
+    pub async fn get_cluster_network_state(
+        &self,
+    ) -> Result<ClusterNetworkState, ConfigServiceError> {
+        let config = network_config::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| ConfigServiceError::InvalidConfiguration {
+                details: "network_config singleton row is missing".to_string(),
+            })?;
+        let subnet_prefix_len = u8::try_from(config.subnet_prefix_len).map_err(|_| {
+            ConfigServiceError::InvalidConfiguration {
+                details: format!(
+                    "network_config subnet prefix {} is outside the supported u8 range",
+                    config.subnet_prefix_len
+                ),
+            }
+        })?;
+        let worker_allocations = nodes::Entity::find()
+            .filter(nodes::Column::ComputeCidr.is_not_null())
+            .count(self.db.as_ref())
+            .await?;
+
+        Ok(ClusterNetworkState {
+            compute_pool_cidr: config.compute_pool_cidr,
+            subnet_prefix_len,
+            allocation_count: worker_allocations
+                + u64::from(config.control_plane_compute_cidr.is_some()),
+        })
     }
 
     /// Check if using MySQL/MariaDB database
@@ -1825,6 +1870,101 @@ mod tests {
 
     fn count_row(count: i64) -> BTreeMap<String, Value> {
         BTreeMap::from([("num_items".to_string(), Value::BigInt(Some(count)))])
+    }
+
+    fn network_config_row(
+        subnet_prefix_len: i32,
+        control_plane_compute_cidr: Option<&str>,
+    ) -> network_config::Model {
+        network_config::Model {
+            id: 1,
+            compute_pool_cidr: "10.240.0.0/16".to_string(),
+            subnet_prefix_len,
+            transport: "vxlan".to_string(),
+            vxlan_vni: 42,
+            vxlan_port: 4789,
+            underlay_mtu: 1500,
+            control_plane_compute_cidr: control_plane_compute_cidr.map(str::to_string),
+            control_plane_underlay_address: Some("10.200.4.1".to_string()),
+            control_plane_overlay_ready: control_plane_compute_cidr.is_some(),
+            control_plane_setup_generation: 1,
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_counts_control_plane_and_worker_allocations() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[network_config_row(24, Some("10.240.0.0/24"))]])
+                .append_query_results([[count_row(2)]])
+                .into_connection(),
+        );
+        let svc = ConfigService::new(test_config(), db);
+
+        let state = svc
+            .get_cluster_network_state()
+            .await
+            .expect("valid cluster network state should load");
+
+        assert_eq!(state.compute_pool_cidr, "10.240.0.0/16");
+        assert_eq!(state.subnet_prefix_len, 24);
+        assert_eq!(state.allocation_count, 3);
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_requires_the_singleton_row() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<network_config::Model>::new()])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("a missing singleton must be reported");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::InvalidConfiguration { details }
+                if details.contains("singleton row is missing")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_rejects_an_invalid_prefix() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[network_config_row(300, None)]])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("an out-of-range prefix must be rejected");
+
+        assert!(matches!(
+            error,
+            ConfigServiceError::InvalidConfiguration { details }
+                if details.contains("outside the supported u8 range")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cluster_network_state_propagates_database_errors() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors([sea_orm::DbErr::Custom(
+                "network configuration unavailable".to_string(),
+            )])
+            .into_connection();
+        let svc = ConfigService::new(test_config(), Arc::new(db));
+
+        let error = svc
+            .get_cluster_network_state()
+            .await
+            .expect_err("database errors must remain typed");
+
+        assert!(matches!(error, ConfigServiceError::Database(_)));
     }
 
     #[test]

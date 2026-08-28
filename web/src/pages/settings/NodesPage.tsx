@@ -303,6 +303,9 @@ function JoinTokenSection() {
       queryClient.invalidateQueries({
         queryKey: getJoinTokenStatusOptions().queryKey,
       })
+      queryClient.invalidateQueries({
+        queryKey: getSettingsOptions().queryKey,
+      })
     },
   })
   const revokeToken = useMutation({
@@ -496,7 +499,7 @@ function JoinInstructions({ joinCommand }: { joinCommand: string }) {
               <CopyButton text={joinCommand} />
             </div>
             <p className="mt-1 text-xs">
-              Replace <code>&lt;worker-ip&gt;</code> with the worker machine's
+              Replace <code>&lt;worker-ip&gt;</code> with the worker machine’s
               private IP address.
             </p>
           </div>
@@ -716,7 +719,7 @@ function EdgeAnalyticsSection({ nodeId }: { nodeId: number }) {
           </div>
         ) : !overview ? (
           <p className="text-sm text-muted-foreground text-center py-6">
-            No analytics data available. The edge node may be offline or hasn't
+            No analytics data available. The edge node may be offline or hasn’t
             received traffic yet.
           </p>
         ) : (
@@ -1102,11 +1105,11 @@ function NodeDetail({
       <AlertDialog open={showDrainDialog} onOpenChange={setShowDrainDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Drain node "{node.name}"?</AlertDialogTitle>
+            <AlertDialogTitle>Drain node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
               This will stop scheduling new containers to this node and redeploy
               existing workloads to other healthy nodes. The node will remain in
-              the cluster in a "draining" state until all containers are
+              the cluster in a “draining” state until all containers are
               migrated.
             </AlertDialogDescription>
           </AlertDialogHeader>
@@ -1128,7 +1131,7 @@ function NodeDetail({
       <AlertDialog open={showRemoveDialog} onOpenChange={setShowRemoveDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Remove node "{node.name}"?</AlertDialogTitle>
+            <AlertDialogTitle>Remove node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
               This will permanently remove the node from the cluster. This
               action cannot be undone. The node must be drained first (no active
@@ -1157,9 +1160,9 @@ function NodeDetail({
       <AlertDialog open={showUndrainDialog} onOpenChange={setShowUndrainDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Reactivate node "{node.name}"?</AlertDialogTitle>
+            <AlertDialogTitle>Reactivate node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will set the node back to "active" so it can accept new
+              This will set the node back to “active” so it can accept new
               container deployments again. Any containers that were already
               migrated off will not be moved back automatically.
             </AlertDialogDescription>
@@ -1448,7 +1451,7 @@ function ClusterTrustCard() {
               {settingsQuery.isLoading
                 ? 'Loading…'
                 : (fingerprint ??
-                  'Not initialized — mint an enrollment token first.')}
+                  'Initializing cluster trust… restart the control plane if this persists.')}
             </p>
           </div>
           <Alert variant="destructive">

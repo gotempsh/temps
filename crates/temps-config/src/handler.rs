@@ -365,10 +365,24 @@ pub struct MultiNodeSettingsMasked {
     /// SHA-256 fingerprint of the cluster CA certificate (public — operators can
     /// verify it out of band; the CA private key is never exposed).
     pub cluster_ca_fingerprint: Option<String>,
+    /// Effective cluster-wide container address pool. `None` only when the
+    /// singleton network configuration could not be read.
+    pub cluster_network: Option<ClusterNetworkSettings>,
     /// Node resource-alert thresholds (percent); `None` = that alert disabled.
     pub node_cpu_alert_percent: Option<f64>,
     pub node_memory_alert_percent: Option<f64>,
     pub node_disk_alert_percent: Option<f64>,
+}
+
+/// Read-only cluster network state. Pool changes are performed on the control
+/// plane through `temps network setup-multi-node`, which enforces that no
+/// existing node allocation can be stranded by an in-place edit.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ClusterNetworkSettings {
+    pub compute_pool_cidr: String,
+    pub subnet_prefix_len: u8,
+    pub allocation_count: u64,
+    pub locked: bool,
 }
 
 /// DNS provider settings with masked sensitive fields
@@ -480,6 +494,7 @@ impl From<AppSettings> for AppSettingsResponse {
                     .cluster_ca_cert_pem
                     .as_deref()
                     .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok()),
+                cluster_network: None,
                 node_cpu_alert_percent: settings.multi_node.node_cpu_alert_percent,
                 node_memory_alert_percent: settings.multi_node.node_memory_alert_percent,
                 node_disk_alert_percent: settings.multi_node.node_disk_alert_percent,
@@ -511,6 +526,16 @@ impl From<AppSettings> for AppSettingsResponse {
 }
 
 impl AppSettingsResponse {
+    fn with_cluster_network_state(mut self, state: Option<crate::ClusterNetworkState>) -> Self {
+        self.multi_node.cluster_network = state.map(|state| ClusterNetworkSettings {
+            compute_pool_cidr: state.compute_pool_cidr,
+            subnet_prefix_len: state.subnet_prefix_len,
+            allocation_count: state.allocation_count,
+            locked: state.allocation_count > 0,
+        });
+        self
+    }
+
     /// Reconcile `effective_metrics_store` with the server's ClickHouse
     /// configuration. The runtime only uses ClickHouse when both the
     /// `monitoring.store` toggle is `click_house` AND all `TEMPS_CLICKHOUSE_*`
@@ -1566,10 +1591,11 @@ async fn get_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
-    let (settings_result, policies_result, monitored_services_result) = tokio::join!(
+    let (settings_result, policies_result, monitored_services_result, cluster_network_result) = tokio::join!(
         app_state.config_service.get_settings(),
         app_state.config_service.get_effective_telemetry_policies(),
         app_state.config_service.count_monitored_services(),
+        app_state.config_service.get_cluster_network_state(),
     );
 
     match settings_result {
@@ -1593,9 +1619,18 @@ async fn get_settings(
                     );
                 })
                 .ok();
+            let cluster_network_state = cluster_network_result
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "Failed to read cluster network state; CIDR controls are unavailable"
+                    );
+                })
+                .ok();
             let response = AppSettingsResponse::from(settings)
                 .with_effective_store(app_state.config_service.is_clickhouse_enabled())
                 .with_effective_timescale_state(policies, monitored_services_count)
+                .with_cluster_network_state(cluster_network_state)
                 .with_proxy_port(app_state.config_service.proxy_port());
             Ok(Json(response))
         }
@@ -2233,6 +2268,24 @@ async fn generate_join_token(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // Keep the deprecated shared-token path safe for upgrades from older
+    // installations. Cluster trust belongs to the control plane and must
+    // exist before any credential capable of enrolling a worker is issued.
+    // Startup normally initializes it; this endpoint is a deterministic
+    // repair path for a process upgraded without a restart.
+    crate::cluster_ca::ensure_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await
+    .map_err(|error| {
+        error!(%error, "Failed to initialize cluster CA before join-token generation");
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Cluster CA Initialization Failed")
+            .detail("The join token was not created because the cluster trust root could not be initialized. Check the server logs for details.")
+            .build()
+    })?;
 
     // Generate a random 32-byte token as hex
     let plaintext_token = {
@@ -3098,6 +3151,44 @@ mod tests {
         assert_eq!(response.observability_retention.otel_spans_days, 75);
         assert_eq!(response.observability_retention.otel_logs_days, 45);
         assert_eq!(response.observability_retention.otel_metrics_days, 60);
+    }
+
+    #[test]
+    fn response_exposes_cluster_pool_and_locks_it_after_allocation() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+                compute_pool_cidr: "10.240.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 2,
+            }));
+
+        assert_eq!(
+            response.multi_node.cluster_network,
+            Some(ClusterNetworkSettings {
+                compute_pool_cidr: "10.240.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 2,
+                locked: true,
+            })
+        );
+    }
+
+    #[test]
+    fn response_marks_an_unused_cluster_pool_as_configurable() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+                compute_pool_cidr: "172.20.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 0,
+            }));
+
+        assert!(
+            !response
+                .multi_node
+                .cluster_network
+                .expect("cluster network state")
+                .locked
+        );
     }
 
     #[test]

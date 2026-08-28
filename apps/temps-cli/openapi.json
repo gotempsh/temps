@@ -5759,6 +5759,34 @@
         ],
         "type": "object"
       },
+      "ClusterNetworkSettings": {
+        "description": "Read-only cluster network state. Pool changes are performed on the control\nplane through `temps network setup-multi-node`, which enforces that no\nexisting node allocation can be stranded by an in-place edit.",
+        "properties": {
+          "allocation_count": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "compute_pool_cidr": {
+            "type": "string"
+          },
+          "locked": {
+            "type": "boolean"
+          },
+          "subnet_prefix_len": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "compute_pool_cidr",
+          "subnet_prefix_len",
+          "allocation_count",
+          "locked"
+        ],
+        "type": "object"
+      },
       "CmdBody": {
         "properties": {
           "args": {
@@ -24505,6 +24533,17 @@
             "type": [
               "string",
               "null"
+            ]
+          },
+          "cluster_network": {
+            "description": "Effective cluster-wide container address pool. `None` only when the\nsingleton network configuration could not be read.",
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ClusterNetworkSettings"
+              }
             ]
           },
           "has_join_token": {

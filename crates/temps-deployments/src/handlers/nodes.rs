@@ -30,6 +30,7 @@ use crate::handlers::types::AppState;
 use crate::services::node_service::{
     HeartbeatRequest, NodeError, NodeService, RegisterNodeRequest,
 };
+use crate::services::CONTROL_PLANE_NODE_ID;
 use temps_core::problemdetails::{self, Problem};
 use temps_core::AuditContext;
 use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
@@ -168,6 +169,8 @@ pub struct RegisterNodeResponse {
     pub name: String,
     pub status: String,
     pub message: String,
+    /// Whether this node must serve mTLS and reject plaintext agent traffic.
+    pub mtls_required: bool,
     /// The signed per-node leaf certificate (PEM) the agent serves as its TLS
     /// server cert. Present only when a `csr_pem` was supplied. (ADR-020 WS-2.1.)
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -743,6 +746,45 @@ fn validate_node_private_address(addr: &str) -> Result<(), NodeAddressError> {
     Ok(())
 }
 
+/// Extract the host from a validated node agent URL or private address for use
+/// as a server-authoritative certificate SAN.
+fn node_address_host(address: &str) -> String {
+    let address = address.trim();
+    let authority = address
+        .strip_prefix("https://")
+        .or_else(|| address.strip_prefix("http://"))
+        .unwrap_or(address)
+        .split('/')
+        .next()
+        .unwrap_or(address);
+    if let Some(bracketed) = authority.strip_prefix('[') {
+        if let Some(end) = bracketed.find(']') {
+            return bracketed[..end].to_string();
+        }
+    }
+    match authority.rsplit_once(':') {
+        Some((host, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => {
+            host.to_string()
+        }
+        _ => authority.to_string(),
+    }
+}
+
+fn mtls_agent_address(address: &str) -> String {
+    let address = address.trim();
+    if address.starts_with("https://") {
+        address.to_string()
+    } else if let Some(authority) = address.strip_prefix("http://") {
+        format!("https://{authority}")
+    } else {
+        format!("https://{address}")
+    }
+}
+
+fn node_registration_uses_mtls(cluster_requires_mtls: bool, csr_present: bool) -> bool {
+    cluster_requires_mtls || csr_present
+}
+
 /// Constant-time comparison of two byte slices to prevent timing attacks on token hashes.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
@@ -970,6 +1012,18 @@ async fn register_node(
         }
     }
 
+    if settings.multi_node.require_mtls && request.csr_pem.is_none() {
+        warn!(
+            node = %request.name,
+            "Node registration rejected: this cluster requires mTLS but no CSR was supplied"
+        );
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Node Certificate Required")
+            .with_detail(
+                "This cluster requires mTLS. Upgrade the Temps CLI and re-run `temps join` so the worker can generate a key and certificate signing request.",
+            ));
+    }
+
     let token_hash = sha256_hash(&request.token);
 
     // ── Address validation (SSRF guard) ──────────────────────────────────────
@@ -1019,11 +1073,63 @@ async fn register_node(
                 .with_detail("Failed to process node registration")
         })?;
 
+    // Every modern CLI supplies a CSR. Treat that as an explicit request for
+    // a per-node mTLS identity even while a cluster is in the migration window
+    // where CSR-less legacy workers remain allowed. Fresh clusters additionally
+    // set `require_mtls`, which rejects clients that cannot supply a CSR.
+    let node_uses_mtls =
+        node_registration_uses_mtls(settings.multi_node.require_mtls, request.csr_pem.is_some());
+
+    let registered_address = if node_uses_mtls {
+        mtls_agent_address(&request.address)
+    } else {
+        request.address.trim().to_string()
+    };
+
+    // Issue the certificate before persisting the node. If CA provisioning or
+    // CSR validation fails, enrollment must not leave a ghost HTTPS node that
+    // can never start its agent listener.
+    let (cert_pem, ca_cert_pem) = if let Some(csr_pem) = request.csr_pem.as_ref() {
+        let ca = crate::cluster_ca::ensure_cluster_ca(
+            app_state.config_service.as_ref(),
+            app_state.encryption_service.as_ref(),
+        )
+        .await
+        .map_err(|e| {
+            error!("Failed to provision cluster CA: {}", e);
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Internal Server Error")
+                .with_detail("Failed to provision the cluster certificate authority")
+        })?;
+
+        // Server-authoritative SANs: the node's reachable host (the IP the
+        // control plane connects to) + its registered name. The worker's own
+        // CSR SANs are discarded by sign_node_csr so one worker cannot mint a
+        // certificate valid for another cluster identity.
+        let mut allowed_sans = vec![request.name.trim().to_string()];
+        for address in [&registered_address, request.private_address.trim()] {
+            let host = node_address_host(address);
+            if !host.is_empty() && !allowed_sans.contains(&host) {
+                allowed_sans.push(host);
+            }
+        }
+        let signed =
+            temps_core::node_pki::sign_node_csr(&ca.cert_pem, &ca.key_pem, csr_pem, &allowed_sans)
+                .map_err(|e| {
+                    problemdetails::new(StatusCode::BAD_REQUEST)
+                        .with_title("Invalid CSR")
+                        .with_detail(format!("Failed to sign certificate signing request: {}", e))
+                })?;
+        (Some(signed.cert_pem), Some(ca.cert_pem))
+    } else {
+        (None, None)
+    };
+
     let register_request = RegisterNodeRequest {
         name: request.name.trim().to_string(),
         token_hash,
         token_encrypted: Some(token_encrypted),
-        address: request.address.trim().to_string(),
+        address: registered_address,
         private_address: request.private_address.trim().to_string(),
         public_endpoint: request.public_endpoint,
         wg_public_key: request.wg_public_key,
@@ -1069,103 +1175,6 @@ async fn register_node(
     .await;
     allocate_overlay_cidr(app_state.db.clone(), node.id).await;
 
-    // ── mTLS: sign the node's CSR with the cluster CA (ADR-020 WS-2.1) ──
-    // Only when mTLS is enforced AND the worker supplied a CSR: mint/load the
-    // per-cluster CA and return a signed per-node leaf plus the CA cert. With
-    // require_mtls off (default) we ignore the CSR and the node keeps using
-    // plaintext HTTP behind the bearer token — zero behavior change.
-    let (cert_pem, ca_cert_pem) = if let (true, Some(csr_pem)) =
-        (settings.multi_node.require_mtls, request.csr_pem.as_ref())
-    {
-        match crate::cluster_ca::ensure_cluster_ca(
-            app_state.config_service.as_ref(),
-            app_state.encryption_service.as_ref(),
-        )
-        .await
-        {
-            Ok(ca) => {
-                // Server-authoritative SANs: the node's reachable host (the IP
-                // the control plane connects to) + its registered name. The
-                // worker's own CSR SANs are discarded by sign_node_csr — a
-                // compromised worker must not be able to mint a leaf valid for
-                // the CP's or another node's identity (cluster-wide CA trust).
-                let host_only = |addr: &str| -> String {
-                    let a = addr.trim();
-                    let a = a
-                        .strip_prefix("https://")
-                        .or_else(|| a.strip_prefix("http://"))
-                        .unwrap_or(a);
-                    let a = a.split('/').next().unwrap_or(a);
-                    if let Some(rest) = a.strip_prefix('[') {
-                        if let Some(end) = rest.find(']') {
-                            return rest[..end].to_string();
-                        }
-                    }
-                    match a.rsplit_once(':') {
-                        Some((host, port))
-                            if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) =>
-                        {
-                            host.to_string()
-                        }
-                        _ => a.to_string(),
-                    }
-                };
-                let mut allowed_sans = vec![node.name.clone()];
-                let addr_host = host_only(&node.address);
-                if !addr_host.is_empty() && !allowed_sans.contains(&addr_host) {
-                    allowed_sans.push(addr_host);
-                }
-                let priv_host = host_only(&node.private_address);
-                if !priv_host.is_empty() && !allowed_sans.contains(&priv_host) {
-                    allowed_sans.push(priv_host);
-                }
-                match temps_core::node_pki::sign_node_csr(
-                    &ca.cert_pem,
-                    &ca.key_pem,
-                    csr_pem,
-                    &allowed_sans,
-                ) {
-                    Ok(signed) => {
-                        info!(node_id = node.id, "Signed node CSR for mTLS");
-                        // Switch the node's stored address to https:// so the
-                        // control plane uses its mTLS client for every CP->agent
-                        // call to this now-TLS-serving node.
-                        let https_address = node.address.replacen("http://", "https://", 1);
-                        if https_address != node.address {
-                            use sea_orm::{ActiveModelTrait, Set};
-                            let mut active: temps_entities::nodes::ActiveModel =
-                                node.clone().into();
-                            active.address = Set(https_address);
-                            if let Err(e) = active.update(app_state.db.as_ref()).await {
-                                warn!(
-                                    node_id = node.id,
-                                    "Failed to switch node address to https for mTLS: {}", e
-                                );
-                            }
-                        }
-                        (Some(signed.cert_pem), Some(ca.cert_pem))
-                    }
-                    Err(e) => {
-                        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
-                            .with_title("Invalid CSR")
-                            .with_detail(format!(
-                                "Failed to sign certificate signing request: {}",
-                                e
-                            )));
-                    }
-                }
-            }
-            Err(e) => {
-                error!("Failed to provision cluster CA: {}", e);
-                return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                    .with_title("Internal Server Error")
-                    .with_detail("Failed to provision the cluster certificate authority"));
-            }
-        }
-    } else {
-        (None, None)
-    };
-
     Ok((
         StatusCode::CREATED,
         Json(RegisterNodeResponse {
@@ -1173,6 +1182,7 @@ async fn register_node(
             name: node.name,
             status: node.status,
             message: "Node registered successfully. Send heartbeats to stay active.".to_string(),
+            mtls_required: node_uses_mtls,
             cert_pem,
             ca_cert_pem,
         }),
@@ -1832,10 +1842,6 @@ async fn edge_routes(
         certificates,
     }))
 }
-
-/// Reserved node id for the control plane itself. Real nodes are serial and
-/// start at 1, so `0` is a safe sentinel.
-const CONTROL_PLANE_NODE_ID: i32 = 0;
 
 /// Synthetic node entry for the control plane itself. The CP is always a
 /// scheduling target (`NodeAssignment::Local`), but it is not a row in the
@@ -2983,6 +2989,9 @@ mod tests {
     fn settings_with_join_token() -> temps_core::AppSettings {
         let mut settings = temps_core::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hash("test-join-token"));
+        // Most registration tests exercise the explicit legacy migration mode;
+        // mTLS enforcement has dedicated tests below.
+        settings.multi_node.require_mtls = false;
         settings
     }
 
@@ -3240,6 +3249,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_register_node_rejects_missing_csr_when_mtls_is_required() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let mut settings = settings_with_join_token();
+        settings.multi_node.require_mtls = true;
+        let app = make_app_with_settings(db, settings);
+        let body = serde_json::json!({
+            "name": "worker-1",
+            "token": "test-token",
+            "join_token": "test-join-token",
+            "address": "http://10.100.0.2:3100",
+            "private_address": "10.100.0.2"
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/internal/nodes/register")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(problem["title"], "Node Certificate Required");
+    }
+
+    #[tokio::test]
     async fn test_register_node_blocked_without_join_token_configured() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
         // Default settings — no join token configured
@@ -3404,6 +3447,7 @@ mod tests {
 
         let mut settings = temps_core::AppSettings::default();
         settings.multi_node.join_token_hash = Some(sha256_hash("valid-join-token"));
+        settings.multi_node.require_mtls = false;
 
         let app = make_app_with_settings(db, settings);
         let body = serde_json::json!({
@@ -3843,6 +3887,37 @@ mod tests {
             validate_node_private_address("8.8.8.8").is_ok(),
             "8.8.8.8 must be accepted (public IP, valid WireGuard underlay use case)"
         );
+    }
+
+    #[test]
+    fn test_node_address_host_extracts_certificate_sans() {
+        assert_eq!(node_address_host("https://10.0.5.20:3100"), "10.0.5.20");
+        assert_eq!(node_address_host("[fc00::20]:3100"), "fc00::20");
+        assert_eq!(node_address_host("10.0.5.20"), "10.0.5.20");
+    }
+
+    #[test]
+    fn test_mtls_agent_address_always_uses_https() {
+        assert_eq!(
+            mtls_agent_address("http://10.0.5.20:3100"),
+            "https://10.0.5.20:3100"
+        );
+        assert_eq!(
+            mtls_agent_address("https://10.0.5.20:3100"),
+            "https://10.0.5.20:3100"
+        );
+        assert_eq!(
+            mtls_agent_address("10.0.5.20:3100"),
+            "https://10.0.5.20:3100"
+        );
+    }
+
+    #[test]
+    fn test_modern_csr_enrollment_uses_mtls_during_legacy_migration_window() {
+        assert!(node_registration_uses_mtls(false, true));
+        assert!(node_registration_uses_mtls(true, true));
+        assert!(node_registration_uses_mtls(true, false));
+        assert!(!node_registration_uses_mtls(false, false));
     }
 
     #[test]

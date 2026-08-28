@@ -959,9 +959,10 @@ pub struct MultiNodeSettings {
     /// SECRET — never returned over HTTP (elided in the masked response).
     #[serde(default)]
     pub cluster_ca_key_encrypted: Option<String>,
-    /// Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`
-    /// (default), the control plane ignores join-time CSRs and nodes keep
-    /// serving plaintext HTTP — zero behavior change. When `true`, the CP signs
+    /// Whether to enforce multi-node mTLS (ADR-020 WS-2.1). New installations
+    /// default to `true`. Existing serialized settings that predate this field
+    /// deserialize it as `false`, providing an explicit migration window rather
+    /// than unexpectedly disconnecting legacy workers. When `true`, the CP signs
     /// node CSRs, nodes serve mutual TLS, and every CP→agent call uses the
     /// cluster client cert. Observe-then-enforce: flip this on only once all
     /// workers have re-enrolled with certs.
@@ -1003,7 +1004,7 @@ impl Default for MultiNodeSettings {
             legacy_shared_token_enabled: true,
             cluster_ca_cert_pem: None,
             cluster_ca_key_encrypted: None,
-            require_mtls: false,
+            require_mtls: true,
             node_cpu_alert_percent: default_node_cpu_alert_percent(),
             node_memory_alert_percent: default_node_memory_alert_percent(),
             node_disk_alert_percent: default_node_disk_alert_percent(),
@@ -2070,5 +2071,22 @@ mod tests {
         let settings = AppSettings::default();
         let merged = settings.to_json_merged(&serde_json::Value::Null);
         assert_eq!(merged, settings.to_json());
+    }
+
+    #[test]
+    fn fresh_multi_node_settings_require_mtls() {
+        assert!(MultiNodeSettings::default().require_mtls);
+        assert!(AppSettings::default().multi_node.require_mtls);
+    }
+
+    #[test]
+    fn legacy_multi_node_settings_without_mtls_field_remain_plaintext_until_migrated() {
+        let legacy = serde_json::json!({
+            "multi_node": {
+                "legacy_shared_token_enabled": true
+            }
+        });
+        let parsed = AppSettings::from_json(legacy);
+        assert!(!parsed.multi_node.require_mtls);
     }
 }

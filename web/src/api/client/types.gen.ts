@@ -2835,6 +2835,18 @@ export type ClusterMemberRequest = {
     role: string;
 };
 
+/**
+ * Read-only cluster network state. Pool changes are performed on the control
+ * plane through `temps network setup-multi-node`, which enforces that no
+ * existing node allocation can be stranded by an in-place edit.
+ */
+export type ClusterNetworkSettings = {
+    allocation_count: number;
+    compute_pool_cidr: string;
+    locked: boolean;
+    subnet_prefix_len: number;
+};
+
 export type CmdBody = {
     /**
      * Arguments to pass to the binary. Defaults to empty.
@@ -11286,6 +11298,11 @@ export type MultiNodeSettingsMasked = {
      * verify it out of band; the CA private key is never exposed).
      */
     cluster_ca_fingerprint?: string | null;
+    /**
+     * Effective cluster-wide container address pool. `None` only when the
+     * singleton network configuration could not be read.
+     */
+    cluster_network?: null | ClusterNetworkSettings;
     has_join_token: boolean;
     /**
      * Whether the deprecated shared join token is still accepted.

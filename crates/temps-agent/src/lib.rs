@@ -114,6 +114,11 @@ pub struct AgentConfig {
     /// verifies the control plane's client certificate.
     #[serde(default)]
     pub cluster_ca_path: Option<std::path::PathBuf>,
+    /// Refuse to start the agent listener without a complete mTLS identity.
+    /// Newly enrolled workers set this to `true`. The serde default remains
+    /// `false` so legacy `agent.json` files can be upgraded deliberately.
+    #[serde(default)]
+    pub require_mtls: bool,
     /// Network device the VXLAN overlay should bind to as its underlay
     /// parent (e.g. `enp6s0`). `None` (the default) auto-detects the
     /// device carrying the host's IPv4 default route at startup — set
@@ -415,6 +420,7 @@ mod tests {
             tls_cert_path: None,
             tls_key_path: None,
             cluster_ca_path: None,
+            require_mtls: false,
             underlay_dev: None,
             underlay_mtu: None,
         };
@@ -423,6 +429,7 @@ mod tests {
         let parsed: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.node_name, "worker-1");
         assert_eq!(parsed.node_id, 1);
+        assert!(!parsed.require_mtls);
     }
 
     #[test]
@@ -439,5 +446,6 @@ mod tests {
 
         let parsed: AgentConfig = serde_json::from_str(json).unwrap();
         assert_eq!(parsed.underlay_mtu, None);
+        assert!(!parsed.require_mtls);
     }
 }

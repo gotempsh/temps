@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use temps_entities::{
     external_service_backups, external_service_health_checks, external_services, nodes,
-    postgres_major_upgrades, project_services, projects, service_members,
+    postgres_major_upgrades, project_services, projects, service_members, settings,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -1299,7 +1299,70 @@ impl ExternalServiceManager {
                     })
             })?;
 
-        RemoteServiceClient::new(node.address.clone(), token, node.name.clone())
+        if node.address.starts_with("https://") {
+            let settings_row = settings::Entity::find_by_id(1)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): application settings row is missing",
+                        node_id, node.name
+                    ),
+                })?;
+            let app_settings = temps_core::AppSettings::from_json(settings_row.data);
+            let ca_cert = app_settings.multi_node.cluster_ca_cert_pem.ok_or_else(|| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): cluster CA certificate is missing",
+                        node_id, node.name
+                    ),
+                }
+            })?;
+            let encrypted_ca_key = app_settings
+                .multi_node
+                .cluster_ca_key_encrypted
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): encrypted cluster CA key is missing",
+                        node_id, node.name
+                    ),
+                })?;
+            let ca_key = self
+                .encryption_service
+                .decrypt_string(&encrypted_ca_key)
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): failed to decrypt cluster CA key: {}",
+                        node_id, node.name, e
+                    ),
+                })?;
+            let csr = temps_core::node_pki::generate_node_keypair_csr(
+                "temps-control-plane",
+                &[],
+            )
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Cannot authenticate mTLS node {} ({}): failed to generate control-plane identity: {}",
+                    node_id, node.name, e
+                ),
+            })?;
+            let signed = temps_core::node_pki::sign_node_csr(
+                &ca_cert,
+                &ca_key,
+                &csr.csr_pem,
+                &[],
+            )
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Cannot authenticate mTLS node {} ({}): failed to sign control-plane identity: {}",
+                    node_id, node.name, e
+                ),
+            })?;
+            let identity_pem = format!("{}\n{}", signed.cert_pem, csr.key_pem);
+            RemoteServiceClient::new_mtls(node.address, token, node.name, &identity_pem, &ca_cert)
+        } else {
+            RemoteServiceClient::new(node.address, token, node.name)
+        }
     }
 
     async fn resolve_remote_container_name(
