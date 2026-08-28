@@ -31,6 +31,7 @@ pub struct SettingsState {
     pub config_service: Arc<ConfigService>,
     pub encryption_service: Arc<temps_core::EncryptionService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
     pub route_table_refresher: Option<Arc<dyn temps_core::route_table::RouteTableRefresher>>,
     /// Node enrollment token minting/listing/revocation (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<crate::enrollment_tokens::EnrollmentTokenService>,
@@ -778,6 +779,7 @@ pub struct RotateClusterCaResponse {
         (status = 401, description = "Unauthorized"),
         (status = 403, description = "Insufficient permissions"),
         (status = 409, description = "Expected fingerprint is stale"),
+        (status = 428, description = "Fresh MFA verification required"),
         (status = 500, description = "Internal server error")
     ),
     security(("bearer_auth" = []))
@@ -789,6 +791,13 @@ async fn rotate_cluster_ca(
     Json(req): Json<RotateClusterCaRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, ClusterCaRotate);
+
+    require_cluster_ca_rotation_authorization(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+    )
+    .await?;
 
     if req.confirmation != "ROTATE CLUSTER CA" {
         return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
@@ -864,6 +873,46 @@ async fn rotate_cluster_ca(
         revoked_enrollment_tokens: result.revoked_enrollment_tokens,
         message: "Cluster CA rotated. Every worker must now be re-enrolled with a new single-use token and the new fingerprint.".to_string(),
     }))
+}
+
+async fn require_cluster_ca_rotation_authorization(
+    authorizer: &dyn temps_core::SensitiveActionAuthorizer,
+    auth: &temps_auth::AuthContext,
+) -> Result<(), Problem> {
+    if !auth.is_session() || auth.session_id().is_none() {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Persisted Browser Session Required")
+            .detail("Cluster CA rotation cannot be performed with an API key, CLI token, deployment token, or non-persisted session. Sign in to the Temps console as an administrator.")
+            .value("error_code", "CLUSTER_CA_ROTATION_BROWSER_SESSION_REQUIRED")
+            .build());
+    }
+
+    if !auth.is_admin() {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Administrator Required")
+            .detail("Only a full Temps administrator may rotate the cluster CA. Platform administrators and delegated roles are not sufficient.")
+            .value("error_code", "CLUSTER_CA_ROTATION_ADMIN_REQUIRED")
+            .build());
+    }
+
+    let mfa_enabled = auth.user.as_ref().is_some_and(|user| user.mfa_enabled);
+    if !mfa_enabled {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("MFA Enrollment Required")
+            .detail(
+                "Enroll an MFA method in account security settings before rotating the cluster CA.",
+            )
+            .value("error_code", "CLUSTER_CA_ROTATION_MFA_REQUIRED")
+            .value("setup_path", "/settings/security")
+            .build());
+    }
+
+    temps_auth::require_sensitive_action(
+        authorizer,
+        auth,
+        temps_core::SensitiveAction::RotateClusterCa,
+    )
+    .await
 }
 
 fn enrollment_error_to_problem(e: crate::enrollment_tokens::EnrollmentError) -> Problem {
@@ -2377,6 +2426,97 @@ async fn refresh_route_table(
 mod tests {
     use super::*;
     use temps_core::{AgentSandboxSettings, AiChatLimitsSettings, AppSettings, ProviderConfig};
+
+    fn rotation_test_user(mfa_enabled: bool) -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 71,
+            name: "CA Rotation Admin".to_string(),
+            email: "ca-rotation@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: mfa_enabled.then(|| "test-secret".to_string()),
+            mfa_enabled,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn disconnected_authorizer() -> temps_auth::DefaultSensitiveActionAuthorizer {
+        temps_auth::DefaultSensitiveActionAuthorizer::new(Arc::new(
+            sea_orm::DatabaseConnection::Disconnected,
+        ))
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_rejects_machine_credentials_even_with_permission() {
+        let auth = temps_auth::AuthContext::new_api_key(
+            rotation_test_user(true),
+            None,
+            Some(vec![
+                temps_auth::Permission::SettingsWrite,
+                temps_auth::Permission::ClusterCaRotate,
+            ]),
+            "rotation-key".to_string(),
+            19,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("API keys must never rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!(
+                "CLUSTER_CA_ROTATION_BROWSER_SESSION_REQUIRED"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_rejects_platform_administrators() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            rotation_test_user(true),
+            temps_auth::Role::PlatformAdmin,
+            24,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("platform administrators must not rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("CLUSTER_CA_ROTATION_ADMIN_REQUIRED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_requires_mfa_enrollment() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            rotation_test_user(false),
+            temps_auth::Role::Admin,
+            23,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("an admin without MFA must not rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("CLUSTER_CA_ROTATION_MFA_REQUIRED"))
+        );
+    }
 
     /// An operator's decision to forbid console updates must survive a save
     /// from a client that has never heard of the field.
