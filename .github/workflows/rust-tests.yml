@@ -266,6 +266,9 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7.0.1
 
+      - name: Test worker agent service installer
+        run: scripts/test-install-agent-service.sh
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
