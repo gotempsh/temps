@@ -10532,6 +10532,20 @@ export type ManagedDomainResponse = {
     zone_id?: string | null;
 };
 
+export type ManagedEnvironmentVariable = {
+    description: string;
+    is_secret: boolean;
+    /**
+     * Whether a user-defined value is intentionally allowed to replace the
+     * generated default. When false, the deployment pipeline wins.
+     */
+    is_user_overridable: boolean;
+    name: string;
+    source: ManagedEnvironmentVariableSource;
+};
+
+export type ManagedEnvironmentVariableSource = 'error_tracking' | 'open_telemetry' | 'temps';
+
 /**
  * A manual action the user must perform outside of the automated migration
  */
@@ -27322,6 +27336,42 @@ export type GetLatestDeploymentMediaResponses = {
 };
 
 export type GetLatestDeploymentMediaResponse = GetLatestDeploymentMediaResponses[keyof GetLatestDeploymentMediaResponses];
+
+export type ListManagedEnvironmentVariablesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Framework preset used to select public browser variable names.
+         */
+        preset: string;
+    };
+    url: '/deployments/managed-environment-variables';
+};
+
+export type ListManagedEnvironmentVariablesErrors = {
+    /**
+     * Unknown deployment preset
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Missing project creation permission
+     */
+    403: unknown;
+};
+
+export type ListManagedEnvironmentVariablesResponses = {
+    /**
+     * Platform-managed environment variable metadata
+     */
+    200: Array<ManagedEnvironmentVariable>;
+};
+
+export type ListManagedEnvironmentVariablesResponse = ListManagedEnvironmentVariablesResponses[keyof ListManagedEnvironmentVariablesResponses];
 
 export type GetScanByDeploymentData = {
     body?: never;

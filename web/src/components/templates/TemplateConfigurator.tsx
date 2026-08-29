@@ -21,7 +21,13 @@ import type {
   ConnectionResponse,
   ExternalServiceInfo,
 } from '@/api/client/types.gen'
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Card,
+  CardContent,
+  CardDescription,
+  CardHeader,
+  CardTitle,
+} from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Checkbox } from '@/components/ui/checkbox'
@@ -53,7 +59,11 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { CreateServiceDialog } from '@/components/storage/CreateServiceDialog'
-import { ServiceEnvPreview } from '@/components/project/ServiceEnvPreview'
+import {
+  ProvidedEnvironmentVariables,
+  ProvidedEnvironmentVariableWarning,
+} from '@/components/project/ProvidedEnvironmentVariables'
+import type { ProvidedEnvironmentVariableCollision } from '@/lib/provided-environment-variables'
 import { TemplateImage } from '@/components/templates/TemplateImage'
 import {
   runGenerator,
@@ -64,6 +74,12 @@ import { useSettings } from '@/hooks/useSettings'
 import { getErrorMessage } from '@/utils/errorHandling'
 import { cn } from '@/lib/utils'
 import { ADD_SERVICE_TYPES } from '@/lib/addServiceTypes'
+import {
+  isLikelySecretProjectEnvironmentVariable,
+  isTempsManagedProjectEnvironmentVariable,
+  projectEnvironmentVariablesSchema,
+} from '@/lib/project-environment-variables'
+import { getTemplateServiceRequirements } from '@/lib/template-service-requirements'
 import {
   AlertCircle,
   Building2,
@@ -86,6 +102,8 @@ import {
 } from 'lucide-react'
 import Github from '@/icons/Github'
 import Gitlab from '@/icons/Gitlab'
+
+const EMPTY_SERVICE_IDS: number[] = []
 
 /**
  * Renders the correct icon for a Git provider type — used in the connection
@@ -119,12 +137,7 @@ const formSchema = z.object({
   private: z.boolean(),
   automaticDeploy: z.boolean(),
   storageServices: z.array(z.number()),
-  environmentVariables: z.array(
-    z.object({
-      name: z.string().min(1, 'Variable name is required'),
-      value: z.string(),
-    })
-  ),
+  environmentVariables: projectEnvironmentVariablesSchema,
 })
 
 type FormValues = z.infer<typeof formSchema>
@@ -136,7 +149,11 @@ interface RepositoryPreviewProps {
   connection?: ConnectionResponse
 }
 
-function RepositoryPreview({ repositoryName, repositoryOwner, connection }: RepositoryPreviewProps) {
+function RepositoryPreview({
+  repositoryName,
+  repositoryOwner,
+  connection,
+}: RepositoryPreviewProps) {
   if (!repositoryName || !connection) return null
 
   const owner = repositoryOwner || connection.account_name
@@ -146,7 +163,9 @@ function RepositoryPreview({ repositoryName, repositoryOwner, connection }: Repo
     <div className="rounded-lg border bg-muted/50 p-4">
       <div className="flex items-center gap-2 text-sm">
         <GitBranch className="h-4 w-4 text-muted-foreground" />
-        <span className="text-muted-foreground">Repository will be created at:</span>
+        <span className="text-muted-foreground">
+          Repository will be created at:
+        </span>
       </div>
       <div className="mt-2 flex items-center gap-2">
         <code className="flex-1 rounded bg-background px-3 py-2 font-mono text-sm">
@@ -184,10 +203,15 @@ export function TemplateConfigurator({
 
   // State
   const [showSecrets, setShowSecrets] = useState<Record<number, boolean>>({})
-  const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] = useState(false)
+  const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] =
+    useState(false)
   const [selectedServiceType, setSelectedServiceType] =
     useState<CreatableServiceTypeRoute | null>(null)
-  const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<number[]>([])
+  const [newlyCreatedServices, setNewlyCreatedServices] = useState<
+    ExternalServiceInfo[]
+  >([])
+  const [providedEnvironmentVariables, setProvidedEnvironmentVariables] =
+    useState<ProvidedEnvironmentVariableCollision[]>([])
 
   // Fetch connections
   const { data: connectionsData, isLoading: isLoadingConnections } = useQuery({
@@ -200,13 +224,25 @@ export function TemplateConfigurator({
     ...listGitProvidersOptions(),
   })
 
-  const providerTypeForConnection = (conn: ConnectionResponse): string | undefined =>
+  const providerTypeForConnection = (
+    conn: ConnectionResponse
+  ): string | undefined =>
     gitProviders?.find((p) => p.id === conn.provider_id)?.provider_type
 
   // Fetch existing services
   const { data: existingServices, refetch: refetchServices } = useQuery({
     ...listServicesOptions({}),
   })
+  const availableServices = useMemo(() => {
+    const servicesById = new Map<number, ExternalServiceInfo>()
+    existingServices?.forEach((service) =>
+      servicesById.set(service.id, service)
+    )
+    newlyCreatedServices.forEach((service) =>
+      servicesById.set(service.id, service)
+    )
+    return Array.from(servicesById.values())
+  }, [existingServices, newlyCreatedServices])
 
   // Platform settings provide `preview_domain` (used for deployment URLs) and
   // `external_url`. These drive the `app_url` env-var generator so generated
@@ -237,6 +273,14 @@ export function TemplateConfigurator({
     ]
   )
 
+  const configurableTemplateEnvVars = useMemo(
+    () =>
+      template.env_vars.filter(
+        (env) => !isTempsManagedProjectEnvironmentVariable(env.name)
+      ),
+    [template.env_vars]
+  )
+
   // Initialize form with template defaults, running any default_generator on
   // mount so required fields like NEXTAUTH_URL / NEXTAUTH_SECRET start filled.
   const form = useForm<FormValues>({
@@ -250,15 +294,18 @@ export function TemplateConfigurator({
       private: true,
       automaticDeploy: true,
       storageServices: [],
-      environmentVariables: template.env_vars.map((env) => {
+      environmentVariables: configurableTemplateEnvVars.map((env) => {
         const generated =
           runGenerator(env.default_generator, {
             repositoryName: initialRepoName,
             base: deploymentUrlBase,
           }) || ''
         return {
-          name: env.name,
+          key: env.name,
           value: env.default || generated,
+          isSecret:
+            isLikelySecretProjectEnvironmentVariable(env.name) ||
+            env.default_generator?.includes('secret') === true,
         }
       }),
     },
@@ -267,27 +314,36 @@ export function TemplateConfigurator({
   // Track which generator-produced values are still "untouched" by the user so
   // we can re-run repo-name-dependent generators (`app_url`) when the slug changes.
   // Keyed by env-var name, value is the last value we generated.
-  const [autoGenerated, setAutoGenerated] = useState<Record<string, string>>(() => {
-    const seeded: Record<string, string> = {}
-    for (const env of template.env_vars) {
-      const value =
-        runGenerator(env.default_generator, {
-          repositoryName: initialRepoName,
-          base: deploymentUrlBase,
-        }) || ''
-      if (value && !env.default) seeded[env.name] = value
+  const [autoGenerated, setAutoGenerated] = useState<Record<string, string>>(
+    () => {
+      const seeded: Record<string, string> = {}
+      for (const env of configurableTemplateEnvVars) {
+        const value =
+          runGenerator(env.default_generator, {
+            repositoryName: initialRepoName,
+            base: deploymentUrlBase,
+          }) || ''
+        if (value && !env.default) seeded[env.name] = value
+      }
+      return seeded
     }
-    return seeded
-  })
+  )
 
   // Auto-select first connection when available. Skipped for image-based
   // templates, which deploy a prebuilt image and never touch Git.
   useEffect(() => {
     if (template.image) return
-    if (connectionsData?.connections?.length && !form.getValues('gitProviderConnectionId')) {
-      form.setValue('gitProviderConnectionId', connectionsData.connections[0].id, {
-        shouldValidate: true,
-      })
+    if (
+      connectionsData?.connections?.length &&
+      !form.getValues('gitProviderConnectionId')
+    ) {
+      form.setValue(
+        'gitProviderConnectionId',
+        connectionsData.connections[0].id,
+        {
+          shouldValidate: true,
+        }
+      )
     }
   }, [connectionsData, form, template.image])
 
@@ -299,7 +355,7 @@ export function TemplateConfigurator({
   const autoSelectedServicesRef = useRef(false)
   useEffect(() => {
     if (autoSelectedServicesRef.current) return
-    if (!existingServices || existingServices.length === 0) return
+    if (availableServices.length === 0) return
     if (template.services.length === 0) return
     if ((form.getValues('storageServices') || []).length > 0) return
 
@@ -307,9 +363,10 @@ export function TemplateConfigurator({
     const matchIds: number[] = []
     for (const required of wanted) {
       // First existing service whose type matches the required engine.
-      const match = existingServices.find(
+      const match = availableServices.find(
         (svc: ExternalServiceInfo) =>
-          svc.service_type.toLowerCase() === required && !matchIds.includes(svc.id)
+          svc.service_type.toLowerCase() === required &&
+          !matchIds.includes(svc.id)
       )
       if (match) matchIds.push(match.id)
     }
@@ -318,13 +375,15 @@ export function TemplateConfigurator({
       autoSelectedServicesRef.current = true
       form.setValue('storageServices', matchIds, { shouldValidate: false })
     }
-  }, [existingServices, template.services, form])
+  }, [availableServices, template.services, form])
 
   // Watch project name to update repo name
   const projectName = useWatch({ control: form.control, name: 'projectName' })
   useEffect(() => {
     if (projectName) {
-      form.setValue('repositoryName', generateRepoName(projectName), { shouldValidate: false })
+      form.setValue('repositoryName', generateRepoName(projectName), {
+        shouldValidate: false,
+      })
     }
   }, [projectName, form])
 
@@ -341,17 +400,20 @@ export function TemplateConfigurator({
   const baseKey = `${deploymentUrlBase.scheme}://${deploymentUrlBase.host}${
     deploymentUrlBase.port ? `:${deploymentUrlBase.port}` : ''
   }`
-  const repositoryNameWatch = useWatch({ control: form.control, name: 'repositoryName' })
+  const repositoryNameWatch = useWatch({
+    control: form.control,
+    name: 'repositoryName',
+  })
   useEffect(() => {
     if (!repositoryNameWatch) return
     const currentVars = form.getValues('environmentVariables') || []
     const nextAutoGenerated = { ...autoGenerated }
     let mutated = false
 
-    template.env_vars.forEach((envTemplate) => {
+    configurableTemplateEnvVars.forEach((envTemplate) => {
       if (!generatorDependsOnRepoName(envTemplate.default_generator)) return
 
-      const idx = currentVars.findIndex((v) => v.name === envTemplate.name)
+      const idx = currentVars.findIndex((v) => v.key === envTemplate.name)
       if (idx === -1) return
 
       const currentValue = currentVars[idx].value
@@ -365,7 +427,9 @@ export function TemplateConfigurator({
           base: deploymentUrlBase,
         }) || ''
       if (newValue && newValue !== currentValue) {
-        form.setValue(`environmentVariables.${idx}.value`, newValue, { shouldValidate: false })
+        form.setValue(`environmentVariables.${idx}.value`, newValue, {
+          shouldValidate: false,
+        })
         nextAutoGenerated[envTemplate.name] = newValue
         mutated = true
       }
@@ -391,7 +455,6 @@ export function TemplateConfigurator({
       // `undefined` and previously rendered as "Failed to create project: undefined").
       const message = getErrorMessage(error, 'Unknown error')
       toast.error(`Failed to create project: ${message}`)
-      // eslint-disable-next-line no-console
       console.error('Template project creation failed:', error)
     },
   })
@@ -403,7 +466,9 @@ export function TemplateConfigurator({
       const isSelected = currentServices.includes(serviceId)
       form.setValue(
         'storageServices',
-        isSelected ? currentServices.filter((id) => id !== serviceId) : [...currentServices, serviceId]
+        isSelected
+          ? currentServices.filter((id) => id !== serviceId)
+          : [...currentServices, serviceId]
       )
     },
     [form]
@@ -411,10 +476,21 @@ export function TemplateConfigurator({
 
   // Form submission
   const handleSubmit = async (data: FormValues) => {
-    // Combine existing and newly created services
-    const allServiceIds = Array.from(
-      new Set([...(data.storageServices || []), ...newlyCreatedServiceIds])
-    )
+    const missingServiceRequirements = getTemplateServiceRequirements(
+      template.services,
+      availableServices,
+      data.storageServices || []
+    ).filter((requirement) => !requirement.isSatisfied)
+    if (missingServiceRequirements.length > 0) {
+      toast.error(
+        `Select ${missingServiceRequirements.map((requirement) => requirement.label).join(', ')} before creating this project.`
+      )
+      return
+    }
+
+    // Creation selects the new service immediately, but the submitted value
+    // remains the form's visible selection so a later deselect is respected.
+    const allServiceIds = Array.from(new Set(data.storageServices || []))
 
     // No connection selected → one-click public-repo deploy. The backend forks
     // the template when a connection is present, and deploys straight from the
@@ -436,8 +512,12 @@ export function TemplateConfigurator({
         automatic_deploy: usePublicRepo ? false : data.automaticDeploy,
         storage_service_ids: allServiceIds,
         environment_variables: data.environmentVariables
-          .filter((env) => env.name && env.value)
-          .map((env) => ({ name: env.name, value: env.value })),
+          .filter((env) => env.key && env.value)
+          .map((env) => ({
+            name: env.key,
+            value: env.value,
+            is_secret: env.isSecret,
+          })),
       },
     })
   }
@@ -445,9 +525,11 @@ export function TemplateConfigurator({
   // Add environment variable
   const addEnvironmentVariable = () => {
     const currentVars = form.getValues('environmentVariables') || []
-    form.setValue('environmentVariables', [...currentVars, { name: '', value: '' }], {
-      shouldValidate: false,
-    })
+    form.setValue(
+      'environmentVariables',
+      [...currentVars, { key: '', value: '', isSecret: false }],
+      { shouldValidate: false }
+    )
   }
 
   // Remove environment variable
@@ -459,9 +541,29 @@ export function TemplateConfigurator({
     )
   }
 
-  const watchedServices = form.watch('storageServices') || []
-  const watchedEnvVars = form.watch('environmentVariables') || []
-  const watchedConnectionId = form.watch('gitProviderConnectionId')
+  const watchedServices =
+    useWatch({ control: form.control, name: 'storageServices' }) ??
+    EMPTY_SERVICE_IDS
+  const watchedEnvVars = useWatch({
+    control: form.control,
+    name: 'environmentVariables',
+  })
+  const watchedConnectionId = useWatch({
+    control: form.control,
+    name: 'gitProviderConnectionId',
+  })
+  const serviceRequirements = useMemo(
+    () =>
+      getTemplateServiceRequirements(
+        template.services,
+        availableServices,
+        watchedServices
+      ),
+    [template.services, availableServices, watchedServices]
+  )
+  const missingServiceRequirements = serviceRequirements.filter(
+    (requirement) => !requirement.isSatisfied
+  )
 
   // Public-repo (one-click) mode when no Git connection is selected. The
   // fork-only fields (repository name/owner/visibility) are hidden in this mode.
@@ -473,13 +575,17 @@ export function TemplateConfigurator({
   const isImageTemplate = Boolean(template.image)
 
   // Check if required env vars are filled
-  const requiredEnvVars = template.env_vars.filter((e) => e.required)
   const missingRequiredVars = useMemo(() => {
+    const requiredEnvVars = configurableTemplateEnvVars.filter(
+      (environmentVariable) => environmentVariable.required
+    )
     return requiredEnvVars.filter((required) => {
-      const current = watchedEnvVars.find((e) => e.name === required.name)
+      const current = (watchedEnvVars ?? []).find(
+        (environmentVariable) => environmentVariable.key === required.name
+      )
       return !current?.value
     })
-  }, [requiredEnvVars, watchedEnvVars])
+  }, [configurableTemplateEnvVars, watchedEnvVars])
 
   if (isLoadingConnections) {
     return (
@@ -512,7 +618,9 @@ export function TemplateConfigurator({
               <div>
                 <CardTitle className="text-lg flex items-center gap-2">
                   {template.name}
-                  {template.is_featured && <Star className="h-4 w-4 text-yellow-500 fill-yellow-500" />}
+                  {template.is_featured && (
+                    <Star className="h-4 w-4 text-yellow-500 fill-yellow-500" />
+                  )}
                 </CardTitle>
                 <CardDescription>{template.description}</CardDescription>
               </div>
@@ -588,303 +696,339 @@ export function TemplateConfigurator({
               )}
 
               {!isImageTemplate && (
-              <FormField
-                control={form.control}
-                name="gitProviderConnectionId"
-                render={({ field }) => {
-                  const conns = connectionsData?.connections ?? []
-                  const setValue = (id: number) => field.onChange(id)
+                <FormField
+                  control={form.control}
+                  name="gitProviderConnectionId"
+                  render={({ field }) => {
+                    const conns = connectionsData?.connections ?? []
+                    const setValue = (id: number) => field.onChange(id)
 
-                  // No connection: deploy straight from the template's public
-                  // source repo. This is the one-click activation path — no Git
-                  // account required. We surface a "connect to fork instead"
-                  // affordance for users who want their own copy.
-                  if (conns.length === 0) {
-                    return (
-                      <FormItem>
-                        <FormLabel>Source</FormLabel>
-                        <div className="flex items-start gap-3 rounded-md border bg-muted/50 px-3 py-3">
-                          <Rocket className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                          <div className="space-y-1">
-                            <p className="text-sm font-medium">
-                              Deploy from the template&apos;s public source
-                            </p>
-                            <p className="text-xs text-muted-foreground">
-                              No Git account needed — Temps deploys directly from
-                              the template repository. Want your own copy to push
-                              to?{' '}
-                              <button
-                                type="button"
-                                onClick={() => navigate('/git-providers')}
-                                className="underline underline-offset-2 hover:text-foreground"
-                              >
-                                Connect a Git provider
-                              </button>{' '}
-                              to fork it instead.
-                            </p>
-                          </div>
-                        </div>
-                        <FormMessage />
-                      </FormItem>
-                    )
-                  }
-
-                  // Single connection: render as a read-only chip. The form
-                  // value is auto-set in the existing useEffect that picks
-                  // the first connection on mount, so no extra wiring needed.
-                  if (conns.length === 1) {
-                    const only = conns[0]
-                    return (
-                      <FormItem>
-                        <FormLabel>Git Provider</FormLabel>
-                        <div className="flex items-center gap-2 rounded-md border bg-muted/50 px-3 py-2">
-                          <ProviderIcon
-                            providerType={providerTypeForConnection(only)}
-                          />
-                          <span className="font-medium">{only.account_name}</span>
-                          <span className="text-xs text-muted-foreground">
-                            ({only.account_type})
-                          </span>
-                        </div>
-                        <FormDescription>
-                          A new repository will be created in your connected Git account
-                        </FormDescription>
-                        <FormMessage />
-                      </FormItem>
-                    )
-                  }
-
-                  // 2-4 connections: radio cards (clickable rows). Easier to
-                  // scan than a dropdown when the list is short.
-                  if (conns.length >= 2 && conns.length <= 4) {
-                    return (
-                      <FormItem>
-                        <FormLabel>Git Provider</FormLabel>
-                        <FormControl>
-                          <RadioGroup
-                            value={field.value?.toString() ?? ''}
-                            onValueChange={(v) => setValue(parseInt(v, 10))}
-                            className="gap-2"
-                          >
-                            {conns.map((conn: ConnectionResponse) => {
-                              const id = `git-conn-${conn.id}`
-                              const checked = field.value === conn.id
-                              return (
-                                <Label
-                                  key={conn.id}
-                                  htmlFor={id}
-                                  className={cn(
-                                    'flex cursor-pointer items-center gap-3 rounded-md border p-3 transition-colors hover:bg-accent/50',
-                                    checked && 'border-primary bg-accent/50'
-                                  )}
+                    // No connection: deploy straight from the template's public
+                    // source repo. This is the one-click activation path — no Git
+                    // account required. We surface a "connect to fork instead"
+                    // affordance for users who want their own copy.
+                    if (conns.length === 0) {
+                      return (
+                        <FormItem>
+                          <FormLabel>Source</FormLabel>
+                          <div className="flex items-start gap-3 rounded-md border bg-muted/50 px-3 py-3">
+                            <Rocket className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+                            <div className="space-y-1">
+                              <p className="text-sm font-medium">
+                                Deploy from the template&apos;s public source
+                              </p>
+                              <p className="text-xs text-muted-foreground">
+                                No Git account needed — Temps deploys directly
+                                from the template repository. Want your own copy
+                                to push to?{' '}
+                                <button
+                                  type="button"
+                                  onClick={() => navigate('/git-providers')}
+                                  className="underline underline-offset-2 hover:text-foreground"
                                 >
-                                  <RadioGroupItem id={id} value={conn.id.toString()} />
+                                  Connect a Git provider
+                                </button>{' '}
+                                to fork it instead.
+                              </p>
+                            </div>
+                          </div>
+                          <FormMessage />
+                        </FormItem>
+                      )
+                    }
+
+                    // Single connection: render as a read-only chip. The form
+                    // value is auto-set in the existing useEffect that picks
+                    // the first connection on mount, so no extra wiring needed.
+                    if (conns.length === 1) {
+                      const only = conns[0]
+                      return (
+                        <FormItem>
+                          <FormLabel>Git Provider</FormLabel>
+                          <div className="flex items-center gap-2 rounded-md border bg-muted/50 px-3 py-2">
+                            <ProviderIcon
+                              providerType={providerTypeForConnection(only)}
+                            />
+                            <span className="font-medium">
+                              {only.account_name}
+                            </span>
+                            <span className="text-xs text-muted-foreground">
+                              ({only.account_type})
+                            </span>
+                          </div>
+                          <FormDescription>
+                            A new repository will be created in your connected
+                            Git account
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )
+                    }
+
+                    // 2-4 connections: radio cards (clickable rows). Easier to
+                    // scan than a dropdown when the list is short.
+                    if (conns.length >= 2 && conns.length <= 4) {
+                      return (
+                        <FormItem>
+                          <FormLabel>Git Provider</FormLabel>
+                          <FormControl>
+                            <RadioGroup
+                              value={field.value?.toString() ?? ''}
+                              onValueChange={(v) => setValue(parseInt(v, 10))}
+                              className="gap-2"
+                            >
+                              {conns.map((conn: ConnectionResponse) => {
+                                const id = `git-conn-${conn.id}`
+                                const checked = field.value === conn.id
+                                return (
+                                  <Label
+                                    key={conn.id}
+                                    htmlFor={id}
+                                    className={cn(
+                                      'flex cursor-pointer items-center gap-3 rounded-md border p-3 transition-colors hover:bg-accent/50',
+                                      checked && 'border-primary bg-accent/50'
+                                    )}
+                                  >
+                                    <RadioGroupItem
+                                      id={id}
+                                      value={conn.id.toString()}
+                                    />
+                                    <ProviderIcon
+                                      providerType={providerTypeForConnection(
+                                        conn
+                                      )}
+                                    />
+                                    <span className="font-medium">
+                                      {conn.account_name}
+                                    </span>
+                                    <span className="text-xs text-muted-foreground">
+                                      ({conn.account_type})
+                                    </span>
+                                  </Label>
+                                )
+                              })}
+                            </RadioGroup>
+                          </FormControl>
+                          <FormDescription>
+                            A new repository will be created in your selected
+                            Git account
+                          </FormDescription>
+                          <FormMessage />
+                        </FormItem>
+                      )
+                    }
+
+                    // 5+ connections: fall back to a select dropdown.
+                    return (
+                      <FormItem>
+                        <FormLabel>Git Provider</FormLabel>
+                        <Select
+                          value={field.value?.toString()}
+                          onValueChange={(v) => setValue(parseInt(v, 10))}
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select a Git provider connection" />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            {conns.map((conn: ConnectionResponse) => (
+                              <SelectItem
+                                key={conn.id}
+                                value={conn.id.toString()}
+                              >
+                                <div className="flex items-center gap-2">
                                   <ProviderIcon
-                                    providerType={providerTypeForConnection(conn)}
+                                    providerType={providerTypeForConnection(
+                                      conn
+                                    )}
                                   />
-                                  <span className="font-medium">{conn.account_name}</span>
+                                  <span>{conn.account_name}</span>
                                   <span className="text-xs text-muted-foreground">
                                     ({conn.account_type})
                                   </span>
-                                </Label>
-                              )
-                            })}
-                          </RadioGroup>
-                        </FormControl>
+                                </div>
+                              </SelectItem>
+                            ))}
+                          </SelectContent>
+                        </Select>
                         <FormDescription>
-                          A new repository will be created in your selected Git account
+                          A new repository will be created in your connected Git
+                          account
                         </FormDescription>
                         <FormMessage />
                       </FormItem>
                     )
-                  }
-
-                  // 5+ connections: fall back to a select dropdown.
-                  return (
-                    <FormItem>
-                      <FormLabel>Git Provider</FormLabel>
-                      <Select
-                        value={field.value?.toString()}
-                        onValueChange={(v) => setValue(parseInt(v, 10))}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Select a Git provider connection" />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          {conns.map((conn: ConnectionResponse) => (
-                            <SelectItem key={conn.id} value={conn.id.toString()}>
-                              <div className="flex items-center gap-2">
-                                <ProviderIcon
-                                  providerType={providerTypeForConnection(conn)}
-                                />
-                                <span>{conn.account_name}</span>
-                                <span className="text-xs text-muted-foreground">
-                                  ({conn.account_type})
-                                </span>
-                              </div>
-                            </SelectItem>
-                          ))}
-                        </SelectContent>
-                      </Select>
-                      <FormDescription>
-                        A new repository will be created in your connected Git account
-                      </FormDescription>
-                      <FormMessage />
-                    </FormItem>
-                  )
-                }}
-              />
+                  }}
+                />
               )}
 
               {/* Repository name/owner/visibility only apply when forking into
                   a Git account. In public-repo (one-click) mode there's no fork,
                   so these are hidden to keep the path frictionless. */}
               {!isImageTemplate && !usePublicRepo && (
-              <FormField
-                control={form.control}
-                name="repositoryName"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormLabel>Repository Name</FormLabel>
-                    <FormControl>
-                      <Input {...field} placeholder="my-awesome-project" />
-                    </FormControl>
-                    <FormDescription>
-                      This will be the name of the new repository created from the template
-                    </FormDescription>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
-              )}
-
-              {!usePublicRepo && (
-              <FormField
-                control={form.control}
-                name="repositoryOwner"
-                render={({ field }) => {
-                  const selectedConnection = connectionsData?.connections?.find(
-                    (c: ConnectionResponse) => c.id === form.watch('gitProviderConnectionId')
-                  )
-                  return (
+                <FormField
+                  control={form.control}
+                  name="repositoryName"
+                  render={({ field }) => (
                     <FormItem>
-                      <FormLabel>Repository Owner</FormLabel>
-                      <Select
-                        value={field.value || '_personal'}
-                        onValueChange={(v) => field.onChange(v === '_personal' ? undefined : v)}
-                      >
-                        <FormControl>
-                          <SelectTrigger>
-                            <SelectValue placeholder="Select repository owner" />
-                          </SelectTrigger>
-                        </FormControl>
-                        <SelectContent>
-                          <SelectItem value="_personal">
-                            <div className="flex items-center gap-2">
-                              <User className="h-4 w-4" />
-                              <span>Personal Account</span>
-                              <span className="text-xs text-muted-foreground">
-                                (Your personal repositories)
-                              </span>
-                            </div>
-                          </SelectItem>
-                          {selectedConnection && selectedConnection.account_type === 'Organization' && (
-                            <SelectItem value={selectedConnection.account_name}>
-                              <div className="flex items-center gap-2">
-                                <Building2 className="h-4 w-4" />
-                                <span>{selectedConnection.account_name}</span>
-                                <span className="text-xs text-muted-foreground">
-                                  (Organization)
-                                </span>
-                              </div>
-                            </SelectItem>
-                          )}
-                        </SelectContent>
-                      </Select>
+                      <FormLabel>Repository Name</FormLabel>
+                      <FormControl>
+                        <Input {...field} placeholder="my-awesome-project" />
+                      </FormControl>
                       <FormDescription>
-                        Choose where to create the repository
+                        This will be the name of the new repository created from
+                        the template
                       </FormDescription>
                       <FormMessage />
                     </FormItem>
-                  )
-                }}
-              />
+                  )}
+                />
+              )}
+
+              {!usePublicRepo && (
+                <FormField
+                  control={form.control}
+                  name="repositoryOwner"
+                  render={({ field }) => {
+                    const selectedConnection =
+                      connectionsData?.connections?.find(
+                        (c: ConnectionResponse) => c.id === watchedConnectionId
+                      )
+                    return (
+                      <FormItem>
+                        <FormLabel>Repository Owner</FormLabel>
+                        <Select
+                          value={field.value || '_personal'}
+                          onValueChange={(v) =>
+                            field.onChange(v === '_personal' ? undefined : v)
+                          }
+                        >
+                          <FormControl>
+                            <SelectTrigger>
+                              <SelectValue placeholder="Select repository owner" />
+                            </SelectTrigger>
+                          </FormControl>
+                          <SelectContent>
+                            <SelectItem value="_personal">
+                              <div className="flex items-center gap-2">
+                                <User className="h-4 w-4" />
+                                <span>Personal Account</span>
+                                <span className="text-xs text-muted-foreground">
+                                  (Your personal repositories)
+                                </span>
+                              </div>
+                            </SelectItem>
+                            {selectedConnection &&
+                              selectedConnection.account_type ===
+                                'Organization' && (
+                                <SelectItem
+                                  value={selectedConnection.account_name}
+                                >
+                                  <div className="flex items-center gap-2">
+                                    <Building2 className="h-4 w-4" />
+                                    <span>
+                                      {selectedConnection.account_name}
+                                    </span>
+                                    <span className="text-xs text-muted-foreground">
+                                      (Organization)
+                                    </span>
+                                  </div>
+                                </SelectItem>
+                              )}
+                          </SelectContent>
+                        </Select>
+                        <FormDescription>
+                          Choose where to create the repository
+                        </FormDescription>
+                        <FormMessage />
+                      </FormItem>
+                    )
+                  }}
+                />
               )}
 
               {/* Repository URL Preview (fork mode only) */}
               {!usePublicRepo && (
-              <RepositoryPreview
-                repositoryName={form.watch('repositoryName')}
-                repositoryOwner={form.watch('repositoryOwner')}
-                connection={connectionsData?.connections?.find(
-                  (c: ConnectionResponse) => c.id === form.watch('gitProviderConnectionId')
-                )}
-              />
+                <RepositoryPreview
+                  repositoryName={form.watch('repositoryName')}
+                  repositoryOwner={form.watch('repositoryOwner')}
+                  connection={connectionsData?.connections?.find(
+                    (c: ConnectionResponse) => c.id === watchedConnectionId
+                  )}
+                />
               )}
 
               {!usePublicRepo && (
-              <div className="flex flex-col gap-4 sm:flex-row">
-                <FormField
-                  control={form.control}
-                  name="private"
-                  render={({ field }) => (
-                    <FormItem className="flex-1 flex flex-row items-start space-x-3 space-y-0 rounded-md border p-4">
-                      <FormControl>
-                        <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-                      </FormControl>
-                      <div className="space-y-1 leading-none">
-                        <FormLabel className="flex items-center gap-2">
-                          <Lock className="h-4 w-4" />
-                          Private Repository
-                        </FormLabel>
-                        <p className="text-sm text-muted-foreground">
-                          Create a private repository
-                        </p>
-                      </div>
-                    </FormItem>
-                  )}
-                />
+                <div className="flex flex-col gap-4 sm:flex-row">
+                  <FormField
+                    control={form.control}
+                    name="private"
+                    render={({ field }) => (
+                      <FormItem className="flex-1 flex flex-row items-start space-x-3 space-y-0 rounded-md border p-4">
+                        <FormControl>
+                          <Checkbox
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                        <div className="space-y-1 leading-none">
+                          <FormLabel className="flex items-center gap-2">
+                            <Lock className="h-4 w-4" />
+                            Private Repository
+                          </FormLabel>
+                          <p className="text-sm text-muted-foreground">
+                            Create a private repository
+                          </p>
+                        </div>
+                      </FormItem>
+                    )}
+                  />
 
-                <FormField
-                  control={form.control}
-                  name="automaticDeploy"
-                  render={({ field }) => (
-                    <FormItem className="flex-1 flex flex-row items-start space-x-3 space-y-0 rounded-md border p-4">
-                      <FormControl>
-                        <Checkbox checked={field.value} onCheckedChange={field.onChange} />
-                      </FormControl>
-                      <div className="space-y-1 leading-none">
-                        <FormLabel className="flex items-center gap-2">
-                          <GitBranch className="h-4 w-4" />
-                          Automatic Deployments
-                        </FormLabel>
-                        <p className="text-sm text-muted-foreground">
-                          Deploy when code is pushed
-                        </p>
-                      </div>
-                    </FormItem>
-                  )}
-                />
-              </div>
+                  <FormField
+                    control={form.control}
+                    name="automaticDeploy"
+                    render={({ field }) => (
+                      <FormItem className="flex-1 flex flex-row items-start space-x-3 space-y-0 rounded-md border p-4">
+                        <FormControl>
+                          <Checkbox
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                          />
+                        </FormControl>
+                        <div className="space-y-1 leading-none">
+                          <FormLabel className="flex items-center gap-2">
+                            <GitBranch className="h-4 w-4" />
+                            Automatic Deployments
+                          </FormLabel>
+                          <p className="text-sm text-muted-foreground">
+                            Deploy when code is pushed
+                          </p>
+                        </div>
+                      </FormItem>
+                    )}
+                  />
+                </div>
               )}
             </CardContent>
           </Card>
 
-          {/* Services */}
+          {/* Databases */}
           <Card>
             <CardHeader>
-              <div className="flex items-center justify-between">
-                <div>
-                  <CardTitle>Services</CardTitle>
-                  <CardDescription>Link storage and database services</CardDescription>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="space-y-1.5">
+                  <CardTitle>Databases</CardTitle>
+                  <CardDescription>
+                    Link a managed database or storage resource. Connection
+                    variables are injected automatically.
+                  </CardDescription>
                 </div>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
                     <Button type="button" variant="outline" size="sm">
                       <Plus className="h-4 w-4 mr-2" />
-                      Add Service
+                      Add Database
                       <ChevronDown className="h-4 w-4 ml-1" />
                     </Button>
                   </DropdownMenuTrigger>
@@ -901,7 +1045,9 @@ export function TemplateConfigurator({
                         <ServiceLogo service={type.id} className="h-6 w-6" />
                         <div className="flex flex-col">
                           <span className="font-medium">{type.name}</span>
-                          <span className="text-xs text-muted-foreground">{type.description}</span>
+                          <span className="text-xs text-muted-foreground">
+                            {type.description}
+                          </span>
                         </div>
                       </DropdownMenuItem>
                     ))}
@@ -910,19 +1056,116 @@ export function TemplateConfigurator({
               </div>
             </CardHeader>
             <CardContent>
-              {template.services.length > 0 && (
-                <Alert className="mb-4">
-                  <AlertCircle className="h-4 w-4" />
-                  <AlertDescription>
-                    This template recommends: <strong>{template.services.join(', ')}</strong>.
-                    Make sure to add these services for full functionality.
-                  </AlertDescription>
-                </Alert>
+              {serviceRequirements.length > 0 && (
+                <div className="mb-5 space-y-3 rounded-lg border border-primary/25 bg-primary/[0.035] p-4">
+                  <div className="flex items-start gap-3">
+                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-primary/25 bg-background">
+                      <Database className="h-4 w-4 text-primary" />
+                    </div>
+                    <div>
+                      <p className="text-sm font-medium">
+                        Required for this template
+                      </p>
+                      <p className="text-xs text-muted-foreground">
+                        Select a compatible database or create one here. Temps
+                        will attach it and inject its connection variables.
+                      </p>
+                    </div>
+                  </div>
+
+                  {serviceRequirements.map((requirement) => (
+                    <div
+                      key={requirement.key}
+                      className="rounded-md border bg-background/80 p-3"
+                    >
+                      <div className="flex flex-wrap items-center gap-2">
+                        {requirement.serviceType ? (
+                          <ServiceLogo
+                            service={requirement.serviceType}
+                            className="h-6 w-6"
+                          />
+                        ) : (
+                          <Database className="h-6 w-6 text-muted-foreground" />
+                        )}
+                        <span className="text-sm font-medium">
+                          {requirement.label}
+                        </span>
+                        <Badge
+                          variant={
+                            requirement.isSatisfied ? 'secondary' : 'outline'
+                          }
+                          className={cn(
+                            'ml-auto',
+                            requirement.isSatisfied &&
+                              'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                          )}
+                        >
+                          {requirement.isSatisfied ? 'Selected' : 'Required'}
+                        </Badge>
+                      </div>
+
+                      {requirement.isSatisfied ? (
+                        <div className="mt-3 flex items-center gap-2 text-xs text-emerald-700 dark:text-emerald-300">
+                          <CheckCircle2 className="h-4 w-4" />
+                          <span>
+                            {requirement.selectedServices
+                              .map((service) => service.name)
+                              .join(', ')}{' '}
+                            will be linked automatically.
+                          </span>
+                        </div>
+                      ) : requirement.availableServices.length > 0 ? (
+                        <div className="mt-3 space-y-2">
+                          <p className="text-xs text-muted-foreground">
+                            Select an existing {requirement.label} database:
+                          </p>
+                          <div className="flex flex-wrap gap-2">
+                            {requirement.availableServices.map((service) => (
+                              <Button
+                                key={service.id}
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                onClick={() => handleServiceToggle(service.id)}
+                              >
+                                <CheckCircle2 className="mr-2 h-4 w-4" />
+                                Select {service.name}
+                              </Button>
+                            ))}
+                          </div>
+                        </div>
+                      ) : requirement.serviceType ? (
+                        <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                          <p className="text-xs text-muted-foreground">
+                            You do not have a {requirement.label} database yet.
+                          </p>
+                          <Button
+                            type="button"
+                            size="sm"
+                            onClick={() => {
+                              if (!requirement.serviceType) return
+                              setSelectedServiceType(requirement.serviceType)
+                              setIsCreateServiceDialogOpen(true)
+                            }}
+                          >
+                            <Plus className="mr-2 h-4 w-4" />
+                            Create {requirement.label}
+                          </Button>
+                        </div>
+                      ) : (
+                        <p className="mt-3 text-xs text-destructive">
+                          No built-in creator is available for this service
+                          type. Add a compatible service before continuing.
+                        </p>
+                      )}
+                    </div>
+                  ))}
+                </div>
               )}
 
-              {existingServices && existingServices.length > 0 && (
+              {availableServices.length > 0 && (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-                  {existingServices.map((service: ExternalServiceInfo) => {
+                  {availableServices.map((service: ExternalServiceInfo) => {
                     const isSelected = watchedServices.includes(service.id)
                     return (
                       <Card
@@ -937,10 +1180,15 @@ export function TemplateConfigurator({
                           <div className="flex items-center gap-3">
                             <ServiceLogo service={service.service_type} />
                             <div>
-                              <CardTitle className="text-sm">{service.name}</CardTitle>
+                              <CardTitle className="text-sm">
+                                {service.name}
+                              </CardTitle>
                               <CardDescription className="text-xs">
                                 {service.service_type} · Created{' '}
-                                {format(new Date(service.created_at), 'MMM d, yyyy')}
+                                {format(
+                                  new Date(service.created_at),
+                                  'MMM d, yyyy'
+                                )}
                               </CardDescription>
                             </div>
                           </div>
@@ -951,56 +1199,69 @@ export function TemplateConfigurator({
                 </div>
               )}
 
-              {(!existingServices || existingServices.length === 0) && (
-                <div className="text-center py-8">
-                  <Database className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
-                  <p className="text-sm text-muted-foreground">No services available</p>
-                  <p className="text-xs text-muted-foreground mt-1">
-                    Create services using the button above
-                  </p>
-                </div>
-              )}
-
-              {watchedServices.length > 0 && existingServices && (
-                <div className="mt-4 space-y-3">
-                  <h4 className="text-sm font-medium">Selected Service Variables</h4>
-                  {watchedServices.map((serviceId) => {
-                    const service = existingServices.find((s: ExternalServiceInfo) => s.id === serviceId)
-                    if (!service) return null
-                    return (
-                      <ServiceEnvPreview
-                        key={service.id}
-                        serviceId={service.id}
-                        serviceName={service.name}
-                        serviceType={service.service_type}
-                      />
-                    )
-                  })}
-                </div>
-              )}
+              {availableServices.length === 0 &&
+                serviceRequirements.length === 0 && (
+                  <div className="text-center py-8">
+                    <Database className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
+                    <p className="text-sm text-muted-foreground">
+                      No databases available
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-1">
+                      Create a database using the button above
+                    </p>
+                  </div>
+                )}
             </CardContent>
           </Card>
 
           {/* Environment Variables */}
           <Card>
             <CardHeader>
-              <div className="flex items-center justify-between">
-                <div>
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="space-y-1.5">
                   <CardTitle>Environment Variables</CardTitle>
-                  <CardDescription>Configure required environment variables</CardDescription>
+                  <CardDescription>
+                    Review the template configuration and protect credentials as
+                    write-only secrets.
+                  </CardDescription>
                 </div>
-                <Button type="button" variant="outline" size="sm" onClick={addEnvironmentVariable}>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={addEnvironmentVariable}
+                >
                   <Plus className="h-4 w-4 mr-2" />
                   Add Variable
                 </Button>
               </div>
             </CardHeader>
             <CardContent className="space-y-4">
+              <ProvidedEnvironmentVariables
+                preset={template.preset}
+                databases={watchedServices
+                  .map((serviceId) =>
+                    availableServices.find(
+                      (service) => service.id === serviceId
+                    )
+                  )
+                  .filter((service): service is ExternalServiceInfo =>
+                    Boolean(service)
+                  )
+                  .map((service) => ({
+                    id: service.id,
+                    name: service.name,
+                    serviceType: service.service_type,
+                  }))}
+                onVariablesChange={setProvidedEnvironmentVariables}
+              />
+
               {missingRequiredVars.length > 0 && (
                 <Alert variant="destructive">
                   <AlertCircle className="h-4 w-4" />
                   <AlertDescription>
-                    Missing required variables: {missingRequiredVars.map((v) => v.name).join(', ')}
+                    Missing required variables:{' '}
+                    {missingRequiredVars.map((v) => v.name).join(', ')}
                   </AlertDescription>
                 </Alert>
               )}
@@ -1008,21 +1269,29 @@ export function TemplateConfigurator({
               {watchedEnvVars.length > 0 ? (
                 <div className="space-y-3">
                   {watchedEnvVars.map((envVar, index) => {
-                    const templateVar = template.env_vars.find((e) => e.name === envVar.name)
+                    const templateVar = configurableTemplateEnvVars.find(
+                      (e) => e.name === envVar.key
+                    )
                     return (
-                      <Card key={index} className="border-dashed">
+                      <Card
+                        key={index}
+                        className="border-border/70 bg-muted/15"
+                      >
                         <CardContent className="p-4">
                           <div className="flex items-start gap-3">
                             <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3">
                               <FormField
                                 control={form.control}
-                                name={`environmentVariables.${index}.name`}
+                                name={`environmentVariables.${index}.key`}
                                 render={({ field }) => (
                                   <FormItem>
                                     <FormLabel className="text-sm flex items-center gap-2">
                                       Key
                                       {templateVar?.required && (
-                                        <Badge variant="destructive" className="text-xs">
+                                        <Badge
+                                          variant="destructive"
+                                          className="text-xs"
+                                        >
                                           Required
                                         </Badge>
                                       )}
@@ -1032,7 +1301,13 @@ export function TemplateConfigurator({
                                         {...field}
                                         placeholder="VARIABLE_NAME"
                                         readOnly={!!templateVar}
-                                        className={templateVar ? 'bg-muted' : ''}
+                                        className={cn(
+                                          'font-mono',
+                                          templateVar && 'bg-muted'
+                                        )}
+                                        autoCapitalize="none"
+                                        autoCorrect="off"
+                                        spellCheck={false}
                                       />
                                     </FormControl>
                                     {templateVar?.description && (
@@ -1041,6 +1316,12 @@ export function TemplateConfigurator({
                                       </p>
                                     )}
                                     <FormMessage />
+                                    <ProvidedEnvironmentVariableWarning
+                                      variableName={envVar.key}
+                                      providedVariables={
+                                        providedEnvironmentVariables
+                                      }
+                                    />
                                   </FormItem>
                                 )}
                               />
@@ -1048,10 +1329,12 @@ export function TemplateConfigurator({
                                 control={form.control}
                                 name={`environmentVariables.${index}.value`}
                                 render={({ field }) => {
-                                  const generator = templateVar?.default_generator
+                                  const generator =
+                                    templateVar?.default_generator
                                   const handleGenerate = () => {
                                     const value = runGenerator(generator, {
-                                      repositoryName: form.getValues('repositoryName'),
+                                      repositoryName:
+                                        form.getValues('repositoryName'),
                                       base: deploymentUrlBase,
                                     })
                                     if (!value) {
@@ -1062,9 +1345,13 @@ export function TemplateConfigurator({
                                       )
                                       return
                                     }
-                                    form.setValue(`environmentVariables.${index}.value`, value, {
-                                      shouldValidate: true,
-                                    })
+                                    form.setValue(
+                                      `environmentVariables.${index}.value`,
+                                      value,
+                                      {
+                                        shouldValidate: true,
+                                      }
+                                    )
                                     setAutoGenerated((prev) => ({
                                       ...prev,
                                       [templateVar!.name]: value,
@@ -1072,14 +1359,35 @@ export function TemplateConfigurator({
                                   }
                                   return (
                                     <FormItem>
-                                      <FormLabel className="text-sm">Value</FormLabel>
+                                      <FormLabel className="text-sm">
+                                        Value
+                                      </FormLabel>
                                       <div className="relative">
                                         <FormControl>
                                           <Input
                                             {...field}
-                                            type={showSecrets[index] ? 'text' : 'password'}
-                                            placeholder={templateVar?.example || 'Enter value'}
-                                            className={generator ? 'pr-20' : 'pr-10'}
+                                            type={
+                                              envVar.isSecret &&
+                                              !showSecrets[index]
+                                                ? 'password'
+                                                : 'text'
+                                            }
+                                            placeholder={
+                                              templateVar?.example ||
+                                              'Enter value'
+                                            }
+                                            className={cn(
+                                              'font-mono',
+                                              generator &&
+                                                envVar.isSecret &&
+                                                'pr-20',
+                                              generator &&
+                                                !envVar.isSecret &&
+                                                'pr-10',
+                                              !generator &&
+                                                envVar.isSecret &&
+                                                'pr-10'
+                                            )}
                                           />
                                         </FormControl>
                                         {generator && (
@@ -1087,7 +1395,12 @@ export function TemplateConfigurator({
                                             type="button"
                                             variant="ghost"
                                             size="sm"
-                                            className="absolute right-9 top-0 h-full px-2"
+                                            className={cn(
+                                              'absolute top-0 h-full px-2',
+                                              envVar.isSecret
+                                                ? 'right-9'
+                                                : 'right-0'
+                                            )}
                                             onClick={handleGenerate}
                                             title={
                                               generator === 'app_url'
@@ -1098,29 +1411,61 @@ export function TemplateConfigurator({
                                             <Sparkles className="h-4 w-4" />
                                           </Button>
                                         )}
-                                        <Button
-                                          type="button"
-                                          variant="ghost"
-                                          size="sm"
-                                          className="absolute right-0 top-0 h-full px-3"
-                                          onClick={() =>
-                                            setShowSecrets((prev) => ({
-                                              ...prev,
-                                              [index]: !prev[index],
-                                            }))
-                                          }
-                                        >
-                                          {showSecrets[index] ? (
-                                            <EyeOff className="h-4 w-4" />
-                                          ) : (
-                                            <Eye className="h-4 w-4" />
-                                          )}
-                                        </Button>
+                                        {envVar.isSecret && (
+                                          <Button
+                                            type="button"
+                                            variant="ghost"
+                                            size="sm"
+                                            className="absolute right-0 top-0 h-full px-3"
+                                            onClick={() =>
+                                              setShowSecrets((prev) => ({
+                                                ...prev,
+                                                [index]: !prev[index],
+                                              }))
+                                            }
+                                            aria-label={
+                                              showSecrets[index]
+                                                ? 'Hide secret value'
+                                                : 'Show secret value'
+                                            }
+                                          >
+                                            {showSecrets[index] ? (
+                                              <EyeOff className="h-4 w-4" />
+                                            ) : (
+                                              <Eye className="h-4 w-4" />
+                                            )}
+                                          </Button>
+                                        )}
                                       </div>
                                       <FormMessage />
                                     </FormItem>
                                   )
                                 }}
+                              />
+                              <FormField
+                                control={form.control}
+                                name={`environmentVariables.${index}.isSecret`}
+                                render={({ field }) => (
+                                  <FormItem className="flex items-start gap-3 space-y-0 rounded-md border bg-background/70 p-3 md:col-span-2">
+                                    <FormControl>
+                                      <Checkbox
+                                        checked={field.value}
+                                        onCheckedChange={field.onChange}
+                                        className="mt-0.5"
+                                      />
+                                    </FormControl>
+                                    <div className="space-y-1">
+                                      <FormLabel className="text-sm">
+                                        Encrypt as secret
+                                      </FormLabel>
+                                      <p className="text-xs text-muted-foreground">
+                                        Secret values are write-only after
+                                        creation. Use this for passwords,
+                                        tokens, and private connection strings.
+                                      </p>
+                                    </div>
+                                  </FormItem>
+                                )}
                               />
                             </div>
                             {!templateVar && (
@@ -1130,6 +1475,8 @@ export function TemplateConfigurator({
                                 size="sm"
                                 onClick={() => removeEnvironmentVariable(index)}
                                 className="text-destructive hover:text-destructive h-8 w-8 p-0 mt-6"
+                                aria-label={`Remove environment variable ${index + 1}`}
+                                title="Remove variable"
                               >
                                 <X className="h-4 w-4" />
                               </Button>
@@ -1143,7 +1490,23 @@ export function TemplateConfigurator({
               ) : (
                 <div className="text-center py-8">
                   <Settings className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
-                  <p className="text-sm text-muted-foreground">No environment variables configured</p>
+                  <p className="text-sm text-muted-foreground">
+                    No environment variables configured
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Add app configuration or credentials if this template needs
+                    them
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    className="mt-4"
+                    onClick={addEnvironmentVariable}
+                  >
+                    <Plus className="h-4 w-4 mr-2" />
+                    Add your first variable
+                  </Button>
                 </div>
               )}
             </CardContent>
@@ -1163,7 +1526,11 @@ export function TemplateConfigurator({
             )}
             <Button
               type="submit"
-              disabled={createFromTemplateMutation.isPending || missingRequiredVars.length > 0}
+              disabled={
+                createFromTemplateMutation.isPending ||
+                missingRequiredVars.length > 0 ||
+                missingServiceRequirements.length > 0
+              }
             >
               {createFromTemplateMutation.isPending ? (
                 <>
@@ -1192,11 +1559,23 @@ export function TemplateConfigurator({
         onSuccess={(service: ExternalServiceInfo) => {
           setIsCreateServiceDialogOpen(false)
           setSelectedServiceType(null)
-          setNewlyCreatedServiceIds((prev) => [...prev, service.id])
+          setNewlyCreatedServices((previousServices) => {
+            if (
+              previousServices.some(
+                (existingService) => existingService.id === service.id
+              )
+            ) {
+              return previousServices
+            }
+            return [...previousServices, service]
+          })
           const currentServices = form.getValues('storageServices') || []
-          form.setValue('storageServices', [...currentServices, service.id])
+          form.setValue(
+            'storageServices',
+            Array.from(new Set([...currentServices, service.id]))
+          )
           setTimeout(() => refetchServices(), 100)
-          toast.success(`Service "${service.name}" created successfully!`)
+          toast.success(`Database "${service.name}" created successfully!`)
         }}
       />
     </div>

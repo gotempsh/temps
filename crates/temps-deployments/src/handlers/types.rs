@@ -75,6 +75,7 @@ pub struct AppState {
 
 use crate::services::types::Deployment;
 use serde::{Deserialize, Serialize};
+use utoipa::IntoParams;
 use utoipa::ToSchema;
 
 #[derive(Deserialize, ToSchema)]
@@ -82,6 +83,12 @@ pub struct GetDeploymentsParams {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
     pub environment_id: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ManagedEnvironmentVariablesQuery {
+    /// Framework preset used to select public browser variable names.
+    pub preset: String,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]

@@ -1,7 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { createProjectMutation, listServicesOptions } from '@/api/client/@tanstack/react-query.gen'
+import {
+  createProjectMutation,
+  listServicesOptions,
+} from '@/api/client/@tanstack/react-query.gen'
 import type {
   CreatableServiceTypeRoute,
   ExternalServiceInfo,
@@ -61,8 +64,17 @@ import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 import * as z from 'zod/v4'
-import { ServiceEnvPreview } from './ServiceEnvPreview'
+import {
+  ProvidedEnvironmentVariables,
+  ProvidedEnvironmentVariableWarning,
+} from './ProvidedEnvironmentVariables'
+import type { ProvidedEnvironmentVariableCollision } from '@/lib/provided-environment-variables'
 import { ADD_SERVICE_TYPES } from '@/lib/addServiceTypes'
+import {
+  isLikelySecretProjectEnvironmentVariable,
+  isTempsManagedProjectEnvironmentVariable,
+  projectEnvironmentVariablesSchema,
+} from '@/lib/project-environment-variables'
 
 // Source type options
 const SOURCE_TYPE_OPTIONS: {
@@ -75,7 +87,8 @@ const SOURCE_TYPE_OPTIONS: {
   {
     id: 'manual',
     name: 'Flexible',
-    description: 'Deploy via Docker images, static files, or Git - switch anytime',
+    description:
+      'Deploy via Docker images, static files, or Git - switch anytime',
     icon: Settings,
     recommended: true,
   },
@@ -102,20 +115,7 @@ const formSchema = z.object({
   // Static files specific (will be uploaded after project creation)
   // Common settings
   port: z.number().int().min(1).max(65535).optional(),
-  environmentVariables: z.array(
-    z
-      .object({
-        key: z.string(),
-        value: z.string(),
-        isSecret: z.boolean(),
-      })
-      // A secret is write-only once saved, so an empty one could never be
-      // filled in afterwards — the server rejects it too.
-      .refine((v) => !v.isSecret || v.value.length > 0, {
-        message: 'A secret needs a value — it cannot be filled in later',
-        path: ['value'],
-      })
-  ),
+  environmentVariables: projectEnvironmentVariablesSchema,
   storageServices: z.array(z.number()),
 })
 
@@ -142,13 +142,20 @@ export function ManualProjectConfigurator({
   // Synchronous re-entry guard against fast double-clicks (root cause of
   // users ending up with N duplicate projects from a single intent).
   const isSubmittingRef = useRef(false)
-  const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] = useState(false)
+  const [isCreateServiceDialogOpen, setIsCreateServiceDialogOpen] =
+    useState(false)
   const [selectedServiceType, setSelectedServiceType] =
     useState<CreatableServiceTypeRoute | null>(null)
   const [showSecrets, setShowSecrets] = useState<{ [key: number]: boolean }>({})
   const [isImportEnvOpen, setIsImportEnvOpen] = useState(false)
-  const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<number[]>([])
-  const [newlyCreatedServiceTypes, setNewlyCreatedServiceTypes] = useState<ServiceTypeRoute[]>([])
+  const [providedEnvironmentVariables, setProvidedEnvironmentVariables] =
+    useState<ProvidedEnvironmentVariableCollision[]>([])
+  const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<
+    number[]
+  >([])
+  const [newlyCreatedServiceTypes, setNewlyCreatedServiceTypes] = useState<
+    ServiceTypeRoute[]
+  >([])
 
   // Form initialization
   const form = useForm<ManualProjectFormValues>({
@@ -169,7 +176,6 @@ export function ManualProjectConfigurator({
     control: form.control,
     name: 'sourceType',
   })
-
   // Fetch existing services
   const { data: existingServices, refetch: refetchServices } = useQuery({
     ...listServicesOptions({}),
@@ -240,10 +246,13 @@ export function ManualProjectConfigurator({
         if (serviceToAdd) {
           const selectedTypes = getSelectedServiceTypes()
           if (selectedTypes.has(serviceToAdd.service_type)) {
-            toast.error(`A ${serviceToAdd.service_type} service is already selected`, {
-              description:
-                'Only one service of each type can be linked to a project to avoid environment variable conflicts.',
-            })
+            toast.error(
+              `A ${serviceToAdd.service_type} database is already selected`,
+              {
+                description:
+                  'Only one database of each type can be linked to a project to avoid environment variable conflicts.',
+              }
+            )
             return
           }
         }
@@ -279,14 +288,16 @@ export function ManualProjectConfigurator({
       } else {
         // Use default mutation
         // Determine project_type based on source_type for API compatibility
-        const projectType = finalData.sourceType === 'static_files' ? 'static' : 'docker'
+        const projectType =
+          finalData.sourceType === 'static_files' ? 'static' : 'docker'
         await projectMutation.mutateAsync({
           body: {
             name: finalData.name,
             preset: 'dockerfile', // Use dockerfile preset for manual projects
             directory: './',
             main_branch: 'main', // Placeholder for non-git projects
-            source_type: finalData.sourceType as 'docker_image' | 'static_files' | 'manual',
+            source_type: finalData.sourceType as
+              'docker_image' | 'static_files' | 'manual',
             // Leave repo fields empty for manual projects
             repo_name: undefined,
             repo_owner: undefined,
@@ -297,7 +308,7 @@ export function ManualProjectConfigurator({
             exposed_port: finalData.port,
             storage_service_ids: finalData.storageServices || [],
             environment_variables: finalData.environmentVariables
-              ?.filter(env => env.key.trim() !== '')
+              ?.filter((env) => env.key.trim() !== '')
               ?.map((env) => ({
                 key: env.key,
                 value: env.value,
@@ -341,7 +352,9 @@ export function ManualProjectConfigurator({
                         <div
                           className={cn(
                             'rounded-lg p-2',
-                            isSelected ? 'bg-primary/10 text-primary' : 'bg-muted'
+                            isSelected
+                              ? 'bg-primary/10 text-primary'
+                              : 'bg-muted'
                           )}
                         >
                           <Icon className="h-6 w-6" />
@@ -424,8 +437,8 @@ export function ManualProjectConfigurator({
         <Alert>
           <FileArchive className="h-4 w-4" />
           <AlertDescription>
-            After creating the project, you'll be able to upload your static files
-            (tar.gz or zip) through the project dashboard or API.
+            After creating the project, you&apos;ll be able to upload your
+            static files (tar.gz or zip) through the project dashboard or API.
           </AlertDescription>
         </Alert>
       )}
@@ -434,7 +447,8 @@ export function ManualProjectConfigurator({
         <Alert>
           <Settings className="h-4 w-4" />
           <AlertDescription>
-            <strong>Flexible Project:</strong> After creation, you can deploy using any method:
+            <strong>Flexible Project:</strong> After creation, you can deploy
+            using any method:
             <ul className="list-disc list-inside mt-2 text-xs">
               <li>Docker images from any registry</li>
               <li>Static files (tar.gz or zip uploads)</li>
@@ -450,7 +464,9 @@ export function ManualProjectConfigurator({
         render={({ field }) => (
           <FormItem>
             <FormLabel>
-              {sourceType === 'docker_image' ? 'Container Port' : 'Application Port'}
+              {sourceType === 'docker_image'
+                ? 'Container Port'
+                : 'Application Port'}
             </FormLabel>
             <FormControl>
               <Input
@@ -471,7 +487,9 @@ export function ManualProjectConfigurator({
             <p className="text-xs text-muted-foreground">
               {sourceType === 'docker_image'
                 ? 'Port your container exposes (will be auto-detected from EXPOSE if not set)'
-                : 'Port for serving static files (default: 3000)'}
+                : sourceType === 'static_files'
+                  ? 'Port for serving static files (default: 3000)'
+                  : 'Port your application listens on (default: 3000)'}
             </p>
             <FormMessage />
           </FormItem>
@@ -480,74 +498,69 @@ export function ManualProjectConfigurator({
     </div>
   )
 
-  // Render services step
-  const renderServices = () => {
+  const renderAddDatabaseMenu = () => (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <Button type="button" variant="outline" size="sm">
+          <Plus className="h-4 w-4 mr-2" />
+          Add Database
+          <ChevronDown className="h-4 w-4 ml-1" />
+        </Button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="end" className="w-64">
+        {ADD_SERVICE_TYPES.map((type) => {
+          const selectedTypes = getSelectedServiceTypes()
+          const isTypeAlreadySelected = selectedTypes.has(type.id)
+          return (
+            <DropdownMenuItem
+              key={type.id}
+              onClick={() => {
+                if (isTypeAlreadySelected) {
+                  toast.error(`A ${type.name} database is already selected`, {
+                    description:
+                      'Only one database of each type can be linked to a project.',
+                  })
+                  return
+                }
+                setSelectedServiceType(type.id)
+                setIsCreateServiceDialogOpen(true)
+              }}
+              className={cn(
+                'flex items-center gap-3 py-2.5',
+                isTypeAlreadySelected && 'opacity-50 cursor-not-allowed'
+              )}
+            >
+              <ServiceLogo service={type.id} className="h-6 w-6" />
+              <div className="flex flex-col">
+                <span className="font-medium">
+                  {type.name}
+                  {isTypeAlreadySelected && (
+                    <span className="text-xs text-muted-foreground ml-2">
+                      (already selected)
+                    </span>
+                  )}
+                </span>
+                <span className="text-xs text-muted-foreground">
+                  {type.description}
+                </span>
+              </div>
+            </DropdownMenuItem>
+          )
+        })}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+
+  // Render databases step. The API still calls these storage services, but
+  // "Databases" is the user-facing concept in project creation.
+  const renderDatabases = () => {
     const watchedServices = form.watch('storageServices') || []
 
     return (
       <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="font-medium">Services</h3>
-            <p className="text-sm text-muted-foreground">
-              Link existing services or create new ones
-            </p>
-          </div>
-          <DropdownMenu>
-            <DropdownMenuTrigger asChild>
-              <Button type="button" variant="outline" size="sm">
-                <Plus className="h-4 w-4 mr-2" />
-                Add Service
-                <ChevronDown className="h-4 w-4 ml-1" />
-              </Button>
-            </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" className="w-64">
-              {ADD_SERVICE_TYPES.map((type) => {
-                const selectedTypes = getSelectedServiceTypes()
-                const isTypeAlreadySelected = selectedTypes.has(type.id)
-                return (
-                  <DropdownMenuItem
-                    key={type.id}
-                    onClick={() => {
-                      if (isTypeAlreadySelected) {
-                        toast.error(`A ${type.name} service is already selected`, {
-                          description:
-                            'Only one service of each type can be linked to a project.',
-                        })
-                        return
-                      }
-                      setSelectedServiceType(type.id)
-                      setIsCreateServiceDialogOpen(true)
-                    }}
-                    className={cn(
-                      'flex items-center gap-3 py-2.5',
-                      isTypeAlreadySelected && 'opacity-50 cursor-not-allowed'
-                    )}
-                  >
-                    <ServiceLogo service={type.id} className="h-6 w-6" />
-                    <div className="flex flex-col">
-                      <span className="font-medium">
-                        {type.name}
-                        {isTypeAlreadySelected && (
-                          <span className="text-xs text-muted-foreground ml-2">
-                            (already selected)
-                          </span>
-                        )}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {type.description}
-                      </span>
-                    </div>
-                  </DropdownMenuItem>
-                )
-              })}
-            </DropdownMenuContent>
-          </DropdownMenu>
-        </div>
-
         {existingServices && existingServices.length > 0 && (
           <div>
-            <h4 className="text-sm font-medium mb-3">Existing Services</h4>
+            <h4 className="text-sm font-medium mb-3">Existing Databases</h4>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {existingServices.map((service) => {
                 const isSelected = watchedServices.includes(service.id)
@@ -590,50 +603,22 @@ export function ManualProjectConfigurator({
           <Alert>
             <AlertCircle className="h-4 w-4" />
             <AlertDescription>
-              {newlyCreatedServiceIds.length} new service
-              {newlyCreatedServiceIds.length > 1 ? 's' : ''} will be created
-              with this project
+              {newlyCreatedServiceIds.length} new database
+              {newlyCreatedServiceIds.length > 1 ? 's' : ''} will be linked to
+              this project
             </AlertDescription>
           </Alert>
-        )}
-
-        {/* Environment Variables Preview for Selected Services */}
-        {watchedServices.length > 0 && (
-          <div>
-            <h4 className="text-sm font-medium mb-3">
-              Service Environment Variables Preview
-            </h4>
-            <p className="text-xs text-muted-foreground mb-4">
-              Selected services will provide these environment variables to your
-              project.
-            </p>
-            <div className="space-y-3">
-              {watchedServices.map((serviceId) => {
-                const service = existingServices?.find(
-                  (s: ExternalServiceInfo) => s.id === serviceId
-                )
-                if (!service) return null
-                return (
-                  <ServiceEnvPreview
-                    key={service.id}
-                    serviceId={service.id}
-                    serviceName={service.name}
-                    serviceType={service.service_type}
-                  />
-                )
-              })}
-            </div>
-          </div>
         )}
 
         {!existingServices?.length && newlyCreatedServiceIds.length === 0 && (
           <div className="text-center py-8">
             <Database className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
             <p className="text-sm text-muted-foreground">
-              No services configured yet
+              No databases configured yet
             </p>
             <p className="text-xs text-muted-foreground mt-1">
-              Create services to enhance your project
+              Add PostgreSQL, Redis, MongoDB, or object storage when your app
+              needs it
             </p>
           </div>
         )}
@@ -644,90 +629,123 @@ export function ManualProjectConfigurator({
   // Render environment variables step
   const renderEnvVars = () => {
     const watchedEnvVars = form.watch('environmentVariables') || []
+    const selectedDatabases = (form.watch('storageServices') || [])
+      .map((serviceId) =>
+        existingServices?.find((service) => service.id === serviceId)
+      )
+      .filter((service): service is ExternalServiceInfo => Boolean(service))
+      .map((service) => ({
+        id: service.id,
+        name: service.name,
+        serviceType: service.service_type,
+      }))
 
     return (
       <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="font-medium">Environment Variables</h3>
-            <p className="text-sm text-muted-foreground">
-              Configure environment variables for your project
-            </p>
-          </div>
-          <div className="flex gap-2">
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={() => setIsImportEnvOpen(true)}
-            >
-              <Upload className="h-4 w-4 mr-2" />
-              Import .env
-            </Button>
-            <Button
-              type="button"
-              variant="outline"
-              size="sm"
-              onClick={addEnvironmentVariable}
-            >
-              <Plus className="h-4 w-4 mr-2" />
-              Add Variable
-            </Button>
-          </div>
-        </div>
+        <ProvidedEnvironmentVariables
+          preset="dockerfile"
+          databases={selectedDatabases}
+          onVariablesChange={setProvidedEnvironmentVariables}
+        />
 
         <ImportEnvDialog
           isOpen={isImportEnvOpen}
           onOpenChange={setIsImportEnvOpen}
-          existingKeys={new Set(watchedEnvVars.map((v) => v.key).filter(Boolean))}
+          existingKeys={
+            new Set(watchedEnvVars.map((v) => v.key).filter(Boolean))
+          }
           showEnvironmentSelection={false}
           onImport={async (variables) => {
             const currentVars = form.getValues('environmentVariables') || []
-            const newVars = variables.map((v) => ({
+            const configurableVariables = variables.filter(
+              (variable) =>
+                !isTempsManagedProjectEnvironmentVariable(variable.key)
+            )
+            const skippedCount = variables.length - configurableVariables.length
+            const newVars = configurableVariables.map((v) => ({
               key: v.key,
               value: v.value,
-              isSecret: false,
+              isSecret: isLikelySecretProjectEnvironmentVariable(v.key),
             }))
             form.setValue('environmentVariables', [...currentVars, ...newVars])
+            if (skippedCount > 0) {
+              toast.info(
+                `Skipped ${skippedCount} variable${skippedCount === 1 ? '' : 's'} provided automatically by Temps`
+              )
+            }
           }}
         />
 
         {watchedEnvVars.length > 0 ? (
           <div className="space-y-3">
             {watchedEnvVars.map((_, index) => (
-              <Card key={index} className="border-dashed">
-                <CardContent className="p-4">
-                  <div className="flex items-start gap-3">
-                    <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3">
-                      <FormField
-                        control={form.control}
-                        name={`environmentVariables.${index}.key`}
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className="text-sm">Key</FormLabel>
+              <Card key={index} className="border-border/70 bg-muted/15">
+                <CardContent className="space-y-4 p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <Badge variant="outline" className="font-normal">
+                      Variable {index + 1}
+                    </Badge>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => removeEnvironmentVariable(index)}
+                      className="text-destructive hover:text-destructive h-8 w-8 p-0"
+                      aria-label={`Remove environment variable ${index + 1}`}
+                      title="Remove variable"
+                    >
+                      <X className="h-4 w-4" />
+                    </Button>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    <FormField
+                      control={form.control}
+                      name={`environmentVariables.${index}.key`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-sm">Key</FormLabel>
+                          <FormControl>
+                            <Input
+                              {...field}
+                              className="font-mono"
+                              placeholder="DATABASE_URL"
+                              autoCapitalize="none"
+                              autoCorrect="off"
+                              spellCheck={false}
+                            />
+                          </FormControl>
+                          <FormMessage />
+                          <ProvidedEnvironmentVariableWarning
+                            variableName={watchedEnvVars[index]?.key ?? ''}
+                            providedVariables={providedEnvironmentVariables}
+                          />
+                        </FormItem>
+                      )}
+                    />
+                    <FormField
+                      control={form.control}
+                      name={`environmentVariables.${index}.value`}
+                      render={({ field }) => (
+                        <FormItem>
+                          <FormLabel className="text-sm">Value</FormLabel>
+                          <div className="relative">
                             <FormControl>
-                              <Input {...field} placeholder="DATABASE_URL" />
+                              <Input
+                                {...field}
+                                type={
+                                  watchedEnvVars[index]?.isSecret &&
+                                  !showSecrets[index]
+                                    ? 'password'
+                                    : 'text'
+                                }
+                                className={cn(
+                                  'font-mono',
+                                  watchedEnvVars[index]?.isSecret && 'pr-10'
+                                )}
+                                placeholder="Enter value"
+                              />
                             </FormControl>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                      <FormField
-                        control={form.control}
-                        name={`environmentVariables.${index}.value`}
-                        render={({ field }) => (
-                          <FormItem>
-                            <FormLabel className="text-sm">Value</FormLabel>
-                            <div className="relative">
-                              <FormControl>
-                                <Input
-                                  {...field}
-                                  type={
-                                    showSecrets[index] ? 'text' : 'password'
-                                  }
-                                  placeholder="Enter value"
-                                />
-                              </FormControl>
+                            {watchedEnvVars[index]?.isSecret && (
                               <Button
                                 type="button"
                                 variant="ghost"
@@ -739,6 +757,11 @@ export function ManualProjectConfigurator({
                                     [index]: !prev[index],
                                   }))
                                 }
+                                aria-label={
+                                  showSecrets[index]
+                                    ? 'Hide secret value'
+                                    : 'Show secret value'
+                                }
                               >
                                 {showSecrets[index] ? (
                                   <EyeOff className="h-4 w-4" />
@@ -746,39 +769,38 @@ export function ManualProjectConfigurator({
                                   <Eye className="h-4 w-4" />
                                 )}
                               </Button>
-                            </div>
-                            <FormMessage />
-                          </FormItem>
-                        )}
-                      />
-                    </div>
-                    <div className="flex flex-col gap-2">
-                      <FormField
-                        control={form.control}
-                        name={`environmentVariables.${index}.isSecret`}
-                        render={({ field }) => (
-                          <FormItem className="flex items-center space-x-2 space-y-0">
-                            <FormControl>
-                              <Checkbox
-                                checked={field.value}
-                                onCheckedChange={field.onChange}
-                              />
-                            </FormControl>
-                            <FormLabel className="text-xs">Secret</FormLabel>
-                          </FormItem>
-                        )}
-                      />
-                      <Button
-                        type="button"
-                        variant="ghost"
-                        size="sm"
-                        onClick={() => removeEnvironmentVariable(index)}
-                        className="text-destructive hover:text-destructive h-8 w-8 p-0"
-                      >
-                        <X className="h-4 w-4" />
-                      </Button>
-                    </div>
+                            )}
+                          </div>
+                          <FormMessage />
+                        </FormItem>
+                      )}
+                    />
                   </div>
+                  <FormField
+                    control={form.control}
+                    name={`environmentVariables.${index}.isSecret`}
+                    render={({ field }) => (
+                      <FormItem className="flex items-start gap-3 space-y-0 rounded-md border bg-background/70 p-3">
+                        <FormControl>
+                          <Checkbox
+                            checked={field.value}
+                            onCheckedChange={field.onChange}
+                            className="mt-0.5"
+                          />
+                        </FormControl>
+                        <div className="space-y-1">
+                          <FormLabel className="text-sm">
+                            Encrypt as secret
+                          </FormLabel>
+                          <p className="text-xs text-muted-foreground">
+                            Secret values are write-only after creation. Use
+                            this for passwords, tokens, and private connection
+                            strings.
+                          </p>
+                        </div>
+                      </FormItem>
+                    )}
+                  />
                 </CardContent>
               </Card>
             ))}
@@ -790,8 +812,18 @@ export function ManualProjectConfigurator({
               No environment variables configured
             </p>
             <p className="text-xs text-muted-foreground mt-1">
-              Add variables that your application needs
+              Add one manually or import an existing .env file
             </p>
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="mt-4"
+              onClick={addEnvironmentVariable}
+            >
+              <Plus className="h-4 w-4 mr-2" />
+              Add your first variable
+            </Button>
           </div>
         )}
       </div>
@@ -822,24 +854,53 @@ export function ManualProjectConfigurator({
             <CardContent>{renderProjectConfig()}</CardContent>
           </Card>
 
-          {/* Services — not applicable for static-only projects */}
+          {/* Databases — not applicable for static-only projects */}
           {sourceType !== 'static_files' && (
             <Card>
-              <CardHeader>
-                <CardTitle>Services</CardTitle>
-                <CardDescription>
-                  Select storage and database services
-                </CardDescription>
+              <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="space-y-1.5">
+                  <CardTitle>Databases</CardTitle>
+                  <CardDescription>
+                    Link a managed database or storage resource. Connection
+                    variables are injected automatically.
+                  </CardDescription>
+                </div>
+                {renderAddDatabaseMenu()}
               </CardHeader>
-              <CardContent>{renderServices()}</CardContent>
+              <CardContent>{renderDatabases()}</CardContent>
             </Card>
           )}
 
           {/* Environment Variables */}
           <Card>
-            <CardHeader>
-              <CardTitle>Environment Variables</CardTitle>
-              <CardDescription>Configure environment variables</CardDescription>
+            <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="space-y-1.5">
+                <CardTitle>Environment Variables</CardTitle>
+                <CardDescription>
+                  Add app configuration and credentials. Database connection
+                  variables above are included automatically.
+                </CardDescription>
+              </div>
+              <div className="flex flex-wrap gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={() => setIsImportEnvOpen(true)}
+                >
+                  <Upload className="h-4 w-4 mr-2" />
+                  Import .env
+                </Button>
+                <Button
+                  type="button"
+                  variant="outline"
+                  size="sm"
+                  onClick={addEnvironmentVariable}
+                >
+                  <Plus className="h-4 w-4 mr-2" />
+                  Add Variable
+                </Button>
+              </div>
             </CardHeader>
             <CardContent>{renderEnvVars()}</CardContent>
           </Card>
@@ -888,7 +949,10 @@ export function ManualProjectConfigurator({
           setNewlyCreatedServiceIds((prev) => [...prev, service.id])
           // Track the service type from the selected type
           if (selectedServiceType) {
-            setNewlyCreatedServiceTypes((prev) => [...prev, selectedServiceType])
+            setNewlyCreatedServiceTypes((prev) => [
+              ...prev,
+              selectedServiceType,
+            ])
           }
           setSelectedServiceType(null)
           // Automatically add the newly created service to the form selection
@@ -897,7 +961,7 @@ export function ManualProjectConfigurator({
           setTimeout(() => {
             refetchServices()
           }, 100)
-          toast.success(`Service "${service.name}" created successfully!`)
+          toast.success(`Database "${service.name}" created successfully!`)
         }}
       />
     </div>

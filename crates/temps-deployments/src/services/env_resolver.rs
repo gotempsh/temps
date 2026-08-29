@@ -8,7 +8,8 @@
 //! promotion, and a rollback — resolves env through this one place, so a
 //! container is NEVER created without its environment's fully-resolved set:
 //! user-defined vars, external-service runtime vars (DB/Redis/… connection
-//! strings), `SENTRY_DSN`, `TEMPS_API_URL` / `TEMPS_API_TOKEN`, `CRON_SECRET`,
+//! strings), `SENTRY_DSN` / `SENTRY_TUNNEL`, `TEMPS_API_URL` /
+//! `TEMPS_API_TOKEN`, `CRON_SECRET`,
 //! and the `OTEL_EXPORTER_OTLP_*` instrumentation vars.
 //!
 //! [`WorkflowPlanner`]: super::workflow_planner::WorkflowPlanner
@@ -22,7 +23,7 @@ use temps_entities::{deployments, environments, projects};
 use tracing::{debug, info};
 
 use super::deployment_token_service::DeploymentTokenService;
-use super::workflow_planner::{public_sentry_dsn_var, public_sentry_tunnel_var};
+use super::managed_environment_variables::{public_sentry_dsn_var, public_sentry_tunnel_var};
 
 /// Build the OpenTelemetry SDK header-list value for a deployed project.
 ///
@@ -52,6 +53,21 @@ pub(super) fn otel_exporter_headers(
             .map(|headers| format!("{headers},{slug_header}"))
             .unwrap_or(slug_header),
     }
+}
+
+/// Applies environment-variable layers in increasing precedence order.
+///
+/// Linked services provide convenient defaults such as `POSTGRES_URL`, while
+/// project environment variables are explicit user configuration and must win
+/// when both layers define the same key. Platform-managed variables are added
+/// by the caller after this merge and therefore remain reserved.
+pub(super) fn merge_environment_variable_layers(
+    resolved: &mut HashMap<String, String>,
+    linked_service_vars: HashMap<String, String>,
+    explicit_project_vars: HashMap<String, String>,
+) {
+    resolved.extend(linked_service_vars);
+    resolved.extend(explicit_project_vars);
 }
 
 /// Resolves the full environment-variable map for a `(project, environment,
@@ -86,6 +102,7 @@ impl DeploymentEnvResolver {
         use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
+        let mut explicit_project_vars = HashMap::new();
 
         // Add default HOST environment variable
         // This ensures containers bind to all network interfaces (0.0.0.0)
@@ -126,13 +143,13 @@ impl DeploymentEnvResolver {
                 } else {
                     env_var.value
                 };
-                env_vars_map.insert(env_var.key, value);
+                explicit_project_vars.insert(env_var.key, value);
             }
         }
 
         debug!(
             "📦 Loaded {} environment variables from env_vars table via env_var_environments",
-            env_vars_map.len()
+            explicit_project_vars.len()
         );
 
         // 2. Get runtime environment variables from external services
@@ -150,6 +167,7 @@ impl DeploymentEnvResolver {
 
         // Track failed services to provide detailed error messages
         let mut failed_services: Vec<(i32, String)> = Vec::new();
+        let mut linked_service_vars = HashMap::new();
 
         // Get runtime environment variables from each external service
         for project_service in project_services_list {
@@ -174,8 +192,7 @@ impl DeploymentEnvResolver {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    // Merge service env vars into the main map
-                    env_vars_map.extend(service_env_vars);
+                    linked_service_vars.extend(service_env_vars);
                 }
                 Err(e) => {
                     // Collect the error - we'll fail the entire deployment if any service fails
@@ -209,6 +226,14 @@ impl DeploymentEnvResolver {
             return Err(anyhow::anyhow!(error_message));
         }
 
+        // Linked-service variables are defaults. Explicit project variables
+        // express user intent and therefore take precedence on collisions.
+        merge_environment_variable_layers(
+            &mut env_vars_map,
+            linked_service_vars,
+            explicit_project_vars,
+        );
+
         // 3. Get or create Sentry DSN for error tracking
         // Generate/fetch DSN for this project/environment combination
         // This ensures each environment has its own DSN for proper error isolation
@@ -238,6 +263,10 @@ impl DeploymentEnvResolver {
                         // Always add SENTRY_DSN for server-side usage
                         env_vars_map.insert("SENTRY_DSN".to_string(), project_dsn.dsn.clone());
 
+                        let sentry_tunnel =
+                            format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH);
+                        env_vars_map.insert("SENTRY_TUNNEL".to_string(), sentry_tunnel.clone());
+
                         // Add framework-specific public DSN env var based on preset.
                         // Each client bundler only exposes vars matching its own prefix
                         // convention to the browser bundle, so we mirror that mapping.
@@ -252,10 +281,7 @@ impl DeploymentEnvResolver {
                         // the path can change in one place (here) without touching
                         // deployed apps' source or docs.
                         if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
-                            env_vars_map.insert(
-                                tunnel_var.to_string(),
-                                format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH),
-                            );
+                            env_vars_map.insert(tunnel_var.to_string(), sentry_tunnel);
                         }
                     }
                     Err(e) => {
@@ -393,7 +419,61 @@ impl DeploymentEnvResolver {
 
 #[cfg(test)]
 mod tests {
-    use super::otel_exporter_headers;
+    use std::collections::HashMap;
+
+    use super::{merge_environment_variable_layers, otel_exporter_headers};
+
+    #[test]
+    fn explicit_project_vars_override_linked_service_defaults() {
+        let mut resolved = HashMap::from([("HOST".to_string(), "0.0.0.0".to_string())]);
+        let linked_service_vars = HashMap::from([
+            (
+                "POSTGRES_URL".to_string(),
+                "postgresql://linked-database/app".to_string(),
+            ),
+            ("POSTGRES_HOST".to_string(), "linked-database".to_string()),
+        ]);
+        let explicit_project_vars = HashMap::from([(
+            "POSTGRES_URL".to_string(),
+            "postgresql://user-selected-database/app".to_string(),
+        )]);
+
+        merge_environment_variable_layers(
+            &mut resolved,
+            linked_service_vars,
+            explicit_project_vars,
+        );
+
+        assert_eq!(
+            resolved.get("POSTGRES_URL").map(String::as_str),
+            Some("postgresql://user-selected-database/app")
+        );
+        assert_eq!(
+            resolved.get("POSTGRES_HOST").map(String::as_str),
+            Some("linked-database")
+        );
+        assert_eq!(resolved.get("HOST").map(String::as_str), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn platform_managed_vars_still_override_explicit_project_vars() {
+        let mut resolved = HashMap::new();
+        let explicit_project_vars = HashMap::from([(
+            "SENTRY_DSN".to_string(),
+            "https://user-defined.example/1".to_string(),
+        )]);
+
+        merge_environment_variable_layers(&mut resolved, HashMap::new(), explicit_project_vars);
+        resolved.insert(
+            "SENTRY_DSN".to_string(),
+            "https://temps-managed.example/2".to_string(),
+        );
+
+        assert_eq!(
+            resolved.get("SENTRY_DSN").map(String::as_str),
+            Some("https://temps-managed.example/2")
+        );
+    }
 
     #[test]
     fn otel_headers_include_encoded_token_and_project_slug() {

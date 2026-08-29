@@ -14,6 +14,9 @@ pub use job_processor::*;
 pub mod workflow_planner;
 pub use workflow_planner::*;
 
+pub mod managed_environment_variables;
+pub use managed_environment_variables::*;
+
 pub mod env_resolver;
 pub use env_resolver::*;
 
