@@ -585,6 +585,21 @@ impl PostgresService {
             .unwrap_or_else(|| self.get_container_name())
     }
 
+    fn get_effective_address_for_environment(
+        &self,
+        service_config: ServiceConfig,
+        execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Result<(String, String)> {
+        let config = self.get_postgres_config(service_config)?;
+        Ok(match execution_environment {
+            temps_core::ExecutionEnvironment::Host => ("localhost".to_string(), config.port),
+            temps_core::ExecutionEnvironment::Docker => (
+                self.get_live_container_name(&config),
+                POSTGRES_INTERNAL_PORT.to_string(),
+            ),
+        })
+    }
+
     /// Creates and starts the PostgreSQL container, retrying with a fresh host
     /// port if the chosen one lost the race described in `port_util` docs
     /// (bindable when we checked, but taken by the time Docker actually binds
@@ -2874,18 +2889,10 @@ impl ExternalService for PostgresService {
     }
 
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
-        let config = self.get_postgres_config(service_config)?;
-
-        if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            Ok((
-                self.get_live_container_name(&config),
-                POSTGRES_INTERNAL_PORT.to_string(),
-            ))
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            Ok(("localhost".to_string(), config.port))
-        }
+        self.get_effective_address_for_environment(
+            service_config,
+            temps_core::runtime::execution_environment_compatibility(),
+        )
     }
 
     fn get_docker_container_name(&self) -> String {
@@ -4244,8 +4251,6 @@ impl ExternalService for PostgresService {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
 
     fn backup_with_metadata(metadata: serde_json::Value) -> temps_entities::backups::Model {
         temps_entities::backups::Model {
@@ -5942,10 +5947,6 @@ mod tests {
 
     #[test]
     fn test_get_effective_address_baremetal_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Clear Docker mode to ensure baremetal mode
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = PostgresService::new("test-effective-addr".to_string(), docker);
 
@@ -5963,7 +5964,9 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Host)
+            .unwrap();
 
         // In baremetal mode, should return localhost with exposed port
         assert_eq!(host, "localhost");
@@ -5972,10 +5975,6 @@ mod tests {
 
     #[test]
     fn test_get_effective_address_docker_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Set Docker mode
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = PostgresService::new("test-effective-addr-docker".to_string(), docker);
 
@@ -5993,21 +5992,17 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
 
         // In Docker mode, should return container name with internal port
         assert_eq!(host, "postgres-test-effective-addr-docker");
         assert_eq!(port, "5432"); // Internal port
-
-        // Clean up
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
     }
 
     #[test]
     fn test_get_effective_address_docker_mode_uses_imported_container_name() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = PostgresService::new("imported-svc".to_string(), docker);
 
@@ -6026,12 +6021,12 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
         // The imported container name wins over the derived `postgres-{name}`.
         assert_eq!(host, "legacy-postgres");
         assert_eq!(port, "5432");
-
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
     }
 
     #[test]

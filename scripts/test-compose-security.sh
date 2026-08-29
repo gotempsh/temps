@@ -20,14 +20,22 @@ if [[ -n "${COMPOSE_SECURITY_PREBUILT:-}" ]]; then
   build_flag=()
 fi
 safe_postgres="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-safe_redis="abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+safe_clickhouse="23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01"
+old_clickhouse="3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012"
+workload_probe_name="${project}-workload-probe"
+export TEMPS_NETWORK_NAME="${TEMPS_NETWORK_NAME:-temps-docker-workloads}"
+export CLICKHOUSE_PASSWORD="$safe_clickhouse"
 export TEMPS_ADMIN_EMAIL="Admin@Example.TEST"
 admin_secret_dir="$(mktemp -d)"
 chmod 700 "$admin_secret_dir"
 admin_password_file="$admin_secret_dir/admin_password"
+admin_ingress_password_file="$admin_secret_dir/admin_ingress_password"
+admin_ingress_password='iI4!0123456789abcdef0123456789abcdef'
 printf 'tT3!0123456789abcdef0123456789abcdef\n' >"$admin_password_file"
-chmod 444 "$admin_password_file"
+printf '%s\n' "$admin_ingress_password" >"$admin_ingress_password_file"
+chmod 444 "$admin_password_file" "$admin_ingress_password_file"
 export TEMPS_ADMIN_PASSWORD_FILE="$admin_password_file"
+export TEMPS_ADMIN_INGRESS_PASSWORD_FILE="$admin_ingress_password_file"
 if [[ -z "${DOCKER_GID:-}" ]]; then
   # Inspect from a container because Docker Desktop can present a different
   # socket owner than the host-side symlink reports.
@@ -38,9 +46,10 @@ fi
 export DOCKER_GID
 
 cleanup() {
-  POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
+  docker rm --force "$workload_probe_name" >/dev/null 2>&1 || true
+  POSTGRES_PASSWORD="$safe_postgres" \
     "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
-  rm -f "$admin_password_file"
+  rm -f "$admin_password_file" "$admin_ingress_password_file"
   rmdir "$admin_secret_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -72,51 +81,97 @@ wait_for_completed_service() {
   return 1
 }
 
-if env -u POSTGRES_PASSWORD -u REDIS_PASSWORD "${config_compose[@]}" config --quiet 2>/dev/null; then
-  echo "compose config unexpectedly accepted missing credentials" >&2
+if env -u POSTGRES_PASSWORD "${config_compose[@]}" config --quiet 2>/dev/null; then
+  echo "compose config unexpectedly accepted a missing PostgreSQL credential" >&2
   exit 1
 fi
-if POSTGRES_PASSWORD="$safe_postgres" env -u REDIS_PASSWORD \
-  "${config_compose[@]}" config --quiet 2>/dev/null; then
-  echo "compose config unexpectedly accepted a missing Redis credential" >&2
+if POSTGRES_PASSWORD="$safe_postgres" \
+  env -u CLICKHOUSE_PASSWORD "${config_compose[@]}" config --quiet 2>/dev/null; then
+  echo "compose config unexpectedly accepted a missing ClickHouse credential" >&2
   exit 1
 fi
-if POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
+if POSTGRES_PASSWORD="$safe_postgres" \
   env -u TEMPS_ADMIN_EMAIL "${config_compose[@]}" config --quiet 2>/dev/null; then
   echo "compose config unexpectedly accepted a missing initial admin email" >&2
   exit 1
 fi
-if POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
+if POSTGRES_PASSWORD="$safe_postgres" \
   env -u TEMPS_ADMIN_PASSWORD_FILE "${config_compose[@]}" config --quiet 2>/dev/null; then
   echo "compose config unexpectedly accepted a missing initial admin password file" >&2
   exit 1
 fi
+if POSTGRES_PASSWORD="$safe_postgres" \
+  env -u TEMPS_ADMIN_INGRESS_PASSWORD_FILE "${config_compose[@]}" config --quiet 2>/dev/null; then
+  echo "compose config unexpectedly accepted a missing admin ingress password file" >&2
+  exit 1
+fi
 
-config="$({ POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
+config="$({ POSTGRES_PASSWORD="$safe_postgres" \
   "${config_compose[@]}" config --format json; })"
 jq -e '
-  [.services.postgres.ports[], .services.redis.ports[],
-   (.services.temps.ports[] | select(.target == 9000))]
+  [.services.postgres.ports[], .services.clickhouse.ports[],
+   .services["temps-ingress"].ports[]]
   | all(.host_ip == "127.0.0.1")
 ' <<<"$config" >/dev/null
-jq -e '.services.redis.user != null and .services.redis.user != "0" and .services.redis.user != "root"' \
-  <<<"$config" >/dev/null
-jq -e '
-  [.services.temps.ports[] | select(.target == 3000 or .target == 3443)]
-  | all(has("host_ip") | not)
+jq -e --arg workload_network "$TEMPS_NETWORK_NAME" '
+  .services.temps.environment.TEMPS_CLICKHOUSE_URL == "http://198.18.255.12:8123"
+  and .services.temps.environment.TEMPS_CLICKHOUSE_DATABASE == "temps"
+  and .services.temps.environment.TEMPS_CLICKHOUSE_USER == "temps"
+  and .services.temps.environment.TEMPS_EXECUTION_ENV == "docker"
+  and .services.temps.environment.TEMPS_NETWORK_NAME == $workload_network
+  and .services.temps.environment.TEMPS_ADDRESS == "198.18.255.10:3000"
+  and .services.temps.environment.TEMPS_TLS_ADDRESS == "198.18.255.10:3443"
+  and .services.temps.environment.TEMPS_CONSOLE_ADDRESS == "198.18.255.10:9000"
+  and .services.temps.environment.TEMPS_CONSOLE_ADMIN_ADDRESS == "198.18.255.10:9001"
+  and .services.temps.environment.TEMPS_DATABASE_URL
+    == "postgresql://temps:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef@198.18.255.11:5432/temps"
+  and (.services.temps.environment | has("REDIS_URL") | not)
+  and (.services | has("redis") | not)
+' <<<"$config" >/dev/null
+jq -e --arg workload_network "$TEMPS_NETWORK_NAME" '
+  (.services.temps.networks | has("temps-network"))
+  and (.services.temps.networks | has("temps-app-network"))
+  and .services.temps.networks["temps-network"].ipv4_address == "198.18.255.10"
+  and .services.postgres.networks["temps-network"].ipv4_address == "198.18.255.11"
+  and .services.clickhouse.networks["temps-network"].ipv4_address == "198.18.255.12"
+  and .services["temps-ingress"].networks["temps-ingress-network"].ipv4_address == "198.19.255.10"
+  and (.services["temps-ingress"].networks | has("temps-app-network") | not)
+  and (.services["temps-ingress"].cap_drop | index("ALL") != null)
+  and .services["temps-ingress"].read_only == true
+  and (.services["temps-ingress"].security_opt | index("no-new-privileges:true") != null)
+  and (.services["temps-ingress"].secrets | map(.source) | index("temps_admin_ingress_password") != null)
+  and (.services["temps-ingress"].environment | has("TEMPS_ADMIN_INGRESS_PASSWORD") | not)
+  and .networks["temps-ingress-network"].driver_opts["com.docker.network.bridge.enable_icc"] == "false"
+  and .networks["temps-ingress-network"].driver_opts["com.docker.network.bridge.trusted_host_interfaces"] == "lo"
+  and .networks["temps-network"].internal == true
+  and .networks["temps-network"].ipam.config[0].subnet == "198.18.255.0/24"
+  and .networks["temps-app-network"].name == $workload_network
 ' <<<"$config" >/dev/null
 
-POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
+POSTGRES_PASSWORD="$safe_postgres" \
   "${compose[@]}" run --rm --no-TTY credential-check >/dev/null
-if POSTGRES_PASSWORD='unsafe@password' REDIS_PASSWORD="$safe_redis" \
+if POSTGRES_PASSWORD='unsafe@password' \
   "${compose[@]}" run --rm --no-TTY credential-check >/dev/null 2>&1; then
   echo "credential validator unexpectedly accepted URL delimiters" >&2
   exit 1
 fi
+if POSTGRES_PASSWORD="$safe_postgres" \
+  CLICKHOUSE_PASSWORD='unsafe@password' \
+  "${compose[@]}" run --rm --no-TTY credential-check >/dev/null 2>&1; then
+  echo "credential validator unexpectedly accepted ClickHouse URL delimiters" >&2
+  exit 1
+fi
 
-if grep -En 'temps_password_change_me|redis-server .*--requirepass|redis-cli -a' \
+if grep -En 'temps_password_change_me' \
   docker-compose.yml .env.example; then
   echo "compose files contain a known or argv-exposed credential" >&2
+  exit 1
+fi
+
+if grep -Fxq 'scripts/' .dockerignore || \
+  ! grep -Fxq '!scripts/source_attribution.py' .dockerignore || \
+  ! grep -Fxq '!scripts/docker-ingress-entrypoint.sh' .dockerignore; then
+  echo "Docker build context excludes a required build or ingress script" >&2
   exit 1
 fi
 
@@ -139,9 +194,9 @@ for ignore_file in .gitignore .dockerignore; do
 done
 
 old_postgres="temps_password_change_me"
-POSTGRES_PASSWORD="$old_postgres" REDIS_PASSWORD="$safe_redis" \
+POSTGRES_PASSWORD="$old_postgres" \
   "${compose[@]}" up --detach postgres-credential-sync >/dev/null
-POSTGRES_PASSWORD="$old_postgres" REDIS_PASSWORD="$safe_redis" \
+POSTGRES_PASSWORD="$old_postgres" \
   wait_for_completed_service postgres-credential-sync \
   "fresh-volume credential synchronization"
 
@@ -156,11 +211,11 @@ if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-postgres)" != 
   exit 1
 fi
 
-POSTGRES_PASSWORD="$old_postgres" REDIS_PASSWORD="$safe_redis" \
+POSTGRES_PASSWORD="$old_postgres" \
   "${compose[@]}" stop postgres >/dev/null
-POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
+POSTGRES_PASSWORD="$safe_postgres" \
   "${compose[@]}" up --detach postgres >/dev/null
-POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
+POSTGRES_PASSWORD="$safe_postgres" \
   "${compose[@]}" run --rm --no-deps --no-TTY postgres-credential-sync >/dev/null
 
 for _ in {1..30}; do
@@ -183,34 +238,91 @@ if docker exec --env PGPASSWORD="$old_postgres" temps-postgres \
   exit 1
 fi
 
-POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
-  "${compose[@]}" up --detach redis >/dev/null
-for _ in {1..30}; do
-  if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-redis)" == "healthy" ]]; then
+POSTGRES_PASSWORD="$safe_postgres" \
+  CLICKHOUSE_PASSWORD="$old_clickhouse" \
+  "${compose[@]}" up --detach clickhouse >/dev/null
+for _ in {1..60}; do
+  if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-clickhouse)" == "healthy" ]]; then
     break
   fi
   sleep 1
 done
-if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-redis)" != "healthy" ]]; then
-  echo "Redis did not become healthy with authentication enabled" >&2
+if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-clickhouse)" != "healthy" ]]; then
+  "${compose[@]}" logs clickhouse >&2 || true
+  echo "ClickHouse did not become healthy with authentication enabled" >&2
   exit 1
 fi
-docker exec temps-redis redis-cli ping | grep -q 'NOAUTH'
-docker exec --env REDISCLI_AUTH="$safe_redis" temps-redis redis-cli ping | grep -qx PONG
-docker exec temps-redis awk '/^Uid:/ { exit !($2 != 0) }' /proc/1/status
-if docker inspect --format '{{json .Config.Cmd}}' temps-redis | grep -Fq "$safe_redis"; then
-  echo "Redis password leaked into the long-lived process argv" >&2
+docker exec temps-clickhouse awk '/^Uid:/ { exit !($2 != 0) }' /proc/1/status
+if docker exec --env CLICKHOUSE_PASSWORD= temps-clickhouse \
+  clickhouse-client --user temps --query 'SELECT 1' \
+  >/dev/null 2>&1; then
+  echo "ClickHouse unexpectedly accepted an unauthenticated query" >&2
   exit 1
 fi
+docker exec --env CLICKHOUSE_PASSWORD="$old_clickhouse" temps-clickhouse \
+  clickhouse-client --user temps --database temps --query 'SELECT 1' | grep -qx 1
+if docker exec --env CLICKHOUSE_PASSWORD="$old_clickhouse" temps-clickhouse \
+  clickhouse-client --user temps --query 'CREATE USER temps_compose_security_probe' \
+  >/dev/null 2>&1; then
+  echo "ClickHouse application user unexpectedly has access-management privileges" >&2
+  exit 1
+fi
+docker exec --env CLICKHOUSE_PASSWORD="$old_clickhouse" temps-clickhouse \
+  clickhouse-client --user temps --database temps \
+  --query 'CREATE TABLE compose_security_persistence_probe (value UInt8) ENGINE = TinyLog'
+docker exec --env CLICKHOUSE_PASSWORD="$old_clickhouse" temps-clickhouse \
+  clickhouse-client --user temps --database temps \
+  --query 'INSERT INTO compose_security_persistence_probe VALUES (1)'
+
+POSTGRES_PASSWORD="$safe_postgres" \
+  CLICKHOUSE_PASSWORD="$old_clickhouse" \
+  "${compose[@]}" stop clickhouse >/dev/null
+POSTGRES_PASSWORD="$safe_postgres" \
+  CLICKHOUSE_PASSWORD="$safe_clickhouse" \
+  "${compose[@]}" up --detach clickhouse >/dev/null
+for _ in {1..60}; do
+  if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-clickhouse)" == "healthy" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-clickhouse)" != "healthy" ]]; then
+  "${compose[@]}" logs clickhouse >&2 || true
+  echo "ClickHouse did not become healthy after credential rotation" >&2
+  exit 1
+fi
+if docker exec --env CLICKHOUSE_PASSWORD="$old_clickhouse" temps-clickhouse \
+  clickhouse-client --user temps --database temps --query 'SELECT 1' \
+  >/dev/null 2>&1; then
+  echo "Old ClickHouse password still authenticates after rotation" >&2
+  exit 1
+fi
+docker exec --env CLICKHOUSE_PASSWORD="$safe_clickhouse" temps-clickhouse \
+  clickhouse-client --user temps --database temps \
+  --query 'SELECT count() FROM compose_security_persistence_probe' | grep -qx 1
 
 # Build the production image and seed its persistent data volume before the
 # first application start. This models an upgrade where an existing volume
 # masks /app/data and verifies immutable runtime assets remain available.
-POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
+POSTGRES_PASSWORD="$safe_postgres" \
   "${compose[@]}" run --rm --no-deps ${build_flag[@]+"${build_flag[@]}"} --entrypoint /bin/sh temps \
   -ec 'touch /app/data/.preexisting-volume' >/dev/null
-POSTGRES_PASSWORD="$safe_postgres" REDIS_PASSWORD="$safe_redis" \
-  "${compose[@]}" up --detach temps >/dev/null
+
+# Start an adversarially named workload before Temps. Docker DNS exposes these
+# aliases to the dual-network control plane, so private dependencies and bind
+# addresses must remain pinned to non-confusable control-network IPs.
+docker run --detach --rm \
+  --name "$workload_probe_name" \
+  --network "$TEMPS_NETWORK_NAME" \
+  --network-alias temps-postgres \
+  --network-alias temps-clickhouse \
+  alpine:3.22 \
+  /bin/sh -ec \
+  'while true; do printf "HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nready\n" | nc -l -p 8080; done' \
+  >/dev/null
+
+POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" up --detach temps-ingress >/dev/null
 for _ in {1..180}; do
   if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-app)" == "healthy" ]]; then
     break
@@ -221,11 +333,160 @@ for _ in {1..180}; do
   sleep 1
 done
 if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-app)" != "healthy" ]]; then
-  "${compose[@]}" logs temps >&2 || true
+  POSTGRES_PASSWORD="$safe_postgres" "${compose[@]}" logs temps >&2 || true
   echo "Temps did not become ready on the console /readyz endpoint" >&2
   exit 1
 fi
+for _ in {1..30}; do
+  if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-ingress)" == "healthy" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-ingress)" != "healthy" ]]; then
+  POSTGRES_PASSWORD="$safe_postgres" "${compose[@]}" logs temps-ingress >&2 || true
+  echo "Temps loopback ingress did not become healthy" >&2
+  exit 1
+fi
+
+# Docker-mode routing must use the explicitly named workload network and
+# internal ports even while malicious private-service aliases are present.
+for _ in {1..30}; do
+  if docker exec temps-app wget --quiet --output-document=- \
+    "http://${workload_probe_name}:8080/ready" | grep -qx ready; then
+    break
+  fi
+  sleep 1
+done
+docker exec temps-app wget --quiet --output-document=- \
+  "http://${workload_probe_name}:8080/ready" | grep -qx ready
+for control_plane_alias in temps-postgres temps-clickhouse; do
+  docker exec "$workload_probe_name" nslookup "$control_plane_alias" >/dev/null
+done
+for control_plane_port in 3000 3443 9000; do
+  if docker exec "$workload_probe_name" nc -z -w 1 temps-app "$control_plane_port" \
+    >/dev/null 2>&1; then
+    echo "workload network unexpectedly reaches Temps on port $control_plane_port" >&2
+    exit 1
+  fi
+done
+for private_endpoint in 198.18.255.10:9000 198.18.255.10:9001 198.18.255.11:5432 198.18.255.12:8123; do
+  private_host="${private_endpoint%:*}"
+  private_port="${private_endpoint##*:}"
+  if docker exec "$workload_probe_name" nc -z -w 1 "$private_host" "$private_port" \
+    >/dev/null 2>&1; then
+    echo "workload network unexpectedly reaches private endpoint $private_endpoint" >&2
+    exit 1
+  fi
+done
+
+# The workload may reach the deliberately public ingress surface, but not the
+# private control network. Public console routes must not expose admin/auth UI.
+docker exec "$workload_probe_name" wget --quiet --output-document=- \
+  "http://198.19.255.10:9000/readyz" | grep -qx ready
+public_admin_response="$(docker exec "$workload_probe_name" sh -ec \
+  'wget -S -O /dev/null "$1" 2>&1 || true' -- \
+  'http://198.19.255.10:9000/api/auth/login')"
+if ! grep -Eq 'HTTP/[0-9.]+ 404' <<<"$public_admin_response"; then
+  echo "public console listener did not hide the admin login route" >&2
+  echo "$public_admin_response" >&2
+  exit 1
+fi
+
+# The private admin listener is published only through a second authentication
+# barrier. Temps authentication remains active behind this proxy.
+admin_binding="$(docker port temps-ingress 9001/tcp)"
+if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://${admin_binding}/")" != "401" ]]; then
+  echo "admin ingress unexpectedly accepted an unauthenticated request" >&2
+  exit 1
+fi
+if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
+  --user 'temps:wrong-password' "http://${admin_binding}/")" != "401" ]]; then
+  echo "admin ingress unexpectedly accepted an incorrect password" >&2
+  exit 1
+fi
+curl --fail --silent --show-error --user "temps:${admin_ingress_password}" \
+  "http://${admin_binding}/" >/dev/null
+workload_admin_response="$(docker exec "$workload_probe_name" sh -ec \
+  'wget -S -O /dev/null "$1" 2>&1 || true' -- \
+  'http://198.19.255.10:9001/')"
+if ! grep -Eq 'HTTP/[0-9.]+ 401' <<<"$workload_admin_response"; then
+  echo "admin ingress did not require authentication from the workload network" >&2
+  echo "$workload_admin_response" >&2
+  exit 1
+fi
+
+# Loopback publication must still reach the listener bound to the private
+# control-network address.
+console_binding="$(docker port temps-ingress 9000/tcp)"
+curl --fail --silent --show-error "http://${console_binding}/readyz" | grep -qx ready
+
+# No public listener may expose the split admin/auth surface. Check the public
+# HTTP proxy, HTTPS proxy, and console/ingest listener independently.
+for public_port in 3000 9000; do
+  public_binding="$(docker port temps-ingress "${public_port}/tcp")"
+  public_status="$(curl --silent --output /dev/null --write-out '%{http_code}' \
+    "http://${public_binding}/api/auth/login")"
+  if [[ "$public_status" != "404" ]]; then
+    echo "public port $public_port returned $public_status for an admin route; expected 404" >&2
+    exit 1
+  fi
+done
+tls_binding="$(docker port temps-ingress 3443/tcp)"
+tls_admin_status="$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' \
+  --connect-timeout 5 "https://${tls_binding}/api/auth/login" || true)"
+if [[ "$tls_admin_status" != "404" && "$tls_admin_status" != "000" ]]; then
+  echo "public TLS port 3443 returned $tls_admin_status for an admin route; expected 404 or a fail-closed TLS handshake" >&2
+  exit 1
+fi
+
+# Exercise more slow public connections than the per-source ceiling. Nginx must
+# reject the excess without spawning one ingress process per connection, then
+# recover after the configured idle timeout.
+docker exec --detach "$workload_probe_name" sh -ec '
+  index=0
+  while [ "$index" -lt 128 ]; do
+    (sleep 30) | nc -w 15 198.19.255.10 9000 >/dev/null 2>&1 &
+    index=$((index + 1))
+  done
+  wait
+'
+connection_limit_enforced=false
+for _ in {1..10}; do
+  ingress_process_count="$(docker exec temps-ingress sh -ec \
+    'set -- /proc/[0-9]*; printf "%s" "$#"')"
+  if ((ingress_process_count > 8)); then
+    echo "public connection saturation spawned $ingress_process_count ingress processes" >&2
+    exit 1
+  fi
+  ingress_logs="$(docker logs temps-ingress 2>&1)"
+  if grep -Fq 'limiting connections by zone "public_clients"' <<<"$ingress_logs"; then
+    connection_limit_enforced=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$connection_limit_enforced" != "true" ]]; then
+  echo "public ingress did not enforce its concurrent connection ceiling" >&2
+  exit 1
+fi
+if [[ "$(docker inspect --format '{{.HostConfig.PidsLimit}}' temps-ingress)" != "32" ]]; then
+  echo "admin ingress PID limit is not 32" >&2
+  exit 1
+fi
+if [[ "$(docker inspect --format '{{.HostConfig.Memory}}' temps-ingress)" != "134217728" ]]; then
+  echo "admin ingress memory limit is not 128 MiB" >&2
+  exit 1
+fi
+sleep 10
+curl --fail --silent --show-error "http://${console_binding}/readyz" | grep -qx ready
+
 docker exec temps-app awk '/^Uid:/ { exit !($2 != 0) }' /proc/1/status
+docker exec temps-ingress awk '/^Uid:/ { exit !($2 != 0) }' /proc/1/status
+if docker exec temps-ingress touch /etc/compose-security-write-test >/dev/null 2>&1; then
+  echo "admin ingress root filesystem is unexpectedly writable" >&2
+  exit 1
+fi
 docker exec temps-app sh -ec 'touch /app/data/.compose-security-write-test; rm /app/data/.compose-security-write-test'
 docker exec temps-app sh -ec 'test -r /var/run/docker.sock && test -w /var/run/docker.sock'
 docker exec temps-app sh -ec \
@@ -233,11 +494,21 @@ docker exec temps-app sh -ec \
 docker exec temps-app sh -ec \
   'test -r /usr/share/temps/GeoLite2-City.mmdb && test ! -w /usr/share/temps/GeoLite2-City.mmdb'
 docker exec temps-app test -f /app/data/.preexisting-volume
-docker exec temps-app wget --quiet --output-document=- http://127.0.0.1:9000/readyz | grep -qx ready
 docker exec --env PGPASSWORD="$safe_postgres" temps-postgres \
   psql -h 127.0.0.1 -U temps -d temps -tAc \
   "SELECT count(*) FROM users u JOIN user_roles ur ON ur.user_id = u.id JOIN roles r ON r.id = ur.role_id WHERE u.email = 'admin@example.test' AND u.deleted_at IS NULL AND r.name = 'admin'" \
   | grep -qx 1
+for _ in {1..60}; do
+  if docker exec --env CLICKHOUSE_PASSWORD="$safe_clickhouse" temps-clickhouse \
+    clickhouse-client --user temps --database temps \
+    --query "EXISTS TABLE _temps_ch_migrations" | grep -qx 1; then
+    break
+  fi
+  sleep 1
+done
+docker exec --env CLICKHOUSE_PASSWORD="$safe_clickhouse" temps-clickhouse \
+  clickhouse-client --user temps --database temps \
+  --query "EXISTS TABLE _temps_ch_migrations" | grep -qx 1
 # The harness must never report product telemetry (see
 # compose-security.harness.yml). Assert on the container env, not on logs:
 # the ENABLED/DISABLED notice is emitted during plugin registration, before
@@ -257,6 +528,15 @@ if docker inspect --format '{{json .Config.Env}}' temps-app | grep -Fq 'tT3!0123
 fi
 if docker logs temps-app 2>&1 | grep -Fq 'tT3!0123456789abcdef'; then
   echo "initial admin password leaked into application logs" >&2
+  exit 1
+fi
+if docker inspect --format '{{json .Config.Env}}' temps-ingress \
+  | grep -Fq "$admin_ingress_password"; then
+  echo "admin ingress password leaked into the proxy environment" >&2
+  exit 1
+fi
+if docker logs temps-ingress 2>&1 | grep -Fq "$admin_ingress_password"; then
+  echo "admin ingress password leaked into proxy logs" >&2
   exit 1
 fi
 

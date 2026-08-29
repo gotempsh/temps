@@ -502,6 +502,21 @@ impl MariaDbService {
             .unwrap_or_else(|| self.get_container_name())
     }
 
+    fn get_effective_address_for_environment(
+        &self,
+        service_config: ServiceConfig,
+        execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Result<(String, String)> {
+        let config = self.get_mariadb_config(service_config)?;
+        Ok(match execution_environment {
+            temps_core::ExecutionEnvironment::Host => ("localhost".to_string(), config.port),
+            temps_core::ExecutionEnvironment::Docker => (
+                self.get_live_container_name(&config),
+                MARIADB_INTERNAL_PORT.to_string(),
+            ),
+        })
+    }
+
     fn get_mariadb_config(&self, service_config: ServiceConfig) -> Result<MariaDbConfig> {
         let input_config: MariaDbInputConfig = serde_json::from_value(service_config.parameters)
             .map_err(|e| anyhow::anyhow!("Failed to parse MariaDB configuration: {}", e))?;
@@ -3159,16 +3174,10 @@ impl ExternalService for MariaDbService {
     }
 
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
-        let config = self.get_mariadb_config(service_config)?;
-
-        if temps_core::DeploymentMode::is_docker() {
-            Ok((
-                self.get_live_container_name(&config),
-                MARIADB_INTERNAL_PORT.to_string(),
-            ))
-        } else {
-            Ok(("localhost".to_string(), config.port))
-        }
+        self.get_effective_address_for_environment(
+            service_config,
+            temps_core::runtime::execution_environment_compatibility(),
+        )
     }
 
     fn get_docker_container_name(&self) -> String {
@@ -3704,7 +3713,6 @@ impl ExternalService for MariaDbService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
 
     /// A manifest read back from S3 drives both an S3 key and a host file
     /// write during PITR restore, so anything that is not a bare filename has
@@ -4510,10 +4518,6 @@ mod tests {
 
     #[test]
     fn test_get_effective_address_baremetal_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Clear Docker mode to ensure baremetal mode.
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
-
         let service = MariaDbService::new(
             "test-effective-addr".to_string(),
             Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
@@ -4533,7 +4537,9 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Host)
+            .unwrap();
         // Baremetal: localhost with the exposed host port.
         assert_eq!(host, "localhost");
         assert_eq!(port, "3307");
@@ -4541,9 +4547,6 @@ mod tests {
 
     #[test]
     fn test_get_effective_address_docker_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let service = MariaDbService::new(
             "test-effective-addr-docker".to_string(),
             Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
@@ -4563,19 +4566,16 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
         // Docker: container name with the internal port, not the host port.
         assert_eq!(host, "mariadb-test-effective-addr-docker");
         assert_eq!(port, MARIADB_INTERNAL_PORT);
-
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
     }
 
     #[test]
     fn test_get_effective_address_docker_mode_uses_imported_container_name() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let service = MariaDbService::new(
             "imported-svc".to_string(),
             Arc::new(Docker::connect_with_http_defaults().expect("docker client")),
@@ -4596,12 +4596,12 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
         // The imported container name wins over the derived mariadb-{name}.
         assert_eq!(host, "legacy-mariadb");
         assert_eq!(port, MARIADB_INTERNAL_PORT);
-
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
     }
 
     #[test]
