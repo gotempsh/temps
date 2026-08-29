@@ -133,7 +133,10 @@ jobs:
   build-linux-amd64:
     name: Build Linux AMD64
     needs: build-web-assets
-    runs-on: ubuntu-latest
+    # Pinned to 22.04 (glibc 2.35) so the released binary runs on Ubuntu 22.04+/Debian 12+.
+    # ubuntu-latest currently resolves to 24.04 (glibc 2.39), which broke the binary on
+    # older-but-still-common distros with a "GLIBC_2.38/2.39 not found" error.
+    runs-on: ubuntu-22.04
     permissions:
       contents: read
     steps:
@@ -202,7 +205,8 @@ jobs:
   build-linux-arm64:
     name: Build Linux ARM64
     needs: build-web-assets
-    runs-on: ubuntu-24.04-arm
+    # See build-linux-amd64: pinned to 22.04 (glibc 2.35) for the same broad-compatibility reason.
+    runs-on: ubuntu-22.04-arm
     permissions:
       contents: read
     steps:
