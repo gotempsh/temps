@@ -5,6 +5,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   getTemplateServiceRequirements,
   normalizeTemplateServiceType,
+  toggleDatabaseSelection,
 } from './template-service-requirements'
 
 const services = [
@@ -17,6 +18,7 @@ describe('template service requirements', () => {
     expect(normalizeTemplateServiceType(' PostgreSQL ')).toBe('postgres')
     expect(normalizeTemplateServiceType('mysql')).toBe('mariadb')
     expect(normalizeTemplateServiceType('object-storage')).toBe('s3')
+    expect(normalizeTemplateServiceType('rustfs')).toBe('s3')
   })
 
   test('exposes matching existing services as one-click choices', () => {
@@ -55,5 +57,47 @@ describe('template service requirements', () => {
     )
 
     expect(requirements).toHaveLength(1)
+  })
+
+  test('deselects a newly created database instead of forcing it back into submission', () => {
+    const result = toggleDatabaseSelection([3], 3, [
+      { id: 3, name: 'new-postgres', service_type: 'postgres' },
+    ])
+
+    expect(result.selectedServiceIds).toEqual([])
+    expect(result.conflictingService).toBeUndefined()
+  })
+
+  test('rejects a second provider for the same normalized variable namespace', () => {
+    const result = toggleDatabaseSelection([1], 3, [
+      ...services,
+      { id: 3, name: 'second-postgres', service_type: 'postgresql' },
+    ])
+
+    expect(result.selectedServiceIds).toEqual([1])
+    expect(result.conflictingService?.name).toBe('existing-postgres')
+  })
+
+  test('allows databases with different variable namespaces', () => {
+    const result = toggleDatabaseSelection([1], 2, services)
+
+    expect(result.selectedServiceIds).toEqual([1, 2])
+    expect(result.conflictingService).toBeUndefined()
+  })
+
+  test('treats RustFS as the S3 variable namespace for requirements and collisions', () => {
+    const rustfs = { id: 4, name: 'objects', service_type: 'rustfs' }
+    const [requirement] = getTemplateServiceRequirements(
+      ['s3'],
+      [rustfs],
+      [rustfs.id]
+    )
+    const collision = toggleDatabaseSelection([rustfs.id], 5, [
+      rustfs,
+      { id: 5, name: 'second-objects', service_type: 's3' },
+    ])
+
+    expect(requirement.isSatisfied).toBeTrue()
+    expect(collision.conflictingService?.id).toBe(rustfs.id)
   })
 })

@@ -1,14 +1,10 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import {
-  createProjectMutation,
-  listServicesOptions,
-} from '@/api/client/@tanstack/react-query.gen'
+import { createProjectMutation } from '@/api/client/@tanstack/react-query.gen'
 import type {
   CreatableServiceTypeRoute,
   ExternalServiceInfo,
-  ServiceTypeRoute,
   SourceType,
 } from '@/api/client/types.gen'
 import { ImportEnvDialog } from '@/components/ui/import-env-dialog'
@@ -42,7 +38,7 @@ import { Input } from '@/components/ui/input'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { cn } from '@/lib/utils'
 import { zodResolver } from '@hookform/resolvers/zod'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
 import {
   AlertCircle,
@@ -59,7 +55,7 @@ import {
   Upload,
   X,
 } from 'lucide-react'
-import { useCallback, useRef, useState } from 'react'
+import { useCallback, useMemo, useRef, useState } from 'react'
 import { useForm, useWatch } from 'react-hook-form'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
@@ -75,6 +71,11 @@ import {
   isTempsManagedProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
 } from '@/lib/project-environment-variables'
+import {
+  normalizeTemplateServiceType,
+  toggleDatabaseSelection,
+} from '@/lib/template-service-requirements'
+import { useAllServices } from '@/hooks/useAllServices'
 
 // Source type options
 const SOURCE_TYPE_OPTIONS: {
@@ -150,11 +151,8 @@ export function ManualProjectConfigurator({
   const [isImportEnvOpen, setIsImportEnvOpen] = useState(false)
   const [providedEnvironmentVariables, setProvidedEnvironmentVariables] =
     useState<ProvidedEnvironmentVariableCollision[]>([])
-  const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<
-    number[]
-  >([])
-  const [newlyCreatedServiceTypes, setNewlyCreatedServiceTypes] = useState<
-    ServiceTypeRoute[]
+  const [newlyCreatedServices, setNewlyCreatedServices] = useState<
+    ExternalServiceInfo[]
   >([])
 
   // Form initialization
@@ -177,9 +175,17 @@ export function ManualProjectConfigurator({
     name: 'sourceType',
   })
   // Fetch existing services
-  const { data: existingServices, refetch: refetchServices } = useQuery({
-    ...listServicesOptions({}),
-  })
+  const { data: existingServices, refetch: refetchServices } = useAllServices()
+  const availableServices = useMemo(() => {
+    const servicesById = new Map<number, ExternalServiceInfo>()
+    existingServices?.forEach((service) =>
+      servicesById.set(service.id, service)
+    )
+    newlyCreatedServices.forEach((service) =>
+      servicesById.set(service.id, service)
+    )
+    return Array.from(servicesById.values())
+  }, [existingServices, newlyCreatedServices])
 
   // Project creation mutation
   const projectMutation = useMutation({
@@ -220,50 +226,33 @@ export function ManualProjectConfigurator({
 
     // Add types from selected existing services
     currentServices.forEach((serviceId: number) => {
-      const service = existingServices?.find((s) => s.id === serviceId)
+      const service = availableServices.find((item) => item.id === serviceId)
       if (service) {
-        selectedTypes.add(service.service_type)
+        selectedTypes.add(normalizeTemplateServiceType(service.service_type))
       }
     })
 
-    // Add types from newly created services
-    newlyCreatedServiceTypes.forEach((serviceType) => {
-      selectedTypes.add(serviceType)
-    })
-
     return selectedTypes
-  }, [form, existingServices, newlyCreatedServiceTypes])
+  }, [form, availableServices])
 
   // Service selection handler
   const handleServiceToggle = useCallback(
     (serviceId: number) => {
       const currentServices = form.getValues('storageServices') || []
-      const isSelected = currentServices.includes(serviceId)
-
-      // If trying to select (not deselect), check for type collision
-      if (!isSelected) {
-        const serviceToAdd = existingServices?.find((s) => s.id === serviceId)
-        if (serviceToAdd) {
-          const selectedTypes = getSelectedServiceTypes()
-          if (selectedTypes.has(serviceToAdd.service_type)) {
-            toast.error(
-              `A ${serviceToAdd.service_type} database is already selected`,
-              {
-                description:
-                  'Only one database of each type can be linked to a project to avoid environment variable conflicts.',
-              }
-            )
-            return
-          }
-        }
+      const result = toggleDatabaseSelection(
+        currentServices,
+        serviceId,
+        availableServices
+      )
+      if (result.conflictingService) {
+        toast.error('A compatible database is already selected', {
+          description: `${result.conflictingService.name} already provides this database variable namespace. Deselect it first.`,
+        })
+        return
       }
-
-      const newValues = isSelected
-        ? currentServices.filter((id) => id !== serviceId)
-        : [...currentServices, serviceId]
-      form.setValue('storageServices', newValues)
+      form.setValue('storageServices', result.selectedServiceIds)
     },
-    [form, existingServices, getSelectedServiceTypes]
+    [form, availableServices]
   )
 
   // Handle form submission
@@ -273,14 +262,11 @@ export function ManualProjectConfigurator({
     try {
       setIsSubmitting(true)
 
-      // Remove duplicates from service IDs
-      const allServiceIds = Array.from(
-        new Set([...(data.storageServices || []), ...newlyCreatedServiceIds])
-      )
-
       const finalData = {
         ...data,
-        storageServices: allServiceIds,
+        // The visible selection is authoritative. A database created in this
+        // flow can still be deselected before submission.
+        storageServices: Array.from(new Set(data.storageServices || [])),
       }
 
       if (onSubmit) {
@@ -558,20 +544,29 @@ export function ManualProjectConfigurator({
 
     return (
       <div className="space-y-4">
-        {existingServices && existingServices.length > 0 && (
+        {availableServices.length > 0 && (
           <div>
             <h4 className="text-sm font-medium mb-3">Existing Databases</h4>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {existingServices.map((service) => {
+              {availableServices.map((service) => {
                 const isSelected = watchedServices.includes(service.id)
                 return (
                   <Card
                     key={service.id}
+                    role="checkbox"
+                    tabIndex={0}
+                    aria-checked={isSelected}
                     className={cn(
-                      'cursor-pointer transition-colors hover:bg-muted/50',
+                      'cursor-pointer transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
                       isSelected && 'ring-2 ring-primary'
                     )}
                     onClick={() => handleServiceToggle(service.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        handleServiceToggle(service.id)
+                      }
+                    }}
                   >
                     <CardHeader className="pb-3">
                       <div className="flex items-center justify-between">
@@ -599,18 +594,29 @@ export function ManualProjectConfigurator({
           </div>
         )}
 
-        {newlyCreatedServiceIds.length > 0 && (
+        {newlyCreatedServices.some((service) =>
+          watchedServices.includes(service.id)
+        ) && (
           <Alert>
             <AlertCircle className="h-4 w-4" />
             <AlertDescription>
-              {newlyCreatedServiceIds.length} new database
-              {newlyCreatedServiceIds.length > 1 ? 's' : ''} will be linked to
-              this project
+              {
+                newlyCreatedServices.filter((service) =>
+                  watchedServices.includes(service.id)
+                ).length
+              }{' '}
+              new database
+              {newlyCreatedServices.filter((service) =>
+                watchedServices.includes(service.id)
+              ).length > 1
+                ? 's'
+                : ''}{' '}
+              will be linked to this project
             </AlertDescription>
           </Alert>
         )}
 
-        {!existingServices?.length && newlyCreatedServiceIds.length === 0 && (
+        {availableServices.length === 0 && (
           <div className="text-center py-8">
             <Database className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
             <p className="text-sm text-muted-foreground">
@@ -631,7 +637,7 @@ export function ManualProjectConfigurator({
     const watchedEnvVars = form.watch('environmentVariables') || []
     const selectedDatabases = (form.watch('storageServices') || [])
       .map((serviceId) =>
-        existingServices?.find((service) => service.id === serviceId)
+        availableServices.find((service) => service.id === serviceId)
       )
       .filter((service): service is ExternalServiceInfo => Boolean(service))
       .map((service) => ({
@@ -946,21 +952,19 @@ export function ManualProjectConfigurator({
         serviceType={selectedServiceType || 'postgres'}
         onSuccess={(service: ExternalServiceInfo) => {
           setIsCreateServiceDialogOpen(false)
-          setNewlyCreatedServiceIds((prev) => [...prev, service.id])
-          // Track the service type from the selected type
-          if (selectedServiceType) {
-            setNewlyCreatedServiceTypes((prev) => [
-              ...prev,
-              selectedServiceType,
-            ])
-          }
+          setNewlyCreatedServices((previousServices) =>
+            previousServices.some((item) => item.id === service.id)
+              ? previousServices
+              : [...previousServices, service]
+          )
           setSelectedServiceType(null)
           // Automatically add the newly created service to the form selection
           const currentServices = form.getValues('storageServices') || []
-          form.setValue('storageServices', [...currentServices, service.id])
-          setTimeout(() => {
-            refetchServices()
-          }, 100)
+          form.setValue(
+            'storageServices',
+            Array.from(new Set([...currentServices, service.id]))
+          )
+          void refetchServices()
           toast.success(`Database "${service.name}" created successfully!`)
         }}
       />

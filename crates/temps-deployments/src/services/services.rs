@@ -141,6 +141,57 @@ pub struct RepoReference {
     pub branch: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeploymentAssetOrigin {
+    deployment_id: i32,
+    environment_id: i32,
+    slug: String,
+}
+
+/// Resolve the immutable build artifact behind a deployment. Promotion and
+/// rollback rows may already reference an earlier source, so propagating the
+/// immediate row would lose assets after the second hop.
+fn canonical_deployment_asset_origin(
+    deployment_id: i32,
+    environment_id: i32,
+    slug: &str,
+    context: Option<&serde_json::Value>,
+) -> DeploymentAssetOrigin {
+    let source_deployment_id = context
+        .and_then(|value| value.get("source_deployment_id"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let source_environment_id = context
+        .and_then(|value| value.get("source_environment_id"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let source_slug = context
+        .and_then(|value| value.get("source_deployment_slug"))
+        .and_then(serde_json::Value::as_str);
+
+    match (source_deployment_id, source_environment_id, source_slug) {
+        (Some(deployment_id), Some(environment_id), Some(slug)) => DeploymentAssetOrigin {
+            deployment_id,
+            environment_id,
+            slug: slug.to_string(),
+        },
+        _ => DeploymentAssetOrigin {
+            deployment_id,
+            environment_id,
+            slug: slug.to_string(),
+        },
+    }
+}
+
+fn deployment_asset_origin(deployment: &deployments::Model) -> DeploymentAssetOrigin {
+    canonical_deployment_asset_origin(
+        deployment.id,
+        deployment.environment_id,
+        &deployment.slug,
+        deployment.context_vars.as_ref(),
+    )
+}
+
 #[derive(Clone)]
 pub struct DeploymentService {
     db: Arc<temps_database::DbConnection>,
@@ -2001,6 +2052,7 @@ impl DeploymentService {
 
         let rollback_slug = format!("{}-{}", project.slug, deployment_number);
 
+        let rollback_asset_origin = deployment_asset_origin(&target_deployment);
         let rollback_metadata = DeploymentMetadata {
             is_rollback: true,
             rolled_back_from_id: Some(deployment_id),
@@ -2030,7 +2082,9 @@ impl DeploymentService {
             cancelled_reason: Set(None),
             context_vars: Set(Some(serde_json::json!({
                 "trigger": "rollback",
-                "source_deployment_id": deployment_id,
+                "source_deployment_id": rollback_asset_origin.deployment_id,
+                "source_deployment_slug": rollback_asset_origin.slug.clone(),
+                "source_environment_id": rollback_asset_origin.environment_id,
             }))),
             deployment_config: Set(target_deployment.deployment_config.clone()),
             promoted_from_deployment_id: Set(None),
@@ -2226,6 +2280,17 @@ impl DeploymentService {
 
             // Step 1: Execute DeployImageJob with external image
             // Use the NEW rollback slug as the container name (not the old deployment's slug)
+            let exposed_port = environment
+                .deployment_config
+                .as_ref()
+                .and_then(|config| config.exposed_port)
+                .or_else(|| {
+                    project
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.exposed_port)
+                })
+                .unwrap_or(3000) as u32;
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
@@ -2248,19 +2313,7 @@ impl DeploymentService {
                         })
                         .unwrap_or(1),
                 )
-                .port(
-                    environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|c| c.exposed_port)
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|c| c.exposed_port)
-                        })
-                        .unwrap_or(3000) as u32,
-                )
+                .port(exposed_port)
                 .log_id(deploy_log_id.clone())
                 .log_service(self.log_service.clone());
 
@@ -2291,7 +2344,7 @@ impl DeploymentService {
             // CRON_SECRET, OTEL_*) instead of nothing. Without this, a rollback
             // reuses the image but starts it unconfigured.
             let resolved_env = if let Some(resolver) = self.env_resolver.get() {
-                resolver
+                let mut resolved = resolver
                     .resolve(&project, &environment, &rollback_deployment)
                     .await
                     .map_err(|e| {
@@ -2299,7 +2352,15 @@ impl DeploymentService {
                             "Failed to resolve environment variables for rollback in environment {}: {}",
                             environment_id, e
                         ))
-                    })?
+                    })?;
+                crate::services::env_resolver::apply_deployment_owned_variables(
+                    &mut resolved,
+                    project.preset,
+                    &rollback_asset_origin.slug,
+                    (project.preset != temps_entities::preset::Preset::DockerCompose)
+                        .then_some(exposed_port),
+                );
+                resolved
             } else {
                 tracing::warn!(
                     "Rollback: env resolver not wired — rolled-back container starts with no resolved env vars"
@@ -2696,6 +2757,7 @@ impl DeploymentService {
             )
         });
 
+        let promotion_asset_origin = deployment_asset_origin(&source);
         let new_deployment = deployments::ActiveModel {
             id: sea_orm::NotSet,
             project_id: Set(project_id),
@@ -2719,8 +2781,9 @@ impl DeploymentService {
             cancelled_reason: Set(None),
             context_vars: Set(Some(serde_json::json!({
                 "trigger": "promotion",
-                "source_deployment_id": source_deployment_id,
-                "source_environment_id": source.environment_id,
+                "source_deployment_id": promotion_asset_origin.deployment_id,
+                "source_deployment_slug": promotion_asset_origin.slug.clone(),
+                "source_environment_id": promotion_asset_origin.environment_id,
             }))),
             deployment_config: Set(deployment_config_snapshot),
             promoted_from_deployment_id: Set(Some(source_deployment_id)),
@@ -2897,6 +2960,17 @@ impl DeploymentService {
             info!("Promotion: Deploying image: {}", image_name);
 
             // Execute DeployImageJob with external image
+            let exposed_port = target_env
+                .deployment_config
+                .as_ref()
+                .and_then(|config| config.exposed_port)
+                .or_else(|| {
+                    project
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.exposed_port)
+                })
+                .unwrap_or(3000) as u32;
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
@@ -2919,19 +2993,7 @@ impl DeploymentService {
                         })
                         .unwrap_or(1),
                 )
-                .port(
-                    target_env
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|c| c.exposed_port)
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|c| c.exposed_port)
-                        })
-                        .unwrap_or(3000) as u32,
-                )
+                .port(exposed_port)
                 .log_id(deploy_log_id.clone())
                 .log_service(self.log_service.clone());
 
@@ -2958,7 +3020,7 @@ impl DeploymentService {
             // TEMPS_API_TOKEN/URL, CRON_SECRET, OTEL_*) instead of nothing.
             // Without this, promotion reuses the image but starts it unconfigured.
             let resolved_env = if let Some(resolver) = self.env_resolver.get() {
-                resolver
+                let mut resolved = resolver
                     .resolve(&project, &target_env, &promoted_deployment)
                     .await
                     .map_err(|e| {
@@ -2966,7 +3028,15 @@ impl DeploymentService {
                             "Failed to resolve environment variables for promotion to environment {}: {}",
                             target_environment_id, e
                         ))
-                    })?
+                    })?;
+                crate::services::env_resolver::apply_deployment_owned_variables(
+                    &mut resolved,
+                    project.preset,
+                    &promotion_asset_origin.slug,
+                    (project.preset != temps_entities::preset::Preset::DockerCompose)
+                        .then_some(exposed_port),
+                );
+                resolved
             } else {
                 tracing::warn!(
                     "Promotion: env resolver not wired — promoted container starts with no resolved env vars"
@@ -4884,6 +4954,45 @@ mod tests {
                 Err(DeploymentError::InvalidBundlePath { .. })
             ));
         }
+    }
+
+    #[test]
+    fn deployment_asset_origin_stays_canonical_across_reuse_hops() {
+        let first_reuse_context = serde_json::json!({
+            "source_deployment_id": 10,
+            "source_environment_id": 20,
+            "source_deployment_slug": "original-build",
+        });
+
+        let origin = canonical_deployment_asset_origin(
+            30,
+            40,
+            "first-promotion",
+            Some(&first_reuse_context),
+        );
+        assert_eq!(
+            origin,
+            DeploymentAssetOrigin {
+                deployment_id: 10,
+                environment_id: 20,
+                slug: "original-build".to_string(),
+            }
+        );
+
+        let second_reuse_context = serde_json::json!({
+            "source_deployment_id": origin.deployment_id,
+            "source_environment_id": origin.environment_id,
+            "source_deployment_slug": origin.slug.clone(),
+        });
+        assert_eq!(
+            canonical_deployment_asset_origin(
+                50,
+                60,
+                "second-promotion",
+                Some(&second_reuse_context),
+            ),
+            origin
+        );
     }
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{

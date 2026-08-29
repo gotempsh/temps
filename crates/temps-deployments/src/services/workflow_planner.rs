@@ -746,7 +746,9 @@ impl WorkflowPlanner {
 
             // Use commit SHA as service version when available
             if let Some(ref commit_sha) = deployment.commit_sha {
-                env_vars_map.insert("OTEL_SERVICE_VERSION".to_string(), commit_sha.clone());
+                env_vars_map
+                    .entry("OTEL_SERVICE_VERSION".to_string())
+                    .or_insert_with(|| commit_sha.clone());
             }
 
             debug!(
@@ -1335,17 +1337,28 @@ impl WorkflowPlanner {
             );
         }
 
-        // Inject TEMPS_ASSET_PREFIX for stale-chunk prevention.
+        // Inject deployment-owned runtime variables for stale-chunk prevention
+        // and a deterministic default port. Source-specific planners may
+        // replace PORT later after inspecting an external image.
         // Frameworks can use this to namespace static assets per deployment:
         //   Next.js: assetPrefix: process.env.NEXT_PUBLIC_TEMPS_ASSET_PREFIX || ''
         //   Vite:    base: process.env.TEMPS_ASSET_PREFIX || '/'
         // The value is the deployment slug, which is unique and URL-safe.
-        let asset_prefix = format!("/_temps/assets/{}", deployment.slug);
-        env_vars.insert("TEMPS_ASSET_PREFIX".to_string(), asset_prefix.clone());
-        // NEXT_PUBLIC_ prefix makes it available at build time in Next.js client bundles
-        if project.preset == temps_entities::preset::Preset::NextJs {
-            env_vars.insert("NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string(), asset_prefix);
-        }
+        let default_port = if project.preset == temps_entities::preset::Preset::DockerCompose {
+            None
+        } else {
+            Some(
+                self.resolve_exposed_port(environment, project, None)
+                    .await
+                    .into(),
+            )
+        };
+        super::env_resolver::apply_deployment_owned_variables(
+            &mut env_vars,
+            project.preset,
+            &deployment.slug,
+            default_port,
+        );
 
         debug!(
             "📦 Gathered {} environment variables for deployment",

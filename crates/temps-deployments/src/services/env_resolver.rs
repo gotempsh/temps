@@ -19,11 +19,12 @@ use std::sync::Arc;
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use temps_core::EncryptionService;
-use temps_entities::{deployments, environments, projects};
+use temps_entities::{deployments, environments, preset::Preset, projects};
 use tracing::{debug, info};
 
 use super::deployment_token_service::DeploymentTokenService;
 use super::managed_environment_variables::{public_sentry_dsn_var, public_sentry_tunnel_var};
+use super::workflow_planner::SecretsResolverSlot;
 
 /// Build the OpenTelemetry SDK header-list value for a deployed project.
 ///
@@ -70,6 +71,25 @@ pub(super) fn merge_environment_variable_layers(
     resolved.extend(explicit_project_vars);
 }
 
+/// Apply values owned by the deployment runtime after every tenant-controlled
+/// layer has been resolved. These keys must behave identically for normal,
+/// promoted, and rolled-back deployments.
+pub(super) fn apply_deployment_owned_variables(
+    resolved: &mut HashMap<String, String>,
+    preset: Preset,
+    deployment_slug: &str,
+    exposed_port: Option<u32>,
+) {
+    let asset_prefix = format!("/_temps/assets/{deployment_slug}");
+    if let Some(exposed_port) = exposed_port {
+        resolved.insert("PORT".to_string(), exposed_port.to_string());
+    }
+    resolved.insert("TEMPS_ASSET_PREFIX".to_string(), asset_prefix.clone());
+    if preset == Preset::NextJs {
+        resolved.insert("NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string(), asset_prefix);
+    }
+}
+
 /// Resolves the full environment-variable map for a `(project, environment,
 /// deployment)`. Holds the six services the resolution needs; cheap to clone
 /// (every field is an `Arc`).
@@ -81,6 +101,7 @@ pub struct DeploymentEnvResolver {
     pub external_service_manager: Arc<temps_providers::ExternalServiceManager>,
     pub dsn_service: Arc<temps_error_tracking::DSNService>,
     pub deployment_token_service: Arc<DeploymentTokenService>,
+    pub secrets_resolver: SecretsResolverSlot,
 }
 
 impl DeploymentEnvResolver {
@@ -233,6 +254,53 @@ impl DeploymentEnvResolver {
             linked_service_vars,
             explicit_project_vars,
         );
+
+        // Secrets-manager bindings are operator-controlled and therefore
+        // override linked-service defaults and explicit project variables.
+        // Platform-owned values are injected after this layer and remain
+        // authoritative. Resolution is fail-closed: a deployment must never
+        // continue with silently missing secrets.
+        let maybe_secrets_resolver = {
+            let guard = self.secrets_resolver.read().await;
+            guard.as_ref().cloned()
+        };
+        if let Some(secrets_resolver) = maybe_secrets_resolver {
+            let secret_bindings = secrets_resolver
+                .resolve_secrets_for_deployment(project.id, environment.id)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Secrets-manager resolution failed for project {} environment {}: {}. \
+                         The deployment cannot proceed. Verify provider connectivity and credentials.",
+                        project.id,
+                        environment.id,
+                        error
+                    )
+                })?;
+
+            info!(
+                "Resolved {} secret(s) for project {} environment {}: [{}]",
+                secret_bindings.len(),
+                project.id,
+                environment.id,
+                secret_bindings
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            for key in secret_bindings.keys() {
+                if env_vars_map.contains_key(key) {
+                    tracing::warn!(
+                        "Secrets binding overwrites existing env var '{}' for project {} environment {}",
+                        key,
+                        project.id,
+                        environment.id,
+                    );
+                }
+            }
+            env_vars_map.extend(secret_bindings);
+        }
 
         // 3. Get or create Sentry DSN for error tracking
         // Generate/fetch DSN for this project/environment combination
@@ -399,13 +467,24 @@ impl DeploymentEnvResolver {
 
             // Use commit SHA as service version when available
             if let Some(ref commit_sha) = deployment.commit_sha {
-                env_vars_map.insert("OTEL_SERVICE_VERSION".to_string(), commit_sha.clone());
+                env_vars_map
+                    .entry("OTEL_SERVICE_VERSION".to_string())
+                    .or_insert_with(|| commit_sha.clone());
             }
 
             debug!(
                 "Set OTEL_EXPORTER_OTLP_ENDPOINT for project {} environment {}",
                 project.id, environment.id
             );
+        }
+
+        // Release identity is a platform-provided default, but advanced users
+        // may supply a semantic release name. Keep the explicit/secret value
+        // when present, matching the normal Git and image planners.
+        if let Some(ref commit_sha) = deployment.commit_sha {
+            env_vars_map
+                .entry("SENTRY_RELEASE".to_string())
+                .or_insert_with(|| commit_sha.clone());
         }
 
         info!(
@@ -421,7 +500,11 @@ impl DeploymentEnvResolver {
 mod tests {
     use std::collections::HashMap;
 
-    use super::{merge_environment_variable_layers, otel_exporter_headers};
+    use temps_entities::preset::Preset;
+
+    use super::{
+        apply_deployment_owned_variables, merge_environment_variable_layers, otel_exporter_headers,
+    };
 
     #[test]
     fn explicit_project_vars_override_linked_service_defaults() {
@@ -472,6 +555,56 @@ mod tests {
         assert_eq!(
             resolved.get("SENTRY_DSN").map(String::as_str),
             Some("https://temps-managed.example/2")
+        );
+    }
+
+    #[test]
+    fn deployment_owned_vars_override_tenant_layers() {
+        let mut resolved = HashMap::from([
+            ("PORT".to_string(), "9999".to_string()),
+            (
+                "TEMPS_ASSET_PREFIX".to_string(),
+                "/tenant-controlled".to_string(),
+            ),
+            (
+                "NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string(),
+                "/tenant-controlled".to_string(),
+            ),
+        ]);
+
+        apply_deployment_owned_variables(&mut resolved, Preset::NextJs, "deploy-abc", Some(3000));
+
+        assert_eq!(resolved.get("PORT").map(String::as_str), Some("3000"));
+        assert_eq!(
+            resolved.get("TEMPS_ASSET_PREFIX").map(String::as_str),
+            Some("/_temps/assets/deploy-abc")
+        );
+        assert_eq!(
+            resolved
+                .get("NEXT_PUBLIC_TEMPS_ASSET_PREFIX")
+                .map(String::as_str),
+            Some("/_temps/assets/deploy-abc")
+        );
+    }
+
+    #[test]
+    fn compose_deployments_do_not_receive_a_global_port() {
+        let mut resolved = HashMap::from([("PORT".to_string(), "service-owned".to_string())]);
+
+        apply_deployment_owned_variables(
+            &mut resolved,
+            Preset::DockerCompose,
+            "deploy-compose",
+            None,
+        );
+
+        assert_eq!(
+            resolved.get("PORT").map(String::as_str),
+            Some("service-owned")
+        );
+        assert_eq!(
+            resolved.get("TEMPS_ASSET_PREFIX").map(String::as_str),
+            Some("/_temps/assets/deploy-compose")
         );
     }
 

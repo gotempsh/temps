@@ -151,7 +151,7 @@ pub fn managed_environment_variables(preset: Preset) -> Vec<ManagedEnvironmentVa
             "SENTRY_RELEASE",
             ErrorTracking,
             false,
-            false,
+            true,
             "Deployment commit, tag, or image version when available.",
         ),
         variable(
@@ -209,13 +209,6 @@ pub fn managed_environment_variables(preset: Preset) -> Vec<ManagedEnvironmentVa
             false,
             true,
             "Default bind address for the deployed application.",
-        ),
-        variable(
-            "PORT",
-            Temps,
-            false,
-            false,
-            "Container port selected from the project deployment configuration.",
         ),
         variable(
             "TEMPS_ASSET_PREFIX",
@@ -277,10 +270,20 @@ pub fn managed_environment_variables(preset: Preset) -> Vec<ManagedEnvironmentVa
             "OTEL_SERVICE_VERSION",
             OpenTelemetry,
             false,
-            false,
+            true,
             "Deployment commit, tag, or image version when available.",
         ),
     ]);
+
+    if preset != Preset::DockerCompose {
+        variables.push(variable(
+            "PORT",
+            Temps,
+            false,
+            false,
+            "Container port selected from the project deployment configuration.",
+        ));
+    }
 
     if preset == Preset::NextJs {
         variables.push(variable(
@@ -329,6 +332,17 @@ mod tests {
     }
 
     #[test]
+    fn compose_catalog_does_not_claim_a_global_port() {
+        let names = managed_environment_variables(Preset::DockerCompose)
+            .into_iter()
+            .map(|variable| variable.name)
+            .collect::<Vec<_>>();
+
+        assert!(!names.contains(&"PORT".to_string()));
+        assert!(names.contains(&"TEMPS_ASSET_PREFIX".to_string()));
+    }
+
+    #[test]
     fn only_credentials_are_marked_secret() {
         let variables = managed_environment_variables(Preset::NextJs);
         let secrets = variables
@@ -359,11 +373,13 @@ mod tests {
         assert_eq!(
             overridable,
             vec![
+                "SENTRY_RELEASE",
                 "SENTRY_URL",
                 "SENTRY_AUTH_TOKEN",
                 "SENTRY_ORG",
                 "SENTRY_PROJECT",
-                "HOST"
+                "HOST",
+                "OTEL_SERVICE_VERSION"
             ]
         );
     }

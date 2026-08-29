@@ -444,11 +444,22 @@ fn should_redirect_to_https(
     env_force_https.unwrap_or_else(host_has_cert)
 }
 
-fn deployment_asset_path_matches(
-    current_deployment_slug: Option<&str>,
+fn deployment_asset_scope(
+    current_deployment_slug: &str,
+    current_environment_id: i32,
+    current_deployment_id: i32,
+    source_deployment_slug: Option<&str>,
+    source_environment_id: Option<i32>,
+    source_deployment_id: Option<i32>,
     requested_deployment_slug: &str,
-) -> bool {
-    current_deployment_slug == Some(requested_deployment_slug)
+) -> Option<(i32, i32)> {
+    if current_deployment_slug == requested_deployment_slug {
+        return Some((current_environment_id, current_deployment_id));
+    }
+
+    (source_deployment_slug == Some(requested_deployment_slug))
+        .then(|| Some((source_environment_id?, source_deployment_id?)))
+        .flatten()
 }
 
 fn inherited_https_policy(production_https: bool, host_has_cert: bool) -> bool {
@@ -491,15 +502,40 @@ fn should_apply_production_https_default(
 #[cfg(test)]
 mod deployment_asset_scope_tests {
     use super::{
-        deployment_asset_path_matches, inherited_https_policy,
-        should_apply_production_https_default, should_redirect_to_https,
+        deployment_asset_scope, inherited_https_policy, should_apply_production_https_default,
+        should_redirect_to_https,
     };
 
     #[test]
-    fn prefixed_asset_must_name_the_current_deployment() {
-        assert!(deployment_asset_path_matches(Some("deploy-a"), "deploy-a"));
-        assert!(!deployment_asset_path_matches(Some("deploy-a"), "deploy-b"));
-        assert!(!deployment_asset_path_matches(None, "deploy-a"));
+    fn prefixed_asset_resolves_current_or_reused_source_artifact() {
+        assert_eq!(
+            deployment_asset_scope("deploy-a", 10, 20, None, None, None, "deploy-a"),
+            Some((10, 20))
+        );
+        assert_eq!(
+            deployment_asset_scope(
+                "promoted-b",
+                11,
+                21,
+                Some("deploy-a"),
+                Some(10),
+                Some(20),
+                "deploy-a",
+            ),
+            Some((10, 20))
+        );
+        assert_eq!(
+            deployment_asset_scope(
+                "promoted-b",
+                11,
+                21,
+                Some("deploy-a"),
+                Some(10),
+                Some(20),
+                "unknown",
+            ),
+            None
+        );
     }
 
     #[test]
@@ -2306,6 +2342,7 @@ impl LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         url_path: &str,
+        source_scope: Option<(i32, i32)>,
     ) -> Result<bool> {
         // Apply the static-file publication policy only to CAS serving. Invalid
         // container routes still fall through to their upstream unchanged.
@@ -2320,7 +2357,9 @@ impl LoadBalancer {
 
         let scope = match (&ctx.project, &ctx.environment, &ctx.deployment) {
             (Some(project), Some(environment), Some(deployment)) => {
-                (project.id, environment.id, deployment.id)
+                let (environment_id, deployment_id) =
+                    source_scope.unwrap_or((environment.id, deployment.id));
+                (project.id, environment_id, deployment_id)
             }
             _ => return Ok(false),
         };
@@ -5026,16 +5065,35 @@ impl ProxyHttp for LoadBalancer {
             if let Some(slash_pos) = after_prefix.find('/') {
                 let deployment_slug = &after_prefix[..slash_pos];
                 let asset_path = after_prefix[slash_pos + 1..].to_string();
-                if deployment_asset_path_matches(
-                    ctx.deployment
-                        .as_ref()
-                        .map(|deployment| deployment.slug.as_str()),
-                    deployment_slug,
-                ) && Self::is_cacheable_static_asset(&asset_path)
-                {
-                    if let Ok(true) = self.serve_asset_from_store(session, ctx, &asset_path).await {
-                        ctx.routing_status = "prefixed_asset".to_string();
-                        return Ok(true);
+                let asset_scope = ctx.deployment.as_ref().and_then(|deployment| {
+                    let context = deployment.context_vars.as_ref();
+                    deployment_asset_scope(
+                        &deployment.slug,
+                        deployment.environment_id,
+                        deployment.id,
+                        context
+                            .and_then(|value| value.get("source_deployment_slug"))
+                            .and_then(serde_json::Value::as_str),
+                        context
+                            .and_then(|value| value.get("source_environment_id"))
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        context
+                            .and_then(|value| value.get("source_deployment_id"))
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        deployment_slug,
+                    )
+                });
+                if Self::is_cacheable_static_asset(&asset_path) {
+                    if let Some(asset_scope) = asset_scope {
+                        if let Ok(true) = self
+                            .serve_asset_from_store(session, ctx, &asset_path, Some(asset_scope))
+                            .await
+                        {
+                            ctx.routing_status = "prefixed_asset".to_string();
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -5051,7 +5109,10 @@ impl ProxyHttp for LoadBalancer {
                 .await
         {
             let url_path = ctx.path.trim_start_matches('/').to_string();
-            if let Ok(true) = self.serve_asset_from_store(session, ctx, &url_path).await {
+            if let Ok(true) = self
+                .serve_asset_from_store(session, ctx, &url_path, None)
+                .await
+            {
                 ctx.routing_status = "stale_chunk_fallback".to_string();
                 return Ok(true);
             }

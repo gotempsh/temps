@@ -13,7 +13,6 @@ import {
   createProjectFromTemplateMutation,
   listConnectionsOptions,
   listGitProvidersOptions,
-  listServicesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import type {
   CreatableServiceTypeRoute,
@@ -79,7 +78,12 @@ import {
   isTempsManagedProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
 } from '@/lib/project-environment-variables'
-import { getTemplateServiceRequirements } from '@/lib/template-service-requirements'
+import {
+  getTemplateServiceRequirements,
+  normalizeTemplateServiceType,
+  toggleDatabaseSelection,
+} from '@/lib/template-service-requirements'
+import { useAllServices } from '@/hooks/useAllServices'
 import {
   AlertCircle,
   Building2,
@@ -230,9 +234,12 @@ export function TemplateConfigurator({
     gitProviders?.find((p) => p.id === conn.provider_id)?.provider_type
 
   // Fetch existing services
-  const { data: existingServices, refetch: refetchServices } = useQuery({
-    ...listServicesOptions({}),
-  })
+  const {
+    data: existingServices,
+    isPending: isLoadingServices,
+    isError: isServicesError,
+    refetch: refetchServices,
+  } = useAllServices()
   const availableServices = useMemo(() => {
     const servicesById = new Map<number, ExternalServiceInfo>()
     existingServices?.forEach((service) =>
@@ -359,13 +366,17 @@ export function TemplateConfigurator({
     if (template.services.length === 0) return
     if ((form.getValues('storageServices') || []).length > 0) return
 
-    const wanted = new Set(template.services.map((s) => s.toLowerCase()))
+    const wanted = new Set(
+      template.services.map((serviceType) =>
+        normalizeTemplateServiceType(serviceType)
+      )
+    )
     const matchIds: number[] = []
     for (const required of wanted) {
       // First existing service whose type matches the required engine.
       const match = availableServices.find(
         (svc: ExternalServiceInfo) =>
-          svc.service_type.toLowerCase() === required &&
+          normalizeTemplateServiceType(svc.service_type) === required &&
           !matchIds.includes(svc.id)
       )
       if (match) matchIds.push(match.id)
@@ -463,19 +474,32 @@ export function TemplateConfigurator({
   const handleServiceToggle = useCallback(
     (serviceId: number) => {
       const currentServices = form.getValues('storageServices') || []
-      const isSelected = currentServices.includes(serviceId)
-      form.setValue(
-        'storageServices',
-        isSelected
-          ? currentServices.filter((id) => id !== serviceId)
-          : [...currentServices, serviceId]
+      const result = toggleDatabaseSelection(
+        currentServices,
+        serviceId,
+        availableServices
       )
+      if (result.conflictingService) {
+        toast.error('A compatible database is already selected', {
+          description: `${result.conflictingService.name} already provides this database variable namespace. Deselect it first.`,
+        })
+        return
+      }
+      form.setValue('storageServices', result.selectedServiceIds)
     },
-    [form]
+    [form, availableServices]
   )
 
   // Form submission
   const handleSubmit = async (data: FormValues) => {
+    if (isLoadingServices) {
+      toast.error('Wait for the database list to finish loading.')
+      return
+    }
+    if (isServicesError) {
+      toast.error('Reload the database list before creating this project.')
+      return
+    }
     const missingServiceRequirements = getTemplateServiceRequirements(
       template.services,
       availableServices,
@@ -1026,142 +1050,201 @@ export function TemplateConfigurator({
                 </div>
                 <DropdownMenu>
                   <DropdownMenuTrigger asChild>
-                    <Button type="button" variant="outline" size="sm">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      disabled={isLoadingServices || isServicesError}
+                    >
                       <Plus className="h-4 w-4 mr-2" />
                       Add Database
                       <ChevronDown className="h-4 w-4 ml-1" />
                     </Button>
                   </DropdownMenuTrigger>
                   <DropdownMenuContent align="end" className="w-64">
-                    {ADD_SERVICE_TYPES.map((type) => (
-                      <DropdownMenuItem
-                        key={type.id}
-                        onClick={() => {
-                          setSelectedServiceType(type.id)
-                          setIsCreateServiceDialogOpen(true)
-                        }}
-                        className="flex items-center gap-3 py-2.5"
-                      >
-                        <ServiceLogo service={type.id} className="h-6 w-6" />
-                        <div className="flex flex-col">
-                          <span className="font-medium">{type.name}</span>
-                          <span className="text-xs text-muted-foreground">
-                            {type.description}
-                          </span>
-                        </div>
-                      </DropdownMenuItem>
-                    ))}
+                    {ADD_SERVICE_TYPES.map((type) => {
+                      const isTypeAlreadySelected = availableServices.some(
+                        (service) =>
+                          watchedServices.includes(service.id) &&
+                          normalizeTemplateServiceType(service.service_type) ===
+                            type.id
+                      )
+                      return (
+                        <DropdownMenuItem
+                          key={type.id}
+                          onClick={() => {
+                            if (isTypeAlreadySelected) {
+                              toast.error(
+                                `A ${type.name} database is already selected`,
+                                {
+                                  description:
+                                    'Deselect it before creating another database of this type.',
+                                }
+                              )
+                              return
+                            }
+                            setSelectedServiceType(type.id)
+                            setIsCreateServiceDialogOpen(true)
+                          }}
+                          className={cn(
+                            'flex items-center gap-3 py-2.5',
+                            isTypeAlreadySelected &&
+                              'cursor-not-allowed opacity-50'
+                          )}
+                        >
+                          <ServiceLogo service={type.id} className="h-6 w-6" />
+                          <div className="flex flex-col">
+                            <span className="font-medium">{type.name}</span>
+                            <span className="text-xs text-muted-foreground">
+                              {type.description}
+                            </span>
+                          </div>
+                        </DropdownMenuItem>
+                      )
+                    })}
                   </DropdownMenuContent>
                 </DropdownMenu>
               </div>
             </CardHeader>
             <CardContent>
-              {serviceRequirements.length > 0 && (
-                <div className="mb-5 space-y-3 rounded-lg border border-primary/25 bg-primary/[0.035] p-4">
-                  <div className="flex items-start gap-3">
-                    <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-primary/25 bg-background">
-                      <Database className="h-4 w-4 text-primary" />
-                    </div>
-                    <div>
-                      <p className="text-sm font-medium">
-                        Required for this template
-                      </p>
-                      <p className="text-xs text-muted-foreground">
-                        Select a compatible database or create one here. Temps
-                        will attach it and inject its connection variables.
-                      </p>
-                    </div>
-                  </div>
-
-                  {serviceRequirements.map((requirement) => (
-                    <div
-                      key={requirement.key}
-                      className="rounded-md border bg-background/80 p-3"
-                    >
-                      <div className="flex flex-wrap items-center gap-2">
-                        {requirement.serviceType ? (
-                          <ServiceLogo
-                            service={requirement.serviceType}
-                            className="h-6 w-6"
-                          />
-                        ) : (
-                          <Database className="h-6 w-6 text-muted-foreground" />
-                        )}
-                        <span className="text-sm font-medium">
-                          {requirement.label}
-                        </span>
-                        <Badge
-                          variant={
-                            requirement.isSatisfied ? 'secondary' : 'outline'
-                          }
-                          className={cn(
-                            'ml-auto',
-                            requirement.isSatisfied &&
-                              'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
-                          )}
-                        >
-                          {requirement.isSatisfied ? 'Selected' : 'Required'}
-                        </Badge>
-                      </div>
-
-                      {requirement.isSatisfied ? (
-                        <div className="mt-3 flex items-center gap-2 text-xs text-emerald-700 dark:text-emerald-300">
-                          <CheckCircle2 className="h-4 w-4" />
-                          <span>
-                            {requirement.selectedServices
-                              .map((service) => service.name)
-                              .join(', ')}{' '}
-                            will be linked automatically.
-                          </span>
-                        </div>
-                      ) : requirement.availableServices.length > 0 ? (
-                        <div className="mt-3 space-y-2">
-                          <p className="text-xs text-muted-foreground">
-                            Select an existing {requirement.label} database:
-                          </p>
-                          <div className="flex flex-wrap gap-2">
-                            {requirement.availableServices.map((service) => (
-                              <Button
-                                key={service.id}
-                                type="button"
-                                variant="outline"
-                                size="sm"
-                                onClick={() => handleServiceToggle(service.id)}
-                              >
-                                <CheckCircle2 className="mr-2 h-4 w-4" />
-                                Select {service.name}
-                              </Button>
-                            ))}
-                          </div>
-                        </div>
-                      ) : requirement.serviceType ? (
-                        <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
-                          <p className="text-xs text-muted-foreground">
-                            You do not have a {requirement.label} database yet.
-                          </p>
-                          <Button
-                            type="button"
-                            size="sm"
-                            onClick={() => {
-                              if (!requirement.serviceType) return
-                              setSelectedServiceType(requirement.serviceType)
-                              setIsCreateServiceDialogOpen(true)
-                            }}
-                          >
-                            <Plus className="mr-2 h-4 w-4" />
-                            Create {requirement.label}
-                          </Button>
-                        </div>
-                      ) : (
-                        <p className="mt-3 text-xs text-destructive">
-                          No built-in creator is available for this service
-                          type. Add a compatible service before continuing.
-                        </p>
-                      )}
-                    </div>
-                  ))}
+              {isLoadingServices && (
+                <div className="flex items-center gap-2 rounded-md border p-4 text-sm text-muted-foreground">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  Loading available databases…
                 </div>
               )}
+
+              {isServicesError && (
+                <Alert variant="destructive">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription className="flex flex-wrap items-center justify-between gap-3">
+                    <span>
+                      Could not load your databases. Retry before creating or
+                      selecting one to avoid duplicates.
+                    </span>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      onClick={() => void refetchServices()}
+                    >
+                      Retry
+                    </Button>
+                  </AlertDescription>
+                </Alert>
+              )}
+
+              {!isLoadingServices &&
+                !isServicesError &&
+                serviceRequirements.length > 0 && (
+                  <div className="mb-5 space-y-3 rounded-lg border border-primary/25 bg-primary/[0.035] p-4">
+                    <div className="flex items-start gap-3">
+                      <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-md border border-primary/25 bg-background">
+                        <Database className="h-4 w-4 text-primary" />
+                      </div>
+                      <div>
+                        <p className="text-sm font-medium">
+                          Required for this template
+                        </p>
+                        <p className="text-xs text-muted-foreground">
+                          Select a compatible database or create one here. Temps
+                          will attach it and inject its connection variables.
+                        </p>
+                      </div>
+                    </div>
+
+                    {serviceRequirements.map((requirement) => (
+                      <div
+                        key={requirement.key}
+                        className="rounded-md border bg-background/80 p-3"
+                      >
+                        <div className="flex flex-wrap items-center gap-2">
+                          {requirement.serviceType ? (
+                            <ServiceLogo
+                              service={requirement.serviceType}
+                              className="h-6 w-6"
+                            />
+                          ) : (
+                            <Database className="h-6 w-6 text-muted-foreground" />
+                          )}
+                          <span className="text-sm font-medium">
+                            {requirement.label}
+                          </span>
+                          <Badge
+                            variant={
+                              requirement.isSatisfied ? 'secondary' : 'outline'
+                            }
+                            className={cn(
+                              'ml-auto',
+                              requirement.isSatisfied &&
+                                'border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                            )}
+                          >
+                            {requirement.isSatisfied ? 'Selected' : 'Required'}
+                          </Badge>
+                        </div>
+
+                        {requirement.isSatisfied ? (
+                          <div className="mt-3 flex items-center gap-2 text-xs text-emerald-700 dark:text-emerald-300">
+                            <CheckCircle2 className="h-4 w-4" />
+                            <span>
+                              {requirement.selectedServices
+                                .map((service) => service.name)
+                                .join(', ')}{' '}
+                              will be linked automatically.
+                            </span>
+                          </div>
+                        ) : requirement.availableServices.length > 0 ? (
+                          <div className="mt-3 space-y-2">
+                            <p className="text-xs text-muted-foreground">
+                              Select an existing {requirement.label} database:
+                            </p>
+                            <div className="flex flex-wrap gap-2">
+                              {requirement.availableServices.map((service) => (
+                                <Button
+                                  key={service.id}
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  onClick={() =>
+                                    handleServiceToggle(service.id)
+                                  }
+                                >
+                                  <CheckCircle2 className="mr-2 h-4 w-4" />
+                                  Select {service.name}
+                                </Button>
+                              ))}
+                            </div>
+                          </div>
+                        ) : requirement.serviceType ? (
+                          <div className="mt-3 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                            <p className="text-xs text-muted-foreground">
+                              You do not have a {requirement.label} database
+                              yet.
+                            </p>
+                            <Button
+                              type="button"
+                              size="sm"
+                              onClick={() => {
+                                if (!requirement.serviceType) return
+                                setSelectedServiceType(requirement.serviceType)
+                                setIsCreateServiceDialogOpen(true)
+                              }}
+                            >
+                              <Plus className="mr-2 h-4 w-4" />
+                              Create {requirement.label}
+                            </Button>
+                          </div>
+                        ) : (
+                          <p className="mt-3 text-xs text-destructive">
+                            No built-in creator is available for this service
+                            type. Add a compatible service before continuing.
+                          </p>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                )}
 
               {availableServices.length > 0 && (
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
@@ -1170,11 +1253,20 @@ export function TemplateConfigurator({
                     return (
                       <Card
                         key={service.id}
+                        role="checkbox"
+                        tabIndex={0}
+                        aria-checked={isSelected}
                         className={cn(
-                          'cursor-pointer transition-colors hover:bg-muted/50',
+                          'cursor-pointer transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
                           isSelected && 'ring-2 ring-primary'
                         )}
                         onClick={() => handleServiceToggle(service.id)}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter' || event.key === ' ') {
+                            event.preventDefault()
+                            handleServiceToggle(service.id)
+                          }
+                        }}
                       >
                         <CardHeader className="pb-3">
                           <div className="flex items-center gap-3">
@@ -1199,7 +1291,9 @@ export function TemplateConfigurator({
                 </div>
               )}
 
-              {availableServices.length === 0 &&
+              {!isLoadingServices &&
+                !isServicesError &&
+                availableServices.length === 0 &&
                 serviceRequirements.length === 0 && (
                   <div className="text-center py-8">
                     <Database className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
@@ -1574,7 +1668,7 @@ export function TemplateConfigurator({
             'storageServices',
             Array.from(new Set([...currentServices, service.id]))
           )
-          setTimeout(() => refetchServices(), 100)
+          void refetchServices()
           toast.success(`Database "${service.name}" created successfully!`)
         }}
       />

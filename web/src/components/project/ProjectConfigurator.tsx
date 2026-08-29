@@ -10,7 +10,6 @@ import {
   getRepositoryComposeServicesLiveOptions,
   getPublicComposeServicesOptions,
   listPresetsOptions,
-  listServicesOptions,
   revealServiceEnvironmentVariablesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import {
@@ -111,6 +110,11 @@ import {
   isTempsManagedProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
 } from '@/lib/project-environment-variables'
+import {
+  normalizeTemplateServiceType,
+  toggleDatabaseSelection,
+} from '@/lib/template-service-requirements'
+import { useAllServices } from '@/hooks/useAllServices'
 
 // Derives a browsable repo URL from whatever the API gave us. clone_url is an
 // HTTPS URL (possibly `.git`-suffixed) for connected providers, but for the
@@ -629,8 +633,8 @@ export function ProjectConfigurator({
   const [isImportEnvOpen, setIsImportEnvOpen] = useState(false)
   const [providedEnvironmentVariables, setProvidedEnvironmentVariables] =
     useState<ProvidedEnvironmentVariableCollision[]>([])
-  const [newlyCreatedServiceIds, setNewlyCreatedServiceIds] = useState<
-    number[]
+  const [newlyCreatedServices, setNewlyCreatedServices] = useState<
+    ExternalServiceInfo[]
   >([])
   const [allowDirectoryOverride, setAllowDirectoryOverride] = useState(false)
 
@@ -654,9 +658,17 @@ export function ProjectConfigurator({
   })
 
   // Fetch existing services
-  const { data: existingServices, refetch: refetchServices } = useQuery({
-    ...listServicesOptions({}),
-  })
+  const { data: existingServices, refetch: refetchServices } = useAllServices()
+  const availableServices = useMemo(() => {
+    const servicesById = new Map<number, ExternalServiceInfo>()
+    existingServices?.forEach((service) =>
+      servicesById.set(service.id, service)
+    )
+    newlyCreatedServices.forEach((service) =>
+      servicesById.set(service.id, service)
+    )
+    return Array.from(servicesById.values())
+  }, [existingServices, newlyCreatedServices])
 
   // Platform settings provide `preview_domain` / `external_url`, which drive
   // the suggested "this project's URL" option offered for *_URL vars in the
@@ -1100,13 +1112,20 @@ export function ProjectConfigurator({
   const handleServiceToggle = useCallback(
     (serviceId: number) => {
       const currentServices = form.getValues('storageServices') || []
-      const isSelected = currentServices.includes(serviceId)
-      const newValues = isSelected
-        ? currentServices.filter((id) => id !== serviceId)
-        : [...currentServices, serviceId]
-      form.setValue('storageServices', newValues)
+      const result = toggleDatabaseSelection(
+        currentServices,
+        serviceId,
+        availableServices
+      )
+      if (result.conflictingService) {
+        toast.error('A compatible database is already selected', {
+          description: `${result.conflictingService.name} already provides this database variable namespace. Deselect it first.`,
+        })
+        return
+      }
+      form.setValue('storageServices', result.selectedServiceIds)
     },
-    [form]
+    [form, availableServices]
   )
 
   // Handle form submission
@@ -1116,18 +1135,15 @@ export function ProjectConfigurator({
     try {
       setIsSubmitting(true)
 
-      // Remove duplicates from service IDs (newly created services are already in data.storageServices)
-      const allServiceIds = Array.from(
-        new Set([...(data.storageServices || []), ...newlyCreatedServiceIds])
-      )
-
       // Extract just the preset name from "preset::path" format for backend
       const [presetName] = data.preset.split('::')
 
       const finalData = {
         ...data,
         preset: presetName, // Use only the preset name, not the full "preset::path"
-        storageServices: allServiceIds,
+        // The visible selection is authoritative. A newly created database
+        // can be deselected before project submission.
+        storageServices: Array.from(new Set(data.storageServices || [])),
       }
 
       if (onSubmit) {
@@ -1500,24 +1516,42 @@ export function ProjectConfigurator({
         </Button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="end" className="w-64">
-        {ADD_SERVICE_TYPES.map((type) => (
-          <DropdownMenuItem
-            key={type.id}
-            onClick={() => {
-              setSelectedServiceType(type.id)
-              setIsCreateServiceDialogOpen(true)
-            }}
-            className="flex items-center gap-3 py-2.5"
-          >
-            <ServiceLogo service={type.id} className="h-6 w-6" />
-            <div className="flex flex-col">
-              <span className="font-medium">{type.name}</span>
-              <span className="text-xs text-muted-foreground">
-                {type.description}
-              </span>
-            </div>
-          </DropdownMenuItem>
-        ))}
+        {ADD_SERVICE_TYPES.map((type) => {
+          const selectedIds = form.getValues('storageServices') || []
+          const isTypeAlreadySelected = availableServices.some(
+            (service) =>
+              selectedIds.includes(service.id) &&
+              normalizeTemplateServiceType(service.service_type) === type.id
+          )
+          return (
+            <DropdownMenuItem
+              key={type.id}
+              onClick={() => {
+                if (isTypeAlreadySelected) {
+                  toast.error(`A ${type.name} database is already selected`, {
+                    description:
+                      'Deselect it before creating another database of this type.',
+                  })
+                  return
+                }
+                setSelectedServiceType(type.id)
+                setIsCreateServiceDialogOpen(true)
+              }}
+              className={cn(
+                'flex items-center gap-3 py-2.5',
+                isTypeAlreadySelected && 'cursor-not-allowed opacity-50'
+              )}
+            >
+              <ServiceLogo service={type.id} className="h-6 w-6" />
+              <div className="flex flex-col">
+                <span className="font-medium">{type.name}</span>
+                <span className="text-xs text-muted-foreground">
+                  {type.description}
+                </span>
+              </div>
+            </DropdownMenuItem>
+          )
+        })}
       </DropdownMenuContent>
     </DropdownMenu>
   )
@@ -1529,20 +1563,29 @@ export function ProjectConfigurator({
 
     return (
       <div className="space-y-4">
-        {existingServices && existingServices.length > 0 && (
+        {availableServices.length > 0 && (
           <div>
             <h4 className="text-sm font-medium mb-3">Existing Databases</h4>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
-              {existingServices.map((service) => {
+              {availableServices.map((service) => {
                 const isSelected = watchedServices.includes(service.id)
                 return (
                   <Card
                     key={service.id}
+                    role="checkbox"
+                    tabIndex={0}
+                    aria-checked={isSelected}
                     className={cn(
-                      'cursor-pointer transition-colors hover:bg-muted/50',
+                      'cursor-pointer transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2',
                       isSelected && 'ring-2 ring-primary'
                     )}
                     onClick={() => handleServiceToggle(service.id)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' || event.key === ' ') {
+                        event.preventDefault()
+                        handleServiceToggle(service.id)
+                      }
+                    }}
                   >
                     <CardHeader className="pb-3">
                       <div className="flex items-center justify-between">
@@ -1570,18 +1613,29 @@ export function ProjectConfigurator({
           </div>
         )}
 
-        {newlyCreatedServiceIds.length > 0 && (
+        {newlyCreatedServices.some((service) =>
+          watchedServices.includes(service.id)
+        ) && (
           <Alert>
             <AlertCircle className="h-4 w-4" />
             <AlertDescription>
-              {newlyCreatedServiceIds.length} new database
-              {newlyCreatedServiceIds.length > 1 ? 's' : ''} will be linked to
-              this project
+              {
+                newlyCreatedServices.filter((service) =>
+                  watchedServices.includes(service.id)
+                ).length
+              }{' '}
+              new database
+              {newlyCreatedServices.filter((service) =>
+                watchedServices.includes(service.id)
+              ).length > 1
+                ? 's'
+                : ''}{' '}
+              will be linked to this project
             </AlertDescription>
           </Alert>
         )}
 
-        {!existingServices?.length && newlyCreatedServiceIds.length === 0 && (
+        {availableServices.length === 0 && (
           <div className="text-center py-8">
             <Database className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
             <p className="text-sm text-muted-foreground">
@@ -1602,7 +1656,7 @@ export function ProjectConfigurator({
     const watchedEnvVars = form.watch('environmentVariables') || []
     const selectedDatabases = (form.watch('storageServices') || [])
       .map((serviceId) =>
-        existingServices?.find((service) => service.id === serviceId)
+        availableServices.find((service) => service.id === serviceId)
       )
       .filter((service): service is ExternalServiceInfo => Boolean(service))
       .map((service) => ({
@@ -1760,7 +1814,7 @@ export function ProjectConfigurator({
                                 title="Fill from a database connection URL"
                                 disabled={
                                   fillingEnvExampleKey === v.key ||
-                                  (!existingServices?.length &&
+                                  (availableServices.length === 0 &&
                                     !suggestedAppUrl)
                                 }
                               >
@@ -1788,13 +1842,13 @@ export function ProjectConfigurator({
                                       </span>
                                     </div>
                                   </DropdownMenuItem>
-                                  {!!existingServices?.length && (
+                                  {availableServices.length > 0 && (
                                     <DropdownMenuSeparator />
                                   )}
                                 </>
                               )}
-                              {existingServices?.length ? (
-                                existingServices.map((service) => (
+                              {availableServices.length ? (
+                                availableServices.map((service) => (
                                   <DropdownMenuItem
                                     key={service.id}
                                     onClick={() =>
@@ -1992,7 +2046,7 @@ export function ProjectConfigurator({
                             {isConnectionStringKey(
                               watchedEnvVars[index]?.key ?? ''
                             ) &&
-                              (!!existingServices?.length ||
+                              (availableServices.length > 0 ||
                                 !!suggestedAppUrl) && (
                                 <DropdownMenu>
                                   <DropdownMenuTrigger asChild>
@@ -2032,12 +2086,12 @@ export function ProjectConfigurator({
                                             </span>
                                           </div>
                                         </DropdownMenuItem>
-                                        {!!existingServices?.length && (
+                                        {availableServices.length > 0 && (
                                           <DropdownMenuSeparator />
                                         )}
                                       </>
                                     )}
-                                    {existingServices?.map((service) => (
+                                    {availableServices.map((service) => (
                                       <DropdownMenuItem
                                         key={service.id}
                                         onClick={() =>
@@ -2260,13 +2314,18 @@ export function ProjectConfigurator({
           onSuccess={(service: ExternalServiceInfo) => {
             setIsCreateServiceDialogOpen(false)
             setSelectedServiceType(null)
-            setNewlyCreatedServiceIds((prev) => [...prev, service.id])
+            setNewlyCreatedServices((previousServices) =>
+              previousServices.some((item) => item.id === service.id)
+                ? previousServices
+                : [...previousServices, service]
+            )
             // Automatically add the newly created service to the form selection
             const currentServices = form.getValues('storageServices') || []
-            form.setValue('storageServices', [...currentServices, service.id])
-            setTimeout(() => {
-              refetchServices()
-            }, 100)
+            form.setValue(
+              'storageServices',
+              Array.from(new Set([...currentServices, service.id]))
+            )
+            void refetchServices()
             toast.success(`Database "${service.name}" created successfully!`)
           }}
         />
