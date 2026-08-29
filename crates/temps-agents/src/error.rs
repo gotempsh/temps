@@ -78,6 +78,15 @@ pub enum AgentError {
         reason: String,
     },
 
+    #[error(
+        "Sandbox snapshot for {sandbox_id} exceeded the {max_size_bytes} byte limit while {stage}"
+    )]
+    SnapshotSizeLimitExceeded {
+        sandbox_id: String,
+        stage: String,
+        max_size_bytes: u64,
+    },
+
     #[error("Sandbox provider '{provider}' unavailable: {reason}")]
     SandboxProviderUnavailable { provider: String, reason: String },
 

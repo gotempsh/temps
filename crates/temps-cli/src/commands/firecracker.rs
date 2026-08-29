@@ -426,7 +426,7 @@ impl FirecrackerSetupCommand {
         failures += check_kvm_access();
 
         // Required host tooling for rootfs builds (ADR-029 §4)
-        for tool in ["mkfs.ext4", "ip"] {
+        for tool in ["mkfs.ext4", "debugfs", "ip", "bwrap"] {
             match find_in_path(tool) {
                 Some(p) => pass(tool, p.display().to_string()),
                 None => {
@@ -434,10 +434,10 @@ impl FirecrackerSetupCommand {
                         tool,
                         format!(
                             "Not found. Install it (Debian/Ubuntu: `apt install {}`).",
-                            if tool == "mkfs.ext4" {
-                                "e2fsprogs"
-                            } else {
-                                "iproute2"
+                            match tool {
+                                "mkfs.ext4" | "debugfs" => "e2fsprogs",
+                                "bwrap" => "bubblewrap",
+                                _ => "iproute2",
                             }
                         ),
                     );

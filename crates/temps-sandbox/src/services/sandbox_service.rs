@@ -857,28 +857,41 @@ impl SandboxService {
             Some(value) => SandboxLifecycle::parse(value)?,
         };
 
+        if req.from_snapshot_artifact.is_some() && req.source.is_some() {
+            return Err(SandboxError::Validation {
+                message: "source cannot be combined with from_snapshot; the snapshot already owns the workspace contents"
+                    .to_string(),
+            });
+        }
+
         // Resolve the effective seed source before anything is created.
         // An explicit `source` always wins — `project_id` only supplies a
         // default, so a caller can create a workspace attributed to a
         // project while seeding it from a fork or a different branch.
-        let source = match (req.source.clone(), req.project_id) {
-            // Caller-supplied: already validated by the handler, which owns
-            // the request-shape rules too. Re-checking here would duplicate a
-            // DNS lookup on every create for no gain.
-            (Some(explicit), _) => Some(explicit),
-            // Project-derived: the handler never saw this URL, so it is
-            // validated here — the layer that produced it. `projects.git_url`
-            // is checked for IP literals on the project side but never
-            // resolved, so a name pointing at the metadata endpoint would
-            // otherwise pass; and a row predating that guard can still carry
-            // `user:password@`, which would land in `source_repo_url` and be
-            // echoed back out of the API.
-            (None, Some(project_id)) => {
-                let derived = self.source_from_project(project_id).await?;
-                validate_resolved_source(&derived).await?;
-                Some(derived)
+        let source = if req.from_snapshot_artifact.is_some() {
+            // project_id remains valid attribution, but must not implicitly
+            // clone over the workspace restored from the snapshot.
+            None
+        } else {
+            match (req.source.clone(), req.project_id) {
+                // Caller-supplied: already validated by the handler, which owns
+                // the request-shape rules too. Re-checking here would duplicate a
+                // DNS lookup on every create for no gain.
+                (Some(explicit), _) => Some(explicit),
+                // Project-derived: the handler never saw this URL, so it is
+                // validated here — the layer that produced it. `projects.git_url`
+                // is checked for IP literals on the project side but never
+                // resolved, so a name pointing at the metadata endpoint would
+                // otherwise pass; and a row predating that guard can still carry
+                // `user:password@`, which would land in `source_repo_url` and be
+                // echoed back out of the API.
+                (None, Some(project_id)) => {
+                    let derived = self.source_from_project(project_id).await?;
+                    validate_resolved_source(&derived).await?;
+                    Some(derived)
+                }
+                (None, None) => None,
             }
-            (None, None) => None,
         };
 
         let source_repo_url = source.as_ref().and_then(|s| match s {
@@ -2428,7 +2441,7 @@ mod tests {
             .expect("protected sandbox should mint a link");
 
         assert!(url.starts_with(
-            "https://ws-deadbeef01234567-3000.localho.st/__temps/preview/login?grant=1&next=%2F#session_grant="
+            "http://ws-deadbeef01234567-3000.localho.st:0/__temps/preview/login?grant=1&next=%2F#session_grant="
         ));
         assert!(!url.contains("?session_grant="));
         assert!(expires_at >= before + temps_core::PREVIEW_SESSION_GRANT_MAX_TTL.as_secs());
@@ -3568,13 +3581,17 @@ mod storage_cleanup_tests {
         let artifact = temps_agents::sandbox::SnapshotArtifact {
             content_path: std::path::PathBuf::from("/tmp/test.tar"),
             content_digest: "sha256fake".to_string(),
+            primary_digest: "sha256fake".to_string(),
             size_bytes: 1024,
             backend: temps_agents::sandbox::SandboxBackend::Docker,
             image_ref: Some("temps-snapshot/test:v1".to_string()),
+            image_id: Some("sha256:fake".to_string()),
+            workspace: None,
         };
 
         let req = CreateSandboxRequest {
             from_snapshot_artifact: Some(artifact),
+            project_id: Some(42),
             ..Default::default()
         };
 
@@ -3602,7 +3619,7 @@ mod storage_cleanup_tests {
     #[tokio::test]
     async fn non_docker_provider_take_snapshot_default_returns_not_supported() {
         let handle = handle_for("test");
-        let result = FakeProvider::new().take_snapshot(&handle, None).await;
+        let result = FakeProvider::new().take_snapshot(&handle, None, 1024).await;
         assert!(
             result.is_err(),
             "default take_snapshot must return an error, got Ok"
@@ -3623,9 +3640,12 @@ mod storage_cleanup_tests {
         let artifact = temps_agents::sandbox::SnapshotArtifact {
             content_path: std::path::PathBuf::from("/tmp/test.tar"),
             content_digest: "sha256fake".to_string(),
+            primary_digest: "sha256fake".to_string(),
             size_bytes: 0,
             backend: temps_agents::sandbox::SandboxBackend::Docker,
             image_ref: None,
+            image_id: None,
+            workspace: None,
         };
         let config = SandboxCreateConfig {
             run_id: 0,

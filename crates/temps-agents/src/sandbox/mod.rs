@@ -207,25 +207,49 @@ pub struct SandboxCreateConfig {
 /// trait object — no provider-specific types leak across the boundary.
 ///
 /// ADR-037 §2 describes the full design.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct SnapshotCompanionArtifact {
+    /// Absolute path to the companion artifact on the host.
+    pub content_path: std::path::PathBuf,
+    /// SHA-256 hex of this companion file.
+    pub content_digest: String,
+    /// Size of this companion file in bytes.
+    pub size_bytes: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SnapshotArtifact {
-    /// Content-addressed path on the host: `$TEMPS_DATA_DIR/snapshots/<digest>.tar`.
-    /// Written atomically (write to temp path, rename on close) by the provider.
+    /// Content-addressed path on the host. Docker stores an image tarball;
+    /// Firecracker stores a sanitized sparse ext4 filesystem. Providers write
+    /// to a temporary path and publish the artifact atomically.
     pub content_path: std::path::PathBuf,
-    /// SHA-256 hex of the tarball. The canonical store key — two snapshots
-    /// with identical content share one file on disk (dedup on digest).
+    /// SHA-256 hex of the complete logical snapshot state. The canonical
+    /// store key — two snapshots with identical content share files on disk.
     pub content_digest: String,
-    /// Approximate size of the tarball in bytes.
+    /// SHA-256 of the primary artifact file. For a single-file snapshot this
+    /// equals `content_digest`; multi-file snapshots use `content_digest` as
+    /// the combined logical key and retain this checksum for restore-time
+    /// verification.
+    pub primary_digest: String,
+    /// Total size of the primary artifact and every companion artifact.
     pub size_bytes: u64,
     /// Which backend produced this artifact. Cross-backend restore is rejected
     /// with 422 at the service layer (a Docker tar cannot boot as a Firecracker
     /// rootfs, and vice versa).
     pub backend: SandboxBackend,
-    /// For Docker: the daemon image tag `temps-snapshot/<public_id>:latest`
+    /// For Docker: the daemon image tag `temps-snapshot/<logical_digest>:latest`
     /// that was committed before exporting. Stored so the restore path can
     /// confirm (or re-import) the image in the daemon without parsing the
     /// tarball name.
     pub image_ref: Option<String>,
+    /// Immutable Docker image ID captured before export. Restore verifies that
+    /// a mutable `image_ref` still resolves to this ID before using it.
+    pub image_id: Option<String>,
+    /// Workspace bytes stored separately from the provider's primary
+    /// artifact. Docker needs this because its workspace is a bind mount and
+    /// `docker commit` deliberately excludes mounts. Firecracker leaves this
+    /// as `None` because its sanitized ext4 artifact contains the workspace.
+    pub workspace: Option<SnapshotCompanionArtifact>,
 }
 
 /// A cached rootfs image (Firecracker backend). Digest-keyed build artifact
@@ -617,16 +641,19 @@ pub trait SandboxProvider: Send + Sync {
     ///
     /// `label` is a human-readable annotation stored on the DB row; it is
     /// **not** used as part of the content-addressed file name.
+    /// `max_size_bytes` is a hard cap for all artifacts produced by this
+    /// operation; providers must abort and clean up before crossing it.
     ///
-    /// **Default: returns `AgentError::SandboxExecFailed` ("not supported").**
-    /// Backends other than Docker leave this default until their snapshot
-    /// support lands in a separate ADR.
+    /// Docker and Firecracker override this method. Providers without a
+    /// persistent snapshot format leave the default implementation in place.
     async fn take_snapshot(
         &self,
         handle: &SandboxHandle,
         label: Option<String>,
+        max_size_bytes: u64,
     ) -> Result<SnapshotArtifact, AgentError> {
         let _ = label;
+        let _ = max_size_bytes;
         Err(AgentError::SandboxExecFailed {
             run_id: 0,
             sandbox_id: handle.sandbox_id.clone(),
@@ -642,8 +669,8 @@ pub trait SandboxProvider: Send + Sync {
     ///
     /// For Docker: ensures the snapshot image tag is present in the daemon
     /// (loading from the tarball if absent), then passes `artifact.image_ref`
-    /// as the `image` in the container create config. The resulting handle
-    /// is indistinguishable from one created from any other image.
+    /// as the `image` in the container create config. For Firecracker: clones
+    /// the captured sparse root disk into a new VM and boots it.
     ///
     /// The caller is responsible for verifying that `artifact.backend` matches
     /// the target provider's backend before calling — the service layer does

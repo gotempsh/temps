@@ -22,9 +22,10 @@
 //! open — scoping it to a credential proxy is ADR-013 (deferred), so
 //! `network_mode: "restricted"` currently fails closed to no-network.
 //!
-//! v1 sprint scope, deliberately deferred: the jailer (VMM runs as the
-//! server's own user — still KVM-isolated), the ADR-013 egress credential
-//! proxy, and snapshot-based pause.
+//! Still deferred: the jailer (VMM runs as the server's own user — still
+//! KVM-isolated), the ADR-013 egress credential proxy, and memory-state-based
+//! pause. Persistent snapshots rebuild a fresh ext4 image from the quiesced
+//! filesystem so deleted blocks and runtime credential state are excluded.
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -648,73 +649,39 @@ impl FirecrackerSandboxProvider {
         Ok(())
     }
 
-    /// Actual on-disk bytes for a file (sparse-aware: counts allocated
-    /// blocks, not the apparent length).
-    fn disk_bytes(path: &Path) -> u64 {
-        use std::os::unix::fs::MetadataExt;
-        std::fs::metadata(path)
-            .map(|m| m.blocks() * 512)
-            .unwrap_or(0)
-    }
-}
-
-#[async_trait]
-impl SandboxProvider for FirecrackerSandboxProvider {
-    async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
-        let name = self.resolve_name(&config);
-        let vm_dir = self.config.vm_dir(&name);
-        let image = config
-            .image
-            .clone()
-            .filter(|i| !i.is_empty())
-            .unwrap_or_else(|| DEFAULT_IMAGE.to_string());
-
-        // Convert (or reuse) the cached rootfs, copy it for this VM, and mark
-        // the cache entry as referenced — ALL under the cache lock so a
-        // concurrent destroy-triggered GC can't delete the entry between the
-        // conversion and the reference marker landing. Only the fast bits are
-        // in the critical section; the VM boot below is not.
-        let vm_rootfs = vm_dir.join("rootfs.ext4");
-        {
-            let _cache_guard = self.cache_lock.lock().await;
-            let rootfs_cache = self.ensure_rootfs_locked(&image).await.map_err(|e| {
-                AgentError::SandboxCreationFailed {
-                    run_id: config.run_id,
-                    provider: "firecracker".to_string(),
-                    reason: e.to_string(),
-                }
-            })?;
-
-            std::fs::create_dir_all(&vm_dir)?;
-            // The VM dir holds the rootfs, sockets, and `env.json` (injected
-            // credentials like ANTHROPIC_API_KEY). 0700 keeps other local
-            // users out of the secrets.
-            set_dir_private(&vm_dir);
-            // Per-VM writable copy. `cp --sparse=always` (SEEK_HOLE-aware)
-            // reproduces the source's holes — `std::fs::copy`'s
-            // copy_file_range path doesn't reliably preserve sparseness on
-            // ext4 and inflates each per-VM disk to the full nominal size.
-            let cp = tokio::process::Command::new("cp")
-                .args(["--sparse=always", "--reflink=auto"])
-                .arg(&rootfs_cache)
-                .arg(&vm_rootfs)
-                .output()
-                .await?;
-            if !cp.status.success() {
-                std::fs::copy(&rootfs_cache, &vm_rootfs)?;
+    async fn finish_create(
+        &self,
+        config: SandboxCreateConfig,
+        name: String,
+        image: String,
+        vm_rootfs: PathBuf,
+    ) -> Result<SandboxHandle, AgentError> {
+        let cleanup_name = name.clone();
+        let result = self
+            .finish_create_inner(config, name, image, vm_rootfs)
+            .await;
+        if result.is_err() {
+            if let Some(pid) = self.vm_pid(&cleanup_name) {
+                // SAFETY: `kill` does not dereference memory. The PID comes
+                // from this VM's pidfile and SIGKILL is used only while
+                // rolling back a failed create, before its directory is removed.
+                unsafe { libc::kill(pid as i32, libc::SIGKILL) };
             }
-            // Reference marker (cache file stem is the digest). Written under
-            // the lock so GC sees it before it can consider the entry orphaned.
-            if let Some(digest) = rootfs_cache.file_stem().and_then(|s| s.to_str()) {
-                let _ = std::fs::write(vm_dir.join("image.digest"), digest);
-            }
+            self.release_tap(&cleanup_name).await;
+            let _ = std::fs::remove_dir_all(self.config.vm_dir(&cleanup_name));
         }
+        result
+    }
 
-        // Grow the per-VM disk to the requested size. The cache is sized to
-        // the image content (its floor); we only ever grow, never shrink, so
-        // the requested size is clamped up to that floor. `resize2fs` adds
-        // only metadata for the new range — the extra space stays sparse
-        // until the guest writes to it, so a big disk still costs image-size.
+    async fn finish_create_inner(
+        &self,
+        config: SandboxCreateConfig,
+        name: String,
+        image: String,
+        vm_rootfs: PathBuf,
+    ) -> Result<SandboxHandle, AgentError> {
+        // Grow the per-VM disk to the requested size. Snapshot restores only
+        // grow: a caller cannot truncate state captured in a larger disk.
         let base_bytes = std::fs::metadata(&vm_rootfs)?.len();
         let requested_bytes = config
             .disk_size_mb
@@ -722,7 +689,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
             .saturating_mul(1024 * 1024);
         if requested_bytes > base_bytes {
             if let Err(e) = self.grow_rootfs(&vm_rootfs, requested_bytes).await {
-                let _ = std::fs::remove_dir_all(&vm_dir);
+                let _ = std::fs::remove_dir_all(self.config.vm_dir(&name));
                 return Err(AgentError::SandboxCreationFailed {
                     run_id: config.run_id,
                     provider: "firecracker".to_string(),
@@ -739,12 +706,6 @@ impl SandboxProvider for FirecrackerSandboxProvider {
             .memory_limit_mb
             .unwrap_or(self.config.default_memory_mib);
 
-        // Networking: `"none"` boots without a NIC (stronger than Docker's
-        // none — there is no device at all). `"restricted"` is meant to scope
-        // egress to the credential proxy (ADR-013), which isn't built yet —
-        // so it FAILS CLOSED to no-network rather than silently granting the
-        // full-NAT egress it's asking to restrict. `"full"`/None get a TAP.
-        // Guest addressing rides the kernel's built-in IP autoconfig.
         let networked = !matches!(
             config.network_mode.as_deref(),
             Some("none") | Some("restricted")
@@ -811,6 +772,7 @@ impl SandboxProvider for FirecrackerSandboxProvider {
             "vsock": { "guest_cid": 3, "uds_path": "v.sock" },
             "network-interfaces": network_interfaces,
         });
+        let vm_dir = self.config.vm_dir(&name);
         std::fs::write(
             vm_dir.join("vm.json"),
             serde_json::to_vec_pretty(&vm_config).map_err(|e| self.err(&name, e))?,
@@ -834,6 +796,413 @@ impl SandboxProvider for FirecrackerSandboxProvider {
 
         tracing::info!("firecracker sandbox {} up (image {})", name, image);
         Ok(self.handle_with_image(&name, image))
+    }
+
+    async fn copy_sparse_file(
+        &self,
+        source: &Path,
+        destination: &Path,
+        sandbox_name: &str,
+    ) -> Result<(), AgentError> {
+        let copy = tokio::process::Command::new("cp")
+            .args(["--sparse=always", "--reflink=auto"])
+            .arg(source)
+            .arg(destination)
+            .output()
+            .await;
+        if copy.as_ref().is_ok_and(|output| output.status.success()) {
+            return Ok(());
+        }
+        std::fs::copy(source, destination).map_err(|error| {
+            let optimized_copy_error = match &copy {
+                Ok(output) => String::from_utf8_lossy(&output.stderr).trim().to_string(),
+                Err(command_error) => command_error.to_string(),
+            };
+            self.err(
+                sandbox_name,
+                format!(
+                    "copy rootfs '{}' to '{}': optimized sparse copy failed ({}); fallback copy failed: {}",
+                    source.display(),
+                    destination.display(),
+                    optimized_copy_error,
+                    error
+                ),
+            )
+        })?;
+        Ok(())
+    }
+
+    fn hash_file(path: &Path) -> std::io::Result<String> {
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0u8; 1024 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    fn scrub_snapshot_tree(root: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Firecracker commands currently execute as root, so AI CLIs and
+        // credential helpers can leave injected secrets under /root. Runtime
+        // and platform credential state is ephemeral and must never enter a
+        // reusable snapshot. The workspace remains untouched.
+        for relative in ["root", "etc/temps", "tmp", "run", "var/tmp"] {
+            let path = root.join(relative);
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            std::fs::create_dir_all(&path)?;
+        }
+        std::fs::set_permissions(root.join("root"), std::fs::Permissions::from_mode(0o700))?;
+        for relative in ["tmp", "run", "var/tmp"] {
+            std::fs::set_permissions(root.join(relative), std::fs::Permissions::from_mode(0o1777))?;
+        }
+        Ok(())
+    }
+
+    fn sandboxed_debugfs_command(staging: &Path, source: &Path) -> tokio::process::Command {
+        let mut command = tokio::process::Command::new("bwrap");
+        command
+            .args([
+                "--unshare-all",
+                "--die-with-parent",
+                "--new-session",
+                "--cap-drop",
+                "ALL",
+                "--clearenv",
+                "--setenv",
+                "PATH",
+                "/usr/sbin:/usr/bin:/sbin:/bin",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--ro-bind-try",
+                "/bin",
+                "/bin",
+                "--ro-bind-try",
+                "/sbin",
+                "/sbin",
+                "--ro-bind-try",
+                "/lib",
+                "/lib",
+                "--ro-bind-try",
+                "/lib64",
+                "/lib64",
+                "--dir",
+                "/etc",
+                "--dir",
+                "/home",
+                "--dir",
+                "/root",
+                "--dir",
+                "/dev",
+                "--dir",
+                "/run",
+                "--dir",
+                "/tmp",
+                "--remount-ro",
+                "/",
+                "--bind",
+            ])
+            .arg(staging)
+            .arg("/tmp")
+            .arg("--ro-bind")
+            .arg(source)
+            .arg("/tmp/source.ext4")
+            .args([
+                "--chdir",
+                "/tmp",
+                "debugfs",
+                "-R",
+                "rdump / extracted",
+                "/tmp/source.ext4",
+            ]);
+        command
+    }
+
+    async fn export_sanitized_rootfs(
+        &self,
+        source: &Path,
+        destination: &Path,
+        max_size_bytes: u64,
+        sandbox_name: &str,
+    ) -> Result<u64, AgentError> {
+        let allocated_source_bytes = Self::try_disk_bytes(source).map_err(|error| {
+            self.err(
+                sandbox_name,
+                format!(
+                    "read allocated size for snapshot source '{}': {}",
+                    source.display(),
+                    error
+                ),
+            )
+        })?;
+        if allocated_source_bytes > max_size_bytes {
+            return Err(AgentError::SnapshotSizeLimitExceeded {
+                sandbox_id: sandbox_name.to_string(),
+                stage: format!(
+                    "checking the Firecracker rootfs ({} allocated bytes)",
+                    allocated_source_bytes
+                ),
+                max_size_bytes,
+            });
+        }
+
+        let staging = destination.with_extension("staging");
+        let extracted = staging.join("extracted");
+        let _ = std::fs::remove_dir_all(&staging);
+        std::fs::create_dir_all(&extracted).map_err(|error| {
+            self.err(
+                sandbox_name,
+                format!(
+                    "create snapshot staging tree '{}': {}",
+                    extracted.display(),
+                    error
+                ),
+            )
+        })?;
+
+        // debugfs reads the stopped ext4 filesystem without mounting it and
+        // materializes only live directory entries. Its `rdump` command must
+        // never run directly on an untrusted guest image: crafted ext dirent
+        // names containing `../` can otherwise escape the output directory
+        // (e2fsprogs#272). Bubblewrap gives the extractor a private, networkless
+        // mount namespace containing only read-only system binaries/libraries,
+        // an otherwise empty read-only root (including `/dev` and `/run`), the
+        // read-only source image, and this writable staging directory. Procfs
+        // is intentionally absent. No host root, sysfs,
+        // configuration, home directory, runtime sockets, devices, or temps
+        // data enter the namespace. Escaped writes can at worst land elsewhere
+        // in staging or fail with EROFS.
+        let mut dump_command = Self::sandboxed_debugfs_command(&staging, source);
+        // Never collect parser-controlled streams into unbounded Vecs. Besides
+        // normal diagnostics, a malicious dirent could otherwise target a
+        // procfs fd path and make rdump feed inode contents into stdout/stderr.
+        let dump_result = dump_command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .await;
+        let dump = match dump_result {
+            Ok(dump) => dump,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(self.err(
+                    sandbox_name,
+                    format!(
+                        "run sandboxed debugfs for sanitized snapshot export (install bubblewrap): {}",
+                        error
+                    ),
+                ));
+            }
+        };
+        if !dump.success() {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(self.err(
+                sandbox_name,
+                format!("sandboxed debugfs snapshot export failed with status {dump}"),
+            ));
+        }
+
+        let extracted_for_task = extracted.clone();
+        let scrub_result = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+            Self::scrub_snapshot_tree(&extracted_for_task)?;
+            Ok(dir_size(&extracted_for_task))
+        })
+        .await;
+        let content_bytes = match scrub_result {
+            Ok(Ok(content_bytes)) => content_bytes,
+            Ok(Err(error)) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(self.err(
+                    sandbox_name,
+                    format!(
+                        "scrub snapshot staging tree '{}': {}",
+                        extracted.display(),
+                        error
+                    ),
+                ));
+            }
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                return Err(self.err(
+                    sandbox_name,
+                    format!("snapshot scrub task failed: {}", error),
+                ));
+            }
+        };
+
+        if content_bytes > max_size_bytes {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(AgentError::SnapshotSizeLimitExceeded {
+                sandbox_id: sandbox_name.to_string(),
+                stage: format!(
+                    "exporting {} bytes of live Firecracker files",
+                    content_bytes
+                ),
+                max_size_bytes,
+            });
+        }
+
+        let filesystem_bytes = content_bytes
+            .saturating_mul(3)
+            .saturating_div(2)
+            .saturating_add(CACHE_SLACK_MB * 1024 * 1024)
+            .next_multiple_of(4096);
+        if filesystem_bytes > max_size_bytes {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(AgentError::SnapshotSizeLimitExceeded {
+                sandbox_id: sandbox_name.to_string(),
+                stage: format!(
+                    "sizing the sanitized Firecracker filesystem at {} bytes",
+                    filesystem_bytes
+                ),
+                max_size_bytes,
+            });
+        }
+
+        let blocks = filesystem_bytes / 4096;
+        let mkfs_result = tokio::process::Command::new("mkfs.ext4")
+            .args([
+                "-q",
+                "-F",
+                "-b",
+                "4096",
+                "-E",
+                "lazy_itable_init=0,lazy_journal_init=0",
+                "-d",
+            ])
+            .arg(&extracted)
+            .arg(destination)
+            .arg(blocks.to_string())
+            .output()
+            .await;
+        let mkfs = match mkfs_result {
+            Ok(mkfs) => mkfs,
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&staging);
+                let _ = std::fs::remove_file(destination);
+                return Err(self.err(
+                    sandbox_name,
+                    format!("run mkfs.ext4 for sanitized snapshot: {}", error),
+                ));
+            }
+        };
+        let _ = std::fs::remove_dir_all(&staging);
+        if !mkfs.status.success() {
+            let _ = std::fs::remove_file(destination);
+            return Err(self.err(
+                sandbox_name,
+                format!(
+                    "mkfs.ext4 sanitized snapshot failed: {}",
+                    String::from_utf8_lossy(&mkfs.stderr).trim()
+                ),
+            ));
+        }
+
+        let artifact_bytes = Self::try_disk_bytes(destination).map_err(|error| {
+            self.err(
+                sandbox_name,
+                format!(
+                    "read allocated size for snapshot artifact '{}': {}",
+                    destination.display(),
+                    error
+                ),
+            )
+        })?;
+        if artifact_bytes > max_size_bytes {
+            let _ = std::fs::remove_file(destination);
+            return Err(AgentError::SnapshotSizeLimitExceeded {
+                sandbox_id: sandbox_name.to_string(),
+                stage: format!(
+                    "publishing the {} byte Firecracker artifact",
+                    artifact_bytes
+                ),
+                max_size_bytes,
+            });
+        }
+        Ok(artifact_bytes)
+    }
+
+    /// Actual on-disk bytes for a file (sparse-aware: counts allocated
+    /// blocks, not the apparent length).
+    fn try_disk_bytes(path: &Path) -> std::io::Result<u64> {
+        use std::os::unix::fs::MetadataExt;
+        Ok(std::fs::metadata(path)?.blocks() * 512)
+    }
+
+    /// Best-effort allocated size for status and cleanup accounting.
+    fn disk_bytes(path: &Path) -> u64 {
+        Self::try_disk_bytes(path).unwrap_or(0)
+    }
+}
+
+#[async_trait]
+impl SandboxProvider for FirecrackerSandboxProvider {
+    async fn create(&self, config: SandboxCreateConfig) -> Result<SandboxHandle, AgentError> {
+        let name = self.resolve_name(&config);
+        let vm_dir = self.config.vm_dir(&name);
+        let image = config
+            .image
+            .clone()
+            .filter(|i| !i.is_empty())
+            .unwrap_or_else(|| DEFAULT_IMAGE.to_string());
+
+        // Convert (or reuse) the cached rootfs, copy it for this VM, and mark
+        // the cache entry as referenced — ALL under the cache lock so a
+        // concurrent destroy-triggered GC can't delete the entry between the
+        // conversion and the reference marker landing. Only the fast bits are
+        // in the critical section; the VM boot below is not.
+        let vm_rootfs = vm_dir.join("rootfs.ext4");
+        {
+            let _cache_guard = self.cache_lock.lock().await;
+            let rootfs_cache = self.ensure_rootfs_locked(&image).await.map_err(|e| {
+                AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "firecracker".to_string(),
+                    reason: e.to_string(),
+                }
+            })?;
+
+            std::fs::create_dir_all(&vm_dir)?;
+            // The VM dir holds the rootfs, sockets, and `env.json` (injected
+            // credentials like ANTHROPIC_API_KEY). 0700 keeps other local
+            // users out of the secrets.
+            set_dir_private(&vm_dir);
+            // Per-VM writable copy. `cp --sparse=always` (SEEK_HOLE-aware)
+            // reproduces the source's holes — `std::fs::copy`'s
+            // copy_file_range path doesn't reliably preserve sparseness on
+            // ext4 and inflates each per-VM disk to the full nominal size.
+            let cp = tokio::process::Command::new("cp")
+                .args(["--sparse=always", "--reflink=auto"])
+                .arg(&rootfs_cache)
+                .arg(&vm_rootfs)
+                .output()
+                .await?;
+            if !cp.status.success() {
+                std::fs::copy(&rootfs_cache, &vm_rootfs)?;
+            }
+            // Reference marker (cache file stem is the digest). Written under
+            // the lock so GC sees it before it can consider the entry orphaned.
+            if let Some(digest) = rootfs_cache.file_stem().and_then(|s| s.to_str()) {
+                let _ = std::fs::write(vm_dir.join("image.digest"), digest);
+            }
+        }
+
+        self.finish_create(config, name, image, vm_rootfs).await
     }
 
     async fn exec(
@@ -1116,6 +1485,209 @@ impl SandboxProvider for FirecrackerSandboxProvider {
         }
     }
 
+    async fn take_snapshot(
+        &self,
+        handle: &SandboxHandle,
+        _label: Option<String>,
+        max_size_bytes: u64,
+    ) -> Result<super::SnapshotArtifact, AgentError> {
+        let name = &handle.sandbox_name;
+        if self.vm_pid(name).is_some() {
+            return Err(self.err(
+                name,
+                "snapshot requires a stopped Firecracker VM for filesystem consistency",
+            ));
+        }
+
+        let source = self.config.vm_dir(name).join("rootfs.ext4");
+        if !source.exists() {
+            return Err(self.err(
+                name,
+                format!("snapshot source rootfs '{}' is missing", source.display()),
+            ));
+        }
+
+        let snapshots_dir = self.config.data_dir.join("snapshots");
+        tokio::fs::create_dir_all(&snapshots_dir)
+            .await
+            .map_err(|error| {
+                self.err(
+                    name,
+                    format!(
+                        "create snapshot directory '{}': {}",
+                        snapshots_dir.display(),
+                        error
+                    ),
+                )
+            })?;
+        let temporary = snapshots_dir.join(format!(".tmp-firecracker-{}", name));
+        let _ = tokio::fs::remove_file(&temporary).await;
+        let size_bytes = self
+            .export_sanitized_rootfs(&source, &temporary, max_size_bytes, name)
+            .await?;
+
+        let hash_path = temporary.clone();
+        let hash_result = tokio::task::spawn_blocking(move || Self::hash_file(&hash_path)).await;
+        let digest = match hash_result {
+            Ok(Ok(digest)) => digest,
+            Ok(Err(error)) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(self.err(
+                    name,
+                    format!("hash snapshot rootfs '{}': {}", temporary.display(), error),
+                ));
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(self.err(name, format!("snapshot hash task failed: {}", error)));
+            }
+        };
+        let final_path = snapshots_dir.join(format!("{}.ext4", digest));
+        match tokio::fs::hard_link(&temporary, &final_path).await {
+            Ok(()) => {
+                // The published hard link owns the inode now; remove only the
+                // private staging name.
+                let _ = tokio::fs::remove_file(&temporary).await;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Never replace a content-addressed artifact. Verify that an
+                // existing file really contains the bytes its name promises
+                // before sharing it with the new database row.
+                let existing_path = final_path.clone();
+                let existing_hash =
+                    tokio::task::spawn_blocking(move || Self::hash_file(&existing_path)).await;
+                let _ = tokio::fs::remove_file(&temporary).await;
+                let existing_digest = existing_hash
+                    .map_err(|task_error| {
+                        self.err(
+                            name,
+                            format!("existing snapshot hash task failed: {}", task_error),
+                        )
+                    })?
+                    .map_err(|hash_error| {
+                        self.err(
+                            name,
+                            format!(
+                                "hash existing Firecracker snapshot '{}': {}",
+                                final_path.display(),
+                                hash_error
+                            ),
+                        )
+                    })?;
+                if existing_digest != digest {
+                    return Err(self.err(
+                        name,
+                        format!(
+                            "existing Firecracker snapshot '{}' failed content-address verification: expected {}, got {}",
+                            final_path.display(),
+                            digest,
+                            existing_digest
+                        ),
+                    ));
+                }
+            }
+            Err(error) => {
+                let _ = tokio::fs::remove_file(&temporary).await;
+                return Err(self.err(
+                    name,
+                    format!(
+                        "publish Firecracker snapshot '{}' as '{}': {}",
+                        temporary.display(),
+                        final_path.display(),
+                        error
+                    ),
+                ));
+            }
+        }
+
+        tracing::info!(
+            sandbox = %name,
+            digest = %digest,
+            size_bytes,
+            path = %final_path.display(),
+            "firecracker snapshot completed"
+        );
+        Ok(super::SnapshotArtifact {
+            content_path: final_path,
+            content_digest: digest.clone(),
+            primary_digest: digest,
+            size_bytes,
+            backend: super::SandboxBackend::Firecracker,
+            image_ref: None,
+            image_id: None,
+            workspace: None,
+        })
+    }
+
+    async fn create_from_snapshot(
+        &self,
+        artifact: &super::SnapshotArtifact,
+        config: SandboxCreateConfig,
+    ) -> Result<SandboxHandle, AgentError> {
+        if artifact.backend != super::SandboxBackend::Firecracker {
+            return Err(AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "firecracker".to_string(),
+                reason: format!(
+                    "cannot restore '{}' snapshot artifact with Firecracker",
+                    artifact.backend
+                ),
+            });
+        }
+
+        let source = artifact.content_path.clone();
+        if artifact.content_digest != artifact.primary_digest {
+            return Err(AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "firecracker".to_string(),
+                reason: format!(
+                    "Firecracker snapshot metadata is inconsistent: logical digest {} differs from rootfs digest {}",
+                    artifact.content_digest, artifact.primary_digest
+                ),
+            });
+        }
+        let expected_digest = artifact.primary_digest.clone();
+        let hash_source = source.clone();
+        let actual_digest = tokio::task::spawn_blocking(move || Self::hash_file(&hash_source))
+            .await
+            .map_err(|error| AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "firecracker".to_string(),
+                reason: format!("snapshot hash task failed: {}", error),
+            })?
+            .map_err(|error| AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "firecracker".to_string(),
+                reason: format!("hash snapshot rootfs '{}': {}", source.display(), error),
+            })?;
+        if actual_digest != expected_digest {
+            return Err(AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "firecracker".to_string(),
+                reason: format!(
+                    "snapshot rootfs digest mismatch: expected {}, got {}",
+                    expected_digest, actual_digest
+                ),
+            });
+        }
+
+        let name = self.resolve_name(&config);
+        let vm_dir = self.config.vm_dir(&name);
+        std::fs::create_dir_all(&vm_dir)?;
+        set_dir_private(&vm_dir);
+        let vm_rootfs = vm_dir.join("rootfs.ext4");
+        if let Err(error) = self.copy_sparse_file(&source, &vm_rootfs, &name).await {
+            let _ = std::fs::remove_dir_all(&vm_dir);
+            return Err(error);
+        }
+
+        let image = format!(
+            "firecracker-snapshot:{}",
+            &expected_digest[..expected_digest.len().min(12)]
+        );
+        self.finish_create(config, name, image, vm_rootfs).await
+    }
+
     fn supports_backend(&self, backend: super::SandboxBackend) -> bool {
         matches!(backend, super::SandboxBackend::Firecracker)
     }
@@ -1263,8 +1835,8 @@ fn set_file_private(path: &Path) {
     }
 }
 
-/// Total apparent size of a directory tree (bytes), following the entries
-/// as extracted. Used to size the cached ext4 to its image content.
+/// Total apparent size of a directory tree (bytes), without following
+/// guest-controlled symlinks outside the staging tree or into cycles.
 fn dir_size(root: &Path) -> u64 {
     let mut total = 0u64;
     let mut stack = vec![root.to_path_buf()];
@@ -1273,11 +1845,13 @@ fn dir_size(root: &Path) -> u64 {
             continue;
         };
         for entry in entries.flatten() {
-            let Ok(meta) = entry.metadata() else { continue };
+            let Ok(meta) = entry.path().symlink_metadata() else {
+                continue;
+            };
             if meta.is_dir() {
                 stack.push(entry.path());
             } else {
-                total += meta.len();
+                total = total.saturating_add(meta.len());
             }
         }
     }
@@ -1313,12 +1887,13 @@ pub async fn is_firecracker_available(data_dir: &Path) -> bool {
 mod tests {
     use super::*;
 
-    fn provider() -> FirecrackerSandboxProvider {
+    fn provider_at(data_dir: PathBuf) -> FirecrackerSandboxProvider {
         let docker = Arc::new(bollard::Docker::connect_with_local_defaults().unwrap());
-        FirecrackerSandboxProvider::new(
-            FirecrackerSandboxConfig::from_data_dir(PathBuf::from("/nonexistent")),
-            docker,
-        )
+        FirecrackerSandboxProvider::new(FirecrackerSandboxConfig::from_data_dir(data_dir), docker)
+    }
+
+    fn provider() -> FirecrackerSandboxProvider {
+        provider_at(PathBuf::from("/nonexistent"))
     }
 
     #[test]
@@ -1356,5 +1931,228 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[test]
+    fn snapshot_scrub_preserves_workspace_and_removes_runtime_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("workspace/src")).unwrap();
+        std::fs::create_dir_all(root.path().join("root/.claude")).unwrap();
+        std::fs::create_dir_all(root.path().join("etc/temps")).unwrap();
+        std::fs::write(root.path().join("workspace/src/state.txt"), b"preserve").unwrap();
+        std::fs::write(root.path().join("root/.claude/token"), b"secret").unwrap();
+        std::fs::write(
+            root.path().join("etc/temps/credential-daemon.env"),
+            b"TOKEN=secret",
+        )
+        .unwrap();
+
+        FirecrackerSandboxProvider::scrub_snapshot_tree(root.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(root.path().join("workspace/src/state.txt")).unwrap(),
+            b"preserve"
+        );
+        assert!(!root.path().join("root/.claude/token").exists());
+        assert!(!root.path().join("etc/temps/credential-daemon.env").exists());
+    }
+
+    #[test]
+    fn snapshot_size_walk_does_not_follow_guest_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("outside.bin"), vec![1u8; 64 * 1024]).unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+
+        let measured = dir_size(root.path());
+
+        assert!(measured < 64 * 1024);
+    }
+
+    #[test]
+    fn snapshot_extractor_uses_minimal_bubblewrap_namespace() {
+        let staging = PathBuf::from("/safe/staging");
+        let source = PathBuf::from("/safe/source.ext4");
+        let command = FirecrackerSandboxProvider::sandboxed_debugfs_command(&staging, &source);
+        let std_command = command.as_std();
+        assert_eq!(std_command.get_program(), "bwrap");
+        let args = std_command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+
+        let has_sequence = |expected: &[&str]| {
+            args.windows(expected.len()).any(|window| {
+                window
+                    .iter()
+                    .map(String::as_str)
+                    .eq(expected.iter().copied())
+            })
+        };
+        assert!(has_sequence(&["--unshare-all", "--die-with-parent"]));
+        assert!(has_sequence(&["--dir", "/dev"]));
+        assert!(has_sequence(&["--dir", "/run"]));
+        assert!(has_sequence(&["--dir", "/tmp"]));
+        assert!(has_sequence(&["--remount-ro", "/"]));
+        assert!(has_sequence(&["--bind", "/safe/staging", "/tmp"]));
+        assert!(has_sequence(&[
+            "--ro-bind",
+            "/safe/source.ext4",
+            "/tmp/source.ext4"
+        ]));
+        assert!(
+            !args.iter().any(|arg| arg == "--proc"),
+            "procfs would let malicious dirents target inherited file descriptors"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--dev"),
+            "the extractor must use an empty /dev instead of host-backed devices"
+        );
+        assert!(
+            !args.iter().any(|arg| arg == "--tmpfs"),
+            "a writable tmpfs outside staging would bypass snapshot quotas"
+        );
+        let root_read_only = args
+            .windows(2)
+            .position(|window| window == ["--remount-ro", "/"])
+            .unwrap();
+        let staging_bind = args
+            .windows(3)
+            .position(|window| window == ["--bind", "/safe/staging", "/tmp"])
+            .unwrap();
+        assert!(
+            root_read_only < staging_bind,
+            "only the staging bind may remain writable after the root is remounted read-only"
+        );
+        assert!(
+            !has_sequence(&["--ro-bind", "/", "/"]),
+            "the untrusted extractor must never see the host root"
+        );
+        for hidden_host_path in ["/dev", "/proc", "/sys", "/run", "/etc", "/home", "/root"] {
+            assert!(
+                !has_sequence(&["--ro-bind", hidden_host_path, hidden_host_path]),
+                "host path {hidden_host_path} must not be exposed read-only to the parser"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_firecracker_restore_removes_copied_vm_directory() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(data_dir.path().to_path_buf());
+        let snapshot_path = data_dir.path().join("snapshot.ext4");
+        std::fs::write(&snapshot_path, b"synthetic-rootfs").unwrap();
+        let digest = FirecrackerSandboxProvider::hash_file(&snapshot_path).unwrap();
+        let artifact = super::super::SnapshotArtifact {
+            content_path: snapshot_path,
+            content_digest: digest.clone(),
+            primary_digest: digest,
+            size_bytes: 16,
+            backend: super::super::SandboxBackend::Firecracker,
+            image_ref: None,
+            image_id: None,
+            workspace: None,
+        };
+        let label = "failed-restore-cleanup";
+        let config = SandboxCreateConfig {
+            owner_user_id: None,
+            run_id: 17,
+            container_name_override: Some(label.to_string()),
+            host_work_dir: data_dir.path().join("unused-workspace"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: Some(0),
+            network_mode: None,
+            env_vars: HashMap::new(),
+            idle_timeout: Duration::from_secs(60),
+            backend: Some(super::super::SandboxBackend::Firecracker),
+        };
+
+        let result = provider.create_from_snapshot(&artifact, config).await;
+
+        assert!(result.is_err());
+        assert!(!provider
+            .config
+            .vm_dir(&format!("{}{}", FC_SANDBOX_NAME_PREFIX, label))
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn firecracker_snapshot_rootfs_round_trip_preserves_workspace_bytes() {
+        for tool in ["mkfs.ext4", "debugfs", "bwrap"] {
+            if tokio::process::Command::new(tool)
+                .arg("-V")
+                .output()
+                .await
+                .is_err()
+            {
+                eprintln!(
+                    "skipping Firecracker snapshot test: '{}' is unavailable",
+                    tool
+                );
+                return;
+            }
+        }
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let provider = provider_at(data_dir.path().to_path_buf());
+        let sandbox_name = "temps-fcsandbox-snapshot-round-trip";
+        let vm_dir = provider.config.vm_dir(sandbox_name);
+        std::fs::create_dir_all(&vm_dir).unwrap();
+        let source_rootfs = vm_dir.join("rootfs.ext4");
+        let source_tree = data_dir.path().join("source-tree");
+        std::fs::create_dir_all(source_tree.join("workspace/src")).unwrap();
+        std::fs::create_dir_all(source_tree.join("root/.claude")).unwrap();
+        let workspace_state = b"workspace-state-must-survive";
+        let injected_secret = b"tok-injected-secret-must-not-survive";
+        std::fs::write(source_tree.join("workspace/src/state.txt"), workspace_state).unwrap();
+        std::fs::write(
+            source_tree.join("root/.claude/credentials.json"),
+            injected_secret,
+        )
+        .unwrap();
+        let mkfs = tokio::process::Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-d"])
+            .arg(&source_tree)
+            .arg(&source_rootfs)
+            .arg("32768")
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            mkfs.status.success(),
+            "mkfs.ext4 failed: {}",
+            String::from_utf8_lossy(&mkfs.stderr)
+        );
+        let handle = provider.handle_with_image(sandbox_name, "alpine:3.20".to_string());
+
+        let artifact = provider
+            .take_snapshot(&handle, None, 512 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        assert_eq!(artifact.backend, super::super::SandboxBackend::Firecracker);
+        assert!(artifact.workspace.is_none());
+
+        let workspace = tokio::process::Command::new("debugfs")
+            .args(["-R", "cat /workspace/src/state.txt"])
+            .arg(&artifact.content_path)
+            .output()
+            .await
+            .unwrap();
+        assert_eq!(workspace.stdout, workspace_state);
+
+        let artifact_bytes = std::fs::read(&artifact.content_path).unwrap();
+        assert!(
+            !artifact_bytes
+                .windows(injected_secret.len())
+                .any(|window| window == injected_secret),
+            "sanitized snapshot must not retain injected token bytes, including in free blocks"
+        );
     }
 }
