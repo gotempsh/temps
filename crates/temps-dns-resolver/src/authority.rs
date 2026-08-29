@@ -19,6 +19,7 @@
 //! exercises the same wire-format primitives, so we avoid an awkward
 //! impedance match.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use hickory_proto::op::{Header, HeaderCounts, MessageType, Metadata, OpCode, ResponseCode};
@@ -131,10 +132,14 @@ impl RequestHandler for ZoneAuthority {
             .filter(|r| matches_qtype(r, qtype))
             .collect();
 
+        let (answers, suppressed_duplicates) = build_unique_answers(&qname, &matches);
+
         debug!(
             qname = %qname_str,
             qtype = ?qtype,
-            answers = matches.len(),
+            matching_rows = matches.len(),
+            answers = answers.len(),
+            suppressed_duplicates,
             any_match,
             "DNS query"
         );
@@ -148,12 +153,6 @@ impl RequestHandler for ZoneAuthority {
             // Genuine NXDOMAIN.
             return reply_error(request, &mut response_handle, ResponseCode::NXDomain).await;
         }
-
-        // Build records.
-        let answers: Vec<Record> = matches
-            .iter()
-            .filter_map(|r| build_answer(&qname, r))
-            .collect();
 
         if answers.is_empty() {
             // We had matching FQDN+type rows but none were valid (e.g. all
@@ -231,6 +230,28 @@ fn build_answer(qname: &Name, record: &ZoneRecord) -> Option<Record> {
         }
     };
     Some(Record::from_rdata(qname.clone(), ttl, rdata))
+}
+
+/// Build wire answers while collapsing registry rows that describe the same
+/// resource record. A stale persisted snapshot or malformed sync response
+/// must not amplify one address into a fragmented DNS packet that Docker's
+/// embedded resolver rejects.
+fn build_unique_answers(qname: &Name, records: &[&ZoneRecord]) -> (Vec<Record>, usize) {
+    let mut seen = HashSet::with_capacity(records.len());
+    let mut answers = Vec::with_capacity(records.len());
+    let mut suppressed_duplicates = 0;
+    for record in records {
+        let Some(answer) = build_answer(qname, record) else {
+            continue;
+        };
+        let key = format!("{:?}", answer.data);
+        if seen.insert(key) {
+            answers.push(answer);
+        } else {
+            suppressed_duplicates += 1;
+        }
+    }
+    (answers, suppressed_duplicates)
 }
 
 async fn reply_error<R: ResponseHandler>(
@@ -359,6 +380,29 @@ mod tests {
         match &answer.data {
             RData::AAAA(RDataAAAA(v6)) => assert!(v6.to_string().contains("fd00")),
             other => panic!("expected AAAA, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_unique_answers_collapses_duplicate_rows() {
+        let qname = Name::from_str("x.temps.local.").unwrap();
+        let records: Vec<ZoneRecord> = (1..=165)
+            .map(|id| {
+                let mut record = rec("A", "172.20.255.2");
+                record.id = id;
+                record.generation = id;
+                record
+            })
+            .collect();
+        let references: Vec<&ZoneRecord> = records.iter().collect();
+
+        let (answers, suppressed_duplicates) = build_unique_answers(&qname, &references);
+
+        assert_eq!(answers.len(), 1);
+        assert_eq!(suppressed_duplicates, 164);
+        match &answers[0].data {
+            RData::A(RDataA(ip)) => assert_eq!(ip.to_string(), "172.20.255.2"),
+            other => panic!("expected A, got {other:?}"),
         }
     }
 
