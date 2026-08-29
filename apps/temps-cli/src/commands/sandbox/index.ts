@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
+import { writeFile, readFile } from 'node:fs/promises'
 import { requireAuth, credentials } from '../../config/store.js'
 import { normalizeApiUrl } from '../../lib/api-client.js'
 import { config } from '../../config/store.js'
@@ -1203,7 +1204,9 @@ async function fsReadAction(
   const bytes = base64Decode(res.contents_b64)
 
   if (options.out) {
-    await Bun.write(options.out, bytes)
+    // The published CLI is bundled for Node (see docs.ts), so this must use
+    // Node's fs promises rather than Bun.write, which is undefined there.
+    await writeFile(options.out, bytes)
     success(`Wrote ${res.size} bytes to ${colors.primary(options.out)}`)
   } else {
     process.stdout.write(bytes)
@@ -1220,8 +1223,9 @@ async function fsWriteAction(
 
   let bytes: Uint8Array
   if (options.file) {
-    const buf = await Bun.file(options.file).arrayBuffer()
-    bytes = new Uint8Array(buf)
+    // The published CLI is bundled for Node (see docs.ts), so this must use
+    // Node's fs promises rather than Bun.file, which is undefined there.
+    bytes = new Uint8Array(await readFile(options.file))
   } else if (options.content !== undefined) {
     bytes = new TextEncoder().encode(options.content)
   } else {

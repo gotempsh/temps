@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import type { Command } from 'commander'
+import { existsSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { requireAuth, credentials, config } from '../../config/store.js'
 import { normalizeApiUrl } from '../../lib/api-client.js'
 import { setupClient, client } from '../../lib/api-client.js'
@@ -365,13 +367,14 @@ async function runAction(slug: string | undefined, options: RunOptions): Promise
   if (options.fromFile) {
     // Read the YAML up front so the user gets a fast local error if the path
     // is wrong — much better DX than letting the server reject an empty body.
-    const file = Bun.file(options.fromFile)
-    if (!(await file.exists())) {
+    // The published CLI is bundled for Node (see docs.ts), so this must use
+    // Node's fs rather than Bun.file, which is undefined there.
+    if (!existsSync(options.fromFile)) {
       errorOut(`File not found: ${options.fromFile}`)
       process.exitCode = 2
       return
     }
-    const yaml = await file.text()
+    const yaml = await readFile(options.fromFile, 'utf8')
     if (!yaml.trim()) {
       errorOut(`File is empty: ${options.fromFile}`)
       process.exitCode = 2
