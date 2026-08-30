@@ -373,6 +373,11 @@ const AiChat = lazy(() =>
     default: m.AiChat,
   }))
 )
+const AiFirstPrototype = lazy(() =>
+  import('./pages/AiFirstPrototype').then((m) => ({
+    default: m.AiFirstPrototype,
+  }))
+)
 const AiWorkflowsOverview = lazy(() =>
   import('./pages/AiWorkflowsOverview').then((m) => ({
     default: m.AiWorkflowsOverview,
@@ -783,6 +788,7 @@ const FullAppRoutes = () => {
                       element={<AiGatewaySetupPage />}
                     />
                     <Route path="/chat" element={<AiChat />} />
+                    <Route path="/ai-first" element={<AiFirstPrototype />} />
                     <Route
                       path="/ai-workflows"
                       element={<AiWorkflowsOverview />}
@@ -977,6 +983,7 @@ const AppContent = () => {
             <Suspense fallback={<PageLoader />}>
               <Routes>
                 {/* Public routes that don't require authentication */}
+                <Route path="/ai-first" element={<AiFirstPrototype />} />
                 <Route path="/mfa-verify" element={<MfaVerify />} />
                 <Route path="/forgot-password" element={<ForgotPassword />} />
                 {/* Target of the password-reset email link
@@ -1007,6 +1014,29 @@ const AppContent = () => {
       </AuthProvider>
     </BrowserRouter>
   )
+}
+
+/**
+ * Keep the speculative AI-first surface self-contained when opened directly.
+ * It is intentionally usable before an API or account exists so the concept
+ * can be reviewed without bootstrapping a full Temps instance. In-app
+ * navigation still uses the public route declared inside AppContent above.
+ */
+const PrototypeAwareAppContent = () => {
+  if (
+    typeof window !== 'undefined' &&
+    window.location.pathname === '/ai-first'
+  ) {
+    return (
+      <BrowserRouter>
+        <Suspense fallback={<PageLoader />}>
+          <AiFirstPrototype />
+        </Suspense>
+      </BrowserRouter>
+    )
+  }
+
+  return <AppContent />
 }
 
 // Helper to generate friendly error titles from mutation operations
@@ -1125,7 +1155,7 @@ export const TempsConsole = ({
       <ThemeWrapper>
         <QueryClientProvider client={queryClient}>
           <ConsoleExtensionsProvider extensions={extensions}>
-            <AppContent />
+            <PrototypeAwareAppContent />
           </ConsoleExtensionsProvider>
         </QueryClientProvider>
         <Toaster position="top-center" />
