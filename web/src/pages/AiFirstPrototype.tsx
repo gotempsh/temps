@@ -11,6 +11,7 @@ import {
   Circle,
   Cloud,
   Code2,
+  Copy,
   CreditCard,
   Database,
   EyeOff,
@@ -23,7 +24,9 @@ import {
   MoreHorizontal,
   Network,
   PanelLeft,
+  Pencil,
   Plus,
+  RotateCcw,
   Server,
   Settings2,
   ShieldCheck,
@@ -59,10 +62,18 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { writeToClipboard } from '@/lib/clipboard'
 import {
   buildSecretReferencePayload,
   containsLikelyCredential,
@@ -89,6 +100,8 @@ const conversations = [
   { title: 'Database recovery plan', detail: 'Yesterday', active: false },
   { title: 'Why did checkout fail?', detail: 'Tuesday', active: false },
 ] as const
+
+const DEFAULT_CONVERSATION_TITLE = conversations[0].title
 
 const palette = {
   '--ai-canvas': '#0b0d0c',
@@ -123,6 +136,16 @@ export function AiFirstPrototype() {
   const [applyStep, setApplyStep] = useState(0)
   const [exchanges, setExchanges] = useState<ExtraExchange[]>([])
   const [railOpen, setRailOpen] = useState(false)
+  const [conversationTitle, setConversationTitle] = useState<string>(
+    DEFAULT_CONVERSATION_TITLE
+  )
+  const [renameDialogOpen, setRenameDialogOpen] = useState(false)
+  const [renameDraft, setRenameDraft] = useState<string>(
+    DEFAULT_CONVERSATION_TITLE
+  )
+  const [conversationNotice, setConversationNotice] = useState<string | null>(
+    null
+  )
 
   useEffect(() => {
     if (phase !== 'applying') return
@@ -140,6 +163,12 @@ export function AiFirstPrototype() {
       window.clearTimeout(complete)
     }
   }, [phase])
+
+  useEffect(() => {
+    if (!conversationNotice) return
+    const timeout = window.setTimeout(() => setConversationNotice(null), 2_500)
+    return () => window.clearTimeout(timeout)
+  }, [conversationNotice])
 
   const missingSecrets = useMemo(
     () =>
@@ -193,6 +222,41 @@ export function AiFirstPrototype() {
     if (!secretsReady || phase !== 'review') return
     setApplyStep(0)
     setPhase('applying')
+  }
+
+  const openRenameDialog = () => {
+    setRenameDraft(conversationTitle)
+    setRenameDialogOpen(true)
+  }
+
+  const renameConversation = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault()
+    const nextTitle = renameDraft.trim()
+    if (!nextTitle) return
+    setConversationTitle(nextTitle)
+    setRenameDialogOpen(false)
+    setConversationNotice('Conversation renamed')
+  }
+
+  const copyConversationLink = async () => {
+    try {
+      await writeToClipboard(window.location.href)
+      setConversationNotice('Conversation link copied')
+    } catch {
+      setConversationNotice('Your browser blocked clipboard access')
+    }
+  }
+
+  const resetPrototype = () => {
+    setComposer('')
+    setSecretDialogOpen(false)
+    setSecretReferences([])
+    setSecurityNotice(null)
+    setPhase('review')
+    setApplyStep(0)
+    setExchanges([])
+    setConversationTitle(DEFAULT_CONVERSATION_TITLE)
+    setConversationNotice('Prototype reset')
   }
 
   return (
@@ -255,7 +319,11 @@ export function AiFirstPrototype() {
       </header>
 
       <div className="relative z-10 grid h-[calc(100dvh-3.5rem)] min-h-0 grid-cols-1 lg:grid-cols-[230px_minmax(0,1fr)] xl:grid-cols-[230px_minmax(560px,1fr)_330px]">
-        <ConversationRail open={railOpen} onClose={() => setRailOpen(false)} />
+        <ConversationRail
+          open={railOpen}
+          activeTitle={conversationTitle}
+          onClose={() => setRailOpen(false)}
+        />
 
         <main className="relative flex min-h-0 min-w-0 flex-col bg-[color-mix(in_srgb,var(--ai-canvas)_80%,transparent)]">
           <div className="border-b border-[var(--ai-line-soft)] px-4 py-3 sm:px-6">
@@ -263,23 +331,53 @@ export function AiFirstPrototype() {
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <h1 className="truncate text-sm font-medium">
-                    Launch commerce suite
+                    {conversationTitle}
                   </h1>
                   <span className="rounded-full bg-[rgba(215,255,99,0.09)] px-2 py-0.5 text-[10px] font-medium text-[var(--ai-lime)]">
                     onboarding
                   </span>
                 </div>
-                <p className="mt-0.5 truncate text-xs text-[var(--ai-muted)]">
-                  AI generates the interface needed for each decision
-                </p>
+                {conversationNotice ? (
+                  <p
+                    className="mt-0.5 truncate text-xs text-[var(--ai-lime)]"
+                    role="status"
+                  >
+                    {conversationNotice}
+                  </p>
+                ) : (
+                  <p className="mt-0.5 truncate text-xs text-[var(--ai-muted)]">
+                    AI generates the interface needed for each decision
+                  </p>
+                )}
               </div>
-              <button
-                type="button"
-                className="rounded-md p-1.5 text-[var(--ai-muted)] transition-colors hover:bg-[var(--ai-panel)] hover:text-[var(--ai-text)]"
-                aria-label="Conversation options"
-              >
-                <MoreHorizontal className="size-4" />
-              </button>
+              <DropdownMenu>
+                <DropdownMenuTrigger asChild>
+                  <button
+                    type="button"
+                    className="rounded-md p-1.5 text-[var(--ai-muted)] transition-colors hover:bg-[var(--ai-panel)] hover:text-[var(--ai-text)] data-[state=open]:bg-[var(--ai-panel)] data-[state=open]:text-[var(--ai-text)]"
+                    aria-label="Conversation options"
+                  >
+                    <MoreHorizontal className="size-4" />
+                  </button>
+                </DropdownMenuTrigger>
+                <DropdownMenuContent align="end" className="w-52">
+                  <DropdownMenuItem onSelect={openRenameDialog}>
+                    <Pencil />
+                    Rename conversation
+                  </DropdownMenuItem>
+                  <DropdownMenuItem
+                    onSelect={() => void copyConversationLink()}
+                  >
+                    <Copy />
+                    Copy conversation link
+                  </DropdownMenuItem>
+                  <DropdownMenuSeparator />
+                  <DropdownMenuItem onSelect={resetPrototype}>
+                    <RotateCcw />
+                    Reset prototype
+                  </DropdownMenuItem>
+                </DropdownMenuContent>
+              </DropdownMenu>
             </div>
           </div>
 
@@ -454,15 +552,52 @@ export function AiFirstPrototype() {
         }
         onStore={storeSecrets}
       />
+      <Dialog open={renameDialogOpen} onOpenChange={setRenameDialogOpen}>
+        <DialogContent className="sm:max-w-md">
+          <form onSubmit={renameConversation}>
+            <DialogHeader>
+              <DialogTitle>Rename conversation</DialogTitle>
+              <DialogDescription>
+                Use a name that describes the application or operation this
+                thread manages.
+              </DialogDescription>
+            </DialogHeader>
+            <div className="py-5">
+              <Label htmlFor="conversation-title">Conversation name</Label>
+              <Input
+                id="conversation-title"
+                value={renameDraft}
+                onChange={(event) => setRenameDraft(event.target.value)}
+                autoFocus
+                className="mt-2"
+              />
+            </div>
+            <DialogFooter>
+              <Button
+                type="button"
+                variant="outline"
+                onClick={() => setRenameDialogOpen(false)}
+              >
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!renameDraft.trim()}>
+                Save name
+              </Button>
+            </DialogFooter>
+          </form>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
 
 function ConversationRail({
   open,
+  activeTitle,
   onClose,
 }: {
   open: boolean
+  activeTitle: string
   onClose: () => void
 }) {
   return (
@@ -508,7 +643,7 @@ function ConversationRail({
             )}
           >
             <span className="block truncate text-xs font-medium">
-              {conversation.title}
+              {conversation.active ? activeTitle : conversation.title}
             </span>
             <span className="mt-1 block text-[10px] text-[var(--ai-muted)]">
               {conversation.detail}
