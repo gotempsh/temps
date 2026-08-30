@@ -266,7 +266,15 @@ Temps joins the private dependency network and the separately named
 listeners use static addresses on the private network so workload-controlled
 Docker DNS aliases cannot redirect control-plane credentials or listener binds.
 Managed workloads can reach the intentionally public HTTP/TLS/ingest surface,
-but cannot route directly to the private admin listener or data services.
+but cannot resolve the private admin service name or reach the control-plane
+data services.
+Compose enforces that separation with two ingress containers: the public proxy
+joins the workload network, while the loopback admin proxy joins a dedicated
+bridge that workloads cannot resolve by service name. Docker engines differ in
+cross-bridge routing, so the independent Basic-auth barrier remains mandatory
+even when a client knows the admin proxy's private IP. Both proxies bind to
+explicit private addresses inside their containers; no listener binds to
+`0.0.0.0`.
 
 <Note>
   Basic auth uses the HTTP `Authorization` header. Browser sessions work because
@@ -284,9 +292,12 @@ root-equivalent host access.
 Redis is not a control-plane dependency. Enabling Temps KV storage provisions
 and manages its own Redis service separately.
 
-If the default `198.18.255.0/24` control subnet overlaps a Docker, LAN, or VPN
-route, change `TEMPS_CONTROL_SUBNET` and all three `*_INTERNAL_IP` values in
-`.env` together before the first `docker compose up`.
+If a default subnet overlaps a Docker, LAN, or VPN route, change the associated
+values together before the first `docker compose up`: `TEMPS_CONTROL_SUBNET`
+and all three `*_INTERNAL_IP` values for the private control plane;
+`TEMPS_WORKLOAD_SUBNET` and `TEMPS_PUBLIC_INGRESS_IP` for managed workloads;
+or `TEMPS_INGRESS_SUBNET`, `TEMPS_ADMIN_INGRESS_IP`, and
+`TEMPS_INGRESS_GATEWAY_IP` for the loopback admin proxy.
 
 On the first unattended startup, Temps creates `TEMPS_ADMIN_EMAIL` as the
 administrator using the mounted `TEMPS_ADMIN_PASSWORD_FILE`. The password is

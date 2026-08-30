@@ -239,9 +239,10 @@ services:
       retries: 3
       start_period: 40s
 
-  # Publish public listeners on host loopback and expose the private admin
-  # listener through an independent Basic-auth barrier. The proxy runs as an
-  # unprivileged, read-only container and never receives the Docker socket.
+  # Publish public listeners on host loopback and make the same surface
+  # reachable from managed workloads. Keeping this proxy separate from the
+  # admin proxy prevents its workload-network attachment from exposing the UI
+  # or management API.
   temps-ingress:
     build:
       context: .
@@ -262,21 +263,59 @@ services:
         condition: service_healthy
     environment:
       TEMPS_CONTROL_INTERNAL_IP: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}
-      TEMPS_INGRESS_PUBLISH_IP: ${TEMPS_INGRESS_PUBLISH_IP:-198.19.255.10}
-    secrets:
-      - source: temps_admin_ingress_password
-        target: temps_admin_ingress_password
+      TEMPS_INGRESS_MODE: public
+      TEMPS_INGRESS_LISTEN_IP: ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10}
     ports:
       - "127.0.0.1:3000:3000"
       - "127.0.0.1:3443:3443"
       - "127.0.0.1:9000:9000"
+    networks:
+      temps-network:
+      temps-app-network:
+        ipv4_address: ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10} 3000 && nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10} 3443 && nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10} 9000 && nc -z -w 1 ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10} 9000"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # The admin/UI listener has an independent, loopback-only Basic-auth barrier
+  # and never joins the workload network. Both ingress containers run
+  # unprivileged with read-only roots and never receive the Docker socket.
+  temps-admin-ingress:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingress
+    container_name: temps-admin-ingress
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    read_only: true
+    mem_limit: 128m
+    pids_limit: 32
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    depends_on:
+      temps:
+        condition: service_healthy
+    environment:
+      TEMPS_CONTROL_INTERNAL_IP: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}
+      TEMPS_INGRESS_MODE: admin
+      TEMPS_INGRESS_LISTEN_IP: ${TEMPS_ADMIN_INGRESS_IP:-198.19.255.10}
+    secrets:
+      - source: temps_admin_ingress_password
+        target: temps_admin_ingress_password
+    ports:
       - "127.0.0.1:9001:9001"
     networks:
       temps-network:
       temps-ingress-network:
-        ipv4_address: ${TEMPS_INGRESS_PUBLISH_IP:-198.19.255.10}
+        ipv4_address: ${TEMPS_ADMIN_INGRESS_IP:-198.19.255.10}
     healthcheck:
-      test: ["CMD-SHELL", "nc -z -w 1 ${TEMPS_INGRESS_PUBLISH_IP:-198.19.255.10} 9000 && nc -z -w 1 ${TEMPS_INGRESS_PUBLISH_IP:-198.19.255.10} 9001 && nc -z -w 1 ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10} 9000 && nc -z -w 1 ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10} 9001"]
+      test: ["CMD-SHELL", "nc -z -w 1 ${TEMPS_ADMIN_INGRESS_IP:-198.19.255.10} 9001 && nc -z -w 1 ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10} 9001"]
       interval: 10s
       timeout: 3s
       retries: 6
@@ -304,6 +343,9 @@ networks:
     # Compose and containers created through the Docker API share the network.
     name: ${TEMPS_NETWORK_NAME:-temps-docker-workloads}
     driver: bridge
+    ipam:
+      config:
+        - subnet: ${TEMPS_WORKLOAD_SUBNET:-198.20.255.0/24}
   temps-ingress-network:
     driver: bridge
     driver_opts:

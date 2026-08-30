@@ -24,6 +24,7 @@ safe_postgres="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 safe_clickhouse="23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef01"
 old_clickhouse="3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012"
 workload_probe_name="${project}-workload-probe"
+saturation_probe_name="${project}-saturation-probe"
 export TEMPS_NETWORK_NAME="${TEMPS_NETWORK_NAME:-temps-docker-workloads}"
 export CLICKHOUSE_PASSWORD="$safe_clickhouse"
 export TEMPS_ADMIN_EMAIL="Admin@Example.TEST"
@@ -47,6 +48,7 @@ fi
 export DOCKER_GID
 
 cleanup() {
+  docker rm --force "$saturation_probe_name" >/dev/null 2>&1 || true
   docker rm --force "$workload_probe_name" >/dev/null 2>&1 || true
   POSTGRES_PASSWORD="$safe_postgres" \
     "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
@@ -111,7 +113,8 @@ config="$({ POSTGRES_PASSWORD="$safe_postgres" \
   "${config_compose[@]}" config --format json; })"
 jq -e '
   [.services.postgres.ports[], .services.clickhouse.ports[],
-   .services["temps-ingress"].ports[]]
+   .services["temps-ingress"].ports[],
+   .services["temps-admin-ingress"].ports[]]
   | all(.host_ip == "127.0.0.1")
 ' <<<"$config" >/dev/null
 jq -e --arg workload_network "$TEMPS_NETWORK_NAME" '
@@ -135,18 +138,25 @@ jq -e --arg workload_network "$TEMPS_NETWORK_NAME" '
   and .services.temps.networks["temps-network"].ipv4_address == "198.18.255.10"
   and .services.postgres.networks["temps-network"].ipv4_address == "198.18.255.11"
   and .services.clickhouse.networks["temps-network"].ipv4_address == "198.18.255.12"
-  and .services["temps-ingress"].networks["temps-ingress-network"].ipv4_address == "198.19.255.10"
-  and (.services["temps-ingress"].networks | has("temps-app-network") | not)
+  and .services["temps-ingress"].networks["temps-app-network"].ipv4_address == "198.20.255.10"
+  and (.services["temps-ingress"].networks | has("temps-ingress-network") | not)
   and (.services["temps-ingress"].cap_drop | index("ALL") != null)
   and .services["temps-ingress"].read_only == true
   and (.services["temps-ingress"].security_opt | index("no-new-privileges:true") != null)
-  and (.services["temps-ingress"].secrets | map(.source) | index("temps_admin_ingress_password") != null)
   and (.services["temps-ingress"].environment | has("TEMPS_ADMIN_INGRESS_PASSWORD") | not)
+  and .services["temps-admin-ingress"].networks["temps-ingress-network"].ipv4_address == "198.19.255.10"
+  and (.services["temps-admin-ingress"].networks | has("temps-app-network") | not)
+  and (.services["temps-admin-ingress"].cap_drop | index("ALL") != null)
+  and .services["temps-admin-ingress"].read_only == true
+  and (.services["temps-admin-ingress"].security_opt | index("no-new-privileges:true") != null)
+  and (.services["temps-admin-ingress"].secrets | map(.source) | index("temps_admin_ingress_password") != null)
+  and (.services["temps-admin-ingress"].environment | has("TEMPS_ADMIN_INGRESS_PASSWORD") | not)
   and .networks["temps-ingress-network"].driver_opts["com.docker.network.bridge.enable_icc"] == "false"
   and .networks["temps-ingress-network"].driver_opts["com.docker.network.bridge.trusted_host_interfaces"] == "lo"
   and .networks["temps-network"].internal == true
   and .networks["temps-network"].ipam.config[0].subnet == "198.18.255.0/24"
   and .networks["temps-app-network"].name == $workload_network
+  and .networks["temps-app-network"].ipam.config[0].subnet == "198.20.255.0/24"
 ' <<<"$config" >/dev/null
 
 POSTGRES_PASSWORD="$safe_postgres" \
@@ -323,7 +333,7 @@ docker run --detach --rm \
   >/dev/null
 
 POSTGRES_PASSWORD="$safe_postgres" \
-  "${compose[@]}" up --detach temps-ingress >/dev/null
+  "${compose[@]}" up --detach temps-ingress temps-admin-ingress >/dev/null
 for _ in {1..180}; do
   if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-app)" == "healthy" ]]; then
     break
@@ -347,6 +357,17 @@ done
 if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-ingress)" != "healthy" ]]; then
   POSTGRES_PASSWORD="$safe_postgres" "${compose[@]}" logs temps-ingress >&2 || true
   echo "Temps loopback ingress did not become healthy" >&2
+  exit 1
+fi
+for _ in {1..30}; do
+  if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-admin-ingress)" == "healthy" ]]; then
+    break
+  fi
+  sleep 1
+done
+if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-admin-ingress)" != "healthy" ]]; then
+  POSTGRES_PASSWORD="$safe_postgres" "${compose[@]}" logs temps-admin-ingress >&2 || true
+  echo "Temps admin ingress did not become healthy" >&2
   exit 1
 fi
 
@@ -397,18 +418,46 @@ for private_endpoint in 198.18.255.10:9000 198.18.255.10:9001 198.18.255.11:5432
   fi
 done
 
-# NOTE: temps-app-network and temps-ingress-network are unconnected bridge
-# networks, so a workload container cannot reach temps-ingress's
-# 198.19.255.10 address at all on real Docker Engine (only Docker Desktop's
-# more permissive cross-bridge routing made that look reachable here before).
-# Verifying "the workload can reach the public ingress surface" from this
-# vantage point is deferred until that connectivity is deliberately wired up.
-# The admin/auth-hiding properties below are still verified from the host via
-# the published loopback ports, which is a real, currently-reachable surface.
+# Managed workloads must reach the public ingress over their shared network,
+# while the physically separate admin proxy remains undiscoverable and
+# unreachable from that network.
+docker exec "$workload_probe_name" wget --quiet --output-document=- \
+  "http://temps-ingress:9000/readyz" | grep -qx ready
+for public_port in 3000 9000; do
+  workload_admin_response="$(docker exec "$workload_probe_name" \
+    wget --server-response --spider \
+    "http://temps-ingress:${public_port}/api/auth/login" 2>&1 || true)"
+  workload_admin_status="$(sed -n 's/^[[:space:]]*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' \
+    <<<"$workload_admin_response" | tail -1)"
+  if [[ "$workload_admin_status" != "404" ]]; then
+    printf '%s\n' "$workload_admin_response" >&2
+    echo "workload-facing public port $public_port returned $workload_admin_status for an admin route; expected 404" >&2
+    exit 1
+  fi
+done
+docker exec "$workload_probe_name" nc -z -w 5 temps-ingress 3443
+if docker exec "$workload_probe_name" getent hosts temps-admin-ingress >/dev/null 2>&1; then
+  echo "workload network unexpectedly resolves the private admin ingress" >&2
+  exit 1
+fi
+# Native Linux bridge isolation rejects this route. Docker Desktop may route a
+# numerically addressed packet across otherwise-unconnected bridges; if it
+# does, the independent authentication boundary must still fail closed.
+if docker exec "$workload_probe_name" nc -z -w 1 198.19.255.10 9001 >/dev/null 2>&1; then
+  workload_admin_response="$(docker exec "$workload_probe_name" \
+    wget --server-response --spider http://198.19.255.10:9001/ 2>&1 || true)"
+  workload_admin_status="$(sed -n 's/^[[:space:]]*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' \
+    <<<"$workload_admin_response" | tail -1)"
+  if [[ "$workload_admin_status" != "401" ]]; then
+    printf '%s\n' "$workload_admin_response" >&2
+    echo "routed workload request bypassed the admin ingress authentication barrier" >&2
+    exit 1
+  fi
+fi
 
 # The private admin listener is published only through a second authentication
 # barrier. Temps authentication remains active behind this proxy.
-admin_binding="$(docker port temps-ingress 9001/tcp)"
+admin_binding="$(docker port temps-admin-ingress 9001/tcp)"
 if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' "http://${admin_binding}/")" != "401" ]]; then
   echo "admin ingress unexpectedly accepted an unauthenticated request" >&2
   exit 1
@@ -431,6 +480,45 @@ if [[ "$admin_authenticated" != "true" ]]; then
   echo "admin ingress did not accept the correct credentials" >&2
   exit 1
 fi
+
+# Exercise an actual HTTP/1.1 upgrade through the same admin ingress image.
+# The mock upstream records the forwarded request so the test also proves the
+# independent Basic credential is removed before application traffic.
+POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" up --detach websocket-ingress-probe >/dev/null
+websocket_binding="$(POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" port websocket-ingress-probe 9001)"
+websocket_upgraded=false
+for _ in {1..10}; do
+  websocket_status="$(curl --http1.1 --silent --output /dev/null --write-out '%{http_code}' \
+    --max-time 5 --user "temps:${admin_ingress_password}" \
+    --header 'Connection: Upgrade' --header 'Upgrade: websocket' \
+    "http://${websocket_binding}/socket" || true)"
+  if [[ "$websocket_status" == "101" ]]; then
+    websocket_upgraded=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$websocket_upgraded" != "true" ]]; then
+  POSTGRES_PASSWORD="$safe_postgres" "${compose[@]}" logs websocket-ingress-probe websocket-upstream-probe >&2 || true
+  echo "admin ingress did not preserve a WebSocket upgrade" >&2
+  exit 1
+fi
+websocket_request="$(POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" exec --no-TTY websocket-upstream-probe cat /tmp/websocket-request)"
+websocket_request_clean="$(tr -d '\r' <<<"$websocket_request")"
+if ! grep -Eiq '^Upgrade:[[:space:]]*websocket$' <<<"$websocket_request_clean" || \
+  ! grep -Eiq '^Connection:[[:space:]]*upgrade$' <<<"$websocket_request_clean"; then
+  printf '%s\n' "$websocket_request_clean" >&2
+  echo "admin ingress did not forward the WebSocket upgrade headers" >&2
+  exit 1
+fi
+if grep -Eiq '^Authorization:' <<<"$websocket_request_clean"; then
+  echo "admin ingress forwarded its Basic Authorization credential upstream" >&2
+  exit 1
+fi
+
 # Loopback publication must still reach the listener bound to the private
 # control-network address.
 console_binding="$(docker port temps-ingress 9000/tcp)"
@@ -459,6 +547,12 @@ for public_port in 3000 9000; do
   fi
 done
 tls_binding="$(docker port temps-ingress 3443/tcp)"
+tls_host="${tls_binding%:*}"
+tls_port="${tls_binding##*:}"
+if ! nc -z -w 5 "$tls_host" "$tls_port"; then
+  echo "public TLS port 3443 is not reachable through its loopback publication" >&2
+  exit 1
+fi
 tls_admin_status="$(curl --insecure --silent --output /dev/null --write-out '%{http_code}' \
   --connect-timeout 5 "https://${tls_binding}/api/auth/login" || true)"
 if [[ "$tls_admin_status" != "404" && "$tls_admin_status" != "000" ]]; then
@@ -466,19 +560,50 @@ if [[ "$tls_admin_status" != "404" && "$tls_admin_status" != "000" ]]; then
   exit 1
 fi
 
+# Regression for the former global 10-second stream timeout: a quiet client
+# must remain connected long enough to send its request after that boundary.
+# A dedicated HTTP upstream isolates the ingress timeout from Temps' own HTTP
+# connection timeout.
+POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" up --detach idle-stream-ingress-probe >/dev/null
+idle_stream_ready=false
+for _ in {1..10}; do
+  if docker exec "$workload_probe_name" nc -z -w 1 idle-stream-ingress-probe 9000 \
+    >/dev/null 2>&1; then
+    idle_stream_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$idle_stream_ready" != "true" ]]; then
+  POSTGRES_PASSWORD="$safe_postgres" \
+    "${compose[@]}" logs idle-stream-ingress-probe idle-stream-upstream-probe >&2 || true
+  echo "idle-stream ingress regression fixture did not become ready" >&2
+  exit 1
+fi
+idle_stream_response="$(docker run --rm --network "$TEMPS_NETWORK_NAME" \
+  alpine:3.22 timeout 30 sh -ec \
+  '{ sleep 12; printf "GET /readyz HTTP/1.1\r\nHost: temps\r\nConnection: close\r\n\r\n"; sleep 5; } | nc idle-stream-ingress-probe 9000')"
+if ! grep -Fq ready <<<"$idle_stream_response"; then
+  echo "public ingress dropped a valid stream after more than ten idle seconds" >&2
+  exit 1
+fi
+
 # Exercise more slow public connections than the per-source ceiling. Nginx must
-# reject the excess without spawning one ingress process per connection, then
-# recover after the configured idle timeout.
-docker exec --detach "$workload_probe_name" sh -ec '
+# reject the excess without spawning one ingress process per connection. Use a
+# disposable source container so the test explicitly terminates every client.
+docker run --detach --rm --name "$saturation_probe_name" \
+  --network "$TEMPS_NETWORK_NAME" alpine:3.22 sleep 300 >/dev/null
+docker exec --detach "$saturation_probe_name" sh -ec '
   index=0
   while [ "$index" -lt 128 ]; do
-    (sleep 30) | nc -w 15 198.19.255.10 9000 >/dev/null 2>&1 &
+    (sleep 60) | nc -w 65 temps-ingress 9000 >/dev/null 2>&1 &
     index=$((index + 1))
   done
   wait
 '
 connection_limit_enforced=false
-for _ in {1..10}; do
+for _ in {1..20}; do
   ingress_process_count="$(docker exec temps-ingress sh -ec \
     'set -- /proc/[0-9]*; printf "%s" "$#"')"
   if ((ingress_process_count > 8)); then
@@ -496,23 +621,34 @@ if [[ "$connection_limit_enforced" != "true" ]]; then
   echo "public ingress did not enforce its concurrent connection ceiling" >&2
   exit 1
 fi
-if [[ "$(docker inspect --format '{{.HostConfig.PidsLimit}}' temps-ingress)" != "32" ]]; then
-  echo "admin ingress PID limit is not 32" >&2
-  exit 1
-fi
-if [[ "$(docker inspect --format '{{.HostConfig.Memory}}' temps-ingress)" != "134217728" ]]; then
-  echo "admin ingress memory limit is not 128 MiB" >&2
-  exit 1
-fi
-sleep 10
+docker rm --force "$saturation_probe_name" >/dev/null
+for _ in {1..10}; do
+  if curl --fail --silent "http://${console_binding}/readyz" 2>/dev/null | grep -qx ready; then
+    break
+  fi
+  sleep 1
+done
 curl --fail --silent --show-error "http://${console_binding}/readyz" | grep -qx ready
 
+for ingress_container in temps-ingress temps-admin-ingress; do
+  if [[ "$(docker inspect --format '{{.HostConfig.PidsLimit}}' "$ingress_container")" != "32" ]]; then
+    echo "$ingress_container PID limit is not 32" >&2
+    exit 1
+  fi
+  if [[ "$(docker inspect --format '{{.HostConfig.Memory}}' "$ingress_container")" != "134217728" ]]; then
+    echo "$ingress_container memory limit is not 128 MiB" >&2
+    exit 1
+  fi
+done
+
 docker exec temps-app awk '/^Uid:/ { exit !($2 != 0) }' /proc/1/status
-docker exec temps-ingress awk '/^Uid:/ { exit !($2 != 0) }' /proc/1/status
-if docker exec temps-ingress touch /etc/compose-security-write-test >/dev/null 2>&1; then
-  echo "admin ingress root filesystem is unexpectedly writable" >&2
-  exit 1
-fi
+for ingress_container in temps-ingress temps-admin-ingress; do
+  docker exec "$ingress_container" awk '/^Uid:/ { exit !($2 != 0) }' /proc/1/status
+  if docker exec "$ingress_container" touch /etc/compose-security-write-test >/dev/null 2>&1; then
+    echo "$ingress_container root filesystem is unexpectedly writable" >&2
+    exit 1
+  fi
+done
 docker exec temps-app sh -ec 'touch /app/data/.compose-security-write-test; rm /app/data/.compose-security-write-test'
 docker exec temps-app sh -ec 'test -r /var/run/docker.sock && test -w /var/run/docker.sock'
 docker exec temps-app sh -ec \
@@ -556,12 +692,12 @@ if docker logs temps-app 2>&1 | grep -Fq 'tT3!0123456789abcdef'; then
   echo "initial admin password leaked into application logs" >&2
   exit 1
 fi
-if docker inspect --format '{{json .Config.Env}}' temps-ingress \
+if docker inspect --format '{{json .Config.Env}}' temps-admin-ingress \
   | grep -Fq "$admin_ingress_password"; then
   echo "admin ingress password leaked into the proxy environment" >&2
   exit 1
 fi
-if docker logs temps-ingress 2>&1 | grep -Fq "$admin_ingress_password"; then
+if docker logs temps-admin-ingress 2>&1 | grep -Fq "$admin_ingress_password"; then
   echo "admin ingress password leaked into proxy logs" >&2
   exit 1
 fi

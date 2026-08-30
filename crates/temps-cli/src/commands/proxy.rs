@@ -433,8 +433,11 @@ impl ProxyCommand {
                     .map_err(|e| anyhow::anyhow!("Docker ping failed: {}", e))?;
                 Ok::<_, anyhow::Error>(docker)
             });
-            match docker {
-                Ok(docker) => {
+            match crate::commands::serve::proxy::optional_docker_feature(
+                docker,
+                "on-demand scale-to-zero wake for this proxy",
+            ) {
+                Some(docker) => {
                     let docker_runtime = temps_deployer::docker::DockerRuntime::new(
                         Arc::new(docker),
                         true,
@@ -455,14 +458,7 @@ impl ProxyCommand {
                         None,
                     )))
                 }
-                Err(e) => {
-                    warn!(
-                        "Docker not available — on-demand scale-to-zero wake is disabled \
-                         for this proxy: {}",
-                        e
-                    );
-                    None
-                }
+                None => None,
             }
         };
 

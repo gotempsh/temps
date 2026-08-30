@@ -15,6 +15,26 @@ use tracing::{info, warn};
 
 use super::shutdown::CtrlCShutdownSignal;
 
+/// Keep HTTP serving available when optional Docker-backed features cannot be
+/// initialized. Both combined and split proxy composition roots use this gate,
+/// so an unavailable socket cannot accidentally become a startup failure in
+/// one mode only.
+pub(crate) fn optional_docker_feature<T>(
+    result: anyhow::Result<T>,
+    disabled_features: &str,
+) -> Option<T> {
+    match result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            warn!(
+                "Docker not available — {} will be disabled: {}",
+                disabled_features, error
+            );
+            None
+        }
+    }
+}
+
 /// Adapter bridging `temps_deployer::ContainerDeployer` to `temps_proxy::on_demand::ContainerLifecycle`.
 pub(crate) struct ContainerLifecycleAdapter {
     deployer: Arc<dyn ContainerDeployer>,
@@ -278,6 +298,16 @@ pub fn start_proxy_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_docker_disables_optional_features_without_failing_startup() {
+        let result = optional_docker_feature::<()>(
+            Err(anyhow::anyhow!("Docker socket is unavailable")),
+            "on-demand test features",
+        );
+
+        assert!(result.is_none());
+    }
     use std::collections::HashMap;
     use temps_deployer::{
         ContainerInfo, ContainerStats, ContainerStatus, DeployRequest, DeployResult, DeployerError,

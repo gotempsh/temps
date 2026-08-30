@@ -346,6 +346,25 @@ pub fn execution_environment_compatibility() -> ExecutionEnvironment {
 mod tests {
     use super::*;
 
+    const PROCESS_ENVIRONMENT_CHILD: &str = "TEMPS_RUNTIME_PROCESS_ENVIRONMENT_CHILD";
+    const NON_UNICODE_CHILD: &str = "TEMPS_RUNTIME_NON_UNICODE_CHILD";
+
+    fn run_exact_test_in_child(
+        test_name: &str,
+        marker: &str,
+        canonical_value: &std::ffi::OsStr,
+    ) -> std::process::ExitStatus {
+        std::process::Command::new(std::env::current_exe().expect("test executable should exist"))
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(marker, "1")
+            .env(EXECUTION_ENVIRONMENT_VARIABLE, canonical_value)
+            .env_remove(LEGACY_DEPLOYMENT_MODE_VARIABLE)
+            .status()
+            .expect("runtime environment child test should start")
+    }
+
     #[test]
     fn canonical_value_has_precedence_over_legacy_value() {
         let context = RuntimeContext::from_configured_values(Some("host"), Some("docker"))
@@ -436,5 +455,58 @@ mod tests {
 
         assert_eq!(host.url(None), "http://127.0.0.1:18123");
         assert_eq!(docker.url(None), "http://temps-clickhouse:8123");
+    }
+
+    #[test]
+    fn process_runtime_context_reads_and_caches_the_real_environment() {
+        if std::env::var_os(PROCESS_ENVIRONMENT_CHILD).is_some() {
+            let first = initialize_process_runtime_context()
+                .expect("configured Docker environment should initialize");
+            let second = initialize_process_runtime_context()
+                .expect("cached Docker environment should remain available");
+
+            assert_eq!(first.execution_environment(), ExecutionEnvironment::Docker);
+            assert_eq!(first.source(), ExecutionEnvironmentSource::Canonical);
+            assert!(std::ptr::eq(first, second));
+            return;
+        }
+
+        let status = run_exact_test_in_child(
+            "runtime::tests::process_runtime_context_reads_and_caches_the_real_environment",
+            PROCESS_ENVIRONMENT_CHILD,
+            std::ffi::OsStr::new("docker"),
+        );
+        assert!(status.success(), "runtime environment child test failed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn process_runtime_context_rejects_and_caches_non_unicode_input() {
+        if std::env::var_os(NON_UNICODE_CHILD).is_some() {
+            let first = initialize_process_runtime_context()
+                .expect_err("non-Unicode execution environment must fail closed");
+            let second = initialize_process_runtime_context()
+                .expect_err("cached non-Unicode error must remain stable");
+
+            assert!(matches!(
+                first,
+                RuntimeConfigurationError::NonUnicodeExecutionEnvironment {
+                    variable: EXECUTION_ENVIRONMENT_VARIABLE,
+                    ..
+                }
+            ));
+            assert_eq!(first, second);
+            return;
+        }
+
+        use std::os::unix::ffi::OsStringExt;
+
+        let invalid_value = std::ffi::OsString::from_vec(vec![0xff, 0xfe]);
+        let status = run_exact_test_in_child(
+            "runtime::tests::process_runtime_context_rejects_and_caches_non_unicode_input",
+            NON_UNICODE_CHILD,
+            &invalid_value,
+        );
+        assert!(status.success(), "non-Unicode runtime child test failed");
     }
 }

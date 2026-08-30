@@ -51,8 +51,10 @@ applications network access to the control-plane PostgreSQL or ClickHouse
 services. The Compose package pins its private dependencies and Temps listener
 binds to configurable static control-network addresses rather than DNS-derived
 addresses. Host access is published separately on `127.0.0.1`. Compose splits
-public ingest (`9000`) from admin/UI (`9001`); the latter passes through a
-separate Basic-auth secret before reaching Temps' own authentication.
+public ingest (`9000`) from admin/UI (`9001`) with physically separate proxy
+containers; only the public proxy joins the workload network. The admin proxy
+passes through a separate Basic-auth secret before reaching Temps' own
+authentication.
 
 The Compose file also reads these `.env` values. If the subnet overlaps an
 existing route, change the subnet and all three addresses together:
@@ -63,6 +65,11 @@ existing route, change the subnet and all three addresses together:
 | `TEMPS_CONTROL_INTERNAL_IP` | `198.18.255.10` | Temps listener address on the private network |
 | `TEMPS_POSTGRES_INTERNAL_IP` | `198.18.255.11` | PostgreSQL address used by Temps |
 | `TEMPS_CLICKHOUSE_INTERNAL_IP` | `198.18.255.12` | ClickHouse address used by Temps |
+| `TEMPS_WORKLOAD_SUBNET` | `198.20.255.0/24` | Shared managed-workload bridge subnet |
+| `TEMPS_PUBLIC_INGRESS_IP` | `198.20.255.10` | Public proxy address reachable by managed workloads |
+| `TEMPS_INGRESS_SUBNET` | `198.19.255.0/24` | Dedicated loopback-admin proxy bridge subnet |
+| `TEMPS_ADMIN_INGRESS_IP` | `198.19.255.10` | Admin proxy address on its dedicated bridge |
+| `TEMPS_INGRESS_GATEWAY_IP` | `198.19.255.1` | Dedicated admin bridge gateway |
 | `TEMPS_ADMIN_PASSWORD_FILE` | `./secrets/admin_password` | Initial Temps administrator password secret |
 | `TEMPS_ADMIN_INGRESS_PASSWORD_FILE` | `./secrets/admin_ingress_password` | Independent Basic-auth secret for loopback admin ingress (username `temps`) |
 

@@ -164,7 +164,10 @@ chmod 444 secrets/admin_password secrets/admin_ingress_password
 Set `TEMPS_ADMIN_INGRESS_PASSWORD_FILE` to the second file. It protects the
 loopback-only admin port (`127.0.0.1:9001`) with username `temps`; keep it
 independent from the Temps account password. The public ingest listener remains
-on `127.0.0.1:9000` and does not serve admin routes.
+on `127.0.0.1:9000` and does not serve admin routes. The updated stack uses
+separate public and admin proxy containers: only the public proxy joins the
+managed-workload network, and both continue to publish exclusively on host
+loopback.
 Set `DOCKER_GID` to the group that owns `/var/run/docker.sock` as seen inside a
 container on Linux or macOS:
 

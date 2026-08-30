@@ -446,25 +446,19 @@ impl ServeCommand {
         // The proxy server (80/443) MUST come up regardless.
         let docker_handle: Option<Arc<bollard::Docker>> = {
             let docker_rt = tokio::runtime::Runtime::new()?;
-            match docker_rt.block_on(async {
-                let docker = bollard::Docker::connect_with_defaults()
-                    .map_err(|e| anyhow::anyhow!("Docker connect failed: {}", e))?;
-                docker
-                    .ping()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Docker ping failed: {}", e))?;
-                Ok::<_, anyhow::Error>(docker)
-            }) {
-                Ok(docker) => Some(Arc::new(docker)),
-                Err(e) => {
-                    warn!(
-                        "Docker not available — on-demand scale-to-zero and workspace \
-                         preview gateway will be disabled: {}",
-                        e
-                    );
-                    None
-                }
-            }
+            proxy::optional_docker_feature(
+                docker_rt.block_on(async {
+                    let docker = bollard::Docker::connect_with_defaults()
+                        .map_err(|e| anyhow::anyhow!("Docker connect failed: {}", e))?;
+                    docker
+                        .ping()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Docker ping failed: {}", e))?;
+                    Ok::<_, anyhow::Error>(docker)
+                }),
+                "on-demand scale-to-zero and workspace preview gateway",
+            )
+            .map(Arc::new)
         };
 
         // The on-demand wake manager is a PROXY-side concern: it watches request

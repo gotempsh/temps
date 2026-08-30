@@ -70,14 +70,19 @@ prevent Docker-only assumptions from leaking into business logic, but this
 iteration does not add Kubernetes crates, manifests, API clients, RBAC,
 resolvers, workload providers, or integration tests.
 
-The foundation is complete when a future Kubernetes adapter can be added at the
-composition root without changing endpoint consumers or domain services. It is
-not necessary to ship an unused Kubernetes implementation today.
+The architectural target is complete when a future Kubernetes adapter can be
+added at the composition root without changing endpoint consumers or domain
+services. It is not necessary to ship an unused Kubernetes implementation
+today. The Docker delivery implements the immutable Host/Docker context and
+typed endpoint values first; capability probing and the remaining compatibility
+call-site migration stay explicitly tracked in the migration plan below.
 
 ### 1. Construct one immutable runtime context at startup
 
-The CLI composition root will construct and validate one `RuntimeContext`, then
-inject it into services that need infrastructure behavior. It will contain:
+The CLI composition root constructs and validates one `RuntimeContext`, then
+injects it into routing and readiness services. In the initial Docker delivery
+it contains the validated environment, resolver, and configuration source. The
+completed architecture will additionally contain:
 
 - A validated `ExecutionEnvironment`: `Host`, `Docker`, or `Kubernetes`.
 - A `ServiceEndpointResolver` selected for that environment.
@@ -127,11 +132,13 @@ cgroup contents are not a reliable configuration contract.
 Consumers will request an endpoint using a stable service identity and logical
 port instead of assembling a hostname from the execution environment.
 
-Resolution follows this precedence:
+At the composition and packaging boundary, resolution follows this precedence:
 
 1. An explicit operator-provided endpoint, such as `TEMPS_DATABASE_URL` or
    `TEMPS_CLICKHOUSE_URL`.
-2. The environment-specific resolver configured at startup.
+2. The environment-specific resolver configured at startup. The initial
+   Host/Docker resolver implements this defaulting layer; existing explicit URL
+   consumers remain authoritative while their call sites are migrated.
 3. A typed `EndpointUnavailable` error containing the service identity,
    execution environment, and missing configuration.
 
@@ -278,13 +285,18 @@ Because the Compose control plane is attached to both networks, its HTTP, TLS,
 and console/admin listeners MUST bind only to its configured static private
 control-network address, never `0.0.0.0`, a DNS-derived address, or the
 workload-network address. Public HTTP, TLS, and ingest listeners are forwarded
-through an unprivileged ingress container and published only on `127.0.0.1`.
-Managed workloads can reach this deliberately public surface, so it MUST return
-404 for admin, authentication, UI, and management routes.
+through an unprivileged public ingress container, published only on
+`127.0.0.1`, and attached to the workload network. Managed workloads can reach
+this deliberately public surface, so it MUST return 404 for admin,
+authentication, UI, and management routes.
 
 The admin/UI listener binds to a separate private control address and port. It
-is published on host loopback through an HTTP reverse proxy with an independent,
-strong, randomly generated Basic-auth password mounted as a file secret. The
+is published on host loopback through a physically separate HTTP reverse proxy
+on a bridge that does not join or advertise itself on the workload network and
+has an independent, strong, randomly generated Basic-auth password mounted as a
+file secret. Because Docker engines differ in whether they route a numerically
+addressed packet across otherwise-unconnected bridges, network separation is
+defense in depth and the authentication barrier MUST remain fail-closed. The
 proxy MUST bcrypt the secret at startup, rate-limit authentication failures,
 strip the Basic `Authorization` header before forwarding, and preserve Temps'
 own authentication and authorization checks. It MUST run non-root with a
