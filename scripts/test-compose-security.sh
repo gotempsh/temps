@@ -399,8 +399,23 @@ done
 
 # The workload may reach the deliberately public ingress surface, but not the
 # private control network. Public console routes must not expose admin/auth UI.
-docker exec "$workload_probe_name" wget --quiet --output-document=- \
-  "http://198.19.255.10:9000/readyz" | grep -qx ready
+# The ingress container's own health check flips to healthy as soon as its
+# ports accept connections, which can be a moment before nginx has fully
+# loaded the upstream proxy_pass config, so retry like every other
+# post-health-flip readiness probe in this script.
+public_ready=false
+for _ in {1..30}; do
+  if docker exec "$workload_probe_name" wget --quiet --output-document=- \
+    "http://198.19.255.10:9000/readyz" | grep -qx ready; then
+    public_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$public_ready" != "true" ]]; then
+  echo "public ingress console listener did not become ready" >&2
+  exit 1
+fi
 public_admin_response="$(docker exec "$workload_probe_name" sh -ec \
   'wget -S -O /dev/null "$1" 2>&1 || true' -- \
   'http://198.19.255.10:9000/api/auth/login')"
@@ -422,8 +437,19 @@ if [[ "$(curl --silent --output /dev/null --write-out '%{http_code}' \
   echo "admin ingress unexpectedly accepted an incorrect password" >&2
   exit 1
 fi
-curl --fail --silent --show-error --user "temps:${admin_ingress_password}" \
-  "http://${admin_binding}/" >/dev/null
+admin_authenticated=false
+for _ in {1..10}; do
+  if curl --fail --silent --user "temps:${admin_ingress_password}" \
+    "http://${admin_binding}/" >/dev/null 2>&1; then
+    admin_authenticated=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$admin_authenticated" != "true" ]]; then
+  echo "admin ingress did not accept the correct credentials" >&2
+  exit 1
+fi
 workload_admin_response="$(docker exec "$workload_probe_name" sh -ec \
   'wget -S -O /dev/null "$1" 2>&1 || true' -- \
   'http://198.19.255.10:9001/')"
@@ -436,7 +462,18 @@ fi
 # Loopback publication must still reach the listener bound to the private
 # control-network address.
 console_binding="$(docker port temps-ingress 9000/tcp)"
-curl --fail --silent --show-error "http://${console_binding}/readyz" | grep -qx ready
+loopback_ready=false
+for _ in {1..10}; do
+  if curl --fail --silent "http://${console_binding}/readyz" 2>/dev/null | grep -qx ready; then
+    loopback_ready=true
+    break
+  fi
+  sleep 1
+done
+if [[ "$loopback_ready" != "true" ]]; then
+  echo "loopback-published console listener did not become ready" >&2
+  exit 1
+fi
 
 # No public listener may expose the split admin/auth surface. Check the public
 # HTTP proxy, HTTPS proxy, and console/ingest listener independently.
