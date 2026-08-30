@@ -372,6 +372,16 @@ for control_plane_alias in temps-postgres temps-clickhouse; do
   done
   if [[ "$alias_resolved" != "true" ]]; then
     echo "workload network alias $control_plane_alias did not become resolvable" >&2
+    echo "--- resolv.conf ---" >&2
+    docker exec "$workload_probe_name" cat /etc/resolv.conf >&2 || true
+    echo "--- nslookup output ---" >&2
+    docker exec "$workload_probe_name" nslookup "$control_plane_alias" >&2 || true
+    echo "--- nslookup against 127.0.0.11 explicitly ---" >&2
+    docker exec "$workload_probe_name" nslookup "$control_plane_alias" 127.0.0.11 >&2 || true
+    echo "--- getent hosts ---" >&2
+    docker exec "$workload_probe_name" getent hosts "$control_plane_alias" >&2 || true
+    echo "--- network inspect ---" >&2
+    docker network inspect "$TEMPS_NETWORK_NAME" >&2 || true
     exit 1
   fi
 done
