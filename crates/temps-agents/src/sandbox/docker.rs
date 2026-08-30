@@ -3385,27 +3385,43 @@ impl SandboxProvider for DockerSandboxProvider {
         }
         if let Some(workspace) = &artifact.workspace {
             let workspace_path = workspace.content_path.clone();
+            let workspace_path_for_hash = workspace_path.clone();
             let expected_workspace_digest = workspace.content_digest.clone();
+            let logical_snapshot_digest = artifact.content_digest.clone();
             let (actual_workspace_digest, _) =
-                tokio::task::spawn_blocking(move || hash_file(&workspace_path))
+                tokio::task::spawn_blocking(move || hash_file(&workspace_path_for_hash))
                     .await
                     .map_err(|e| AgentError::SandboxCreationFailed {
                         run_id: config.run_id,
                         provider: "docker".to_string(),
-                        reason: format!("verify workspace snapshot task failed: {}", e),
+                        reason: format!(
+                            "verify workspace artifact '{}' for logical snapshot '{}' \
+                             task failed: {}",
+                            workspace_path.display(),
+                            logical_snapshot_digest,
+                            e
+                        ),
                     })?
                     .map_err(|e| AgentError::SandboxCreationFailed {
                         run_id: config.run_id,
                         provider: "docker".to_string(),
-                        reason: format!("verify workspace snapshot artifact: {}", e),
+                        reason: format!(
+                            "verify workspace artifact '{}' for logical snapshot '{}': {}",
+                            workspace_path.display(),
+                            logical_snapshot_digest,
+                            e
+                        ),
                     })?;
             if actual_workspace_digest != expected_workspace_digest {
                 return Err(AgentError::SandboxCreationFailed {
                     run_id: config.run_id,
                     provider: "docker".to_string(),
                     reason: format!(
-                        "workspace snapshot digest mismatch: expected {}, got {}",
-                        expected_workspace_digest, actual_workspace_digest
+                        "workspace artifact '{}' for logical snapshot '{}' has digest mismatch: expected {}, got {}",
+                        workspace_path.display(),
+                        logical_snapshot_digest,
+                        expected_workspace_digest,
+                        actual_workspace_digest
                     ),
                 });
             }
@@ -4076,6 +4092,59 @@ mod tests {
             .unwrap_err();
 
         assert!(error.to_string().contains("no immutable Docker image ID"));
+    }
+
+    #[tokio::test]
+    async fn docker_workspace_verification_error_identifies_artifact_and_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("snapshot.tar");
+        std::fs::write(&primary, b"verified-image-tar").unwrap();
+        let (primary_digest, primary_size) = hash_file(&primary).unwrap();
+        let missing_workspace = directory.path().join("missing-workspace.tar");
+        let logical_digest = "logical-snapshot-digest".to_string();
+        let artifact = super::super::SnapshotArtifact {
+            content_path: primary,
+            content_digest: logical_digest.clone(),
+            primary_digest,
+            size_bytes: primary_size,
+            backend: super::super::SandboxBackend::Docker,
+            image_ref: Some("temps-snapshot/context:latest".to_string()),
+            image_id: Some("sha256:immutable-image".to_string()),
+            workspace: Some(super::super::SnapshotCompanionArtifact {
+                content_path: missing_workspace.clone(),
+                content_digest: "missing-workspace-digest".to_string(),
+                size_bytes: 1,
+            }),
+        };
+        let provider = DockerSandboxProvider::new(
+            Arc::new(Docker::connect_with_local_defaults().unwrap()),
+            DockerSandboxConfig::default(),
+        );
+        let config = SandboxCreateConfig {
+            owner_user_id: None,
+            run_id: 2,
+            container_name_override: Some("workspace-context".to_string()),
+            host_work_dir: directory.path().join("workspace"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            network_mode: Some("none".to_string()),
+            env_vars: HashMap::new(),
+            idle_timeout: std::time::Duration::from_secs(60),
+            backend: Some(super::super::SandboxBackend::Docker),
+        };
+
+        let error = provider
+            .create_from_snapshot(&artifact, config)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(&missing_workspace.display().to_string()));
+        assert!(error.contains(&logical_digest));
     }
 
     /// Root maintenance commands resolve `chown`/`su`/`cp` through PATH. The
