@@ -54,6 +54,15 @@ pub fn build_router(
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
+        output_capture_slots: Arc::new(tokio::sync::Semaphore::new(
+            handlers::MAX_CONCURRENT_OUTPUT_CAPTURES,
+        )),
+        exec_operation_slots: Arc::new(tokio::sync::Semaphore::new(
+            handlers::MAX_CONCURRENT_EXEC_OPERATIONS,
+        )),
+        image_import_slots: Arc::new(tokio::sync::Semaphore::new(
+            handlers::MAX_CONCURRENT_IMAGE_IMPORTS,
+        )),
         docker,
         overlay_bridge_address,
         overlay_peers,

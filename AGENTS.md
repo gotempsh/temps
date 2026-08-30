@@ -197,6 +197,25 @@ Always use `git commit -s` (and `-s` on `--amend`/`revert`). Like the
 Changelog check, the DCO check validates every commit in `base..HEAD`,
 not just the tip.
 
+This is a mandatory agent pre-commit gate. Never run a plain `git commit`:
+
+```bash
+git commit -s -m "type(scope): description"
+```
+
+If a commit was created without the trailer, repair it before pushing:
+
+```bash
+git commit --amend --no-edit -s
+```
+
+Before opening or updating a PR, verify every commit in the PR range contains
+the trailer. Do not assume the pre-commit hooks add it automatically:
+
+```bash
+git log origin/main..HEAD --format='%h%n%B%n---'
+```
+
 ## Per-record config columns, not env vars
 
 When adding a new runtime knob, default to a column on the relevant

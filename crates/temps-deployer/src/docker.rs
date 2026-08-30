@@ -6,8 +6,8 @@
 use crate::static_ingestion::{MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_STATIC_TOTAL_BYTES};
 use crate::{
     BuildRequest, BuildResult, BuilderError, ContainerDeployer, ContainerInfo, ContainerRuntime,
-    ContainerStatus, DeployRequest, DeployResult, DeployerError, ImageBuilder, PortMapping,
-    Protocol, RuntimeInfo,
+    ContainerStatus, DeployRequest, DeployResult, DeployerError, ImageBuilder, ImageImportStream,
+    PortMapping, Protocol, RuntimeInfo,
 };
 use async_trait::async_trait;
 use bollard::{
@@ -31,6 +31,189 @@ use tracing::{debug, error, info, warn};
 
 const MAX_STATIC_ARCHIVE_STREAM_BYTES: u64 =
     MAX_STATIC_TOTAL_BYTES + (MAX_STATIC_ENTRIES as u64 * 1024) + (1024 * 1024);
+
+/// Maximum payload returned by the one-shot container logs endpoint.
+///
+/// The control plane persists at most 8 MiB during container teardown, so
+/// retaining more on a worker only increases memory and transfer cost.
+const MAX_CONTAINER_LOG_BYTES: usize = 8 * 1024 * 1024;
+const LOG_TRUNCATION_NOTICE: &str = "[… earlier container logs truncated by worker …]\n";
+
+fn append_printable_log_utf8(output: &mut String, input: &str) {
+    for character in input.chars() {
+        if character.is_control() && !matches!(character, '\n' | '\r' | '\t') {
+            output.push('?');
+        } else {
+            output.push(character);
+        }
+    }
+}
+
+fn append_sanitized_log_utf8(output: &mut String, mut input: &[u8]) {
+    while !input.is_empty() {
+        match std::str::from_utf8(input) {
+            Ok(valid) => {
+                append_printable_log_utf8(output, valid);
+                break;
+            }
+            Err(error) => {
+                let valid_bytes = error.valid_up_to();
+                if let Ok(valid) = std::str::from_utf8(&input[..valid_bytes]) {
+                    append_printable_log_utf8(output, valid);
+                }
+                output.push('?');
+                match error.error_len() {
+                    Some(invalid_bytes) => input = &input[valid_bytes + invalid_bytes..],
+                    None => break,
+                }
+            }
+        }
+    }
+}
+
+struct DockerLogTail {
+    bytes: Vec<u8>,
+    start: usize,
+    limit: usize,
+    truncated: bool,
+}
+
+impl DockerLogTail {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            start: 0,
+            limit,
+            truncated: false,
+        }
+    }
+
+    fn push(&mut self, chunk: bytes::Bytes) {
+        if chunk.is_empty() {
+            return;
+        }
+
+        if self.limit == 0 {
+            self.truncated = true;
+            return;
+        }
+
+        if chunk.len() >= self.limit {
+            self.truncated |= !self.bytes.is_empty() || chunk.len() > self.limit;
+            self.bytes.clear();
+            self.start = 0;
+            self.bytes
+                .extend_from_slice(&chunk[chunk.len() - self.limit..]);
+            return;
+        }
+
+        let mut append_bytes = 0;
+        if self.bytes.len() < self.limit {
+            append_bytes = chunk.len().min(self.limit - self.bytes.len());
+            self.bytes.extend_from_slice(&chunk[..append_bytes]);
+            if append_bytes == chunk.len() {
+                return;
+            }
+        }
+
+        let overwrite = &chunk[append_bytes..];
+        let first = overwrite.len().min(self.limit - self.start);
+        self.bytes[self.start..self.start + first].copy_from_slice(&overwrite[..first]);
+        if first < overwrite.len() {
+            self.bytes[..overwrite.len() - first].copy_from_slice(&overwrite[first..]);
+        }
+        self.start = (self.start + overwrite.len()) % self.limit;
+        self.truncated = true;
+    }
+
+    fn into_string(mut self) -> String {
+        let notice_len = if self.truncated {
+            LOG_TRUNCATION_NOTICE.len()
+        } else {
+            0
+        };
+        let mut output = String::with_capacity(self.bytes.len().saturating_add(notice_len));
+        if self.truncated {
+            output.push_str(LOG_TRUNCATION_NOTICE);
+        }
+        if self.bytes.len() == self.limit && self.start > 0 {
+            self.bytes.rotate_left(self.start);
+        }
+        append_sanitized_log_utf8(&mut output, &self.bytes);
+        output
+    }
+}
+
+fn split_repository_and_tag(image: &str) -> (&str, &str) {
+    match image.rsplit_once(':') {
+        Some((repository, image_tag)) if !image_tag.contains('/') => (repository, image_tag),
+        _ => (image, "latest"),
+    }
+}
+
+async fn import_stream_into_docker(
+    docker: &Docker,
+    image_stream: ImageImportStream,
+    tag: &str,
+) -> Result<String, BuilderError> {
+    let import_stream = docker.import_image_stream(
+        bollard::query_parameters::ImportImageOptions {
+            quiet: false,
+            ..Default::default()
+        },
+        image_stream,
+        None,
+    );
+
+    let mut image_id = None;
+    let mut stream = std::pin::Pin::new(Box::new(import_stream));
+
+    while let Some(result) = futures::StreamExt::next(&mut stream).await {
+        match result {
+            Ok(info) => {
+                if let Some(stream_msg) = info.stream {
+                    info!(message = %stream_msg.trim(), "Docker image import progress");
+                    if stream_msg.contains("Loaded image:") {
+                        image_id = stream_msg
+                            .split("Loaded image: ")
+                            .nth(1)
+                            .map(|value| value.trim().to_string());
+                    }
+                }
+            }
+            Err(error) => {
+                return Err(BuilderError::Other(format!(
+                    "Failed to import image '{tag}' into Docker: {error}"
+                )));
+            }
+        }
+    }
+
+    let image_id = image_id.ok_or_else(|| {
+        BuilderError::Other(format!(
+            "Docker completed the import for image '{tag}' without reporting an image ID"
+        ))
+    })?;
+
+    let (repository, image_tag) = split_repository_and_tag(tag);
+
+    docker
+        .tag_image(
+            &image_id,
+            Some(TagImageOptions {
+                repo: Some(repository.to_string()),
+                tag: Some(image_tag.to_string()),
+            }),
+        )
+        .await
+        .map_err(|error| {
+            BuilderError::Other(format!(
+                "Failed to tag imported Docker image '{tag}' from ID '{image_id}': {error}"
+            ))
+        })?;
+
+    Ok(image_id)
+}
 
 struct DockerContainerCleanupGuard {
     docker: Arc<Docker>,
@@ -2063,59 +2246,21 @@ impl ImageBuilder for DockerRuntime {
             .await
             .map_err(BuilderError::IoError)?;
 
-        let byte_stream =
+        let byte_stream: ImageImportStream = Box::pin(
             tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new())
-                .map(|r| r.map(|b| b.freeze()));
-
-        let import_stream = self.docker.import_image_stream(
-            bollard::query_parameters::ImportImageOptions {
-                quiet: false,
-                ..Default::default()
-            },
-            byte_stream,
-            None,
+                .map(|result| result.map(|bytes| bytes.freeze())),
         );
 
-        let mut image_id = None;
-        let mut stream = std::pin::Pin::new(Box::new(import_stream));
+        import_stream_into_docker(&self.docker, byte_stream, tag).await
+    }
 
-        while let Some(result) = futures::StreamExt::next(&mut stream).await {
-            match result {
-                Ok(info) => {
-                    if let Some(stream_msg) = info.stream {
-                        info!("Import progress: {}", stream_msg.trim());
-                        if stream_msg.contains("Loaded image:") {
-                            image_id = stream_msg
-                                .split("Loaded image: ")
-                                .nth(1)
-                                .map(|s| s.trim().to_string());
-                        }
-                    }
-                }
-                Err(e) => {
-                    return Err(BuilderError::Other(format!(
-                        "Failed to import image: {}",
-                        e
-                    )));
-                }
-            }
-        }
-
-        let id = image_id.ok_or_else(|| BuilderError::Other("No image ID found".to_string()))?;
-
-        // Tag the image
-        self.docker
-            .tag_image(
-                &id,
-                Some(TagImageOptions {
-                    repo: Some(tag.split(':').next().unwrap_or(tag).to_string()),
-                    tag: Some(tag.split(':').nth(1).unwrap_or("latest").to_string()),
-                }),
-            )
-            .await
-            .map_err(|e| BuilderError::Other(format!("Failed to tag image: {}", e)))?;
-
-        Ok(id)
+    async fn import_image_stream(
+        &self,
+        image_stream: ImageImportStream,
+        tag: &str,
+    ) -> Result<String, BuilderError> {
+        info!(image = %tag, "Importing streamed image into Docker");
+        import_stream_into_docker(&self.docker, image_stream, tag).await
     }
 
     async fn save_image(&self, image_name: &str, output_path: &Path) -> Result<(), BuilderError> {
@@ -3072,23 +3217,26 @@ impl ContainerDeployer for DockerRuntime {
     }
 
     async fn get_container_logs(&self, container_id: &str) -> Result<String, DeployerError> {
-        let logs_stream = self
-            .docker
-            .logs(
-                container_id,
-                Some(LogsOptions {
-                    stdout: true,
-                    stderr: true,
-                    tail: "10000".to_string(),
-                    ..Default::default()
-                }),
-            )
-            .map(|chunk| chunk.map(|c| String::from_utf8_lossy(&c.into_bytes()).to_string()))
-            .try_collect::<Vec<_>>()
-            .await
-            .map_err(|e| DeployerError::Other(format!("Failed to get logs: {}", e)))?;
+        let mut logs_stream = self.docker.logs(
+            container_id,
+            Some(LogsOptions {
+                stdout: true,
+                stderr: true,
+                tail: "10000".to_string(),
+                ..Default::default()
+            }),
+        );
+        let mut logs = DockerLogTail::new(MAX_CONTAINER_LOG_BYTES);
 
-        Ok(logs_stream.join(""))
+        while let Some(chunk) = logs_stream.try_next().await.map_err(|error| {
+            DeployerError::Other(format!(
+                "Failed to read logs for container '{container_id}': {error}"
+            ))
+        })? {
+            logs.push(chunk.into_bytes());
+        }
+
+        Ok(logs.into_string())
     }
 
     async fn stream_container_logs(
@@ -3417,6 +3565,76 @@ mod docker_tests {
     use tempfile::TempDir;
     use tokio::fs;
     use tokio::time::{timeout, Duration};
+
+    #[test]
+    fn docker_log_tail_keeps_memory_bounded_and_retains_newest_bytes() {
+        let mut logs = DockerLogTail::new(8);
+        logs.push(bytes::Bytes::from_static(b"abcd"));
+        logs.push(bytes::Bytes::from_static(b"efgh"));
+        logs.push(bytes::Bytes::from_static(b"ijkl"));
+
+        assert_eq!(
+            logs.into_string(),
+            format!("{LOG_TRUNCATION_NOTICE}efghijkl")
+        );
+    }
+
+    #[test]
+    fn docker_log_tail_uses_a_fixed_capacity_ring() {
+        const LIMIT: usize = 64 * 1024;
+        let mut logs = DockerLogTail::new(LIMIT);
+        for _ in 0..200_000 {
+            logs.push(bytes::Bytes::from_static(b"x"));
+        }
+
+        assert_eq!(logs.bytes.len(), LIMIT);
+        assert_eq!(
+            logs.into_string().len(),
+            LOG_TRUNCATION_NOTICE.len() + LIMIT
+        );
+    }
+
+    #[test]
+    fn docker_log_tail_invalid_utf8_does_not_expand_output() {
+        let mut logs = DockerLogTail::new(128);
+        logs.push(bytes::Bytes::from(vec![0xff; 128]));
+
+        let logs = logs.into_string();
+        assert_eq!(logs.len(), 128);
+        assert!(logs.bytes().all(|byte| byte == b'?'));
+    }
+
+    #[test]
+    fn docker_log_tail_control_bytes_do_not_expand_in_json() {
+        let mut logs = DockerLogTail::new(128);
+        logs.push(bytes::Bytes::from(vec![0; 128]));
+
+        let logs = logs.into_string();
+        assert_eq!(logs.len(), 128);
+        assert!(logs.bytes().all(|byte| byte == b'?'));
+    }
+
+    #[test]
+    fn docker_log_tail_preserves_utf8_split_across_ring_wrap() {
+        let mut logs = DockerLogTail::new(5);
+        logs.push(bytes::Bytes::from_static(b"abcde"));
+        logs.push(bytes::Bytes::from_static(b"wxyz"));
+        logs.push(bytes::Bytes::from_static("😀".as_bytes()));
+
+        assert_eq!(logs.into_string(), format!("{LOG_TRUNCATION_NOTICE}z😀"));
+    }
+
+    #[test]
+    fn image_tag_split_preserves_registry_ports() {
+        assert_eq!(
+            split_repository_and_tag("registry.example:5000/team/app:v2"),
+            ("registry.example:5000/team/app", "v2")
+        );
+        assert_eq!(
+            split_repository_and_tag("registry.example:5000/team/app"),
+            ("registry.example:5000/team/app", "latest")
+        );
+    }
 
     #[test]
     fn extraction_and_cleanup_errors_preserve_both_causes() {
