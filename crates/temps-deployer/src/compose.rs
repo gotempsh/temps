@@ -1203,30 +1203,54 @@ impl ComposeExecutor {
 
     /// Tear down containers before a redeploy. Preserves volumes (database data,
     /// uploads, etc.) so they survive between deployments.
+    ///
+    /// Passes `remove_secrets: false` because an upcoming `deploy_prepared()`
+    /// call will consume the secrets that `prepare_and_pull()` just materialized.
+    /// Deleting them here would cause the new containers to start with missing
+    /// or empty secret files.
     pub async fn teardown_for_redeploy(&self, project_name: &str) -> Result<(), ComposeError> {
-        self.teardown_at(project_name, None, None, &HashMap::new())
+        self.teardown_at(project_name, None, None, &HashMap::new(), false)
             .await
     }
 
     /// Tear down a Compose stack from the exact directory used for `up`.
     /// Uploaded/Git deployments run Compose inside their checkout rather than
     /// the data-dir fallback, so compensation must retain that location.
+    ///
+    /// `remove_secrets` controls whether the on-disk directory of materialized
+    /// secret files (`data_dir/compose-secrets/<project_name>/`) is deleted.
+    ///
+    /// **HAZARD**: In a `prepare_and_pull()` → `teardown_at()` → `deploy_prepared()`
+    /// sequence the secrets have just been materialized and `deploy_prepared()`
+    /// is about to bind-mount them into new containers. Passing `remove_secrets:
+    /// true` in that sequence deletes the files that the new containers need,
+    /// causing them to start with missing or empty secrets — a silent credential
+    /// loss that only surfaces at container runtime. Always pass `false` when
+    /// an immediate `deploy_prepared()` follows.
+    ///
+    /// Pass `true` only when the deploy attempt is definitively over: compensating
+    /// cleanup on failure, zero-services edge-case teardown, cancellation cleanup,
+    /// or final destruction of a project/environment.
     pub async fn teardown_at(
         &self,
         project_name: &str,
         repo_dir: Option<&Path>,
         compose_path: Option<&str>,
         _environment_vars: &HashMap<String, String>,
+        remove_secrets: bool,
     ) -> Result<(), ComposeError> {
         if let Some(compose_path) = compose_path {
             Self::validate_relative_path(compose_path, "compose_path")?;
         }
-        // Drop the plaintext secret files first, and regardless of whether the
-        // stack directory still exists. `deploy()` re-materializes them before
-        // `up`, so this is safe on the redeploy path and stops a failed deploy
-        // from leaving credentials on disk for a stack that is no longer
-        // running.
-        self.remove_secrets_dir(project_name).await;
+        // Only delete the plaintext secret files when this teardown is the last
+        // step — i.e. the deploy attempt is over and nothing downstream will
+        // consume the files that were just materialized. When `remove_secrets`
+        // is false, the caller is about to call `deploy_prepared()` and those
+        // files must remain on disk so the new containers can bind-mount them.
+        // See the hazard note on `teardown_at`'s doc comment.
+        if remove_secrets {
+            self.remove_secrets_dir(project_name).await;
+        }
 
         let project_dir = repo_dir
             .map(Path::to_path_buf)
@@ -8350,5 +8374,90 @@ services:
 
         assert!(sanitized.len() < diagnostic.len());
         assert!(sanitized.contains("diagnostic truncated"));
+    }
+
+    /// `teardown_at` with `remove_secrets: false` must preserve the on-disk
+    /// secrets directory even when the project stack directory does not exist
+    /// (the early-return path is taken, which is what allows this test to run
+    /// without Docker).
+    #[tokio::test]
+    async fn test_teardown_at_remove_secrets_false_preserves_secrets_dir() {
+        let docker = Docker::connect_with_defaults();
+        if docker.is_err() {
+            // Docker unavailable — we can still run this test because
+            // teardown_at returns early when the project directory does not
+            // exist, before it attempts any Docker call.
+        }
+        // Use a real temporary directory so the secrets-dir assertion is
+        // meaningful (we are asserting on actual filesystem state).
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = tmp.path().to_path_buf();
+
+        // Build a minimal ComposeExecutor backed by a placeholder Docker
+        // handle. teardown_at returns early before any Docker call when the
+        // project directory does not exist, so the handle is never used.
+        let docker_handle = match Docker::connect_with_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(_) => {
+                // No Docker: synthesise a handle via connect_with_local_defaults
+                // which also won't be called. If even that fails, skip.
+                match Docker::connect_with_local_defaults() {
+                    Ok(d) => Arc::new(d),
+                    Err(_) => return,
+                }
+            }
+        };
+        let executor = ComposeExecutor::new(docker_handle, data_dir.clone());
+
+        // Manually create the secrets directory that teardown_at would
+        // otherwise delete, mirroring what materialize_secrets() produces.
+        let project_name = "test-remove-secrets-false";
+        let secrets_dir = data_dir.join("compose-secrets").join(project_name);
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        std::fs::write(secrets_dir.join("MY_SECRET"), b"hunter2").expect("write dummy secret");
+
+        // Project directory intentionally does not exist → teardown_at returns
+        // early after (conditionally) running the secrets-dir deletion logic.
+        executor
+            .teardown_at(project_name, None, None, &HashMap::new(), false)
+            .await
+            .expect("teardown_at should succeed with no project dir");
+
+        assert!(
+            secrets_dir.exists(),
+            "secrets dir must still exist after teardown_at with remove_secrets=false"
+        );
+    }
+
+    /// `teardown_at` with `remove_secrets: true` must delete the on-disk
+    /// secrets directory (same early-return path as above, no Docker needed).
+    #[tokio::test]
+    async fn test_teardown_at_remove_secrets_true_deletes_secrets_dir() {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let data_dir = tmp.path().to_path_buf();
+
+        let docker_handle = match Docker::connect_with_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(_) => match Docker::connect_with_local_defaults() {
+                Ok(d) => Arc::new(d),
+                Err(_) => return,
+            },
+        };
+        let executor = ComposeExecutor::new(docker_handle, data_dir.clone());
+
+        let project_name = "test-remove-secrets-true";
+        let secrets_dir = data_dir.join("compose-secrets").join(project_name);
+        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+        std::fs::write(secrets_dir.join("MY_SECRET"), b"hunter2").expect("write dummy secret");
+
+        executor
+            .teardown_at(project_name, None, None, &HashMap::new(), true)
+            .await
+            .expect("teardown_at should succeed with no project dir");
+
+        assert!(
+            !secrets_dir.exists(),
+            "secrets dir must be deleted after teardown_at with remove_secrets=true"
+        );
     }
 }

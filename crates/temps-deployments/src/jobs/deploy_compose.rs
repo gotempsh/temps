@@ -743,6 +743,11 @@ impl WorkflowTask for DeployComposeJob {
                 repo_path.as_deref(),
                 Some(compose_file_name),
                 &self.environment_vars,
+                // Secrets must NOT be deleted here: prepare_and_pull() just
+                // materialized them and deploy_prepared() is about to bind-mount
+                // them into the new containers. Deleting them now would cause
+                // the new containers to start with missing or empty secrets.
+                false,
             )
             .await
         {
@@ -769,6 +774,10 @@ impl WorkflowTask for DeployComposeJob {
                         repo_path.as_deref(),
                         Some(compose_file_name),
                         &self.environment_vars,
+                        // Deploy attempt is over; remove secrets so plaintext
+                        // credentials are not left on disk for a stack that
+                        // is no longer running.
+                        true,
                     )
                     .await
                     .err();
@@ -821,6 +830,10 @@ impl WorkflowTask for DeployComposeJob {
                     repo_path.as_deref(),
                     Some(compose_file_name),
                     &self.environment_vars,
+                    // Deploy attempt is over; remove secrets so plaintext
+                    // credentials are not left on disk for a stack that
+                    // is no longer running.
+                    true,
                 )
                 .await;
             let error_msg = "No containers found after docker compose up".to_string();
@@ -981,6 +994,10 @@ impl WorkflowTask for DeployComposeJob {
                         cleanup_repo_path.as_deref(),
                         Some(compose_file_name),
                         &self.environment_vars,
+                        // Deploy attempt is aborted; remove secrets so plaintext
+                        // credentials are not left on disk for a stack that
+                        // is no longer running.
+                        true,
                     )
                     .await
                     .map_err(|error| WorkflowError::JobExecutionFailed(format!(
