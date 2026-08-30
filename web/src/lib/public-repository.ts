@@ -5,6 +5,8 @@ export type PublicRepositoryLocation = {
   provider: 'github' | 'gitlab'
   owner: string
   name: string
+  /** GitLab origin for self-hosted instances; omitted for gitlab.com. */
+  instanceUrl?: string
 }
 
 export type RepositoryCoordinates = {
@@ -20,7 +22,10 @@ export type RepositoryCoordinates = {
 export function parseRepositoryCoordinates(
   value: string | null | undefined
 ): RepositoryCoordinates | null {
-  let reference = (value || '').trim().replace(/\/$/, '').replace(/\.git$/, '')
+  let reference = (value || '')
+    .trim()
+    .replace(/\/$/, '')
+    .replace(/\.git$/, '')
   if (!reference) return null
 
   const sshMatch = reference.match(/^git@[^:]+:(.+)$/)
@@ -44,19 +49,60 @@ export function parseRepositoryCoordinates(
 export function parsePublicRepositoryUrl(
   value: string | null | undefined
 ): PublicRepositoryLocation | null {
-  const match = (value || '')
+  const raw = (value || '')
     .trim()
-    .match(
-      /(?:https?:\/\/|ssh:\/\/git@|git@)?(github\.com|gitlab\.com)[/:]([^/\s]+)\/([^/\s]+)/i
-    )
-  if (!match) return null
+    .replace(/\/$/, '')
+    .replace(/\.git$/, '')
+  if (!raw) return null
+  if (raw.includes('://') && !/^(?:https?|ssh):\/\//i.test(raw)) return null
 
-  const name = match[3].replace(/\.git\/?$/, '').replace(/\/$/, '')
-  if (!match[2] || !name) return null
+  let hostname: string
+  let pathname: string
+  let origin: string
+  try {
+    if (/^https?:\/\//i.test(raw) || /^ssh:\/\//i.test(raw)) {
+      const parsed = new URL(raw)
+      hostname = parsed.hostname.toLowerCase()
+      pathname = parsed.pathname
+      origin = `https://${parsed.host}`
+    } else {
+      const ssh = raw.match(/^git@([^:]+):(.+)$/i)
+      if (ssh) {
+        hostname = ssh[1].toLowerCase()
+        pathname = `/${ssh[2]}`
+        origin = `https://${ssh[1]}`
+      } else {
+        const schemeless = raw.match(/^([^/]+)\/(.+)$/)
+        if (!schemeless) return null
+        hostname = schemeless[1].toLowerCase()
+        pathname = `/${schemeless[2]}`
+        origin = `https://${schemeless[1]}`
+      }
+    }
+  } catch {
+    return null
+  }
+
+  // GitHub public clone URLs use github.com. Any other HTTPS/SSH host is
+  // treated as a self-hosted GitLab origin; GitLab instances frequently use
+  // neutral corporate hostnames that do not contain the word "gitlab".
+  const provider = hostname === 'github.com' ? 'github' : 'gitlab'
+
+  const parts = pathname.split('/').filter(Boolean)
+  if (parts.length < 2 || (provider === 'github' && parts.length !== 2)) {
+    return null
+  }
+  const name = parts.pop()
+  if (!name) return null
+  const owner = parts.join('/')
+
   return {
-    provider: match[1].toLowerCase() === 'gitlab.com' ? 'gitlab' : 'github',
-    owner: match[2],
+    provider,
+    owner,
     name,
+    ...(provider === 'gitlab' && hostname !== 'gitlab.com'
+      ? { instanceUrl: origin }
+      : {}),
   }
 }
 

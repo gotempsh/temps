@@ -250,7 +250,12 @@ function ComposeFileSelector({
   repositoryId: number | undefined
   branch: string | undefined
   /** Set for public "git URL" imports, where there's no `repositoryId` to key the live preview query on. */
-  publicRepo?: { provider: string; owner: string; repo: string } | null
+  publicRepo?: {
+    provider: string
+    owner: string
+    repo: string
+    baseUrl?: string
+  } | null
 }) {
   const [isCustomPath, setIsCustomPath] = useState(false)
   const rootDirectory = form.watch('rootDirectory') || './'
@@ -325,7 +330,11 @@ function ComposeFileSelector({
         owner: publicRepo?.owner || '',
         repo: publicRepo?.repo || '',
       },
-      query: { branch, path: composeRepositoryPath },
+      query: {
+        branch,
+        path: composeRepositoryPath,
+        base_url: publicRepo?.baseUrl,
+      },
     }),
     enabled:
       !!publicRepo && !!publicRepo.owner && !!publicRepo.repo && !!composePath,
@@ -419,8 +428,8 @@ function ComposeFileSelector({
                       </span>
                     </TooltipTrigger>
                     <TooltipContent className="max-w-xs">
-                      This looks like a database container — it won&apos;t have Temps
-                      backup/restore. Consider excluding it and using a
+                      This looks like a database container — it won&apos;t have
+                      Temps backup/restore. Consider excluding it and using a
                       Temps-managed database instead.
                     </TooltipContent>
                   </Tooltip>
@@ -577,7 +586,12 @@ interface ProjectConfiguratorProps {
    * and docker-compose services) query public endpoints instead of using the
    * synthetic `repository.id` from this flow.
    */
-  publicRepo?: { provider: string; owner: string; repo: string } | null
+  publicRepo?: {
+    provider: string
+    owner: string
+    repo: string
+    baseUrl?: string
+  } | null
 
   // Display modes
   mode?: 'wizard' | 'inline' | 'compact'
@@ -797,6 +811,7 @@ export function ProjectConfigurator({
       query: {
         branch: selectedBranch,
         root_directory: selectedRootDirectory || './',
+        base_url: publicRepo?.baseUrl,
       },
     }),
     enabled: !!publicRepo && !!selectedBranch,
@@ -812,25 +827,23 @@ export function ProjectConfigurator({
       : fetchedPublicEnvExampleData
         ? fetchedPublicEnvExampleData.path
         : (providedEnvExampleData?.path ?? null)
-  const envExampleVariables = useMemo(
-    () => {
-      if (isFetchingEnvExample) return []
-      if (fetchedEnvExampleData) return fetchedEnvExampleData.variables
-      if (fetchedPublicEnvExampleData) {
-        return fetchedPublicEnvExampleData.variables.map((variable) => ({
-          key: variable.key,
-          defaultValue: variable.default_value,
-          description: variable.description,
-        }))
-      }
-      return providedEnvExampleData?.variables ?? []
-    }, [
-      providedEnvExampleData,
-      fetchedEnvExampleData,
-      fetchedPublicEnvExampleData,
-      isFetchingEnvExample,
-    ]
-  )
+  const envExampleVariables = useMemo(() => {
+    if (isFetchingEnvExample) return []
+    if (fetchedEnvExampleData) return fetchedEnvExampleData.variables
+    if (fetchedPublicEnvExampleData) {
+      return fetchedPublicEnvExampleData.variables.map((variable) => ({
+        key: variable.key,
+        defaultValue: variable.default_value,
+        description: variable.description,
+      }))
+    }
+    return providedEnvExampleData?.variables ?? []
+  }, [
+    providedEnvExampleData,
+    fetchedEnvExampleData,
+    fetchedPublicEnvExampleData,
+    isFetchingEnvExample,
+  ])
 
   const [envExampleDismissed, setEnvExampleDismissed] = useState(false)
   const [selectedEnvExampleKeys, setSelectedEnvExampleKeys] = useState<
@@ -2033,7 +2046,9 @@ export function ProjectConfigurator({
                                           >
                                             <Globe className="h-4 w-4 shrink-0 text-muted-foreground" />
                                             <div className="flex flex-col min-w-0">
-                                              <span>This project&apos;s URL</span>
+                                              <span>
+                                                This project&apos;s URL
+                                              </span>
                                               <span className="text-xs text-muted-foreground truncate">
                                                 {suggestedAppUrl}
                                               </span>

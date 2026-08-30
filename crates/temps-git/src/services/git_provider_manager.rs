@@ -1923,43 +1923,6 @@ impl GitProviderManager {
         }
     }
 
-    /// Classify a failed provider HTTP response into a typed error.
-    ///
-    /// Provider 401/403 responses MUST become
-    /// [`GitProviderError::AuthenticationFailed`] rather than a generic
-    /// `ApiError`, for two reasons:
-    ///
-    /// 1. [`Self::is_authentication_error`] drives the token
-    ///    force-refresh-and-retry path. A 401 flattened into `ApiError`
-    ///    silently skips that retry, so an expired-but-refreshable token
-    ///    hard-fails instead of recovering.
-    /// 2. The HTTP layer maps `AuthenticationFailed` to a distinct problem
-    ///    type, so clients can tell "reconnect this git account" apart from
-    ///    "the provider is having a bad day" and say so to the user.
-    ///
-    /// `operation` names what was being fetched, so the message stays
-    /// greppable and specific (e.g. "get tree for owner/repo@main").
-    fn classify_provider_response_error(
-        status: reqwest::StatusCode,
-        operation: &str,
-    ) -> GitProviderError {
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            GitProviderError::AuthenticationFailed(format!(
-                "provider rejected the stored credential while trying to {}: HTTP {}",
-                operation, status
-            ))
-        } else if status == reqwest::StatusCode::FORBIDDEN {
-            GitProviderError::PermissionDenied {
-                operation: operation.to_string(),
-                required_permission:
-                    "repository access with the permission required by this operation".to_string(),
-                provider_message: format!("HTTP {}", status),
-            }
-        } else {
-            GitProviderError::ApiError(format!("Failed to {}: HTTP {}", operation, status))
-        }
-    }
-
     /// Check if a GitProviderError is an authentication error (401)
     fn is_authentication_error(&self, error: &super::git_provider::GitProviderError) -> bool {
         matches!(
@@ -3247,98 +3210,11 @@ impl GitProviderManager {
         repo: &str,
         branch: &str,
     ) -> Result<Vec<String>, GitProviderError> {
-        // For GitHub, we can use the tree API to get file list
-        // For other providers, we may need different approaches
-
-        // Try to get file list from the root of the repository
-        // This is a simplified approach - in production you might want to be more thorough
-
-        let client = reqwest::Client::new();
-
         match provider_service.provider_type() {
-            GitProviderType::GitHub => {
-                // Use GitHub API to get tree
-                let url = format!(
-                    "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
-                    owner, repo, branch
-                );
-
-                let response = client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", access_token))
-                    .header("User-Agent", "Temps-Engine")
-                    .send()
+            GitProviderType::GitHub | GitProviderType::GitLab => {
+                provider_service
+                    .list_repository_files(access_token, owner, repo, branch)
                     .await
-                    .map_err(|e| {
-                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
-                    })?;
-
-                if !response.status().is_success() {
-                    return Err(Self::classify_provider_response_error(
-                        response.status(),
-                        &format!("get tree for {}/{}@{}", owner, repo, branch),
-                    ));
-                }
-
-                let tree_data: serde_json::Value = response.json().await.map_err(|e| {
-                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
-                })?;
-
-                let files = tree_data["tree"]
-                    .as_array()
-                    .ok_or_else(|| GitProviderError::ApiError("No tree in response".to_string()))?
-                    .iter()
-                    .filter_map(|item| {
-                        if item["type"].as_str() == Some("blob") {
-                            item["path"].as_str().map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                Ok(files)
-            }
-            GitProviderType::GitLab => {
-                // GitLab tree API
-                let url = format!(
-                    "https://gitlab.com/api/v4/projects/{}/repository/tree?ref={}&recursive=true&per_page=100",
-                    urlencoding::encode(&format!("{}/{}", owner, repo)),
-                    branch
-                );
-
-                let response = client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", access_token))
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
-                    })?;
-
-                if !response.status().is_success() {
-                    return Err(Self::classify_provider_response_error(
-                        response.status(),
-                        &format!("get tree for {}/{}@{}", owner, repo, branch),
-                    ));
-                }
-
-                let tree_data: Vec<serde_json::Value> = response.json().await.map_err(|e| {
-                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
-                })?;
-
-                let files = tree_data
-                    .iter()
-                    .filter_map(|item| {
-                        if item["type"].as_str() == Some("blob") {
-                            item["path"].as_str().map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                Ok(files)
             }
             _ => {
                 // For other providers, return empty list for now
@@ -3412,9 +3288,8 @@ impl GitProviderManager {
         // the user. This previously decrypted the token inline and called
         // directly, so preset detection was the one provider path that never
         // got the refresh treatment — and because a provider 401 was also
-        // flattened into a generic `ApiError`, the retry could not have fired
-        // even if it had been wrapped (see
-        // `classify_provider_response_error`).
+        // flattened into a generic `ApiError`, the retry could not fire. The
+        // provider implementation now preserves typed authentication errors.
         let files = self
             .execute_with_refresh(connection_id, |access_token| {
                 let provider_service = provider_service.clone();
@@ -5786,86 +5661,6 @@ impl GitProviderManagerTrait for GitProviderManager {
                 connection_id, owner, repo, e
             ))),
         }
-    }
-}
-
-#[cfg(test)]
-mod classify_provider_response_error_tests {
-    use super::*;
-
-    /// A provider 401 MUST become `AuthenticationFailed`, not `ApiError`.
-    /// `is_authentication_error` keys off this variant to drive the token
-    /// force-refresh-and-retry, and the HTTP layer maps it to 401 +
-    /// `errors/authentication_failed` so clients can say "reconnect this
-    /// account" instead of "the provider is down".
-    #[test]
-    fn unauthorized_is_classified_as_authentication_failure() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::UNAUTHORIZED,
-            "get tree for owner/repo@main",
-        );
-        assert!(
-            matches!(err, GitProviderError::AuthenticationFailed(_)),
-            "401 must map to AuthenticationFailed, got {err:?}"
-        );
-    }
-
-    /// A valid credential that lacks a repository capability is not an
-    /// authentication failure: clients must tell the operator which grant to
-    /// add instead of asking them to reconnect the same credential.
-    #[test]
-    fn forbidden_is_classified_as_permission_denied() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::FORBIDDEN,
-            "get tree for owner/repo@main",
-        );
-        assert!(
-            matches!(err, GitProviderError::PermissionDenied { .. }),
-            "403 must map to PermissionDenied, got {err:?}"
-        );
-        assert!(err.to_string().contains("owner/repo@main"));
-    }
-
-    /// Everything else stays a generic API error — a provider outage is not
-    /// a credential problem and must not tell the user to reconnect.
-    #[test]
-    fn server_error_stays_a_generic_api_error() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "get tree for owner/repo@main",
-        );
-        assert!(
-            matches!(err, GitProviderError::ApiError(_)),
-            "500 must stay ApiError, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn not_found_stays_a_generic_api_error() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::NOT_FOUND,
-            "get tree for owner/repo@main",
-        );
-        assert!(matches!(err, GitProviderError::ApiError(_)));
-    }
-
-    /// The operation and status must survive into the message — these errors
-    /// are the only breadcrumb when a self-hosted user debugs alone.
-    #[test]
-    fn message_names_the_operation_and_status() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::UNAUTHORIZED,
-            "get tree for gotempsh/temps-examples@main",
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("gotempsh/temps-examples@main"),
-            "message should name the operation: {msg}"
-        );
-        assert!(
-            msg.contains("401"),
-            "message should carry the status: {msg}"
-        );
     }
 }
 

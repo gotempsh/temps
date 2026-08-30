@@ -51,6 +51,8 @@ import {
 import { Drop } from '@/pages/Drop'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
+import { parsePublicRepositoryUrl } from '@/lib/public-repository'
+import { getPublicRepository } from '@/api/client/sdk.gen'
 
 const SOURCE_VALUES: ProjectSource[] = [
   'templates',
@@ -69,6 +71,7 @@ interface ParsedGitUrl {
   provider: 'github' | 'gitlab'
   owner: string
   repo: string
+  instanceUrl?: string
 }
 
 /**
@@ -76,50 +79,15 @@ interface ParsedGitUrl {
  * Supports: https://github.com/owner/repo, https://gitlab.com/owner/repo, etc.
  */
 function parseGitUrl(url: string): ParsedGitUrl | null {
-  try {
-    // Clean up the URL
-    const cleanUrl = url.trim().replace(/\.git$/, '')
-
-    // Try to parse as URL
-    let hostname: string
-    let pathname: string
-
-    if (cleanUrl.startsWith('http://') || cleanUrl.startsWith('https://')) {
-      const parsed = new URL(cleanUrl)
-      hostname = parsed.hostname.toLowerCase()
-      pathname = parsed.pathname
-    } else if (cleanUrl.includes('@') && cleanUrl.includes(':')) {
-      // SSH URL format: git@github.com:owner/repo
-      const match = cleanUrl.match(/@([^:]+):(.+)/)
-      if (!match) return null
-      hostname = match[1].toLowerCase()
-      pathname = '/' + match[2]
-    } else {
-      return null
-    }
-
-    // Determine provider
-    let provider: 'github' | 'gitlab'
-    if (hostname.includes('github')) {
-      provider = 'github'
-    } else if (hostname.includes('gitlab')) {
-      provider = 'gitlab'
-    } else {
-      return null
-    }
-
-    // Extract owner and repo from pathname
-    const parts = pathname.split('/').filter(Boolean)
-    if (parts.length < 2) return null
-
-    return {
-      provider,
-      owner: parts[0],
-      repo: parts[1],
-    }
-  } catch {
-    return null
-  }
+  const parsed = parsePublicRepositoryUrl(url)
+  return parsed
+    ? {
+        provider: parsed.provider,
+        owner: parsed.owner,
+        repo: parsed.name,
+        instanceUrl: parsed.instanceUrl,
+      }
+    : null
 }
 
 interface GitImportCloneProps {
@@ -398,6 +366,7 @@ export function GitImportClone({
         owner: parsedPublicRepo?.owner || '',
         repo: parsedPublicRepo?.repo || '',
       },
+      query: { base_url: parsedPublicRepo?.instanceUrl },
     }),
     enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
   })
@@ -429,6 +398,7 @@ export function GitImportClone({
         },
         query: {
           branch: selectedRepository?.default_branch,
+          base_url: parsedPublicRepo?.instanceUrl,
         },
       }),
       enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
@@ -493,14 +463,20 @@ export function GitImportClone({
       setIsValidatingUrl(true)
 
       try {
-        const response = await fetch(
-          `/api/git/public/${parsed.provider}/${parsed.owner}/${parsed.repo}`
-        )
+        const result = await getPublicRepository({
+          path: {
+            provider: parsed.provider,
+            owner: parsed.owner,
+            repo: parsed.repo,
+          },
+          query: { base_url: parsed.instanceUrl },
+          throwOnError: false,
+        })
 
-        if (!response.ok) {
-          if (response.status === 404) {
+        if (!result.data) {
+          if (result.response?.status === 404) {
             toast.error('Repository not found or is not public')
-          } else if (response.status === 429) {
+          } else if (result.response?.status === 429) {
             toast.error('Rate limit exceeded. Please try again later.')
           } else {
             toast.error('Failed to fetch repository information')
@@ -509,7 +485,7 @@ export function GitImportClone({
           return
         }
 
-        const repoInfo = await response.json()
+        const repoInfo = result.data
 
         const repoFromApi: RepositoryResponse = {
           id: 0,
@@ -669,6 +645,7 @@ export function GitImportClone({
                     provider: parsedPublicRepo.provider || 'github',
                     owner: parsedPublicRepo.owner,
                     repo: parsedPublicRepo.repo,
+                    baseUrl: parsedPublicRepo.instanceUrl,
                   }
                 : null
             }

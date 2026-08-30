@@ -66758,6 +66758,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.",
+            "in": "query",
+            "name": "base_url",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -66773,6 +66785,9 @@
           },
           "400": {
             "description": "Provider not supported"
+          },
+          "401": {
+            "description": "Authentication required for custom GitLab origins"
           },
           "403": {
             "description": "Git provider permission required"
@@ -66825,6 +66840,18 @@
             }
           },
           {
+            "description": "HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.",
+            "in": "query",
+            "name": "base_url",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Force fetch fresh data, bypassing cache (default: false)",
             "in": "query",
             "name": "fresh",
@@ -66847,6 +66874,9 @@
           },
           "400": {
             "description": "Provider not supported"
+          },
+          "401": {
+            "description": "Authentication required for custom GitLab origins"
           },
           "403": {
             "description": "Git provider permission required"
@@ -66899,6 +66929,18 @@
             }
           },
           {
+            "description": "HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.",
+            "in": "query",
+            "name": "base_url",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Branch to read the compose file from (default: repository's default branch)",
             "in": "query",
             "name": "branch",
@@ -66933,6 +66975,12 @@
           },
           "400": {
             "description": "Provider not supported, or the compose file could not be parsed"
+          },
+          "401": {
+            "description": "Authentication required for custom GitLab origins"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository, branch, or compose file not found"
@@ -66978,6 +67026,18 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "description": "HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.",
+            "in": "query",
+            "name": "base_url",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "requestBody": {
@@ -67003,6 +67063,12 @@
           },
           "400": {
             "description": "Compose file or override is invalid"
+          },
+          "401": {
+            "description": "Authentication required for custom GitLab origins"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository, branch, or compose file not found"
@@ -67046,6 +67112,18 @@
             }
           },
           {
+            "description": "HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.",
+            "in": "query",
+            "name": "base_url",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Branch name to inspect (default: repository's default branch)",
             "in": "query",
             "name": "branch",
@@ -67083,6 +67161,12 @@
           },
           "400": {
             "description": "Provider not supported"
+          },
+          "401": {
+            "description": "Authentication required for custom GitLab origins"
+          },
+          "403": {
+            "description": "Git provider permission required"
           },
           "404": {
             "description": "Repository or branch not found"
@@ -67132,6 +67216,18 @@
             }
           },
           {
+            "description": "HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.",
+            "in": "query",
+            "name": "base_url",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
             "description": "Branch name to detect presets for (default: repository's default branch)",
             "in": "query",
             "name": "branch",
@@ -67166,6 +67262,9 @@
           },
           "400": {
             "description": "Provider not supported"
+          },
+          "401": {
+            "description": "Authentication required for custom GitLab origins"
           },
           "403": {
             "description": "Git provider permission required"

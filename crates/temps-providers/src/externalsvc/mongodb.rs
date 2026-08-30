@@ -3769,6 +3769,44 @@ mod tests {
         assert_eq!(service.get_container_name(), "temps-mongodb-test-service");
     }
 
+    #[tokio::test]
+    async fn init_preserves_a_persisted_port_owned_by_the_running_service() {
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve a port as a running MongoDB container would");
+        let persisted_port = held.local_addr().expect("read reserved port").port();
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("existing-service".to_string(), docker);
+        let config = ServiceConfig {
+            name: "existing-service".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": persisted_port.to_string(),
+                "database": "admin",
+                "username": "root",
+                "password": "persisted-password",
+                "docker_image": "gotempsh/mongodb-walg:8.0"
+            }),
+        };
+
+        let inferred = service
+            .init(config)
+            .await
+            .expect("initializing an existing service must keep its persisted endpoint");
+
+        assert_eq!(inferred.get("port"), Some(&persisted_port.to_string()));
+        assert_eq!(
+            service
+                .config
+                .read()
+                .await
+                .as_ref()
+                .map(|runtime| runtime.port.as_str()),
+            Some(persisted_port.to_string().as_str())
+        );
+    }
+
     #[test]
     fn test_get_effective_address_docker_mode_uses_imported_container_name() {
         let _lock = crate::externalsvc::DEPLOYMENT_MODE_MUTEX
