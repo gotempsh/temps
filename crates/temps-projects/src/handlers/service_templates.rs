@@ -9,15 +9,16 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::SecondsFormat;
 use serde::{Deserialize, Serialize};
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, AuthContext, RequireAuth};
 use temps_core::problemdetails::{self, Problem};
 use utoipa::{OpenApi, ToSchema};
 
 use super::AppState;
 use crate::services::service_templates::{
-    preflight_template, prepare_template, CoolifyTemplate, PreparedServiceTemplate,
-    ServiceTemplateCatalogError, TemplateCapabilityRequirement, TemplateRoute,
-    TemplateTransformation, TemplateVariable, COOLIFY_CATALOG_URL, COOLIFY_REPOSITORY_URL,
+    preflight_template, prepare_template, CatalogTemplateAnalysis, CoolifyTemplate,
+    PreparedServiceTemplate, ServiceTemplateCatalogError, TemplateCapabilityRequirement,
+    TemplateRoute, TemplateTransformation, TemplateVariable, COOLIFY_CATALOG_URL,
+    COOLIFY_REPOSITORY_URL,
 };
 
 const DEFAULT_PER_PAGE: usize = 24;
@@ -95,11 +96,12 @@ pub struct ServiceTemplateVariableResponse {
 
 impl From<TemplateVariable> for ServiceTemplateVariableResponse {
     fn from(variable: TemplateVariable) -> Self {
+        let is_secret = variable.is_secret();
         Self {
             name: variable.name,
             kind: variable.kind.as_str().to_string(),
             required: variable.required,
-            is_secret: variable.kind.is_secret(),
+            is_secret,
             default_value: variable.default_value,
             route_service: variable.route_service,
         }
@@ -169,10 +171,16 @@ pub struct ServiceTemplateDetailResponse {
     pub source_url: String,
     pub source_repository_url: String,
     pub source_revision: Option<String>,
+    /// SHA-256 of the exact normalized Compose and deployment-critical route metadata.
+    pub install_plan_digest: String,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct PreflightServiceTemplateRequest {
+    /// Project name used to plan the exact slug and canonical route hostnames.
+    pub project_name: String,
+    /// Digest returned by the detail endpoint; prevents validating a newer install plan.
+    pub expected_install_plan_digest: String,
     /// Final environment values the project would persist. Values are never returned.
     #[serde(default)]
     pub variables: BTreeMap<String, String>,
@@ -188,6 +196,10 @@ pub struct PreflightServiceTemplateResponse {
     pub architecture: String,
     pub errors: Vec<String>,
     pub warnings: Vec<String>,
+    /// Optimistically allocated slug that must be claimed with `expected_slug`.
+    pub planned_project_slug: String,
+    /// Canonical URL/FQDN variables calculated from the allocated slug and hostname strategy.
+    pub public_variables: BTreeMap<String, String>,
 }
 
 #[derive(OpenApi)]
@@ -235,7 +247,7 @@ pub async fn list_service_templates(
     RequireAuth(auth): RequireAuth,
     Query(query): Query<ListServiceTemplatesQuery>,
 ) -> Result<Json<ListServiceTemplatesResponse>, Problem> {
-    permission_guard!(auth, ProjectsCreate);
+    require_service_template_access(&auth)?;
     let snapshot = state
         .service_template_catalog
         .snapshot()
@@ -268,14 +280,11 @@ pub async fn list_service_templates(
     categories.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
 
     let mut compatibility = ServiceTemplateCompatibilitySummaryResponse::default();
-    for (slug, template) in &snapshot.templates {
-        match prepare_template(slug, template) {
-            Ok(prepared) => match prepared.compatibility_tier().as_str() {
-                "standard" => compatibility.standard += 1,
-                "elevated" => compatibility.elevated += 1,
-                _ => compatibility.blocked += 1,
-            },
-            Err(_) => compatibility.blocked += 1,
+    for analysis in snapshot.analyses.values() {
+        match analysis.compatibility_tier.as_str() {
+            "standard" => compatibility.standard += 1,
+            "elevated" => compatibility.elevated += 1,
+            _ => compatibility.blocked += 1,
         }
     }
 
@@ -283,19 +292,7 @@ pub async fn list_service_templates(
         .templates
         .iter()
         .filter(|(slug, template)| {
-            category.as_ref().is_none_or(|category| {
-                template_category(template).to_ascii_lowercase() == *category
-            }) && search.as_ref().is_none_or(|search| {
-                let mut haystack = format!(
-                    "{} {} {} {}",
-                    slug,
-                    template.slogan.as_deref().unwrap_or_default(),
-                    template_category(template),
-                    template.tags.join(" ")
-                );
-                haystack.make_ascii_lowercase();
-                haystack.contains(search)
-            })
+            template_matches(slug, template, search.as_deref(), category.as_deref())
         })
         .collect::<Vec<_>>();
     filtered.sort_by(|(left_slug, _), (right_slug, _)| {
@@ -308,7 +305,9 @@ pub async fn list_service_templates(
         .into_iter()
         .skip(offset)
         .take(per_page)
-        .map(|(slug, template)| summary_response(slug, template))
+        .map(|(slug, template)| {
+            summary_response(slug, template, snapshot.analyses.get(slug.as_str()))
+        })
         .collect();
 
     Ok(Json(ListServiceTemplatesResponse {
@@ -351,7 +350,7 @@ pub async fn get_service_template(
     RequireAuth(auth): RequireAuth,
     Path(slug): Path<String>,
 ) -> Result<Json<ServiceTemplateDetailResponse>, Problem> {
-    permission_guard!(auth, ProjectsCreate);
+    require_service_template_access(&auth)?;
     let (template, snapshot) = state
         .service_template_catalog
         .get(&slug)
@@ -359,6 +358,7 @@ pub async fn get_service_template(
         .map_err(catalog_problem)?;
     let prepared = prepare_template(&slug, &template).map_err(catalog_problem)?;
     let summary = prepared_summary_response(&slug, &template, &prepared);
+    let install_plan_digest = prepared.install_plan_digest(&template);
     Ok(Json(ServiceTemplateDetailResponse {
         summary,
         compose: prepared.compose,
@@ -388,6 +388,7 @@ pub async fn get_service_template(
         source_url: COOLIFY_CATALOG_URL.to_string(),
         source_repository_url: COOLIFY_REPOSITORY_URL.to_string(),
         source_revision: snapshot.etag.clone(),
+        install_plan_digest,
     }))
 }
 
@@ -405,7 +406,10 @@ pub async fn get_service_template(
         (status = 403, description = "Insufficient permissions"),
         (status = 404, description = "Template not found"),
         (status = 422, description = "Template content is invalid"),
-        (status = 502, description = "Upstream catalog unavailable")
+        (status = 400, description = "Invalid project name"),
+        (status = 409, description = "Catalog install plan changed; reload required"),
+        (status = 502, description = "Upstream catalog unavailable"),
+        (status = 503, description = "Docker preflight unavailable or at capacity")
     ),
     security(("bearer_auth" = []))
 )]
@@ -415,16 +419,32 @@ pub async fn preflight_service_template(
     Path(slug): Path<String>,
     Json(request): Json<PreflightServiceTemplateRequest>,
 ) -> Result<Json<PreflightServiceTemplateResponse>, Problem> {
-    permission_guard!(auth, ProjectsCreate);
+    require_service_template_access(&auth)?;
     let (template, _) = state
         .service_template_catalog
         .get(&slug)
         .await
         .map_err(catalog_problem)?;
+    let prepared = prepare_template(&slug, &template).map_err(catalog_problem)?;
+    if prepared.install_plan_digest(&template) != request.expected_install_plan_digest {
+        return Err(catalog_problem(
+            ServiceTemplateCatalogError::RevisionChanged { slug },
+        ));
+    }
+    let planned_project_slug = state
+        .project_service
+        .plan_project_slug(&request.project_name)
+        .await
+        .map_err(Problem::from)?;
+    let public_variables = canonical_public_variables(&state, &planned_project_slug, &prepared)
+        .await
+        .map_err(catalog_problem)?;
+    let mut final_values = request.variables;
+    final_values.extend(public_variables.clone());
     let result = preflight_template(
         &slug,
         &template,
-        &request.variables,
+        &final_values,
         &request.approved_capability_services,
     )
     .await
@@ -435,13 +455,118 @@ pub async fn preflight_service_template(
         architecture: result.architecture,
         errors: result.errors,
         warnings: result.warnings,
+        planned_project_slug,
+        public_variables,
     }))
 }
 
-fn summary_response(slug: &str, template: &CoolifyTemplate) -> ServiceTemplateSummaryResponse {
-    match prepare_template(slug, template) {
-        Ok(prepared) => prepared_summary_response(slug, template, &prepared),
-        Err(error) => ServiceTemplateSummaryResponse {
+async fn canonical_public_variables(
+    state: &AppState,
+    project_slug: &str,
+    prepared: &PreparedServiceTemplate,
+) -> Result<BTreeMap<String, String>, ServiceTemplateCatalogError> {
+    let settings = state.config_service.get_settings().await.map_err(|error| {
+        ServiceTemplateCatalogError::PreflightInfrastructure {
+            slug: project_slug.to_string(),
+            reason: format!("could not load hostname settings: {error}"),
+        }
+    })?;
+    let preview_domain = if settings.preview_domain.trim().is_empty() {
+        "localho.st"
+    } else {
+        settings.preview_domain.trim()
+    };
+    let strategy = state
+        .public_hostname_resolver
+        .strategy_for(preview_domain)
+        .await;
+    let (scheme, port) = settings
+        .external_url
+        .as_deref()
+        .and_then(|value| url::Url::parse(value).ok())
+        .map(|url| (url.scheme().to_string(), url.port()))
+        .unwrap_or_else(|| ("http".to_string(), Some(state.config_service.proxy_port())));
+    let environment_slug = format!("{project_slug}-production");
+    Ok(build_canonical_public_variables(
+        prepared,
+        &environment_slug,
+        preview_domain,
+        strategy,
+        &scheme,
+        port,
+    ))
+}
+
+fn build_canonical_public_variables(
+    prepared: &PreparedServiceTemplate,
+    environment_slug: &str,
+    preview_domain: &str,
+    strategy: temps_core::PublicHostnameStrategy,
+    scheme: &str,
+    port: Option<u16>,
+) -> BTreeMap<String, String> {
+    let primary_service = prepared.routes.first().map(|route| route.service.as_str());
+    let mut values = BTreeMap::new();
+    for variable in &prepared.variables {
+        if !matches!(variable.kind.as_str(), "public_url" | "public_host") {
+            continue;
+        }
+        let route_service = variable
+            .route_service
+            .as_deref()
+            .or(primary_service)
+            .unwrap_or("app");
+        let hostname = if Some(route_service) == primary_service {
+            strategy.environment_hostname(preview_domain, environment_slug)
+        } else {
+            strategy.service_hostname(preview_domain, environment_slug, route_service)
+        };
+        let port_suffix = port
+            .filter(|port| {
+                !((scheme == "http" && *port == 80) || (scheme == "https" && *port == 443))
+            })
+            .map(|port| format!(":{port}"))
+            .unwrap_or_default();
+        let path = variable
+            .default_value
+            .as_deref()
+            .filter(|value| value.starts_with('/'))
+            .unwrap_or_default();
+        let value = if variable.kind.as_str() == "public_url" {
+            format!("{scheme}://{hostname}{port_suffix}{path}")
+        } else {
+            format!("{hostname}{path}")
+        };
+        values.insert(variable.name.clone(), value);
+    }
+    values
+}
+
+fn summary_response(
+    slug: &str,
+    template: &CoolifyTemplate,
+    analysis: Option<&CatalogTemplateAnalysis>,
+) -> ServiceTemplateSummaryResponse {
+    match analysis {
+        Some(analysis) => ServiceTemplateSummaryResponse {
+            slug: slug.to_string(),
+            name: display_name(slug),
+            description: template.slogan.clone(),
+            documentation_url: template.documentation.as_deref().and_then(safe_http_url),
+            logo_url: template.logo.as_deref().and_then(logo_url),
+            category: template_category(template),
+            tags: template.tags.clone(),
+            port: template.port.as_deref().and_then(|port| port.parse().ok()),
+            service_count: analysis.service_count,
+            installable: analysis.installable,
+            compatibility_tier: analysis.compatibility_tier.as_str().to_string(),
+            compatibility_issues: analysis.compatibility_issues.clone(),
+            warnings: analysis.warnings.clone(),
+            amd_only: template.amd_only,
+            arm_only: template.arm_only,
+            template_last_updated_at: template.template_last_updated_at.clone(),
+        },
+        None => ServiceTemplateSummaryResponse {
             slug: slug.to_string(),
             name: display_name(slug),
             description: template.slogan.clone(),
@@ -453,7 +578,7 @@ fn summary_response(slug: &str, template: &CoolifyTemplate) -> ServiceTemplateSu
             service_count: 0,
             installable: false,
             compatibility_tier: "blocked".to_string(),
-            compatibility_issues: vec![error.to_string()],
+            compatibility_issues: vec!["Catalog analysis is unavailable".to_string()],
             warnings: Vec::new(),
             amd_only: template.amd_only,
             arm_only: template.arm_only,
@@ -511,6 +636,31 @@ fn template_category(template: &CoolifyTemplate) -> String {
         .to_string()
 }
 
+fn template_matches(
+    slug: &str,
+    template: &CoolifyTemplate,
+    search: Option<&str>,
+    category: Option<&str>,
+) -> bool {
+    category.is_none_or(|category| template_category(template).to_ascii_lowercase() == category)
+        && search.is_none_or(|search| {
+            let mut haystack = format!(
+                "{} {} {} {}",
+                slug,
+                template.slogan.as_deref().unwrap_or_default(),
+                template_category(template),
+                template.tags.join(" ")
+            );
+            haystack.make_ascii_lowercase();
+            haystack.contains(search)
+        })
+}
+
+fn require_service_template_access(auth: &AuthContext) -> Result<(), Problem> {
+    permission_guard!(auth, ProjectsCreate);
+    Ok(())
+}
+
 fn safe_http_url(value: &str) -> Option<String> {
     let url = reqwest::Url::parse(value).ok()?;
     matches!(url.scheme(), "http" | "https").then(|| url.to_string())
@@ -546,6 +696,16 @@ fn catalog_problem(error: ServiceTemplateCatalogError) -> Problem {
                 .with_title("Service Template Preflight Busy")
                 .with_detail(error.to_string())
         }
+        ServiceTemplateCatalogError::RevisionChanged { .. } => {
+            problemdetails::new(StatusCode::CONFLICT)
+                .with_title("Service Template Changed")
+                .with_detail(error.to_string())
+        }
+        ServiceTemplateCatalogError::PreflightInfrastructure { .. } => {
+            problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Service Template Preflight Unavailable")
+                .with_detail(error.to_string())
+        }
         ServiceTemplateCatalogError::ClientBuild { .. }
         | ServiceTemplateCatalogError::Fetch { .. }
         | ServiceTemplateCatalogError::HttpStatus { .. }
@@ -562,6 +722,61 @@ fn catalog_problem(error: ServiceTemplateCatalogError) -> Problem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::response::IntoResponse;
+    use base64::Engine;
+    use chrono::Utc;
+    use temps_auth::Permission;
+    use temps_entities::users;
+
+    fn api_key_auth(permissions: Vec<Permission>) -> AuthContext {
+        let now = Utc::now();
+        let user = users::Model {
+            id: 42,
+            name: "Template Tester".to_string(),
+            email: "templates@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        };
+        AuthContext::new_api_key(
+            user,
+            None,
+            Some(permissions),
+            "templates-test".to_string(),
+            1,
+        )
+    }
+
+    fn prepared(compose: &str) -> PreparedServiceTemplate {
+        prepare_template(
+            "routes",
+            &CoolifyTemplate {
+                documentation: None,
+                slogan: None,
+                compose: base64::engine::general_purpose::STANDARD.encode(compose),
+                tags: Vec::new(),
+                category: None,
+                logo: None,
+                port: None,
+                template_last_updated_at: None,
+                amd_only: false,
+                arm_only: false,
+            },
+        )
+        .unwrap()
+    }
 
     #[test]
     fn display_name_humanizes_catalog_slug() {
@@ -592,5 +807,148 @@ mod tests {
             Some("https://example.com/docs".to_string())
         );
         assert_eq!(safe_http_url("javascript:alert(1)"), None);
+    }
+
+    #[test]
+    fn catalog_access_requires_projects_create_permission() {
+        let denied = require_service_template_access(&api_key_auth(Vec::new()))
+            .expect_err("custom key should be denied")
+            .into_response();
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+
+        let allowed = api_key_auth(vec![Permission::ProjectsCreate]);
+        assert!(require_service_template_access(&allowed).is_ok());
+    }
+
+    #[test]
+    fn catalog_filter_matches_search_tags_and_exact_category() {
+        let template = CoolifyTemplate {
+            documentation: None,
+            slogan: Some("Private budgeting".to_string()),
+            compose: String::new(),
+            tags: vec!["finance".to_string(), "money".to_string()],
+            category: Some("Productivity".to_string()),
+            logo: None,
+            port: None,
+            template_last_updated_at: None,
+            amd_only: false,
+            arm_only: false,
+        };
+
+        assert!(template_matches(
+            "actualbudget",
+            &template,
+            Some("finance"),
+            Some("productivity")
+        ));
+        assert!(template_matches(
+            "actualbudget",
+            &template,
+            Some("budget"),
+            None
+        ));
+        assert!(!template_matches(
+            "actualbudget",
+            &template,
+            None,
+            Some("database")
+        ));
+    }
+
+    #[test]
+    fn canonical_public_values_use_backend_hostname_strategies() {
+        let prepared = prepared(
+            r#"services:
+  app:
+    image: example/app:1
+    environment:
+      - SERVICE_URL_APP_3000=/console
+  admin_api:
+    image: example/admin:1
+    environment:
+      - SERVICE_FQDN_ADMIN_3001
+"#,
+        );
+
+        let standard = build_canonical_public_variables(
+            &prepared,
+            "example-production",
+            "apps.example.com",
+            temps_core::PublicHostnameStrategy::Standard,
+            "https",
+            None,
+        );
+        assert_eq!(
+            standard["SERVICE_URL_APP_3000"],
+            "https://example-production.apps.example.com/console"
+        );
+        assert_eq!(
+            standard["SERVICE_FQDN_ADMIN_3001"],
+            "admin-api--example-production.apps.example.com"
+        );
+
+        let flat = build_canonical_public_variables(
+            &prepared,
+            "example-production",
+            "apps.example.com",
+            temps_core::PublicHostnameStrategy::Flat,
+            "http",
+            Some(8080),
+        );
+        assert_eq!(
+            flat["SERVICE_FQDN_ADMIN_3001"],
+            "example-production--admin-api.apps.example.com"
+        );
+        assert_eq!(
+            flat["SERVICE_URL_APP_3000"],
+            "http://example-production.apps.example.com:8080/console"
+        );
+    }
+
+    #[test]
+    fn revision_changes_are_reported_as_conflicts() {
+        let response = catalog_problem(ServiceTemplateCatalogError::RevisionChanged {
+            slug: "example".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn preflight_infrastructure_failures_are_service_unavailable() {
+        let response = catalog_problem(ServiceTemplateCatalogError::PreflightInfrastructure {
+            slug: "example".to_string(),
+            reason: "Docker is unavailable".to_string(),
+        })
+        .into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn missing_and_invalid_templates_have_typed_http_statuses() {
+        let missing = catalog_problem(ServiceTemplateCatalogError::NotFound {
+            slug: "missing".to_string(),
+        })
+        .into_response();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let invalid = catalog_problem(ServiceTemplateCatalogError::InvalidPreflightInput {
+            slug: "example".to_string(),
+            reason: "undeclared variable".to_string(),
+        })
+        .into_response();
+        assert_eq!(invalid.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
+
+    #[test]
+    fn variable_response_uses_backend_secret_classification() {
+        let response = ServiceTemplateVariableResponse::from(TemplateVariable {
+            name: "PUSH_SERVICE_KEY".to_string(),
+            kind: crate::services::service_templates::TemplateVariableKind::UserInput,
+            required: true,
+            default_value: None,
+            route_service: None,
+        });
+        assert!(response.is_secret);
     }
 }

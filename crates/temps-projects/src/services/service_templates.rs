@@ -20,6 +20,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 use serde::Deserializer;
 use serde_yaml::{Mapping, Value as YamlValue};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio::sync::{Mutex, RwLock, Semaphore};
 
@@ -28,6 +29,7 @@ pub const COOLIFY_CATALOG_URL: &str =
 pub const COOLIFY_REPOSITORY_URL: &str = "https://github.com/coollabsio/coolify";
 
 const CATALOG_TTL: Duration = Duration::from_secs(60 * 60);
+const FAILED_REFRESH_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_CATALOG_BYTES: usize = 4 * 1024 * 1024;
 const MAX_TEMPLATE_COMPOSE_BYTES: usize = 512 * 1024;
 const MAX_CATALOG_ENTRIES: usize = 2_000;
@@ -43,7 +45,7 @@ const DOCKER_BINARY_CANDIDATES: &[&str] = &[
 ];
 static PREFLIGHT_COMPOSE_SLOTS: Semaphore = Semaphore::const_new(MAX_CONCURRENT_PREFLIGHTS);
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ServiceTemplateCatalogError {
     #[error("Failed to build the Coolify catalog HTTP client: {reason}")]
     ClientBuild { reason: String },
@@ -75,6 +77,10 @@ pub enum ServiceTemplateCatalogError {
         "Service template '{slug}' preflight is busy; at most {limit} Compose validations may run concurrently"
     )]
     PreflightBusy { slug: String, limit: usize },
+    #[error("Service template '{slug}' changed after it was opened; reload it before installing")]
+    RevisionChanged { slug: String },
+    #[error("Service template '{slug}' preflight infrastructure failed: {reason}")]
+    PreflightInfrastructure { slug: String, reason: String },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -97,9 +103,19 @@ pub struct CoolifyTemplate {
 #[derive(Debug)]
 pub struct CatalogSnapshot {
     pub templates: BTreeMap<String, CoolifyTemplate>,
+    pub analyses: BTreeMap<String, CatalogTemplateAnalysis>,
     pub fetched_at: DateTime<Utc>,
     pub etag: Option<String>,
     refreshed_at: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct CatalogTemplateAnalysis {
+    pub service_count: usize,
+    pub installable: bool,
+    pub compatibility_tier: TemplateCompatibilityTier,
+    pub compatibility_issues: Vec<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -184,6 +200,12 @@ pub struct TemplateVariable {
     pub route_service: Option<String>,
 }
 
+impl TemplateVariable {
+    pub fn is_secret(&self) -> bool {
+        self.kind.is_secret() || variable_name_is_secret(&self.name)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TemplateRoute {
     pub service: String,
@@ -261,6 +283,89 @@ impl PreparedServiceTemplate {
             TemplateCompatibilityTier::Elevated
         }
     }
+
+    pub fn install_plan_digest(&self, template: &CoolifyTemplate) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut hasher = Sha256::new();
+        digest_field(&mut hasher, b"temps-service-template-install-plan-v1");
+        digest_field(&mut hasher, self.compose.as_bytes());
+        digest_field(
+            &mut hasher,
+            template.port.as_deref().unwrap_or_default().as_bytes(),
+        );
+        digest_field(&mut hasher, &[u8::from(template.amd_only)]);
+        digest_field(&mut hasher, &[u8::from(template.arm_only)]);
+        for route in &self.routes {
+            digest_field(&mut hasher, route.service.as_bytes());
+            digest_field(&mut hasher, &route.port.to_be_bytes());
+            for variable_name in &route.variable_names {
+                digest_field(&mut hasher, variable_name.as_bytes());
+            }
+        }
+        let digest = hasher.finalize();
+        let mut encoded = String::with_capacity(digest.len() * 2);
+        for byte in digest {
+            encoded.push(HEX[(byte >> 4) as usize] as char);
+            encoded.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        encoded
+    }
+}
+
+fn digest_field(hasher: &mut Sha256, value: &[u8]) {
+    hasher.update((value.len() as u64).to_be_bytes());
+    hasher.update(value);
+}
+
+fn variable_name_is_secret(name: &str) -> bool {
+    let name = name.trim().to_ascii_uppercase();
+    if name.is_empty()
+        || name.starts_with("PUBLIC_")
+        || name.starts_with("NEXT_PUBLIC_")
+        || name.starts_with("NUXT_PUBLIC_")
+        || name.starts_with("VITE_")
+        || name.starts_with("REACT_APP_")
+        || name.contains("PUBLISHABLE_KEY")
+        || name.contains("PUBLIC_KEY")
+        || name.contains("KEY_PUBLIC")
+        || name.contains("SITE_KEY")
+        || name.contains("ANON_KEY")
+        || name.starts_with("SERVICE_URL_")
+        || name.starts_with("SERVICE_FQDN_")
+    {
+        return false;
+    }
+
+    const SECRET_MARKERS: &[&str] = &[
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "TOKEN",
+        "PRIVATE_KEY",
+        "API_KEY",
+        "ACCESS_KEY",
+        "DATABASE_URL",
+        "POSTGRES_URL",
+        "MYSQL_URL",
+        "MONGODB_URL",
+        "MONGODB_URI",
+        "REDIS_URL",
+        "AMQP_URL",
+        "CONNECTION_STRING",
+        "DSN",
+        "WEBHOOK_URL",
+    ];
+    SECRET_MARKERS.iter().any(|marker| {
+        name == *marker
+            || name.starts_with(&format!("{marker}_"))
+            || name.ends_with(&format!("_{marker}"))
+            || name.contains(&format!("_{marker}_"))
+    }) || name == "PASS"
+        || name.ends_with("_PASS")
+        || name == "PASSPHRASE"
+        || name.ends_with("_PASSPHRASE")
+        || name == "APP_KEY"
+        || name.split('_').any(|segment| segment == "KEY")
 }
 
 pub async fn preflight_template(
@@ -334,7 +439,7 @@ pub async fn preflight_template(
             }
         })?;
         match validate_with_docker_compose(slug, &prepared.compose, &prepared.variables, values)
-            .await
+            .await?
         {
             Ok(()) => true,
             Err(reason) => {
@@ -417,29 +522,50 @@ async fn validate_with_docker_compose(
     compose: &str,
     variables: &[TemplateVariable],
     values: &BTreeMap<String, String>,
-) -> Result<(), String> {
+) -> Result<Result<(), String>, ServiceTemplateCatalogError> {
     let directory = tempfile::Builder::new()
         .prefix("temps-service-template-preflight-")
         .tempdir()
-        .map_err(|error| {
-            format!("Could not create a temporary preflight directory for '{slug}': {error}")
-        })?;
+        .map_err(
+            |error| ServiceTemplateCatalogError::PreflightInfrastructure {
+                slug: slug.to_string(),
+                reason: format!("could not create a temporary directory: {error}"),
+            },
+        )?;
     let compose_path = directory.path().join("docker-compose.yml");
     tokio::fs::write(&compose_path, compose)
         .await
-        .map_err(|error| {
-            format!(
-                "Could not write the temporary Compose file for template '{slug}' at '{}': {error}",
-                compose_path.display()
-            )
-        })?;
-    create_preflight_env_files(directory.path(), compose, slug).await?;
-    let env_content = render_preflight_env(variables, values)?;
+        .map_err(
+            |error| ServiceTemplateCatalogError::PreflightInfrastructure {
+                slug: slug.to_string(),
+                reason: format!(
+                    "could not write temporary Compose file '{}': {error}",
+                    compose_path.display()
+                ),
+            },
+        )?;
+    create_preflight_env_files(directory.path(), compose, slug)
+        .await
+        .map_err(
+            |reason| ServiceTemplateCatalogError::PreflightInfrastructure {
+                slug: slug.to_string(),
+                reason,
+            },
+        )?;
+    let env_content = render_preflight_env(variables, values).map_err(|reason| {
+        ServiceTemplateCatalogError::InvalidPreflightInput {
+            slug: slug.to_string(),
+            reason,
+        }
+    })?;
     tokio::fs::write(directory.path().join(".env"), env_content)
         .await
-        .map_err(|error| {
-            format!("Could not create the temporary .env for template '{slug}': {error}")
-        })?;
+        .map_err(
+            |error| ServiceTemplateCatalogError::PreflightInfrastructure {
+                slug: slug.to_string(),
+                reason: format!("could not create temporary .env: {error}"),
+            },
+        )?;
 
     let mut command = isolated_docker_command();
     command
@@ -460,24 +586,28 @@ async fn validate_with_docker_compose(
 
     let output = tokio::time::timeout(Duration::from_secs(15), command.output())
         .await
-        .map_err(|_| {
-            format!("Docker Compose validation for template '{slug}' timed out after 15 seconds")
+        .map_err(|_| ServiceTemplateCatalogError::PreflightInfrastructure {
+            slug: slug.to_string(),
+            reason: "Docker Compose validation timed out after 15 seconds".to_string(),
         })?
-        .map_err(|error| {
-            format!("Docker Compose is unavailable while validating template '{slug}': {error}")
-        })?;
+        .map_err(
+            |error| ServiceTemplateCatalogError::PreflightInfrastructure {
+                slug: slug.to_string(),
+                reason: format!("Docker Compose is unavailable: {error}"),
+            },
+        )?;
     if output.status.success() {
-        return Ok(());
+        return Ok(Ok(()));
     }
     let mut diagnostic = String::from_utf8_lossy(&output.stderr).into_owned();
     for value in values.values().filter(|value| !value.is_empty()) {
         diagnostic = diagnostic.replace(value, "***");
     }
     diagnostic.truncate(diagnostic.floor_char_boundary(8 * 1024));
-    Err(format!(
+    Ok(Err(format!(
         "Docker Compose rejected template '{slug}': {}",
         diagnostic.trim()
-    ))
+    )))
 }
 
 /// Create a Docker CLI process whose environment cannot expose Temps secrets
@@ -592,6 +722,7 @@ pub struct ServiceTemplateCatalog {
     source_url: String,
     cache: RwLock<Option<Arc<CatalogSnapshot>>>,
     refresh_guard: Mutex<()>,
+    last_failed_refresh: RwLock<Option<(Instant, ServiceTemplateCatalogError)>>,
 }
 
 impl ServiceTemplateCatalog {
@@ -614,6 +745,7 @@ impl ServiceTemplateCatalog {
             source_url,
             cache: RwLock::new(None),
             refresh_guard: Mutex::new(()),
+            last_failed_refresh: RwLock::new(None),
         }
     }
 
@@ -622,19 +754,28 @@ impl ServiceTemplateCatalog {
             return Ok(snapshot);
         }
 
+        let stale = self.cache.read().await.clone();
+        if let Some(result) = self.backoff_result(stale.clone()).await {
+            return result;
+        }
+
         let _refresh_guard = self.refresh_guard.lock().await;
         if let Some(snapshot) = self.fresh_snapshot().await {
             return Ok(snapshot);
         }
+        if let Some(result) = self.backoff_result(stale.clone()).await {
+            return result;
+        }
 
-        let stale = self.cache.read().await.clone();
         match self.fetch_catalog().await {
             Ok(snapshot) => {
                 let snapshot = Arc::new(snapshot);
                 *self.cache.write().await = Some(snapshot.clone());
+                *self.last_failed_refresh.write().await = None;
                 Ok(snapshot)
             }
             Err(error) => {
+                *self.last_failed_refresh.write().await = Some((Instant::now(), error.clone()));
                 if let Some(snapshot) = stale {
                     tracing::warn!(
                         source_url = %self.source_url,
@@ -647,6 +788,26 @@ impl ServiceTemplateCatalog {
                 }
             }
         }
+    }
+
+    #[cfg(test)]
+    async fn refresh_backoff_active(&self) -> bool {
+        self.last_failed_refresh
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|(failed_at, _)| failed_at.elapsed() < FAILED_REFRESH_BACKOFF)
+    }
+
+    async fn backoff_result(
+        &self,
+        stale: Option<Arc<CatalogSnapshot>>,
+    ) -> Option<Result<Arc<CatalogSnapshot>, ServiceTemplateCatalogError>> {
+        let failed_refresh = self.last_failed_refresh.read().await;
+        let (_, error) = failed_refresh
+            .as_ref()
+            .filter(|(failed_at, _)| failed_at.elapsed() < FAILED_REFRESH_BACKOFF)?;
+        Some(stale.map_or_else(|| Err(error.clone()), Ok))
     }
 
     async fn fresh_snapshot(&self) -> Option<Arc<CatalogSnapshot>> {
@@ -720,8 +881,40 @@ impl ServiceTemplateCatalog {
             });
         }
 
+        let analysis_templates = templates.clone();
+        let analyses = tokio::task::spawn_blocking(move || {
+            analysis_templates
+                .iter()
+                .map(|(slug, template)| {
+                    let analysis = match prepare_template(slug, template) {
+                        Ok(prepared) => CatalogTemplateAnalysis {
+                            service_count: prepared.service_count,
+                            installable: prepared.installable(),
+                            compatibility_tier: prepared.compatibility_tier(),
+                            compatibility_issues: prepared.compatibility_issues,
+                            warnings: prepared.warnings,
+                        },
+                        Err(error) => CatalogTemplateAnalysis {
+                            service_count: 0,
+                            installable: false,
+                            compatibility_tier: TemplateCompatibilityTier::Blocked,
+                            compatibility_issues: vec![error.to_string()],
+                            warnings: Vec::new(),
+                        },
+                    };
+                    (slug.clone(), analysis)
+                })
+                .collect::<BTreeMap<_, _>>()
+        })
+        .await
+        .map_err(|error| ServiceTemplateCatalogError::InvalidCatalog {
+            url: self.source_url.clone(),
+            reason: format!("catalog analysis task failed: {error}"),
+        })?;
+
         Ok(CatalogSnapshot {
             templates,
+            analyses,
             fetched_at: Utc::now(),
             etag,
             refreshed_at: Instant::now(),
@@ -1288,6 +1481,7 @@ fn compatibility_issues(root: &YamlValue) -> Vec<String> {
         for field in [
             "build",
             "cap_add",
+            "cgroup",
             "cgroup_parent",
             "credential_spec",
             "device_cgroup_rules",
@@ -1330,6 +1524,13 @@ fn compatibility_issues(root: &YamlValue) -> Vec<String> {
         if service.get("privileged").and_then(YamlValue::as_bool) == Some(true) {
             issues.push(format!("Service '{name}' requests privileged mode"));
         }
+        for field in ["privileged", "shm_size", "cgroup"] {
+            if service.get(field).is_some_and(value_contains_interpolation) {
+                issues.push(format!(
+                    "Service '{name}' interpolates security-guarded field '{field}'"
+                ));
+            }
+        }
         if service
             .get("deploy")
             .and_then(YamlValue::as_mapping)
@@ -1354,6 +1555,11 @@ fn compatibility_issues(root: &YamlValue) -> Vec<String> {
         }
         if let Some(volumes) = service.get("volumes").and_then(YamlValue::as_sequence) {
             for volume in volumes {
+                if value_contains_interpolation(volume) {
+                    issues.push(format!(
+                        "Service '{name}' interpolates security-guarded field 'volumes'"
+                    ));
+                }
                 let source = volume_source(volume);
                 if source.is_some_and(is_unsafe_volume_source) {
                     issues.push(format!(
@@ -1389,6 +1595,16 @@ fn compatibility_warnings(root: &YamlValue) -> Vec<String> {
         }
     }
     warnings
+}
+
+fn value_contains_interpolation(value: &YamlValue) -> bool {
+    match value {
+        YamlValue::String(value) => value.contains('$'),
+        YamlValue::Sequence(values) => values.iter().any(value_contains_interpolation),
+        YamlValue::Mapping(values) => values.values().any(value_contains_interpolation),
+        YamlValue::Tagged(value) => value_contains_interpolation(&value.value),
+        _ => false,
+    }
 }
 
 fn env_file_paths(value: &YamlValue) -> Vec<&str> {
@@ -1785,6 +2001,28 @@ fn variable_kind(name: &str) -> TemplateVariableKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn serve_one_response(status: &str, body: String) -> (String, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let request_count = requests.clone();
+        let status = status.to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            request_count.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+        (format!("http://{address}/catalog.json"), requests)
+    }
 
     fn template(compose: &str, port: Option<&str>) -> CoolifyTemplate {
         CoolifyTemplate {
@@ -2397,5 +2635,213 @@ networks:
                 .iter()
                 .any(|issue| issue.contains("label_file")));
         }
+    }
+
+    #[test]
+    fn blocks_interpolation_in_deployer_guarded_fields() {
+        let prepared = prepare_template(
+            "guarded-interpolation",
+            &template(
+                r#"services:
+  app:
+    image: example/app:1
+    privileged: ${PRIVILEGED:-false}
+    shm_size: ${SHM_SIZE:-64m}
+    volumes:
+      - type: volume
+        source: data
+        target: ${DATA_TARGET:-/data}
+"#,
+                None,
+            ),
+        )
+        .unwrap();
+
+        assert!(!prepared.installable());
+        for field in ["privileged", "shm_size", "volumes"] {
+            assert!(prepared
+                .compatibility_issues
+                .iter()
+                .any(|issue| issue.contains(field) && issue.contains("interpolates")));
+        }
+    }
+
+    #[test]
+    fn install_plan_digest_is_stable_and_binds_compose_and_metadata() {
+        let first_template = template(
+            "services:\n  app:\n    image: example/app:1\n",
+            Some("3000"),
+        );
+        let first = prepare_template("digest", &first_template).unwrap();
+        let same_template = first_template.clone();
+        let same = prepare_template("digest", &same_template).unwrap();
+        let changed_template = template(
+            "services:\n  app:\n    image: example/app:2\n",
+            Some("3000"),
+        );
+        let changed = prepare_template("digest", &changed_template).unwrap();
+        let metadata_changed_template = template(
+            "services:\n  app:\n    image: example/app:1\n",
+            Some("4000"),
+        );
+        let metadata_changed = prepare_template("digest", &metadata_changed_template).unwrap();
+
+        assert_eq!(
+            first.install_plan_digest(&first_template),
+            same.install_plan_digest(&same_template)
+        );
+        assert_ne!(
+            first.install_plan_digest(&first_template),
+            changed.install_plan_digest(&changed_template)
+        );
+        assert_ne!(
+            first.install_plan_digest(&first_template),
+            metadata_changed.install_plan_digest(&metadata_changed_template)
+        );
+        assert_eq!(first.install_plan_digest(&first_template).len(), 64);
+    }
+
+    #[test]
+    fn credential_like_user_inputs_are_backend_classified_as_secrets() {
+        for name in [
+            "APP_KEY",
+            "PUSH_SERVICE_KEY",
+            "SERVICE_OPENAI_KEY",
+            "SERVICE_BEEHIIVE_KEY",
+            "STRIPE_SIGNING_KEY",
+            "STRIPE_SIGNING_KEY_CONNECT",
+            "CERT_PASSPHRASE",
+            "NEXT_PRIVATE_SIGNING_LOCAL_FILE_PASSPHRASE",
+            "MAIL_OPTIONS_AUTH_PASS",
+            "BACKEND_MAIL_AUTH_PASS",
+            "SPARKY_FITNESS_EMAIL_PASS",
+            "NTFY_SMTP_SENDER_PASS",
+        ] {
+            let variable = TemplateVariable {
+                name: name.to_string(),
+                kind: TemplateVariableKind::UserInput,
+                required: true,
+                default_value: None,
+                route_service: None,
+            };
+            assert!(variable.is_secret(), "{name} should be write-only");
+        }
+
+        for name in [
+            "NEXT_PUBLIC_API_KEY",
+            "STRIPE_PUBLISHABLE_KEY",
+            "SUPABASE_ANON_KEY",
+            "SERVICE_FQDN_APP",
+            "PASSPHRASE_FILE",
+        ] {
+            let variable = TemplateVariable {
+                name: name.to_string(),
+                kind: TemplateVariableKind::UserInput,
+                required: false,
+                default_value: None,
+                route_service: None,
+            };
+            assert!(!variable.is_secret(), "{name} should remain readable");
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_snapshot_is_served_during_failed_refresh_backoff() {
+        let catalog = ServiceTemplateCatalog::with_client(
+            reqwest::Client::new(),
+            "http://127.0.0.1:9/unreachable".to_string(),
+        );
+        *catalog.cache.write().await = Some(Arc::new(CatalogSnapshot {
+            templates: BTreeMap::new(),
+            analyses: BTreeMap::new(),
+            fetched_at: Utc::now(),
+            etag: Some("stale".to_string()),
+            refreshed_at: Instant::now() - CATALOG_TTL - Duration::from_secs(1),
+        }));
+        *catalog.last_failed_refresh.write().await = Some((
+            Instant::now(),
+            ServiceTemplateCatalogError::Fetch {
+                url: "http://127.0.0.1:9/unreachable".to_string(),
+                reason: "offline".to_string(),
+            },
+        ));
+
+        let snapshot = catalog.snapshot().await.unwrap();
+
+        assert_eq!(snapshot.etag.as_deref(), Some("stale"));
+    }
+
+    #[tokio::test]
+    async fn fetched_catalog_is_analyzed_and_reused_from_cache() {
+        let compose = base64::engine::general_purpose::STANDARD
+            .encode("services:\n  app:\n    image: example/app:1\n");
+        let body = serde_json::json!({
+            "example": {
+                "documentation": "https://example.com/docs",
+                "slogan": "Example",
+                "compose": compose,
+                "tags": ["example"],
+                "category": "test",
+                "port": "3000"
+            }
+        })
+        .to_string();
+        let (source_url, requests) = serve_one_response("200 OK", body).await;
+        let catalog = ServiceTemplateCatalog::with_client(reqwest::Client::new(), source_url);
+
+        let first = catalog.snapshot().await.unwrap();
+        let second = catalog.snapshot().await.unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        let analysis = &first.analyses["example"];
+        assert_eq!(analysis.service_count, 1);
+        assert!(analysis.installable);
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_sets_backoff_and_serves_stale_cache() {
+        let (source_url, requests) =
+            serve_one_response("500 Internal Server Error", String::new()).await;
+        let catalog = ServiceTemplateCatalog::with_client(reqwest::Client::new(), source_url);
+        let stale = Arc::new(CatalogSnapshot {
+            templates: BTreeMap::new(),
+            analyses: BTreeMap::new(),
+            fetched_at: Utc::now(),
+            etag: Some("stale".to_string()),
+            refreshed_at: Instant::now() - CATALOG_TTL - Duration::from_secs(1),
+        });
+        *catalog.cache.write().await = Some(stale.clone());
+
+        let first = catalog.snapshot().await.unwrap();
+        let second = catalog.snapshot().await.unwrap();
+
+        assert!(Arc::ptr_eq(&first, &stale));
+        assert!(Arc::ptr_eq(&second, &stale));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(catalog.refresh_backoff_active().await);
+    }
+
+    #[tokio::test]
+    async fn concurrent_cold_cache_failures_fetch_once_during_backoff() {
+        let (source_url, requests) =
+            serve_one_response("500 Internal Server Error", String::new()).await;
+        let catalog = Arc::new(ServiceTemplateCatalog::with_client(
+            reqwest::Client::new(),
+            source_url,
+        ));
+
+        let (first, second) = tokio::join!(catalog.snapshot(), catalog.snapshot());
+
+        assert!(matches!(
+            first,
+            Err(ServiceTemplateCatalogError::HttpStatus { status: 500, .. })
+        ));
+        assert!(matches!(
+            second,
+            Err(ServiceTemplateCatalogError::HttpStatus { status: 500, .. })
+        ));
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(catalog.refresh_backoff_active().await);
     }
 }

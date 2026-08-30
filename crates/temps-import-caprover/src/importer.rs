@@ -1191,6 +1191,7 @@ async fn execute_plan(
 
     let create_project_request = temps_projects::services::types::CreateProjectRequest {
         name: context.project_name.clone(),
+        expected_slug: None,
         repo_name,
         repo_owner,
         directory: context.directory.clone(),

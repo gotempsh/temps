@@ -632,7 +632,13 @@ impl ProjectService {
         let normalized_directory = normalize_project_directory(&request.directory)?;
 
         let validated_name = validate_project_name(&request.name)?;
-        let project_slug = self.generate_unique_project_slug(&validated_name).await?;
+        let project_slug = if let Some(expected_slug) = request.expected_slug.as_deref() {
+            self.validate_expected_project_slug(&validated_name, expected_slug)
+                .await?;
+            expected_slug.to_string()
+        } else {
+            self.generate_unique_project_slug(&validated_name).await?
+        };
         let resolved = resolve_preset_selection(
             request.preset.as_str(),
             request.preset_config.as_ref(),
@@ -3477,12 +3483,7 @@ impl ProjectService {
     /// Slug is truncated to 40 chars max to keep DNS labels within the 63-char limit
     /// when combined with environment slug and service name prefix.
     pub async fn generate_unique_project_slug(&self, name: &str) -> Result<String, ProjectError> {
-        let mut base_slug = slugify(name);
-        // Truncate to 40 chars max (leaves room for "-production" env slug + "service-" prefix
-        // within the 63-char DNS label limit)
-        if base_slug.len() > 40 {
-            base_slug = base_slug[..40].trim_end_matches('-').to_string();
-        }
+        let base_slug = base_project_slug(name);
 
         // First, try the base slug
         let existing = projects::Entity::find()
@@ -3526,6 +3527,44 @@ impl ProjectService {
         } else {
             Ok(unique_slug)
         }
+    }
+
+    pub async fn plan_project_slug(&self, name: &str) -> Result<String, ProjectError> {
+        let validated_name = validate_project_name(name)?;
+        self.generate_unique_project_slug(&validated_name).await
+    }
+
+    async fn validate_expected_project_slug(
+        &self,
+        name: &str,
+        expected_slug: &str,
+    ) -> Result<(), ProjectError> {
+        let base_slug = base_project_slug(name);
+        let suffix = expected_slug
+            .strip_prefix(&format!("{base_slug}-"))
+            .filter(|suffix| matches!(suffix.len(), 6 | 8))
+            .filter(|suffix| suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+        if expected_slug != base_slug && suffix.is_none() {
+            return Err(ProjectError::InvalidInput(format!(
+                "Expected slug '{expected_slug}' does not match project name '{name}'"
+            )));
+        }
+        let exists = projects::Entity::find()
+            .filter(projects::Column::Slug.eq(expected_slug))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|error| ProjectError::DatabaseError {
+                reason: format!(
+                    "failed to validate expected project slug '{expected_slug}': {error}"
+                ),
+            })?
+            .is_some();
+        if exists {
+            return Err(ProjectError::SlugConflict {
+                slug: expected_slug.to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// LEFT JOIN each project to the provider behind its Git connection and
@@ -4023,6 +4062,17 @@ impl ProjectService {
             Some(commit_to_use),
         ))
     }
+}
+
+fn base_project_slug(name: &str) -> String {
+    let mut slug = slugify(name);
+    // Leave room for the production environment and service namespace within
+    // a single DNS label. This must stay identical for planning and creation.
+    if slug.chars().count() > 40 {
+        slug = slug.chars().take(40).collect::<String>();
+        slug.truncate(slug.trim_end_matches('-').len());
+    }
+    slug
 }
 
 #[cfg(test)]
@@ -4803,6 +4853,7 @@ mod tests {
         // Update the project
         let update_request = CreateProjectRequest {
             name: "Updated Test Project".to_string(),
+            expected_slug: None,
             repo_name: None,
             repo_owner: None,
             directory: "/".to_string(),
@@ -5283,6 +5334,7 @@ mod tests {
         // Update the project name
         let update_request = CreateProjectRequest {
             name: "Event Data Test Updated".to_string(),
+            expected_slug: None,
             repo_name: None,
             repo_owner: None,
             directory: "/".to_string(),
@@ -5401,6 +5453,7 @@ mod tests {
     fn create_request(name: &str) -> CreateProjectRequest {
         CreateProjectRequest {
             name: name.to_string(),
+            expected_slug: None,
             repo_name: Some("repo".to_string()),
             repo_owner: Some("owner".to_string()),
             directory: "/".to_string(),
@@ -6623,8 +6676,14 @@ mod tests {
             .create_project(create_request("Duplicate Name"))
             .await
             .expect("first create should succeed");
+        let planned_slug = project_service
+            .plan_project_slug("Duplicate Name")
+            .await
+            .expect("slug planning should succeed");
+        let mut second_request = create_request("Duplicate Name");
+        second_request.expected_slug = Some(planned_slug.clone());
         let second = project_service
-            .create_project(create_request("Duplicate Name"))
+            .create_project(second_request)
             .await
             .expect("second create with same name should succeed with suffixed slug");
 
@@ -6635,6 +6694,22 @@ mod tests {
             second.slug
         );
         assert_ne!(first.id, second.id);
+        assert_eq!(second.slug, planned_slug);
+    }
+
+    #[test]
+    fn planned_slug_base_matches_creation_truncation() {
+        let slug = base_project_slug(
+            "This project name is deliberately much longer than the DNS allocation permits",
+        );
+        assert!(slug.len() <= 40);
+        assert!(slug.starts_with("this-project-name-is-deliberately"));
+    }
+
+    #[test]
+    fn planned_slug_truncation_is_safe_for_unicode_names() {
+        let slug = base_project_slug(&"é".repeat(50));
+        assert_eq!(slug.chars().count(), 40);
     }
 
     #[tokio::test]

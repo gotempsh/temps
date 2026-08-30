@@ -3028,7 +3028,10 @@ export type ComposeServicePreviewResponse = {
 };
 
 /**
- * Immutable catalog provenance captured when a Compose service template is installed.
+ * Informational catalog origin captured from the install request.
+ *
+ * The server preserves it after creation, but it is not a cryptographic
+ * attestation: API clients can supply project configuration directly.
  */
 export type ComposeTemplateOrigin = {
     provider: string;
@@ -4488,6 +4491,10 @@ export type CreateProjectRequest = {
      * `is_secret: false`.
      */
     environment_variables?: Array<ProjectEnvVarInput> | null;
+    /**
+     * Exact slug returned by service-template preflight. Normal project creation omits it.
+     */
+    expected_slug?: string | null;
     /**
      * Port exposed by the container (fallback when image has no EXPOSE directive)
      *
@@ -13451,6 +13458,14 @@ export type PreflightServiceTemplateRequest = {
      */
     approved_capability_services?: Array<string>;
     /**
+     * Digest returned by the detail endpoint; prevents validating a newer install plan.
+     */
+    expected_install_plan_digest: string;
+    /**
+     * Project name used to plan the exact slug and canonical route hostnames.
+     */
+    project_name: string;
+    /**
      * Final environment values the project would persist. Values are never returned.
      */
     variables?: {
@@ -13462,6 +13477,16 @@ export type PreflightServiceTemplateResponse = {
     architecture: string;
     compose_validated: boolean;
     errors: Array<string>;
+    /**
+     * Optimistically allocated slug that must be claimed with `expected_slug`.
+     */
+    planned_project_slug: string;
+    /**
+     * Canonical URL/FQDN variables calculated from the allocated slug and hostname strategy.
+     */
+    public_variables: {
+        [key: string]: string;
+    };
     ready: boolean;
     warnings: Array<string>;
 };
@@ -17273,6 +17298,10 @@ export type ServiceTemplateDetailResponse = ServiceTemplateSummaryResponse & {
      * Normalized Compose copied into the new project when installed.
      */
     compose: string;
+    /**
+     * SHA-256 of the exact normalized Compose and deployment-critical route metadata.
+     */
+    install_plan_digest: string;
     routes: Array<ServiceTemplateRouteResponse>;
     source_repository_url: string;
     source_revision?: string | null;
@@ -40677,6 +40706,10 @@ export type CreateProjectErrors = {
      */
     400: unknown;
     /**
+     * Expected project slug is already in use
+     */
+    409: unknown;
+    /**
      * Internal server error
      */
     500: unknown;
@@ -52760,6 +52793,10 @@ export type PreflightServiceTemplateData = {
 
 export type PreflightServiceTemplateErrors = {
     /**
+     * Invalid project name
+     */
+    400: unknown;
+    /**
      * Unauthorized
      */
     401: unknown;
@@ -52772,6 +52809,10 @@ export type PreflightServiceTemplateErrors = {
      */
     404: unknown;
     /**
+     * Catalog install plan changed; reload required
+     */
+    409: unknown;
+    /**
      * Template content is invalid
      */
     422: unknown;
@@ -52779,6 +52820,10 @@ export type PreflightServiceTemplateErrors = {
      * Upstream catalog unavailable
      */
     502: unknown;
+    /**
+     * Docker preflight unavailable or at capacity
+     */
+    503: unknown;
 };
 
 export type PreflightServiceTemplateResponses = {

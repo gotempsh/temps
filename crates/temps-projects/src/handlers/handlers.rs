@@ -695,6 +695,7 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
     responses(
         (status = 200, description = "Project created successfully", body = ProjectResponse),
         (status = 400, description = "Invalid input"),
+        (status = 409, description = "Expected project slug is already in use"),
         (status = 500, description = "Internal server error")
     ),
     security(
@@ -730,6 +731,7 @@ pub async fn create_project(
 
     let project_req = crate::services::types::CreateProjectRequest {
         name: project.name,
+        expected_slug: project.expected_slug,
         repo_name: project.repo_name,
         repo_owner: project.repo_owner,
         directory: project.directory,
@@ -1005,6 +1007,7 @@ pub async fn update_project(
 
     let project_req = crate::services::types::CreateProjectRequest {
         name: project.name.clone(),
+        expected_slug: None,
         repo_name: project.repo_name.clone(),
         repo_owner: project.repo_owner.clone(),
         directory: project.directory.clone(),
@@ -2317,6 +2320,7 @@ pub async fn create_project_from_template(
         );
         let req = crate::services::types::CreateProjectRequest {
             name: request.project_name.clone(),
+            expected_slug: None,
             // No Git source — the image is pulled from its registry.
             repo_name: None,
             repo_owner: None,
@@ -2392,6 +2396,7 @@ pub async fn create_project_from_template(
                 // flattened into the fork root by create_repository_and_push_template.
                 let req = crate::services::types::CreateProjectRequest {
                     name: request.project_name.clone(),
+                    expected_slug: None,
                     repo_name: Some(new_repo.name.clone()),
                     repo_owner: Some(new_repo.owner.clone()),
                     directory: ".".to_string(),
@@ -2438,6 +2443,7 @@ pub async fn create_project_from_template(
 
                 let req = crate::services::types::CreateProjectRequest {
                     name: request.project_name.clone(),
+                    expected_slug: None,
                     repo_name: Some(repo_name),
                     repo_owner: Some(repo_owner),
                     directory,

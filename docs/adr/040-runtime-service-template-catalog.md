@@ -36,17 +36,24 @@ The backend:
    timeouts.
 2. Accepts at most 2,000 catalog entries and caches the last successful result
    for one hour. A failed refresh serves a stale successful snapshot; the first
-   failed fetch returns a typed 502 response.
-3. Returns paginated metadata without Compose bodies. A selected template is
-   decoded and normalized only on the detail request.
+   failed fetch returns a typed 502 response. Failed refreshes back off for 30
+   seconds so concurrent readers do not repeatedly wait on an unavailable
+   upstream.
+3. Decodes and analyzes each bounded entry once on refresh in a blocking worker
+   and caches the results. List requests paginate cached metadata without
+   reparsing Compose or blocking the async runtime; a selected template is
+   normalized on the detail request.
 4. Produces a typed install plan containing every public Compose service,
    routable target port, variable, safety transformation, warning, and required
    capability approval. Existing fixed host bindings become random
    loopback-only bindings; fixed project/container names are removed.
 5. Describes Coolify magic variables as typed generators or user inputs. The UI
-   generates credentials locally, including dependent Supabase JWT values,
-   creates Coolify's URL/FQDN variable pairs, and marks sensitive values secret
-   when it creates the project.
+   generates credentials locally, including dependent Supabase JWT values. The
+   backend plans the final project slug and derives URL/FQDN values through
+   Temps' canonical hostname strategy. Project creation claims that exact slug
+   or returns 409 so the installer can re-plan once. Sensitive values are
+   classified authoritatively by the backend and marked write-only when the
+   project is created.
 6. Classifies each entry as `standard`, `elevated`, or `blocked`. Database-style
    images and services that initialize writable Docker volumes can request the
    existing limited startup-capability profile, but the user must explicitly
@@ -61,17 +68,32 @@ The backend:
    at most four Compose processes concurrently, and clears the server process
    environment before invoking an absolute Docker CLI path. Values reach
    Compose only through a safely encoded temporary env file.
+8. Binds preflight to the SHA-256 digest of the complete install plan returned
+   by the detail endpoint: normalized Compose, public route/port metadata, and
+   architecture flags. If upstream refreshes between selection and validation,
+   preflight returns 409 and requires the user to review the new snapshot.
+   Operational Docker, timeout, or filesystem failures return 503; a validly
+   executed Compose rejection remains a 200 response with `ready: false` and
+   actionable validation errors.
 
 Installing creates a regular `uploaded_source` project with the normalized
 `docker-compose.yml`, environment variables, all public service/port
-selections, capability approvals, an informational catalog-origin record, and the normal Temps
-deployment pipeline. The selected Compose is copied into the project's source
-bundle. Updating the remote catalog therefore affects only future installs;
-existing deployments remain reproducible and operator-controlled. The stored
-provider, slug, catalog revision, and template timestamp are preserved after
-creation and provide the basis for a future reviewable upstream diff. They are
-not a server-attested audit record because API clients can create projects
-directly.
+selections, capability approvals, an informational catalog-origin record, and
+the normal Temps deployment pipeline. Project creation optimistically claims
+the slug planned by preflight. If a concurrent create wins, it fails safely
+with 409 and the installer re-runs preflight once, so collision suffixes,
+truncation, and multi-route hostnames do not silently drift. If a later upload
+or deployment step fails, the created project is retained for inspection and
+safe retry instead of being deleted by a browser-side rollback.
+
+The selected Compose is copied into the project's source bundle. Updating the
+remote catalog therefore affects only future installs; existing deployments
+retain their reviewed configuration and remain operator-controlled. Images may
+still use mutable registry tags, so identical Compose does not yet guarantee
+bit-for-bit reproducible redeployment. The stored provider, slug, catalog
+revision, and template timestamp are preserved after creation and provide the
+basis for a future reviewable upstream diff. They are not a server-attested
+audit record because API clients can create projects directly.
 
 The page attributes the catalog to Coolify and links to both the upstream
 repository and each service's documentation. Coolify's catalog is distributed

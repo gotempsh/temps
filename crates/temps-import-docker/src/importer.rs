@@ -650,6 +650,7 @@ impl WorkloadImporter for DockerImporter {
 
         let create_project_request = temps_projects::services::types::CreateProjectRequest {
             name: context.project_name.clone(),
+            expected_slug: None,
             repo_name: context.repo_name.clone(),
             repo_owner: context.repo_owner.clone(),
             directory: context.directory.clone(),

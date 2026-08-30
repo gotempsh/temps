@@ -130,7 +130,7 @@ export function generateServiceTemplateValue(
       }
     }
   }
-  if (input.defaultValue != null) return input.defaultValue
+  if (input.kind === 'user_input') return input.defaultValue || ''
   switch (input.kind) {
     case 'generated_password':
       return randomAlphaNumeric(32)
@@ -229,5 +229,45 @@ export async function generateDependentServiceTemplateValue(
 }
 
 export function serviceTemplateVariableIsGenerated(kind: string): boolean {
-  return kind !== 'user_input'
+  return [
+    'public_url',
+    'public_host',
+    'generated_password',
+    'generated_password_64',
+    'generated_password_with_symbols',
+    'generated_password_with_symbols_64',
+    'generated_user',
+    'generated_lowercase_user',
+    'generated_random_32',
+    'generated_random_64',
+    'generated_random_128',
+    'generated_base64_32',
+    'generated_base64_64',
+    'generated_base64_128',
+    'generated_hex_32',
+    'generated_hex_64',
+    'generated_hex_128',
+    'generated_supabase_anon',
+    'generated_supabase_service',
+  ].includes(kind)
+}
+
+/**
+ * Claim an optimistic service-template project slug, re-planning exactly once
+ * if another project wins the unique-slug race between preflight and create.
+ */
+export async function createServiceTemplateWithSlugRetry<TPlan, TResult>(
+  initialPlan: TPlan,
+  create: (plan: TPlan) => Promise<TResult>,
+  replan: () => Promise<TPlan>,
+  isSlugConflict: (error: unknown) => boolean
+): Promise<{ plan: TPlan; result: TResult }> {
+  try {
+    return { plan: initialPlan, result: await create(initialPlan) }
+  } catch (error) {
+    if (!isSlugConflict(error)) throw error
+  }
+
+  const plan = await replan()
+  return { plan, result: await create(plan) }
 }

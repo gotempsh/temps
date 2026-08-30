@@ -3,7 +3,6 @@
 
 import {
   createProject,
-  deleteProject,
   deployFromUploadedSource,
   getEnvironments,
   preflightServiceTemplate,
@@ -16,7 +15,6 @@ import type {
   ServiceTemplateDetailResponse,
   ServiceTemplateSummaryResponse,
 } from '@/api/client/types.gen'
-import { resolveDeploymentUrlBase } from '@/components/templates/envVarGenerators'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -37,15 +35,15 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
-import { useSettings } from '@/hooks/useSettings'
+import { Skeleton } from '@/components/ui/skeleton'
 import { prepareDrop } from '@/lib/drop-archive'
 import {
+  createServiceTemplateWithSlugRetry,
   generateDependentServiceTemplateValue,
   generateServiceTemplateValue,
   serviceTemplateVariableIsGenerated,
 } from '@/lib/service-template-values'
-import { isLikelySecretProjectEnvironmentVariable } from '@/lib/project-environment-variables'
-import { getErrorMessage } from '@/utils/errorHandling'
+import { extractProblemDetails, getErrorMessage } from '@/utils/errorHandling'
 import { useQuery } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -63,20 +61,11 @@ import {
   ShieldAlert,
   Sparkles,
 } from 'lucide-react'
-import { useDeferredValue, useEffect, useMemo, useState } from 'react'
+import { useDeferredValue, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 const PER_PAGE = 24
-
-function projectSlug(name: string): string {
-  return (
-    name
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '') || 'service'
-  )
-}
 
 function templateLogo(template: ServiceTemplateSummaryResponse) {
   if (!template.logo_url) {
@@ -191,7 +180,6 @@ function TemplateInstaller({
   onBack: () => void
 }) {
   const navigate = useNavigate()
-  const { data: settings } = useSettings()
   const [name, setName] = useState(detail.name)
   const [visible, setVisible] = useState<Record<string, boolean>>({})
   const [installing, setInstalling] = useState(false)
@@ -199,16 +187,8 @@ function TemplateInstaller({
     Record<string, boolean>
   >({})
   const [preflightErrors, setPreflightErrors] = useState<string[]>([])
-  const base = useMemo(
-    () =>
-      resolveDeploymentUrlBase({
-        previewDomain: settings?.preview_domain,
-        externalUrl: settings?.external_url,
-        proxyPort: settings?.proxy_port,
-      }),
-    [settings?.preview_domain, settings?.external_url, settings?.proxy_port]
-  )
-  const slug = projectSlug(name)
+  const [generationError, setGenerationError] = useState<string | null>(null)
+  const [generatingDependencies, setGeneratingDependencies] = useState(false)
   const routeForVariable = (
     variable: ServiceTemplateDetailResponse['variables'][number]
   ) =>
@@ -238,39 +218,65 @@ function TemplateInstaller({
         )
         .map((variable) => [
           variable.name,
-          generateServiceTemplateValue(
-            generatorInput(variable),
-            projectSlug(detail.name),
-            base
-          ),
+          generateServiceTemplateValue(generatorInput(variable), detail.slug),
         ])
     )
   )
   const jwtSigningKey = values.SERVICE_PASSWORD_JWT
   useEffect(() => {
-    if (!jwtSigningKey) return
     let cancelled = false
-    const resolveDependencies = async () => {
-      const generated = await Promise.all(
-        detail.variables.map(
-          async (variable) =>
-            [
-              variable.name,
-              await generateDependentServiceTemplateValue(variable.kind, {
-                SERVICE_PASSWORD_JWT: jwtSigningKey,
-              }),
-            ] as const
-        )
+    const dependentVariables = detail.variables.filter((variable) =>
+      ['generated_supabase_anon', 'generated_supabase_service'].includes(
+        variable.kind
       )
+    )
+    const resolveDependencies = async () => {
+      // Defer state synchronization so the effect itself only coordinates the
+      // asynchronous WebCrypto work and cannot trigger a cascading render.
+      await Promise.resolve()
       if (cancelled) return
       setValues((current) => ({
         ...current,
         ...Object.fromEntries(
-          generated.filter((entry): entry is readonly [string, string] =>
-            Boolean(entry[1])
-          )
+          dependentVariables.map((variable) => [variable.name, ''])
         ),
       }))
+      setGenerationError(null)
+      if (!jwtSigningKey) {
+        setGeneratingDependencies(false)
+        return
+      }
+      setGeneratingDependencies(true)
+      try {
+        const generated = await Promise.all(
+          dependentVariables.map(
+            async (variable) =>
+              [
+                variable.name,
+                await generateDependentServiceTemplateValue(variable.kind, {
+                  SERVICE_PASSWORD_JWT: jwtSigningKey,
+                }),
+              ] as const
+          )
+        )
+        if (cancelled) return
+        setValues((current) => ({
+          ...current,
+          ...Object.fromEntries(
+            generated.filter((entry): entry is readonly [string, string] =>
+              Boolean(entry[1])
+            )
+          ),
+        }))
+      } catch (error) {
+        if (!cancelled) {
+          setGenerationError(
+            getErrorMessage(error, 'Could not generate dependent credentials')
+          )
+        }
+      } finally {
+        if (!cancelled) setGeneratingDependencies(false)
+      }
     }
     void resolveDependencies()
     return () => {
@@ -280,13 +286,13 @@ function TemplateInstaller({
   }, [detail.variables, jwtSigningKey])
   const valueFor = (
     variable: ServiceTemplateDetailResponse['variables'][number]
-  ) =>
-    variable.kind === 'public_url' || variable.kind === 'public_host'
-      ? generateServiceTemplateValue(generatorInput(variable), slug, base)
-      : values[variable.name] || ''
+  ) => values[variable.name] || ''
 
   const missing = detail.variables.filter(
-    (variable) => variable.required && !valueFor(variable).trim()
+    (variable) =>
+      variable.required &&
+      !['public_url', 'public_host'].includes(variable.kind) &&
+      !valueFor(variable).trim()
   )
   const missingCapabilityApprovals = detail.capability_requirements.filter(
     (requirement) => !approvedCapabilities[requirement.service]
@@ -295,18 +301,31 @@ function TemplateInstaller({
   const regenerateVariable = async (
     variable: ServiceTemplateDetailResponse['variables'][number]
   ) => {
-    const dependent = await generateDependentServiceTemplateValue(
-      variable.kind,
-      values
-    )
-    const next =
-      dependent ??
-      generateServiceTemplateValue(generatorInput(variable), slug, base)
-    setValues((current) => ({ ...current, [variable.name]: next }))
+    setGenerationError(null)
+    try {
+      const dependent = await generateDependentServiceTemplateValue(
+        variable.kind,
+        values
+      )
+      const next =
+        dependent ??
+        generateServiceTemplateValue(generatorInput(variable), detail.slug)
+      setValues((current) => ({ ...current, [variable.name]: next }))
+    } catch (error) {
+      setGenerationError(
+        getErrorMessage(error, `Could not regenerate ${variable.name}`)
+      )
+    }
   }
 
   const install = async () => {
-    if (!detail.installable || installing) return
+    if (
+      !detail.installable ||
+      installing ||
+      generatingDependencies ||
+      generationError
+    )
+      return
     if (!name.trim()) {
       toast.error('Project name is required')
       return
@@ -324,34 +343,63 @@ function TemplateInstaller({
       return
     }
 
-    let createdProjectId: number | null = null
-    let deploymentAccepted = false
+    let createdProjectSlug: string | null = null
     setInstalling(true)
     setPreflightErrors([])
     try {
-      const environmentVariables = Object.fromEntries(
+      const localVariables = Object.fromEntries(
         detail.variables
+          .filter(
+            (variable) =>
+              variable.kind !== 'public_url' && variable.kind !== 'public_host'
+          )
           .map((variable) => [variable.name, valueFor(variable)] as const)
           .filter(([, value]) => value.trim())
       )
+      const dependentVariables = await Promise.all(
+        detail.variables.map(
+          async (variable) =>
+            [
+              variable.name,
+              await generateDependentServiceTemplateValue(
+                variable.kind,
+                localVariables
+              ),
+            ] as const
+        )
+      )
+      const resolvedVariables = {
+        ...localVariables,
+        ...Object.fromEntries(
+          dependentVariables.filter(
+            (entry): entry is readonly [string, string] => Boolean(entry[1])
+          )
+        ),
+      }
       const approvedCapabilityServices = detail.capability_requirements
         .filter((requirement) => approvedCapabilities[requirement.service])
         .map((requirement) => requirement.service)
-      const preflight = await preflightServiceTemplate({
-        throwOnError: true,
-        path: { slug: detail.slug },
-        body: {
-          variables: environmentVariables,
-          approved_capability_services: approvedCapabilityServices,
-        },
-      })
-      if (!preflight.data?.ready) {
-        const errors = preflight.data?.errors || [
-          'Temps could not validate this Compose template.',
-        ]
-        setPreflightErrors(errors)
-        throw new Error(errors.join(' '))
+      const runPreflight = async () => {
+        const response = await preflightServiceTemplate({
+          throwOnError: true,
+          path: { slug: detail.slug },
+          body: {
+            project_name: name.trim(),
+            expected_install_plan_digest: detail.install_plan_digest,
+            variables: resolvedVariables,
+            approved_capability_services: approvedCapabilityServices,
+          },
+        })
+        if (!response.data?.ready) {
+          const errors = response.data?.errors || [
+            'Temps could not validate this Compose template.',
+          ]
+          setPreflightErrors(errors)
+          throw new Error(errors.join(' '))
+        }
+        return response.data
       }
+      const preflight = await runPreflight()
       const archive = await prepareDrop([
         {
           file: new File([detail.compose], 'docker-compose.yml', {
@@ -364,42 +412,61 @@ function TemplateInstaller({
         service: route.service,
         port: route.port,
       }))
-      const created = await createProject({
-        throwOnError: true,
-        body: {
-          name: name.trim(),
-          directory: '.',
-          main_branch: 'main',
-          preset: 'docker-compose',
-          source_type: 'uploaded_source',
-          project_type: 'server',
-          automatic_deploy: false,
-          storage_service_ids: [],
-          preset_config: {
-            composePath: 'docker-compose.yml',
-            publicPorts,
-            relaxedCapabilityServices: approvedCapabilityServices,
-            templateOrigin: {
-              provider: 'coolify',
-              slug: detail.slug,
-              sourceUrl: detail.source_url,
-              sourceRevision: detail.source_revision,
-              templateLastUpdatedAt: detail.template_last_updated_at,
+      const createFromPreflight = (planned: typeof preflight) => {
+        const finalVariables = {
+          ...resolvedVariables,
+          ...planned.public_variables,
+        }
+        return createProject({
+          throwOnError: true,
+          body: {
+            name: name.trim(),
+            expected_slug: planned.planned_project_slug,
+            directory: '.',
+            main_branch: 'main',
+            preset: 'docker-compose',
+            source_type: 'uploaded_source',
+            project_type: 'server',
+            automatic_deploy: false,
+            storage_service_ids: [],
+            preset_config: {
+              composePath: 'docker-compose.yml',
+              publicPorts,
+              relaxedCapabilityServices: approvedCapabilityServices,
+              templateOrigin: {
+                provider: 'coolify',
+                slug: detail.slug,
+                sourceUrl: detail.source_url,
+                sourceRevision: detail.source_revision,
+                templateLastUpdatedAt: detail.template_last_updated_at,
+              },
             },
+            environment_variables: detail.variables
+              .filter((variable) => finalVariables[variable.name]?.trim())
+              .map((variable) => ({
+                key: variable.name,
+                value: finalVariables[variable.name],
+                is_secret: variable.is_secret,
+              })),
           },
-          environment_variables: detail.variables
-            .filter((variable) => valueFor(variable).trim())
-            .map((variable) => ({
-              key: variable.name,
-              value: valueFor(variable),
-              is_secret:
-                variable.is_secret ||
-                isLikelySecretProjectEnvironmentVariable(variable.name),
-            })),
-        },
-      })
+        })
+      }
+      const createResult = await createServiceTemplateWithSlugRetry(
+        preflight,
+        createFromPreflight,
+        runPreflight,
+        (error) =>
+          (
+            extractProblemDetails(error) as
+              | (ReturnType<typeof extractProblemDetails> & {
+                  status?: number
+                })
+              | null
+          )?.status === 409
+      )
+      const created = createResult.result
       if (!created.data) throw new Error('Temps created no project record')
-      createdProjectId = created.data.id
+      createdProjectSlug = created.data.slug
 
       const environments = await getEnvironments({
         throwOnError: true,
@@ -421,21 +488,12 @@ function TemplateInstaller({
         body: { file: archive.file },
       })
       if (!deployed.data) throw new Error('Temps accepted no deployment')
-      deploymentAccepted = true
       toast.success(`${detail.name} installation started`)
       navigate(`/projects/${created.data.slug}/deployments/${deployed.data.id}`)
     } catch (error) {
       let message = getErrorMessage(error, 'Service installation failed')
-      if (createdProjectId && !deploymentAccepted) {
-        try {
-          await deleteProject({
-            throwOnError: true,
-            path: { id: createdProjectId },
-          })
-          message += ' The incomplete project was removed.'
-        } catch (cleanupError) {
-          message += ` Cleanup also failed: ${getErrorMessage(cleanupError, 'unknown cleanup error')}`
-        }
+      if (createdProjectSlug) {
+        message += ` Project '${createdProjectSlug}' was kept so you can inspect or retry it safely.`
       }
       toast.error(message)
     } finally {
@@ -532,12 +590,8 @@ function TemplateInstaller({
                 disabled={!detail.installable || installing}
               />
               <p className="text-xs text-muted-foreground">
-                Public URL:{' '}
-                {generateServiceTemplateValue(
-                  { name: 'SERVICE_URL', kind: 'public_url' },
-                  slug,
-                  base
-                )}
+                Temps plans the final slug and canonical public URLs during
+                preflight, then safely retries if another project claims it.
               </p>
             </div>
 
@@ -551,7 +605,7 @@ function TemplateInstaller({
                   </p>
                 </div>
                 <div className="grid gap-2 sm:grid-cols-2">
-                  {detail.routes.map((route, index) => (
+                  {detail.routes.map((route) => (
                     <div
                       key={route.service}
                       className="rounded-lg border bg-muted/30 p-3"
@@ -561,16 +615,7 @@ function TemplateInstaller({
                         <Badge variant="outline">:{route.port}</Badge>
                       </div>
                       <p className="mt-1 break-all text-xs text-muted-foreground">
-                        {generateServiceTemplateValue(
-                          {
-                            name: 'SERVICE_URL',
-                            kind: 'public_url',
-                            routeService: route.service,
-                            routeIsPrimary: index === 0,
-                          },
-                          slug,
-                          base
-                        )}
+                        Canonical hostname generated by Temps during validation
                       </p>
                     </div>
                   ))}
@@ -630,9 +675,7 @@ function TemplateInstaller({
                 </div>
                 <div className="grid gap-4 md:grid-cols-2">
                   {detail.variables.map((variable) => {
-                    const isSecret =
-                      variable.is_secret ||
-                      isLikelySecretProjectEnvironmentVariable(variable.name)
+                    const isSecret = variable.is_secret
                     const generated = serviceTemplateVariableIsGenerated(
                       variable.kind
                     )
@@ -661,6 +704,13 @@ function TemplateInstaller({
                                 : 'text'
                             }
                             value={valueFor(variable)}
+                            placeholder={
+                              ['public_url', 'public_host'].includes(
+                                variable.kind
+                              )
+                                ? 'Generated by Temps during preflight'
+                                : undefined
+                            }
                             onChange={(event) =>
                               setValues((current) => ({
                                 ...current,
@@ -765,6 +815,8 @@ function TemplateInstaller({
             disabled={
               !detail.installable ||
               installing ||
+              generatingDependencies ||
+              Boolean(generationError) ||
               missing.length > 0 ||
               missingCapabilityApprovals.length > 0
             }
@@ -777,6 +829,13 @@ function TemplateInstaller({
             )}
             {installing ? 'Installing…' : `Install ${detail.name}`}
           </Button>
+          {generationError && (
+            <Alert variant="destructive">
+              <AlertTriangle className="size-4" />
+              <AlertTitle>Credential generation failed</AlertTitle>
+              <AlertDescription>{generationError}</AlertDescription>
+            </Alert>
+          )}
           {detail.documentation_url && (
             <Button variant="outline" className="w-full" asChild>
               <a
@@ -822,8 +881,12 @@ export function ServiceTemplateCatalog() {
   if (selectedSlug) {
     if (detail.isPending) {
       return (
-        <div className="flex justify-center py-20">
-          <Loader2 className="size-8 animate-spin text-muted-foreground" />
+        <div className="space-y-6" aria-label="Loading service template">
+          <Skeleton className="h-9 w-36" />
+          <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_22rem]">
+            <Skeleton className="h-[38rem] w-full" />
+            <Skeleton className="h-72 w-full" />
+          </div>
         </div>
       )
     }
@@ -855,8 +918,17 @@ export function ServiceTemplateCatalog() {
 
   if (catalog.isPending) {
     return (
-      <div className="flex justify-center py-20">
-        <Loader2 className="size-8 animate-spin text-muted-foreground" />
+      <div className="space-y-6" aria-label="Loading service catalog">
+        <div className="space-y-3">
+          <Skeleton className="h-7 w-52" />
+          <Skeleton className="h-4 w-full max-w-xl" />
+          <Skeleton className="h-6 w-80" />
+        </div>
+        <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+          {Array.from({ length: 6 }, (_, index) => (
+            <Skeleton key={index} className="h-64 w-full" />
+          ))}
+        </div>
       </div>
     )
   }

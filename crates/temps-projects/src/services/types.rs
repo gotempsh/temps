@@ -247,6 +247,7 @@ impl CreateProjectEnvVar {
 #[derive(Deserialize)]
 pub struct CreateProjectRequest {
     pub name: String,
+    pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,

@@ -28,6 +28,8 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
     pub service_template_catalog: Arc<ServiceTemplateCatalog>,
+    pub config_service: Arc<temps_config::ConfigService>,
+    pub public_hostname_resolver: Arc<dyn temps_core::PublicHostnameResolver>,
     pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker enforcing team-based project access for human sessions.
@@ -173,6 +175,9 @@ pub struct ProjectEnvVarInput {
 #[derive(Serialize, Deserialize, ToSchema)]
 pub struct CreateProjectRequest {
     pub name: String,
+    /// Exact slug returned by service-template preflight. Normal project creation omits it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_slug: Option<String>,
     pub repo_name: Option<String>,
     pub repo_owner: Option<String>,
     pub directory: String,
