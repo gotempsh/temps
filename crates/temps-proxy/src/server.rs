@@ -321,6 +321,19 @@ pub fn setup_proxy_server(
     // for why that is an accepted limitation rather than a bug.
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<()> {
+    // Fail fast and loud if the configured ports are already taken. Without
+    // this, a bind conflict is only discovered deep inside Pingora's own
+    // listener setup (`Service::start_service` in pingora-core, which does
+    // `.expect("Failed to build listeners")` inside a spawned tokio task).
+    // Tokio swallows a panicking task silently -- the process keeps running
+    // with that one listener simply never up, so e.g. a port-80 conflict
+    // doesn't crash the proxy, it just means HTTP-01 challenges start timing
+    // out against a host that never answers, with nothing in the logs
+    // pointing at "port 80 was already in use at startup". Checking here,
+    // before any of the setup below runs, turns that into an ordinary
+    // startup error the existing callers already log and exit on.
+    preflight_check_listen_addresses(&proxy_config)?;
+
     // Setup plugin system (async operation in sync context)
     // A `current_thread` runtime is enough here: plugin registration awaits a
     // bounded file-existence poll and otherwise does sync work, so a worker
@@ -594,6 +607,37 @@ pub fn setup_proxy_server(
     Ok(())
 }
 
+/// Bind-and-immediately-drop every configured proxy listener address so a
+/// port conflict is reported as a normal startup error instead of a silently
+/// swallowed panic inside Pingora (see the comment at the top of
+/// `setup_proxy_server`). `std::net::TcpListener::bind` sets `SO_REUSEADDR`
+/// on Unix, so this only rejects an address another process is *actively
+/// listening* on -- it does not false-positive on a socket still winding
+/// down in `TIME_WAIT`, which is exactly the case Pingora's own bind retries
+/// are designed to tolerate.
+fn preflight_check_listen_addresses(proxy_config: &ProxyConfig) -> Result<()> {
+    check_address_bindable(&proxy_config.address, "TEMPS_ADDRESS")?;
+    if let Some(ref tls_address) = proxy_config.tls_address {
+        check_address_bindable(tls_address, "TEMPS_TLS_ADDRESS")?;
+    }
+    Ok(())
+}
+
+fn check_address_bindable(address: &str, env_var: &str) -> Result<()> {
+    std::net::TcpListener::bind(address)
+        .map(|_| ())
+        .map_err(|e| {
+            let port = address.rsplit(':').next().unwrap_or(address);
+            anyhow::anyhow!(
+                "Cannot start the proxy: failed to bind to {address}: {e}. Another process on \
+             this machine is already listening on that port -- find it with \
+             `lsof -iTCP:{port} -sTCP:LISTEN -n -P` (macOS/Linux) or `ss -ltnp | grep :{port}` \
+             (Linux), stop it, then restart Temps. To use a different port instead, set \
+             {env_var} and restart."
+            )
+        })
+}
+
 /// Create a proxy service with the given configuration
 pub fn create_proxy_service(
     db: Arc<DbConnection>,
@@ -699,4 +743,72 @@ pub fn create_proxy_service(
     );
 
     Ok(lb)
+}
+
+#[cfg(test)]
+mod preflight_bind_tests {
+    use super::*;
+
+    #[test]
+    fn check_address_bindable_succeeds_on_free_port() {
+        // Bind to an OS-assigned ephemeral port, then release it immediately so
+        // the address is free again for the check itself to bind.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let result = check_address_bindable(&addr, "TEMPS_ADDRESS");
+        assert!(result.is_ok(), "expected free port to bind, got {result:?}");
+    }
+
+    #[test]
+    fn check_address_bindable_fails_with_actionable_message_when_port_taken() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = held.local_addr().unwrap().to_string();
+        let port = held.local_addr().unwrap().port();
+
+        let result = check_address_bindable(&addr, "TEMPS_TLS_ADDRESS");
+
+        let err = result.expect_err("expected bind conflict to be reported as an error");
+        let message = err.to_string();
+        assert!(
+            message.contains(&addr),
+            "error should name the conflicting address: {message}"
+        );
+        assert!(
+            message.contains(&format!("lsof -iTCP:{port}")),
+            "error should give an actionable command to find the offending process: {message}"
+        );
+        assert!(
+            message.contains("TEMPS_TLS_ADDRESS"),
+            "error should name the env var to reconfigure: {message}"
+        );
+
+        drop(held);
+    }
+
+    #[test]
+    fn preflight_check_listen_addresses_reports_tls_port_conflict() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held_addr = held.local_addr().unwrap().to_string();
+
+        let free_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free_addr = free_probe.local_addr().unwrap().to_string();
+        drop(free_probe);
+
+        let proxy_config = ProxyConfig {
+            address: free_addr,
+            tls_address: Some(held_addr.clone()),
+            ..Default::default()
+        };
+
+        let result = preflight_check_listen_addresses(&proxy_config);
+
+        let message = result
+            .expect_err("expected TLS address conflict to fail preflight")
+            .to_string();
+        assert!(message.contains(&held_addr));
+
+        drop(held);
+    }
 }
