@@ -11,12 +11,14 @@ import {
   Circle,
   Cloud,
   Code2,
+  CreditCard,
   Database,
   EyeOff,
   GitBranch,
   Globe2,
   KeyRound,
   LoaderCircle,
+  Lock,
   LockKeyhole,
   MoreHorizontal,
   Network,
@@ -37,7 +39,6 @@ import {
   type CSSProperties,
   type FormEvent,
 } from 'react'
-import { Link } from 'react-router'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -73,16 +74,18 @@ import { cn } from '@/lib/utils'
 const SECRET_REQUIREMENTS = [
   {
     key: 'STRIPE_SECRET_KEY',
-    description: 'Payments in production',
+    description: 'Stripe payments',
+    targets: ['payments-api'],
   },
   {
     key: 'RESEND_API_KEY',
     description: 'Transactional email',
+    targets: ['storefront-web', 'fulfillment-worker'],
   },
 ] as const
 
 const conversations = [
-  { title: 'Launch storefront', detail: '2 minutes ago', active: true },
+  { title: 'Launch commerce suite', detail: '2 minutes ago', active: true },
   { title: 'Database recovery plan', detail: 'Yesterday', active: false },
   { title: 'Why did checkout fail?', detail: 'Tuesday', active: false },
 ] as const
@@ -175,7 +178,7 @@ export function AiFirstPrototype() {
   }
 
   const storeSecrets = (drafts: SecretDraft[]) => {
-    const nextReferences = buildSecretReferencePayload('storefront', drafts)
+    const nextReferences = buildSecretReferencePayload('commerce-suite', drafts)
     setSecretReferences((current) => {
       const retained = current.filter(
         (saved) =>
@@ -243,10 +246,10 @@ export function AiFirstPrototype() {
             size="sm"
             className="h-8 text-[var(--ai-muted)] hover:bg-[var(--ai-panel-raised)] hover:text-[var(--ai-text)]"
           >
-            <Link to="/projects">
+            <a href="/projects">
               <X className="size-4 sm:mr-1.5" />
               <span className="hidden sm:inline">Classic console</span>
-            </Link>
+            </a>
           </Button>
         </div>
       </header>
@@ -260,7 +263,7 @@ export function AiFirstPrototype() {
               <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <h1 className="truncate text-sm font-medium">
-                    Launch storefront
+                    Launch commerce suite
                   </h1>
                   <span className="rounded-full bg-[rgba(215,255,99,0.09)] px-2 py-0.5 text-[10px] font-medium text-[var(--ai-lime)]">
                     onboarding
@@ -284,15 +287,15 @@ export function AiFirstPrototype() {
             <div className="mx-auto flex max-w-3xl flex-col gap-7 px-4 py-7 sm:px-6 sm:py-9">
               <AssistantMessage>
                 <p className="text-base leading-7 text-[var(--ai-text)]">
-                  Welcome to Temps. Tell me what you want to ship—I’ll inspect
-                  the repository, propose a plan, and stop before anything
-                  changes.
+                  Welcome to Temps. Describe the whole system you want to
+                  ship—I’ll map its repositories, projects, and integrations,
+                  then stop before anything changes.
                 </p>
                 <div className="mt-4 flex flex-wrap gap-2">
                   {[
-                    'Deploy a Git repository',
-                    'Import from Vercel',
-                    'Create a database',
+                    'Deploy a multi-repo application',
+                    'Connect private GitHub repos',
+                    'Create shared infrastructure',
                   ].map((suggestion) => (
                     <button
                       key={suggestion}
@@ -307,16 +310,17 @@ export function AiFirstPrototype() {
               </AssistantMessage>
 
               <UserMessage>
-                Deploy the storefront repository from our connected Git
-                provider. Use the main branch, add Postgres, and make previews
-                for pull requests.
+                Launch our commerce suite. It has three private GitHub repos: a
+                Next.js storefront, a Go payments API, and a fulfillment worker.
+                Add Postgres, Stripe, email, and pull-request previews.
               </UserMessage>
 
-              <AssistantMessage label="Inspected repository · 4.8s">
+              <AssistantMessage label="Inspected 3 private repositories · 7.2s">
                 <p className="leading-6">
-                  I found a Next.js app and generated a production-safe plan.
-                  Two values are missing; I’ll collect them outside this chat so
-                  neither I nor the transcript can read them.
+                  I mapped the repositories into three Temps projects inside one
+                  application stack. GitHub access stays in the connected GitHub
+                  App; two integration values are missing, so I’ll collect them
+                  outside this chat.
                 </p>
                 <DeploymentPlan
                   phase={phase}
@@ -350,11 +354,12 @@ export function AiFirstPrototype() {
                       </div>
                       <div>
                         <p className="font-medium text-[var(--ai-text)]">
-                          Storefront is live
+                          Commerce suite is live
                         </p>
                         <p className="mt-1 text-sm leading-6 text-[var(--ai-muted)]">
-                          Health checks passed, Postgres is attached, and pull
-                          request previews are enabled.
+                          All three projects are healthy, Stripe webhooks are
+                          verified, Postgres is attached, and previews are
+                          enabled for every repository.
                         </p>
                         <div className="mt-3 flex flex-wrap gap-2">
                           <button className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--ai-lime)] px-3 py-1.5 text-xs font-semibold text-[var(--ai-lime-ink)]">
@@ -518,7 +523,16 @@ function ConversationRail({
         </p>
         <div className="mt-2 space-y-1">
           <ContextLink icon={Server} label="local instance" detail="healthy" />
-          <ContextLink icon={GitBranch} label="storefront" detail="main" />
+          <ContextLink
+            icon={GitBranch}
+            label="3 private repos"
+            detail="GitHub"
+          />
+          <ContextLink
+            icon={Network}
+            label="commerce suite"
+            detail="3 projects"
+          />
           <ContextLink icon={ShieldCheck} label="Guarded mode" detail="on" />
         </div>
       </div>
@@ -616,7 +630,7 @@ function DeploymentPlan({
         <div className="flex items-center gap-2">
           <Wand2 className="size-3.5 text-[var(--ai-lime)]" />
           <span className="text-xs font-medium text-[var(--ai-text)]">
-            Generated deployment plan
+            Generated application plan
           </span>
         </div>
         <span className="text-[10px] text-[var(--ai-muted)]">
@@ -625,9 +639,13 @@ function DeploymentPlan({
       </div>
 
       <div className="grid gap-px bg-[var(--ai-line-soft)] sm:grid-cols-2">
-        <PlanDatum icon={GitBranch} label="Source" value="storefront · main" />
-        <PlanDatum icon={Code2} label="Detected" value="Next.js · Node 22" />
-        <PlanDatum icon={Database} label="Data" value="Postgres 17 · 1 GB" />
+        <PlanDatum icon={GitBranch} label="Source" value="3 private repos" />
+        <PlanDatum
+          icon={Code2}
+          label="Detected"
+          value="Next.js · Go · worker"
+        />
+        <PlanDatum icon={Database} label="Data" value="Shared Postgres 17" />
         <PlanDatum
           icon={Network}
           label="Delivery"
@@ -636,13 +654,42 @@ function DeploymentPlan({
       </div>
 
       <div className="border-t border-[var(--ai-line-soft)] px-4 py-3">
+        <div className="mb-2 flex items-center justify-between">
+          <p className="text-[9px] font-medium uppercase tracking-[0.14em] text-[var(--ai-muted)]">
+            Projects in this application
+          </p>
+          <span className="inline-flex items-center gap-1 text-[9px] text-[var(--ai-muted)]">
+            <Lock className="size-2.5" /> private via GitHub App
+          </span>
+        </div>
+        <div className="grid gap-1.5 sm:grid-cols-3">
+          <StackProject
+            name="storefront-web"
+            runtime="Next.js"
+            dependsOn="payments-api"
+          />
+          <StackProject
+            name="payments-api"
+            runtime="Go"
+            dependsOn="Postgres + Stripe"
+          />
+          <StackProject
+            name="fulfillment-worker"
+            runtime="Node worker"
+            dependsOn="Postgres + email"
+          />
+        </div>
+      </div>
+
+      <div className="border-t border-[var(--ai-line-soft)] px-4 py-3">
         <div className="flex items-center justify-between gap-4">
           <div>
             <p className="text-xs font-medium text-[var(--ai-text)]">
-              6 proposed changes
+              11 proposed changes across 3 projects
             </p>
             <p className="mt-0.5 text-[10px] text-[var(--ai-muted)]">
-              Create project, database, domain, and preview policy
+              Create projects, shared services, integrations, and preview
+              policies
             </p>
           </div>
           {phase === 'live' ? (
@@ -674,11 +721,12 @@ function DeploymentPlan({
               </AlertDialogTrigger>
               <AlertDialogContent>
                 <AlertDialogHeader>
-                  <AlertDialogTitle>Apply 6 changes?</AlertDialogTitle>
+                  <AlertDialogTitle>Apply 11 changes?</AlertDialogTitle>
                   <AlertDialogDescription>
-                    Temps will create the storefront project, a Postgres
-                    service, production and preview environments, and a domain.
-                    It will not delete or modify existing resources.
+                    Temps will create three linked projects, shared Postgres,
+                    production and preview environments, a domain, and scoped
+                    Stripe and email bindings. It will not delete or modify
+                    existing resources.
                   </AlertDialogDescription>
                 </AlertDialogHeader>
                 <div className="rounded-lg border bg-muted/40 p-3 text-sm">
@@ -687,14 +735,14 @@ function DeploymentPlan({
                     One-time scoped approval
                   </div>
                   <p className="mt-1 text-xs leading-5 text-muted-foreground">
-                    This grants only the six writes shown above. Future changes
-                    need a new approval.
+                    This grants only the eleven writes shown above, across the
+                    three named projects. Future changes need a new approval.
                   </p>
                 </div>
                 <AlertDialogFooter>
                   <AlertDialogCancel>Keep reviewing</AlertDialogCancel>
                   <AlertDialogAction onClick={onApply}>
-                    Apply 6 changes
+                    Apply 11 changes
                   </AlertDialogAction>
                 </AlertDialogFooter>
               </AlertDialogContent>
@@ -724,6 +772,31 @@ function PlanDatum({
         </p>
         <p className="mt-0.5 truncate text-xs text-[var(--ai-text)]">{value}</p>
       </div>
+    </div>
+  )
+}
+
+function StackProject({
+  name,
+  runtime,
+  dependsOn,
+}: {
+  name: string
+  runtime: string
+  dependsOn: string
+}) {
+  return (
+    <div className="rounded-lg border border-[var(--ai-line)] bg-[var(--ai-canvas)] p-2.5">
+      <div className="flex items-center gap-1.5">
+        <Lock className="size-2.5 text-[var(--ai-muted)]" />
+        <p className="truncate font-mono text-[9px] text-[var(--ai-text)]">
+          {name}
+        </p>
+      </div>
+      <p className="mt-1.5 text-[10px] text-[var(--ai-muted)]">{runtime}</p>
+      <p className="mt-0.5 truncate text-[9px] text-[var(--ai-lime)]">
+        → {dependsOn}
+      </p>
     </div>
   )
 }
@@ -779,6 +852,10 @@ function SecretBoundary({
                     <EyeOff className="size-2.5" />
                   )}
                   {requirement.key}
+                  <span className="font-sans text-[8px] opacity-70">
+                    → {requirement.targets.length} project
+                    {requirement.targets.length === 1 ? '' : 's'}
+                  </span>
                 </span>
               )
             })}
@@ -806,7 +883,9 @@ function GeneratedCanvas({
             <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-[var(--ai-muted)]">
               Generated view
             </p>
-            <h2 className="mt-1 text-sm font-medium">Storefront topology</h2>
+            <h2 className="mt-1 text-sm font-medium">
+              Commerce suite topology
+            </h2>
           </div>
           <Zap className="size-4 text-[var(--ai-lime)]" />
         </div>
@@ -814,16 +893,52 @@ function GeneratedCanvas({
 
       <div className="space-y-5 p-4">
         <section className="rounded-xl border border-[var(--ai-line)] bg-[var(--ai-canvas)] p-3">
-          <div className="flex items-center gap-2 text-xs font-medium">
-            <GitBranch className="size-3.5 text-[var(--ai-muted)]" />
-            main branch
+          <div className="flex items-center justify-between gap-2 rounded-lg border border-[var(--ai-line-soft)] bg-[var(--ai-panel)] px-2.5 py-2">
+            <div className="flex items-center gap-2 text-[11px] font-medium">
+              <GitBranch className="size-3.5 text-[var(--ai-lime)]" />
+              GitHub App
+            </div>
+            <span className="inline-flex items-center gap-1 text-[9px] text-[var(--ai-muted)]">
+              <Lock className="size-2.5" /> 3 private repos
+            </span>
           </div>
-          <div className="ml-[7px] h-5 border-l border-dashed border-[var(--ai-line)]" />
-          <TopologyNode icon={Code2} label="Next.js web" detail="port 3000" />
-          <div className="ml-[7px] h-5 border-l border-dashed border-[var(--ai-line)]" />
+          <div className="ml-[14px] h-4 border-l border-dashed border-[var(--ai-line)]" />
+          <div className="space-y-1.5">
+            <TopologyProject
+              name="storefront-web"
+              runtime="Next.js · public edge"
+              dependency="calls payments-api"
+            />
+            <TopologyProject
+              name="payments-api"
+              runtime="Go · private service"
+              dependency="Postgres + Stripe"
+            />
+            <TopologyProject
+              name="fulfillment-worker"
+              runtime="Node · background worker"
+              dependency="Postgres + email"
+            />
+          </div>
+          <div className="ml-[14px] h-4 border-l border-dashed border-[var(--ai-line)]" />
           <div className="grid grid-cols-2 gap-2">
-            <TopologyNode icon={Database} label="Postgres" detail="managed" />
-            <TopologyNode icon={Globe2} label="Domain" detail="automatic TLS" />
+            <TopologyNode
+              icon={Database}
+              label="Postgres"
+              detail="shared data"
+            />
+            <TopologyNode
+              icon={CreditCard}
+              label="Stripe"
+              detail="payments-api"
+            />
+            <div className="col-span-2">
+              <TopologyNode
+                icon={Globe2}
+                label="store.example.com"
+                detail="storefront-web · automatic TLS"
+              />
+            </div>
           </div>
         </section>
 
@@ -849,17 +964,17 @@ function GeneratedCanvas({
           </div>
           <div className="space-y-1.5">
             <ExecutionRow
-              label="Create project"
+              label="Create 3 linked projects"
               done={phase === 'live' || applyStep >= 1}
               active={phase === 'applying' && applyStep === 0}
             />
             <ExecutionRow
-              label="Provision Postgres"
+              label="Bind shared services"
               done={phase === 'live' || applyStep >= 2}
               active={phase === 'applying' && applyStep === 1}
             />
             <ExecutionRow
-              label="Deploy and verify"
+              label="Deploy all and verify"
               done={phase === 'live'}
               active={phase === 'applying' && applyStep === 2}
             />
@@ -872,8 +987,12 @@ function GeneratedCanvas({
             <h3 className="text-xs font-medium">AI access policy</h3>
           </div>
           <div className="mt-3 space-y-2.5">
-            <PolicyRow label="Read repository metadata" value="Allowed" />
+            <PolicyRow
+              label="Read private repo metadata"
+              value="Via GitHub App"
+            />
             <PolicyRow label="Create resources" value="Ask each time" />
+            <PolicyRow label="Read GitHub access token" value="Never" danger />
             <PolicyRow label="Read secret values" value="Never" danger />
             <PolicyRow label="Delete resources" value="Denied" danger />
           </div>
@@ -887,13 +1006,15 @@ function GeneratedCanvas({
             <EyeOff className="size-3.5 text-[var(--ai-muted)]" />
           </div>
           <div className="space-y-1.5 rounded-xl border border-[var(--ai-line)] bg-[var(--ai-canvas)] p-3 font-mono text-[9px] leading-5 text-[var(--ai-muted)]">
-            <p>project.name: storefront</p>
-            <p>runtime.framework: nextjs</p>
+            <p>stack.name: commerce-suite</p>
+            <p>projects: [web, payments-api, worker]</p>
+            <p>repositories.auth: brokered_github_app</p>
             <p>approval.mode: per_action</p>
             {secretReferences.length > 0 ? (
               secretReferences.map((secret) => (
                 <p key={secret.key} className="truncate text-[var(--ai-lime)]">
-                  {secret.key}: {secret.reference}
+                  {secret.key} → [{secret.targets.join(',')}]:{' '}
+                  {secret.reference}
                 </p>
               ))
             ) : (
@@ -903,6 +1024,36 @@ function GeneratedCanvas({
         </section>
       </div>
     </aside>
+  )
+}
+
+function TopologyProject({
+  name,
+  runtime,
+  dependency,
+}: {
+  name: string
+  runtime: string
+  dependency: string
+}) {
+  return (
+    <div className="flex items-center gap-2.5 rounded-lg border border-[var(--ai-line)] bg-[var(--ai-panel)] p-2.5">
+      <div className="flex size-7 shrink-0 items-center justify-center rounded-md bg-[rgba(215,255,99,0.08)] text-[var(--ai-lime)]">
+        <Code2 className="size-3.5" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-1.5">
+          <p className="truncate font-mono text-[10px] font-medium">{name}</p>
+          <Lock className="size-2.5 shrink-0 text-[var(--ai-muted)]" />
+        </div>
+        <p className="mt-0.5 truncate text-[9px] text-[var(--ai-muted)]">
+          {runtime}
+        </p>
+      </div>
+      <span className="max-w-20 text-right text-[8px] leading-3 text-[var(--ai-lime)]">
+        {dependency}
+      </span>
+    </div>
   )
 }
 
@@ -982,7 +1133,11 @@ function SecureSecretDialog({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  requirements: ReadonlyArray<{ key: string; description: string }>
+  requirements: ReadonlyArray<{
+    key: string
+    description: string
+    targets: readonly string[]
+  }>
   onStore: (drafts: SecretDraft[]) => void
 }) {
   const submit = (event: FormEvent<HTMLFormElement>) => {
@@ -993,6 +1148,7 @@ function SecureSecretDialog({
       key: requirement.key,
       value: String(data.get(requirement.key) ?? ''),
       scope: 'production' as const,
+      targets: [...requirement.targets],
     }))
 
     onStore(drafts)
@@ -1009,9 +1165,9 @@ function SecureSecretDialog({
           </div>
           <DialogTitle>Secure secret broker</DialogTitle>
           <DialogDescription>
-            Values are encrypted directly into the project vault. They are not
-            added to the conversation, model context, browser history, or audit
-            log payloads.
+            Values are encrypted directly into the application vault and bound
+            only to the selected projects. They are not added to the
+            conversation, model context, browser history, or audit log payloads.
           </DialogDescription>
         </DialogHeader>
 
@@ -1055,6 +1211,10 @@ function SecureSecretDialog({
                 autoComplete="new-password"
                 className="font-mono"
               />
+              <p className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
+                <Network className="size-3" />
+                Bound to {requirement.targets.join(', ')}
+              </p>
             </div>
           ))}
 

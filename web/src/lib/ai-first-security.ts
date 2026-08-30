@@ -5,12 +5,14 @@ export interface SecretDraft {
   key: string
   value: string
   scope: 'production' | 'preview' | 'all'
+  targets: string[]
 }
 
 export interface SecretReference {
   key: string
   reference: string
   scope: SecretDraft['scope']
+  targets: string[]
   status: 'stored'
 }
 
@@ -43,15 +45,16 @@ function normalizeSecretKey(key: string): string {
  * the model. Values are intentionally excluded from the returned shape.
  */
 export function buildSecretReferencePayload(
-  projectSlug: string,
+  stackSlug: string,
   drafts: SecretDraft[]
 ): SecretReference[] {
   return drafts.map((draft) => {
     const key = normalizeSecretKey(draft.key)
     return {
       key,
-      reference: `secret://projects/${projectSlug}/${draft.scope}/${key}`,
+      reference: `secret://stacks/${stackSlug}/${draft.scope}/${key}`,
       scope: draft.scope,
+      targets: [...draft.targets],
       status: 'stored',
     }
   })

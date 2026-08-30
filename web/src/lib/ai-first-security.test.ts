@@ -29,14 +29,16 @@ describe('AI-first secret boundary', () => {
         key: 'stripe-secret-key',
         value: plaintext,
         scope: 'production',
+        targets: ['payments-api'],
       },
     ])
 
     expect(payload).toEqual([
       {
         key: 'STRIPE_SECRET_KEY',
-        reference: 'secret://projects/northstar/production/STRIPE_SECRET_KEY',
+        reference: 'secret://stacks/northstar/production/STRIPE_SECRET_KEY',
         scope: 'production',
+        targets: ['payments-api'],
         status: 'stored',
       },
     ])
