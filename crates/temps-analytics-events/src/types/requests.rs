@@ -188,6 +188,16 @@ pub struct EventMetricsPayload {
     pub page_title: Option<String>,
     /// Referrer URL (falls back to Referer header if not provided)
     pub referrer: Option<String>,
+    /// Client-generated visitor id, used only when the request carries no
+    /// Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+    /// an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+    /// Accepts the SDK's `visitorId` key too, since the shared SDK helper that
+    /// generates this value sends camelCase for every ingest endpoint.
+    #[serde(default, alias = "visitorId")]
+    pub visitor_id: Option<String>,
+    /// Client-generated session id fallback (see `visitor_id`).
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
     // Performance metrics (web vitals) - optional
     /// Time to First Byte (milliseconds)
     pub ttfb: Option<f32>,

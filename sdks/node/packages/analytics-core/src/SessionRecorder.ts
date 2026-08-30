@@ -4,6 +4,7 @@
 import { record, type eventWithTime } from "rrweb";
 import { pack } from "@rrweb/packer";
 import { SESSION_RECORDER_ENDPOINT, DEFAULT_BASE_PATH, DEFAULT_EXCLUDED_PATHS } from "./constants";
+import { getOrCreateVisitorId } from "./identity";
 import type { SessionRecordingConfig } from "./types";
 
 export interface SessionRecorderOptions extends SessionRecordingConfig {
@@ -57,18 +58,6 @@ function generateBatchId(): string {
   return randomId("batch");
 }
 
-function generateVisitorId(): string {
-  if (typeof localStorage !== "undefined") {
-    let visitorId = localStorage.getItem("temps_visitor_id");
-    if (!visitorId) {
-      visitorId = `visitor_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
-      localStorage.setItem("temps_visitor_id", visitorId);
-    }
-    return visitorId;
-  }
-  return `visitor_${Date.now()}_${Math.random().toString(36).substring(2, 11)}`;
-}
-
 function matchesAnyPath(currentPath: string, paths: string[]): boolean {
   return paths.some((path) => {
     const regex = new RegExp(`^${path.replace(/\*/g, ".*")}$`);
@@ -81,7 +70,7 @@ function getSessionMetadata(): Record<string, unknown> {
   const screen = window.screen || ({} as Screen);
   const nav = window.navigator || ({} as Navigator);
   return {
-    visitorId: generateVisitorId(),
+    visitorId: getOrCreateVisitorId(),
     userAgent: nav.userAgent,
     language: nav.language,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,

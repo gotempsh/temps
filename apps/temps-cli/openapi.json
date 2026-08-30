@@ -15855,6 +15855,13 @@
               "null"
             ]
           },
+          "session_id": {
+            "description": "Client-generated session id fallback (see `visitor_id`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ttfb": {
             "description": "Time to First Byte (milliseconds)",
             "format": "float",
@@ -15876,6 +15883,13 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "visitor_id": {
+            "description": "Client-generated visitor id, used only when the request carries no\nTemps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as\nan analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).\nAccepts the SDK's `visitorId` key too, since the shared SDK helper that\ngenerates this value sends camelCase for every ingest endpoint.",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -37143,6 +37157,13 @@
               "integer",
               "null"
             ]
+          },
+          "visitorId": {
+            "description": "Client-generated visitor id, used only when the request carries no\nTemps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as\nan analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).\nThe SDK already sends this today via `getSessionMetadata()`.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -39162,6 +39183,13 @@
               "null"
             ]
           },
+          "sessionId": {
+            "description": "Client-generated session id fallback (see `visitor_id`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ttfb": {
             "description": "Time to First Byte (milliseconds)",
             "format": "float",
@@ -39183,6 +39211,13 @@
             "format": "int32",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "visitorId": {
+            "description": "Client-generated visitor id, used only when the request carries no\nTemps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as\nan analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).",
+            "type": [
+              "string",
               "null"
             ]
           }

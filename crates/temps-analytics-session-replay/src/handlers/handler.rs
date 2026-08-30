@@ -204,6 +204,12 @@ pub struct AddEventsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionReplayInitRequest {
     pub session_id: String,
+    /// Client-generated visitor id, used only when the request carries no
+    /// Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+    /// an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+    /// The SDK already sends this today via `getSessionMetadata()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visitor_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -771,6 +777,19 @@ pub async fn add_events(
     }
 }
 
+/// Resolve a visitor identity, preferring the Temps-issued, encrypted cookie
+/// (tamper-evident) over the SDK's client-generated fallback. The fallback
+/// only exists for setups where Temps never serves this page's HTML and so
+/// never gets a chance to issue its own cookie (gotempsh/temps#848); an
+/// oversized or empty client value is treated as absent rather than stored,
+/// since it can't have come from the real identity SDK helper.
+fn resolve_client_identity(
+    cookie: Option<String>,
+    payload_value: Option<String>,
+) -> Option<String> {
+    cookie.or_else(|| payload_value.filter(|id| !id.is_empty() && id.len() <= 128))
+}
+
 /// Initialize session replay with metadata
 #[utoipa::path(
     post,
@@ -793,11 +812,20 @@ pub async fn init_session_replay(
         request.session_id
     );
 
-    let visitor_id = metadata.visitor_id_cookie.ok_or_else(|| {
-        ErrorBuilder::new(StatusCode::BAD_REQUEST)
-            .title("Visitor ID is required")
-            .build()
-    })?;
+    // Only reject the request if the client sent neither a cookie nor a
+    // fallback id, which means it's an SDK version too old to generate one.
+    let visitor_id =
+        resolve_client_identity(metadata.visitor_id_cookie, request.visitor_id.clone())
+            .ok_or_else(|| {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Visitor ID is required")
+                    .detail(
+                        "No _temps_visitor_id cookie and no visitorId in the request body. \
+                     Update the Temps analytics SDK to a version that sends a \
+                     client-generated visitorId fallback.",
+                    )
+                    .build()
+            })?;
 
     // Resolve project, environment, and deployment from route table
     let (project_id, environment_id, deployment_id) =
@@ -1001,6 +1029,41 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
 mod tests {
     use super::*;
     use crate::services::service::VisitorInfo;
+
+    #[test]
+    fn test_resolve_client_identity_prefers_cookie_over_payload() {
+        assert_eq!(
+            resolve_client_identity(
+                Some("cookie-id".to_string()),
+                Some("payload-id".to_string())
+            ),
+            Some("cookie-id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_identity_falls_back_to_payload_when_no_cookie() {
+        assert_eq!(
+            resolve_client_identity(None, Some("payload-id".to_string())),
+            Some("payload-id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_identity_none_when_both_absent() {
+        assert_eq!(resolve_client_identity(None, None), None);
+    }
+
+    #[test]
+    fn test_resolve_client_identity_rejects_empty_payload_value() {
+        assert_eq!(resolve_client_identity(None, Some(String::new())), None);
+    }
+
+    #[test]
+    fn test_resolve_client_identity_rejects_oversized_payload_value() {
+        let oversized = "x".repeat(129);
+        assert_eq!(resolve_client_identity(None, Some(oversized)), None);
+    }
 
     #[tokio::test]
     async fn test_session_replay_dto_conversion() {

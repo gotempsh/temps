@@ -180,6 +180,12 @@ pub struct SpeedMetricsPayload {
     pub pathname: Option<String>,
     /// Query string
     pub query: Option<String>,
+    /// Client-generated visitor id, used only when the request carries no
+    /// Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+    /// an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+    pub visitor_id: Option<String>,
+    /// Client-generated session id fallback (see `visitor_id`).
+    pub session_id: Option<String>,
 }
 
 /// Update speed metrics payload for late-loading metrics
@@ -497,6 +503,19 @@ async fn has_performance_metrics(
     }
 }
 
+/// Resolve a visitor/session identity, preferring the Temps-issued, encrypted
+/// cookie (tamper-evident) over the SDK's client-generated fallback. The
+/// fallback only exists for setups where Temps never serves this page's HTML
+/// and so never gets a chance to issue its own cookie (gotempsh/temps#848);
+/// an oversized or empty client value is treated as absent rather than
+/// stored, since it can't have come from the real identity SDK helper.
+fn resolve_client_identity(
+    cookie: Option<String>,
+    payload_value: Option<String>,
+) -> Option<String> {
+    cookie.or_else(|| payload_value.filter(|id| !id.is_empty() && id.len() <= 128))
+}
+
 /// Record performance metrics from client
 #[utoipa::path(
     tag = "Performance",
@@ -607,14 +626,19 @@ pub async fn record_speed_metrics(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let session_id =
+        resolve_client_identity(metadata.session_id_cookie, payload.session_id.clone());
+    let visitor_id =
+        resolve_client_identity(metadata.visitor_id_cookie, payload.visitor_id.clone());
+
     match state
         .performance_service
         .record_performance_metrics(RecordPerformanceMetricsConfig {
             project_id,
             environment_id,
             deployment_id,
-            session_id: metadata.session_id_cookie,
-            visitor_id: metadata.visitor_id_cookie,
+            session_id,
+            visitor_id,
             ip_address_id,
             ttfb: payload.ttfb,
             lcp: payload.lcp,
@@ -766,6 +790,41 @@ mod tests {
     use async_trait::async_trait;
     use temps_auth::Role;
     use temps_core::ProjectAccessChecker;
+
+    #[test]
+    fn test_resolve_client_identity_prefers_cookie_over_payload() {
+        assert_eq!(
+            resolve_client_identity(
+                Some("cookie-id".to_string()),
+                Some("payload-id".to_string())
+            ),
+            Some("cookie-id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_identity_falls_back_to_payload_when_no_cookie() {
+        assert_eq!(
+            resolve_client_identity(None, Some("payload-id".to_string())),
+            Some("payload-id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_identity_none_when_both_absent() {
+        assert_eq!(resolve_client_identity(None, None), None);
+    }
+
+    #[test]
+    fn test_resolve_client_identity_rejects_empty_payload_value() {
+        assert_eq!(resolve_client_identity(None, Some(String::new())), None);
+    }
+
+    #[test]
+    fn test_resolve_client_identity_rejects_oversized_payload_value() {
+        let oversized = "x".repeat(129);
+        assert_eq!(resolve_client_identity(None, Some(oversized)), None);
+    }
 
     fn test_user_auth(role: Role) -> AuthContext {
         let user = temps_entities::users::Model {

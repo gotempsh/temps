@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { getOrCreateSessionId, getOrCreateVisitorId } from "./identity";
 import type { JsonValue } from "./types";
 
 export function getRequestId(): string | undefined {
@@ -42,18 +43,19 @@ export function isTestEnvironment(): boolean {
 }
 
 /**
- * Returns a new object with request_id and session_id attached if available.
- * When they are unavailable, the keys are set to `undefined` so `JSON.stringify`
- * omits them entirely (matching legacy @temps-sdk/react-analytics behavior).
+ * Returns a new object with request_id, visitorId and sessionId attached.
+ * `visitorId`/`sessionId` are the client-generated fallback identity (see
+ * `./identity`) — the server only uses them when it has no Temps-issued
+ * `_temps_visitor_id`/`_temps_sid` cookie of its own to prefer. When a value
+ * is unavailable, the key is set to `undefined` so `JSON.stringify` omits it
+ * entirely (matching legacy @temps-sdk/react-analytics behavior).
  */
 function enrich(data: Record<string, JsonValue>): Record<string, JsonValue> {
   const enriched = {
     ...data,
     request_id: getRequestId(),
-    session_id:
-      typeof localStorage !== "undefined"
-        ? localStorage.getItem("session_id") || undefined
-        : undefined,
+    visitorId: getOrCreateVisitorId(),
+    sessionId: getOrCreateSessionId(),
   } as Record<string, JsonValue>;
   return enriched;
 }

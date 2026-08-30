@@ -7544,11 +7544,23 @@ export type EventMetricsPayload = {
     screen_height?: number | null;
     screen_width?: number | null;
     /**
+     * Client-generated session id fallback (see `visitor_id`).
+     */
+    session_id?: string | null;
+    /**
      * Time to First Byte (milliseconds)
      */
     ttfb?: number | null;
     viewport_height?: number | null;
     viewport_width?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     * Accepts the SDK's `visitorId` key too, since the shared SDK helper that
+     * generates this value sends camelCase for every ingest endpoint.
+     */
+    visitor_id?: string | null;
 };
 
 /**
@@ -17079,6 +17091,13 @@ export type SessionReplayInitRequest = {
     userAgent?: string | null;
     viewportHeight?: number | null;
     viewportWidth?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     * The SDK already sends this today via `getSessionMetadata()`.
+     */
+    visitorId?: string | null;
 };
 
 export type SessionReplayInitResponse = {
@@ -17983,6 +18002,10 @@ export type SpeedMetricsPayload = {
      */
     screenWidth?: number | null;
     /**
+     * Client-generated session id fallback (see `visitor_id`).
+     */
+    sessionId?: string | null;
+    /**
      * Time to First Byte (milliseconds)
      */
     ttfb?: number | null;
@@ -17994,6 +18017,12 @@ export type SpeedMetricsPayload = {
      * Viewport width in pixels
      */
     viewportWidth?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     */
+    visitorId?: string | null;
 };
 
 /**

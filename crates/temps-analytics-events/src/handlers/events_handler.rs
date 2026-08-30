@@ -700,6 +700,19 @@ fn primary_accept_language(header: &str) -> Option<String> {
     Some(tag.to_ascii_lowercase())
 }
 
+/// Resolve a visitor/session identity, preferring the Temps-issued, encrypted
+/// cookie (tamper-evident) over the SDK's client-generated fallback. The
+/// fallback only exists for setups where Temps never serves this page's HTML
+/// and so never gets a chance to issue its own cookie (gotempsh/temps#848);
+/// an oversized or empty client value is treated as absent rather than
+/// stored, since it can't have come from the real identity SDK helper.
+fn resolve_client_identity(
+    cookie: Option<String>,
+    payload_value: Option<String>,
+) -> Option<String> {
+    cookie.or_else(|| payload_value.filter(|id| !id.is_empty() && id.len() <= 128))
+}
+
 /// Record analytics event
 #[utoipa::path(
     tag = "Metrics",
@@ -850,14 +863,19 @@ pub async fn record_event_metrics(
         None
     };
 
+    let session_id =
+        resolve_client_identity(metadata.session_id_cookie, payload.session_id.clone());
+    let visitor_id =
+        resolve_client_identity(metadata.visitor_id_cookie, payload.visitor_id.clone());
+
     match state
         .events_writer
         .record_event(
             project_id,
             environment_id,
             deployment_id,
-            metadata.session_id_cookie,
-            metadata.visitor_id_cookie,
+            session_id,
+            visitor_id,
             &payload.event_name,
             payload.event_data,
             &payload.request_path,
@@ -1306,6 +1324,41 @@ mod tests {
     use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
     use tower::ServiceExt;
+
+    #[test]
+    fn test_resolve_client_identity_prefers_cookie_over_payload() {
+        assert_eq!(
+            resolve_client_identity(
+                Some("cookie-id".to_string()),
+                Some("payload-id".to_string())
+            ),
+            Some("cookie-id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_identity_falls_back_to_payload_when_no_cookie() {
+        assert_eq!(
+            resolve_client_identity(None, Some("payload-id".to_string())),
+            Some("payload-id".to_string())
+        );
+    }
+
+    #[test]
+    fn test_resolve_client_identity_none_when_both_absent() {
+        assert_eq!(resolve_client_identity(None, None), None);
+    }
+
+    #[test]
+    fn test_resolve_client_identity_rejects_empty_payload_value() {
+        assert_eq!(resolve_client_identity(None, Some(String::new())), None);
+    }
+
+    #[test]
+    fn test_resolve_client_identity_rejects_oversized_payload_value() {
+        let oversized = "x".repeat(129);
+        assert_eq!(resolve_client_identity(None, Some(oversized)), None);
+    }
 
     #[test]
     fn test_primary_accept_language_takes_highest_priority_tag() {
