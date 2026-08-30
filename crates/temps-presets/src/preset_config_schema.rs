@@ -7,7 +7,9 @@
 //! These schemas are used in the API and validated when creating/updating projects.
 
 use serde::{Deserialize, Serialize};
-use temps_entities::preset::{ComposePublicPort, DockerfileVariant, NixpacksProvider};
+use temps_entities::preset::{
+    ComposePublicPort, ComposeTemplateOrigin, DockerfileVariant, NixpacksProvider,
+};
 
 #[cfg(feature = "openapi")]
 use utoipa::ToSchema;
@@ -49,9 +51,18 @@ pub struct DockerComposePresetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_override: Option<String>,
 
+    /// Informational catalog origin captured when a service template creates the project.
+    /// This is not a server-attested audit record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_origin: Option<ComposeTemplateOrigin>,
+
     /// Compose service ports that should be publicly routed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub public_ports: Vec<ComposePublicPort>,
+
+    /// Services granted the limited startup capability profile after explicit approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub relaxed_capability_services: Vec<String>,
 }
 
 /// Configuration for Nixpacks preset
@@ -172,17 +183,20 @@ mod tests {
         let config = DockerComposePresetConfig {
             compose_path: Some("deploy/compose.yml".to_string()),
             compose_override: None,
+            template_origin: None,
             public_ports: vec![ComposePublicPort {
                 service: "web".to_string(),
                 port: 3000,
                 ..Default::default()
             }],
+            relaxed_capability_services: vec!["database".to_string()],
         };
 
         let json = serde_json::to_value(&config).unwrap();
         assert_eq!(json["composePath"], "deploy/compose.yml");
         assert_eq!(json["publicPorts"][0]["service"], "web");
         assert_eq!(json["publicPorts"][0]["port"], 3000);
+        assert_eq!(json["relaxedCapabilityServices"][0], "database");
     }
 
     #[test]

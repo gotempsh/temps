@@ -7,6 +7,9 @@ use super::audit::{
 };
 use utoipa::OpenApi;
 
+use super::service_templates::{
+    get_service_template, list_service_templates, preflight_service_template,
+};
 use super::AppState;
 use axum::Router;
 use axum::{
@@ -79,6 +82,15 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         .route("/templates", get(list_project_templates))
         .route("/templates/tags", get(list_project_template_tags))
         .route("/templates/{slug}", get(get_project_template))
+        // Runtime-synced Docker Compose service catalog
+        .route("/service-templates", get(list_service_templates))
+        // The generated client preserves the nested OpenAPI root slash.
+        .route("/service-templates/", get(list_service_templates))
+        .route("/service-templates/{slug}", get(get_service_template))
+        .route(
+            "/service-templates/{slug}/preflight",
+            post(preflight_service_template),
+        )
         // Pipeline trigger route
         .route(
             "/projects/{id}/trigger-pipeline",
@@ -299,7 +311,8 @@ async fn authorize_storage_service_scopes(
         (name = "Templates", description = "Project template endpoints")
     ),
     nest(
-        (path = "/projects", api = super::custom_domains::CustomDomainsApiDoc)
+        (path = "/projects", api = super::custom_domains::CustomDomainsApiDoc),
+        (path = "/service-templates", api = super::service_templates::ServiceTemplatesApiDoc)
     )
 )]
 pub struct ApiDoc;

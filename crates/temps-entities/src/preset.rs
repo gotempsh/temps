@@ -868,6 +868,22 @@ pub struct DockerfileConfig {
     pub target: Option<String>,
 }
 
+/// Informational catalog origin captured from the install request.
+///
+/// The server preserves it after creation, but it is not a cryptographic
+/// attestation: API clients can supply project configuration directly.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ComposeTemplateOrigin {
+    pub provider: String,
+    pub slug: String,
+    pub source_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_revision: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_last_updated_at: Option<String>,
+}
+
 /// Docker Compose preset configuration
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema, Default)]
 #[serde(rename_all = "camelCase")]
@@ -880,6 +896,9 @@ pub struct DockerComposeConfig {
     /// Use to override ports, volumes, environment, commands, etc.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_override: Option<String>,
+    /// Informational catalog source copied with the project for future diffing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_origin: Option<ComposeTemplateOrigin>,
     /// Ports to expose publicly through the proxy.
     /// Each entry specifies a service name and container port that gets a public subdomain.
     /// All other ports remain private (accessible only via host-mapped ports).

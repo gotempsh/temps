@@ -10,6 +10,7 @@ use utoipa::ToSchema;
 
 use crate::services::custom_domains::CustomDomainService;
 use crate::services::project::ProjectService;
+use crate::services::service_templates::ServiceTemplateCatalog;
 use crate::services::types::{CreateProjectEnvVar, ProjectError};
 use http::StatusCode;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ pub struct AppState {
     pub custom_domain_service: Arc<CustomDomainService>,
     pub audit_service: Arc<dyn AuditLogger>,
     pub template_service: Arc<TemplateService>,
+    pub service_template_catalog: Arc<ServiceTemplateCatalog>,
     pub project_archive_cleaner: Arc<dyn temps_core::ProjectArchiveCleaner>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker enforcing team-based project access for human sessions.

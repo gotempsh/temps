@@ -3028,6 +3028,17 @@ export type ComposeServicePreviewResponse = {
 };
 
 /**
+ * Immutable catalog provenance captured when a Compose service template is installed.
+ */
+export type ComposeTemplateOrigin = {
+    provider: string;
+    slug: string;
+    sourceRevision?: string | null;
+    sourceUrl: string;
+    templateLastUpdatedAt?: string | null;
+};
+
+/**
  * Per-upstream concurrent-connection limiting. Protects the proxy's own
  * connection/file-descriptor budget from a single slow or malicious
  * customer upstream — independent of the request/idle timeouts in
@@ -6344,6 +6355,11 @@ export type DockerComposePresetConfig = {
      * Compose service ports that should be publicly routed.
      */
     publicPorts?: Array<ComposePublicPort>;
+    /**
+     * Services granted the limited startup capability profile after explicit approval.
+     */
+    relaxedCapabilityServices?: Array<string>;
+    templateOrigin?: null | ComposeTemplateOrigin;
 };
 
 export type DockerRegistrySettings = {
@@ -10479,6 +10495,46 @@ export type ListSecretsResponse = {
     total: number;
 };
 
+export type ListServiceTemplatesQuery = {
+    /**
+     * Exact case-insensitive category filter.
+     */
+    category?: string | null;
+    /**
+     * One-based page number. Defaults to 1.
+     */
+    page?: number | null;
+    /**
+     * Results per page. Defaults to 24 and is capped at 100.
+     */
+    per_page?: number | null;
+    /**
+     * Case-insensitive search across name, description, category, and tags.
+     */
+    search?: string | null;
+};
+
+export type ListServiceTemplatesResponse = {
+    catalog_fetched_at: string;
+    /**
+     * Total entries in the upstream catalog before filters are applied.
+     */
+    catalog_total: number;
+    categories: Array<string>;
+    compatibility: ServiceTemplateCompatibilitySummaryResponse;
+    page: number;
+    per_page: number;
+    source_repository_url: string;
+    source_revision?: string | null;
+    source_url: string;
+    templates: Array<ServiceTemplateSummaryResponse>;
+    /**
+     * Total entries matching the current search and category filters.
+     */
+    total: number;
+    total_pages: number;
+};
+
 /**
  * Concrete list wrapper for skill definitions (utoipa requires non-generic types).
  */
@@ -13387,6 +13443,27 @@ export type PostgresWalHealth = {
      * Computed warnings, ordered by severity (critical first).
      */
     warnings: Array<WalWarning>;
+};
+
+export type PreflightServiceTemplateRequest = {
+    /**
+     * Services for which the user explicitly approved limited startup capabilities.
+     */
+    approved_capability_services?: Array<string>;
+    /**
+     * Final environment values the project would persist. Values are never returned.
+     */
+    variables?: {
+        [key: string]: string;
+    };
+};
+
+export type PreflightServiceTemplateResponse = {
+    architecture: string;
+    compose_validated: boolean;
+    errors: Array<string>;
+    ready: boolean;
+    warnings: Array<string>;
 };
 
 /**
@@ -17175,6 +17252,81 @@ export type ServiceStatsReport = {
     members: Array<ContainerStatsSample>;
     service_id: number;
     topology: string;
+};
+
+export type ServiceTemplateCapabilityRequirementResponse = {
+    capability: string;
+    reason: string;
+    service: string;
+};
+
+export type ServiceTemplateCompatibilitySummaryResponse = {
+    blocked: number;
+    elevated: number;
+    standard: number;
+};
+
+export type ServiceTemplateDetailResponse = ServiceTemplateSummaryResponse & {
+    capability_requirements: Array<ServiceTemplateCapabilityRequirementResponse>;
+    catalog_fetched_at: string;
+    /**
+     * Normalized Compose copied into the new project when installed.
+     */
+    compose: string;
+    routes: Array<ServiceTemplateRouteResponse>;
+    source_repository_url: string;
+    source_revision?: string | null;
+    source_url: string;
+    transformations: Array<ServiceTemplateTransformationResponse>;
+    variables: Array<ServiceTemplateVariableResponse>;
+};
+
+export type ServiceTemplateRouteResponse = {
+    port: number;
+    service: string;
+    variable_names: Array<string>;
+};
+
+export type ServiceTemplateSummaryResponse = {
+    amd_only: boolean;
+    arm_only: boolean;
+    category: string;
+    compatibility_issues: Array<string>;
+    /**
+     * `standard`, `elevated`, or `blocked`.
+     */
+    compatibility_tier: string;
+    description?: string | null;
+    documentation_url?: string | null;
+    installable: boolean;
+    logo_url?: string | null;
+    name: string;
+    port?: number | null;
+    service_count: number;
+    slug: string;
+    tags: Array<string>;
+    /**
+     * Upstream timestamp as supplied by Coolify.
+     */
+    template_last_updated_at?: string | null;
+    warnings: Array<string>;
+};
+
+export type ServiceTemplateTransformationResponse = {
+    code: string;
+    description: string;
+};
+
+export type ServiceTemplateVariableResponse = {
+    default_value?: string | null;
+    is_secret: boolean;
+    /**
+     * Generator/input type used by the installer.
+     */
+    kind: string;
+    name: string;
+    required: boolean;
+    route_service?: string | null;
 };
 
 export type ServiceTypeInfo = {
@@ -52501,6 +52653,142 @@ export type RevenueListProvidersResponses = {
 };
 
 export type RevenueListProvidersResponse = RevenueListProvidersResponses[keyof RevenueListProvidersResponses];
+
+export type ListServiceTemplatesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Search name, description, category, and tags
+         */
+        search?: string;
+        /**
+         * Filter by category
+         */
+        category?: string;
+        /**
+         * One-based page number
+         */
+        page?: number;
+        /**
+         * Results per page, maximum 100
+         */
+        per_page?: number;
+    };
+    url: '/service-templates/';
+};
+
+export type ListServiceTemplatesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Upstream catalog unavailable
+     */
+    502: unknown;
+};
+
+export type ListServiceTemplatesResponses = {
+    /**
+     * Paginated service template catalog
+     */
+    200: ListServiceTemplatesResponse;
+};
+
+export type ListServiceTemplatesResponse2 = ListServiceTemplatesResponses[keyof ListServiceTemplatesResponses];
+
+export type GetServiceTemplateData = {
+    body?: never;
+    path: {
+        /**
+         * Coolify template slug
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/service-templates/{slug}';
+};
+
+export type GetServiceTemplateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Template not found
+     */
+    404: unknown;
+    /**
+     * Template content is invalid
+     */
+    422: unknown;
+    /**
+     * Upstream catalog unavailable
+     */
+    502: unknown;
+};
+
+export type GetServiceTemplateResponses = {
+    /**
+     * Service template detail and compatibility analysis
+     */
+    200: ServiceTemplateDetailResponse;
+};
+
+export type GetServiceTemplateResponse = GetServiceTemplateResponses[keyof GetServiceTemplateResponses];
+
+export type PreflightServiceTemplateData = {
+    body: PreflightServiceTemplateRequest;
+    path: {
+        /**
+         * Coolify template slug
+         */
+        slug: string;
+    };
+    query?: never;
+    url: '/service-templates/{slug}/preflight';
+};
+
+export type PreflightServiceTemplateErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Template not found
+     */
+    404: unknown;
+    /**
+     * Template content is invalid
+     */
+    422: unknown;
+    /**
+     * Upstream catalog unavailable
+     */
+    502: unknown;
+};
+
+export type PreflightServiceTemplateResponses = {
+    /**
+     * Template preflight result
+     */
+    200: PreflightServiceTemplateResponse;
+};
+
+export type PreflightServiceTemplateResponse2 = PreflightServiceTemplateResponses[keyof PreflightServiceTemplateResponses];
 
 export type GetProjectSessionReplaysData = {
     body?: never;

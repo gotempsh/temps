@@ -6088,6 +6088,38 @@
         ],
         "type": "object"
       },
+      "ComposeTemplateOrigin": {
+        "description": "Immutable catalog provenance captured when a Compose service template is installed.",
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "sourceRevision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sourceUrl": {
+            "type": "string"
+          },
+          "templateLastUpdatedAt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "provider",
+          "slug",
+          "sourceUrl"
+        ],
+        "type": "object"
+      },
       "ConnectionLimitSettings": {
         "description": "Per-upstream concurrent-connection limiting. Protects the proxy's own\nconnection/file-descriptor budget from a single slow or malicious\ncustomer upstream — independent of the request/idle timeouts in\n`RequestTimeoutSettings`, which bound how long a connection may stay\nopen, not how many may exist at once. See issue #646.",
         "properties": {
@@ -13041,6 +13073,24 @@
               "$ref": "#/components/schemas/ComposePublicPort"
             },
             "type": "array"
+          },
+          "relaxedCapabilityServices": {
+            "description": "Services granted the limited startup capability profile after explicit approval.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "templateOrigin": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComposeTemplateOrigin",
+                "description": "Catalog provenance captured when a service template creates the project."
+              }
+            ]
           }
         },
         "type": "object"
@@ -22421,6 +22471,111 @@
         ],
         "type": "object"
       },
+      "ListServiceTemplatesQuery": {
+        "properties": {
+          "category": {
+            "description": "Exact case-insensitive category filter.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "page": {
+            "description": "One-based page number. Defaults to 1.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "per_page": {
+            "description": "Results per page. Defaults to 24 and is capped at 100.",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "search": {
+            "description": "Case-insensitive search across name, description, category, and tags.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ListServiceTemplatesResponse": {
+        "properties": {
+          "catalog_fetched_at": {
+            "type": "string"
+          },
+          "catalog_total": {
+            "description": "Total entries in the upstream catalog before filters are applied.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "categories": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "compatibility": {
+            "$ref": "#/components/schemas/ServiceTemplateCompatibilitySummaryResponse"
+          },
+          "page": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "per_page": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "source_repository_url": {
+            "type": "string"
+          },
+          "source_revision": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "source_url": {
+            "type": "string"
+          },
+          "templates": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceTemplateSummaryResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "description": "Total entries matching the current search and category filters.",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_pages": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "templates",
+          "categories",
+          "catalog_total",
+          "total",
+          "page",
+          "per_page",
+          "total_pages",
+          "catalog_fetched_at",
+          "source_url",
+          "source_repository_url",
+          "compatibility"
+        ],
+        "type": "object"
+      },
       "ListSkillsResponse": {
         "description": "Concrete list wrapper for skill definitions (utoipa requires non-generic types).",
         "properties": {
@@ -29020,6 +29175,61 @@
           "archive_backlog",
           "stale_slots",
           "oldest_wal_age_secs",
+          "warnings"
+        ],
+        "type": "object"
+      },
+      "PreflightServiceTemplateRequest": {
+        "properties": {
+          "approved_capability_services": {
+            "description": "Services for which the user explicitly approved limited startup capabilities.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "variables": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Final environment values the project would persist. Values are never returned.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          }
+        },
+        "type": "object"
+      },
+      "PreflightServiceTemplateResponse": {
+        "properties": {
+          "architecture": {
+            "type": "string"
+          },
+          "compose_validated": {
+            "type": "boolean"
+          },
+          "errors": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ready",
+          "compose_validated",
+          "architecture",
+          "errors",
           "warnings"
         ],
         "type": "object"
@@ -36910,6 +37120,282 @@
           "service_id",
           "topology",
           "members"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateCapabilityRequirementResponse": {
+        "properties": {
+          "capability": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          },
+          "service": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "capability",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateCompatibilitySummaryResponse": {
+        "properties": {
+          "blocked": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "elevated": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "standard": {
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "standard",
+          "elevated",
+          "blocked"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateDetailResponse": {
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/ServiceTemplateSummaryResponse"
+          },
+          {
+            "properties": {
+              "capability_requirements": {
+                "items": {
+                  "$ref": "#/components/schemas/ServiceTemplateCapabilityRequirementResponse"
+                },
+                "type": "array"
+              },
+              "catalog_fetched_at": {
+                "type": "string"
+              },
+              "compose": {
+                "description": "Normalized Compose copied into the new project when installed.",
+                "type": "string"
+              },
+              "routes": {
+                "items": {
+                  "$ref": "#/components/schemas/ServiceTemplateRouteResponse"
+                },
+                "type": "array"
+              },
+              "source_repository_url": {
+                "type": "string"
+              },
+              "source_revision": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "source_url": {
+                "type": "string"
+              },
+              "transformations": {
+                "items": {
+                  "$ref": "#/components/schemas/ServiceTemplateTransformationResponse"
+                },
+                "type": "array"
+              },
+              "variables": {
+                "items": {
+                  "$ref": "#/components/schemas/ServiceTemplateVariableResponse"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "compose",
+              "routes",
+              "variables",
+              "transformations",
+              "capability_requirements",
+              "catalog_fetched_at",
+              "source_url",
+              "source_repository_url"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "ServiceTemplateRouteResponse": {
+        "properties": {
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "service": {
+            "type": "string"
+          },
+          "variable_names": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "service",
+          "port",
+          "variable_names"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateSummaryResponse": {
+        "properties": {
+          "amd_only": {
+            "type": "boolean"
+          },
+          "arm_only": {
+            "type": "boolean"
+          },
+          "category": {
+            "type": "string"
+          },
+          "compatibility_issues": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "compatibility_tier": {
+            "description": "`standard`, `elevated`, or `blocked`.",
+            "type": "string"
+          },
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "documentation_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "installable": {
+            "type": "boolean"
+          },
+          "logo_url": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "port": {
+            "format": "int32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "service_count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "template_last_updated_at": {
+            "description": "Upstream timestamp as supplied by Coolify.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "warnings": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "slug",
+          "name",
+          "category",
+          "tags",
+          "service_count",
+          "installable",
+          "compatibility_tier",
+          "compatibility_issues",
+          "warnings",
+          "amd_only",
+          "arm_only"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateTransformationResponse": {
+        "properties": {
+          "code": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "description"
+        ],
+        "type": "object"
+      },
+      "ServiceTemplateVariableResponse": {
+        "properties": {
+          "default_value": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_secret": {
+            "type": "boolean"
+          },
+          "kind": {
+            "description": "Generator/input type used by the installer.",
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "required": {
+            "type": "boolean"
+          },
+          "route_service": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "kind",
+          "required",
+          "is_secret"
         ],
         "type": "object"
       },
@@ -97033,6 +97519,195 @@
         "x-maturity": "experimental"
       }
     },
+    "/service-templates/": {
+      "get": {
+        "operationId": "list_service_templates",
+        "parameters": [
+          {
+            "description": "Search name, description, category, and tags",
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by category",
+            "in": "query",
+            "name": "category",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "One-based page number",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Results per page, maximum 100",
+            "in": "query",
+            "name": "per_page",
+            "required": false,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListServiceTemplatesResponse"
+                }
+              }
+            },
+            "description": "Paginated service template catalog"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "502": {
+            "description": "Upstream catalog unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Browse Coolify's one-click Docker Compose catalog.",
+        "tags": [
+          "Service Templates"
+        ]
+      }
+    },
+    "/service-templates/{slug}": {
+      "get": {
+        "operationId": "get_service_template",
+        "parameters": [
+          {
+            "description": "Coolify template slug",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ServiceTemplateDetailResponse"
+                }
+              }
+            },
+            "description": "Service template detail and compatibility analysis"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Template not found"
+          },
+          "422": {
+            "description": "Template content is invalid"
+          },
+          "502": {
+            "description": "Upstream catalog unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Inspect a normalized service template before installing it.",
+        "tags": [
+          "Service Templates"
+        ]
+      }
+    },
+    "/service-templates/{slug}/preflight": {
+      "post": {
+        "operationId": "preflight_service_template",
+        "parameters": [
+          {
+            "description": "Coolify template slug",
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PreflightServiceTemplateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PreflightServiceTemplateResponse"
+                }
+              }
+            },
+            "description": "Template preflight result"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Template not found"
+          },
+          "422": {
+            "description": "Template content is invalid"
+          },
+          "502": {
+            "description": "Upstream catalog unavailable"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Validate a fully configured template without creating a project or containers.",
+        "tags": [
+          "Service Templates"
+        ]
+      }
+    },
     "/session-replays": {
       "get": {
         "operationId": "get_project_session_replays",
@@ -103928,6 +104603,10 @@
     {
       "description": "Custom domain management for projects",
       "name": "Custom Domains"
+    },
+    {
+      "description": "Runtime-synced Docker Compose service catalog",
+      "name": "Service Templates"
     },
     {
       "description": "Error tracking data fetching endpoints",

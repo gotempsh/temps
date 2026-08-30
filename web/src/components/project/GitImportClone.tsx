@@ -51,9 +51,11 @@ import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
 import { parsePublicRepositoryUrl } from '@/lib/public-repository'
 import { getPublicRepository } from '@/api/client/sdk.gen'
+import { ServiceTemplateCatalog } from '@/components/service-templates/ServiceTemplateCatalog'
 
 const SOURCE_VALUES: ProjectSource[] = [
   'templates',
+  'services',
   'browse',
   'git-url',
   'manual',
@@ -702,6 +704,8 @@ export function GitImportClone({
           </CardContent>
         </Card>
       )}
+
+      {selectedSource === 'services' && <ServiceTemplateCatalog />}
 
       {selectedSource === 'browse' && connections && connectionCount === 0 && (
         <Card>

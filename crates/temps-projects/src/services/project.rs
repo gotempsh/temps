@@ -277,6 +277,13 @@ fn merge_preset_config(
             if omits("composeOverride") {
                 parsed_cfg.compose_override = existing_cfg.compose_override.clone();
             }
+            // An origin supplied during project creation is informational, not
+            // server-attested provenance. Once present, preserve it across all
+            // PATCHes so ordinary project edits cannot rewrite the install
+            // history shown in the UI.
+            if existing_cfg.template_origin.is_some() {
+                parsed_cfg.template_origin = existing_cfg.template_origin.clone();
+            }
             if omits("publicPorts") {
                 parsed_cfg.public_ports = existing_cfg.public_ports.clone();
             }
@@ -5777,6 +5784,11 @@ mod tests {
         create.preset = "docker-compose".to_string();
         create.preset_config = Some(serde_json::json!({
             "composePath": "compose.yml",
+            "templateOrigin": {
+                "provider": "catalog",
+                "slug": "example-stack",
+                "sourceUrl": "https://example.com/catalog.json"
+            },
             "composeServices": [
                 {"name": "postgres", "image": "postgres:17-alpine", "looksLikeDatabase": true},
                 {"name": "hub", "image": "ghcr.io/getpaseo/hub:latest", "looksLikeDatabase": false}
@@ -5787,12 +5799,20 @@ mod tests {
             .await
             .expect("create docker-compose project");
 
-        // A patch touching only excludedServices must not wipe composePath/composeServices.
+        // A settings patch must not wipe compose fields or rewrite an origin
+        // already captured at project creation.
         let updated = project_service
             .update_project_settings(
                 created.id,
                 UpdateProjectSettingsParams {
-                    preset_config: Some(serde_json::json!({ "excludedServices": ["postgres"] })),
+                    preset_config: Some(serde_json::json!({
+                        "excludedServices": ["postgres"],
+                        "templateOrigin": {
+                            "provider": "forged",
+                            "slug": "different-stack",
+                            "sourceUrl": "https://attacker.invalid/catalog.json"
+                        }
+                    })),
                     ..Default::default()
                 },
             )
@@ -5813,6 +5833,12 @@ mod tests {
                 assert_eq!(cfg.excluded_services, vec!["postgres".to_string()]);
                 assert_eq!(cfg.compose_services.len(), 2);
                 assert_eq!(cfg.compose_services[0].name, "postgres");
+                assert_eq!(
+                    cfg.template_origin
+                        .as_ref()
+                        .map(|origin| origin.slug.as_str()),
+                    Some("example-stack")
+                );
             }
             other => panic!("expected DockerCompose config, got {other:?}"),
         }
