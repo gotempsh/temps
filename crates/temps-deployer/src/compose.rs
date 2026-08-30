@@ -30,6 +30,13 @@ const COMPOSE_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// Interval between `docker compose ps` polls while waiting for readiness.
 const COMPOSE_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Maximum time allowed for `docker compose pull` to complete. Pulls can be
+/// slow on large images or slow registries, but an unbounded pull would stall a
+/// deployment forever. 300 s matches [`COMPOSE_READY_TIMEOUT`] — both bound a
+/// single phase of the deployment that should complete within minutes, not
+/// hours, on any reasonable network.
+const COMPOSE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// How long a single TCP connect attempt against a published port may take
 /// before `port_reachable` gives up and reports the port not yet listening.
 /// Short by design: this runs once per poll interval, not once total, so a
@@ -482,6 +489,25 @@ pub struct ComposePortBinding {
     pub host_port: u16,
     pub container_port: u16,
     pub protocol: String,
+}
+
+/// State produced by [`ComposeExecutor::prepare_and_pull`] and consumed by
+/// [`ComposeExecutor::deploy_prepared`].
+///
+/// Carrying these fields out of `prepare_and_pull` avoids re-computing them in
+/// `deploy_prepared` and keeps the split-phase API type-safe: a caller cannot
+/// pass an arbitrary directory to `deploy_prepared` — it must come from the
+/// same preparation step that wrote the files to disk.
+pub struct PreparedComposeDeploy {
+    /// Resolved working directory (repo checkout when available, otherwise the
+    /// Temps data-dir project directory).
+    pub effective_dir: PathBuf,
+    /// Compose project name (e.g., `"temps-{project_id}-{env_id}"`).
+    pub project_name: String,
+    /// Compose file name relative to `effective_dir`.
+    pub compose_file: String,
+    /// Values to strip from diagnostic messages (secrets, env values, etc.).
+    pub redact_values: Vec<String>,
 }
 
 /// Docker Compose deployment executor.
@@ -939,15 +965,21 @@ impl ComposeExecutor {
         }
     }
 
-    /// Deploy a compose stack: write files, pull images, start containers,
-    /// wait for every service to become ready, then discover and label them.
-    /// Returns one result per service. Fails (rather than reporting a false
-    /// success) if a service never reaches `running`/`healthy` within
-    /// [`COMPOSE_READY_TIMEOUT`].
-    pub async fn deploy(
+    /// Prepare compose files on disk, build images (if required), and pull
+    /// images for `image:`-based services.
+    ///
+    /// This is the first half of a two-phase deploy. It MUST be called while
+    /// the previously-running stack is **still alive** so that image-fetch
+    /// latency falls outside the downtime window. If this step fails, the
+    /// caller MUST NOT call [`Self::teardown_at`] — the old stack is still
+    /// serving traffic and should keep doing so.
+    ///
+    /// On success, returns a [`PreparedComposeDeploy`] that must be passed to
+    /// [`Self::deploy_prepared`] after [`Self::teardown_at`].
+    pub async fn prepare_and_pull(
         &self,
-        request: ComposeDeployRequest,
-    ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
+        request: &ComposeDeployRequest,
+    ) -> Result<PreparedComposeDeploy, ComposeError> {
         let project_dir = self.project_dir(&request.project_name);
         let project_name = request.project_name.clone();
         Self::validate_relative_path(
@@ -971,13 +1003,26 @@ impl ComposeExecutor {
         if let Some(ref compose_override) = request.compose_override {
             self.validate_compose_security_policy("compose override", compose_override)?;
         }
-        let has_build = self.has_build_directives(&request.compose_content);
+
+        // Check for build directives in BOTH the base file and the override.
+        // `compose_pull --ignore-buildable` sees the Compose-CLI-merged config
+        // (base + all override files), so a service that only has `build:` in
+        // the override — not in the base — is still treated as buildable there.
+        // If we skip `compose_build` for such a service (because the base has
+        // no build directive) and `compose_pull` also skips it (because the
+        // merged view shows a `build:` stanza), the service is neither built
+        // nor pulled and `compose_up` fails on a missing or stale local image.
+        let has_build = self.has_build_directives(&request.compose_content)
+            || request
+                .compose_override
+                .as_deref()
+                .is_some_and(|o| self.has_build_directives(o));
 
         // Every value that must never appear in a deployment error, including
         // the secrets this deploy is about to mount: a container that echoes
         // its own secret while crash-looping would otherwise have it captured
         // into the failure diagnostic and persisted on the deployment.
-        let redact_values = collect_redactable_values(&request);
+        let redact_values = collect_redactable_values(request);
 
         // Always use the repo checkout directory when available.
         // Compose files often reference local paths (bind mounts, configs,
@@ -988,12 +1033,13 @@ impl ComposeExecutor {
             .unwrap_or_else(|| project_dir.clone());
 
         // 1. Write compose files + env overrides to disk
-        self.write_compose_files(&effective_dir, &request).await?;
+        self.write_compose_files(&effective_dir, request).await?;
 
         let compose_file = request
             .compose_path
             .as_deref()
-            .unwrap_or("docker-compose.yml");
+            .unwrap_or("docker-compose.yml")
+            .to_string();
 
         // Lexical path validation cannot see repository symlinks. Resolve every
         // host path from the same base directory Docker Compose uses, after the
@@ -1002,14 +1048,14 @@ impl ComposeExecutor {
         // configs/secrets, local-driver binds, and build paths.
         Self::validate_compose_filesystem_confinement(
             &effective_dir,
-            compose_file,
+            &compose_file,
             "compose file",
             &request.compose_content,
         )?;
         if let Some(ref compose_override) = request.compose_override {
             Self::validate_compose_filesystem_confinement(
                 &effective_dir,
-                compose_file,
+                &compose_file,
                 "compose override",
                 compose_override,
             )?;
@@ -1020,7 +1066,7 @@ impl ComposeExecutor {
             self.compose_build(
                 &effective_dir,
                 &project_name,
-                compose_file,
+                &compose_file,
                 &redact_values,
                 &request.build_args,
             )
@@ -1035,8 +1081,35 @@ impl ComposeExecutor {
         // `--ignore-buildable` skips services that only have a `build:` directive
         // (those were already handled above by `compose_build`), so this call is
         // safe regardless of whether the project mixes built and pulled services.
-        self.compose_pull(&effective_dir, &project_name, compose_file, &redact_values)
+        self.compose_pull(&effective_dir, &project_name, &compose_file, &redact_values)
             .await?;
+
+        Ok(PreparedComposeDeploy {
+            effective_dir,
+            project_name,
+            compose_file,
+            redact_values,
+        })
+    }
+
+    /// Complete a deployment after the old stack has been torn down.
+    ///
+    /// This is the second half of a two-phase deploy. It expects a
+    /// [`PreparedComposeDeploy`] produced by a prior call to
+    /// [`Self::prepare_and_pull`] (images are already local at this point),
+    /// creates the shared network if needed, starts the new containers, waits
+    /// for readiness, discovers containers, and applies Temps labels.
+    pub async fn deploy_prepared(
+        &self,
+        prepared: PreparedComposeDeploy,
+        request: &ComposeDeployRequest,
+    ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
+        let PreparedComposeDeploy {
+            effective_dir,
+            project_name,
+            compose_file,
+            redact_values,
+        } = prepared;
 
         // Ensure the shared Temps network exists before `up` attaches every
         // service to it (docker-compose.temps-network.yml, written above) —
@@ -1055,7 +1128,7 @@ impl ComposeExecutor {
         self.compose_up(
             &effective_dir,
             &project_name,
-            compose_file,
+            &compose_file,
             &redact_values,
             &request.relaxed_capability_services,
         )
@@ -1069,7 +1142,7 @@ impl ComposeExecutor {
         self.wait_for_services_ready(
             &effective_dir,
             &project_name,
-            compose_file,
+            &compose_file,
             &redact_values,
             &request.relaxed_capability_services,
             COMPOSE_READY_TIMEOUT,
@@ -1078,7 +1151,7 @@ impl ComposeExecutor {
 
         // 5. Discover running containers
         let containers = self
-            .discover_containers(&effective_dir, &project_name, compose_file)
+            .discover_containers(&effective_dir, &project_name, &compose_file)
             .await?;
 
         // 5b. Apply Temps labels to each container
@@ -1107,6 +1180,25 @@ impl ComposeExecutor {
         );
 
         Ok(containers)
+    }
+
+    /// Deploy a compose stack: write files, pull images, start containers,
+    /// wait for every service to become ready, then discover and label them.
+    /// Returns one result per service. Fails (rather than reporting a false
+    /// success) if a service never reaches `running`/`healthy` within
+    /// [`COMPOSE_READY_TIMEOUT`].
+    ///
+    /// This is a thin wrapper over [`Self::prepare_and_pull`] followed by
+    /// [`Self::deploy_prepared`]. Callers that need to tear down an existing
+    /// stack between the two phases (the common redeploy path) should call
+    /// `prepare_and_pull` and `deploy_prepared` directly so that image-fetch
+    /// latency falls outside the downtime window.
+    pub async fn deploy(
+        &self,
+        request: ComposeDeployRequest,
+    ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
+        let prepared = self.prepare_and_pull(&request).await?;
+        self.deploy_prepared(prepared, &request).await
     }
 
     /// Tear down containers before a redeploy. Preserves volumes (database data,
@@ -3643,7 +3735,15 @@ impl ComposeExecutor {
 
         debug!(project = %project_name, "Running docker compose pull");
 
-        let output = cmd.output().await?;
+        let output = tokio::time::timeout(COMPOSE_PULL_TIMEOUT, cmd.output())
+            .await
+            .map_err(|_| ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "docker compose pull timed out after {} seconds",
+                    COMPOSE_PULL_TIMEOUT.as_secs()
+                ),
+            })??;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -5537,6 +5637,68 @@ networks:
         assert!(executor.has_build_directives(
             "services:\n  web:\n    build:\n      context: .\n      dockerfile: Dockerfile\n"
         ));
+    }
+
+    /// `has_build_directives` must detect a `build:` stanza that appears only
+    /// in the compose override, not in the base file. This is the Bug 2 scenario:
+    /// a user override adds `build:` to a service that only has `image:` in the
+    /// base, making `compose_pull --ignore-buildable` skip that service (because
+    /// the merged view has a build stanza), while the old code skipped
+    /// `compose_build` too (because it only scanned the base file). The service
+    /// ended up neither built nor pulled.
+    #[test]
+    fn test_has_build_in_override_only_is_detected() {
+        let docker = Docker::connect_with_defaults();
+        if docker.is_err() {
+            return;
+        }
+        let executor = ComposeExecutor::new(Arc::new(docker.unwrap()), PathBuf::from("/tmp/test"));
+
+        // Base file has no build directive.
+        let base = "services:\n  web:\n    image: nginx:latest\n";
+        // Override adds a build stanza to the same service.
+        let override_yaml = "services:\n  web:\n    build: ./custom\n";
+
+        // The base alone should NOT look like a build project.
+        assert!(
+            !executor.has_build_directives(base),
+            "base without build: should not be detected as a build project"
+        );
+        // The override alone SHOULD be detected.
+        assert!(
+            executor.has_build_directives(override_yaml),
+            "override with build: should be detected"
+        );
+        // The combined check — as used in prepare_and_pull — must fire when
+        // the override has the directive even if the base does not.
+        let combined =
+            executor.has_build_directives(base) || executor.has_build_directives(override_yaml);
+        assert!(
+            combined,
+            "combined base+override check must detect build: in the override"
+        );
+    }
+
+    /// Verify that the combined base+override check does NOT produce a false
+    /// positive when neither document contains a `build:` directive (e.g. a
+    /// purely `image:`-based stack with an override that only changes env vars).
+    #[test]
+    fn test_no_build_in_base_or_override_is_not_detected() {
+        let docker = Docker::connect_with_defaults();
+        if docker.is_err() {
+            return;
+        }
+        let executor = ComposeExecutor::new(Arc::new(docker.unwrap()), PathBuf::from("/tmp/test"));
+
+        let base = "services:\n  web:\n    image: nginx:latest\n";
+        let override_yaml = "services:\n  web:\n    environment:\n      - FOO=bar\n";
+
+        let combined =
+            executor.has_build_directives(base) || executor.has_build_directives(override_yaml);
+        assert!(
+            !combined,
+            "stack with no build: directives in either document must not be flagged as a build project"
+        );
     }
 
     #[test]
