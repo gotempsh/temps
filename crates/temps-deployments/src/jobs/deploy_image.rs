@@ -948,11 +948,30 @@ impl DeployImageJob {
         &self.target
     }
 
+    /// Record a newly-created container and the deployer that owns it before
+    /// any subsequent fallible operation. Cleanup must never guess which
+    /// Docker daemon owns a container created on a worker node.
+    fn track_container(&self, container_id: String, deployer: Arc<dyn ContainerDeployer>) {
+        // Insert ownership first. This prevents cleanup from observing a
+        // container ID without the node-aware deployer needed to remove it.
+        self.replica_deployers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(container_id.clone(), deployer);
+        self.container_ids
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(container_id);
+    }
+
     /// Remove all containers if they exist (called on timeout/failure/cancellation)
     async fn cleanup_container(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
         // First, abort the background log streaming task if running
         let should_log = {
-            let mut task_handle = self.log_stream_task.lock().unwrap();
+            let mut task_handle = self
+                .log_stream_task
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             if let Some(handle) = task_handle.take() {
                 handle.abort();
                 true
@@ -968,7 +987,10 @@ impl DeployImageJob {
 
         // Then clean up all containers
         let container_ids = {
-            let guard = self.container_ids.lock().unwrap();
+            let guard = self
+                .container_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.clone()
         };
 
@@ -985,7 +1007,10 @@ impl DeployImageJob {
 
                 // Use per-replica deployer if available, otherwise fall back to local
                 let deployer = {
-                    let deployers = self.replica_deployers.lock().unwrap();
+                    let deployers = self
+                        .replica_deployers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     deployers
                         .get(container_id)
                         .cloned()
@@ -1007,8 +1032,27 @@ impl DeployImageJob {
                         format!("✅ Container {} removed successfully", container_id),
                     )
                     .await?;
+                    self.replica_deployers
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(container_id);
                 }
             }
+
+            // Snapshot ownership before locking the ID list. `track_container`
+            // acquires these locks in the opposite phase (ownership, then IDs),
+            // so nesting them here could deadlock a concurrent cancellation.
+            let remaining_container_ids = self
+                .replica_deployers
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .keys()
+                .cloned()
+                .collect::<std::collections::HashSet<_>>();
+            self.container_ids
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .retain(|container_id| remaining_container_ids.contains(container_id));
         }
 
         Ok(())
@@ -1324,11 +1368,6 @@ impl DeployImageJob {
                 .await
             {
                 Ok((container_id, host_port, container_port)) => {
-                    // Track the deployer for this container (used for cleanup)
-                    {
-                        let mut deployers = self.replica_deployers.lock().unwrap();
-                        deployers.insert(container_id.clone(), deployer);
-                    }
                     all_container_ids.push(container_id);
                     all_host_ports.push(host_port);
                     all_node_ids.push(assignment.node_id());
@@ -1645,11 +1684,9 @@ impl DeployImageJob {
                 WorkflowError::JobExecutionFailed(format!("Failed to deploy container: {}", e))
             })?;
 
-        // CRITICAL: Store container_id immediately for cleanup on failure/cancellation
-        {
-            let mut container_ids = self.container_ids.lock().unwrap();
-            container_ids.push(deploy_result.container_id.clone());
-        }
+        // Store both the ID and its owning deployer before status checks,
+        // startup log streaming, health checks, or any other fallible work.
+        self.track_container(deploy_result.container_id.clone(), deployer.clone());
 
         self.log(
             context,
@@ -1749,6 +1786,7 @@ impl DeployImageJob {
         let log_id = self.log_id.clone();
         let log_service = self.log_service.clone();
         let context_for_logs = context.clone();
+        let deployer_for_logs = deployer.clone();
 
         let log_task = tokio::spawn(async move {
             // Helper macro to write logs in the background task
@@ -1768,29 +1806,22 @@ impl DeployImageJob {
                 "📋 Streaming container logs for 15s...".to_string()
             );
 
-            // Connect to Docker
-            let docker = match bollard::Docker::connect_with_local_defaults() {
-                Ok(d) => d,
+            // Ask the selected deployer for logs. For worker assignments this
+            // streams through the worker agent instead of opening the control
+            // plane's local Docker socket.
+            let mut log_stream = match deployer_for_logs
+                .stream_container_logs(&container_id_for_logs)
+                .await
+            {
+                Ok(stream) => stream,
                 Err(e) => {
                     write_log!(
                         LogLevel::Warning,
-                        format!("⚠️  Cannot stream logs - Docker connection failed: {}", e)
+                        format!("⚠️  Cannot stream logs from the container's node: {}", e)
                     );
                     return;
                 }
             };
-
-            // Configure log options
-            let log_options = bollard::query_parameters::LogsOptions {
-                stdout: true,
-                stderr: true,
-                follow: true,
-                timestamps: false,
-                ..Default::default()
-            };
-
-            // Stream logs with timeout
-            let mut log_stream = docker.logs(&container_id_for_logs, Some(log_options));
             let mut line_count = 0;
             let max_lines = 100;
             let timeout = tokio::time::sleep(std::time::Duration::from_secs(15));
@@ -1805,8 +1836,8 @@ impl DeployImageJob {
                     }
                     log_result = log_stream.next() => {
                         match log_result {
-                            Some(Ok(log_output)) => {
-                                let clean_msg = log_output.to_string().trim().to_string();
+                            Some(log_output) => {
+                                let clean_msg = log_output.trim().to_string();
                                 if !clean_msg.is_empty() {
                                     write_log!(LogLevel::Info,
                                         format!("🐳 {}", clean_msg));
@@ -1818,11 +1849,6 @@ impl DeployImageJob {
                                         break;
                                     }
                                 }
-                            }
-                            Some(Err(e)) => {
-                                write_log!(LogLevel::Warning,
-                                    format!("⚠️  Log stream error: {}", e));
-                                break;
                             }
                             None => {
                                 write_log!(LogLevel::Info,
@@ -1837,7 +1863,10 @@ impl DeployImageJob {
 
         // Store the task handle for cleanup on cancellation
         {
-            let mut task_handle = self.log_stream_task.lock().unwrap();
+            let mut task_handle = self
+                .log_stream_task
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             *task_handle = Some(log_task);
         }
 

@@ -493,7 +493,7 @@ impl DeploymentService {
                 }
             };
 
-            match deployer.get_container_info(&container_id).await {
+            let runtime_container_absent = match deployer.get_container_info(&container_id).await {
                 Ok(info) => {
                     let expected_project = project_id.to_string();
                     let expected_environment = container_environment_id.to_string();
@@ -513,8 +513,9 @@ impl DeploymentService {
                             reason,
                         });
                     }
+                    false
                 }
-                Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {}
+                Err(temps_deployer::DeployerError::ContainerNotFound(_)) => true,
                 Err(error) => {
                     let _ = self
                         .restore_cleanup_marker(&original, already_prepared)
@@ -527,17 +528,23 @@ impl DeploymentService {
                         reason: format!("failed to verify runtime container ownership: {error}"),
                     });
                 }
-            }
+            };
 
-            let removal_error = match tokio::time::timeout(
-                std::time::Duration::from_secs(30),
-                deployer.remove_container(&container_id),
-            )
-            .await
-            {
-                Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => None,
-                Ok(Err(error)) => Some(error.to_string()),
-                Err(_) => Some("container removal timed out after 30 seconds".to_string()),
+            let removal_error = if runtime_container_absent {
+                None
+            } else {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    deployer.remove_container(&container_id),
+                )
+                .await
+                {
+                    Ok(Ok(())) | Ok(Err(temps_deployer::DeployerError::ContainerNotFound(_))) => {
+                        None
+                    }
+                    Ok(Err(error)) => Some(error.to_string()),
+                    Err(_) => Some("container removal timed out after 30 seconds".to_string()),
+                }
             };
             if let Some(reason) = removal_error {
                 // Once a request may have reached Docker/the agent, its result is
@@ -5531,7 +5538,7 @@ mod tests {
 
         let test_db = TestDatabase::with_migrations().await?;
         let db = test_db.connection_arc();
-        let (project, environment, _deployment, container) = setup_test_deployment(&db).await?;
+        let (project, _environment, _deployment, container) = setup_test_deployment(&db).await?;
 
         let mut interrupted: deployment_containers::ActiveModel = container.clone().into();
         interrupted.status = Set(Some("removing".to_string()));
@@ -5540,12 +5547,15 @@ mod tests {
 
         let mut deployer = MockContainerDeployer::new();
         deployer.expect_list_containers().returning(|| Ok(vec![]));
-        expect_owned_container_info(&mut deployer, project.id, environment.id);
-        deployer.expect_remove_container().times(1).returning(|_| {
-            Err(temps_deployer::DeployerError::ContainerNotFound(
-                "already removed".to_string(),
-            ))
-        });
+        deployer
+            .expect_get_container_info()
+            .times(1)
+            .returning(|_| {
+                Err(temps_deployer::DeployerError::ContainerNotFound(
+                    "already removed".to_string(),
+                ))
+            });
+        deployer.expect_remove_container().never();
         let service = create_cleanup_service_for_test(db.clone(), Arc::new(deployer));
 
         let removed = temps_core::DeploymentContainerCleaner::cleanup_project_containers(
