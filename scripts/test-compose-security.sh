@@ -3,6 +3,7 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 
 set -euo pipefail
+trap 'echo "test-compose-security.sh failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
 project="temps-compose-security-${GITHUB_RUN_ID:-local}-$$"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
