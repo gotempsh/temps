@@ -462,6 +462,16 @@ fn deployment_asset_scope(
         .flatten()
 }
 
+fn legacy_deployment_asset_scope(
+    current_deployment_slug: &str,
+    origin: &crate::service::static_asset_lookup::LegacyAssetOrigin,
+    requested_deployment_slug: &str,
+) -> Option<(i32, i32)> {
+    (requested_deployment_slug == current_deployment_slug
+        || requested_deployment_slug == origin.slug)
+        .then_some((origin.environment_id, origin.deployment_id))
+}
+
 fn inherited_https_policy(production_https: bool, host_has_cert: bool) -> bool {
     production_https || host_has_cert
 }
@@ -502,9 +512,10 @@ fn should_apply_production_https_default(
 #[cfg(test)]
 mod deployment_asset_scope_tests {
     use super::{
-        deployment_asset_scope, inherited_https_policy, should_apply_production_https_default,
-        should_redirect_to_https,
+        deployment_asset_scope, inherited_https_policy, legacy_deployment_asset_scope,
+        should_apply_production_https_default, should_redirect_to_https,
     };
+    use crate::service::static_asset_lookup::LegacyAssetOrigin;
 
     #[test]
     fn prefixed_asset_resolves_current_or_reused_source_artifact() {
@@ -534,6 +545,28 @@ mod deployment_asset_scope_tests {
                 Some(20),
                 "unknown",
             ),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_prefixed_asset_maps_both_old_current_and_original_slugs_to_origin() {
+        let origin = LegacyAssetOrigin {
+            deployment_id: 10,
+            environment_id: 20,
+            slug: "original-build".to_string(),
+        };
+
+        assert_eq!(
+            legacy_deployment_asset_scope("legacy-promotion", &origin, "legacy-promotion"),
+            Some((20, 10))
+        );
+        assert_eq!(
+            legacy_deployment_asset_scope("legacy-promotion", &origin, "original-build"),
+            Some((20, 10))
+        );
+        assert_eq!(
+            legacy_deployment_asset_scope("legacy-promotion", &origin, "unrelated"),
             None
         );
     }
@@ -5065,26 +5098,50 @@ impl ProxyHttp for LoadBalancer {
             if let Some(slash_pos) = after_prefix.find('/') {
                 let deployment_slug = &after_prefix[..slash_pos];
                 let asset_path = after_prefix[slash_pos + 1..].to_string();
-                let asset_scope = ctx.deployment.as_ref().and_then(|deployment| {
+                let mut legacy_source = None;
+                let mut legacy_current_slug = None;
+                let mut asset_scope = ctx.deployment.as_ref().and_then(|deployment| {
                     let context = deployment.context_vars.as_ref();
+                    let source_slug = context
+                        .and_then(|value| value.get("source_deployment_slug"))
+                        .and_then(serde_json::Value::as_str);
+                    let source_deployment_id = context
+                        .and_then(|value| value.get("source_deployment_id"))
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok());
+                    if source_slug.is_none() {
+                        legacy_source = source_deployment_id;
+                        legacy_current_slug = Some(deployment.slug.clone());
+                    }
                     deployment_asset_scope(
                         &deployment.slug,
                         deployment.environment_id,
                         deployment.id,
-                        context
-                            .and_then(|value| value.get("source_deployment_slug"))
-                            .and_then(serde_json::Value::as_str),
+                        source_slug,
                         context
                             .and_then(|value| value.get("source_environment_id"))
                             .and_then(serde_json::Value::as_i64)
                             .and_then(|value| i32::try_from(value).ok()),
-                        context
-                            .and_then(|value| value.get("source_deployment_id"))
-                            .and_then(serde_json::Value::as_i64)
-                            .and_then(|value| i32::try_from(value).ok()),
+                        source_deployment_id,
                         deployment_slug,
                     )
                 });
+                if let (Some(project_id), Some(source_deployment_id)) = (
+                    ctx.project.as_ref().map(|project| project.id),
+                    legacy_source,
+                ) {
+                    if let Some(origin) = self
+                        .static_asset_lookup
+                        .resolve_legacy_asset_origin(project_id, source_deployment_id)
+                        .await
+                    {
+                        asset_scope = legacy_deployment_asset_scope(
+                            legacy_current_slug.as_deref().unwrap_or_default(),
+                            &origin,
+                            deployment_slug,
+                        );
+                    }
+                }
                 if Self::is_cacheable_static_asset(&asset_path) {
                     if let Some(asset_scope) = asset_scope {
                         if let Ok(true) = self

@@ -208,6 +208,7 @@ mod m20260827_000001_create_notification_routes;
 mod m20260828_000001_alarms_nullable_project;
 mod m20260828_000002_add_alarms_silenced_until;
 mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
+mod m20260830_000001_add_external_service_creator;
 
 pub struct Migrator;
 
@@ -450,6 +451,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260828_000001_alarms_nullable_project::Migration),
             Box::new(m20260828_000002_add_alarms_silenced_until::Migration),
             Box::new(m20260829_000001_allow_duplicate_ready_snapshot_digests::Migration),
+            Box::new(m20260830_000001_add_external_service_creator::Migration),
         ]
     }
 }

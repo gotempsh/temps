@@ -12015,6 +12015,7 @@ mod tests {
             default_backup_provisioned: Set(false),
             ai_data_access: Set(false),
             container_name: Set(None),
+            created_by_user_id: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         };
@@ -12193,6 +12194,7 @@ mod tests {
             default_backup_provisioned: Set(false),
             ai_data_access: Set(false),
             container_name: Set(None),
+            created_by_user_id: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -12628,6 +12630,7 @@ mod tests {
             default_backup_provisioned: Set(false),
             ai_data_access: Set(false),
             container_name: Set(None),
+            created_by_user_id: Set(None),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }

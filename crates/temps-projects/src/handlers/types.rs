@@ -20,6 +20,7 @@ use temps_presets::preset_config_schema::PresetConfigSchema;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
+    pub external_service_manager: Arc<temps_providers::ExternalServiceManager>,
     pub deployment_canceller: Arc<dyn temps_core::DeploymentCanceller>,
     pub deployment_container_cleaner: Arc<dyn temps_core::DeploymentContainerCleaner>,
     pub custom_domain_service: Arc<CustomDomainService>,

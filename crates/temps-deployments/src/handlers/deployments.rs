@@ -463,6 +463,13 @@ impl From<crate::services::services::DeploymentError> for Problem {
                     .with_title("Invalid Bundle Path")
                     .with_detail(format!("Bundle path '{path}' is invalid: {reason}"))
             }
+            error @ (DeploymentError::AssetOriginNotFound { .. }
+            | DeploymentError::AssetOriginCycle { .. }
+            | DeploymentError::EnvironmentResolution(_)) => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Deployment Configuration Error")
+                    .with_detail(error.to_string())
+            }
             DeploymentError::Other(msg) => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .with_title("Internal Server Error")
                 .with_detail(msg),
@@ -3208,6 +3215,95 @@ mod tests {
     /// Helper to create a mock AuthContext for testing
     fn create_test_auth_context() -> temps_auth::AuthContext {
         create_test_auth_context_for_role(temps_auth::Role::Admin)
+    }
+
+    #[tokio::test]
+    async fn managed_environment_variables_route_enforces_contract() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let app = Router::new().route(
+            "/deployments/managed-environment-variables",
+            axum::routing::get(list_managed_environment_variables),
+        );
+
+        let mut success_request = Request::builder()
+            .uri("/deployments/managed-environment-variables?preset=nextjs")
+            .body(Body::empty())
+            .expect("build request");
+        success_request
+            .extensions_mut()
+            .insert(create_test_auth_context());
+        let success = app
+            .clone()
+            .oneshot(success_request)
+            .await
+            .expect("route responds");
+        assert_eq!(success.status(), StatusCode::OK);
+        let body = to_bytes(success.into_body(), usize::MAX)
+            .await
+            .expect("read response body");
+        let variables: Vec<ManagedEnvironmentVariable> =
+            serde_json::from_slice(&body).expect("managed-variable response");
+        assert!(variables
+            .iter()
+            .any(|variable| variable.name == "SENTRY_DSN"));
+
+        let mut invalid_request = Request::builder()
+            .uri("/deployments/managed-environment-variables?preset=unknown")
+            .body(Body::empty())
+            .expect("build request");
+        invalid_request
+            .extensions_mut()
+            .insert(create_test_auth_context());
+        assert_eq!(
+            app.clone()
+                .oneshot(invalid_request)
+                .await
+                .expect("route responds")
+                .status(),
+            StatusCode::BAD_REQUEST
+        );
+
+        let unauthenticated = Request::builder()
+            .uri("/deployments/managed-environment-variables?preset=nextjs")
+            .body(Body::empty())
+            .expect("build request");
+        assert_eq!(
+            app.clone()
+                .oneshot(unauthenticated)
+                .await
+                .expect("route responds")
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let mut forbidden_request = Request::builder()
+            .uri("/deployments/managed-environment-variables?preset=nextjs")
+            .body(Body::empty())
+            .expect("build request");
+        forbidden_request
+            .extensions_mut()
+            .insert(create_test_auth_context_for_role(temps_auth::Role::Reader));
+        assert_eq!(
+            app.oneshot(forbidden_request)
+                .await
+                .expect("route responds")
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+    }
+
+    #[test]
+    fn managed_environment_variables_route_is_in_openapi() {
+        use utoipa::OpenApi;
+
+        let spec = DeploymentsApiDoc::openapi();
+        assert!(spec
+            .paths
+            .paths
+            .contains_key("/deployments/managed-environment-variables"));
     }
 
     /// Helper to create a mock AuthContext with a persisted session (non-None

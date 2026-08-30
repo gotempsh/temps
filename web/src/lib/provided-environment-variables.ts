@@ -20,7 +20,8 @@ const SOURCE_ORDER: ManagedEnvironmentVariableSource[] = [
 
 export function normalizeCreationPreset(preset: string): string {
   const [name] = preset.split('::')
-  return name.trim().toLowerCase() || 'dockerfile'
+  const normalized = name.trim().toLowerCase() || 'dockerfile'
+  return normalized === 'custom' ? 'static' : normalized
 }
 
 export function groupManagedEnvironmentVariables(
@@ -38,6 +39,16 @@ export function findProvidedEnvironmentVariableCollision(
 ) {
   const normalizedName = variableName.trim()
   return providedVariables.find((variable) => variable.name === normalizedName)
+}
+
+export function isNonOverridableProvidedEnvironmentVariable(
+  variableName: string,
+  providedVariables: ProvidedEnvironmentVariableCollision[]
+): boolean {
+  return (
+    findProvidedEnvironmentVariableCollision(variableName, providedVariables)
+      ?.isUserOverridable === false
+  )
 }
 
 export function databaseProvidedEnvironmentVariable(

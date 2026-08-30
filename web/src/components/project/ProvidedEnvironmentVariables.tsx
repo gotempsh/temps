@@ -11,6 +11,7 @@ import type {
 } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Collapsible,
   CollapsibleContent,
@@ -29,7 +30,6 @@ import {
   Braces,
   ChevronDown,
   Database,
-  Loader2,
   LockKeyhole,
   ServerCog,
   TriangleAlert,
@@ -46,7 +46,7 @@ interface ProvidedEnvironmentVariablesProps {
   preset: string
   databases: ProvidedEnvironmentVariableDatabase[]
   onVariablesChange?: (
-    variables: ProvidedEnvironmentVariableCollision[]
+    variables: ProvidedEnvironmentVariableCollision[] | null
   ) => void
 }
 
@@ -121,15 +121,27 @@ export function ProvidedEnvironmentVariables({
   const collisionVariablesSignature = JSON.stringify(collisionVariables)
 
   useEffect(() => {
-    if (
-      !onVariablesChange ||
-      collisionVariablesSignature === lastReportedVariablesRef.current
-    ) {
+    if (!onVariablesChange) return
+    const hasError =
+      platformQuery.isError || databaseQueries.some((query) => query.isError)
+    if (isLoading || hasError) {
+      if (lastReportedVariablesRef.current !== '__unavailable__') {
+        lastReportedVariablesRef.current = '__unavailable__'
+        onVariablesChange(null)
+      }
       return
     }
+    if (collisionVariablesSignature === lastReportedVariablesRef.current) return
     lastReportedVariablesRef.current = collisionVariablesSignature
     onVariablesChange(collisionVariables)
-  }, [collisionVariables, collisionVariablesSignature, onVariablesChange])
+  }, [
+    collisionVariables,
+    collisionVariablesSignature,
+    databaseQueries,
+    isLoading,
+    onVariablesChange,
+    platformQuery.isError,
+  ])
 
   return (
     <Collapsible open={isOpen} onOpenChange={setIsOpen}>
@@ -149,7 +161,7 @@ export function ProvidedEnvironmentVariables({
                 <div className="flex flex-wrap items-center gap-2">
                   <span className="text-sm font-medium">Provided by Temps</span>
                   {isLoading ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin text-muted-foreground" />
+                    <Skeleton className="h-4 w-20 rounded-full" />
                   ) : totalVariableCount > 0 ? (
                     <Badge
                       variant="secondary"
@@ -345,9 +357,14 @@ export function ProvidedEnvironmentVariableWarning({
 
 function LoadingRow({ label }: { label: string }) {
   return (
-    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-      {label}
+    <div
+      className="space-y-2"
+      aria-label={label}
+      role="status"
+      aria-live="polite"
+    >
+      <Skeleton className="h-3 w-2/5" />
+      <Skeleton className="h-8 w-full" />
     </div>
   )
 }

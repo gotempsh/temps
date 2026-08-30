@@ -14,7 +14,8 @@ use axum::{
 };
 use temps_auth::RequireAuth;
 use temps_auth::{
-    deny_deployment_token, permission_guard, project_access_guard, project_scope_guard,
+    deny_deployment_token, permission_guard, project_access_guard, project_permission_guard,
+    project_scope_guard,
 };
 use temps_core::{
     error_builder::{
@@ -30,6 +31,7 @@ use super::audit::{
     ExternalServiceClusterMemberRemovedAudit, ExternalServiceCreatedAudit,
     ExternalServiceDeletedAudit, ExternalServiceEnvironmentVariableRevealedAudit,
     ExternalServiceEnvironmentVariablesRevealedAudit, ExternalServiceParameterRevealedAudit,
+    ExternalServiceProjectLinkedAudit, ExternalServiceProjectUnlinkedAudit,
     ExternalServiceRuntimeCredentialsIssuedAudit, ExternalServiceStatusChangedAudit,
     ExternalServiceUpdatedAudit, ServiceHealthChecked,
 };
@@ -558,7 +560,7 @@ async fn create_service(
 
     match app_state
         .external_service_manager
-        .create_service(service_config)
+        .create_service_for_user(service_config, auth.user_id())
         .await
     {
         Ok(service) => {
@@ -830,6 +832,64 @@ async fn require_service_parameter_project_access(
     } else {
         Ok(())
     }
+}
+
+async fn authorize_service_link_source(
+    auth: &temps_auth::AuthContext,
+    scope: &crate::services::ExternalServiceProjectScope,
+    checker: Option<&dyn temps_core::ProjectAccessChecker>,
+) -> Result<Option<i32>, Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return Ok(None);
+    }
+    let Some(checker) = checker else {
+        return Ok(None);
+    };
+
+    if scope.project_ids.is_empty() {
+        return if scope.created_by_user_id == Some(auth.user_id()) {
+            Ok(Some(auth.user_id()))
+        } else {
+            Err(forbidden()
+                .title("Service Access Denied")
+                .detail("The selected database is not available to this user")
+                .build())
+        };
+    }
+
+    let required = temps_auth::Permission::ExternalServicesWrite.to_string();
+    let mut infrastructure_error = None;
+    for project_id in &scope.project_ids {
+        match checker
+            .effective_project_permissions(auth.user_id(), *project_id)
+            .await
+        {
+            Ok(Some(permissions)) if permissions.contains(&required) => return Ok(None),
+            Ok(Some(_)) => {}
+            Ok(None) => match checker
+                .user_can_access_project(auth.user_id(), *project_id)
+                .await
+            {
+                Ok(true) => return Ok(None),
+                Ok(false) => {}
+                Err(error) => infrastructure_error = Some(error),
+            },
+            Err(error) => infrastructure_error = Some(error),
+        }
+    }
+
+    if let Some(error) = infrastructure_error {
+        error!(service_id = scope.service_id, error = %error, "service link authorization failed closed");
+        return Err(internal_server_error()
+            .title("Service Authorization Failed")
+            .detail("Could not verify access to the selected database")
+            .build());
+    }
+
+    Err(forbidden()
+        .title("Service Access Denied")
+        .detail("Your project role cannot link this database")
+        .build())
 }
 
 fn require_reveal_audit(
@@ -1901,20 +1961,76 @@ async fn link_service_to_project(
     State(app_state): State<Arc<AppState>>,
     Path(id): Path<i32>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<LinkServiceRequest>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ExternalServicesWrite);
+    project_permission_guard!(
+        auth,
+        ExternalServicesWrite,
+        request.project_id,
+        app_state.project_access_checker
+    );
+    project_scope_guard!(auth, request.project_id);
+
+    let claim_user_id = if auth.is_deployment_token() {
+        super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
+        None
+    } else {
+        let scope = app_state
+            .external_service_manager
+            .project_scopes_for_services(&[id])
+            .await
+            .map_err(|error| match error {
+                crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+                    not_found().detail("Service not found").build()
+                }
+                _ => internal_server_error()
+                    .detail("Failed to authorize service link")
+                    .build(),
+            })?
+            .into_iter()
+            .next()
+            .ok_or_else(|| not_found().detail("Service not found").build())?;
+        authorize_service_link_source(&auth, &scope, app_state.project_access_checker.as_deref())
+            .await?
+    };
 
     match app_state
         .external_service_manager
-        .link_service_to_project(id, request.project_id)
+        .link_service_to_project_with_claim(id, request.project_id, claim_user_id)
         .await
     {
-        Ok(info) => Ok((StatusCode::CREATED, Json(info))),
-        Err(e) => match e.to_string().as_str() {
-            "Service not found" | "Project not found" => {
+        Ok(info) => {
+            let service_name = app_state
+                .external_service_manager
+                .get_service(id)
+                .await
+                .map(|service| service.name)
+                .unwrap_or_default();
+            let audit = ExternalServiceProjectLinkedAudit {
+                context: AuditContext {
+                    user_id: auth.user_id(),
+                    ip_address: Some(metadata.ip_address.clone()),
+                    user_agent: metadata.user_agent,
+                },
+                service_id: id,
+                service_name,
+                project_id: request.project_id,
+            };
+            if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+                error!(service_id = id, project_id = request.project_id, error = %error, "failed to audit service link");
+            }
+            Ok((StatusCode::CREATED, Json(info)))
+        }
+        Err(e) => match e {
+            crate::services::ExternalServiceError::ServiceNotFound { .. }
+            | crate::services::ExternalServiceError::ProjectNotFound { .. } => {
                 Err(not_found().detail(e.to_string()).build())
             }
+            crate::services::ExternalServiceError::ServiceClaimDenied { .. } => Err(forbidden()
+                .title("Service Claim Expired")
+                .detail("This database has already been claimed by another project")
+                .build()),
             _ => Err(internal_server_error()
                 .detail(format!("Failed to link service: {}", e))
                 .build()),
@@ -1941,15 +2057,43 @@ async fn unlink_service_from_project(
     State(app_state): State<Arc<AppState>>,
     Path((id, project_id)): Path<(i32, i32)>,
     RequireAuth(auth): RequireAuth,
+    Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
-    permission_guard!(auth, ExternalServicesWrite);
+    project_permission_guard!(
+        auth,
+        ExternalServicesWrite,
+        project_id,
+        app_state.project_access_checker
+    );
+    project_scope_guard!(auth, project_id);
 
     match app_state
         .external_service_manager
         .unlink_service_from_project(id, project_id)
         .await
     {
-        Ok(_) => Ok(StatusCode::NO_CONTENT),
+        Ok(_) => {
+            let service_name = app_state
+                .external_service_manager
+                .get_service(id)
+                .await
+                .map(|service| service.name)
+                .unwrap_or_default();
+            let audit = ExternalServiceProjectUnlinkedAudit {
+                context: AuditContext {
+                    user_id: auth.user_id(),
+                    ip_address: Some(metadata.ip_address.clone()),
+                    user_agent: metadata.user_agent,
+                },
+                service_id: id,
+                service_name,
+                project_id,
+            };
+            if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+                error!(service_id = id, project_id, error = %error, "failed to audit service unlink");
+            }
+            Ok(StatusCode::NO_CONTENT)
+        }
         Err(e) => match e.to_string().as_str() {
             "Service link not found" => Err(not_found().detail(e.to_string()).build()),
             _ => Err(internal_server_error()
@@ -1981,12 +2125,29 @@ async fn list_service_projects(
     Query(pagination): Query<temps_core::PaginationParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ExternalServicesRead);
+    super::metrics_handlers::assert_service_owned_by_caller(id, &auth, &app_state).await?;
 
     let (page, page_size) = pagination.normalize();
+    let hidden_project_ids = if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        Vec::new()
+    } else if let Some(checker) = app_state.project_access_checker.as_ref() {
+        checker
+            .hidden_project_ids(auth.user_id())
+            .await
+            .map_err(|error| {
+                error!(service_id = id, error = %error, "failed to filter service projects");
+                internal_server_error()
+                    .detail("Failed to filter service projects")
+                    .build()
+            })?
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
 
     match app_state
         .external_service_manager
-        .list_service_projects_paginated(id, page, page_size)
+        .list_service_projects_paginated(id, page, page_size, &hidden_project_ids)
         .await
     {
         Ok(projects) => Ok((StatusCode::OK, Json(projects))),
@@ -3151,6 +3312,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlinked_service_creator_gets_one_time_link_claim() {
+        let auth = test_auth_context_with_role(temps_auth::Role::Reader);
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: Vec::new(),
+            fail: false,
+        };
+        let scope = crate::services::ExternalServiceProjectScope {
+            service_id: 7,
+            project_ids: Vec::new(),
+            created_by_user_id: Some(auth.user_id()),
+        };
+
+        assert_eq!(
+            authorize_service_link_source(&auth, &scope, Some(&checker))
+                .await
+                .expect("creator should be able to claim an unlinked service"),
+            Some(auth.user_id())
+        );
+    }
+
+    #[tokio::test]
+    async fn creator_marker_does_not_bypass_linked_project_access() {
+        let auth = test_auth_context_with_role(temps_auth::Role::Reader);
+        let checker = TestProjectAccessChecker {
+            allowed_project_ids: vec![99],
+            fail: false,
+        };
+        let scope = crate::services::ExternalServiceProjectScope {
+            service_id: 7,
+            project_ids: vec![10],
+            created_by_user_id: Some(auth.user_id()),
+        };
+
+        let problem = authorize_service_link_source(&auth, &scope, Some(&checker))
+            .await
+            .expect_err("creator must use linked-project authorization after first claim");
+        assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
     async fn credential_reveal_returns_no_store_response_and_writes_audit() {
         let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
             "service-handler-reveal-test",
@@ -3186,6 +3387,7 @@ mod tests {
             default_backup_provisioned: false,
             ai_data_access: false,
             container_name: None,
+            created_by_user_id: None,
         };
         let db = Arc::new(
             MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
