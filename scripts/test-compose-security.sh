@@ -362,7 +362,18 @@ done
 docker exec temps-app wget --quiet --output-document=- \
   "http://${workload_probe_name}:8080/ready" | grep -qx ready
 for control_plane_alias in temps-postgres temps-clickhouse; do
-  docker exec "$workload_probe_name" nslookup "$control_plane_alias" >/dev/null
+  alias_resolved=false
+  for _ in {1..10}; do
+    if docker exec "$workload_probe_name" nslookup "$control_plane_alias" >/dev/null 2>&1; then
+      alias_resolved=true
+      break
+    fi
+    sleep 1
+  done
+  if [[ "$alias_resolved" != "true" ]]; then
+    echo "workload network alias $control_plane_alias did not become resolvable" >&2
+    exit 1
+  fi
 done
 for control_plane_port in 3000 3443 9000; do
   if docker exec "$workload_probe_name" nc -z -w 1 temps-app "$control_plane_port" \
