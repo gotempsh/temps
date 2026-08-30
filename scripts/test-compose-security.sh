@@ -361,10 +361,15 @@ for _ in {1..30}; do
 done
 docker exec temps-app wget --quiet --output-document=- \
   "http://${workload_probe_name}:8080/ready" | grep -qx ready
+# Runners that inject a DNS search domain (e.g. GitHub Actions' Azure host
+# search suffix) break plain `nslookup`: Alpine's musl-libc resolver queries
+# the search-suffixed name first and, unlike glibc, does not fall back to the
+# bare name on NXDOMAIN. `getent hosts` resolves the alias correctly in both
+# environments, so use it instead of `nslookup` for this liveness check.
 for control_plane_alias in temps-postgres temps-clickhouse; do
   alias_resolved=false
   for _ in {1..10}; do
-    if docker exec "$workload_probe_name" nslookup "$control_plane_alias" >/dev/null 2>&1; then
+    if docker exec "$workload_probe_name" getent hosts "$control_plane_alias" >/dev/null 2>&1; then
       alias_resolved=true
       break
     fi
@@ -372,16 +377,6 @@ for control_plane_alias in temps-postgres temps-clickhouse; do
   done
   if [[ "$alias_resolved" != "true" ]]; then
     echo "workload network alias $control_plane_alias did not become resolvable" >&2
-    echo "--- resolv.conf ---" >&2
-    docker exec "$workload_probe_name" cat /etc/resolv.conf >&2 || true
-    echo "--- nslookup output ---" >&2
-    docker exec "$workload_probe_name" nslookup "$control_plane_alias" >&2 || true
-    echo "--- nslookup against 127.0.0.11 explicitly ---" >&2
-    docker exec "$workload_probe_name" nslookup "$control_plane_alias" 127.0.0.11 >&2 || true
-    echo "--- getent hosts ---" >&2
-    docker exec "$workload_probe_name" getent hosts "$control_plane_alias" >&2 || true
-    echo "--- network inspect ---" >&2
-    docker network inspect "$TEMPS_NETWORK_NAME" >&2 || true
     exit 1
   fi
 done
