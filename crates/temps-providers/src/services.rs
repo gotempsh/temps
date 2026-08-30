@@ -24,8 +24,8 @@ use bollard::Docker;
 use chrono::Utc;
 use sea_orm::{
     sea_query::{Expr, LockType},
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
-    QueryOrder, QuerySelect, Set, TransactionTrait,
+    ActiveModelTrait, ColumnTrait, Condition, DatabaseConnection, EntityTrait, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
@@ -1116,16 +1116,14 @@ impl ExternalServiceManager {
         }
         let requested_ids: Vec<i32> = unique_ids.iter().copied().collect();
 
-        let existing_services: Vec<(i32, Option<i32>)> = external_services::Entity::find()
-            .select_only()
-            .column(external_services::Column::Id)
-            .column(external_services::Column::CreatedByUserId)
+        let existing_services = external_services::Entity::find()
             .filter(external_services::Column::Id.is_in(requested_ids.clone()))
-            .into_tuple()
             .all(self.db.as_ref())
             .await?;
-        let creators_by_service: BTreeMap<i32, Option<i32>> =
-            existing_services.into_iter().collect();
+        let creators_by_service: BTreeMap<i32, Option<i32>> = existing_services
+            .into_iter()
+            .map(|service| (service.id, service.created_by_user_id))
+            .collect();
         let existing_ids: BTreeSet<i32> = creators_by_service.keys().copied().collect();
         if let Some(id) = unique_ids.difference(&existing_ids).next().copied() {
             return Err(ExternalServiceError::ServiceNotFound { id });
@@ -2147,29 +2145,40 @@ impl ExternalServiceManager {
         Ok(result)
     }
 
-    /// List services linked to at least one project visible to the caller.
+    /// List services linked to at least one project visible to the caller, plus
+    /// services the caller has just created but has not linked yet.
     ///
     /// `hidden_project_ids` comes from the registered `ProjectAccessChecker`.
-    /// The join deliberately excludes unlinked services and applies the access
-    /// filter before pagination, so restricted callers cannot enumerate a
-    /// service through sparse or misleading pages. `DISTINCT` prevents a
-    /// service linked to multiple visible projects from appearing twice.
+    /// The left join and creator condition apply access filtering before
+    /// pagination, so restricted callers cannot enumerate another user's
+    /// unlinked service or receive sparse/misleading pages. `DISTINCT` prevents
+    /// a service linked to multiple visible projects from appearing twice.
     pub async fn list_project_accessible_services_paginated(
         &self,
         page: u64,
         page_size: u64,
         hidden_project_ids: &[i32],
+        creator_user_id: i32,
     ) -> Result<Vec<ExternalServiceInfo>, ExternalServiceError> {
-        let mut query = external_services::Entity::find()
-            .inner_join(project_services::Entity)
+        let linked_to_visible_project = if hidden_project_ids.is_empty() {
+            Condition::all().add(project_services::Column::ServiceId.is_not_null())
+        } else {
+            Condition::all().add(
+                project_services::Column::ProjectId.is_not_in(hidden_project_ids.iter().copied()),
+            )
+        };
+        let creator_owned_and_unlinked = Condition::all()
+            .add(external_services::Column::CreatedByUserId.eq(creator_user_id))
+            .add(project_services::Column::ServiceId.is_null());
+        let query = external_services::Entity::find()
+            .left_join(project_services::Entity)
+            .filter(
+                Condition::any()
+                    .add(linked_to_visible_project)
+                    .add(creator_owned_and_unlinked),
+            )
             .distinct()
             .order_by_desc(external_services::Column::CreatedAt);
-
-        if !hidden_project_ids.is_empty() {
-            query = query.filter(
-                project_services::Column::ProjectId.is_not_in(hidden_project_ids.iter().copied()),
-            );
-        }
 
         let services = query
             .paginate(self.db.as_ref(), page_size)
@@ -8431,80 +8440,20 @@ echo "[restore] Pre-seed complete"
         project_id_val: i32,
         claim_user_id: Option<i32>,
     ) -> Result<ProjectServiceInfo, ExternalServiceError> {
-        let link = self
-            .db
-            .transaction::<_, project_services::Model, ExternalServiceError>(|txn| {
-                Box::pin(async move {
-                    let service = external_services::Entity::find_by_id(service_id_val)
-                        .lock(LockType::Update)
-                        .one(txn)
-                        .await?
-                        .ok_or(ExternalServiceError::ServiceNotFound { id: service_id_val })?;
-
-                    projects::Entity::find_by_id(project_id_val)
-                        .one(txn)
-                        .await?
-                        .ok_or(ExternalServiceError::ProjectNotFound { id: project_id_val })?;
-
-                    if let Some(user_id) = claim_user_id {
-                        let already_linked = project_services::Entity::find()
-                            .filter(project_services::Column::ServiceId.eq(service_id_val))
-                            .one(txn)
-                            .await?
-                            .is_some();
-                        validate_creator_claim(
-                            service_id_val,
-                            service.created_by_user_id,
-                            already_linked,
-                            user_id,
-                        )?;
-                    }
-
-                    let existing_links = project_services::Entity::find()
-                        .filter(project_services::Column::ProjectId.eq(project_id_val))
-                        .all(txn)
-                        .await?;
-                    let existing_service_ids = existing_links
-                        .into_iter()
-                        .map(|link| link.service_id)
-                        .collect::<Vec<_>>();
-                    let duplicate_type_exists = !existing_service_ids.is_empty()
-                        && external_services::Entity::find()
-                            .filter(external_services::Column::Id.is_in(existing_service_ids))
-                            .filter(
-                                external_services::Column::ServiceType
-                                    .eq(service.service_type.clone()),
-                            )
-                            .one(txn)
-                            .await?
-                            .is_some();
-                    if duplicate_type_exists {
-                        return Err(ExternalServiceError::DuplicateServiceType {
-                            project_id: project_id_val,
-                            service_type: service.service_type.clone(),
-                        });
-                    }
-
-                    let link = project_services::ActiveModel {
-                        project_id: Set(project_id_val),
-                        service_id: Set(service_id_val),
-                        created_at: Set(Utc::now()),
-                        updated_at: Set(Utc::now()),
-                        ..Default::default()
-                    }
-                    .insert(txn)
-                    .await?;
-
-                    if service.created_by_user_id.is_some() {
-                        let mut service_update: external_services::ActiveModel = service.into();
-                        service_update.created_by_user_id = Set(None);
-                        service_update.update(txn).await?;
-                    }
-
-                    Ok(link)
-                })
-            })
+        let claims = claim_user_id
+            .map(|user_id| BTreeMap::from([(service_id_val, user_id)]))
+            .unwrap_or_default();
+        let mut links = self
+            .link_services_to_project_transactionally(&[service_id_val], project_id_val, &claims)
             .await?;
+        let link = links
+            .pop()
+            .ok_or_else(|| ExternalServiceError::InternalError {
+                reason: format!(
+                    "linking service {} to project {} produced no link",
+                    service_id_val, project_id_val
+                ),
+            })?;
         let service_info = self.get_service_info(service_id_val).await?;
 
         // Fetch project metadata
@@ -8524,6 +8473,141 @@ echo "[restore] Pre-seed complete"
             },
             service: service_info,
         })
+    }
+
+    /// Link every selected service and consume creator claims in one transaction.
+    ///
+    /// Project creation uses this bulk operation so a validation or insert failure
+    /// for a later database cannot leave an earlier database unlinked with its
+    /// one-time creator claim already consumed.
+    pub async fn link_services_to_project_with_claims(
+        &self,
+        service_ids: &[i32],
+        project_id: i32,
+        claims: &BTreeMap<i32, i32>,
+    ) -> Result<(), ExternalServiceError> {
+        self.link_services_to_project_transactionally(service_ids, project_id, claims)
+            .await?;
+        Ok(())
+    }
+
+    async fn link_services_to_project_transactionally(
+        &self,
+        service_ids: &[i32],
+        project_id: i32,
+        claims: &BTreeMap<i32, i32>,
+    ) -> Result<Vec<project_services::Model>, ExternalServiceError> {
+        let mut ordered_service_ids = service_ids.to_vec();
+        ordered_service_ids.sort_unstable();
+        ordered_service_ids.dedup();
+        if ordered_service_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let claims = claims.clone();
+        self.db
+            .transaction::<_, Vec<project_services::Model>, ExternalServiceError>(|txn| {
+                Box::pin(async move {
+                    let services = external_services::Entity::find()
+                        .filter(external_services::Column::Id.is_in(ordered_service_ids.clone()))
+                        .order_by_asc(external_services::Column::Id)
+                        .lock(LockType::Update)
+                        .all(txn)
+                        .await?;
+                    if services.len() != ordered_service_ids.len() {
+                        let found_ids = services
+                            .iter()
+                            .map(|service| service.id)
+                            .collect::<BTreeSet<_>>();
+                        let missing_id = ordered_service_ids
+                            .iter()
+                            .find(|service_id| !found_ids.contains(service_id))
+                            .copied()
+                            .unwrap_or_default();
+                        return Err(ExternalServiceError::ServiceNotFound { id: missing_id });
+                    }
+
+                    projects::Entity::find_by_id(project_id)
+                        .lock(LockType::Update)
+                        .one(txn)
+                        .await?
+                        .ok_or(ExternalServiceError::ProjectNotFound { id: project_id })?;
+
+                    let selected_links = project_services::Entity::find()
+                        .filter(
+                            project_services::Column::ServiceId.is_in(ordered_service_ids.clone()),
+                        )
+                        .all(txn)
+                        .await?;
+                    let already_linked_ids = selected_links
+                        .iter()
+                        .map(|link| link.service_id)
+                        .collect::<BTreeSet<_>>();
+                    for service in &services {
+                        if let Some(user_id) = claims.get(&service.id) {
+                            validate_creator_claim(
+                                service.id,
+                                service.created_by_user_id,
+                                already_linked_ids.contains(&service.id),
+                                *user_id,
+                            )?;
+                        }
+                    }
+
+                    let existing_links = project_services::Entity::find()
+                        .filter(project_services::Column::ProjectId.eq(project_id))
+                        .all(txn)
+                        .await?;
+                    let existing_service_ids = existing_links
+                        .into_iter()
+                        .map(|link| link.service_id)
+                        .collect::<Vec<_>>();
+                    let mut linked_service_types = if existing_service_ids.is_empty() {
+                        BTreeSet::new()
+                    } else {
+                        external_services::Entity::find()
+                            .filter(external_services::Column::Id.is_in(existing_service_ids))
+                            .all(txn)
+                            .await?
+                            .into_iter()
+                            .map(|service| service.service_type)
+                            .collect::<BTreeSet<_>>()
+                    };
+                    for service in &services {
+                        if !linked_service_types.insert(service.service_type.clone()) {
+                            return Err(ExternalServiceError::DuplicateServiceType {
+                                project_id,
+                                service_type: service.service_type.clone(),
+                            });
+                        }
+                    }
+
+                    let now = Utc::now();
+                    let mut links = Vec::with_capacity(services.len());
+                    for service in services {
+                        let link = project_services::ActiveModel {
+                            project_id: Set(project_id),
+                            service_id: Set(service.id),
+                            created_at: Set(now),
+                            updated_at: Set(now),
+                            ..Default::default()
+                        }
+                        .insert(txn)
+                        .await?;
+                        links.push(link);
+
+                        if service.created_by_user_id.is_some() {
+                            let mut service_update: external_services::ActiveModel = service.into();
+                            service_update.created_by_user_id = Set(None);
+                            service_update.update(txn).await?;
+                        }
+                    }
+
+                    Ok(links)
+                })
+            })
+            .await
+            .map_err(ExternalServiceError::from)
     }
 
     pub async fn get_service_environment_variables(
@@ -9984,6 +10068,25 @@ echo "[restore] Pre-seed complete"
         &self,
         request: ImportExternalServiceRequest,
     ) -> Result<ExternalServiceInfo> {
+        self.import_service_with_creator(request, None).await
+    }
+
+    /// Import a service on behalf of an authenticated user, preserving the
+    /// same one-time pre-link ownership semantics as newly provisioned services.
+    pub async fn import_service_for_user(
+        &self,
+        request: ImportExternalServiceRequest,
+        user_id: i32,
+    ) -> Result<ExternalServiceInfo> {
+        self.import_service_with_creator(request, Some(user_id))
+            .await
+    }
+
+    async fn import_service_with_creator(
+        &self,
+        request: ImportExternalServiceRequest,
+        created_by_user_id: Option<i32>,
+    ) -> Result<ExternalServiceInfo> {
         // Get the service-specific implementation based on Docker inspection
         let container = self
             .docker
@@ -10186,6 +10289,7 @@ echo "[restore] Pre-seed complete"
             status: Set("running".to_string()),
             config: Set(Some(encrypted_config)),
             container_name: Set(imported_container_name),
+            created_by_user_id: Set(created_by_user_id),
             ..Default::default()
         }
         .insert(self.db.as_ref())
@@ -13394,7 +13498,7 @@ mod tests {
         let manager = mock_service_manager_with_db(db.clone());
 
         let services = manager
-            .list_project_accessible_services_paginated(1, 25, &[10, 11])
+            .list_project_accessible_services_paginated(1, 25, &[10, 11], 42)
             .await
             .expect("project-scoped external-service list should succeed");
         assert_eq!(services.len(), 1);
@@ -13405,19 +13509,24 @@ mod tests {
         let log = db.into_transaction_log();
         let list_sql = &log[0].statements()[0].sql;
         assert!(
-            list_sql.contains("INNER JOIN \"project_services\""),
-            "unlinked services must be excluded by the database query: {list_sql}"
+            list_sql.contains("LEFT JOIN \"project_services\""),
+            "creator-owned unlinked services require a left join: {list_sql}"
         );
         assert!(
             list_sql.contains("\"project_services\".\"project_id\" NOT IN ($1, $2)"),
             "hidden projects must be excluded before pagination: {list_sql}"
         );
         assert!(
+            list_sql.contains("\"external_services\".\"created_by_user_id\" = $3")
+                && list_sql.contains("\"project_services\".\"service_id\" IS NULL"),
+            "only the caller's unlinked services may supplement visible links: {list_sql}"
+        );
+        assert!(
             list_sql.contains("SELECT DISTINCT"),
             "services linked to multiple accessible projects must be deduplicated: {list_sql}"
         );
         assert!(
-            list_sql.contains("LIMIT $3 OFFSET $4"),
+            list_sql.contains("LIMIT $4 OFFSET $5"),
             "access filtering must be part of the paginated query: {list_sql}"
         );
     }
@@ -14130,6 +14239,94 @@ mod tests {
 
         // Cleanup
         let _ = manager.delete_service(service_id).await;
+    }
+
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test]
+    async fn bulk_link_failure_preserves_every_creator_claim() {
+        use temps_entities::preset::Preset;
+        use temps_entities::users;
+
+        let (manager, test_db) = setup_test_manager_or_skip!();
+        let now = Utc::now();
+        let user = users::ActiveModel {
+            name: Set("Database Creator".to_string()),
+            email: Set(format!(
+                "bulk-link-creator-{}@test.local",
+                now.timestamp_nanos_opt().unwrap_or(0)
+            )),
+            email_verified: Set(true),
+            mfa_enabled: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("insert creator");
+        let project = projects::ActiveModel {
+            name: Set("atomic database links".to_string()),
+            preset: Set(Preset::Static),
+            slug: Set(format!("atomic-database-links-{}", now.timestamp_millis())),
+            directory: Set(".".to_string()),
+            main_branch: Set("main".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("insert project");
+
+        let mut service_ids = Vec::new();
+        for suffix in ["one", "two"] {
+            let service = external_services::ActiveModel {
+                name: Set(format!("atomic-postgres-{suffix}")),
+                service_type: Set("postgres".to_string()),
+                version: Set(Some("17".to_string())),
+                status: Set("creating".to_string()),
+                slug: Set(Some(format!("atomic-postgres-{suffix}"))),
+                created_by_user_id: Set(Some(user.id)),
+                created_at: Set(now),
+                updated_at: Set(now),
+                ..Default::default()
+            }
+            .insert(test_db.db.as_ref())
+            .await
+            .expect("insert claimed service");
+            service_ids.push(service.id);
+        }
+        let claims = service_ids
+            .iter()
+            .copied()
+            .map(|service_id| (service_id, user.id))
+            .collect::<BTreeMap<_, _>>();
+
+        let error = manager
+            .link_services_to_project_with_claims(&service_ids, project.id, &claims)
+            .await
+            .expect_err("duplicate database types must reject the whole bulk link");
+        assert!(matches!(
+            error,
+            ExternalServiceError::DuplicateServiceType { .. }
+        ));
+
+        let links = project_services::Entity::find()
+            .filter(project_services::Column::ProjectId.eq(project.id))
+            .all(test_db.db.as_ref())
+            .await
+            .expect("query project links");
+        assert!(links.is_empty(), "a failed bulk link must create no links");
+
+        let services = external_services::Entity::find()
+            .filter(external_services::Column::Id.is_in(service_ids))
+            .all(test_db.db.as_ref())
+            .await
+            .expect("query claimed services");
+        assert_eq!(services.len(), 2);
+        assert!(services
+            .iter()
+            .all(|service| service.created_by_user_id == Some(user.id)));
     }
 
     #[cfg(feature = "docker-tests")]

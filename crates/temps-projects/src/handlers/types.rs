@@ -1085,7 +1085,7 @@ impl From<ProjectError> for Problem {
 
             err @ (ProjectError::EnvironmentCreationFailed { .. }
             | ProjectError::EnvVarCreationFailed { .. }
-            | ProjectError::StorageLinkFailed { .. }) => {
+            | ProjectError::StorageLinksFailed { .. }) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Project Creation Failed")
                     .with_detail(err.to_string())

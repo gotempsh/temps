@@ -328,10 +328,10 @@ pub enum ProjectError {
         reason: String,
     },
 
-    #[error("Failed to link storage service {service_id} to project {project_id}: {reason}")]
-    StorageLinkFailed {
+    #[error("Failed to link storage services {service_ids:?} to project {project_id}: {reason}")]
+    StorageLinksFailed {
         project_id: i32,
-        service_id: i32,
+        service_ids: Vec<i32>,
         reason: String,
     },
 

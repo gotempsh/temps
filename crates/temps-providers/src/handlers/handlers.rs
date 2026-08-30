@@ -201,7 +201,7 @@ async fn import_external_service(
 
     let service = state
         .external_service_manager
-        .import_service(service_request)
+        .import_service_for_user(service_request, auth.user_id())
         .await
         .map_err(|e| {
             error!("Failed to import service: {}", e);
@@ -424,10 +424,18 @@ async fn list_services(
                 .list_services_paginated(page, page_size)
                 .await
         }
-        ExternalServiceListScope::ProjectLinked { hidden_project_ids } => {
+        ExternalServiceListScope::ProjectLinked {
+            hidden_project_ids,
+            creator_user_id,
+        } => {
             app_state
                 .external_service_manager
-                .list_project_accessible_services_paginated(page, page_size, &hidden_project_ids)
+                .list_project_accessible_services_paginated(
+                    page,
+                    page_size,
+                    &hidden_project_ids,
+                    creator_user_id,
+                )
                 .await
         }
     };
@@ -446,7 +454,10 @@ async fn list_services(
 #[derive(Debug, PartialEq, Eq)]
 enum ExternalServiceListScope {
     FleetWide,
-    ProjectLinked { hidden_project_ids: Vec<i32> },
+    ProjectLinked {
+        hidden_project_ids: Vec<i32>,
+        creator_user_id: i32,
+    },
 }
 
 async fn resolve_external_service_list_scope(
@@ -457,16 +468,17 @@ async fn resolve_external_service_list_scope(
         return Ok(ExternalServiceListScope::FleetWide);
     }
 
-    let Some(checker) = checker else {
-        return Ok(ExternalServiceListScope::ProjectLinked {
-            hidden_project_ids: Vec::new(),
-        });
-    };
     let Some(user_id) = auth.user_id_opt() else {
         return Err(forbidden()
             .title("Project Access Denied")
             .detail("Could not resolve caller identity")
             .build());
+    };
+    let Some(checker) = checker else {
+        return Ok(ExternalServiceListScope::ProjectLinked {
+            hidden_project_ids: Vec::new(),
+            creator_user_id: user_id,
+        });
     };
 
     checker
@@ -474,6 +486,7 @@ async fn resolve_external_service_list_scope(
         .await
         .map(|hidden| ExternalServiceListScope::ProjectLinked {
             hidden_project_ids: hidden.unwrap_or_default(),
+            creator_user_id: user_id,
         })
         .map_err(|error| {
             error!(user_id, error = %error, "Failed to resolve external-service list access");
@@ -858,32 +871,69 @@ async fn authorize_service_link_source(
     }
 
     let required = temps_auth::Permission::ExternalServicesWrite.to_string();
-    let mut infrastructure_error = None;
-    for project_id in &scope.project_ids {
-        match checker
-            .effective_project_permissions(auth.user_id(), *project_id)
-            .await
-        {
-            Ok(Some(permissions)) if permissions.contains(&required) => return Ok(None),
-            Ok(Some(_)) => {}
-            Ok(None) => match checker
-                .user_can_access_project(auth.user_id(), *project_id)
-                .await
-            {
-                Ok(true) => return Ok(None),
-                Ok(false) => {}
-                Err(error) => infrastructure_error = Some(error),
-            },
-            Err(error) => infrastructure_error = Some(error),
-        }
-    }
-
-    if let Some(error) = infrastructure_error {
-        error!(service_id = scope.service_id, error = %error, "service link authorization failed closed");
+    let permissions = checker
+        .effective_project_permissions_batch(auth.user_id(), &scope.project_ids)
+        .await
+        .map_err(|error| {
+            error!(service_id = scope.service_id, error = %error, "service link permission resolution failed closed");
+            internal_server_error()
+                .title("Service Authorization Failed")
+                .detail("Could not verify access to the selected database")
+                .build()
+        })?;
+    if scope
+        .project_ids
+        .iter()
+        .any(|project_id| !permissions.contains_key(project_id))
+    {
+        error!(
+            service_id = scope.service_id,
+            project_ids = ?scope.project_ids,
+            "service link permission result omitted a project"
+        );
         return Err(internal_server_error()
             .title("Service Authorization Failed")
             .detail("Could not verify access to the selected database")
             .build());
+    }
+    if permissions.values().any(
+        |permissions| matches!(permissions, Some(permissions) if permissions.contains(&required)),
+    ) {
+        return Ok(None);
+    }
+
+    let fallback_ids = scope
+        .project_ids
+        .iter()
+        .copied()
+        .filter(|project_id| matches!(permissions.get(project_id), Some(None)))
+        .collect::<Vec<_>>();
+    let coarse_access = checker
+        .user_can_access_projects(auth.user_id(), &fallback_ids)
+        .await
+        .map_err(|error| {
+            error!(service_id = scope.service_id, error = %error, "service link membership resolution failed closed");
+            internal_server_error()
+                .title("Service Authorization Failed")
+                .detail("Could not verify access to the selected database")
+                .build()
+        })?;
+    if fallback_ids
+        .iter()
+        .any(|project_id| !coarse_access.contains_key(project_id))
+    {
+        error!(
+            service_id = scope.service_id,
+            project_ids = ?fallback_ids,
+            "service link membership result omitted a project"
+        );
+        return Err(internal_server_error()
+            .title("Service Authorization Failed")
+            .detail("Could not verify access to the selected database")
+            .build());
+    }
+    if coarse_access.values().any(|allowed| *allowed) {
+        return Ok(None);
     }
 
     Err(forbidden()
@@ -1950,7 +2000,10 @@ async fn stop_service(
     request_body = LinkServiceRequest,
     responses(
         (status = 201, description = "Service linked to project successfully", body = ProjectServiceInfo),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permission to link this service"),
         (status = 404, description = "Service or project not found"),
+        (status = 409, description = "Project already has a database of this type"),
         (status = 500, description = "Internal server error")
     ),
     params(
@@ -2031,6 +2084,9 @@ async fn link_service_to_project(
                 .title("Service Claim Expired")
                 .detail("This database has already been claimed by another project")
                 .build()),
+            crate::services::ExternalServiceError::DuplicateServiceType { .. } => {
+                Err(conflict().detail(e.to_string()).build())
+            }
             _ => Err(internal_server_error()
                 .detail(format!("Failed to link service: {}", e))
                 .build()),
@@ -2045,6 +2101,8 @@ async fn link_service_to_project(
     tag = "External Services",
     responses(
         (status = 204, description = "Service unlinked from project successfully"),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permission to unlink this service"),
         (status = 404, description = "Service link not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -2094,8 +2152,11 @@ async fn unlink_service_from_project(
             }
             Ok(StatusCode::NO_CONTENT)
         }
-        Err(e) => match e.to_string().as_str() {
-            "Service link not found" => Err(not_found().detail(e.to_string()).build()),
+        Err(e) => match e {
+            crate::services::ExternalServiceError::ServiceNotFound { .. }
+            | crate::services::ExternalServiceError::ServiceNotLinkedToProject { .. } => {
+                Err(not_found().detail(e.to_string()).build())
+            }
             _ => Err(internal_server_error()
                 .detail(format!("Failed to unlink service: {}", e))
                 .build()),
@@ -2110,6 +2171,8 @@ async fn unlink_service_from_project(
     tag = "External Services",
     responses(
         (status = 200, description = "List of linked projects", body = Vec<ProjectServiceInfo>),
+        (status = 401, description = "Authentication required"),
+        (status = 403, description = "Insufficient permission to view this service"),
         (status = 404, description = "Service not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -2151,8 +2214,10 @@ async fn list_service_projects(
         .await
     {
         Ok(projects) => Ok((StatusCode::OK, Json(projects))),
-        Err(e) => match e.to_string().as_str() {
-            "Service not found" => Err(not_found().detail("Service not found").build()),
+        Err(e) => match e {
+            crate::services::ExternalServiceError::ServiceNotFound { .. } => {
+                Err(not_found().detail("Service not found").build())
+            }
             _ => Err(internal_server_error()
                 .detail(format!("Failed to list projects: {}", e))
                 .build()),
@@ -3085,6 +3150,58 @@ mod tests {
         calls: Mutex<usize>,
     }
 
+    struct BatchProjectAccessChecker {
+        permission_batch_calls: Mutex<usize>,
+        access_batch_calls: Mutex<usize>,
+    }
+
+    #[async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for BatchProjectAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("service-link authorization must use the batch access method")
+        }
+
+        async fn user_can_access_projects(
+            &self,
+            _user_id: i32,
+            project_ids: &[i32],
+        ) -> Result<std::collections::BTreeMap<i32, bool>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            *self
+                .access_batch_calls
+                .lock()
+                .expect("access batch counter mutex") += 1;
+            Ok(project_ids
+                .iter()
+                .copied()
+                .map(|project_id| (project_id, project_id == 11))
+                .collect())
+        }
+
+        async fn effective_project_permissions_batch(
+            &self,
+            _user_id: i32,
+            project_ids: &[i32],
+        ) -> Result<
+            std::collections::BTreeMap<i32, Option<Vec<String>>>,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            *self
+                .permission_batch_calls
+                .lock()
+                .expect("permission batch counter mutex") += 1;
+            Ok(project_ids
+                .iter()
+                .copied()
+                .map(|project_id| (project_id, None))
+                .collect())
+        }
+    }
+
     #[async_trait::async_trait]
     impl temps_core::ProjectAccessChecker for ListProjectAccessChecker {
         async fn user_can_access_project(
@@ -3156,7 +3273,8 @@ mod tests {
         assert_eq!(
             scope,
             ExternalServiceListScope::ProjectLinked {
-                hidden_project_ids: vec![10, 11]
+                hidden_project_ids: vec![10, 11],
+                creator_user_id: auth.user_id(),
             }
         );
         assert_eq!(*checker.calls.lock().expect("calls mutex"), 1);
@@ -3349,6 +3467,38 @@ mod tests {
             .await
             .expect_err("creator must use linked-project authorization after first claim");
         assert_eq!(problem.into_response().status(), StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn linked_service_authorization_batches_project_access_checks() {
+        let auth = test_auth_context_with_role(temps_auth::Role::Reader);
+        let checker = BatchProjectAccessChecker {
+            permission_batch_calls: Mutex::new(0),
+            access_batch_calls: Mutex::new(0),
+        };
+        let scope = crate::services::ExternalServiceProjectScope {
+            service_id: 7,
+            project_ids: vec![10, 11],
+            created_by_user_id: None,
+        };
+
+        authorize_service_link_source(&auth, &scope, Some(&checker))
+            .await
+            .expect("coarse access to one linked project should authorize the link");
+        assert_eq!(
+            *checker
+                .permission_batch_calls
+                .lock()
+                .expect("permission batch counter mutex"),
+            1
+        );
+        assert_eq!(
+            *checker
+                .access_batch_calls
+                .lock()
+                .expect("access batch counter mutex"),
+            1
+        );
     }
 
     #[tokio::test]

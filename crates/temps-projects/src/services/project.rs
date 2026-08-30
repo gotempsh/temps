@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use temps_core::url_validation::{redact_url_password, validate_git_url};
 use tracing::{error, info, warn};
@@ -1041,24 +1041,22 @@ impl ProjectService {
                 storage_service_ids.len(),
                 project.id
             );
-            for storage_service_id in storage_service_ids {
-                let claim_user_id = storage_service_claim_ids
-                    .contains(&storage_service_id)
-                    .then_some(storage_service_claim_user_id)
-                    .flatten();
-                self.external_service_manager
-                    .link_service_to_project_with_claim(
-                        storage_service_id,
-                        project.id,
-                        claim_user_id,
-                    )
-                    .await
-                    .map_err(|e| ProjectError::StorageLinkFailed {
-                        project_id: project.id,
-                        service_id: storage_service_id,
-                        reason: e.to_string(),
-                    })?;
-            }
+            let claims = storage_service_claim_user_id
+                .map(|user_id| {
+                    storage_service_claim_ids
+                        .into_iter()
+                        .map(|service_id| (service_id, user_id))
+                        .collect::<BTreeMap<_, _>>()
+                })
+                .unwrap_or_default();
+            self.external_service_manager
+                .link_services_to_project_with_claims(&storage_service_ids, project.id, &claims)
+                .await
+                .map_err(|e| ProjectError::StorageLinksFailed {
+                    project_id: project.id,
+                    service_ids: storage_service_ids,
+                    reason: e.to_string(),
+                })?;
         }
 
         Ok(default_environment)

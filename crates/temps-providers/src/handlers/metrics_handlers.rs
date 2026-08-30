@@ -1487,11 +1487,10 @@ fn validate_severity(sev: &str) -> Result<(), Problem> {
 /// permission can fetch metrics for any service ID — including services owned
 /// by other projects/tenants.  This violates row-level access control.
 ///
-/// The check joins `project_services` against the service ID.  If no row
-/// matches, it means either:
-/// - The service does not exist (return 404), or
-/// - The service exists but is not linked to the user's project (return 404
-///   — do not distinguish these cases to avoid leaking service existence).
+/// The check joins `project_services` against the service ID. A session caller
+/// may also access an unlinked service while its authenticated creator marker
+/// belongs to that caller; this is the bootstrap window between creating a
+/// database and selecting it for a project. Linking consumes that marker.
 ///
 /// For deployment tokens, the token's bound `project_id` is checked directly
 /// against `project_services`. For session/API-key/CLI callers there is no
@@ -1545,16 +1544,21 @@ pub(crate) async fn assert_service_owned_by_caller(
     // full project metadata with a `projects` table lookup per linked row,
     // which is unneeded N+1 cost here (only the IDs matter) on a path now
     // shared by every session/API-key/CLI request across 30+ handlers.
-    let service_exists = state
+    let service = state
         .external_service_manager
         .get_service(service_id)
         .await
-        .is_ok();
-    if !service_exists {
-        return Err(not_found()
-            .detail(format!("External service {} not found", service_id))
-            .build());
-    }
+        .map_err(|error| match error {
+            crate::services::ExternalServiceError::ServiceNotFound { .. } => not_found()
+                .detail(format!("External service {} not found", service_id))
+                .build(),
+            error => {
+                tracing::error!(service_id, error = %error, "assert_service_owned: service lookup failed");
+                internal_server_error()
+                    .detail("Failed to verify service ownership")
+                    .build()
+            }
+        })?;
 
     let project_ids: Vec<i32> = project_services::Entity::find()
         .filter(project_services::Column::ServiceId.eq(service_id))
@@ -1570,12 +1574,25 @@ pub(crate) async fn assert_service_owned_by_caller(
         .map(|link| link.project_id)
         .collect();
 
+    if unlinked_service_creator_may_access(auth.user_id(), &project_ids, service.created_by_user_id)
+    {
+        return Ok(());
+    }
+
     session_caller_may_access_linked_projects(
         auth,
         &project_ids,
         state.project_access_checker.as_deref(),
     )
     .await
+}
+
+fn unlinked_service_creator_may_access(
+    user_id: i32,
+    project_ids: &[i32],
+    created_by_user_id: Option<i32>,
+) -> bool {
+    project_ids.is_empty() && created_by_user_id == Some(user_id)
 }
 
 /// Pure authorization decision for the session/API-key/CLI branch of
@@ -1969,6 +1986,14 @@ mod tests {
     // row match), these callers have no single bound project, so ownership
     // is expressed through the `ProjectAccessChecker` EE extension point —
     // a no-op in OSS, real team-based enforcement in EE.
+
+    #[test]
+    fn creator_access_only_applies_while_service_is_unlinked() {
+        assert!(unlinked_service_creator_may_access(42, &[], Some(42)));
+        assert!(!unlinked_service_creator_may_access(42, &[], Some(7)));
+        assert!(!unlinked_service_creator_may_access(42, &[9], Some(42)));
+        assert!(!unlinked_service_creator_may_access(42, &[], None));
+    }
 
     struct TestProjectAccessChecker {
         allowed_project_ids: Vec<i32>,
