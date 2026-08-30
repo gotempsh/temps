@@ -1027,6 +1027,17 @@ impl ComposeExecutor {
             .await?;
         }
 
+        // 3. Pull images for plain `image:` services BEFORE tearing down old
+        // containers. Image-fetch latency (seconds to minutes on slow registries
+        // or fat images) would otherwise occur inside the downtime window between
+        // old-container-stop and new-container-healthy. By pulling here, while
+        // the old stack is still serving traffic, we minimise the actual gap.
+        // `--ignore-buildable` skips services that only have a `build:` directive
+        // (those were already handled above by `compose_build`), so this call is
+        // safe regardless of whether the project mixes built and pulled services.
+        self.compose_pull(&effective_dir, &project_name, compose_file, &redact_values)
+            .await?;
+
         // Ensure the shared Temps network exists before `up` attaches every
         // service to it (docker-compose.temps-network.yml, written above) —
         // this is the same network Temps-managed external services and
@@ -1034,7 +1045,10 @@ impl ComposeExecutor {
         // reach a Temps-managed database by name.
         self.ensure_temps_network_exists().await?;
 
-        // 3. Run docker compose up (pulls pre-built images, starts built + pulled).
+        // 4. Run docker compose up. Images are already pulled (step 3) or built
+        // (step 2), so `--pull never` would also work, but omitting `--pull`
+        // entirely lets Compose fall back to its default (only pull if absent
+        // locally), which is safe and avoids a redundant network round-trip.
         // If a user-provided `container_name` conflicts with an existing
         // container, let Compose report the conflict instead of deleting
         // containers outside this Temps project boundary.
@@ -1047,7 +1061,7 @@ impl ComposeExecutor {
         )
         .await?;
 
-        // 3b. `up -d` returns as soon as containers are created/started, not
+        // 4b. `up -d` returns as soon as containers are created/started, not
         // once they're actually ready. Wait for every service to reach
         // `running` (and `healthy`, for services that define a healthcheck)
         // so a crash-looping or slow-starting service surfaces as a failed
@@ -1062,12 +1076,12 @@ impl ComposeExecutor {
         )
         .await?;
 
-        // 4. Discover running containers
+        // 5. Discover running containers
         let containers = self
             .discover_containers(&effective_dir, &project_name, compose_file)
             .await?;
 
-        // 4. Apply Temps labels to each container
+        // 5b. Apply Temps labels to each container
         for container in &containers {
             if let Err(e) = self
                 .apply_labels(
@@ -3593,6 +3607,57 @@ impl ComposeExecutor {
             })
     }
 
+    /// Pull images for every `image:`-based service in the compose stack.
+    ///
+    /// This is intentionally a separate step from [`compose_up`] so that
+    /// image-fetch latency — which can range from seconds to minutes depending
+    /// on registry speed and image size — occurs while the *old* containers are
+    /// still running and serving traffic, not during the downtime window between
+    /// old-container-stop and new-container-healthy. By the time `compose_up`
+    /// tears down and recreates containers the images are already local, which
+    /// keeps the actual downtime window as short as possible.
+    ///
+    /// `--ignore-buildable` skips services that only declare a `build:` stanza
+    /// and have no pullable `image:` tag; those services are handled by
+    /// `compose_build`. This makes the call safe regardless of whether the
+    /// project mixes built and pulled services.
+    async fn compose_pull(
+        &self,
+        project_dir: &Path,
+        project_name: &str,
+        compose_file: &str,
+        redact_values: &[String],
+    ) -> Result<(), ComposeError> {
+        let mut cmd = isolated_docker_command();
+        cmd.args(["compose", "-p", project_name]);
+        Self::append_compose_file_args(&mut cmd, project_dir, compose_file);
+        Self::append_compose_env_file_args(&mut cmd, project_dir);
+
+        cmd.args(["pull", "--ignore-buildable"])
+            .current_dir(project_dir)
+            .env("PWD", project_dir.to_string_lossy().to_string());
+
+        // Cancellation drops the command future; terminate the Compose CLI so
+        // compensating `compose down` cannot race a still-running `compose pull`.
+        cmd.kill_on_drop(true);
+
+        debug!(project = %project_name, "Running docker compose pull");
+
+        let output = cmd.output().await?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = sanitize_compose_diagnostic(&stderr, redact_values);
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!("docker compose pull failed: {stderr}"),
+            });
+        }
+
+        info!(project = %project_name, "docker compose pull completed");
+        Ok(())
+    }
+
     async fn compose_up(
         &self,
         project_dir: &Path,
@@ -3606,15 +3671,8 @@ impl ComposeExecutor {
         Self::append_compose_file_args(&mut cmd, project_dir, compose_file);
         Self::append_compose_env_file_args(&mut cmd, project_dir);
 
-        cmd.args([
-            "up",
-            "-d",
-            "--pull",
-            "always",
-            "--remove-orphans",
-            "--force-recreate",
-        ])
-        .current_dir(project_dir);
+        cmd.args(["up", "-d", "--remove-orphans", "--force-recreate"])
+            .current_dir(project_dir);
 
         // Set PWD so compose files using ${PWD} resolve correctly
         cmd.env("PWD", project_dir.to_string_lossy().to_string());
