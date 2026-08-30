@@ -626,16 +626,39 @@ fn preflight_check_listen_addresses(proxy_config: &ProxyConfig) -> Result<()> {
 fn check_address_bindable(address: &str, env_var: &str) -> Result<()> {
     std::net::TcpListener::bind(address)
         .map(|_| ())
-        .map_err(|e| {
-            let port = address.rsplit(':').next().unwrap_or(address);
-            anyhow::anyhow!(
-                "Cannot start the proxy: failed to bind to {address}: {e}. Another process on \
+        .map_err(|e| anyhow::anyhow!(bind_failure_message(address, env_var, e.kind(), &e)))
+}
+
+/// Render an actionable message for a failed bind, distinguishing "something
+/// else already has this port" from "we're not allowed to bind this port" --
+/// binding to a port below 1024 without root/`CAP_NET_BIND_SERVICE` fails
+/// with `PermissionDenied`, not `AddrInUse`, and is common enough (`temps
+/// serve` run as a non-root user against the default 80/443) that lumping it
+/// into "another process is listening" would send the operator chasing a
+/// process that doesn't exist.
+fn bind_failure_message(
+    address: &str,
+    env_var: &str,
+    kind: std::io::ErrorKind,
+    err: &dyn std::fmt::Display,
+) -> String {
+    if kind == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "Cannot start the proxy: not permitted to bind to {address}: {err}. Binding to \
+             ports below 1024 usually requires root or `CAP_NET_BIND_SERVICE` (Linux: \
+             `sudo setcap 'cap_net_bind_service=+ep' $(which temps)`). Either run Temps with \
+             that capability, or set {env_var} to a port >= 1024 and restart."
+        )
+    } else {
+        let port = address.rsplit(':').next().unwrap_or(address);
+        format!(
+            "Cannot start the proxy: failed to bind to {address}: {err}. Another process on \
              this machine is already listening on that port -- find it with \
              `lsof -iTCP:{port} -sTCP:LISTEN -n -P` (macOS/Linux) or `ss -ltnp | grep :{port}` \
              (Linux), stop it, then restart Temps. To use a different port instead, set \
              {env_var} and restart."
-            )
-        })
+        )
+    }
 }
 
 /// Create a proxy service with the given configuration
@@ -759,6 +782,32 @@ mod preflight_bind_tests {
 
         let result = check_address_bindable(&addr, "TEMPS_ADDRESS");
         assert!(result.is_ok(), "expected free port to bind, got {result:?}");
+    }
+
+    #[test]
+    fn bind_failure_message_explains_permission_denied_separately_from_port_taken() {
+        // Can't reliably trigger a real EACCES portably (CI may run as root),
+        // so exercise the pure message-selection logic directly instead of
+        // going through an actual privileged bind.
+        let message = bind_failure_message(
+            "0.0.0.0:80",
+            "TEMPS_ADDRESS",
+            std::io::ErrorKind::PermissionDenied,
+            &"permission denied (os error 13)",
+        );
+        assert!(
+            message.contains("CAP_NET_BIND_SERVICE"),
+            "permission-denied message should explain the capability fix: {message}"
+        );
+        assert!(
+            message.contains("TEMPS_ADDRESS"),
+            "permission-denied message should name the env var to reconfigure: {message}"
+        );
+        assert!(
+            !message.contains("lsof"),
+            "permission-denied message should not send the operator hunting for a process \
+             that doesn't exist: {message}"
+        );
     }
 
     #[test]
