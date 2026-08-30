@@ -437,9 +437,20 @@ impl CloudLink {
             .dropped();
         let dropped = spool_dropped.saturating_add(self.incoming_dropped.load(Ordering::Relaxed));
         if dropped > 0 {
+            // Refresh the counts but keep whatever reason the last delivery
+            // attempt (or producer backpressure, which never sees one) left
+            // behind — never overwrite it with a blank one.
+            let reason = match &*self.health.read().unwrap_or_else(|p| p.into_inner()) {
+                MirrorHealth::Dropping { reason, .. } | MirrorHealth::Buffering { reason, .. } => {
+                    reason.clone()
+                }
+                _ => "spans were discarded before a mirror delivery attempt could report why"
+                    .to_string(),
+            };
             return MirrorHealth::Dropping {
                 spooled: self.spooled(),
                 dropped,
+                reason,
             };
         }
         self.health
@@ -1042,7 +1053,11 @@ impl CloudLink {
                     .saturating_add(self.incoming_dropped.load(Ordering::Relaxed));
 
                 *self.health.write().unwrap_or_else(|p| p.into_inner()) = if dropped > 0 {
-                    MirrorHealth::Dropping { spooled, dropped }
+                    MirrorHealth::Dropping {
+                        spooled,
+                        dropped,
+                        reason: e.to_string(),
+                    }
                 } else {
                     MirrorHealth::Buffering {
                         spooled,

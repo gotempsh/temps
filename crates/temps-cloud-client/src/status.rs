@@ -78,7 +78,11 @@ pub enum MirrorHealth {
     Buffering { spooled: usize, reason: String },
     /// The spool overflowed and telemetry was discarded. This is the one state
     /// that must never be quiet.
-    Dropping { spooled: usize, dropped: u64 },
+    Dropping {
+        spooled: usize,
+        dropped: u64,
+        reason: String,
+    },
     /// Accepted, but the backend is degrading us (e.g. over quota).
     Degraded { detail: Unavailable },
 }
@@ -91,9 +95,13 @@ impl MirrorHealth {
                 "{spooled} spans awaiting mirror delivery — {reason}. Source telemetry remains \
                  in local Temps storage."
             ),
-            MirrorHealth::Dropping { spooled, dropped } => format!(
+            MirrorHealth::Dropping {
+                spooled,
+                dropped,
+                reason,
+            } => format!(
                 "Local buffer is full: {dropped} spans discarded, {spooled} still queued. \
-                 The backend has been unreachable long enough to overflow the buffer."
+                 Last delivery attempt failed: {reason}."
             ),
             MirrorHealth::Degraded { detail } => match detail {
                 Unavailable::QuotaExhausted {
@@ -189,9 +197,15 @@ mod tests {
         let dropping = MirrorHealth::Dropping {
             spooled: 10_000,
             dropped: 523,
+            reason: "backend returned 500".into(),
         };
         assert!(dropping.is_losing_data());
         assert!(dropping.message().contains("523"), "must state how many");
+        assert!(
+            dropping.message().contains("backend returned 500"),
+            "must state why: {}",
+            dropping.message()
+        );
     }
 
     #[test]

@@ -212,6 +212,8 @@ async fn a_saturated_ingest_queue_drops_only_the_mirror_and_reports_it() {
         MirrorHealth::Dropping {
             spooled: 8,
             dropped: 1,
+            reason: "spans were discarded before a mirror delivery attempt could report why"
+                .to_string(),
         },
         "mirror pressure must be visible without affecting local ingest"
     );
