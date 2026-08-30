@@ -24,11 +24,22 @@ import {
   getServiceEnvironmentVariables,
   getServiceEnvironmentVariable,
   getProjectBySlug,
+  externalServiceMetricsGetRange,
+  externalServiceMetricsGetLatest,
+  externalServiceMetricsStatus,
+  externalServiceMetricsByDatabase,
+  externalServiceMetricsToggle,
+  externalServiceMetricsGetAlertRules,
+  externalServiceMetricsCreateAlertRule,
+  externalServiceMetricsUpdateAlertRule,
+  externalServiceMetricsDeleteAlertRule,
 } from '../../api/sdk.gen.js'
 import type {
   CreatableServiceTypeRoute,
   ExternalServiceInfo,
   ServiceTypeRoute,
+  ServiceAlertRuleResponse,
+  MetricDataPoint,
 } from '../../api/types.gen.js'
 import { requireProjectSlug } from '../../config/resolve-project.js'
 import { withSpinner } from '../../ui/spinner.js'
@@ -403,6 +414,105 @@ export function registerServicesCommands(program: Command): void {
     .requiredOption('--id <id>', 'Service ID')
     .option('-y, --yes', 'Skip the restart confirmation prompt (for automation)')
     .action(serviceEnablePgStatStatementsAction)
+
+  const metrics = services
+    .command('metrics')
+    .description('Resource and engine metrics for a database/cache/storage service')
+
+  metrics
+    .command('latest')
+    .description('Show the most recent value of every tracked metric')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsLatestAction)
+
+  metrics
+    .command('range')
+    .description('Show a time-series range for a single metric')
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('-m, --metric <name>', 'Metric name, e.g. "pg.connections_active"')
+    .option('-r, --range <window>', 'Time window: 1h, 6h, 24h, 7d (default: 24h)')
+    .option('-p, --percentile <n>', 'Histogram percentile (0-100) instead of a plain average')
+    .option('--json', 'Output raw JSON instead of a formatted table')
+    .action(serviceMetricsRangeAction)
+
+  metrics
+    .command('status')
+    .description('Show when metrics were last received for a service')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsStatusAction)
+
+  metrics
+    .command('by-database')
+    .description('Per-database metric breakdown (PostgreSQL services only)')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsByDatabaseAction)
+
+  metrics
+    .command('enable')
+    .description('Enable metric collection for a service (seeds default alert rules)')
+    .requiredOption('--id <id>', 'Service ID')
+    .action(serviceMetricsEnableAction)
+
+  metrics
+    .command('disable')
+    .description('Disable metric collection for a service')
+    .requiredOption('--id <id>', 'Service ID')
+    .action(serviceMetricsDisableAction)
+
+  const alertRules = metrics
+    .command('alert-rules')
+    .description('Manage monitoring alert rules for a service')
+
+  alertRules
+    .command('list')
+    .alias('ls')
+    .description('List alert rules for a service')
+    .requiredOption('--id <id>', 'Service ID')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsAlertRulesListAction)
+
+  alertRules
+    .command('create')
+    .alias('add')
+    .description('Create an alert rule for a service')
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('-n, --name <name>', 'Alert rule name')
+    .requiredOption('-m, --metric <name>', 'Metric name, e.g. "pg.connections_active"')
+    .requiredOption('-c, --comparator <op>', 'Comparator: >, <, >=, <=')
+    .requiredOption('-t, --threshold <n>', 'Threshold value that triggers the alert')
+    .option('-s, --severity <level>', 'warning or critical (default: warning)')
+    .option('--for-duration <secs>', 'Seconds the breach must persist before firing (default: 0)')
+    .option('--disabled', 'Create the rule disabled')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsAlertRulesCreateAction)
+
+  alertRules
+    .command('update')
+    .description('Update an existing alert rule')
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('--rule-id <id>', 'Alert rule ID')
+    .option('-n, --name <name>', 'Alert rule name')
+    .option('-m, --metric <name>', 'Metric name')
+    .option('-c, --comparator <op>', 'Comparator: >, <, >=, <=')
+    .option('-t, --threshold <n>', 'Threshold value')
+    .option('-s, --severity <level>', 'warning or critical')
+    .option('--for-duration <secs>', 'Seconds the breach must persist before firing')
+    .option('--enable', 'Enable the rule')
+    .option('--disable', 'Disable the rule')
+    .option('--json', 'Output in JSON format')
+    .action(serviceMetricsAlertRulesUpdateAction)
+
+  alertRules
+    .command('remove')
+    .alias('rm')
+    .description('Delete an alert rule')
+    .requiredOption('--id <id>', 'Service ID')
+    .requiredOption('--rule-id <id>', 'Alert rule ID')
+    .option('-y, --yes', 'Skip confirmation prompt')
+    .action(serviceMetricsAlertRulesRemoveAction)
 
   // Restore-related commands: capabilities, list backups on an S3 source,
   // kick off a restore (in-place / clone / PITR), show / list runs.
@@ -1649,4 +1759,496 @@ async function serviceEnablePgStatStatementsAction(
 
   success(`pg_stat_statements enabled — service ${id} has been restarted.`)
   info(`Run "temps services slow-queries --id ${id}" to view query stats.`)
+}
+
+// ── services metrics ────────────────────────────────────────────────────────
+
+/** Parse and validate a required numeric `--id`, warning and returning
+ *  `undefined` (rather than throwing) so callers can early-return cleanly. */
+function parseServiceId(raw: string): number | undefined {
+  const id = parseInt(raw, 10)
+  if (isNaN(id)) {
+    warning('Invalid service ID — --id must be a numeric service ID')
+    return undefined
+  }
+  return id
+}
+
+interface ServiceMetricsLatestOptions {
+  id: string
+  json?: boolean
+}
+
+async function serviceMetricsLatestAction(options: ServiceMetricsLatestOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const latest = await withSpinner('Fetching latest metrics…', async () => {
+    const { data, error } = await externalServiceMetricsGetLatest({ client, path: { id } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data ?? {}
+  })
+
+  if (options.json) {
+    json(latest)
+    return
+  }
+
+  const entries = Object.entries(latest)
+  newline()
+  header(`${icons.info} Latest Metrics — Service ${id}`)
+
+  if (entries.length === 0) {
+    info('No metrics recorded yet for this service')
+    info(`Run: temps services metrics enable --id ${id} to start collecting metrics`)
+    newline()
+    return
+  }
+
+  for (const [name, value] of entries.sort(([a], [b]) => a.localeCompare(b))) {
+    keyValue(name, value)
+  }
+  newline()
+}
+
+interface ServiceMetricsRangeOptions {
+  id: string
+  metric: string
+  range?: string
+  percentile?: string
+  json?: boolean
+}
+
+async function serviceMetricsRangeAction(options: ServiceMetricsRangeOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const percentile = options.percentile !== undefined ? Number(options.percentile) : undefined
+  if (percentile !== undefined && (isNaN(percentile) || percentile < 0 || percentile > 100)) {
+    warning('Invalid --percentile — must be a number between 0 and 100')
+    return
+  }
+
+  const points = await withSpinner(`Fetching "${options.metric}"…`, async () => {
+    const { data, error } = await externalServiceMetricsGetRange({
+      client,
+      path: { id },
+      query: {
+        metric: options.metric,
+        range: options.range,
+        percentile,
+      },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data ?? []
+  })
+
+  if (options.json) {
+    json(points)
+    return
+  }
+
+  newline()
+  header(`${icons.info} ${options.metric} — Service ${id} (${options.range ?? '24h'})`)
+
+  if (points.length === 0) {
+    info('No data points in this time range')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<MetricDataPoint>[] = [
+    { header: 'Time', accessor: (p) => formatLogTs(p.time) },
+    { header: 'Value', accessor: (p) => p.value.toString(), align: 'right' },
+  ]
+
+  printTable(points, columns)
+  newline()
+  info(`${points.length} data point${points.length === 1 ? '' : 's'}`)
+}
+
+interface ServiceMetricsStatusOptions {
+  id: string
+  json?: boolean
+}
+
+async function serviceMetricsStatusAction(options: ServiceMetricsStatusOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const status = await withSpinner('Fetching metrics status…', async () => {
+    const { data, error } = await externalServiceMetricsStatus({ client, path: { id } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(status)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Metrics Status — Service ${id}`)
+  if (status?.last_received_at) {
+    keyValue('Last received', new Date(status.last_received_at).toLocaleString())
+  } else {
+    info('No metrics received yet')
+    info(`Run: temps services metrics enable --id ${id} to start collecting metrics`)
+  }
+  newline()
+}
+
+interface ServiceMetricsByDatabaseOptions {
+  id: string
+  json?: boolean
+}
+
+async function serviceMetricsByDatabaseAction(options: ServiceMetricsByDatabaseOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const result = await withSpinner('Fetching per-database metrics…', async () => {
+    const { data, error } = await externalServiceMetricsByDatabase({ client, path: { id } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(result)
+    return
+  }
+
+  const databases = result?.databases ?? []
+  newline()
+  header(`${icons.info} Databases — Service ${id} (${databases.length})`)
+
+  if (databases.length === 0) {
+    info('No per-database metrics recorded yet')
+    newline()
+    return
+  }
+
+  for (const row of databases) {
+    header(row.database)
+    for (const [metric, value] of Object.entries(row.metrics).sort(([a], [b]) => a.localeCompare(b))) {
+      keyValue(metric, value)
+    }
+    newline()
+  }
+}
+
+interface ServiceMetricsToggleOptions {
+  id: string
+}
+
+async function serviceMetricsEnableAction(options: ServiceMetricsToggleOptions): Promise<void> {
+  await toggleServiceMetrics(options.id, true)
+}
+
+async function serviceMetricsDisableAction(options: ServiceMetricsToggleOptions): Promise<void> {
+  await toggleServiceMetrics(options.id, false)
+}
+
+async function toggleServiceMetrics(rawId: string, enabled: boolean): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(rawId)
+  if (id === undefined) return
+
+  await withSpinner(`${enabled ? 'Enabling' : 'Disabling'} metric collection…`, async () => {
+    const { error } = await externalServiceMetricsToggle({
+      client,
+      path: { id },
+      body: { enabled },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+  })
+
+  success(`Metric collection ${enabled ? 'enabled' : 'disabled'} for service ${id}`)
+  if (enabled) {
+    info(`Run: temps services metrics latest --id ${id} once data has been collected`)
+  }
+}
+
+interface ServiceMetricsAlertRulesListOptions {
+  id: string
+  json?: boolean
+}
+
+async function serviceMetricsAlertRulesListAction(
+  options: ServiceMetricsAlertRulesListOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const rules = await withSpinner('Fetching alert rules…', async () => {
+    const { data, error } = await externalServiceMetricsGetAlertRules({ client, path: { id } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data ?? []
+  })
+
+  if (options.json) {
+    json(rules)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Alert Rules — Service ${id} (${rules.length})`)
+
+  if (rules.length === 0) {
+    info('No alert rules configured')
+    info(`Run: temps services metrics alert-rules create --id ${id} --name ... to add one`)
+    newline()
+    return
+  }
+
+  const columns: TableColumn<ServiceAlertRuleResponse>[] = [
+    { header: 'ID', key: 'id', width: 6 },
+    { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
+    { header: 'Metric', key: 'metric_name' },
+    { header: 'Condition', accessor: (r) => `${r.comparator} ${r.threshold}` },
+    { header: 'For', accessor: (r) => `${r.for_duration_secs}s` },
+    { header: 'Severity', key: 'severity' },
+    { header: 'Enabled', accessor: (r) => (r.enabled ? 'yes' : 'no') },
+  ]
+
+  printTable(rules, columns, { style: 'minimal' })
+  newline()
+}
+
+interface ServiceMetricsAlertRulesCreateOptions {
+  id: string
+  name: string
+  metric: string
+  comparator: string
+  threshold: string
+  severity?: string
+  forDuration?: string
+  disabled?: boolean
+  json?: boolean
+}
+
+const VALID_COMPARATORS = new Set(['>', '<', '>=', '<='])
+
+async function serviceMetricsAlertRulesCreateAction(
+  options: ServiceMetricsAlertRulesCreateOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  if (!VALID_COMPARATORS.has(options.comparator)) {
+    warning(`Invalid --comparator "${options.comparator}" — must be one of >, <, >=, <=`)
+    return
+  }
+
+  const threshold = Number(options.threshold)
+  if (isNaN(threshold)) {
+    warning('Invalid --threshold — must be a number')
+    return
+  }
+
+  const forDurationSecs = options.forDuration !== undefined ? Number(options.forDuration) : undefined
+  if (forDurationSecs !== undefined && (isNaN(forDurationSecs) || forDurationSecs < 0)) {
+    warning('Invalid --for-duration — must be a non-negative number of seconds')
+    return
+  }
+
+  const severity = options.severity ?? 'warning'
+  if (severity !== 'warning' && severity !== 'critical') {
+    warning('Invalid --severity — must be "warning" or "critical"')
+    return
+  }
+
+  const rule = await withSpinner('Creating alert rule…', async () => {
+    const { data, error } = await externalServiceMetricsCreateAlertRule({
+      client,
+      path: { id },
+      body: {
+        name: options.name,
+        metric_name: options.metric,
+        comparator: options.comparator,
+        threshold,
+        severity,
+        for_duration_secs: forDurationSecs,
+        enabled: !options.disabled,
+      },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(rule)
+    return
+  }
+
+  success(`Alert rule "${options.name}" created (ID: ${rule?.id})`)
+}
+
+interface ServiceMetricsAlertRulesUpdateOptions {
+  id: string
+  ruleId: string
+  name?: string
+  metric?: string
+  comparator?: string
+  threshold?: string
+  severity?: string
+  forDuration?: string
+  enable?: boolean
+  disable?: boolean
+  json?: boolean
+}
+
+async function serviceMetricsAlertRulesUpdateAction(
+  options: ServiceMetricsAlertRulesUpdateOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const ruleId = parseInt(options.ruleId, 10)
+  if (isNaN(ruleId)) {
+    warning('Invalid --rule-id — must be a numeric alert rule ID')
+    return
+  }
+
+  if (options.comparator !== undefined && !VALID_COMPARATORS.has(options.comparator)) {
+    warning(`Invalid --comparator "${options.comparator}" — must be one of >, <, >=, <=`)
+    return
+  }
+
+  if (options.severity !== undefined && options.severity !== 'warning' && options.severity !== 'critical') {
+    warning('Invalid --severity — must be "warning" or "critical"')
+    return
+  }
+
+  if (options.enable && options.disable) {
+    warning('Cannot pass both --enable and --disable')
+    return
+  }
+
+  let threshold: number | undefined
+  if (options.threshold !== undefined) {
+    threshold = Number(options.threshold)
+    if (isNaN(threshold)) {
+      warning('Invalid --threshold — must be a number')
+      return
+    }
+  }
+
+  let forDurationSecs: number | undefined
+  if (options.forDuration !== undefined) {
+    forDurationSecs = Number(options.forDuration)
+    if (isNaN(forDurationSecs) || forDurationSecs < 0) {
+      warning('Invalid --for-duration — must be a non-negative number of seconds')
+      return
+    }
+  }
+
+  const rule = await withSpinner('Updating alert rule…', async () => {
+    const { data, error } = await externalServiceMetricsUpdateAlertRule({
+      client,
+      path: { id, rule_id: ruleId },
+      body: {
+        name: options.name,
+        metric_name: options.metric,
+        comparator: options.comparator,
+        threshold,
+        severity: options.severity,
+        for_duration_secs: forDurationSecs,
+        enabled: options.enable ? true : options.disable ? false : undefined,
+      },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(rule)
+    return
+  }
+
+  success(`Alert rule ${ruleId} updated`)
+}
+
+interface ServiceMetricsAlertRulesRemoveOptions {
+  id: string
+  ruleId: string
+  yes?: boolean
+}
+
+async function serviceMetricsAlertRulesRemoveAction(
+  options: ServiceMetricsAlertRulesRemoveOptions,
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseServiceId(options.id)
+  if (id === undefined) return
+
+  const ruleId = parseInt(options.ruleId, 10)
+  if (isNaN(ruleId)) {
+    warning('Invalid --rule-id — must be a numeric alert rule ID')
+    return
+  }
+
+  if (!options.yes) {
+    const confirmed = await promptConfirm({
+      message: `Delete alert rule ${ruleId} on service ${id}?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  await withSpinner('Deleting alert rule…', async () => {
+    const { error } = await externalServiceMetricsDeleteAlertRule({
+      client,
+      path: { id, rule_id: ruleId },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+  })
+
+  success(`Alert rule ${ruleId} deleted`)
 }
