@@ -11,6 +11,9 @@ import {
   truncateQuery,
   buildSlowQueriesErrorMessage,
   buildEnablePgStatStatementsErrorMessage,
+  parsePositiveIntId,
+  isValidComparator,
+  isValidSeverity,
 } from './index.js'
 
 describe('schemaToPromptParams', () => {
@@ -168,5 +171,53 @@ describe('buildEnablePgStatStatementsErrorMessage', () => {
 
   test('passes other errors through untouched', () => {
     expect(buildEnablePgStatStatementsErrorMessage('permission denied')).toBe('permission denied')
+  })
+})
+
+describe('parsePositiveIntId', () => {
+  test('parses a positive integer string', () => {
+    expect(parsePositiveIntId('42')).toBe(42)
+  })
+
+  test('rejects zero', () => {
+    expect(parsePositiveIntId('0')).toBeUndefined()
+  })
+
+  test('rejects a negative number', () => {
+    expect(parsePositiveIntId('-1')).toBeUndefined()
+  })
+
+  test('rejects non-numeric input', () => {
+    expect(parsePositiveIntId('not-a-number')).toBeUndefined()
+  })
+
+  test('parses the leading digits of a mixed string, matching parseInt semantics', () => {
+    expect(parsePositiveIntId('42abc')).toBe(42)
+  })
+})
+
+describe('isValidComparator', () => {
+  test('accepts every comparator the backend supports', () => {
+    for (const op of ['>', '<', '>=', '<=']) {
+      expect(isValidComparator(op)).toBe(true)
+    }
+  })
+
+  test('rejects an unsupported operator', () => {
+    expect(isValidComparator('=')).toBe(false)
+    expect(isValidComparator('!=')).toBe(false)
+    expect(isValidComparator('')).toBe(false)
+  })
+})
+
+describe('isValidSeverity', () => {
+  test('accepts "warning" and "critical"', () => {
+    expect(isValidSeverity('warning')).toBe(true)
+    expect(isValidSeverity('critical')).toBe(true)
+  })
+
+  test('rejects any other value', () => {
+    expect(isValidSeverity('catastrophic')).toBe(false)
+    expect(isValidSeverity('')).toBe(false)
   })
 })
