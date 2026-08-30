@@ -923,7 +923,6 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       errorTitle: 'Failed to create deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment created successfully')
       setIsRedeployModalOpen(false)
     },
   })
@@ -935,7 +934,6 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       errorTitle: 'Failed to redeploy image',
     },
     onSuccess: () => {
-      toast.success('Deployment created successfully')
       setIsRedeployModalOpen(false)
     },
   })

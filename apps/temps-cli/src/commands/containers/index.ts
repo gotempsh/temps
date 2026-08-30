@@ -71,9 +71,11 @@ export function registerContainersCommands(program: Command): void {
 
   containers
     .command('history')
-    .description('List every container that has ever run in an environment, including ones replaced by a later redeploy')
+    .description('List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included')
     .requiredOption('-p, --project-id <id>', 'Project ID')
     .requiredOption('-e, --environment-id <id>', 'Environment ID')
+    .option('-d, --deployment-id <id>', 'Only list containers belonging to this deployment')
+    .option('-l, --limit <count>', 'Max REPLACED container rows to return on top of the running ones, newest first (default 20, max 100)')
     .option('--json', 'Output in JSON format')
     .action(listContainerHistoryAction)
 
@@ -189,7 +191,13 @@ async function listContainersAction(
 }
 
 async function listContainerHistoryAction(
-  options: { projectId: string; environmentId: string; json?: boolean }
+  options: {
+    projectId: string
+    environmentId: string
+    deploymentId?: string
+    limit?: string
+    json?: boolean
+  }
 ): Promise<void> {
   await requireAuth()
   await setupClient()
@@ -201,12 +209,33 @@ async function listContainerHistoryAction(
     return
   }
 
+  let deploymentId: number | undefined
+  if (options.deploymentId !== undefined) {
+    deploymentId = parseInt(options.deploymentId, 10)
+    if (isNaN(deploymentId)) {
+      warning('Invalid deployment ID')
+      return
+    }
+  }
+
+  let limit: number | undefined
+  if (options.limit !== undefined) {
+    limit = parseInt(options.limit, 10)
+    if (isNaN(limit)) {
+      warning('Invalid limit')
+      return
+    }
+  }
+
+  let totalCount = 0
   const containers = await withSpinner('Fetching container history...', async () => {
     const { data, error } = await listContainerHistory({
       client,
       path: { project_id: projId, environment_id: envId },
+      query: { deployment_id: deploymentId, limit },
     })
     if (error) throw new Error(getErrorMessage(error))
+    totalCount = data?.total_count ?? 0
     return data?.containers ?? []
   })
 
@@ -216,7 +245,11 @@ async function listContainerHistoryAction(
   }
 
   newline()
-  header(`${icons.info} Container history (${containers.length})`)
+  const title =
+    totalCount > containers.length
+      ? `${icons.info} Container history (${containers.length} of ${totalCount})`
+      : `${icons.info} Container history (${containers.length})`
+  header(title)
 
   if (containers.length === 0) {
     info('No containers have ever run in this environment')

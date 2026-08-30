@@ -3210,6 +3210,11 @@ export type ContainerHistoryEntry = {
 
 export type ContainerHistoryListResponse = {
     containers: Array<ContainerHistoryEntry>;
+    /**
+     * Total number of container rows matching the filter, before `limit`
+     * was applied — lets the client show "20 of 627".
+     */
+    total_count: number;
 };
 
 export type ContainerInfoResponse = {
@@ -44776,13 +44781,27 @@ export type ListContainerHistoryData = {
          */
         environment_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Only return containers belonging to this deployment. Omit to list
+         * containers across every deployment the environment has ever had.
+         */
+        deployment_id?: number | null;
+        /**
+         * Maximum number of *replaced* container rows to return, most recently
+         * replaced first (default 20, max 100). Every currently-running
+         * container is always included and does not count against this limit —
+         * it only bounds how much historical (replaced-by-redeploy) context
+         * comes back alongside them.
+         */
+        limit?: number | null;
+    };
     url: '/projects/{project_id}/environments/{environment_id}/container-history';
 };
 
 export type ListContainerHistoryErrors = {
     /**
-     * Environment not found
+     * Environment or deployment not found
      */
     404: ProblemDetails;
     /**
@@ -44795,7 +44814,7 @@ export type ListContainerHistoryError = ListContainerHistoryErrors[keyof ListCon
 
 export type ListContainerHistoryResponses = {
     /**
-     * Every container that has ever run for this environment, current and replaced
+     * Containers that have run for this environment: every currently-running one first (uncapped), then the newest replaced ones up to `limit`
      */
     200: ContainerHistoryListResponse;
 };

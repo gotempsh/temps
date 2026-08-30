@@ -987,9 +987,26 @@ pub struct ContainerHistoryEntry {
     pub is_current: bool,
 }
 
+/// Query parameters for the environment container-history endpoint.
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct ContainerHistoryQuery {
+    /// Only return containers belonging to this deployment. Omit to list
+    /// containers across every deployment the environment has ever had.
+    pub deployment_id: Option<i32>,
+    /// Maximum number of *replaced* container rows to return, most recently
+    /// replaced first (default 20, max 100). Every currently-running
+    /// container is always included and does not count against this limit —
+    /// it only bounds how much historical (replaced-by-redeploy) context
+    /// comes back alongside them.
+    pub limit: Option<u64>,
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct ContainerHistoryListResponse {
     pub containers: Vec<ContainerHistoryEntry>,
+    /// Total number of container rows matching the filter, before `limit`
+    /// was applied — lets the client show "20 of 627".
+    pub total_count: u64,
 }
 
 /// Response indicating success of container state change

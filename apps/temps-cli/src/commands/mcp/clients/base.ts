@@ -3,7 +3,12 @@
 
 import * as fs from 'node:fs'
 import * as path from 'node:path'
-import * as jsonc from 'jsonc-parser'
+// jsonc-parser's package.json `main` points at a UMD build whose dynamic
+// require() of sibling files (e.g. `./impl/format`) doesn't survive Bun's
+// single-file bundle -- those files never get inlined, so Node throws
+// MODULE_NOT_FOUND at runtime. The ESM build uses static imports Bun can
+// inline correctly, so import it directly rather than via the package root.
+import * as jsonc from 'jsonc-parser/lib/esm/main.js'
 
 export interface McpServerEntry {
   url: string

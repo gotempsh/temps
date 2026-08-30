@@ -131,7 +131,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         }
         setSearchParams({}, { replace: true })
         initialDeploymentCountRef.current = null
-        toast.success('New deployment detected!')
       } else {
         // No new deployment yet, set up refresh interval
         if (!refreshIntervalRef.current) {

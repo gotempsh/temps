@@ -6497,10 +6497,17 @@
               "$ref": "#/components/schemas/ContainerHistoryEntry"
             },
             "type": "array"
+          },
+          "total_count": {
+            "description": "Total number of container rows matching the filter, before `limit`\nwas applied — lets the client show \"20 of 627\".",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
           }
         },
         "required": [
-          "containers"
+          "containers",
+          "total_count"
         ],
         "type": "object"
       },
@@ -83989,6 +83996,33 @@
               "format": "int32",
               "type": "integer"
             }
+          },
+          {
+            "description": "Only return containers belonging to this deployment. Omit to list\ncontainers across every deployment the environment has ever had.",
+            "in": "query",
+            "name": "deployment_id",
+            "required": false,
+            "schema": {
+              "format": "int32",
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Maximum number of *replaced* container rows to return, most recently\nreplaced first (default 20, max 100). Every currently-running\ncontainer is always included and does not count against this limit —\nit only bounds how much historical (replaced-by-redeploy) context\ncomes back alongside them.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
@@ -84000,7 +84034,7 @@
                 }
               }
             },
-            "description": "Every container that has ever run for this environment, current and replaced"
+            "description": "Containers that have run for this environment: every currently-running one first (uncapped), then the newest replaced ones up to `limit`"
           },
           "404": {
             "content": {
@@ -84010,7 +84044,7 @@
                 }
               }
             },
-            "description": "Environment not found"
+            "description": "Environment or deployment not found"
           },
           "500": {
             "content": {

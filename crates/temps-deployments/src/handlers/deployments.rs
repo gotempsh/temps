@@ -37,14 +37,14 @@ use crate::handlers::failure_report::*;
 use crate::handlers::types::{
     ActivityDay, ActivityGraphQuery, ActivityGraphResponse, ContainerActionResponse,
     ContainerDetailResponse, ContainerEnvironmentVariableValueResponse, ContainerHistoryEntry,
-    ContainerHistoryListResponse, ContainerInfoResponse, ContainerListResponse, ContainerLogsQuery,
-    ContainerMetricHistoryPoint, ContainerMetricsHistoryQuery, ContainerMetricsResponse,
-    DeploymentContainerLogContentResponse, DeploymentContainerLogResponse,
-    DeploymentContainerLogsListResponse, DeploymentJobResponse, DeploymentJobsResponse,
-    DeploymentListResponse, DeploymentResponse, DeploymentStateResponse, EnvVarResponse,
-    FailureReportPreviewResponse, LatestDeploymentMediaResponse, LatestDeploymentMediaResponseItem,
-    ManagedEnvironmentVariablesQuery, PromoteDeploymentRequest, ResourceLimitsResponse,
-    SendFailureReportRequest,
+    ContainerHistoryListResponse, ContainerHistoryQuery, ContainerInfoResponse,
+    ContainerListResponse, ContainerLogsQuery, ContainerMetricHistoryPoint,
+    ContainerMetricsHistoryQuery, ContainerMetricsResponse, DeploymentContainerLogContentResponse,
+    DeploymentContainerLogResponse, DeploymentContainerLogsListResponse, DeploymentJobResponse,
+    DeploymentJobsResponse, DeploymentListResponse, DeploymentResponse, DeploymentStateResponse,
+    EnvVarResponse, FailureReportPreviewResponse, LatestDeploymentMediaResponse,
+    LatestDeploymentMediaResponseItem, ManagedEnvironmentVariablesQuery, PromoteDeploymentRequest,
+    ResourceLimitsResponse, SendFailureReportRequest,
 };
 use crate::services::{
     managed_environment_variables, ManagedEnvironmentVariable, ManagedEnvironmentVariableSource,
@@ -2366,11 +2366,12 @@ pub async fn get_container_metrics_history(
     path = "/projects/{project_id}/environments/{environment_id}/container-history",
     params(
         ("project_id" = i32, Path, description = "Project ID"),
-        ("environment_id" = i32, Path, description = "Environment ID")
+        ("environment_id" = i32, Path, description = "Environment ID"),
+        ContainerHistoryQuery,
     ),
     responses(
-        (status = 200, description = "Every container that has ever run for this environment, current and replaced", body = ContainerHistoryListResponse),
-        (status = 404, description = "Environment not found", body = temps_core::problemdetails::ProblemDetails),
+        (status = 200, description = "Containers that have run for this environment: every currently-running one first (uncapped), then the newest replaced ones up to `limit`", body = ContainerHistoryListResponse),
+        (status = 404, description = "Environment or deployment not found", body = temps_core::problemdetails::ProblemDetails),
         (status = 500, description = "Internal server error", body = temps_core::problemdetails::ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -2378,14 +2379,20 @@ pub async fn get_container_metrics_history(
 pub async fn list_container_history(
     State(state): State<Arc<AppState>>,
     Path((project_id, environment_id)): Path<(i32, i32)>,
+    Query(params): Query<ContainerHistoryQuery>,
     RequireAuth(auth): RequireAuth,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, EnvironmentsRead);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    let rows = state
+    let (rows, total_count) = state
         .deployment_service
-        .list_environment_container_history(project_id, environment_id)
+        .list_environment_container_history(
+            project_id,
+            environment_id,
+            params.deployment_id,
+            params.limit,
+        )
         .await?;
 
     let containers = rows
@@ -2403,7 +2410,11 @@ pub async fn list_container_history(
         })
         .collect();
 
-    Ok(Json(ContainerHistoryListResponse { containers }).into_response())
+    Ok(Json(ContainerHistoryListResponse {
+        containers,
+        total_count,
+    })
+    .into_response())
 }
 
 /// Stream container metrics via Server-Sent Events (SSE)
