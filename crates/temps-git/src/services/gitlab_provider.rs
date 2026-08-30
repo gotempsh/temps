@@ -176,11 +176,10 @@ impl GitLabProvider {
 
                     let status = response.status();
                     if status.is_server_error() || status.as_u16() == 429 {
-                        let error_text = response.text().await.unwrap_or_default();
-                        return Err(GitProviderError::ApiError(format!(
-                            "HTTP {}: {}",
-                            status, error_text
-                        )));
+                        // Provider bodies are untrusted and may contain echoed
+                        // secrets or be arbitrarily large. Status is enough to
+                        // classify a transient retry without logging the body.
+                        return Err(GitProviderError::ApiError(format!("HTTP {status}")));
                     }
 
                     Ok(response)
@@ -220,6 +219,101 @@ impl GitLabProvider {
         }
 
         headers
+    }
+
+    async fn decode_bounded_json<T>(
+        response: reqwest::Response,
+        limit_bytes: usize,
+        context: &str,
+    ) -> Result<(T, usize), GitProviderError>
+    where
+        T: serde::de::DeserializeOwned,
+    {
+        if response
+            .content_length()
+            .is_some_and(|length| length > limit_bytes as u64)
+        {
+            return Err(GitProviderError::ApiError(format!(
+                "Provider response for {context} exceeded the {limit_bytes}-byte safety limit"
+            )));
+        }
+
+        let mut body = Vec::with_capacity(
+            response
+                .content_length()
+                .unwrap_or(0)
+                .min(limit_bytes as u64) as usize,
+        );
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "Failed to read provider response for {context}: {error}"
+                ))
+            })?;
+            if body.len().saturating_add(chunk.len()) > limit_bytes {
+                return Err(GitProviderError::ApiError(format!(
+                    "Provider response for {context} exceeded the {limit_bytes}-byte safety limit"
+                )));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        let body_len = body.len();
+        serde_json::from_slice(&body)
+            .map(|value| (value, body_len))
+            .map_err(|error| {
+                GitProviderError::ApiError(format!(
+                    "Failed to parse provider response for {context}: {error}"
+                ))
+            })
+    }
+
+    fn append_bounded_repository_paths<I>(
+        files: &mut Vec<String>,
+        retained_path_bytes: &mut usize,
+        paths: I,
+        max_files: usize,
+        max_path_bytes: usize,
+        max_total_path_bytes: usize,
+        context: &str,
+    ) -> Result<(), GitProviderError>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        for path in paths {
+            let path_bytes = path.len();
+            if path_bytes > max_path_bytes
+                || files.len() >= max_files
+                || retained_path_bytes.saturating_add(path_bytes) > max_total_path_bytes
+            {
+                return Err(GitProviderError::ApiError(format!(
+                    "Provider tree for {context} exceeded its repository path safety limit"
+                )));
+            }
+            *retained_path_bytes += path_bytes;
+            files.push(path);
+        }
+        Ok(())
+    }
+
+    fn record_tree_page_budget(
+        total_entries: &mut usize,
+        total_response_bytes: &mut usize,
+        page_entries: usize,
+        page_response_bytes: usize,
+        max_entries: usize,
+        max_response_bytes: usize,
+        context: &str,
+    ) -> Result<(), GitProviderError> {
+        *total_entries = total_entries.saturating_add(page_entries);
+        *total_response_bytes = total_response_bytes.saturating_add(page_response_bytes);
+        if *total_entries > max_entries || *total_response_bytes > max_response_bytes {
+            return Err(GitProviderError::ApiError(format!(
+                "Provider tree for {context} exceeded its whole-operation safety limit"
+            )));
+        }
+        Ok(())
     }
 
     /// Refresh an access token using a refresh token
@@ -1013,6 +1107,104 @@ impl GitProviderService for GitLabProvider {
         all_entries.sort_by(|a, b| b.is_dir.cmp(&a.is_dir).then_with(|| a.name.cmp(&b.name)));
 
         Ok(all_entries)
+    }
+
+    async fn list_repository_files(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Vec<String>, GitProviderError> {
+        const PER_PAGE: usize = 100;
+        const MAX_PAGES: u32 = 100;
+        const MAX_PAGE_BYTES: usize = 2 * 1024 * 1024;
+        const MAX_FILES: usize = 100_000;
+        const MAX_ENTRIES: usize = 100_000;
+        const MAX_PATH_BYTES: usize = 4 * 1024;
+        const MAX_TOTAL_PATH_BYTES: usize = 8 * 1024 * 1024;
+        const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+        let client = self.get_client();
+        let headers = self.get_headers(access_token);
+        let encoded_project = urlencoding::encode(&format!("{owner}/{repo}")).into_owned();
+        let encoded_reference = urlencoding::encode(reference);
+        let operation = format!("get tree for {owner}/{repo}@{reference}");
+        let mut files = Vec::new();
+        let mut retained_path_bytes = 0usize;
+        let mut total_entries = 0usize;
+        let mut total_response_bytes = 0usize;
+
+        for page in 1..=MAX_PAGES {
+            let url = format!(
+                "{}/api/v4/projects/{}/repository/tree?ref={}&recursive=true&per_page={}&page={}",
+                self.base_url, encoded_project, encoded_reference, PER_PAGE, page
+            );
+            let response = self
+                .send_with_retry(|| client.get(&url).headers(headers.clone()))
+                .await?;
+            let status = response.status();
+            if !status.is_success() {
+                return Err(match status {
+                    reqwest::StatusCode::UNAUTHORIZED => {
+                        GitProviderError::AuthenticationFailed(format!(
+                            "provider rejected the stored credential while trying to {operation}: HTTP {status}"
+                        ))
+                    }
+                    reqwest::StatusCode::FORBIDDEN => GitProviderError::PermissionDenied {
+                        operation,
+                        required_permission: "read_repository".to_string(),
+                        provider_message: format!("HTTP {status}"),
+                    },
+                    _ => GitProviderError::ApiError(format!(
+                        "Failed to {operation}: HTTP {status}"
+                    )),
+                });
+            }
+
+            #[derive(Deserialize)]
+            struct TreeEntry {
+                path: String,
+                #[serde(rename = "type")]
+                entry_type: String,
+            }
+
+            let (entries, page_response_bytes): (Vec<TreeEntry>, _) = Self::decode_bounded_json(
+                response,
+                MAX_PAGE_BYTES,
+                &format!("tree for {owner}/{repo}@{reference} page {page}"),
+            )
+            .await?;
+            let entry_count = entries.len();
+            Self::record_tree_page_budget(
+                &mut total_entries,
+                &mut total_response_bytes,
+                entry_count,
+                page_response_bytes,
+                MAX_ENTRIES,
+                MAX_RESPONSE_BYTES,
+                &format!("{owner}/{repo}@{reference}"),
+            )?;
+            Self::append_bounded_repository_paths(
+                &mut files,
+                &mut retained_path_bytes,
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.entry_type == "blob")
+                    .map(|entry| entry.path),
+                MAX_FILES,
+                MAX_PATH_BYTES,
+                MAX_TOTAL_PATH_BYTES,
+                &format!("{owner}/{repo}@{reference}"),
+            )?;
+            if entry_count < PER_PAGE {
+                return Ok(files);
+            }
+        }
+
+        Err(GitProviderError::ApiError(format!(
+            "GitLab tree for {owner}/{repo}@{reference} exceeded {MAX_PAGES} pages"
+        )))
     }
 
     async fn create_webhook(
@@ -2120,5 +2312,186 @@ mod list_directory_tests {
         let entries = map_and_sort(vec![("tests", "tests", "tree")]);
         assert_eq!(entries.len(), 1);
         assert!(entries[0].is_dir);
+    }
+}
+
+#[cfg(test)]
+mod repository_file_tree_tests {
+    use super::*;
+
+    #[test]
+    fn cumulative_repository_path_limit_spans_pages() {
+        let mut files = Vec::new();
+        let mut retained_path_bytes = 0;
+        GitLabProvider::append_bounded_repository_paths(
+            &mut files,
+            &mut retained_path_bytes,
+            ["one".to_string(), "two".to_string()],
+            3,
+            16,
+            32,
+            "platform/example-service@main",
+        )
+        .expect("the first full page should fit");
+
+        let error = GitLabProvider::append_bounded_repository_paths(
+            &mut files,
+            &mut retained_path_bytes,
+            ["three".to_string(), "four".to_string()],
+            3,
+            16,
+            32,
+            "platform/example-service@main",
+        )
+        .expect_err("a later page must share the same cumulative limit");
+
+        assert!(error.to_string().contains("path safety limit"));
+        assert_eq!(files, vec!["one", "two", "three"]);
+    }
+
+    #[test]
+    fn cumulative_tree_budget_counts_directory_only_page_bytes() {
+        let mut entries = 0;
+        let mut response_bytes = 0;
+        GitLabProvider::record_tree_page_budget(
+            &mut entries,
+            &mut response_bytes,
+            100,
+            8,
+            150,
+            15,
+            "platform/example-service@main",
+        )
+        .expect("the first directory-only page should fit");
+
+        let error = GitLabProvider::record_tree_page_budget(
+            &mut entries,
+            &mut response_bytes,
+            100,
+            8,
+            150,
+            15,
+            "platform/example-service@main",
+        )
+        .expect_err("the next directory-only page must share the raw response budget");
+
+        assert!(error.to_string().contains("whole-operation safety limit"));
+    }
+
+    #[tokio::test]
+    async fn retry_errors_do_not_include_provider_bodies() {
+        let mut server = mockito::Server::new_async().await;
+        let upstream_marker = "sensitive-upstream-marker";
+        let failure = server
+            .mock("GET", "/transient-failure")
+            .with_status(500)
+            .with_body(upstream_marker)
+            .expect(3)
+            .create_async()
+            .await;
+        let provider = GitLabProvider::new(
+            None,
+            AuthMethod::PersonalAccessToken {
+                token: "unused-test-token".to_string(),
+            },
+        );
+        let url = format!("{}/transient-failure", server.url());
+
+        let error = provider
+            .send_with_retry(|| reqwest::Client::new().get(&url))
+            .await
+            .expect_err("the transient response should exhaust retries");
+
+        failure.assert_async().await;
+        assert!(!error.to_string().contains(upstream_marker));
+        assert_eq!(
+            error.to_string(),
+            "API error: HTTP 500 Internal Server Error"
+        );
+    }
+
+    #[tokio::test]
+    async fn uses_the_self_hosted_instance_and_pat_header() {
+        let mut server = mockito::Server::new_async().await;
+        let tree = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    r"^/api/v4/projects/platform%2Fexample-service/repository/tree$".to_string(),
+                ),
+            )
+            .match_header("private-token", "instance-pat")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("ref".into(), "main".into()),
+                mockito::Matcher::UrlEncoded("recursive".into(), "true".into()),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+                mockito::Matcher::UrlEncoded("page".into(), "1".into()),
+            ]))
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"[{"path":"Cargo.toml","type":"blob"},{"path":"src","type":"tree"}]"#)
+            .create_async()
+            .await;
+        let provider = GitLabProvider::new(
+            Some(server.url()),
+            AuthMethod::PersonalAccessToken {
+                token: "stored-token".to_string(),
+            },
+        );
+
+        let files = <GitLabProvider as GitProviderService>::list_repository_files(
+            &provider,
+            "instance-pat",
+            "platform",
+            "example-service",
+            "main",
+        )
+        .await
+        .expect("self-hosted GitLab tree should be readable");
+
+        tree.assert_async().await;
+        assert_eq!(files, vec!["Cargo.toml"]);
+    }
+
+    #[tokio::test]
+    async fn preserves_unauthorized_as_an_authentication_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let tree = server
+            .mock(
+                "GET",
+                mockito::Matcher::Regex(
+                    r"^/api/v4/projects/platform%2Fexample-service/repository/tree$".to_string(),
+                ),
+            )
+            .match_header("private-token", "expired-pat")
+            .match_query(mockito::Matcher::AllOf(vec![
+                mockito::Matcher::UrlEncoded("ref".into(), "main".into()),
+                mockito::Matcher::UrlEncoded("recursive".into(), "true".into()),
+                mockito::Matcher::UrlEncoded("per_page".into(), "100".into()),
+                mockito::Matcher::UrlEncoded("page".into(), "1".into()),
+            ]))
+            .with_status(401)
+            .create_async()
+            .await;
+        let provider = GitLabProvider::new(
+            Some(server.url()),
+            AuthMethod::PersonalAccessToken {
+                token: "stored-token".to_string(),
+            },
+        );
+
+        let error = <GitLabProvider as GitProviderService>::list_repository_files(
+            &provider,
+            "expired-pat",
+            "platform",
+            "example-service",
+            "main",
+        )
+        .await
+        .expect_err("a rejected PAT must remain an authentication failure");
+
+        tree.assert_async().await;
+        assert!(matches!(error, GitProviderError::AuthenticationFailed(_)));
+        assert!(error.to_string().contains("platform/example-service@main"));
     }
 }

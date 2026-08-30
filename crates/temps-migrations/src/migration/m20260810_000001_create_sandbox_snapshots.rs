@@ -3,8 +3,8 @@
 
 //! ADR-037: Sandbox snapshots table.
 //!
-//! A snapshot is a committed image layer derived from a sandbox container,
-//! stored as a content-addressed tarball under `$TEMPS_DATA_DIR/snapshots/`.
+//! A snapshot is backend-specific filesystem state stored as one or more
+//! content-addressed artifacts under `$TEMPS_DATA_DIR/snapshots/`.
 //! Snapshots are user-managed; there is no automatic GC.
 //!
 //! Key design choices (from the ADR):
@@ -59,7 +59,9 @@ CREATE TABLE IF NOT EXISTS sandbox_snapshots (
         .await?;
 
         // Deduplication lookup: find an existing ready snapshot with the same
-        // content digest before writing a new tarball to disk.
+        // content digest before writing a new artifact to disk. This index was
+        // initially unique; m20260829_000001 relaxes it because separate
+        // user-owned rows intentionally share the same artifact.
         conn.execute_unprepared(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_sandbox_snapshots_digest_ready ON sandbox_snapshots (content_digest) WHERE status = 'ready'",
         )

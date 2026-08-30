@@ -34083,7 +34083,12 @@ export type GetPublicRepositoryData = {
          */
         repo: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+    };
     url: '/git/public/{provider}/{owner}/{repo}';
 };
 
@@ -34092,6 +34097,10 @@ export type GetPublicRepositoryErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
     /**
      * Git provider permission required
      */
@@ -34137,6 +34146,10 @@ export type GetPublicBranchesData = {
     };
     query?: {
         /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+        /**
          * Force fetch fresh data, bypassing cache (default: false)
          */
         fresh?: boolean;
@@ -34149,6 +34162,10 @@ export type GetPublicBranchesErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
     /**
      * Git provider permission required
      */
@@ -34194,6 +34211,10 @@ export type GetPublicComposeServicesData = {
     };
     query: {
         /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+        /**
          * Branch to read the compose file from (default: repository's default branch)
          */
         branch?: string | null;
@@ -34211,6 +34232,14 @@ export type GetPublicComposeServicesErrors = {
      * Provider not supported, or the compose file could not be parsed
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository, branch, or compose file not found
      */
@@ -34250,7 +34279,12 @@ export type GetPublicComposePreviewData = {
          */
         repo: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+    };
     url: '/git/public/{provider}/{owner}/{repo}/compose-file';
 };
 
@@ -34259,6 +34293,14 @@ export type GetPublicComposePreviewErrors = {
      * Compose file or override is invalid
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository, branch, or compose file not found
      */
@@ -34292,6 +34334,10 @@ export type DetectPublicEnvExampleData = {
     };
     query?: {
         /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+        /**
          * Branch name to inspect (default: repository's default branch)
          */
         branch?: string | null;
@@ -34308,6 +34354,14 @@ export type DetectPublicEnvExampleErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository or branch not found
      */
@@ -34349,6 +34403,10 @@ export type DetectPublicPresetsData = {
     };
     query?: {
         /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+        /**
          * Branch name to detect presets for (default: repository's default branch)
          */
         branch?: string | null;
@@ -34365,6 +34423,10 @@ export type DetectPublicPresetsErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
     /**
      * Git provider permission required
      */

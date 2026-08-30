@@ -1550,6 +1550,59 @@ impl GitProviderService for GitHubProvider {
         Ok(entries)
     }
 
+    async fn list_repository_files(
+        &self,
+        access_token: &str,
+        owner: &str,
+        repo: &str,
+        reference: &str,
+    ) -> Result<Vec<String>, GitProviderError> {
+        let client = self.get_client();
+        let headers = self.get_headers(access_token);
+        let url = format!(
+            "{}/repos/{}/{}/git/trees/{}?recursive=1",
+            self.api_url,
+            owner,
+            repo,
+            urlencoding::encode(reference)
+        );
+        let response = self
+            .send_with_retry(|| client.get(&url).headers(headers.clone()))
+            .await?;
+        if !response.status().is_success() {
+            return Err(github_response_error(
+                response,
+                format!("get tree for {owner}/{repo}@{reference}"),
+                "Contents: read and access to the target repository",
+            )
+            .await);
+        }
+
+        #[derive(Deserialize)]
+        struct TreeResponse {
+            tree: Vec<TreeEntry>,
+        }
+
+        #[derive(Deserialize)]
+        struct TreeEntry {
+            path: String,
+            #[serde(rename = "type")]
+            entry_type: String,
+        }
+
+        let tree: TreeResponse = response.json().await.map_err(|error| {
+            GitProviderError::ApiError(format!(
+                "Failed to parse tree response for {owner}/{repo}@{reference}: {error}"
+            ))
+        })?;
+        Ok(tree
+            .tree
+            .into_iter()
+            .filter(|entry| entry.entry_type == "blob")
+            .map(|entry| entry.path)
+            .collect())
+    }
+
     async fn get_latest_commit(
         &self,
         access_token: &str,

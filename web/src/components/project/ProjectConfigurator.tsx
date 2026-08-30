@@ -251,7 +251,12 @@ function ComposeFileSelector({
   repositoryId: number | undefined
   branch: string | undefined
   /** Set for public "git URL" imports, where there's no `repositoryId` to key the live preview query on. */
-  publicRepo?: { provider: string; owner: string; repo: string } | null
+  publicRepo?: {
+    provider: string
+    owner: string
+    repo: string
+    baseUrl?: string
+  } | null
 }) {
   const [isCustomPath, setIsCustomPath] = useState(false)
   const rootDirectory = form.watch('rootDirectory') || './'
@@ -326,7 +331,11 @@ function ComposeFileSelector({
         owner: publicRepo?.owner || '',
         repo: publicRepo?.repo || '',
       },
-      query: { branch, path: composeRepositoryPath },
+      query: {
+        branch,
+        path: composeRepositoryPath,
+        base_url: publicRepo?.baseUrl,
+      },
     }),
     enabled:
       !!publicRepo && !!publicRepo.owner && !!publicRepo.repo && !!composePath,
@@ -578,7 +587,12 @@ interface ProjectConfiguratorProps {
    * and docker-compose services) query public endpoints instead of using the
    * synthetic `repository.id` from this flow.
    */
-  publicRepo?: { provider: string; owner: string; repo: string } | null
+  publicRepo?: {
+    provider: string
+    owner: string
+    repo: string
+    baseUrl?: string
+  } | null
 
   // Display modes
   mode?: 'wizard' | 'inline' | 'compact'
@@ -808,6 +822,7 @@ export function ProjectConfigurator({
       query: {
         branch: selectedBranch,
         root_directory: selectedRootDirectory || './',
+        base_url: publicRepo?.baseUrl,
       },
     }),
     enabled: !!publicRepo && !!selectedBranch,

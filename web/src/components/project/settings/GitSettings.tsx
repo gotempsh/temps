@@ -188,6 +188,7 @@ function GitSettingsInline({
   const isUploadedSource = project.source_type === 'uploaded_source'
   const sections = projectSettingsSections(view, project.source_type)
   const publicProvider = publicRepositoryProvider(project?.git_url)
+  const publicRepository = parsePublicRepositoryUrl(project?.git_url)
 
   const { data: providersData } = useQuery({ ...listGitProvidersOptions() })
   const providers = providersData || []
@@ -243,6 +244,7 @@ function GitSettingsInline({
         owner: project?.repo_owner || '',
         repo: project?.repo_name || '',
       },
+      query: { base_url: publicRepository?.instanceUrl },
     }),
     enabled: isPublicRepo && !!project?.repo_owner && !!project?.repo_name,
     retry: false,
@@ -311,6 +313,7 @@ function GitSettingsInline({
         owner: project?.repo_owner || '',
         repo: project?.repo_name || '',
       },
+      query: { base_url: publicRepository?.instanceUrl },
     }),
     enabled: isPublicRepo && !!project?.repo_owner && !!project?.repo_name,
   })
@@ -321,6 +324,7 @@ function GitSettingsInline({
         owner: project?.repo_owner || '',
         repo: project?.repo_name || '',
       },
+      query: { base_url: publicRepository?.instanceUrl },
     }),
     enabled: isPublicRepo && !!project?.repo_owner && !!project?.repo_name,
   })
@@ -511,6 +515,7 @@ function GitSettingsInline({
       'effective-compose-preview',
       repositoryData?.id,
       publicProvider,
+      publicRepository?.instanceUrl,
       project.repo_owner,
       project.repo_name,
       project.main_branch,
@@ -526,6 +531,7 @@ function GitSettingsInline({
               provider: publicProvider,
               owner: project.repo_owner || '',
               repo: project.repo_name || '',
+              baseUrl: publicRepository?.instanceUrl,
             }
           : {
               kind: 'connected',
@@ -2027,6 +2033,7 @@ function ExcludedServicesInline({
     string | null
   >(null)
   const publicProvider = publicRepositoryProvider(project.git_url)
+  const publicRepository = parsePublicRepositoryUrl(project.git_url)
 
   // Persisted snapshot (captured at creation, refreshed after every
   // successful deploy) is the primary data source — no live git fetch on
@@ -2066,7 +2073,11 @@ function ExcludedServicesInline({
         owner: project.repo_owner || '',
         repo: project.repo_name || '',
       },
-      query: { branch: project.main_branch, path: composeRepositoryPath },
+      query: {
+        branch: project.main_branch,
+        path: composeRepositoryPath,
+        base_url: publicRepository?.instanceUrl,
+      },
     }),
     enabled: false,
   })
@@ -2584,6 +2595,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
     provider: 'github' | 'gitlab'
     owner: string
     name: string
+    instanceUrl?: string
   } | null>(() => parsePublicRepositoryUrl(initialPublicUrl))
   // Branch to connect. Seeded from the currently-connected project's branch,
   // and reset whenever the user picks a different repository (below) so the
@@ -2628,6 +2640,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
         owner: parsedPublic?.owner || '',
         repo: parsedPublic?.name || '',
       },
+      query: { base_url: parsedPublic?.instanceUrl },
     }),
     enabled: mode === 'public' && !!parsedPublic,
   })
@@ -2641,6 +2654,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
         owner: parsedPublic?.owner || '',
         repo: parsedPublic?.name || '',
       },
+      query: { base_url: parsedPublic?.instanceUrl },
     }),
     enabled: mode === 'public' && !!parsedPublic,
   })
@@ -2745,9 +2759,12 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
       }
     }
     if (mode === 'public') {
-      const providerHost =
-        parsedPublic?.provider === 'gitlab' ? 'gitlab.com' : 'github.com'
-      body.git_url = `https://${providerHost}/${repoToConnect.owner}/${repoToConnect.name}`
+      const providerOrigin =
+        parsedPublic?.instanceUrl ??
+        (parsedPublic?.provider === 'gitlab'
+          ? 'https://gitlab.com'
+          : 'https://github.com')
+      body.git_url = `${providerOrigin}/${repoToConnect.owner}/${repoToConnect.name}`
       body.is_public_repo = true
       body.git_provider_connection_id = null
     } else {
@@ -3023,7 +3040,7 @@ export function ChangeRepositoryPage({ project, refetch }: GitSettingsProps) {
                 }
                 gitUrl={
                   mode === 'public' && parsedPublic
-                    ? `https://${parsedPublic.provider === 'gitlab' ? 'gitlab.com' : 'github.com'}/${parsedPublic.owner}/${parsedPublic.name}`
+                    ? `${parsedPublic.instanceUrl ?? (parsedPublic.provider === 'gitlab' ? 'https://gitlab.com' : 'https://github.com')}/${parsedPublic.owner}/${parsedPublic.name}`
                     : undefined
                 }
                 value={branch}

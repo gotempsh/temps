@@ -951,27 +951,34 @@ pub async fn create_sandbox(
     let user_id = auth.user_id();
     let from_snapshot_id = body.from_snapshot.clone();
     let mut req: crate::services::sandbox_service::CreateSandboxRequest = body.into();
+    // Held through provider restore so a concurrent delete cannot remove the
+    // verified artifact after resolution but before it is consumed.
+    let mut artifact_lifecycle_guard = None;
 
     if let Some(snap_id) = from_snapshot_id {
-        let backend = req.backend.as_deref().unwrap_or("docker");
         let snapshot_svc = state.snapshot_service.as_ref().ok_or_else(|| {
             use crate::error::SandboxSnapshotError;
             use temps_core::problemdetails::Problem;
             Problem::from(SandboxSnapshotError::NotSupported {
-                backend: backend.to_string(),
+                backend: req.backend.clone().unwrap_or_else(|| "unknown".to_string()),
             })
         })?;
+        artifact_lifecycle_guard = Some(snapshot_svc.acquire_artifact_lifecycle().await);
         let artifact = snapshot_svc
-            .resolve_for_restore(user_id, &snap_id, backend)
+            .resolve_for_restore(user_id, &snap_id, req.backend.as_deref())
             .await
             .map_err(|e| {
                 use temps_core::problemdetails::Problem;
                 Problem::from(e)
             })?;
+        if req.backend.is_none() {
+            req.backend = Some(artifact.backend.to_string());
+        }
         req.from_snapshot_artifact = Some(artifact);
     }
 
     let row = state.sandbox_service.create_sandbox(user_id, req).await?;
+    drop(artifact_lifecycle_guard);
     let resp = build_response(&state, row).await;
     Ok((StatusCode::CREATED, Json(resp)))
 }

@@ -98,7 +98,13 @@ pub async fn find_available_port_async(docker: &Docker, start_port: u16) -> Opti
 /// another allocator grabbed it first. Safe to retry with a fresh port when
 /// this returns true; any other error should propagate as-is.
 pub fn is_port_conflict_error(message: &str) -> bool {
-    message.contains("port is already allocated") || message.contains("address already in use")
+    let message = message.to_ascii_lowercase();
+    message.contains("port is already allocated")
+        || message.contains("address already in use")
+        || message.contains("port is already in use")
+        || message.contains("ports are not available")
+        || message.contains("failed to bind host port")
+        || message.contains("only one usage of each socket address")
 }
 
 /// Collect every host port currently published by a Docker container. Returns
@@ -183,5 +189,19 @@ mod tests {
             a, b,
             "consecutive allocations must not return the same port"
         );
+    }
+
+    #[test]
+    fn recognizes_docker_port_conflict_variants() {
+        for message in [
+            "Ports are not available: exposing port TCP 127.0.0.1:27017",
+            "failed to bind host port for 127.0.0.1:27017: port is already in use",
+            "Only one usage of each socket address is normally permitted",
+        ] {
+            assert!(
+                is_port_conflict_error(message),
+                "Docker port conflict was not recognized: {message}"
+            );
+        }
     }
 }

@@ -71,7 +71,10 @@ import {
 } from '@/lib/credential-reveal-state'
 import { IntegrationBadge } from './IntegrationBadge'
 import { Link } from 'react-router'
-import { publicRepositoryProvider } from '@/lib/public-repository'
+import {
+  parsePublicRepositoryUrl,
+  publicRepositoryProvider,
+} from '@/lib/public-repository'
 import {
   discoverComposeEnvironmentVariables,
   type DiscoveredEnvironmentVariable,
@@ -1156,6 +1159,7 @@ export function EnvironmentVariablesSettings({
   const isDockerCompose = project.preset === 'docker-compose'
   const isPublicRepository = project.is_public_repo
   const publicProvider = publicRepositoryProvider(project.git_url)
+  const publicRepository = parsePublicRepositoryUrl(project.git_url)
   const composeConfig =
     (project.preset_config as Record<string, unknown> | null) ?? {}
   const composePath =
@@ -1222,6 +1226,7 @@ export function EnvironmentVariablesSettings({
       query: {
         branch: project.main_branch,
         root_directory: project.directory || './',
+        base_url: publicRepository?.instanceUrl,
       },
     }),
     enabled:
@@ -1244,7 +1249,11 @@ export function EnvironmentVariablesSettings({
         owner: project.repo_owner ?? '',
         repo: project.repo_name ?? '',
       },
-      query: { branch: project.main_branch, path: composeRepositoryPath },
+      query: {
+        branch: project.main_branch,
+        path: composeRepositoryPath,
+        base_url: publicRepository?.instanceUrl,
+      },
     }),
     enabled:
       isDockerCompose &&

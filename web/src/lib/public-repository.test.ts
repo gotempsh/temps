@@ -22,13 +22,34 @@ describe('public repository location', () => {
     })
   })
 
+  test('keeps accepting schemeless public repository URLs', () => {
+    expect(parsePublicRepositoryUrl('gitlab.com/example/project')).toEqual({
+      provider: 'gitlab',
+      owner: 'example',
+      name: 'project',
+    })
+  })
+
   test('defaults old records without a URL to GitHub', () => {
     expect(publicRepositoryProvider(null)).toBe('github')
   })
 
-  test('rejects unsupported hosts', () => {
+  test('retains a neutral origin for a self-hosted GitLab repository', () => {
     expect(
-      parsePublicRepositoryUrl('https://example.test/owner/repo')
+      parsePublicRepositoryUrl(
+        'https://source.example.com/platform/example-service.git'
+      )
+    ).toEqual({
+      provider: 'gitlab',
+      owner: 'platform',
+      name: 'example-service',
+      instanceUrl: 'https://source.example.com',
+    })
+  })
+
+  test('rejects unsupported protocols', () => {
+    expect(
+      parsePublicRepositoryUrl('ftp://source.example.com/owner/repo')
     ).toBeNull()
   })
 })

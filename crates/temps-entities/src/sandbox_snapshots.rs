@@ -3,10 +3,10 @@
 
 //! Entity for the `sandbox_snapshots` table (ADR-037).
 //!
-//! A snapshot is a committed image layer derived from a sandbox container,
-//! stored as a content-addressed tarball on the host filesystem. See the ADR
-//! for the full design, including the credential-scrubbing security protocol
-//! and the deduplication scheme.
+//! A snapshot is backend-specific filesystem state stored as a
+//! content-addressed artifact on the host filesystem. Docker stores an image
+//! tarball plus a workspace archive; Firecracker rebuilds a sanitized ext4
+//! filesystem. See the ADR for the credential-scrubbing and deduplication design.
 
 use sea_orm::entity::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -64,10 +64,9 @@ impl std::str::FromStr for SnapshotStatus {
 
 /// A snapshot of a sandbox's filesystem state (ADR-037).
 ///
-/// Produced by `docker commit` + tarball export for Docker sandboxes. The home
-/// volume (`/home/temps`) is excluded — only the container writable layer is
-/// captured. Credentials that might appear in the writable layer are scrubbed
-/// before the commit (see ADR-037 §4).
+/// Produced by `docker commit` + workspace export for Docker sandboxes, or by
+/// rebuilding a sanitized ext4 filesystem for Firecracker microVMs.
+/// Credentials are scrubbed before capture (see ADR-037 §4).
 #[derive(Clone, Debug, PartialEq, DeriveEntityModel, Eq, Serialize, Deserialize)]
 #[sea_orm(table_name = "sandbox_snapshots")]
 pub struct Model {
@@ -101,17 +100,16 @@ pub struct Model {
     /// Cross-backend restore is rejected with 422.
     pub backend: String,
 
-    /// SHA-256 of the artifact tarball — the canonical dedup key. Two rows
-    /// with the same `content_digest` share one tarball on disk. The unique
-    /// partial index `idx_sandbox_snapshots_digest_ready` over `status = 'ready'`
-    /// enforces this.
+    /// SHA-256 of the complete logical snapshot — the canonical dedup key.
+    /// Two rows with the same `content_digest` share artifacts on disk. The
+    /// partial index `idx_sandbox_snapshots_digest_ready` accelerates lookup
+    /// while allowing distinct user-owned rows to share one artifact.
     pub content_digest: String,
 
-    /// Absolute path to the tarball on the host filesystem, e.g.
-    /// `$TEMPS_DATA_DIR/snapshots/<sha256>.tar`.
+    /// Absolute path to the primary artifact on the host filesystem.
     pub content_path: String,
 
-    /// Approximate size of the tarball in bytes. Populated at create time.
+    /// Approximate total size of the primary and companion artifacts in bytes.
     pub size_bytes: i64,
 
     /// For Docker: the daemon image tag `temps-snapshot/<public_id>:latest`.
@@ -119,9 +117,8 @@ pub struct Model {
     /// is not already present. `None` for non-Docker backends.
     pub image_ref: Option<String>,
 
-    /// Reserved for backend-specific fields that don't warrant a migration.
-    /// For Firecracker v2 this would carry the memory-state path, disk-diff
-    /// paths, and Firecracker version pin.
+    /// Backend-specific fields that don't warrant a migration. Docker stores
+    /// workspace companion artifact metadata here.
     #[sea_orm(column_type = "JsonBinary")]
     pub metadata: Option<serde_json::Value>,
 

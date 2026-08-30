@@ -615,6 +615,21 @@ pub trait GitProviderService: Send + Sync {
         reference: Option<&str>,
     ) -> Result<Vec<RepoDirEntry>, GitProviderError>;
 
+    /// List every file in a repository recursively at `reference`.
+    ///
+    /// Providers with a recursive tree API should override this so callers do
+    /// not need to reconstruct provider URLs or authentication headers. That
+    /// distinction matters for self-hosted instances and PAT-specific headers.
+    async fn list_repository_files(
+        &self,
+        _access_token: &str,
+        _owner: &str,
+        _repo: &str,
+        _reference: &str,
+    ) -> Result<Vec<String>, GitProviderError> {
+        Err(GitProviderError::NotImplemented)
+    }
+
     /// Get latest commit for a branch
     async fn get_latest_commit(
         &self,

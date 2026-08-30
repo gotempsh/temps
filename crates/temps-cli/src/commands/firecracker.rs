@@ -425,8 +425,18 @@ impl FirecrackerSetupCommand {
         // /dev/kvm
         failures += check_kvm_access();
 
+        // /dev/fuse backs quota-bounded Firecracker snapshot extraction.
+        failures += check_fuse_access();
+
         // Required host tooling for rootfs builds (ADR-029 §4)
-        for tool in ["mkfs.ext4", "ip"] {
+        for tool in [
+            "mkfs.ext4",
+            "debugfs",
+            "ip",
+            "bwrap",
+            "fuse2fs",
+            "fusermount3",
+        ] {
             match find_in_path(tool) {
                 Some(p) => pass(tool, p.display().to_string()),
                 None => {
@@ -434,11 +444,7 @@ impl FirecrackerSetupCommand {
                         tool,
                         format!(
                             "Not found. Install it (Debian/Ubuntu: `apt install {}`).",
-                            if tool == "mkfs.ext4" {
-                                "e2fsprogs"
-                            } else {
-                                "iproute2"
-                            }
+                            firecracker_tool_package(tool)
                         ),
                     );
                     failures += 1;
@@ -1310,6 +1316,37 @@ fn check_kvm_access() -> u32 {
     }
 }
 
+/// FUSE availability + access for quota-bounded snapshot staging.
+fn check_fuse_access() -> u32 {
+    let fuse = Path::new("/dev/fuse");
+    if !fuse.exists() {
+        fail(
+            "/dev/fuse",
+            "Missing. Load the module with `sudo modprobe fuse` and ensure the device is available to the Temps service.",
+        );
+        return 1;
+    }
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(fuse)
+    {
+        Ok(_) => {
+            pass("/dev/fuse", "Accessible (snapshot staging)");
+            0
+        }
+        Err(error) => {
+            fail(
+                "/dev/fuse",
+                format!(
+                    "Cannot open for snapshot staging: {error}. Grant the Temps service user read/write access to /dev/fuse."
+                ),
+            );
+            1
+        }
+    }
+}
+
 /// True when `/etc/group` lists the user as a member of `kvm` (i.e. the
 /// membership exists but may not be effective in the current session).
 fn user_in_kvm_group(user: &str) -> bool {
@@ -1340,6 +1377,16 @@ fn find_in_path(bin: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn firecracker_tool_package(tool: &str) -> &'static str {
+    match tool {
+        "mkfs.ext4" | "debugfs" => "e2fsprogs",
+        "bwrap" => "bubblewrap",
+        "fuse2fs" => "fuse2fs",
+        "fusermount3" => "fuse3",
+        _ => "iproute2",
+    }
 }
 
 fn installed_version(dirs: &Dirs) -> Option<String> {
@@ -1512,5 +1559,15 @@ mod tests {
             iptables_rule_args("filter", "-C", "FORWARD", &rule),
             vec!["-t", "filter", "-C", "FORWARD", "-i", "br0"]
         );
+    }
+
+    #[test]
+    fn test_firecracker_snapshot_tool_packages() {
+        assert_eq!(firecracker_tool_package("mkfs.ext4"), "e2fsprogs");
+        assert_eq!(firecracker_tool_package("debugfs"), "e2fsprogs");
+        assert_eq!(firecracker_tool_package("bwrap"), "bubblewrap");
+        assert_eq!(firecracker_tool_package("fuse2fs"), "fuse2fs");
+        assert_eq!(firecracker_tool_package("fusermount3"), "fuse3");
+        assert_eq!(firecracker_tool_package("ip"), "iproute2");
     }
 }

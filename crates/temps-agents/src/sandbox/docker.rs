@@ -7,7 +7,7 @@ use bollard::exec::StartExecResults;
 use bollard::Docker;
 use futures::StreamExt;
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use super::user::{SANDBOX_CHOWN, SANDBOX_HOME, SANDBOX_UID, SANDBOX_USER, SANDBOX_WORK_DIR};
@@ -77,6 +77,159 @@ const HOME_VOLUME_LABEL: &str = "sh.temps.sandbox.home";
 fn shell_quote(s: &str) -> String {
     let escaped = s.replace('\'', "'\\''");
     format!("'{}'", escaped)
+}
+
+fn workspace_mount_source(mounts: &[bollard::models::MountPoint]) -> Option<PathBuf> {
+    mounts.iter().find_map(|mount| {
+        (mount.destination.as_deref() == Some(CONTAINER_WORK_DIR))
+            .then(|| mount.source.as_deref().map(PathBuf::from))
+            .flatten()
+    })
+}
+
+fn hash_file(path: &Path) -> std::io::Result<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut size_bytes = 0u64;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size_bytes = size_bytes.saturating_add(read as u64);
+    }
+    Ok((hex::encode(hasher.finalize()), size_bytes))
+}
+
+async fn publish_content_addressed_file(
+    temporary: &Path,
+    destination: &Path,
+    expected_digest: &str,
+) -> std::io::Result<bool> {
+    match tokio::fs::hard_link(temporary, destination).await {
+        Ok(()) => {
+            tokio::fs::remove_file(temporary).await?;
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = destination.to_path_buf();
+            let (actual_digest, _) = tokio::task::spawn_blocking(move || hash_file(&existing))
+                .await
+                .map_err(|join_error| {
+                    std::io::Error::other(format!(
+                        "verify existing content-addressed artifact task failed: {}",
+                        join_error
+                    ))
+                })??;
+            if actual_digest != expected_digest {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "existing content-addressed artifact '{}' has digest {}, expected {}",
+                        destination.display(),
+                        actual_digest,
+                        expected_digest
+                    ),
+                ));
+            }
+            tokio::fs::remove_file(temporary).await?;
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+struct LimitedWriter<W> {
+    inner: W,
+    written: u64,
+    limit: u64,
+}
+
+impl<W: std::io::Write> std::io::Write for LimitedWriter<W> {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        if self.written.saturating_add(buffer.len() as u64) > self.limit {
+            return Err(std::io::Error::other(format!(
+                "snapshot artifact exceeds the {} byte limit",
+                self.limit
+            )));
+        }
+        let written = self.inner.write(buffer)?;
+        self.written = self.written.saturating_add(written as u64);
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn archive_workspace(
+    source: &Path,
+    destination: &Path,
+    max_size_bytes: u64,
+) -> std::io::Result<(String, u64)> {
+    let file = LimitedWriter {
+        inner: std::fs::File::create(destination)?,
+        written: 0,
+        limit: max_size_bytes,
+    };
+    let mut archive = tar::Builder::new(file);
+    archive.follow_symlinks(false);
+    archive.append_dir_all(".", source)?;
+    let file = archive.into_inner()?.inner;
+    file.sync_all()?;
+    hash_file(destination)
+}
+
+fn restore_workspace_archive(
+    artifact: &super::SnapshotCompanionArtifact,
+    destination: &Path,
+) -> std::io::Result<()> {
+    std::fs::create_dir_all(destination)?;
+    if std::fs::read_dir(destination)?
+        .next()
+        .transpose()?
+        .is_some()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            format!(
+                "workspace restore destination '{}' is not empty",
+                destination.display()
+            ),
+        ));
+    }
+
+    let (actual_digest, _) = hash_file(&artifact.content_path)?;
+    if actual_digest != artifact.content_digest {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "workspace artifact digest mismatch: expected {}, got {}",
+                artifact.content_digest, actual_digest
+            ),
+        ));
+    }
+
+    let file = std::fs::File::open(&artifact.content_path)?;
+    let mut archive = tar::Archive::new(file);
+    archive.unpack(destination)
+}
+
+fn combined_snapshot_digest(image_digest: &str, workspace_digest: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut hasher = Sha256::new();
+    hasher.update(b"temps-sandbox-snapshot-v2\0");
+    hasher.update(image_digest.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(workspace_digest.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
 // ── Credential-scrubbing helpers (ADR-037 §4) ─────────────────────────────────
@@ -2694,29 +2847,13 @@ impl SandboxProvider for DockerSandboxProvider {
     async fn take_snapshot(
         &self,
         handle: &SandboxHandle,
-        label: Option<String>,
+        _label: Option<String>,
+        max_size_bytes: u64,
     ) -> Result<super::SnapshotArtifact, AgentError> {
         use sha2::{Digest, Sha256};
         use tokio::io::AsyncWriteExt;
 
         let container_id = &handle.sandbox_id;
-
-        // ── Validate label early, before any file I/O ─────────────────────────
-        // An empty label after sanitization produces an invalid Docker tag.
-        // Validate here so the rename to the final path never orphans a tarball
-        // because a later tag call fails.
-        if let Some(ref lbl) = label {
-            if lbl.trim().is_empty() {
-                return Err(AgentError::SandboxExecFailed {
-                    run_id: 0,
-                    sandbox_id: container_id.clone(),
-                    reason: "snapshot: label must not be empty when provided \
-                             (empty label produces an invalid Docker image tag; \
-                             omit the label field to use the content digest instead)"
-                        .to_string(),
-                });
-            }
-        }
 
         // ── Step 1: collect and scrub known-sensitive env vars ────────────────
         // Inspect the stopped container's Config.Env to find injected vars.
@@ -2732,6 +2869,19 @@ impl SandboxProvider for DockerSandboxProvider {
                 run_id: 0,
                 sandbox_id: container_id.clone(),
                 reason: format!("snapshot: failed to inspect container: {}", e),
+            })?;
+
+        let workspace_source = container_inspect
+            .mounts
+            .as_deref()
+            .and_then(workspace_mount_source)
+            .ok_or_else(|| AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!(
+                    "snapshot: container has no host workspace mounted at '{}'",
+                    CONTAINER_WORK_DIR
+                ),
             })?;
 
         // Collect env vars set on the container (from the original create call
@@ -2904,7 +3054,8 @@ impl SandboxProvider for DockerSandboxProvider {
         // Stream the export through a Sha256 hasher while writing to a temp
         // file, then rename atomically. All file I/O uses tokio::fs so we
         // never block the async runtime on a potentially multi-GB write.
-        let tmp_path = snapshots_dir.join(format!(".tmp-{}", short_id));
+        let tmp_path = snapshots_dir.join(format!(".tmp-{}-image", short_id));
+        let workspace_tmp_path = snapshots_dir.join(format!(".tmp-{}-workspace", short_id));
 
         // Helper: best-effort cleanup on failure — remove the staged Docker
         // image (same pattern the earlier branches use) and unlink the temp
@@ -2914,6 +3065,7 @@ impl SandboxProvider for DockerSandboxProvider {
             let docker = self.docker.clone();
             let img = committed_image_id.clone();
             let tmp = tmp_path.clone();
+            let workspace_tmp = workspace_tmp_path.clone();
             move || {
                 tokio::spawn(async move {
                     let _ = docker
@@ -2929,6 +3081,7 @@ impl SandboxProvider for DockerSandboxProvider {
                         .await;
                     // Best-effort unlink of the partially-written temp file.
                     let _ = tokio::fs::remove_file(&tmp).await;
+                    let _ = tokio::fs::remove_file(&workspace_tmp).await;
                 });
             }
         };
@@ -2963,6 +3116,15 @@ impl SandboxProvider for DockerSandboxProvider {
                         });
                     }
                 };
+                if size_bytes.saturating_add(chunk.len() as u64) > max_size_bytes {
+                    drop(tmp_file);
+                    cleanup_on_err();
+                    return Err(AgentError::SnapshotSizeLimitExceeded {
+                        sandbox_id: container_id.clone(),
+                        stage: "exporting the Docker image".to_string(),
+                        max_size_bytes,
+                    });
+                }
                 hasher.update(&chunk);
                 size_bytes += chunk.len() as u64;
                 if let Err(e) = tmp_file.write_all(&chunk).await {
@@ -2988,19 +3150,91 @@ impl SandboxProvider for DockerSandboxProvider {
         }
         drop(tmp_file);
 
-        let digest_hex = hex::encode(hasher.finalize());
-        let final_path = snapshots_dir.join(format!("{}.tar", digest_hex));
+        let image_digest = hex::encode(hasher.finalize());
 
-        // Atomic rename — the file is only visible at the final path once
-        // fully written, so a concurrent reader never sees a partial write.
-        if let Err(e) = tokio::fs::rename(&tmp_path, &final_path).await {
-            cleanup_on_err();
-            return Err(AgentError::SandboxExecFailed {
-                run_id: 0,
-                sandbox_id: container_id.clone(),
-                reason: format!("snapshot: atomic rename failed: {}", e),
-            });
-        }
+        let workspace_source_for_archive = workspace_source.clone();
+        let workspace_tmp_for_archive = workspace_tmp_path.clone();
+        let workspace_limit = max_size_bytes.saturating_sub(size_bytes);
+        let workspace_archive = tokio::task::spawn_blocking(move || {
+            archive_workspace(
+                &workspace_source_for_archive,
+                &workspace_tmp_for_archive,
+                workspace_limit,
+            )
+        })
+        .await;
+        let (workspace_digest, workspace_size_bytes) = match workspace_archive {
+            Ok(Ok(artifact)) => artifact,
+            Ok(Err(e)) => {
+                cleanup_on_err();
+                if e.to_string().contains("snapshot artifact exceeds the") {
+                    return Err(AgentError::SnapshotSizeLimitExceeded {
+                        sandbox_id: container_id.clone(),
+                        stage: "archiving the Docker workspace".to_string(),
+                        max_size_bytes,
+                    });
+                }
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!(
+                        "snapshot: failed to archive workspace '{}': {}",
+                        workspace_source.display(),
+                        e
+                    ),
+                });
+            }
+            Err(e) => {
+                cleanup_on_err();
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: workspace archive task failed: {}", e),
+                });
+            }
+        };
+
+        let digest_hex = combined_snapshot_digest(&image_digest, &workspace_digest);
+        let final_path = snapshots_dir.join(format!("{}.tar", digest_hex));
+        let workspace_final_path = snapshots_dir.join(format!("{}.workspace.tar", digest_hex));
+
+        // Publish without replacing an existing content-addressed file. A
+        // concurrent or deduplicated snapshot may already own the path; this
+        // attempt must never unlink or overwrite that shared artifact.
+        let created_workspace = match publish_content_addressed_file(
+            &workspace_tmp_path,
+            &workspace_final_path,
+            &workspace_digest,
+        )
+        .await
+        {
+            Ok(created) => created,
+            Err(e) => {
+                cleanup_on_err();
+                return Err(AgentError::SandboxExecFailed {
+                    run_id: 0,
+                    sandbox_id: container_id.clone(),
+                    reason: format!("snapshot: workspace artifact publish failed: {}", e),
+                });
+            }
+        };
+        let created_primary =
+            match publish_content_addressed_file(&tmp_path, &final_path, &image_digest).await {
+                Ok(created) => created,
+                Err(e) => {
+                    if created_workspace {
+                        let _ = tokio::fs::remove_file(&workspace_final_path).await;
+                    }
+                    cleanup_on_err();
+                    return Err(AgentError::SandboxExecFailed {
+                        run_id: 0,
+                        sandbox_id: container_id.clone(),
+                        reason: format!("snapshot: image artifact publish failed: {}", e),
+                    });
+                }
+            };
+
+        let size_bytes = size_bytes.saturating_add(workspace_size_bytes);
 
         // ── Tag the committed image with the canonical, content-addressed name ─
         // The tag is derived from the tarball digest, never from the caller's
@@ -3022,7 +3256,8 @@ impl SandboxProvider for DockerSandboxProvider {
         let image_ref = format!("temps-snapshot/{}:latest", image_label);
 
         // Re-tag the committed image to the canonical snapshot name.
-        self.docker
+        if let Err(e) = self
+            .docker
             .tag_image(
                 &committed_image_id,
                 Some(
@@ -3033,20 +3268,28 @@ impl SandboxProvider for DockerSandboxProvider {
                 ),
             )
             .await
-            .map_err(|e| {
-                tracing::warn!(
-                    "snapshot: failed to tag committed image as {}: {}",
-                    image_ref,
-                    e
-                );
-                // Non-fatal: the tarball is written; the image can be re-imported
-                // from the tarball on restore.
-                AgentError::SandboxExecFailed {
-                    run_id: 0,
-                    sandbox_id: container_id.clone(),
-                    reason: format!("snapshot: failed to tag image {}: {}", image_ref, e),
-                }
-            })?;
+        {
+            tracing::warn!(
+                "snapshot: failed to tag committed image as {}: {}",
+                image_ref,
+                e
+            );
+            // A failed row has no DB reference to either artifact. Remove both
+            // published files here so a daemon tagging failure cannot leak
+            // storage indefinitely.
+            if created_primary {
+                let _ = tokio::fs::remove_file(&final_path).await;
+            }
+            if created_workspace {
+                let _ = tokio::fs::remove_file(&workspace_final_path).await;
+            }
+            cleanup_on_err();
+            return Err(AgentError::SandboxExecFailed {
+                run_id: 0,
+                sandbox_id: container_id.clone(),
+                reason: format!("snapshot: failed to tag image {}: {}", image_ref, e),
+            });
+        }
 
         // Remove the staging tag now that the canonical tag is in place.
         let _ = self
@@ -3068,15 +3311,23 @@ impl SandboxProvider for DockerSandboxProvider {
             size_bytes = %size_bytes,
             path = %final_path.display(),
             image_ref = %image_ref,
+            workspace_path = %workspace_final_path.display(),
             "snapshot: completed successfully"
         );
 
         Ok(super::SnapshotArtifact {
             content_path: final_path,
             content_digest: digest_hex,
+            primary_digest: image_digest,
             size_bytes,
             backend: super::SandboxBackend::Docker,
             image_ref: Some(image_ref),
+            image_id: Some(committed_image_id),
+            workspace: Some(super::SnapshotCompanionArtifact {
+                content_path: workspace_final_path,
+                content_digest: workspace_digest,
+                size_bytes: workspace_size_bytes,
+            }),
         })
     }
 
@@ -3103,8 +3354,106 @@ impl SandboxProvider for DockerSandboxProvider {
                         .to_string(),
                 })?;
 
-        // Check if the image is already present in the daemon.
-        let image_present = self.docker.inspect_image(image_ref).await.is_ok();
+        let primary_path = artifact.content_path.clone();
+        let expected_primary_digest = artifact.primary_digest.clone();
+        let (actual_primary_digest, _) =
+            tokio::task::spawn_blocking(move || hash_file(&primary_path))
+                .await
+                .map_err(|e| AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!("verify snapshot image task failed: {}", e),
+                })?
+                .map_err(|e| AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "verify snapshot image artifact '{}': {}",
+                        artifact.content_path.display(),
+                        e
+                    ),
+                })?;
+        if actual_primary_digest != expected_primary_digest {
+            return Err(AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".to_string(),
+                reason: format!(
+                    "snapshot image digest mismatch: expected {}, got {}",
+                    expected_primary_digest, actual_primary_digest
+                ),
+            });
+        }
+        if let Some(workspace) = &artifact.workspace {
+            let workspace_path = workspace.content_path.clone();
+            let workspace_path_for_hash = workspace_path.clone();
+            let expected_workspace_digest = workspace.content_digest.clone();
+            let logical_snapshot_digest = artifact.content_digest.clone();
+            let (actual_workspace_digest, _) =
+                tokio::task::spawn_blocking(move || hash_file(&workspace_path_for_hash))
+                    .await
+                    .map_err(|e| AgentError::SandboxCreationFailed {
+                        run_id: config.run_id,
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "verify workspace artifact '{}' for logical snapshot '{}' \
+                             task failed: {}",
+                            workspace_path.display(),
+                            logical_snapshot_digest,
+                            e
+                        ),
+                    })?
+                    .map_err(|e| AgentError::SandboxCreationFailed {
+                        run_id: config.run_id,
+                        provider: "docker".to_string(),
+                        reason: format!(
+                            "verify workspace artifact '{}' for logical snapshot '{}': {}",
+                            workspace_path.display(),
+                            logical_snapshot_digest,
+                            e
+                        ),
+                    })?;
+            if actual_workspace_digest != expected_workspace_digest {
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "workspace artifact '{}' for logical snapshot '{}' has digest mismatch: expected {}, got {}",
+                        workspace_path.display(),
+                        logical_snapshot_digest,
+                        expected_workspace_digest,
+                        actual_workspace_digest
+                    ),
+                });
+            }
+            let actual_combined =
+                combined_snapshot_digest(&actual_primary_digest, &actual_workspace_digest);
+            if actual_combined != artifact.content_digest {
+                return Err(AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "combined snapshot digest mismatch: expected {}, got {}",
+                        artifact.content_digest, actual_combined
+                    ),
+                });
+            }
+        }
+
+        let expected_image_id = artifact.image_id.as_deref().ok_or_else(|| {
+            AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".to_string(),
+                reason: "snapshot metadata has no immutable Docker image ID; refusing to trust a mutable image tag"
+                    .to_string(),
+            }
+        })?;
+
+        // A Docker tag is mutable. It is usable only when it still resolves to
+        // the immutable image ID captured with this snapshot.
+        let image_present = match self.docker.inspect_image(image_ref).await {
+            Ok(inspect) => inspect.id.as_deref() == Some(expected_image_id),
+            Err(_) => false,
+        };
 
         if !image_present {
             // Load from the tarball. `docker load` imports all tags embedded
@@ -3144,41 +3493,38 @@ impl SandboxProvider for DockerSandboxProvider {
                 });
             }
 
-            // Read the tarball via spawn_blocking so the async runtime is not
-            // stalled on a potentially multi-GB disk read. The bollard
-            // `import_image_stream` API requires the full bytes upfront
-            // (it does not accept an async reader); the cap above bounds
-            // the worst-case allocation.
-            let buf = tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
-                use std::io::Read;
-                let mut f = std::fs::File::open(&path)?;
-                let mut buf = Vec::with_capacity(file_size as usize);
-                f.read_to_end(&mut buf)?;
-                Ok(buf)
-            })
-            .await
-            .map_err(|e| AgentError::SandboxExecFailed {
-                run_id: config.run_id,
-                sandbox_id: String::new(),
-                reason: format!("snapshot: spawn_blocking join error reading tarball: {}", e),
-            })?
-            .map_err(|e| AgentError::SandboxExecFailed {
-                run_id: config.run_id,
-                sandbox_id: String::new(),
-                reason: format!(
-                    "snapshot: failed to read tarball {}: {}",
-                    artifact.content_path.display(),
-                    e
-                ),
-            })?;
+            let file =
+                tokio::fs::File::open(&path)
+                    .await
+                    .map_err(|e| AgentError::SandboxExecFailed {
+                        run_id: config.run_id,
+                        sandbox_id: String::new(),
+                        reason: format!(
+                            "snapshot: failed to open tarball {}: {}",
+                            artifact.content_path.display(),
+                            e
+                        ),
+                    })?;
+            let file_stream = futures::stream::try_unfold(file, |mut file| async move {
+                use tokio::io::AsyncReadExt;
+                let mut chunk = vec![0u8; 1024 * 1024];
+                let read = file.read(&mut chunk).await?;
+                if read == 0 {
+                    Ok::<Option<(bytes::Bytes, tokio::fs::File)>, std::io::Error>(None)
+                } else {
+                    chunk.truncate(read);
+                    Ok::<Option<(bytes::Bytes, tokio::fs::File)>, std::io::Error>(Some((
+                        bytes::Bytes::from(chunk),
+                        file,
+                    )))
+                }
+            });
 
             let mut load_stream = self.docker.import_image_stream(
                 bollard::query_parameters::ImportImageOptionsBuilder::new()
                     .quiet(true)
                     .build(),
-                futures::stream::once(async move {
-                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(buf))
-                }),
+                file_stream,
                 None,
             );
 
@@ -3207,14 +3553,68 @@ impl SandboxProvider for DockerSandboxProvider {
                 }
             }
 
+            self.docker
+                .inspect_image(expected_image_id)
+                .await
+                .map_err(|e| AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "verified snapshot imported without expected image ID '{}': {}",
+                        expected_image_id, e
+                    ),
+                })?;
+            self.docker
+                .tag_image(
+                    expected_image_id,
+                    Some(
+                        bollard::query_parameters::TagImageOptionsBuilder::new()
+                            .repo(image_ref.split(':').next().unwrap_or(image_ref))
+                            .tag(image_ref.rsplit(':').next().unwrap_or("latest"))
+                            .build(),
+                    ),
+                )
+                .await
+                .map_err(|e| AgentError::SandboxCreationFailed {
+                    run_id: config.run_id,
+                    provider: "docker".to_string(),
+                    reason: format!(
+                        "tag imported snapshot image '{}' as '{}': {}",
+                        expected_image_id, image_ref, e
+                    ),
+                })?;
+
             tracing::info!(
                 image_ref = %image_ref,
                 "snapshot: image loaded from tarball"
             );
         }
 
-        // Delegate to the normal create path with the snapshot image.
         let mut config = config;
+        if let Some(workspace) = artifact.workspace.clone() {
+            let destination = config.host_work_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                restore_workspace_archive(&workspace, &destination)
+            })
+            .await
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".to_string(),
+                reason: format!("restore workspace archive task failed: {}", e),
+            })?
+            .map_err(|e| AgentError::SandboxCreationFailed {
+                run_id: config.run_id,
+                provider: "docker".to_string(),
+                reason: format!(
+                    "restore workspace archive into '{}': {}",
+                    config.host_work_dir.display(),
+                    e
+                ),
+            })?;
+        }
+
+        // Delegate to the normal create path with the snapshot image. The
+        // restored host directory is bind-mounted at the sandbox work path by create.
         config.image = Some(image_ref.to_string());
         self.create(config).await
     }
@@ -3555,6 +3955,196 @@ mod tests {
     fn docker_image_lock() -> &'static Mutex<()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn workspace_archive_round_trip_preserves_nested_files() {
+        let source = tempfile::tempdir().unwrap();
+        let nested = source.path().join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("main.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(source.path().join(".gitignore"), b"target\n").unwrap();
+
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive_path = archive_dir.path().join("workspace.tar");
+        let (content_digest, size_bytes) =
+            archive_workspace(source.path(), &archive_path, u64::MAX).unwrap();
+        let artifact = super::super::SnapshotCompanionArtifact {
+            content_path: archive_path,
+            content_digest,
+            size_bytes,
+        };
+        let restored = tempfile::tempdir().unwrap();
+
+        restore_workspace_archive(&artifact, restored.path()).unwrap();
+
+        assert_eq!(
+            std::fs::read(restored.path().join("src/main.rs")).unwrap(),
+            b"fn main() {}\n"
+        );
+        assert_eq!(
+            std::fs::read(restored.path().join(".gitignore")).unwrap(),
+            b"target\n"
+        );
+    }
+
+    #[test]
+    fn workspace_restore_rejects_digest_mismatch() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("state.txt"), b"captured").unwrap();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive_path = archive_dir.path().join("workspace.tar");
+        let (_, size_bytes) = archive_workspace(source.path(), &archive_path, u64::MAX).unwrap();
+        let artifact = super::super::SnapshotCompanionArtifact {
+            content_path: archive_path,
+            content_digest: "0".repeat(64),
+            size_bytes,
+        };
+        let restored = tempfile::tempdir().unwrap();
+
+        let error = restore_workspace_archive(&artifact, restored.path()).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("digest mismatch"));
+    }
+
+    #[test]
+    fn combined_snapshot_digest_changes_with_workspace() {
+        let first = combined_snapshot_digest("same-image", "workspace-one");
+        let second = combined_snapshot_digest("same-image", "workspace-two");
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn workspace_archive_stops_at_size_limit() {
+        let source = tempfile::tempdir().unwrap();
+        std::fs::write(source.path().join("large.bin"), vec![7u8; 4096]).unwrap();
+        let archive_dir = tempfile::tempdir().unwrap();
+        let archive_path = archive_dir.path().join("workspace.tar");
+
+        let error = archive_workspace(source.path(), &archive_path, 1024).unwrap_err();
+
+        assert!(error.to_string().contains("exceeds the 1024 byte limit"));
+        assert!(std::fs::metadata(archive_path).unwrap().len() <= 1024);
+    }
+
+    #[tokio::test]
+    async fn content_addressed_publish_reuses_shared_file_without_replacing_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("shared.tar");
+        let temporary = directory.path().join("attempt.tar");
+        std::fs::write(&destination, b"shared snapshot bytes").unwrap();
+        std::fs::write(&temporary, b"shared snapshot bytes").unwrap();
+        let (digest, _) = hash_file(&destination).unwrap();
+
+        let created = publish_content_addressed_file(&temporary, &destination, &digest)
+            .await
+            .unwrap();
+
+        assert!(!created);
+        assert!(!temporary.exists());
+        assert_eq!(
+            std::fs::read(destination).unwrap(),
+            b"shared snapshot bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn docker_restore_rejects_snapshot_without_immutable_image_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("snapshot.tar");
+        std::fs::write(&primary, b"verified-image-tar").unwrap();
+        let (digest, size_bytes) = hash_file(&primary).unwrap();
+        let artifact = super::super::SnapshotArtifact {
+            content_path: primary,
+            content_digest: digest.clone(),
+            primary_digest: digest,
+            size_bytes,
+            backend: super::super::SandboxBackend::Docker,
+            image_ref: Some("temps-snapshot/legacy:latest".to_string()),
+            image_id: None,
+            workspace: None,
+        };
+        let provider = DockerSandboxProvider::new(
+            Arc::new(Docker::connect_with_local_defaults().unwrap()),
+            DockerSandboxConfig::default(),
+        );
+        let config = SandboxCreateConfig {
+            owner_user_id: None,
+            run_id: 1,
+            container_name_override: Some("missing-image-id".to_string()),
+            host_work_dir: directory.path().join("workspace"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            network_mode: Some("none".to_string()),
+            env_vars: HashMap::new(),
+            idle_timeout: std::time::Duration::from_secs(60),
+            backend: Some(super::super::SandboxBackend::Docker),
+        };
+
+        let error = provider
+            .create_from_snapshot(&artifact, config)
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("no immutable Docker image ID"));
+    }
+
+    #[tokio::test]
+    async fn docker_workspace_verification_error_identifies_artifact_and_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let primary = directory.path().join("snapshot.tar");
+        std::fs::write(&primary, b"verified-image-tar").unwrap();
+        let (primary_digest, primary_size) = hash_file(&primary).unwrap();
+        let missing_workspace = directory.path().join("missing-workspace.tar");
+        let logical_digest = "logical-snapshot-digest".to_string();
+        let artifact = super::super::SnapshotArtifact {
+            content_path: primary,
+            content_digest: logical_digest.clone(),
+            primary_digest,
+            size_bytes: primary_size,
+            backend: super::super::SandboxBackend::Docker,
+            image_ref: Some("temps-snapshot/context:latest".to_string()),
+            image_id: Some("sha256:immutable-image".to_string()),
+            workspace: Some(super::super::SnapshotCompanionArtifact {
+                content_path: missing_workspace.clone(),
+                content_digest: "missing-workspace-digest".to_string(),
+                size_bytes: 1,
+            }),
+        };
+        let provider = DockerSandboxProvider::new(
+            Arc::new(Docker::connect_with_local_defaults().unwrap()),
+            DockerSandboxConfig::default(),
+        );
+        let config = SandboxCreateConfig {
+            owner_user_id: None,
+            run_id: 2,
+            container_name_override: Some("workspace-context".to_string()),
+            host_work_dir: directory.path().join("workspace"),
+            workspace_volume: None,
+            image: None,
+            cpu_limit: None,
+            memory_limit_mb: None,
+            pids_limit: None,
+            disk_size_mb: None,
+            network_mode: Some("none".to_string()),
+            env_vars: HashMap::new(),
+            idle_timeout: std::time::Duration::from_secs(60),
+            backend: Some(super::super::SandboxBackend::Docker),
+        };
+
+        let error = provider
+            .create_from_snapshot(&artifact, config)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains(&missing_workspace.display().to_string()));
+        assert!(error.contains(&logical_digest));
     }
 
     /// Root maintenance commands resolve `chown`/`su`/`cp` through PATH. The
@@ -4011,7 +4601,7 @@ mod tests {
             return;
         }
 
-        let run_id = 99990; // Unlikely to conflict
+        let run_id = 900_000 + (std::process::id() % 90_000) as i32;
         let work_dir = std::env::temp_dir().join(format!("sandbox-e2e-test-{}", run_id));
         let _ = std::fs::create_dir_all(&work_dir);
         std::fs::write(work_dir.join("test.txt"), "hello from test").unwrap();
@@ -4097,16 +4687,101 @@ mod tests {
         let recovered_handle = recovered.unwrap();
         assert_eq!(recovered_handle.sandbox_name, handle.sandbox_name);
 
-        // 6. Destroy
+        // 6. Add container-layer state, then capture both it and the mounted
+        // workspace through the real provider.
+        let write_layer = provider
+            .exec(
+                &handle,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    "printf 'layer-state' > /tmp/snapshot-layer-state".to_string(),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(write_layer.exit_code, 0);
+        provider.stop(&handle).await.unwrap();
+        let artifact = provider
+            .take_snapshot(&handle, Some("e2e-round-trip".to_string()), u64::MAX)
+            .await
+            .unwrap();
+
+        // 7. Destroy the source and remove the daemon tag so restore must load
+        // and verify the exported image tar rather than use the cache.
         provider.destroy(&handle, true).await.unwrap();
+        let image_ref = artifact
+            .image_ref
+            .clone()
+            .expect("Docker snapshot image reference");
+        provider.delete_image(&image_ref).await.unwrap();
 
-        // 7. Verify it's gone
-        assert!(!provider.is_alive(&handle).await.unwrap_or(false));
-        let after_destroy = provider.recover(run_id).await.unwrap();
-        assert!(after_destroy.is_none());
+        // 8. Restore into a new empty host workspace and verify both captured
+        // files through provider exec.
+        let restored_work_dir =
+            std::env::temp_dir().join(format!("sandbox-e2e-restore-test-{}", run_id));
+        let _ = std::fs::remove_dir_all(&restored_work_dir);
+        std::fs::create_dir_all(&restored_work_dir).unwrap();
+        let restored = provider
+            .create_from_snapshot(
+                &artifact,
+                SandboxCreateConfig {
+                    owner_user_id: None,
+                    run_id: run_id + 1,
+                    container_name_override: None,
+                    host_work_dir: restored_work_dir.clone(),
+                    workspace_volume: None,
+                    image: None,
+                    cpu_limit: Some(1.0),
+                    memory_limit_mb: Some(512),
+                    pids_limit: None,
+                    disk_size_mb: None,
+                    network_mode: Some("none".to_string()),
+                    env_vars: HashMap::new(),
+                    idle_timeout: Duration::from_secs(120),
+                    backend: Some(crate::sandbox::SandboxBackend::Docker),
+                },
+            )
+            .await
+            .unwrap();
+        let restored_state = provider
+            .exec(
+                &restored,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "cat {}/test.txt; cat /tmp/snapshot-layer-state",
+                        CONTAINER_WORK_DIR
+                    ),
+                ],
+                HashMap::new(),
+                None,
+            )
+            .await
+            .unwrap();
 
-        // Cleanup
+        // Gather assertions after cleanup so assertion failures cannot leak
+        // Docker resources or content-addressed files.
+        let source_alive = provider.is_alive(&handle).await.unwrap_or(false);
+        let source_recovered = provider.recover(run_id).await.unwrap();
+        provider.destroy(&restored, true).await.unwrap();
+        let _ = provider.delete_image(&image_ref).await;
+        let _ = tokio::fs::remove_file(&artifact.content_path).await;
+        if let Some(workspace) = &artifact.workspace {
+            let _ = tokio::fs::remove_file(&workspace.content_path).await;
+        }
+        let _ = std::fs::remove_dir_all(&restored_work_dir);
         let _ = std::fs::remove_dir_all(&work_dir);
+
+        // 9. Verify source destruction and restored state.
+        assert!(!source_alive);
+        assert!(source_recovered.is_none());
+        assert_eq!(restored_state.exit_code, 0);
+        assert!(restored_state.stdout.contains("hello from test"));
+        assert!(restored_state.stdout.contains("layer-state"));
     }
 
     #[tokio::test]
@@ -5279,6 +5954,9 @@ mod tests {
         // Create a container with env vars that mimic real injected credentials.
         // The values are synthetic but structurally real: the assertion below
         // checks that these specific non-empty values are replaced with "".
+        let workspace = tempfile::tempdir().expect("create mounted workspace");
+        std::fs::write(workspace.path().join("workspace-state.txt"), b"preserved")
+            .expect("write workspace marker");
         let container_config = bollard::models::ContainerCreateBody {
             image: Some(base_image.to_string()),
             cmd: Some(vec!["sleep".to_string(), "60".to_string()]),
@@ -5290,6 +5968,14 @@ mod tests {
                 // Non-sensitive: must survive in the snapshot unchanged
                 "SAFE_VAR=keep-me".to_string(),
             ]),
+            host_config: Some(bollard::models::HostConfig {
+                binds: Some(vec![format!(
+                    "{}:{}",
+                    workspace.path().display(),
+                    CONTAINER_WORK_DIR
+                )]),
+                ..Default::default()
+            }),
             ..Default::default()
         };
 
@@ -5347,7 +6033,11 @@ mod tests {
         // ContainerConfig.env body (silently ignored by the Docker Engine)
         // and fixed by switching to CommitContainerOptionsBuilder::changes().
         let artifact = provider
-            .take_snapshot(&handle, Some("scrub-regression-test".to_string()))
+            .take_snapshot(
+                &handle,
+                Some("scrub-regression-test".to_string()),
+                1024 * 1024 * 1024,
+            )
             .await
             .expect("take_snapshot failed");
 
@@ -5355,6 +6045,19 @@ mod tests {
         // to remove even if an assertion panics.
         let snapshot_image_ref = artifact.image_ref.clone();
         let snapshot_path = artifact.content_path.clone();
+        let workspace_artifact = artifact
+            .workspace
+            .clone()
+            .expect("Docker snapshot must include its bind-mounted workspace");
+
+        let restored_workspace = tempfile::tempdir().expect("create restore destination");
+        restore_workspace_archive(&workspace_artifact, restored_workspace.path())
+            .expect("restore captured workspace");
+        assert_eq!(
+            std::fs::read(restored_workspace.path().join("workspace-state.txt"))
+                .expect("read restored workspace marker"),
+            b"preserved"
+        );
 
         // ── Core assertion: inspect the committed image's Config.Env ─────────
         // This is the exact check that would have caught the bug. The old
@@ -5451,5 +6154,6 @@ mod tests {
         // Remove the snapshot tarball written by take_snapshot to avoid
         // accumulating test artifacts in ~/.temps/snapshots/.
         let _ = tokio::fs::remove_file(&snapshot_path).await;
+        let _ = tokio::fs::remove_file(&workspace_artifact.content_path).await;
     }
 }

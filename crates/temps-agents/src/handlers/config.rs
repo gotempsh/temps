@@ -88,6 +88,11 @@ impl From<AgentError> for Problem {
                     .with_title("Sandbox Exec Failed")
                     .with_detail(error.to_string())
             }
+            AgentError::SnapshotSizeLimitExceeded { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Snapshot Storage Limit Exceeded")
+                    .with_detail(error.to_string())
+            }
             AgentError::SandboxProviderUnavailable { .. } => {
                 problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
                     .with_title("Sandbox Provider Unavailable")
