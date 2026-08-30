@@ -7,7 +7,7 @@
 //! (PostgreSQL, Redis, MongoDB, S3) on any node in the cluster.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -20,11 +20,14 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::exec_timeout::{
-    completed_exec_exit_code, exec_start_was_rejected, resolve_exec_container_id,
-    run_exec_with_deadline, ExecCleanupGuard, ExecCompletionError, ExecDeadlineOutcome,
+    completed_exec_exit_code, exec_start_was_rejected, monitor_exec_until_stopped,
+    resolve_container_id, resolve_exec_container_id, run_exec_with_deadline, ExecCleanupGuard,
+    ExecCompletionError, ExecDeadlineOutcome,
 };
 use crate::handlers::{
-    try_acquire_attached_exec_permits, AgentResponse, AgentState, ExecAdmissionError,
+    captured_error_response, captured_ok_response, container_identity_error_status,
+    try_acquire_attached_exec_permits, try_acquire_exec_lifecycle_permits, AgentResourceLimits,
+    AgentResponse, AgentState, ExecAdmissionError,
 };
 use crate::output_buffer::{BoundedTailBuffer, MAX_CAPTURED_STREAM_BYTES};
 use crate::{
@@ -852,12 +855,17 @@ pub async fn service_status(
     responses(
         (status = 200, description = "Command executed", body = AgentResponse<ServiceExecResponse>),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Service container not found"),
+        (status = 409, description = "Container identity changed before exec start"),
+        (status = 429, description = "Exec or capture capacity exhausted"),
+        (status = 504, description = "Exec deadline exceeded"),
         (status = 500, description = "Exec failed")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn service_exec(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Json(request): Json<ServiceExecRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
@@ -877,6 +885,19 @@ pub async fn service_exec(
             .into_response();
         }
     };
+    let cleanup_container_id = match resolve_container_id(docker, &request.container_name).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                container_identity_error_status(&error),
+                format!(
+                    "Failed to resolve service container '{}' before exec: {error}",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+    };
 
     use bollard::exec::{CreateExecOptions, StartExecOptions};
 
@@ -889,15 +910,44 @@ pub async fn service_exec(
 
     let cmd_refs: Vec<&str> = request.command.iter().map(|s| &s[..]).collect();
 
-    let permits = if request.detach {
-        None
+    let (operation_permit, container_permit, capture_permit) = if request.detach {
+        match try_acquire_exec_lifecycle_permits(&limits, &cleanup_container_id) {
+            Ok(permits) => (permits.operation, permits.container, None),
+            Err(ExecAdmissionError::OperationsExhausted) => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Cannot execute detached command in '{}': all exec operation slots are busy",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+            Err(ExecAdmissionError::ContainerOwned) => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Cannot execute detached command in '{}': another operation already owns that container",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+            Err(ExecAdmissionError::CapturesExhausted) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Detached command in '{}' unexpectedly required output capture capacity",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+        }
     } else {
-        match try_acquire_attached_exec_permits(
-            &state.exec_operation_slots,
-            &state.output_capture_slots,
-        ) {
-            Ok(permits) => Some(permits),
-            Err(ExecAdmissionError::OperationsBusy) => {
+        match try_acquire_attached_exec_permits(&limits, &cleanup_container_id) {
+            Ok(permits) => (permits.operation, permits.container, Some(permits.capture)),
+            Err(ExecAdmissionError::OperationsExhausted) => {
                 return error_response(
                     StatusCode::TOO_MANY_REQUESTS,
                     format!(
@@ -907,11 +957,21 @@ pub async fn service_exec(
                 )
                 .into_response();
             }
-            Err(ExecAdmissionError::CapturesBusy) => {
+            Err(ExecAdmissionError::CapturesExhausted) => {
                 return error_response(
                     StatusCode::TOO_MANY_REQUESTS,
                     format!(
                         "Cannot execute command in '{}': all output capture slots are busy",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+            Err(ExecAdmissionError::ContainerOwned) => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Cannot execute command in '{}': another operation already owns that container",
                         request.container_name
                     ),
                 )
@@ -933,10 +993,7 @@ pub async fn service_exec(
         ..Default::default()
     };
 
-    let exec_create = match docker
-        .create_exec(&request.container_name, exec_config)
-        .await
-    {
+    let exec_create = match docker.create_exec(&cleanup_container_id, exec_config).await {
         Ok(r) => r,
         Err(e) => {
             return error_response(
@@ -950,34 +1007,7 @@ pub async fn service_exec(
         }
     };
 
-    if request.detach {
-        // Start detached — don't wait for output
-        if let Err(e) = docker
-            .start_exec(
-                &exec_create.id,
-                Some(StartExecOptions {
-                    detach: true,
-                    ..Default::default()
-                }),
-            )
-            .await
-        {
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to start exec (detached): {}", e),
-            )
-            .into_response();
-        }
-
-        return ok_response(ServiceExecResponse {
-            exit_code: 0,
-            stdout: String::new(),
-            stderr: "detached".to_string(),
-        })
-        .into_response();
-    }
-
-    let cleanup_container_id = match resolve_exec_container_id(docker, &exec_create.id).await {
+    let exec_container_id = match resolve_exec_container_id(docker, &exec_create.id).await {
         Ok(container_id) => container_id,
         Err(error) => {
             return error_response(
@@ -987,9 +1017,69 @@ pub async fn service_exec(
             .into_response();
         }
     };
+    if exec_container_id != cleanup_container_id {
+        return error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Service container '{}' changed from '{}' to '{}' before exec start",
+                request.container_name, cleanup_container_id, exec_container_id
+            ),
+        )
+        .into_response();
+    }
 
-    let permits = match permits {
-        Some(permits) => permits,
+    if request.detach {
+        let mut cleanup_guard = ExecCleanupGuard::new_without_capture(
+            docker.clone(),
+            exec_create.id.clone(),
+            cleanup_container_id.clone(),
+            Some(operation_permit),
+            container_permit,
+        );
+        let start_result = docker
+            .start_exec(
+                &exec_create.id,
+                Some(StartExecOptions {
+                    detach: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        if let Err(error) = start_result {
+            let cleanup_scheduled = !exec_start_was_rejected(&error);
+            if !cleanup_scheduled {
+                cleanup_guard.disarm();
+            }
+            let cleanup_note = if cleanup_scheduled {
+                "its container restart was scheduled because Docker did not definitively reject the workload"
+            } else {
+                "Docker definitively rejected the workload before start; its container was not restarted"
+            };
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to start detached exec: {error}; {cleanup_note}"),
+            )
+            .into_response();
+        }
+
+        monitor_exec_until_stopped(
+            docker.clone(),
+            exec_create.id.clone(),
+            cleanup_container_id,
+            "detached service exec",
+            cleanup_guard,
+        );
+
+        return ok_response(ServiceExecResponse {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: "detached".to_string(),
+        })
+        .into_response();
+    }
+
+    let capture_permit = match capture_permit {
+        Some(permit) => permit,
         None => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1001,17 +1091,16 @@ pub async fn service_exec(
             .into_response();
         }
     };
-    let capture_permit = permits.capture;
-    let operation_permit = permits.operation;
     let mut cleanup_guard = ExecCleanupGuard::new(
         docker.clone(),
         exec_create.id.clone(),
         cleanup_container_id.clone(),
         capture_permit,
         operation_permit,
+        container_permit,
     );
 
-    let output = match run_exec_with_deadline(
+    let (output, response_permit) = match run_exec_with_deadline(
         docker,
         &exec_create.id,
         &cleanup_container_id,
@@ -1021,8 +1110,17 @@ pub async fn service_exec(
     .await
     {
         ExecDeadlineOutcome::Completed(Ok(output)) => {
-            cleanup_guard.disarm();
-            output
+            let Some(response_permit) = cleanup_guard.disarm_and_take_capture() else {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Command in '{}' completed without response capture ownership",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            };
+            (output, response_permit)
         }
         ExecDeadlineOutcome::Completed(Err(error)) => {
             let cleanup_scheduled = !matches!(
@@ -1077,12 +1175,14 @@ pub async fn service_exec(
         "Exec completed"
     );
 
-    ok_response(ServiceExecResponse {
-        exit_code: output.exit_code,
-        stdout: output.stdout,
-        stderr: output.stderr,
-    })
-    .into_response()
+    captured_ok_response(
+        ServiceExecResponse {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        },
+        response_permit,
+    )
 }
 
 /// Provision a project's logical database, bucket, or Redis allocation on
@@ -1288,12 +1388,17 @@ pub async fn list_services(State(state): State<Arc<AgentState>>) -> impl IntoRes
     responses(
         (status = 200, description = "Backup completed", body = AgentResponse<ServiceBackupResponse>),
         (status = 400, description = "Unsupported service type"),
+        (status = 404, description = "Service container not found"),
+        (status = 409, description = "Container identity changed before backup start"),
+        (status = 429, description = "Exec or capture capacity exhausted"),
+        (status = 504, description = "Backup deadline exceeded"),
         (status = 500, description = "Backup failed")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn backup_service(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Json(request): Json<ServiceBackupRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
@@ -1309,6 +1414,19 @@ pub async fn backup_service(
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Docker client not available".to_string(),
+            )
+            .into_response();
+        }
+    };
+    let cleanup_container_id = match resolve_container_id(docker, &request.container_name).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                container_identity_error_status(&error),
+                format!(
+                    "Failed to resolve service container '{}' before backup: {error}",
+                    request.container_name
+                ),
             )
             .into_response();
         }
@@ -1373,12 +1491,9 @@ pub async fn backup_service(
         }
     };
 
-    let permits = match try_acquire_attached_exec_permits(
-        &state.exec_operation_slots,
-        &state.output_capture_slots,
-    ) {
+    let permits = match try_acquire_attached_exec_permits(&limits, &cleanup_container_id) {
         Ok(permits) => permits,
-        Err(ExecAdmissionError::OperationsBusy) => {
+        Err(ExecAdmissionError::OperationsExhausted) => {
             return error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
@@ -1388,7 +1503,7 @@ pub async fn backup_service(
             )
             .into_response();
         }
-        Err(ExecAdmissionError::CapturesBusy) => {
+        Err(ExecAdmissionError::CapturesExhausted) => {
             return error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
@@ -1398,9 +1513,20 @@ pub async fn backup_service(
             )
             .into_response();
         }
+        Err(ExecAdmissionError::ContainerOwned) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot back up '{}': another operation already owns that container",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
     };
     let capture_permit = permits.capture;
     let operation_permit = permits.operation;
+    let container_permit = permits.container;
 
     // Execute the backup command inside the container.
     use bollard::exec::CreateExecOptions;
@@ -1422,10 +1548,7 @@ pub async fn backup_service(
         ..Default::default()
     };
 
-    let exec_create = match docker
-        .create_exec(&request.container_name, exec_config)
-        .await
-    {
+    let exec_create = match docker.create_exec(&cleanup_container_id, exec_config).await {
         Ok(r) => r,
         Err(e) => {
             return error_response(
@@ -1435,7 +1558,7 @@ pub async fn backup_service(
             .into_response();
         }
     };
-    let cleanup_container_id = match resolve_exec_container_id(docker, &exec_create.id).await {
+    let exec_container_id = match resolve_exec_container_id(docker, &exec_create.id).await {
         Ok(container_id) => container_id,
         Err(error) => {
             return error_response(
@@ -1445,15 +1568,26 @@ pub async fn backup_service(
             .into_response();
         }
     };
+    if exec_container_id != cleanup_container_id {
+        return error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Service container '{}' changed from '{}' to '{}' before backup start",
+                request.container_name, cleanup_container_id, exec_container_id
+            ),
+        )
+        .into_response();
+    }
     let mut cleanup_guard = ExecCleanupGuard::new(
         docker.clone(),
         exec_create.id.clone(),
         cleanup_container_id.clone(),
         capture_permit,
         operation_permit,
+        container_permit,
     );
 
-    let output = match run_exec_with_deadline(
+    let (output, response_permit) = match run_exec_with_deadline(
         docker,
         &exec_create.id,
         &cleanup_container_id,
@@ -1463,8 +1597,17 @@ pub async fn backup_service(
     .await
     {
         ExecDeadlineOutcome::Completed(Ok(output)) => {
-            cleanup_guard.disarm();
-            output
+            let Some(response_permit) = cleanup_guard.disarm_and_take_capture() else {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Backup in '{}' completed without response capture ownership",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            };
+            (output, response_permit)
         }
         ExecDeadlineOutcome::Completed(Err(error)) => {
             let cleanup_scheduled = !matches!(
@@ -1519,7 +1662,11 @@ pub async fn backup_service(
             received_stderr_bytes = output.received_stderr_bytes,
             "Backup command failed"
         );
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+        return captured_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            response_permit,
+        );
     }
 
     tracing::info!(
@@ -1529,13 +1676,15 @@ pub async fn backup_service(
         "Backup completed successfully"
     );
 
-    ok_response(ServiceBackupResponse {
-        s3_location: request.s3_path.clone(),
-        size_bytes: 0,
-        compression_type: "gzip".to_string(),
-        checksum: None,
-    })
-    .into_response()
+    captured_ok_response(
+        ServiceBackupResponse {
+            s3_location: request.s3_path.clone(),
+            size_bytes: 0,
+            compression_type: "gzip".to_string(),
+            checksum: None,
+        },
+        response_permit,
+    )
 }
 
 /// Restore a service from S3.
@@ -1549,12 +1698,17 @@ pub async fn backup_service(
     responses(
         (status = 200, description = "Restore completed"),
         (status = 400, description = "Unsupported service type"),
+        (status = 404, description = "Service container not found"),
+        (status = 409, description = "Container identity changed before restore start"),
+        (status = 429, description = "Exec or capture capacity exhausted"),
+        (status = 504, description = "Restore deadline exceeded"),
         (status = 500, description = "Restore failed")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn restore_service(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Json(request): Json<ServiceRestoreRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
@@ -1570,6 +1724,19 @@ pub async fn restore_service(
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Docker client not available".to_string(),
+            )
+            .into_response();
+        }
+    };
+    let cleanup_container_id = match resolve_container_id(docker, &request.container_name).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                container_identity_error_status(&error),
+                format!(
+                    "Failed to resolve service container '{}' before restore: {error}",
+                    request.container_name
+                ),
             )
             .into_response();
         }
@@ -1615,12 +1782,9 @@ pub async fn restore_service(
         }
     };
 
-    let permits = match try_acquire_attached_exec_permits(
-        &state.exec_operation_slots,
-        &state.output_capture_slots,
-    ) {
+    let permits = match try_acquire_attached_exec_permits(&limits, &cleanup_container_id) {
         Ok(permits) => permits,
-        Err(ExecAdmissionError::OperationsBusy) => {
+        Err(ExecAdmissionError::OperationsExhausted) => {
             return error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
@@ -1630,7 +1794,7 @@ pub async fn restore_service(
             )
             .into_response();
         }
-        Err(ExecAdmissionError::CapturesBusy) => {
+        Err(ExecAdmissionError::CapturesExhausted) => {
             return error_response(
                 StatusCode::TOO_MANY_REQUESTS,
                 format!(
@@ -1640,9 +1804,20 @@ pub async fn restore_service(
             )
             .into_response();
         }
+        Err(ExecAdmissionError::ContainerOwned) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot restore '{}': another operation already owns that container",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
     };
     let capture_permit = permits.capture;
     let operation_permit = permits.operation;
+    let container_permit = permits.container;
 
     use bollard::exec::CreateExecOptions;
 
@@ -1663,10 +1838,7 @@ pub async fn restore_service(
         ..Default::default()
     };
 
-    let exec_create = match docker
-        .create_exec(&request.container_name, exec_config)
-        .await
-    {
+    let exec_create = match docker.create_exec(&cleanup_container_id, exec_config).await {
         Ok(r) => r,
         Err(e) => {
             return error_response(
@@ -1676,7 +1848,7 @@ pub async fn restore_service(
             .into_response();
         }
     };
-    let cleanup_container_id = match resolve_exec_container_id(docker, &exec_create.id).await {
+    let exec_container_id = match resolve_exec_container_id(docker, &exec_create.id).await {
         Ok(container_id) => container_id,
         Err(error) => {
             return error_response(
@@ -1686,15 +1858,26 @@ pub async fn restore_service(
             .into_response();
         }
     };
+    if exec_container_id != cleanup_container_id {
+        return error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Service container '{}' changed from '{}' to '{}' before restore start",
+                request.container_name, cleanup_container_id, exec_container_id
+            ),
+        )
+        .into_response();
+    }
     let mut cleanup_guard = ExecCleanupGuard::new(
         docker.clone(),
         exec_create.id.clone(),
         cleanup_container_id.clone(),
         capture_permit,
         operation_permit,
+        container_permit,
     );
 
-    let output = match run_exec_with_deadline(
+    let (output, response_permit) = match run_exec_with_deadline(
         docker,
         &exec_create.id,
         &cleanup_container_id,
@@ -1704,8 +1887,17 @@ pub async fn restore_service(
     .await
     {
         ExecDeadlineOutcome::Completed(Ok(output)) => {
-            cleanup_guard.disarm();
-            output
+            let Some(response_permit) = cleanup_guard.disarm_and_take_capture() else {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Restore in '{}' completed without response capture ownership",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            };
+            (output, response_permit)
         }
         ExecDeadlineOutcome::Completed(Err(error)) => {
             let cleanup_scheduled = !matches!(
@@ -1760,7 +1952,11 @@ pub async fn restore_service(
             received_stderr_bytes = output.received_stderr_bytes,
             "Restore command failed"
         );
-        return error_response(StatusCode::INTERNAL_SERVER_ERROR, message).into_response();
+        return captured_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            message,
+            response_permit,
+        );
     }
 
     tracing::info!(
@@ -1770,11 +1966,13 @@ pub async fn restore_service(
         "Restore completed successfully"
     );
 
-    ok_response(serde_json::json!({
-        "status": "restored",
-        "container_name": request.container_name,
-    }))
-    .into_response()
+    captured_ok_response(
+        serde_json::json!({
+            "status": "restored",
+            "container_name": request.container_name,
+        }),
+        response_permit,
+    )
 }
 
 /// Build S3 environment variables for backup commands (WAL-G, etc.)

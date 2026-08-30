@@ -8,7 +8,18 @@
 //! worker agent until it is OOM-killed. This buffer retains only the newest
 //! bytes and records that earlier output was discarded.
 
+use axum::{
+    body::Body,
+    http::{header, HeaderValue, StatusCode},
+    response::Response,
+};
 use bytes::Bytes;
+use futures::Stream;
+use serde::Serialize;
+use std::convert::Infallible;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::sync::OwnedSemaphorePermit;
 
 /// Maximum captured bytes per stdout/stderr stream.
 ///
@@ -16,7 +27,81 @@ use bytes::Bytes;
 /// serialization can briefly create another bounded copy.
 pub(crate) const MAX_CAPTURED_STREAM_BYTES: usize = 4 * 1024 * 1024;
 
+/// Keep response frames small enough for HTTP backpressure to prevent a slow
+/// peer from moving an entire multi-megabyte capture outside the semaphore's
+/// accounting in one poll.
+const CAPTURE_RESPONSE_CHUNK_BYTES: usize = 64 * 1024;
+
 const TRUNCATION_NOTICE: &str = "[… earlier output truncated by worker …]\n";
+
+struct CaptureResponseStream {
+    payload: Bytes,
+    offset: usize,
+    permit: Option<OwnedSemaphorePermit>,
+}
+
+impl Stream for CaptureResponseStream {
+    type Item = Result<Bytes, Infallible>;
+
+    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        if self.offset >= self.payload.len() {
+            self.payload = Bytes::new();
+            self.permit.take();
+            return Poll::Ready(None);
+        }
+
+        let end = self
+            .offset
+            .saturating_add(CAPTURE_RESPONSE_CHUNK_BYTES)
+            .min(self.payload.len());
+        // Use an independent allocation rather than `Bytes::slice`: a slice
+        // would keep the complete multi-megabyte JSON allocation alive after
+        // the permit is released merely because Hyper still owns one frame.
+        let chunk = Bytes::copy_from_slice(&self.payload[self.offset..end]);
+        self.offset = end;
+        Poll::Ready(Some(Ok(chunk)))
+    }
+}
+
+/// Serialize a captured result while its permit is held, then retain that
+/// permit until the response body reaches EOF or is dropped by the server.
+/// Chunking allows Hyper's normal transport backpressure to bound data queued
+/// beyond the body stream.
+pub(crate) fn json_response_with_capture_permit<T: Serialize>(
+    status: StatusCode,
+    value: T,
+    permit: OwnedSemaphorePermit,
+) -> Response {
+    let payload = match serde_json::to_vec(&value) {
+        Ok(payload) => Bytes::from(payload),
+        Err(error) => {
+            tracing::error!(reason = %error, "Failed to serialize captured agent response");
+            drop(permit);
+            let mut response = Response::new(Body::from(
+                r#"{"success":false,"data":null,"error":"Failed to serialize agent response"}"#,
+            ));
+            *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
+            response.headers_mut().insert(
+                header::CONTENT_TYPE,
+                HeaderValue::from_static("application/json"),
+            );
+            return response;
+        }
+    };
+
+    let body = Body::from_stream(CaptureResponseStream {
+        payload,
+        offset: 0,
+        permit: Some(permit),
+    });
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("application/json"),
+    );
+    response
+}
 
 fn append_printable_utf8(output: &mut String, input: &str) {
     for character in input.chars() {
@@ -132,6 +217,8 @@ impl BoundedTailBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use http_body_util::BodyExt;
+    use std::sync::Arc;
 
     #[test]
     fn retains_complete_output_below_limit() {
@@ -213,5 +300,45 @@ mod tests {
         output.push(Bytes::from_static("😀".as_bytes()));
 
         assert_eq!(output.into_string(), format!("{TRUNCATION_NOTICE}z😀"));
+    }
+
+    #[tokio::test]
+    async fn capture_permit_is_held_until_response_body_finishes_or_drops() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test semaphore remains open");
+        let payload = "x".repeat(CAPTURE_RESPONSE_CHUNK_BYTES * 2);
+        let response = json_response_with_capture_permit(StatusCode::OK, &payload, permit);
+        let mut body = response.into_body();
+
+        let first = body
+            .frame()
+            .await
+            .expect("response has a first frame")
+            .expect("response frame is infallible")
+            .into_data()
+            .expect("response frame contains data");
+        assert!(first.len() <= CAPTURE_RESPONSE_CHUNK_BYTES);
+        assert!(slots.clone().try_acquire_owned().is_err());
+
+        drop(body);
+        assert_eq!(slots.available_permits(), 1);
+
+        let permit = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test semaphore remains open");
+        let response = json_response_with_capture_permit(StatusCode::OK, &payload, permit);
+        let collected = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body is infallible");
+        assert!(!collected.to_bytes().is_empty());
+        assert_eq!(slots.available_permits(), 1);
     }
 }

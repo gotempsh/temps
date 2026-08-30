@@ -54,20 +54,12 @@ pub fn build_router(
     let state = Arc::new(AgentState {
         container_deployer,
         image_builder,
-        output_capture_slots: Arc::new(tokio::sync::Semaphore::new(
-            handlers::MAX_CONCURRENT_OUTPUT_CAPTURES,
-        )),
-        exec_operation_slots: Arc::new(tokio::sync::Semaphore::new(
-            handlers::MAX_CONCURRENT_EXEC_OPERATIONS,
-        )),
-        image_import_slots: Arc::new(tokio::sync::Semaphore::new(
-            handlers::MAX_CONCURRENT_IMAGE_IMPORTS,
-        )),
         docker,
         overlay_bridge_address,
         overlay_peers,
         platform,
     });
+    let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
     let auth = Arc::new(AgentAuth::new(&config.token));
 
@@ -150,6 +142,7 @@ pub fn build_router(
         )
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth))
+        .layer(Extension(resource_limits))
         .with_state(state);
 
     // Swagger UI — no auth required so it's accessible for documentation
