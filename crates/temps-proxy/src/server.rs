@@ -607,25 +607,41 @@ pub fn setup_proxy_server(
     Ok(())
 }
 
-/// Bind-and-immediately-drop every configured proxy listener address so a
-/// port conflict is reported as a normal startup error instead of a silently
-/// swallowed panic inside Pingora (see the comment at the top of
-/// `setup_proxy_server`). `std::net::TcpListener::bind` sets `SO_REUSEADDR`
-/// on Unix, so this only rejects an address another process is *actively
-/// listening* on -- it does not false-positive on a socket still winding
-/// down in `TIME_WAIT`, which is exactly the case Pingora's own bind retries
-/// are designed to tolerate.
+/// Bind every configured proxy listener address, holding all of them open
+/// simultaneously until every check has run, so a port conflict is reported
+/// as a normal startup error instead of a silently swallowed panic inside
+/// Pingora (see the comment at the top of `setup_proxy_server`).
+///
+/// Binding must overlap, not just happen -- Pingora opens `TEMPS_ADDRESS` and
+/// `TEMPS_TLS_ADDRESS` *concurrently*, so if they're accidentally set to the
+/// same address, checking each one in isolation (bind, then immediately
+/// release before checking the next) would let both checks pass: the first
+/// probe frees the port before the second one binds it. Only the same
+/// address held open at once actually reproduces Pingora's real conflict.
+///
+/// `std::net::TcpListener::bind` sets `SO_REUSEADDR` on Unix, so this only
+/// rejects an address something is *actively listening* on -- it does not
+/// false-positive on a socket still winding down in `TIME_WAIT`, which is
+/// exactly the case Pingora's own bind retries are designed to tolerate.
 fn preflight_check_listen_addresses(proxy_config: &ProxyConfig) -> Result<()> {
-    check_address_bindable(&proxy_config.address, "TEMPS_ADDRESS")?;
+    let _http_listener = bind_or_report(&proxy_config.address, "TEMPS_ADDRESS")?;
     if let Some(ref tls_address) = proxy_config.tls_address {
-        check_address_bindable(tls_address, "TEMPS_TLS_ADDRESS")?;
+        let _tls_listener = bind_or_report(tls_address, "TEMPS_TLS_ADDRESS")?;
     }
     Ok(())
 }
 
+/// Test-only convenience wrapper around `bind_or_report` for exercising a
+/// single address in isolation; production code always goes through
+/// `preflight_check_listen_addresses`, which must hold multiple listeners
+/// open at once (see its doc comment for why).
+#[cfg(test)]
 fn check_address_bindable(address: &str, env_var: &str) -> Result<()> {
+    bind_or_report(address, env_var).map(|_| ())
+}
+
+fn bind_or_report(address: &str, env_var: &str) -> Result<std::net::TcpListener> {
     std::net::TcpListener::bind(address)
-        .map(|_| ())
         .map_err(|e| anyhow::anyhow!(bind_failure_message(address, env_var, e.kind(), &e)))
 }
 
@@ -859,5 +875,33 @@ mod preflight_bind_tests {
         assert!(message.contains(&held_addr));
 
         drop(held);
+    }
+
+    #[test]
+    fn preflight_check_listen_addresses_rejects_identical_http_and_tls_addresses() {
+        // Reproduces TEMPS_ADDRESS and TEMPS_TLS_ADDRESS accidentally set to
+        // the same value. Pingora binds both listeners concurrently, so this
+        // must fail even though each address is individually free -- a naive
+        // "bind, then release, then bind the next one" check would let both
+        // probes pass since neither overlaps with the other in time.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let proxy_config = ProxyConfig {
+            address: addr.clone(),
+            tls_address: Some(addr.clone()),
+            ..Default::default()
+        };
+
+        let result = preflight_check_listen_addresses(&proxy_config);
+
+        let message = result
+            .expect_err("expected identical HTTP/TLS addresses to be reported as a conflict")
+            .to_string();
+        assert!(
+            message.contains(&addr),
+            "error should name the conflicting address: {message}"
+        );
     }
 }
