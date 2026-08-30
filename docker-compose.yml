@@ -51,7 +51,12 @@ services:
       # public interfaces.
       - "127.0.0.1:5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # This image (Spilo/timescaledb-ha based) initialises its cluster at
+      # PGDATA=/home/postgres/pgdata/data, not the stock postgres image's
+      # /var/lib/postgresql/data. Mounting the wrong path silently leaves the
+      # real cluster in the container's writable layer, so every recreation
+      # (image update, `compose down && up`, host reboot) loses all data.
+      - postgres_data:/home/postgres/pgdata/data
       - postgres_socket:/var/run/postgresql
     # NOTE: archive_command is NOT set here on purpose.
     # Command-line parameters take highest priority in PostgreSQL and cannot be
