@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use temps_core::{
     JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
@@ -36,6 +37,10 @@ fn route_binding_for_service<'a>(
                 .find(|binding| binding.container_port == target)
         })
         .or_else(|| bindings.first())
+}
+
+fn secret_generation_for_attempt(deployment_id: i32, attempt_nonce: &str) -> String {
+    format!("deployment-{deployment_id}-{attempt_nonce}")
 }
 
 impl std::fmt::Debug for DeployComposeJob {
@@ -95,6 +100,13 @@ pub struct DeployComposeJob {
     download_job_id: String,
     log_id: Option<String>,
     log_service: Arc<LogService>,
+    /// Set by `execute_with_cancellation`; the serialized executor checks it
+    /// at safe phase boundaries instead of dropping in-flight filesystem or
+    /// Docker futures that could outlive cleanup.
+    cancellation_requested: AtomicBool,
+    /// Unique to this in-memory job construction, including a replay of the
+    /// same durable deployment/workflow identifiers.
+    secret_generation: String,
 }
 
 pub struct DeployComposeJobBuilder {
@@ -237,13 +249,14 @@ impl DeployComposeJobBuilder {
     }
 
     pub fn build(self) -> Result<DeployComposeJob, WorkflowError> {
+        let deployment_id = self
+            .deployment_id
+            .ok_or_else(|| WorkflowError::JobValidationFailed("deployment_id required".into()))?;
         Ok(DeployComposeJob {
             job_id: self
                 .job_id
                 .ok_or_else(|| WorkflowError::JobValidationFailed("job_id required".into()))?,
-            deployment_id: self.deployment_id.ok_or_else(|| {
-                WorkflowError::JobValidationFailed("deployment_id required".into())
-            })?,
+            deployment_id,
             project_id: self
                 .project_id
                 .ok_or_else(|| WorkflowError::JobValidationFailed("project_id required".into()))?,
@@ -272,26 +285,49 @@ impl DeployComposeJobBuilder {
             log_service: self
                 .log_service
                 .ok_or_else(|| WorkflowError::JobValidationFailed("log_service required".into()))?,
+            cancellation_requested: AtomicBool::new(false),
+            secret_generation: secret_generation_for_attempt(
+                deployment_id,
+                &uuid::Uuid::new_v4().simple().to_string(),
+            ),
         })
     }
 }
 
-#[async_trait]
-impl WorkflowTask for DeployComposeJob {
-    fn job_id(&self) -> &str {
-        &self.job_id
+impl DeployComposeJob {
+    async fn compensate_if_cancelled(
+        &self,
+        project_name: &str,
+        repo_path: Option<&Path>,
+        compose_file_name: &str,
+        phase: &str,
+    ) -> Result<(), WorkflowError> {
+        if !self.cancellation_requested.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        self.compose_executor
+            .teardown_at(
+                project_name,
+                repo_path,
+                Some(compose_file_name),
+                &self.environment_vars,
+                true,
+            )
+            .await
+            .map_err(|error| WorkflowError::JobExecutionFailed(format!(
+                "Compose deployment was cancelled {phase}, but compensation failed for {project_name}: {error}"
+            )))?;
+        Err(WorkflowError::WorkflowCancelled)
     }
 
-    fn name(&self) -> &str {
-        "Deploy Compose Stack"
-    }
-
-    fn description(&self) -> &str {
-        "Deploy a multi-container Docker Compose stack"
-    }
-
-    async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+    async fn execute_locked(
+        &self,
+        mut context: WorkflowContext,
+    ) -> Result<JobResult, WorkflowError> {
         let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
+        if self.cancellation_requested.load(Ordering::Acquire) {
+            return Err(WorkflowError::WorkflowCancelled);
+        }
 
         // Log start
         if let Some(ref log_id) = self.log_id {
@@ -713,9 +749,17 @@ impl WorkflowTask for DeployComposeJob {
                 )
                 .await;
         }
-        let prepared = match self.compose_executor.prepare_and_pull(&request).await {
+        let secret_generation = self.secret_generation.clone();
+        let prepared = match self
+            .compose_executor
+            .prepare_and_pull_for_generation(&request, &secret_generation)
+            .await
+        {
             Ok(p) => p,
             Err(e) => {
+                if self.cancellation_requested.load(Ordering::Acquire) {
+                    return Err(WorkflowError::WorkflowCancelled);
+                }
                 let error_msg = format!("Compose prepare/pull failed: {}", e);
                 tracing::error!(error = %error_msg, "Docker Compose prepare_and_pull failed");
                 if let Some(ref log_id) = self.log_id {
@@ -728,6 +772,15 @@ impl WorkflowTask for DeployComposeJob {
         // Tear down previous containers (preserve volumes for data persistence).
         // Images are already local at this point, so the actual downtime window
         // is now only: old-container-stop → new-container-healthy (no pull).
+        if self.cancellation_requested.load(Ordering::Acquire) {
+            self.compose_executor
+                .cleanup_secret_generation(&project_name, &secret_generation)
+                .await
+                .map_err(|error| WorkflowError::JobExecutionFailed(format!(
+                    "Compose deployment was cancelled before teardown, but candidate secret cleanup failed for {project_name}: {error}"
+                )))?;
+            return Err(WorkflowError::WorkflowCancelled);
+        }
         if let Some(ref log_id) = self.log_id {
             let _ = self
                 .log_service
@@ -758,6 +811,14 @@ impl WorkflowTask for DeployComposeJob {
                 "Previous compose stack teardown failed (may not exist)"
             );
         }
+
+        self.compensate_if_cancelled(
+            &project_name,
+            repo_path.as_deref(),
+            compose_file_name,
+            "after teardown",
+        )
+        .await?;
 
         // Deploy (network + up + wait + discover + label). Images are already
         // local from prepare_and_pull so this is the live downtime window.
@@ -819,9 +880,20 @@ impl WorkflowTask for DeployComposeJob {
                 if let Some(cleanup_error) = cleanup_error {
                     tracing::error!(project = %project_name, error = %cleanup_error, "Compose compensation cleanup failed");
                 }
+                if self.cancellation_requested.load(Ordering::Acquire) {
+                    return Err(WorkflowError::WorkflowCancelled);
+                }
                 return Err(WorkflowError::JobExecutionFailed(error_msg));
             }
         };
+
+        self.compensate_if_cancelled(
+            &project_name,
+            repo_path.as_deref(),
+            compose_file_name,
+            "after startup",
+        )
+        .await?;
 
         if services.is_empty() {
             let _ = self
@@ -947,7 +1019,44 @@ impl WorkflowTask for DeployComposeJob {
                 .await;
         }
 
+        // Cancellation may arrive while final service/log metadata is being
+        // persisted after startup. This is the last await boundary before the
+        // synchronous success return, so compensate here while the outer task
+        // still owns the per-project lifecycle lock.
+        self.compensate_if_cancelled(
+            &project_name,
+            repo_path.as_deref(),
+            compose_file_name,
+            "during finalization",
+        )
+        .await?;
+
         Ok(JobResult::success(context))
+    }
+}
+
+#[async_trait]
+impl WorkflowTask for DeployComposeJob {
+    fn job_id(&self) -> &str {
+        &self.job_id
+    }
+
+    fn name(&self) -> &str {
+        "Deploy Compose Stack"
+    }
+
+    fn description(&self) -> &str {
+        "Deploy a multi-container Docker Compose stack"
+    }
+
+    async fn execute(&self, context: WorkflowContext) -> Result<JobResult, WorkflowError> {
+        self.cancellation_requested.store(false, Ordering::Release);
+        let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
+        let _lifecycle_guard = self
+            .compose_executor
+            .acquire_project_lifecycle_lock(&project_name)
+            .await;
+        self.execute_locked(context).await
     }
 
     async fn execute_with_cancellation(
@@ -955,27 +1064,17 @@ impl WorkflowTask for DeployComposeJob {
         context: WorkflowContext,
         cancellation_provider: &dyn WorkflowCancellationProvider,
     ) -> Result<JobResult, WorkflowError> {
+        self.cancellation_requested.store(false, Ordering::Release);
         let workflow_run_id = context.workflow_run_id.clone();
         let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
-        let compose_file_name = self.compose_path.as_deref().unwrap_or("docker-compose.yml");
-        validate_relative_path(compose_file_name, "compose_path")?;
-        validate_relative_path(&self.directory, "directory")?;
-        let cleanup_repo_path = if self.compose_content.is_none() {
-            let repo_dir: Option<String> = context
-                .get_output(&self.download_job_id, "repo_dir")
-                .map_err(|error| WorkflowError::JobExecutionFailed(error.to_string()))?;
-            repo_dir
-                .map(|repo_dir| {
-                    canonicalize_confined_repo_path(
-                        Path::new(&repo_dir),
-                        Path::new(&self.directory),
-                        "directory",
-                    )
-                })
-                .transpose()?
-        } else {
-            None
-        };
+        let _lifecycle_guard = self
+            .compose_executor
+            .acquire_project_lifecycle_lock(&project_name)
+            .await;
+        match cancellation_provider.is_cancelled(&workflow_run_id).await {
+            Ok(false) => {}
+            Ok(true) | Err(_) => return Err(WorkflowError::WorkflowCancelled),
+        }
         let cancellation_check = async {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -986,25 +1085,17 @@ impl WorkflowTask for DeployComposeJob {
             }
         };
 
+        let execution = self.execute_locked(context);
+        tokio::pin!(execution);
         tokio::select! {
-            result = self.execute(context) => result,
+            biased;
+            result = &mut execution => result,
             _ = cancellation_check => {
-                self.compose_executor
-                    .teardown_at(
-                        &project_name,
-                        cleanup_repo_path.as_deref(),
-                        Some(compose_file_name),
-                        &self.environment_vars,
-                        // Deploy attempt is aborted; remove secrets so plaintext
-                        // credentials are not left on disk for a stack that
-                        // is no longer running.
-                        true,
-                    )
-                    .await
-                    .map_err(|error| WorkflowError::JobExecutionFailed(format!(
-                        "Compose deployment was cancelled, but stack cleanup failed for {project_name}: {error}"
-                    )))?;
-                Err(WorkflowError::WorkflowCancelled)
+                self.cancellation_requested.store(true, Ordering::Release);
+                // Keep the serialized execution future alive. It observes the
+                // flag at the next safe phase boundary and compensates while
+                // this method still owns the per-project lifecycle lock.
+                execution.await
             }
         }
     }
@@ -1105,6 +1196,20 @@ mod tests {
         assert_eq!(job.public_ports[0].service, "webserver");
         assert_eq!(job.public_ports[0].port, 8000);
         assert_eq!(job.public_ports[0].published, Some(18005));
+
+        let replay = DeployComposeJobBuilder::new()
+            .job_id("deploy_compose".to_string())
+            .deployment_id(1)
+            .project_id(2)
+            .environment_id(3)
+            .compose_executor(job.compose_executor.clone())
+            .log_service(job.log_service.clone())
+            .build()
+            .expect("reconstructed workflow job should build");
+        assert_ne!(
+            job.secret_generation, replay.secret_generation,
+            "a replay of the same durable deployment needs a fresh candidate generation"
+        );
     }
 
     #[test]
@@ -1145,6 +1250,68 @@ mod tests {
         let selected = route_binding_for_service("gitlab", &bindings, &[]).unwrap();
 
         assert_eq!(selected.container_port, 22);
+    }
+
+    #[test]
+    fn secret_generation_is_unique_per_job_attempt_and_path_safe() {
+        let first = secret_generation_for_attempt(42, "0123456789abcdef");
+        let second = secret_generation_for_attempt(42, "fedcba9876543210");
+        assert_ne!(first, second);
+        assert_eq!(first, "deployment-42-0123456789abcdef");
+        assert_eq!(second, "deployment-42-fedcba9876543210");
+    }
+
+    #[tokio::test]
+    async fn final_cancellation_compensates_stack_secrets_before_returning() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let logs_dir = tempfile::tempdir().unwrap();
+        let project_name = "temps-2-3";
+        let secret_path = data_dir
+            .path()
+            .join("compose-secrets")
+            .join(project_name)
+            .join("active")
+            .join("web")
+            .join("TOKEN");
+        std::fs::create_dir_all(secret_path.parent().unwrap()).unwrap();
+        std::fs::write(&secret_path, "must-be-removed").unwrap();
+
+        let docker = Arc::new(
+            bollard::Docker::connect_with_local_defaults()
+                .expect("constructing the Docker client should not contact the daemon"),
+        );
+        let job = DeployComposeJobBuilder::new()
+            .job_id("deploy_compose".to_string())
+            .deployment_id(1)
+            .project_id(2)
+            .environment_id(3)
+            .compose_executor(Arc::new(ComposeExecutor::new(
+                docker,
+                data_dir.path().to_path_buf(),
+            )))
+            .log_service(Arc::new(LogService::new(logs_dir.path().to_path_buf())))
+            .build()
+            .expect("complete builder should produce a deployment job");
+        job.cancellation_requested.store(true, Ordering::Release);
+
+        let result = job
+            .compensate_if_cancelled(
+                project_name,
+                None,
+                "docker-compose.yml",
+                "during finalization",
+            )
+            .await;
+
+        assert!(matches!(result, Err(WorkflowError::WorkflowCancelled)));
+        assert!(
+            !data_dir
+                .path()
+                .join("compose-secrets")
+                .join(project_name)
+                .exists(),
+            "final cancellation must remove plaintext stack secrets"
+        );
     }
 
     #[test]

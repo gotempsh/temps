@@ -131,6 +131,17 @@ Temps preserves their container targets while replacing public host exposure
 with random loopback bindings. A catalog entry can never approve its own
 limited capability profile.
 
+Compose redeployments prepare and pull images while the previous stack remains
+live. Candidate plaintext secrets are written under a deployment-scoped
+generation, never over the directory mounted by the active containers. A
+pre-teardown failure or cancellation deletes only the candidate generation and
+preserves the old stack; after the replacement becomes healthy, the candidate
+is promoted and obsolete generations are removed. Once teardown has begun,
+cancellation performs full compensating stack and secret cleanup. A
+process-wide lock keyed by the canonical Temps data directory and Compose
+project serializes this complete lifecycle across fresh workflow executor
+instances, including superseding and replayed deployments.
+
 ## Consequences
 
 - A connected Temps instance receives new compatible Coolify templates without

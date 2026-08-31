@@ -16,9 +16,10 @@ use serde_yaml::Value as YamlValue;
 use serde_yaml::{Mapping, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, Weak};
 use thiserror::Error;
 use tokio::net::TcpStream;
+use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, info, warn};
 
 /// How long `deploy()` waits for every Compose service to report `running`
@@ -52,6 +53,9 @@ const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
 /// files into every service. Written last in the `-f` order so a repository
 /// or user override cannot redirect the mount.
 const TEMPS_SECRETS_OVERRIDE: &str = "docker-compose.temps-secrets.yml";
+
+static COMPOSE_LIFECYCLE_LOCKS: LazyLock<Mutex<HashMap<String, Weak<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Mount point for project secrets inside every container. Identical to the
 /// single-container deploy path (`DockerRuntime`), so an application reads its
@@ -508,6 +512,11 @@ pub struct PreparedComposeDeploy {
     pub compose_file: String,
     /// Values to strip from diagnostic messages (secrets, env values, etc.).
     pub redact_values: Vec<String>,
+    /// Deployment-scoped directory containing only this candidate's secrets.
+    /// The previous generation remains mounted by the live stack until this
+    /// candidate has started successfully.
+    pub secret_generation: String,
+    pub has_materialized_secrets: bool,
 }
 
 /// Docker Compose deployment executor.
@@ -521,6 +530,29 @@ pub struct ComposeExecutor {
 impl ComposeExecutor {
     pub fn new(docker: Arc<Docker>, data_dir: PathBuf) -> Self {
         Self { docker, data_dir }
+    }
+
+    /// Serialize prepare → teardown → start → compensation for one Compose
+    /// project. Superseding workflows overlap cooperatively, so without this
+    /// lock an older cancellation could delete a newer workflow's candidate
+    /// files or containers.
+    pub async fn acquire_project_lifecycle_lock(&self, project_name: &str) -> OwnedMutexGuard<()> {
+        let data_dir =
+            std::fs::canonicalize(&self.data_dir).unwrap_or_else(|_| self.data_dir.clone());
+        let key = format!("{}\0{project_name}", data_dir.display());
+        let lock = {
+            let mut locks = COMPOSE_LIFECYCLE_LOCKS.lock().await;
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            match locks.get(&key).and_then(Weak::upgrade) {
+                Some(lock) => lock,
+                None => {
+                    let lock = Arc::new(Mutex::new(()));
+                    locks.insert(key, Arc::downgrade(&lock));
+                    lock
+                }
+            }
+        };
+        lock.lock_owned().await
     }
 
     /// Get the work directory for a compose project.
@@ -552,6 +584,10 @@ impl ComposeExecutor {
     /// source inside it would be gone by the first container restart.
     fn secrets_dir(&self, project_name: &str) -> PathBuf {
         self.secrets_root().join(project_name)
+    }
+
+    fn secret_generation_dir(&self, project_name: &str, generation: &str) -> PathBuf {
+        self.secrets_dir(project_name).join(generation)
     }
 
     /// Which secrets a given Compose service is entitled to read.
@@ -620,9 +656,10 @@ impl ComposeExecutor {
     /// path to the value at all. Duplicating a value across the services
     /// entitled to it costs at most `SECRET_VALUE_MAX_BYTES` per copy.
     ///
-    /// The whole tree is removed and recreated on every deploy, so a key the
-    /// user deleted, renamed, or narrowed the scope of cannot survive as a
-    /// stale file.
+    /// Only the candidate generation is removed and recreated. The generation
+    /// mounted by the active stack remains untouched until replacement
+    /// containers are healthy, so a slow or failed pull cannot rotate secrets
+    /// underneath live containers.
     ///
     /// ### Permissions
     /// `0700` on the root, `0755` on each service directory, `0444` on each
@@ -635,11 +672,13 @@ impl ComposeExecutor {
     async fn materialize_secrets(
         &self,
         project_name: &str,
+        generation: &str,
         secrets: &HashMap<String, String>,
         scopes: &HashMap<String, Vec<String>>,
         services: &[String],
     ) -> Result<HashMap<String, PathBuf>, ComposeError> {
-        let root_for_project = self.secrets_dir(project_name);
+        Self::validate_service_dir_name(generation)?;
+        let root_for_project = self.secret_generation_dir(project_name, generation);
 
         // Clear unconditionally, even with no secrets: a project whose last
         // secret was just deleted must not keep serving the old file.
@@ -965,6 +1004,84 @@ impl ComposeExecutor {
         }
     }
 
+    /// Remove only one not-yet-promoted secret generation. This is used when
+    /// preparation fails or is cancelled while the previous stack is still
+    /// serving; deleting the whole project directory would invalidate the
+    /// bind mounts of that live stack.
+    pub async fn cleanup_secret_generation(
+        &self,
+        project_name: &str,
+        generation: &str,
+    ) -> Result<(), ComposeError> {
+        Self::validate_service_dir_name(generation)?;
+        let dir = self.secret_generation_dir(project_name, generation);
+        match tokio::fs::remove_dir_all(&dir).await {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ComposeError::FileWriteFailed {
+                path: dir.display().to_string(),
+                reason: format!("failed to remove candidate secret generation: {error}"),
+            }),
+        }
+    }
+
+    /// Promote a successful candidate by removing every older generation.
+    /// This runs only after the replacement containers are healthy, so no live
+    /// container can still depend on the directories being removed.
+    async fn promote_secret_generation(
+        &self,
+        project_name: &str,
+        generation: Option<&str>,
+    ) -> Result<(), ComposeError> {
+        if let Some(generation) = generation {
+            Self::validate_service_dir_name(generation)?;
+        }
+        let project_dir = self.secrets_dir(project_name);
+        let mut entries = match tokio::fs::read_dir(&project_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(ComposeError::FileWriteFailed {
+                    path: project_dir.display().to_string(),
+                    reason: format!("failed to list secret generations: {error}"),
+                });
+            }
+        };
+        while let Some(entry) =
+            entries
+                .next_entry()
+                .await
+                .map_err(|error| ComposeError::FileWriteFailed {
+                    path: project_dir.display().to_string(),
+                    reason: format!("failed to inspect secret generations: {error}"),
+                })?
+        {
+            if generation.is_some_and(|current| entry.file_name() == current) {
+                continue;
+            }
+            let path = entry.path();
+            tokio::fs::remove_dir_all(&path).await.map_err(|error| {
+                ComposeError::FileWriteFailed {
+                    path: path.display().to_string(),
+                    reason: format!("failed to remove obsolete secret generation: {error}"),
+                }
+            })?;
+        }
+        if generation.is_none() {
+            match tokio::fs::remove_dir(&project_dir).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(ComposeError::FileWriteFailed {
+                        path: project_dir.display().to_string(),
+                        reason: format!("failed to remove empty secret project directory: {error}"),
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare compose files on disk, build images (if required), and pull
     /// images for `image:`-based services.
     ///
@@ -980,6 +1097,44 @@ impl ComposeExecutor {
         &self,
         request: &ComposeDeployRequest,
     ) -> Result<PreparedComposeDeploy, ComposeError> {
+        let generation = uuid::Uuid::new_v4().simple().to_string();
+        self.prepare_and_pull_for_generation(request, &generation)
+            .await
+    }
+
+    /// Variant used by workflow jobs that need deterministic cancellation
+    /// cleanup. The caller supplies an internal, path-safe generation name so
+    /// it can remove the candidate without touching the active generation.
+    pub async fn prepare_and_pull_for_generation(
+        &self,
+        request: &ComposeDeployRequest,
+        generation: &str,
+    ) -> Result<PreparedComposeDeploy, ComposeError> {
+        let result = self
+            .prepare_and_pull_generation_inner(request, generation)
+            .await;
+        if result.is_err() {
+            if let Err(cleanup_error) = self
+                .cleanup_secret_generation(&request.project_name, generation)
+                .await
+            {
+                warn!(
+                    project = %request.project_name,
+                    generation,
+                    error = %cleanup_error,
+                    "Failed to clean candidate secrets after Compose preparation failure"
+                );
+            }
+        }
+        result
+    }
+
+    async fn prepare_and_pull_generation_inner(
+        &self,
+        request: &ComposeDeployRequest,
+        generation: &str,
+    ) -> Result<PreparedComposeDeploy, ComposeError> {
+        Self::validate_service_dir_name(generation)?;
         let project_dir = self.project_dir(&request.project_name);
         let project_name = request.project_name.clone();
         Self::validate_relative_path(
@@ -1033,7 +1188,8 @@ impl ComposeExecutor {
             .unwrap_or_else(|| project_dir.clone());
 
         // 1. Write compose files + env overrides to disk
-        self.write_compose_files(&effective_dir, request).await?;
+        self.write_compose_files(&effective_dir, request, generation)
+            .await?;
 
         let compose_file = request
             .compose_path
@@ -1089,6 +1245,8 @@ impl ComposeExecutor {
             project_name,
             compose_file,
             redact_values,
+            secret_generation: generation.to_string(),
+            has_materialized_secrets: !request.secrets.is_empty(),
         })
     }
 
@@ -1109,6 +1267,8 @@ impl ComposeExecutor {
             project_name,
             compose_file,
             redact_values,
+            secret_generation,
+            has_materialized_secrets,
         } = prepared;
 
         // Ensure the shared Temps network exists before `up` attaches every
@@ -1171,6 +1331,26 @@ impl ComposeExecutor {
                     "Failed to apply Temps labels to container"
                 );
             }
+        }
+
+        if let Err(error) = self
+            .promote_secret_generation(
+                &project_name,
+                has_materialized_secrets.then_some(secret_generation.as_str()),
+            )
+            .await
+        {
+            // The candidate is already mounted by healthy replacement
+            // containers. Turning an obsolete-generation janitor failure into
+            // a deploy error would make the caller tear those containers down
+            // after the old stack is gone. Keep serving and retry removal on a
+            // later successful deployment.
+            warn!(
+                project = %project_name,
+                generation = %secret_generation,
+                error = %error,
+                "Compose deployed successfully, but obsolete secret generation cleanup was deferred"
+            );
         }
 
         info!(
@@ -1450,6 +1630,7 @@ impl ComposeExecutor {
         &self,
         project_dir: &Path,
         request: &ComposeDeployRequest,
+        secret_generation: &str,
     ) -> Result<(), ComposeError> {
         tokio::fs::create_dir_all(project_dir).await.map_err(|e| {
             ComposeError::FileWriteFailed {
@@ -1670,6 +1851,7 @@ impl ComposeExecutor {
         let secret_mounts = self
             .materialize_secrets(
                 &request.project_name,
+                secret_generation,
                 &request.secrets,
                 &request.secret_compose_services,
                 &services,
@@ -6329,7 +6511,7 @@ services:
         };
 
         executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap();
 
@@ -6393,7 +6575,7 @@ services:
         };
 
         let err = executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap_err();
         assert_eq!(violation_field(err), "env_file");
@@ -6437,7 +6619,7 @@ services:
         };
 
         let err = executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap_err();
         assert_eq!(violation_field(err), "env_file");
@@ -6468,7 +6650,7 @@ services:
         };
 
         let err = executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap_err();
         assert_eq!(violation_field(err), "compose_path");
@@ -6501,7 +6683,7 @@ services:
         };
 
         executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap();
 
@@ -6631,12 +6813,12 @@ services:
         );
 
         executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap();
 
         let secret_file = executor
-            .secrets_dir("temps-1-2")
+            .secret_generation_dir("temps-1-2", "test-generation")
             .join("web")
             .join("DB_PASSWORD");
         assert_eq!(
@@ -6658,7 +6840,7 @@ services:
             assert!(mount.ends_with(":/run/secrets:ro"), "mount was {mount}");
             assert!(mount.starts_with(
                 &executor
-                    .secrets_dir("temps-1-2")
+                    .secret_generation_dir("temps-1-2", "test-generation")
                     .to_string_lossy()
                     .to_string()
             ));
@@ -6697,7 +6879,7 @@ services:
         );
 
         executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap();
 
@@ -6711,13 +6893,17 @@ services:
             & 0o777;
         assert_eq!(root_mode, 0o700);
 
-        let file_mode =
-            tokio::fs::metadata(executor.secrets_dir("temps-1-2").join("web").join("TOKEN"))
-                .await
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o222;
+        let file_mode = tokio::fs::metadata(
+            executor
+                .secret_generation_dir("temps-1-2", "test-generation")
+                .join("web")
+                .join("TOKEN"),
+        )
+        .await
+        .unwrap()
+        .permissions()
+        .mode()
+            & 0o222;
         assert_eq!(file_mode, 0, "secret files must not be writable");
     }
 
@@ -6735,6 +6921,7 @@ services:
             .write_compose_files(
                 project_dir.path(),
                 &secrets_test_request("temps-1-2", compose, one_secret("OLD_KEY", "value")),
+                "test-generation",
             )
             .await
             .unwrap();
@@ -6745,12 +6932,15 @@ services:
             .write_compose_files(
                 project_dir.path(),
                 &secrets_test_request("temps-1-2", compose, HashMap::new()),
+                "test-generation",
             )
             .await
             .unwrap();
 
         assert!(
-            !executor.secrets_dir("temps-1-2").exists(),
+            !executor
+                .secret_generation_dir("temps-1-2", "test-generation")
+                .exists(),
             "stale plaintext survived a redeploy with no secrets"
         );
         assert!(
@@ -6773,6 +6963,7 @@ services:
             .write_compose_files(
                 project_dir.path(),
                 &secrets_test_request("temps-1-2", compose, one_secret("API_KEY", "old-value")),
+                "test-generation",
             )
             .await
             .unwrap();
@@ -6780,11 +6971,14 @@ services:
             .write_compose_files(
                 project_dir.path(),
                 &secrets_test_request("temps-1-2", compose, one_secret("RENAMED", "new-value")),
+                "test-generation",
             )
             .await
             .unwrap();
 
-        let dir = executor.secrets_dir("temps-1-2").join("web");
+        let dir = executor
+            .secret_generation_dir("temps-1-2", "test-generation")
+            .join("web");
         assert!(
             !dir.join("API_KEY").exists(),
             "renamed key left a stale file"
@@ -6795,6 +6989,172 @@ services:
                 .unwrap(),
             "new-value"
         );
+    }
+
+    #[tokio::test]
+    async fn test_candidate_secret_generation_preserves_active_generation_until_promotion() {
+        let Some(docker) = Docker::connect_with_defaults().ok() else {
+            return;
+        };
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), data_dir.path().to_path_buf());
+        let project_dir = tempfile::tempdir().unwrap();
+        let compose = "services:\n  web:\n    image: nginx\n";
+
+        executor
+            .write_compose_files(
+                project_dir.path(),
+                &secrets_test_request("temps-1-2", compose, one_secret("TOKEN", "active")),
+                "active-generation",
+            )
+            .await
+            .unwrap();
+        executor
+            .write_compose_files(
+                project_dir.path(),
+                &secrets_test_request("temps-1-2", compose, one_secret("TOKEN", "candidate")),
+                "candidate-generation",
+            )
+            .await
+            .unwrap();
+
+        let active = executor
+            .secret_generation_dir("temps-1-2", "active-generation")
+            .join("web/TOKEN");
+        let candidate = executor
+            .secret_generation_dir("temps-1-2", "candidate-generation")
+            .join("web/TOKEN");
+        assert_eq!(tokio::fs::read_to_string(&active).await.unwrap(), "active");
+        assert_eq!(
+            tokio::fs::read_to_string(&candidate).await.unwrap(),
+            "candidate"
+        );
+
+        executor
+            .cleanup_secret_generation("temps-1-2", "candidate-generation")
+            .await
+            .unwrap();
+        assert!(
+            active.exists(),
+            "cancelling preparation removed active secrets"
+        );
+        assert!(
+            !candidate.exists(),
+            "candidate plaintext survived cancellation"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_project_lifecycle_lock_serializes_distinct_executor_instances() {
+        let docker = Arc::new(
+            Docker::connect_with_local_defaults()
+                .expect("constructing the Docker client should not contact the daemon"),
+        );
+        let data_dir = tempfile::tempdir().unwrap();
+        let first_executor = ComposeExecutor::new(docker.clone(), data_dir.path().to_path_buf());
+        let second_executor = ComposeExecutor::new(docker, data_dir.path().to_path_buf());
+
+        let first = first_executor
+            .acquire_project_lifecycle_lock("temps-1-2")
+            .await;
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(25),
+            second_executor.acquire_project_lifecycle_lock("temps-1-2"),
+        )
+        .await;
+        assert!(
+            blocked.is_err(),
+            "a second executor entered the same project lifecycle concurrently"
+        );
+
+        drop(first);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            second_executor.acquire_project_lifecycle_lock("temps-1-2"),
+        )
+        .await
+        .expect("the next workflow should acquire the project after release");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_preparation_failure_cleans_candidate_but_preserves_active_secrets() {
+        use std::os::unix::fs::symlink;
+
+        let docker = Docker::connect_with_local_defaults()
+            .expect("constructing the Docker client should not contact the daemon");
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), data_dir.path().to_path_buf());
+        let project_dir = tempfile::tempdir().unwrap();
+        let active_request = secrets_test_request(
+            "temps-1-2",
+            "services:\n  web:\n    image: nginx\n",
+            one_secret("TOKEN", "active"),
+        );
+        executor
+            .write_compose_files(project_dir.path(), &active_request, "active-generation")
+            .await
+            .unwrap();
+
+        symlink("/", project_dir.path().join("escape")).unwrap();
+        let mut candidate_request = secrets_test_request(
+            "temps-1-2",
+            "services:\n  web:\n    image: nginx\n    volumes:\n      - ./escape:/data\n",
+            one_secret("TOKEN", "candidate"),
+        );
+        candidate_request.repo_dir = Some(project_dir.path().to_path_buf());
+
+        let error = match executor
+            .prepare_and_pull_for_generation(&candidate_request, "candidate-generation")
+            .await
+        {
+            Ok(_) => panic!("symlink escape should fail before pull"),
+            Err(error) => error,
+        };
+        assert!(matches!(
+            error,
+            ComposeError::SecurityPolicyViolation { .. }
+        ));
+
+        let active = executor
+            .secret_generation_dir("temps-1-2", "active-generation")
+            .join("web/TOKEN");
+        assert_eq!(tokio::fs::read_to_string(active).await.unwrap(), "active");
+        assert!(!executor
+            .secret_generation_dir("temps-1-2", "candidate-generation")
+            .exists());
+    }
+
+    #[tokio::test]
+    async fn test_promoting_secret_generation_removes_only_obsolete_plaintext() {
+        let Some(docker) = Docker::connect_with_defaults().ok() else {
+            return;
+        };
+        let data_dir = tempfile::tempdir().unwrap();
+        let executor = ComposeExecutor::new(Arc::new(docker), data_dir.path().to_path_buf());
+        let project_dir = tempfile::tempdir().unwrap();
+        let compose = "services:\n  web:\n    image: nginx\n";
+
+        for (generation, value) in [("old", "old-secret"), ("current", "new-secret")] {
+            executor
+                .write_compose_files(
+                    project_dir.path(),
+                    &secrets_test_request("temps-1-2", compose, one_secret("TOKEN", value)),
+                    generation,
+                )
+                .await
+                .unwrap();
+        }
+
+        executor
+            .promote_secret_generation("temps-1-2", Some("current"))
+            .await
+            .unwrap();
+        assert!(!executor.secret_generation_dir("temps-1-2", "old").exists());
+        assert!(executor
+            .secret_generation_dir("temps-1-2", "current")
+            .join("web/TOKEN")
+            .exists());
     }
 
     fn scoped_request(
@@ -6827,11 +7187,11 @@ services:
         );
 
         executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap();
 
-        let stack = executor.secrets_dir("temps-1-2");
+        let stack = executor.secret_generation_dir("temps-1-2", "test-generation");
         // The scoped secret exists only under the entitled service. This is
         // the whole point: `db` has no filesystem path to the value, so it is
         // not merely "not mounted" -- it was never written for that service.
@@ -6856,7 +7216,7 @@ services:
         );
 
         executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap();
 
@@ -6870,7 +7230,10 @@ services:
         // An empty /run/secrets mount would imply "this app has no secrets";
         // no mount at all is the honest representation.
         assert!(parsed["services"]["db"].is_null());
-        assert!(!executor.secrets_dir("temps-1-2").join("db").exists());
+        assert!(!executor
+            .secret_generation_dir("temps-1-2", "test-generation")
+            .join("db")
+            .exists());
     }
 
     #[tokio::test]
@@ -6887,11 +7250,12 @@ services:
             .write_compose_files(
                 project_dir.path(),
                 &scoped_request(one_secret("TOKEN", "value"), HashMap::new()),
+                "test-generation",
             )
             .await
             .unwrap();
         assert!(executor
-            .secrets_dir("temps-1-2")
+            .secret_generation_dir("temps-1-2", "test-generation")
             .join("db")
             .join("TOKEN")
             .exists());
@@ -6905,17 +7269,21 @@ services:
                     one_secret("TOKEN", "value"),
                     HashMap::from([("TOKEN".to_string(), vec!["web".to_string()])]),
                 ),
+                "test-generation",
             )
             .await
             .unwrap();
 
         assert!(executor
-            .secrets_dir("temps-1-2")
+            .secret_generation_dir("temps-1-2", "test-generation")
             .join("web")
             .join("TOKEN")
             .exists());
         assert!(
-            !executor.secrets_dir("temps-1-2").join("db").exists(),
+            !executor
+                .secret_generation_dir("temps-1-2", "test-generation")
+                .join("db")
+                .exists(),
             "narrowing a scope left the revoked service's plaintext on disk"
         );
     }
@@ -6987,7 +7355,7 @@ services:
         // that dependency so the guarantee cannot be removed elsewhere
         // without a failure here.
         let error = executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap_err();
 
@@ -7030,7 +7398,7 @@ services:
         );
 
         let error = executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap_err();
 
@@ -7125,7 +7493,7 @@ services:
         );
 
         executor
-            .write_compose_files(project_dir.path(), &request)
+            .write_compose_files(project_dir.path(), &request, "test-generation")
             .await
             .unwrap();
 

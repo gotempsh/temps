@@ -1056,6 +1056,10 @@ fn externalize_literal_credentials(
     transformations: &mut Vec<TemplateTransformation>,
 ) {
     let mut variables_by_literal = BTreeMap::<String, String>::new();
+    let mut reserved_variables = extract_variables(root, &[])
+        .into_iter()
+        .map(|variable| variable.name)
+        .collect::<BTreeSet<_>>();
     let Some(services) = root.get_mut("services").and_then(YamlValue::as_mapping_mut) else {
         return;
     };
@@ -1078,10 +1082,13 @@ fn externalize_literal_credentials(
                     };
                     let name = name.to_string();
                     if should_externalize_literal_credential(&name, value) {
-                        let variable = variables_by_literal
-                            .entry(value.to_string())
-                            .or_insert_with(|| generated_credential_variable(service_name, &name))
-                            .clone();
+                        let variable = allocate_generated_credential_variable(
+                            service_name,
+                            &name,
+                            value,
+                            &mut variables_by_literal,
+                            &mut reserved_variables,
+                        );
                         *entry = YamlValue::String(format!("{name}=${{{variable}}}"));
                         transformations.push(TemplateTransformation {
                             code: "externalized_literal_credential",
@@ -1098,10 +1105,13 @@ fn externalize_literal_credentials(
                         continue;
                     };
                     if should_externalize_literal_credential(name, text) {
-                        let variable = variables_by_literal
-                            .entry(text.to_string())
-                            .or_insert_with(|| generated_credential_variable(service_name, name))
-                            .clone();
+                        let variable = allocate_generated_credential_variable(
+                            service_name,
+                            name,
+                            text,
+                            &mut variables_by_literal,
+                            &mut reserved_variables,
+                        );
                         *value = YamlValue::String(format!("${{{variable}}}"));
                         transformations.push(TemplateTransformation {
                             code: "externalized_literal_credential",
@@ -1165,6 +1175,38 @@ fn generated_credential_variable(service_name: &str, name: &str) -> String {
         })
         .collect::<String>();
     format!("SERVICE_PASSWORD_{suffix}")
+}
+
+fn allocate_generated_credential_variable(
+    service_name: &str,
+    name: &str,
+    literal: &str,
+    variables_by_literal: &mut BTreeMap<String, String>,
+    reserved_variables: &mut BTreeSet<String>,
+) -> String {
+    if let Some(existing) = variables_by_literal.get(literal) {
+        return existing.clone();
+    }
+
+    let base = generated_credential_variable(service_name, name);
+    let mut candidate = base.clone();
+    if reserved_variables.contains(&candidate) {
+        let digest = Sha256::digest(format!("{service_name}\0{name}").as_bytes());
+        let suffix = digest[..4]
+            .iter()
+            .map(|byte| format!("{byte:02X}"))
+            .collect::<String>();
+        candidate = format!("{base}_{suffix}");
+        let mut discriminator = 2_u32;
+        while reserved_variables.contains(&candidate) {
+            candidate = format!("{base}_{suffix}_{discriminator}");
+            discriminator += 1;
+        }
+    }
+
+    variables_by_literal.insert(literal.to_string(), candidate.clone());
+    reserved_variables.insert(candidate.clone());
+    candidate
 }
 
 fn discover_backing_services(root: &YamlValue) -> Vec<TemplateBackingService> {
@@ -2317,6 +2359,80 @@ mod tests {
             temps_presets::validate_compose_credentials(&prepared.compose),
             Ok(())
         );
+    }
+
+    #[test]
+    fn generated_credential_names_remain_distinct_after_normalization_collisions() {
+        let prepared = prepare_template(
+            "colliding-service-names",
+            &template(
+                r#"services:
+  foo-bar:
+    image: example/first
+    environment:
+      PASSWORD: first-literal
+  foo_bar:
+    image: example/second
+    environment:
+      PASSWORD: second-literal
+"#,
+                None,
+            ),
+        )
+        .expect("template should allocate collision-safe generated variables");
+
+        let generated = prepared
+            .variables
+            .iter()
+            .filter(|variable| {
+                variable
+                    .name
+                    .starts_with("SERVICE_PASSWORD_FOO_BAR_PASSWORD")
+            })
+            .map(|variable| variable.name.clone())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(generated.len(), 2);
+        assert!(generated.contains("SERVICE_PASSWORD_FOO_BAR_PASSWORD"));
+        assert!(generated
+            .iter()
+            .any(|name| name.starts_with("SERVICE_PASSWORD_FOO_BAR_PASSWORD_")));
+        for variable in generated {
+            assert!(prepared.compose.contains(&format!("${{{variable}}}")));
+        }
+    }
+
+    #[test]
+    fn generated_credentials_do_not_reuse_existing_template_variables() {
+        let prepared = prepare_template(
+            "reserved-variable-name",
+            &template(
+                r#"services:
+  existing:
+    image: example/existing
+    environment:
+      TOKEN: ${SERVICE_PASSWORD_FOO_BAR_PASSWORD}
+  foo-bar:
+    image: example/generated
+    environment:
+      PASSWORD: generated-literal
+"#,
+                None,
+            ),
+        )
+        .expect("template variable should reserve its existing name");
+
+        let generated = prepared
+            .variables
+            .iter()
+            .map(|variable| variable.name.as_str())
+            .filter(|name| name.starts_with("SERVICE_PASSWORD_FOO_BAR_PASSWORD"))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(generated.len(), 2);
+        assert!(generated.contains("SERVICE_PASSWORD_FOO_BAR_PASSWORD"));
+        assert!(generated
+            .iter()
+            .any(|name| *name != "SERVICE_PASSWORD_FOO_BAR_PASSWORD"));
+        assert!(!prepared.compose.contains("generated-literal"));
     }
 
     #[test]
