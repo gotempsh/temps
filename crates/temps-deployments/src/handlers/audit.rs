@@ -197,6 +197,23 @@ pub struct NodeArchitectureChangedAudit {
     pub to: String,
 }
 
+// ── Traefik discovery audits ────────────────────────────────────────────────
+
+/// An operator suppressed or restored a single Traefik-discovered route.
+///
+/// Worth auditing rather than only logging: flipping this flag changes which
+/// hostname the proxy serves for a container nobody deployed through Temps,
+/// and it is the one write operation on the discovery surface.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraefikDiscoveredRouteToggledAudit {
+    pub context: AuditContext,
+    pub host: String,
+    pub container_name: String,
+    pub network: String,
+    /// The value after the change.
+    pub enabled: bool,
+}
+
 // ── AuditOperation implementations ──────────────────────────────────────────
 
 macro_rules! impl_audit_operation {
@@ -254,3 +271,7 @@ impl_audit_operation!(ExternalImageDeletedAudit, "EXTERNAL_IMAGE_DELETED");
 impl_audit_operation!(StaticBundleDeletedAudit, "STATIC_BUNDLE_DELETED");
 impl_audit_operation!(DeploymentTokenRotatedAudit, "DEPLOYMENT_TOKEN_ROTATED");
 impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED");
+impl_audit_operation!(
+    TraefikDiscoveredRouteToggledAudit,
+    "TRAEFIK_DISCOVERED_ROUTE_TOGGLED"
+);

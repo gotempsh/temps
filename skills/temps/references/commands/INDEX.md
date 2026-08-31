@@ -72,6 +72,7 @@ syntax may have changed.
 - [`workflow`](workflow.md)
 - [`revenue`](revenue.md)
 - [`session-replay`](session-replay.md)
+- [`traefik-discovery`](traefik-discovery.md)
 - [`init`](init.md)
 - [`link`](link.md)
 - [`up`](up.md)

@@ -11,4 +11,5 @@ pub mod failure_report;
 pub mod network;
 pub mod nodes;
 pub mod remote_deployments;
+pub mod traefik_discovery;
 pub mod types;

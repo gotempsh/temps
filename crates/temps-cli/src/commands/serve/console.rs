@@ -1246,6 +1246,17 @@ pub struct ConsoleApiParams {
     /// resolved exactly once per process; registered below for ConfigPlugin's
     /// `GET/POST /settings/update`.
     pub self_updater: Arc<crate::commands::serve::self_update::BinarySelfUpdater>,
+    /// Startup-resolved state of Traefik label discovery. Built by
+    /// `commands/serve/mod.rs` (which decides whether the watcher actually
+    /// runs) and registered into the service registry below so
+    /// `GET /traefik-discovery/status` can report the truth — including
+    /// `configured: false` plus the reason and the env vars that would enable
+    /// it, rather than the endpoint disappearing on a default install.
+    ///
+    /// Read-only status metadata: it never influences routing, auth, or
+    /// connection handling. The watcher's writes reach the route table through
+    /// the `route_table_changes` NOTIFY path, not through this handle.
+    pub traefik_discovery: Arc<temps_deployer::traefik_discovery::TraefikDiscoveryHandle>,
 }
 
 /// Build a ClickHouse-backed metrics store from the server config, or `None`
@@ -2120,6 +2131,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         project_ip_gate_slot,
         update_status,
         self_updater,
+        traefik_discovery,
     } = params;
 
     // Count panics for the anonymous `error_summary` telemetry event. Only
@@ -2250,6 +2262,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     // Registered behind the trait so temps-config depends only on the
     // temps-core contract, never on the CLI crate that implements it.
     service_context.register_service(self_updater.clone() as Arc<dyn temps_core::SelfUpdater>);
+    // Traefik label discovery status, resolved in serve/mod.rs. Pre-registered
+    // before any plugin runs so DeploymentsPlugin's `/traefik-discovery/*`
+    // handlers report this process's real state instead of falling back to a
+    // handle rebuilt from the environment.
+    service_context.register_service(traefik_discovery.clone());
 
     // Register the shared route table (created in serve/mod.rs)
     // This is used by analytics-events and other plugins that need to resolve hosts

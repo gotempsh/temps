@@ -21751,6 +21751,29 @@
         },
         "type": "object"
       },
+      "ListDiscoveredRoutesQuery": {
+        "properties": {
+          "page": {
+            "example": 1,
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "page_size": {
+            "example": 20,
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "ListDomainsResponse": {
         "properties": {
           "domains": {
@@ -41398,6 +41421,333 @@
         ],
         "type": "object"
       },
+      "TraefikDiscoveredRouteListResponse": {
+        "description": "Paginated discovered routes, plus the hosts that were found and rejected.",
+        "properties": {
+          "conflicts": {
+            "description": "Labelled containers found by the last reconciliation that were NOT\nadopted (host owned by a Temps route, or claimed by another container).\nThese have no row of their own — without surfacing them here the\noperator sees nothing at all for a container they labelled.",
+            "items": {
+              "$ref": "#/components/schemas/TraefikDiscoveryConflictResponse"
+            },
+            "type": "array"
+          },
+          "discovery_running": {
+            "description": "`false` when the watcher isn't running, so a client can explain an\nempty list as \"discovery is off\" rather than \"nothing was found\".",
+            "type": "boolean"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes": {
+            "items": {
+              "$ref": "#/components/schemas/TraefikDiscoveredRouteResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "routes",
+          "total",
+          "page",
+          "page_size",
+          "conflicts",
+          "discovery_running"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveredRouteResponse": {
+        "description": "One row of `traefik_discovered_routes`, annotated for an operator.",
+        "properties": {
+          "active": {
+            "description": "Whether this route is currently served by the proxy.",
+            "type": "boolean"
+          },
+          "contested_by": {
+            "description": "Other labelled containers that claim this host and lost the collision.\nNon-empty means someone's container is silently not being routed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "inactive_reason": {
+            "description": "Why it isn't, when `active` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_seen_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "network": {
+            "type": "string"
+          },
+          "router_name": {
+            "type": "string"
+          },
+          "target_container_id": {
+            "type": "string"
+          },
+          "target_container_name": {
+            "type": "string"
+          },
+          "target_host_port": {
+            "description": "Host-published port, used on baremetal installs where the proxy cannot\nresolve container names.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target_port": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "tls": {
+            "type": "boolean"
+          },
+          "updated_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "host",
+          "router_name",
+          "target_container_id",
+          "target_container_name",
+          "target_port",
+          "network",
+          "tls",
+          "enabled",
+          "active",
+          "contested_by",
+          "last_seen_at",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveryConflictResponse": {
+        "description": "A labelled container that was found but deliberately **not** adopted.",
+        "properties": {
+          "container_id": {
+            "type": "string"
+          },
+          "container_name": {
+            "type": "string"
+          },
+          "detail": {
+            "description": "Human-readable explanation of the conflict.",
+            "type": "string"
+          },
+          "host": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Machine-readable discriminator: `owned_by_temps_route` or\n`claimed_by_another_container`.",
+            "type": "string"
+          },
+          "router_name": {
+            "description": "Traefik router name the host came from.",
+            "type": "string"
+          },
+          "winner_container_name": {
+            "description": "Container that holds the host instead, when the conflict is between two\ndiscovered containers.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "host",
+          "container_id",
+          "container_name",
+          "router_name",
+          "reason",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoverySetupResponse": {
+        "description": "How an operator turns discovery on. Always returned, including when\ndiscovery is already running, so the console/CLI can render the exact\ninvocation instead of sending the reader to the docs.",
+        "properties": {
+          "enable_env_var": {
+            "description": "Environment variable that opts this installation in.",
+            "example": "TEMPS_TRAEFIK_DISCOVERY_ENABLED",
+            "type": "string"
+          },
+          "example": {
+            "description": "A concrete, copy-pasteable example of enabling it.",
+            "type": "string"
+          },
+          "network_env_var": {
+            "description": "Environment variable overriding the watched Docker network.",
+            "example": "TEMPS_TRAEFIK_DISCOVERY_NETWORK",
+            "type": "string"
+          },
+          "requires_restart": {
+            "description": "These are read once at process start: changing them needs a restart.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enable_env_var",
+          "network_env_var",
+          "example",
+          "requires_restart"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveryStatusResponse": {
+        "description": "Capability + status of Traefik label discovery on this instance.",
+        "properties": {
+          "configured": {
+            "description": "`true` only when the watcher is actually running in this process.\n`false` means \"not turned on here\", never \"not supported\" — the setup\nblock below always says how to turn it on.",
+            "type": "boolean"
+          },
+          "discovered_route_count": {
+            "description": "Rows currently in `traefik_discovered_routes` (all networks).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enabled": {
+            "description": "Whether `TEMPS_TRAEFIK_DISCOVERY_ENABLED` resolved to true. Can be\n`true` while `configured` is `false` (e.g. Docker unreachable).",
+            "type": "boolean"
+          },
+          "enabled_route_count": {
+            "description": "Of those, how many are enabled and therefore in the live route table.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_reconciliation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TraefikReconciliationResponse",
+                "description": "Last reconciliation pass, absent until the first one completes."
+              }
+            ]
+          },
+          "network": {
+            "description": "Docker network being watched, or the one that *would* be watched.",
+            "type": "string"
+          },
+          "poll_interval_seconds": {
+            "description": "Interval of the full reconciliation safety net.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Why discovery isn't active, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup": {
+            "$ref": "#/components/schemas/TraefikDiscoverySetupResponse"
+          }
+        },
+        "required": [
+          "configured",
+          "enabled",
+          "network",
+          "poll_interval_seconds",
+          "setup",
+          "discovered_route_count",
+          "enabled_route_count"
+        ],
+        "type": "object"
+      },
+      "TraefikReconciliationResponse": {
+        "description": "Summary of the most recent reconciliation pass.",
+        "properties": {
+          "completed_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "conflicts": {
+            "items": {
+              "$ref": "#/components/schemas/TraefikDiscoveryConflictResponse"
+            },
+            "type": "array"
+          },
+          "containers_scanned": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "network": {
+            "type": "string"
+          },
+          "routes_removed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes_unchanged": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes_upserted": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped_temps_managed": {
+            "description": "Containers skipped because Temps deployed them (they already have a\nroute and must never re-derive one from labels they control).",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "network",
+          "containers_scanned",
+          "skipped_temps_managed",
+          "routes_upserted",
+          "routes_unchanged",
+          "routes_removed",
+          "conflicts",
+          "completed_at"
+        ],
+        "type": "object"
+      },
       "TrafficAggregationRequest": {
         "properties": {
           "dimensions": {
@@ -44469,6 +44819,19 @@
           "connection_id",
           "message",
           "is_active"
+        ],
+        "type": "object"
+      },
+      "UpdateTraefikRouteEnabledRequest": {
+        "description": "Body of `PATCH /traefik-discovery/routes/{host}/enabled`.",
+        "properties": {
+          "enabled": {
+            "description": "`false` suppresses the route without touching the container's labels;\nthe row stays visible so the operator can see what was found.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
         ],
         "type": "object"
       },
@@ -98241,6 +98604,163 @@
         "summary": "Get a specific template by slug",
         "tags": [
           "Templates"
+        ]
+      }
+    },
+    "/traefik-discovery/routes": {
+      "get": {
+        "operationId": "list_traefik_discovered_routes",
+        "parameters": [
+          {
+            "description": "Page number (default: 1)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (default: 20, max: 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraefikDiscoveredRouteListResponse"
+                }
+              }
+            },
+            "description": "Discovered routes and unresolved host conflicts"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List every container adopted from Traefik labels, plus the labelled\ncontainers that were found and rejected.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/routes/{host}/enabled": {
+      "patch": {
+        "description": "This is a plain column update: the `traefik_discovered_routes` row-level\ntrigger fires `notify_route_table_change()` on an `enabled` change, so the\nexisting `route_table_changes` LISTEN/NOTIFY path reloads this node's route\ntable *and* every other control plane node's. No manual reload here.",
+        "operationId": "set_traefik_discovered_route_enabled",
+        "parameters": [
+          {
+            "description": "Hostname of the discovered route",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTraefikRouteEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraefikDiscoveredRouteResponse"
+                }
+              }
+            },
+            "description": "Updated discovered route"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No discovered route for that host"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Suppress or restore a single discovered route.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/status": {
+      "get": {
+        "operationId": "get_traefik_discovery_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraefikDiscoveryStatusResponse"
+                }
+              }
+            },
+            "description": "Discovery status. `configured: false` means it is not turned on here — the `setup` block says exactly how to turn it on"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether Traefik label discovery is active on this instance, and how to turn\nit on when it is not.",
+        "tags": [
+          "Traefik Discovery"
         ]
       }
     },

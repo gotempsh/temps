@@ -31,6 +31,8 @@ pub mod readiness;
 pub mod remote;
 pub mod static_deployer;
 pub(crate) mod static_ingestion;
+pub mod traefik_discovery;
+pub mod traefik_labels;
 
 pub use platform::{
     canonicalize_platform, is_buildable_platform, native_platform, normalize_arch,

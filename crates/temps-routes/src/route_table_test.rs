@@ -671,4 +671,495 @@ mod route_table_tests {
         test_db.cleanup().await?;
         Ok(())
     }
+
+    // ── Traefik-discovered routes (section 6 of load_routes) ─────────
+
+    /// Docker network the discovery tests adopt from. `load_routes()` only
+    /// loads discovered rows for the network this process is configured for, so
+    /// every discovery test has to state it explicitly.
+    const DISCOVERY_NETWORK: &str = "temps";
+
+    /// Seed one `traefik_discovered_routes` row on [`DISCOVERY_NETWORK`].
+    async fn seed_discovered(
+        db: &sea_orm::DatabaseConnection,
+        host: &str,
+        container: &str,
+        port: i32,
+        host_port: Option<i32>,
+        tls: bool,
+        enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        seed_discovered_on(
+            db,
+            host,
+            container,
+            port,
+            host_port,
+            tls,
+            enabled,
+            DISCOVERY_NETWORK,
+        )
+        .await
+    }
+
+    /// Seed one `traefik_discovered_routes` row on an explicit network.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_discovered_on(
+        db: &sea_orm::DatabaseConnection,
+        host: &str,
+        container: &str,
+        port: i32,
+        host_port: Option<i32>,
+        tls: bool,
+        enabled: bool,
+        network: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        temps_entities::traefik_discovered_routes::ActiveModel {
+            host: Set(host.to_string()),
+            router_name: Set("app".to_string()),
+            target_container_id: Set(format!("{container}-id")),
+            target_container_name: Set(container.to_string()),
+            target_port: Set(port),
+            target_host_port: Set(host_port),
+            network: Set(network.to_string()),
+            tls: Set(tls),
+            enabled: Set(enabled),
+            ..Default::default()
+        }
+        .insert(db)
+        .await?;
+        Ok(())
+    }
+
+    /// A route table with Traefik label discovery enabled for
+    /// [`DISCOVERY_NETWORK`], as `temps serve` configures it when
+    /// `TEMPS_TRAEFIK_DISCOVERY_ENABLED=true`.
+    fn discovery_enabled_table(db: Arc<sea_orm::DatabaseConnection>) -> Arc<CachedPeerTable> {
+        let table = Arc::new(CachedPeerTable::new(db));
+        table.set_traefik_discovery_network(Some(DISCOVERY_NETWORK.to_string()));
+        table
+    }
+
+    #[tokio::test]
+    async fn test_route_table_loads_traefik_discovered_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        seed_discovered(
+            test_db.db.as_ref(),
+            "legacy-stack.example.com",
+            "whoami",
+            8000,
+            Some(18000),
+            true,
+            true,
+        )
+        .await?;
+
+        let route_table = discovery_enabled_table(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        let route = route_table
+            .get_route("legacy-stack.example.com")
+            .expect("a discovered route must be served");
+        assert!(
+            route.deployment.is_none() && route.project.is_none() && route.environment.is_none(),
+            "a discovered container has no Temps deployment context"
+        );
+        assert!(
+            !route.cert_eligible,
+            "a container-supplied tls label must NOT drive ACME issuance: the labels belong to a \
+             workload Temps did not deploy, so honouring them would let any container on the \
+             watched network mint certificates for hostnames it chose"
+        );
+
+        match &route.backend {
+            crate::route_table::BackendType::Upstream { backends, .. } => {
+                assert_eq!(backends.len(), 1);
+                assert_eq!(
+                    backends[0].container_name.as_deref(),
+                    Some("whoami"),
+                    "container metadata must reach the backend entry"
+                );
+                assert_eq!(
+                    backends[0].container_id.as_deref(),
+                    Some("whoami-id"),
+                    "container id must reach the backend entry"
+                );
+            }
+            other => panic!("expected an Upstream backend, got {other:?}"),
+        }
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_route_table_skips_disabled_traefik_discovered_routes(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        seed_discovered(
+            test_db.db.as_ref(),
+            "switched-off.example.com",
+            "whoami",
+            8000,
+            None,
+            false,
+            false,
+        )
+        .await?;
+
+        let route_table = discovery_enabled_table(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert!(
+            route_table.get_route("switched-off.example.com").is_none(),
+            "the operator kill-switch must keep a discovered route out of the table"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A discovered row must never displace a real custom route, even if a
+    /// racing writer managed to persist it. `load_routes` is the last line of
+    /// defence for that precedence rule.
+    #[tokio::test]
+    async fn test_traefik_discovered_route_never_clobbers_a_custom_route(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        custom_routes::ActiveModel {
+            domain: Set("contested.example.com".to_string()),
+            host: Set("10.0.0.1".to_string()),
+            port: Set(9999),
+            enabled: Set(true),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        seed_discovered(
+            test_db.db.as_ref(),
+            "contested.example.com",
+            "squatter",
+            3000,
+            None,
+            false,
+            true,
+        )
+        .await?;
+
+        let route_table = discovery_enabled_table(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        let route = route_table
+            .get_route_by_host("contested.example.com")
+            .expect("the legitimate custom route must still resolve");
+        assert_eq!(
+            route.get_backend_addr(),
+            "10.0.0.1:9999",
+            "the operator's custom route must win the host, not the discovered container"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A wildcard custom route covering the host also wins: otherwise the
+    /// discovered entry would sit in the table unreachable behind the
+    /// wildcard, or worse, shadow it after a lookup-order change.
+    #[tokio::test]
+    async fn test_traefik_discovered_route_loses_to_a_wildcard_custom_route(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        custom_routes::ActiveModel {
+            domain: Set("*.wild.example.com".to_string()),
+            host: Set("10.0.0.2".to_string()),
+            port: Set(7777),
+            enabled: Set(true),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await?;
+
+        seed_discovered(
+            test_db.db.as_ref(),
+            "api.wild.example.com",
+            "squatter",
+            3000,
+            None,
+            false,
+            true,
+        )
+        .await?;
+
+        let route_table = discovery_enabled_table(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert!(
+            route_table.get_route("api.wild.example.com").is_none(),
+            "a wildcard custom route must keep the discovered entry out of the table"
+        );
+        let route = route_table
+            .get_route_by_host("api.wild.example.com")
+            .expect("the wildcard custom route must still resolve the host");
+        assert_eq!(route.get_backend_addr(), "10.0.0.2:7777");
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// The console hostname is reserved: a discovered container claiming it
+    /// must not lock the operator out of the console (issue #478).
+    #[tokio::test]
+    async fn test_traefik_discovered_route_cannot_take_the_console_hostname(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::{ActiveModelBehavior, EntityTrait};
+        use temps_core::AppSettings;
+        use temps_entities::settings;
+
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        let app_settings = AppSettings {
+            external_url: Some("https://console.example.com".to_string()),
+            ..Default::default()
+        };
+        settings::Entity::insert(settings::ActiveModel {
+            id: Set(1),
+            data: Set(app_settings.to_json()),
+            ..settings::ActiveModel::new()
+        })
+        .on_conflict(
+            sea_orm::sea_query::OnConflict::column(settings::Column::Id)
+                .update_column(settings::Column::Data)
+                .to_owned(),
+        )
+        .exec(test_db.db.as_ref())
+        .await?;
+
+        // A published host port, so the row is rejected for being the console
+        // hostname and not merely for being unreachable.
+        seed_discovered(
+            test_db.db.as_ref(),
+            "console.example.com",
+            "squatter",
+            3000,
+            Some(13000),
+            false,
+            true,
+        )
+        .await?;
+
+        let route_table = discovery_enabled_table(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert!(
+            route_table.get_route("console.example.com").is_none(),
+            "a discovered container must never take the console hostname"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// The SSRF half of the port-label finding, at the merge site.
+    ///
+    /// On baremetal, `build_container_backend_addr` falls back to
+    /// `127.0.0.1:<container port>` when there is no published host port —
+    /// pointing the discovered hostname at an unrelated service on the Temps
+    /// host. Such a row must be skipped outright, not routed to a guess.
+    // `DEPLOYMENT_MODE` is process-global and `load_routes()` reads it, so the
+    // lock has to span the await. It is a test-only guard over a std `Mutex`
+    // that no production code ever takes, held by at most one test at a time
+    // and never re-entered — there is nothing to deadlock against.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn test_traefik_discovered_route_without_a_host_port_is_skipped_on_baremetal(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let _lock = crate::route_table::DEPLOYMENT_MODE_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        // 5432 is the point: a naive fallback would route this host at the
+        // host's PostgreSQL port.
+        seed_discovered(
+            test_db.db.as_ref(),
+            "unreachable.example.com",
+            "internal-only",
+            5432,
+            None,
+            false,
+            true,
+        )
+        .await?;
+
+        let route_table = discovery_enabled_table(test_db.db.clone());
+        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
+        let load = route_table.load_routes().await;
+        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        load?;
+
+        assert!(
+            route_table.get_route("unreachable.example.com").is_none(),
+            "a discovered container with no published host port is unreachable from a baremetal \
+             install and must not be routed to 127.0.0.1:<container port>"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// Turning discovery off must actually stop serving what it adopted. The
+    /// rows outlive the configuration, and the reconciler that would delete
+    /// them is no longer running, so the reader has to enforce this.
+    #[tokio::test]
+    async fn test_traefik_discovered_routes_are_not_loaded_when_discovery_is_disabled(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        seed_discovered(
+            test_db.db.as_ref(),
+            "adopted.example.com",
+            "whoami",
+            8000,
+            Some(18001),
+            false,
+            true,
+        )
+        .await?;
+
+        // Enabled: the row is served.
+        let enabled = discovery_enabled_table(test_db.db.clone());
+        enabled.load_routes().await?;
+        assert!(
+            enabled.get_route("adopted.example.com").is_some(),
+            "precondition: the row is served while discovery is enabled"
+        );
+
+        // Same database, discovery off (the default). Nothing is served, and a
+        // reload on the still-running table drops what it had adopted.
+        let disabled = Arc::new(CachedPeerTable::new(test_db.db.clone()));
+        disabled.load_routes().await?;
+        assert!(
+            disabled.get_route("adopted.example.com").is_none(),
+            "a node with discovery disabled must serve no discovered routes"
+        );
+
+        enabled.set_traefik_discovery_network(None);
+        enabled.load_routes().await?;
+        assert!(
+            enabled.get_route("adopted.example.com").is_none(),
+            "disabling discovery must remove previously-loaded routes on the next reload"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// Repointing `TEMPS_TRAEFIK_DISCOVERY_NETWORK` must stop serving the old
+    /// network's adopted rows immediately, without waiting for the reconciler
+    /// to get around to pruning them.
+    #[tokio::test]
+    async fn test_traefik_discovered_routes_from_another_network_are_not_loaded(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let test_db = TestDBMockOperations::new(test_db_mock.db.clone()).await?;
+
+        seed_discovered_on(
+            test_db.db.as_ref(),
+            "old-network.example.com",
+            "leftover",
+            8000,
+            Some(18002),
+            false,
+            true,
+            "previous_stack_default",
+        )
+        .await?;
+        seed_discovered(
+            test_db.db.as_ref(),
+            "current-network.example.com",
+            "whoami",
+            8000,
+            Some(18003),
+            false,
+            true,
+        )
+        .await?;
+
+        let route_table = discovery_enabled_table(test_db.db.clone());
+        route_table.load_routes().await?;
+
+        assert!(
+            route_table
+                .get_route("current-network.example.com")
+                .is_some(),
+            "rows for the configured network are still served"
+        );
+        assert!(
+            route_table.get_route("old-network.example.com").is_none(),
+            "rows adopted from a network this node no longer watches must not be served"
+        );
+
+        test_db.cleanup().await?;
+        Ok(())
+    }
+
+    /// A statement-level trigger in Postgres fires even when the statement
+    /// matched zero rows. The discovery reconciler reacts to every container
+    /// event on the host and routinely issues delete-by-container statements
+    /// that match nothing, so a statement-level trigger here would NOTIFY —
+    /// and force a full `load_routes()` on every control plane node — on
+    /// container churn that has nothing to do with Temps. Assert against the
+    /// live catalog, which is the deployed truth rather than the SQL text.
+    #[tokio::test]
+    async fn test_traefik_discovered_routes_triggers_are_row_level(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use sea_orm::{ConnectionTrait, Statement};
+
+        let test_db_mock = TestDatabase::with_migrations().await?;
+        let db = test_db_mock.db.clone();
+
+        // pg_trigger.tgtype bit 0 (value 1) is set for FOR EACH ROW triggers
+        // and clear for FOR EACH STATEMENT ones. `tgisinternal` filters out
+        // constraint-implementation triggers.
+        let rows = db
+            .query_all(Statement::from_string(
+                sea_orm::DatabaseBackend::Postgres,
+                "SELECT tgname, (tgtype & 1) AS is_row_level \
+                 FROM pg_trigger \
+                 WHERE tgrelid = 'traefik_discovered_routes'::regclass AND NOT tgisinternal \
+                 ORDER BY tgname",
+            ))
+            .await?;
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "expected the insert/delete and update triggers to exist"
+        );
+        for row in &rows {
+            let name: String = row.try_get("", "tgname")?;
+            let is_row_level: i32 = row.try_get("", "is_row_level")?;
+            assert_eq!(
+                is_row_level, 1,
+                "trigger '{name}' must be FOR EACH ROW: a statement-level trigger NOTIFYs even \
+                 when the statement affected zero rows, reloading every node's route table on \
+                 unrelated container churn"
+            );
+        }
+
+        Ok(())
+    }
 }

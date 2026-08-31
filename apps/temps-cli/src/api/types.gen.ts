@@ -10187,6 +10187,11 @@ export type ListDeploymentTokensQuery = {
     page_size?: number | null;
 };
 
+export type ListDiscoveredRoutesQuery = {
+    page?: number | null;
+    page_size?: number | null;
+};
+
 export type ListDomainsResponse = {
     domains: Array<DomainResponse>;
     page: number;
@@ -19074,6 +19079,172 @@ export type TrackingEventResponse = {
     user_agent?: string | null;
 };
 
+/**
+ * Paginated discovered routes, plus the hosts that were found and rejected.
+ */
+export type TraefikDiscoveredRouteListResponse = {
+    /**
+     * Labelled containers found by the last reconciliation that were NOT
+     * adopted (host owned by a Temps route, or claimed by another container).
+     * These have no row of their own — without surfacing them here the
+     * operator sees nothing at all for a container they labelled.
+     */
+    conflicts: Array<TraefikDiscoveryConflictResponse>;
+    /**
+     * `false` when the watcher isn't running, so a client can explain an
+     * empty list as "discovery is off" rather than "nothing was found".
+     */
+    discovery_running: boolean;
+    page: number;
+    page_size: number;
+    routes: Array<TraefikDiscoveredRouteResponse>;
+    total: number;
+};
+
+/**
+ * One row of `traefik_discovered_routes`, annotated for an operator.
+ */
+export type TraefikDiscoveredRouteResponse = {
+    /**
+     * Whether this route is currently served by the proxy.
+     */
+    active: boolean;
+    /**
+     * Other labelled containers that claim this host and lost the collision.
+     * Non-empty means someone's container is silently not being routed.
+     */
+    contested_by: Array<string>;
+    created_at: string;
+    enabled: boolean;
+    host: string;
+    id: number;
+    /**
+     * Why it isn't, when `active` is false.
+     */
+    inactive_reason?: string | null;
+    last_seen_at: string;
+    network: string;
+    router_name: string;
+    target_container_id: string;
+    target_container_name: string;
+    /**
+     * Host-published port, used on baremetal installs where the proxy cannot
+     * resolve container names.
+     */
+    target_host_port?: number | null;
+    target_port: number;
+    tls: boolean;
+    updated_at: string;
+};
+
+/**
+ * A labelled container that was found but deliberately **not** adopted.
+ */
+export type TraefikDiscoveryConflictResponse = {
+    container_id: string;
+    container_name: string;
+    /**
+     * Human-readable explanation of the conflict.
+     */
+    detail: string;
+    host: string;
+    /**
+     * Machine-readable discriminator: `owned_by_temps_route` or
+     * `claimed_by_another_container`.
+     */
+    reason: string;
+    /**
+     * Traefik router name the host came from.
+     */
+    router_name: string;
+    /**
+     * Container that holds the host instead, when the conflict is between two
+     * discovered containers.
+     */
+    winner_container_name?: string | null;
+};
+
+/**
+ * How an operator turns discovery on. Always returned, including when
+ * discovery is already running, so the console/CLI can render the exact
+ * invocation instead of sending the reader to the docs.
+ */
+export type TraefikDiscoverySetupResponse = {
+    /**
+     * Environment variable that opts this installation in.
+     */
+    enable_env_var: string;
+    /**
+     * A concrete, copy-pasteable example of enabling it.
+     */
+    example: string;
+    /**
+     * Environment variable overriding the watched Docker network.
+     */
+    network_env_var: string;
+    /**
+     * These are read once at process start: changing them needs a restart.
+     */
+    requires_restart: boolean;
+};
+
+/**
+ * Capability + status of Traefik label discovery on this instance.
+ */
+export type TraefikDiscoveryStatusResponse = {
+    /**
+     * `true` only when the watcher is actually running in this process.
+     * `false` means "not turned on here", never "not supported" — the setup
+     * block below always says how to turn it on.
+     */
+    configured: boolean;
+    /**
+     * Rows currently in `traefik_discovered_routes` (all networks).
+     */
+    discovered_route_count: number;
+    /**
+     * Whether `TEMPS_TRAEFIK_DISCOVERY_ENABLED` resolved to true. Can be
+     * `true` while `configured` is `false` (e.g. Docker unreachable).
+     */
+    enabled: boolean;
+    /**
+     * Of those, how many are enabled and therefore in the live route table.
+     */
+    enabled_route_count: number;
+    last_reconciliation?: null | TraefikReconciliationResponse;
+    /**
+     * Docker network being watched, or the one that *would* be watched.
+     */
+    network: string;
+    /**
+     * Interval of the full reconciliation safety net.
+     */
+    poll_interval_seconds: number;
+    /**
+     * Why discovery isn't active, when `configured` is false.
+     */
+    reason?: string | null;
+    setup: TraefikDiscoverySetupResponse;
+};
+
+/**
+ * Summary of the most recent reconciliation pass.
+ */
+export type TraefikReconciliationResponse = {
+    completed_at: string;
+    conflicts: Array<TraefikDiscoveryConflictResponse>;
+    containers_scanned: number;
+    network: string;
+    routes_removed: number;
+    routes_unchanged: number;
+    routes_upserted: number;
+    /**
+     * Containers skipped because Temps deployed them (they already have a
+     * route and must never re-derive one from labels they control).
+     */
+    skipped_temps_managed: number;
+};
+
 export type TrafficAggregationRequest = {
     /**
      * Zero to four grouping dimensions. Zero returns one overall rollup;
@@ -20473,6 +20644,17 @@ export type UpdateTokenResponse = {
     connection_id: number;
     is_active: boolean;
     message: string;
+};
+
+/**
+ * Body of `PATCH /traefik-discovery/routes/{host}/enabled`.
+ */
+export type UpdateTraefikRouteEnabledRequest = {
+    /**
+     * `false` suppresses the route without touching the container's labels;
+     * the row stays visible so the operator can see what was found.
+     */
+    enabled: boolean;
 };
 
 export type UpdateUserRequest = {
@@ -53467,6 +53649,121 @@ export type GetProjectTemplateResponses = {
 };
 
 export type GetProjectTemplateResponse = GetProjectTemplateResponses[keyof GetProjectTemplateResponses];
+
+export type ListTraefikDiscoveredRoutesData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Page number (default: 1)
+         */
+        page?: number;
+        /**
+         * Page size (default: 20, max: 100)
+         */
+        page_size?: number;
+    };
+    url: '/traefik-discovery/routes';
+};
+
+export type ListTraefikDiscoveredRoutesErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListTraefikDiscoveredRoutesResponses = {
+    /**
+     * Discovered routes and unresolved host conflicts
+     */
+    200: TraefikDiscoveredRouteListResponse;
+};
+
+export type ListTraefikDiscoveredRoutesResponse = ListTraefikDiscoveredRoutesResponses[keyof ListTraefikDiscoveredRoutesResponses];
+
+export type SetTraefikDiscoveredRouteEnabledData = {
+    body: UpdateTraefikRouteEnabledRequest;
+    path: {
+        /**
+         * Hostname of the discovered route
+         */
+        host: string;
+    };
+    query?: never;
+    url: '/traefik-discovery/routes/{host}/enabled';
+};
+
+export type SetTraefikDiscoveredRouteEnabledErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No discovered route for that host
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SetTraefikDiscoveredRouteEnabledResponses = {
+    /**
+     * Updated discovered route
+     */
+    200: TraefikDiscoveredRouteResponse;
+};
+
+export type SetTraefikDiscoveredRouteEnabledResponse = SetTraefikDiscoveredRouteEnabledResponses[keyof SetTraefikDiscoveredRouteEnabledResponses];
+
+export type GetTraefikDiscoveryStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/traefik-discovery/status';
+};
+
+export type GetTraefikDiscoveryStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetTraefikDiscoveryStatusResponses = {
+    /**
+     * Discovery status. `configured: false` means it is not turned on here — the `setup` block says exactly how to turn it on
+     */
+    200: TraefikDiscoveryStatusResponse;
+};
+
+export type GetTraefikDiscoveryStatusResponse = GetTraefikDiscoveryStatusResponses[keyof GetTraefikDiscoveryStatusResponses];
 
 export type GetCurrentUserData = {
     body?: never;
