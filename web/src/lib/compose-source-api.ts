@@ -1,55 +1,26 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { client } from '@/api/client/client.gen'
+import {
+  deployComposeSource as deployComposeSourceRequest,
+  getComposeSource as getComposeSourceRequest,
+  saveComposeSource as saveComposeSourceRequest,
+} from '@/api/client/sdk.gen'
+import type {
+  ComposeSourceResponse,
+  ComposeSourceServiceResponse,
+  RemoteDeploymentResponse,
+} from '@/api/client/types.gen'
 
-const BEARER_SECURITY = [{ scheme: 'bearer', type: 'http' }] as const
-
-export interface ComposeSourceService {
-  name: string
-  image?: string | null
-  looks_like_database: boolean
-  detected_service_type?: 'postgres' | 'mariadb' | 'mongodb' | 'redis' | 's3'
-  ports: Array<{
-    target: number
-    published?: number
-    protocol: string
-  }>
-  health_check_path?: string | null
-}
-
-export interface ComposeSource {
-  content: string
-  revision: number
-  checksum: string
-  updated_at: string
-  services: ComposeSourceService[]
-  origin?: {
-    provider: string
-    slug: string
-    sourceUrl: string
-    sourceRevision?: string
-    templateLastUpdatedAt?: string
-  } | null
-}
-
-export interface ComposeDeployment {
-  id: number
-  project_id: number
-  environment_id: number
-  slug: string
-  state: string
-  source_type: string
-  created_at: string
-}
+export type ComposeSourceService = ComposeSourceServiceResponse
+export type ComposeSource = ComposeSourceResponse
+export type ComposeDeployment = RemoteDeploymentResponse
 
 export async function getComposeSource(
   projectId: number,
   signal?: AbortSignal
 ): Promise<ComposeSource> {
-  const { data } = await client.get<ComposeSource, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/projects/{project_id}/compose-source',
+  const { data } = await getComposeSourceRequest({
     path: { project_id: projectId },
     signal,
     throwOnError: true,
@@ -62,15 +33,12 @@ export async function saveComposeSource(
   content: string,
   expectedRevision: number | null
 ): Promise<ComposeSource> {
-  const { data } = await client.put<ComposeSource, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/projects/{project_id}/compose-source',
+  const { data } = await saveComposeSourceRequest({
     path: { project_id: projectId },
     body: {
       content,
       expected_revision: expectedRevision,
     },
-    headers: { 'Content-Type': 'application/json' },
     throwOnError: true,
   })
   return data
@@ -81,12 +49,9 @@ export async function deployComposeSource(
   environmentId: number,
   revision?: number
 ): Promise<ComposeDeployment> {
-  const { data } = await client.post<ComposeDeployment, unknown, true>({
-    security: [...BEARER_SECURITY],
-    url: '/projects/{project_id}/environments/{environment_id}/deploy/compose',
+  const { data } = await deployComposeSourceRequest({
     path: { project_id: projectId, environment_id: environmentId },
     body: { revision },
-    headers: { 'Content-Type': 'application/json' },
     throwOnError: true,
   })
   return data
