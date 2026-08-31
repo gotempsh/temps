@@ -782,6 +782,11 @@ impl ConversationService {
         let conv = ai_conversations::ActiveModel {
             public_id: Set(uuid::Uuid::new_v4().simple().to_string()),
             project_id: Set(project_id),
+            application_id: Set(seed
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.get("application_id"))
+                .and_then(serde_json::Value::as_i64)),
             context_type: Set(context_type.to_string()),
             context_id: Set(context_id.to_string()),
             title: Set(seed.title.clone()),
@@ -3141,6 +3146,7 @@ mod tests {
             id: 1,
             public_id: "pub1".to_string(),
             project_id: 7,
+            application_id: None,
             context_type: "test".to_string(),
             context_id: "42".to_string(),
             title: None,
@@ -3847,6 +3853,7 @@ mod tests {
             id,
             public_id: public_id.to_string(),
             project_id,
+            application_id: None,
             context_type: "deployment".to_string(),
             context_id: "1".to_string(),
             title: Some("t".to_string()),

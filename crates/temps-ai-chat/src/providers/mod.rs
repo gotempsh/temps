@@ -6,6 +6,7 @@
 pub mod alert;
 pub mod alert_suggest;
 pub mod api_tools;
+pub mod application;
 pub mod deployment;
 pub mod project;
 pub mod repo_common;

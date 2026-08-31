@@ -81,6 +81,7 @@ import {
   type SecretReference,
 } from '@/lib/ai-first-security'
 import { cn } from '@/lib/utils'
+import { AiFirstWorkspace } from '@/components/ai-first/AiFirstWorkspace'
 
 const SECRET_REQUIREMENTS = [
   {
@@ -124,7 +125,7 @@ interface ExtraExchange {
   response: string
 }
 
-export function AiFirstPrototype() {
+export function AiFirstPrototypePreview() {
   usePageTitle('AI-first prototype')
   const [composer, setComposer] = useState('')
   const [secretDialogOpen, setSecretDialogOpen] = useState(false)
@@ -589,6 +590,10 @@ export function AiFirstPrototype() {
       </Dialog>
     </div>
   )
+}
+
+export function AiFirstPrototype() {
+  return <AiFirstWorkspace />
 }
 
 function ConversationRail({

@@ -3,12 +3,15 @@
 
 pub mod acme_accounts;
 pub mod acme_orders;
+pub mod ai_application_projects;
+pub mod ai_applications;
 pub mod ai_conversations;
 pub mod ai_gateway_config;
 pub mod ai_messages;
 pub mod ai_pending_actions;
 pub mod ai_provider_keys;
 pub mod ai_provider_models;
+pub mod ai_thread_artifacts;
 pub mod ai_usage_logs;
 pub mod alarms;
 pub mod analytics_ingest_keys;

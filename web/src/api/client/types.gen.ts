@@ -1679,6 +1679,25 @@ export type AppSettingsResponse = {
     tenant_resource_ceilings: TenantResourceCeilings;
 };
 
+export type ApplicationProjectResponse = {
+    id: number;
+    is_private: boolean;
+    main_branch: string;
+    name: string;
+    repository: string;
+    slug: string;
+};
+
+export type ApplicationResponse = {
+    created_at: string;
+    description?: string | null;
+    name: string;
+    projects: Array<ApplicationProjectResponse>;
+    public_id: string;
+    status: string;
+    updated_at: string;
+};
+
 /**
  * Request to apply a hostname mode (recompute + optional DNS sync).
  */
@@ -3637,10 +3656,12 @@ export type ConversationResponse = {
     ai_permission_mode: string;
     ai_provider: string;
     ai_thinking_level?: string | null;
+    application_id?: number | null;
     context_id: string;
     context_type: string;
     created_at: string;
     last_activity_at: string;
+    project_id: number;
     public_id: string;
     status: string;
     title?: string | null;
@@ -3828,6 +3849,19 @@ export type CreateApiKeyResponse = {
     name: string;
     permissions?: Array<string> | null;
     role_type: string;
+};
+
+export type CreateApplicationConversationRequest = {
+    ai_model?: string | null;
+    ai_permission_mode?: string | null;
+    ai_provider?: string | null;
+    ai_thinking_level?: string | null;
+};
+
+export type CreateApplicationRequest = {
+    description?: string | null;
+    name: string;
+    project_ids: Array<number>;
 };
 
 export type CreateBackupScheduleRequest = {
@@ -4786,6 +4820,12 @@ export type CreateTeamRequest = {
     description?: string | null;
     name: string;
     slug: string;
+};
+
+export type CreateThreadArtifactRequest = {
+    kind: string;
+    payload: unknown;
+    title?: string | null;
 };
 
 export type CreateUserRequest = {
@@ -19459,6 +19499,17 @@ export type TestProviderResponse = {
     success: boolean;
 };
 
+export type ThreadArtifactResponse = {
+    created_at: string;
+    kind: string;
+    payload: unknown;
+    public_id: string;
+    schema_version: number;
+    status: string;
+    title?: string | null;
+    updated_at: string;
+};
+
 /**
  * Time bucket statistics response
  */
@@ -23250,6 +23301,151 @@ export type WebhookTriggerResponses = {
 };
 
 export type WebhookTriggerResponse2 = WebhookTriggerResponses[keyof WebhookTriggerResponses];
+
+export type ListApplicationsData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/ai/applications';
+};
+
+export type ListApplicationsErrors = {
+    401: unknown;
+    403: unknown;
+};
+
+export type ListApplicationsResponses = {
+    200: Array<ApplicationResponse>;
+};
+
+export type ListApplicationsResponse = ListApplicationsResponses[keyof ListApplicationsResponses];
+
+export type CreateApplicationData = {
+    body: CreateApplicationRequest;
+    path?: never;
+    query?: never;
+    url: '/ai/applications';
+};
+
+export type CreateApplicationErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+};
+
+export type CreateApplicationResponses = {
+    201: ApplicationResponse;
+};
+
+export type CreateApplicationResponse = CreateApplicationResponses[keyof CreateApplicationResponses];
+
+export type GetApplicationData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}';
+};
+
+export type GetApplicationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type GetApplicationResponses = {
+    200: ApplicationResponse;
+};
+
+export type GetApplicationResponse = GetApplicationResponses[keyof GetApplicationResponses];
+
+export type ListApplicationConversationsData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations';
+};
+
+export type ListApplicationConversationsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListApplicationConversationsResponses = {
+    200: Array<ConversationResponse>;
+};
+
+export type ListApplicationConversationsResponse = ListApplicationConversationsResponses[keyof ListApplicationConversationsResponses];
+
+export type CreateApplicationConversationData = {
+    body: CreateApplicationConversationRequest;
+    path: {
+        application_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations';
+};
+
+export type CreateApplicationConversationErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateApplicationConversationResponses = {
+    201: ConversationResponse;
+};
+
+export type CreateApplicationConversationResponse = CreateApplicationConversationResponses[keyof CreateApplicationConversationResponses];
+
+export type ListThreadArtifactsData = {
+    body?: never;
+    path: {
+        application_public_id: string;
+        conversation_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts';
+};
+
+export type ListThreadArtifactsErrors = {
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type ListThreadArtifactsResponses = {
+    200: Array<ThreadArtifactResponse>;
+};
+
+export type ListThreadArtifactsResponse = ListThreadArtifactsResponses[keyof ListThreadArtifactsResponses];
+
+export type CreateThreadArtifactData = {
+    body: CreateThreadArtifactRequest;
+    path: {
+        application_public_id: string;
+        conversation_public_id: string;
+    };
+    query?: never;
+    url: '/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts';
+};
+
+export type CreateThreadArtifactErrors = {
+    400: unknown;
+    401: unknown;
+    403: unknown;
+    404: unknown;
+};
+
+export type CreateThreadArtifactResponses = {
+    201: ThreadArtifactResponse;
+};
+
+export type CreateThreadArtifactResponse = CreateThreadArtifactResponses[keyof CreateThreadArtifactResponses];
 
 export type ListAllConversationsData = {
     body?: never;

@@ -813,7 +813,10 @@ impl SandboxService {
     /// Authorization is the caller's responsibility: handlers gate this
     /// with `project_scope_guard!` + `project_access_guard!` before the
     /// request reaches the service.
-    async fn source_from_project(&self, project_id: i32) -> Result<SandboxSource, SandboxError> {
+    async fn source_from_project(
+        &self,
+        project_id: i32,
+    ) -> Result<Option<SandboxSource>, SandboxError> {
         let project = projects::Entity::find_by_id(project_id)
             .filter(projects::Column::IsDeleted.eq(false))
             .one(self.db.as_ref())
@@ -824,21 +827,31 @@ impl SandboxService {
             .git_url
             .as_ref()
             .map(|u| u.trim())
-            .filter(|u| !u.is_empty())
-            .ok_or_else(|| SandboxError::ProjectHasNoRepo {
-                project_id,
-                name: project.name.clone(),
-            })?
-            .to_string();
+            .filter(|u| !u.is_empty());
 
-        Ok(SandboxSource::Git {
-            url,
+        let Some(url) = url else {
+            // A Git project with no repository is inconsistent state and
+            // must still fail closed. Git-less project types, however, are
+            // intentionally valid deployment targets: their persistent
+            // workspace begins empty and is populated by the agent or a file
+            // upload instead of a clone.
+            if project.source_type.requires_git_info() {
+                return Err(SandboxError::ProjectHasNoRepo {
+                    project_id,
+                    name: project.name.clone(),
+                });
+            }
+            return Ok(None);
+        };
+
+        Ok(Some(SandboxSource::Git {
+            url: url.to_string(),
             revision: Some(project.main_branch.clone()),
             depth: None,
             username: None,
             password: None,
             git_connection_id: project.git_provider_connection_id,
-        })
+        }))
     }
 
     // ── Lifecycle ────────────────────────────────────────────────────────
@@ -887,8 +900,10 @@ impl SandboxService {
                 // echoed back out of the API.
                 (None, Some(project_id)) => {
                     let derived = self.source_from_project(project_id).await?;
-                    validate_resolved_source(&derived).await?;
-                    Some(derived)
+                    if let Some(source) = derived.as_ref() {
+                        validate_resolved_source(source).await?;
+                    }
+                    derived
                 }
                 (None, None) => None,
             }
@@ -3210,7 +3225,7 @@ mod storage_cleanup_tests {
             .await
             .expect("a connected project yields a git source");
 
-        match source {
+        match source.expect("a Git project has a seed source") {
             SandboxSource::Git {
                 url,
                 revision,
@@ -3257,6 +3272,25 @@ mod storage_cleanup_tests {
             }
             other => panic!("expected ProjectHasNoRepo, got {:?}", other),
         }
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
+
+    #[tokio::test]
+    async fn source_from_project_allows_an_empty_workspace_for_manual_projects() {
+        let data_root = unique_data_root("manual-project-no-repo");
+        let mut manual_project = project_row(None);
+        manual_project.source_type = temps_entities::source_type::SourceType::Manual;
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![manual_project]])
+            .into_connection();
+
+        let (service, _) = build_service(db, FakeProvider::new(), data_root.clone());
+        let source = service
+            .source_from_project(12)
+            .await
+            .expect("a manual project may start with an empty workspace");
+
+        assert!(source.is_none());
         let _ = std::fs::remove_dir_all(&data_root);
     }
 

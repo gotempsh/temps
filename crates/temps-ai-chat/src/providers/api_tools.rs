@@ -27,10 +27,12 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 use serde_json::Value;
 use temps_ai::ChatTool;
 use temps_ai_api_tools::{ApiCallScope, ApiToolsHandle};
 use temps_auth::context::AuthContext;
+use temps_entities::{ai_application_projects, ai_applications};
 
 use crate::provider::{ConversationContextProvider, ConversationSeed};
 
@@ -44,11 +46,19 @@ use crate::provider::{ConversationContextProvider, ConversationSeed};
 /// assistant, etc.) by adding it to the provider list in the plugin.
 pub struct ApiToolsProvider {
     handle: Arc<ApiToolsHandle>,
+    db: Option<Arc<DatabaseConnection>>,
 }
 
 impl ApiToolsProvider {
     pub fn new(handle: Arc<ApiToolsHandle>) -> Self {
-        Self { handle }
+        Self { handle, db: None }
+    }
+
+    pub fn with_database(handle: Arc<ApiToolsHandle>, db: Arc<DatabaseConnection>) -> Self {
+        Self {
+            handle,
+            db: Some(db),
+        }
     }
 }
 
@@ -162,25 +172,23 @@ fn build_system_appendix(root_help: &str) -> String {
 }
 
 /// JSON Schema for the `temps` virtual-CLI tool.
-fn temps_schema() -> Value {
+fn temps_schema(application_scope: bool) -> Value {
+    let mut properties = serde_json::json!({
+        "command": {
+            "type": "string",
+            "description": "A read-only Temps CLI command line. Discovery is `--help`-driven: `--help` lists sections; `<section> --help` lists that section's operations; `<section> <operation> --help` shows an operation's flags. Run an operation with `<section> <operation> --flag value …`. Never put project_id inside the command. Pass only flags you have a real value for."
+        }
+    });
+    if application_scope {
+        properties["project_id"] = serde_json::json!({
+            "type": "integer",
+            "description": "The linked Temps project to query. This is a tool scope selector, not a command flag. Use only an id listed in the application context."
+        });
+    }
     serde_json::json!({
         "type": "object",
         "required": ["command"],
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "A read-only Temps CLI command line. \
-                                Discovery is `--help`-driven: `--help` lists sections; \
-                                `<section> --help` lists that section's operations; \
-                                `<section> <operation> --help` shows an operation's flags. \
-                                Run an operation with `<section> <operation> --flag value …` \
-                                (e.g. `deployments get_last_deployment`, or \
-                                `audit-logs list_audit_logs --limit 20`). \
-                                project_id is auto-filled for the current project — never pass it. \
-                                Pass only flags you have a real value for; omit optional filters \
-                                rather than inventing placeholders."
-            }
-        },
+        "properties": properties,
         "additionalProperties": false
     })
 }
@@ -218,21 +226,24 @@ impl ConversationContextProvider for ApiToolsProvider {
             .map(|caller| caller.cli_read_catalog(auth))
     }
 
-    async fn tools(&self, _project_id: i32, _context_id: &str) -> Vec<ChatTool> {
+    async fn tools(&self, _project_id: i32, context_id: &str) -> Vec<ChatTool> {
+        let application_scope = context_id.starts_with("app_") && context_id.contains(':');
         vec![ChatTool {
             name: "temps".to_string(),
             description: "Read-only Temps MCP tool over the platform API. Invoke this registered \
                 tool directly; never run Bash, a terminal, or a local `temps` binary. \
                 The `command` argument uses a CLI-like grammar. Use `--help` to discover \
                 (sections → operations → flags), then run `<section> <operation> --flag value …`. \
-                project_id is auto-filled — never pass it. Returns help text or the endpoint's \
+                In application threads, select a linked project using the tool's top-level \
+                project_id field; never put project_id inside the command. Otherwise the current \
+                project is auto-filled. Returns help text or the endpoint's \
                 JSON body. Numeric timestamp fields may be Unix epoch milliseconds: interpret \
                 them and present human-readable dates in the final answer. Never include raw \
                 epoch-millisecond values unless the user explicitly requests them. If a call \
                 errors, read the message and adjust; don't repeat \
                 it unchanged."
                 .to_string(),
-            parameters: temps_schema(),
+            parameters: temps_schema(application_scope),
         }]
     }
 
@@ -262,13 +273,13 @@ impl ConversationContextProvider for ApiToolsProvider {
     async fn execute_tool_with_auth(
         &self,
         project_id: i32,
-        _context_id: &str,
+        context_id: &str,
         name: &str,
         arguments: &str,
         auth: &AuthContext,
     ) -> String {
         match name {
-            "temps" => self.exec_cli(arguments, project_id, auth).await,
+            "temps" => self.exec_cli(arguments, project_id, context_id, auth).await,
             other => format!("Unknown tool '{other}'. The only API tool is `temps`."),
         }
     }
@@ -284,7 +295,13 @@ impl ApiToolsProvider {
     /// bound the model to exactly what the user could read — it cannot escalate
     /// or reach another tenant's data. Failures come back as readable text so the
     /// model can recover rather than loop.
-    async fn exec_cli(&self, arguments: &str, project_id: i32, auth: &AuthContext) -> String {
+    async fn exec_cli(
+        &self,
+        arguments: &str,
+        project_id: i32,
+        context_id: &str,
+        auth: &AuthContext,
+    ) -> String {
         let caller = match self.handle.get() {
             Some(c) => c,
             None => {
@@ -305,9 +322,53 @@ impl ApiToolsProvider {
             }
         };
 
+        let selected_project_id = match args.get("project_id").and_then(Value::as_i64) {
+            Some(value) => match i32::try_from(value) {
+                Ok(value) => value,
+                Err(_) => {
+                    return "The selected project_id is outside the supported range.".to_string()
+                }
+            },
+            None => project_id,
+        };
+        if selected_project_id != project_id && context_id.starts_with("app_") {
+            let Some(db) = &self.db else {
+                return "Multi-project API scope is not available during startup.".to_string();
+            };
+            let application_public_id = context_id.split(':').next().unwrap_or(context_id);
+            let application = match ai_applications::Entity::find()
+                .filter(ai_applications::Column::PublicId.eq(application_public_id))
+                .one(db.as_ref())
+                .await
+            {
+                Ok(Some(application)) => application,
+                Ok(None) => return "The application scope no longer exists.".to_string(),
+                Err(error) => return format!("Could not verify the application scope: {error}"),
+            };
+            let linked = ai_application_projects::Entity::find()
+                .filter(ai_application_projects::Column::ApplicationId.eq(application.id))
+                .filter(ai_application_projects::Column::ProjectId.eq(selected_project_id))
+                .one(db.as_ref())
+                .await;
+            match linked {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return format!(
+                        "Project {selected_project_id} is not linked to this application."
+                    )
+                }
+                Err(error) => {
+                    return format!("Could not verify the selected project scope: {error}")
+                }
+            }
+        } else if selected_project_id != project_id {
+            return "Cross-project selection is available only in an application thread."
+                .to_string();
+        }
+
         let scope = ApiCallScope {
             auth: auth.clone(),
-            project_ids: vec![project_id],
+            project_ids: vec![selected_project_id],
         };
         caller.run_cli(command, &scope).await
     }
@@ -356,6 +417,19 @@ mod tests {
         assert!(description.contains("human-readable dates"));
         assert!(description.contains("Never include raw epoch-millisecond values"));
         assert!(description.contains("never run Bash"));
+    }
+
+    #[tokio::test]
+    async fn application_tool_exposes_project_selector_without_cli_project_flag() {
+        let provider = ApiToolsProvider::new(Arc::new(ApiToolsHandle::new()));
+        let application_tools = provider.tools(1, "app_example:thread").await;
+        let project_tools = provider.tools(1, "thread").await;
+
+        assert!(application_tools[0].parameters["properties"]["project_id"].is_object());
+        assert!(project_tools[0].parameters["properties"]["project_id"].is_null());
+        assert!(application_tools[0]
+            .description
+            .contains("top-level project_id field"));
     }
 }
 

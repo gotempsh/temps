@@ -74,6 +74,25 @@ impl_audit_operation!(ChatMessageSentAudit, "AI_CHAT_MESSAGE_SENT");
 impl_audit_operation!(ConversationArchivedAudit, "AI_CHAT_CONVERSATION_ARCHIVED");
 impl_audit_operation!(ConversationRenamedAudit, "AI_CHAT_CONVERSATION_RENAMED");
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ApplicationCreatedAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub project_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadArtifactCreatedAudit {
+    pub context: AuditContext,
+    pub application_id: String,
+    pub conversation_id: String,
+    pub artifact_id: String,
+    pub kind: String,
+}
+
+impl_audit_operation!(ApplicationCreatedAudit, "ai.application.created");
+impl_audit_operation!(ThreadArtifactCreatedAudit, "ai.thread_artifact.created");
+
 // --- Pending-action audit events -------------------------------------------
 
 #[derive(Debug, Clone, Serialize)]

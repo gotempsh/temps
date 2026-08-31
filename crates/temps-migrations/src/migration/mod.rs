@@ -220,6 +220,7 @@ mod m20260902_000001_backup_safety_and_provenance;
 mod m20260903_000001_add_service_project_identity;
 mod m20260903_000001_add_vulnerability_scanning_enabled_to_projects;
 mod m20260904_000001_reset_ambiguous_managed_status_monitors;
+mod m20260831_000001_ai_first_applications;
 
 pub struct Migrator;
 
@@ -483,6 +484,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260831_000002_add_managed_status_monitors::Migration),
             Box::new(m20260903_000001_add_service_project_identity::Migration),
             Box::new(m20260904_000001_reset_ambiguous_managed_status_monitors::Migration),
+            Box::new(m20260831_000001_ai_first_applications::Migration),
         ]
     }
 }

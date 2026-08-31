@@ -40,13 +40,14 @@ use temps_entities::{ai_conversations, ai_messages, ai_pending_actions};
 use temps_ai::streaming::{PermissionDecision, PermissionKind, PermissionRequest};
 
 use crate::audit::{
-    AiActionConfirmedAudit, AiActionRejectedAudit, ChatMessageSentAudit, ConversationArchivedAudit,
-    ConversationCreatedAudit, ConversationRenamedAudit, PermissionResolvedAudit,
+    AiActionConfirmedAudit, AiActionRejectedAudit, ApplicationCreatedAudit, ChatMessageSentAudit,
+    ConversationArchivedAudit, ConversationCreatedAudit, ConversationRenamedAudit,
+    PermissionResolvedAudit, ThreadArtifactCreatedAudit,
 };
 use crate::pending_actions::{PendingActionError, PendingActionService};
 use crate::sensitive::{display_value, redact_json_string, redact_text, redact_value};
 use crate::service::ChatStreamEvent;
-use crate::{ChatError, ConversationService};
+use crate::{ApplicationError, ApplicationService, ChatError, ConversationService};
 
 /// Shared state for the chat routes.
 pub struct AppState {
@@ -56,6 +57,7 @@ pub struct AppState {
     pub audit_service: Arc<dyn AuditLogger>,
     /// Pending-action service (confirm/reject write proposals).
     pub pending_actions: Arc<PendingActionService>,
+    pub applications: Arc<ApplicationService>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 }
@@ -75,6 +77,7 @@ impl AppState {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ConversationResponse {
     pub public_id: String,
+    pub project_id: i32,
     pub context_type: String,
     pub context_id: String,
     pub title: Option<String>,
@@ -85,12 +88,15 @@ pub struct ConversationResponse {
     pub ai_model: String,
     pub ai_thinking_level: Option<String>,
     pub ai_permission_mode: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub application_id: Option<i64>,
 }
 
 impl From<ai_conversations::Model> for ConversationResponse {
     fn from(m: ai_conversations::Model) -> Self {
         Self {
             public_id: m.public_id,
+            project_id: m.project_id,
             context_type: m.context_type,
             context_id: m.context_id,
             title: m.title,
@@ -101,8 +107,104 @@ impl From<ai_conversations::Model> for ConversationResponse {
             ai_model: m.ai_model,
             ai_thinking_level: m.ai_thinking_level,
             ai_permission_mode: m.ai_permission_mode,
+            application_id: m.application_id,
         }
     }
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApplicationProjectResponse {
+    pub id: i32,
+    pub name: String,
+    pub slug: String,
+    pub repository: String,
+    pub main_branch: String,
+    pub is_private: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ApplicationResponse {
+    pub public_id: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub status: String,
+    pub projects: Vec<ApplicationProjectResponse>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<crate::applications::ApplicationWithProjects> for ApplicationResponse {
+    fn from(value: crate::applications::ApplicationWithProjects) -> Self {
+        Self {
+            public_id: value.application.public_id,
+            name: value.application.name,
+            description: value.application.description,
+            status: value.application.status,
+            projects: value
+                .projects
+                .into_iter()
+                .map(|project| ApplicationProjectResponse {
+                    id: project.id,
+                    name: project.name,
+                    slug: project.slug,
+                    repository: format!("{}/{}", project.repo_owner, project.repo_name),
+                    main_branch: project.main_branch,
+                    is_private: !project.is_public_repo,
+                })
+                .collect(),
+            created_at: value.application.created_at.to_rfc3339(),
+            updated_at: value.application.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateApplicationRequest {
+    pub name: String,
+    pub description: Option<String>,
+    pub project_ids: Vec<i32>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateApplicationConversationRequest {
+    pub ai_provider: Option<String>,
+    pub ai_model: Option<String>,
+    pub ai_thinking_level: Option<String>,
+    pub ai_permission_mode: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ThreadArtifactResponse {
+    pub public_id: String,
+    pub kind: String,
+    pub schema_version: i32,
+    pub title: Option<String>,
+    pub payload: serde_json::Value,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl From<temps_entities::ai_thread_artifacts::Model> for ThreadArtifactResponse {
+    fn from(value: temps_entities::ai_thread_artifacts::Model) -> Self {
+        Self {
+            public_id: value.public_id,
+            kind: value.kind,
+            schema_version: value.schema_version,
+            title: value.title,
+            payload: value.payload,
+            status: value.status,
+            created_at: value.created_at.to_rfc3339(),
+            updated_at: value.updated_at.to_rfc3339(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateThreadArtifactRequest {
+    pub kind: String,
+    pub title: Option<String>,
+    pub payload: serde_json::Value,
 }
 
 /// A conversation in the unified cross-project switcher: carries the project it
@@ -341,6 +443,34 @@ impl From<ChatError> for Problem {
                 problemdetails::new(axum::http::StatusCode::BAD_REQUEST)
                     .with_title("Permission Decision Mismatch")
                     .with_detail(e.to_string())
+            }
+        }
+    }
+}
+
+impl From<ApplicationError> for Problem {
+    fn from(error: ApplicationError) -> Self {
+        match error {
+            ApplicationError::NotFound(_)
+            | ApplicationError::ProjectNotFound(_)
+            | ApplicationError::ConversationNotFound(_) => {
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("AI Application Resource Not Found")
+                    .with_detail(error.to_string())
+            }
+            ApplicationError::InvalidName
+            | ApplicationError::InvalidProjects
+            | ApplicationError::InvalidArtifactKind(_)
+            | ApplicationError::SecretValue(_) => problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid AI Application Request")
+                .with_detail(error.to_string()),
+            ApplicationError::Database(_) => {
+                error!(error = %error, "AI application database operation failed");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail(
+                        "A database operation failed while handling the AI application request.",
+                    )
             }
         }
     }
@@ -653,6 +783,385 @@ async fn hidden_conversation_project_ids(
         })
 }
 
+async fn ensure_application_project_access(
+    auth: &AuthContext,
+    checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    project_ids: &[i32],
+) -> Result<(), Problem> {
+    if has_application_project_access(auth, checker, project_ids).await? {
+        return Ok(());
+    }
+    Err(problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("Project Access Denied")
+        .with_detail("Your team membership does not include every project in this application."))
+}
+
+/// Resolve whether a principal may see a full application topology. Application
+/// threads deliberately require access to *every* linked project: an anchor
+/// project must never become a route around a revoked project membership.
+async fn has_application_project_access(
+    auth: &AuthContext,
+    checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    project_ids: &[i32],
+) -> Result<bool, Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin) {
+        return Ok(true);
+    }
+    let Some(checker) = checker else {
+        return Ok(true);
+    };
+    let user_id = auth.user_id_opt().ok_or_else(|| {
+        problemdetails::new(StatusCode::FORBIDDEN)
+            .with_title("Project Access Denied")
+            .with_detail("A user identity is required to access an AI application.")
+    })?;
+    let access = checker
+        .user_can_access_projects(user_id, project_ids)
+        .await
+        .map_err(|error| {
+            error!(user_id, error = %error, "failed to check AI application project access");
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Project Access Check Failed")
+                .with_detail("Could not verify project access; please try again")
+        })?;
+    Ok(project_ids
+        .iter()
+        .all(|project_id| access.get(project_id).copied().unwrap_or(false)))
+}
+
+async fn ensure_application_conversation_access(
+    state: &AppState,
+    auth: &AuthContext,
+    conversation: &ai_conversations::Model,
+) -> Result<(), Problem> {
+    if conversation.context_type != "application" {
+        return Ok(());
+    }
+    let application_public_id =
+        conversation.context_id.split(':').next().ok_or_else(|| {
+            ApplicationError::ConversationNotFound(conversation.public_id.clone())
+        })?;
+    let application = state
+        .applications
+        .get(auth.user_id(), application_public_id)
+        .await?;
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_access(auth, &state.project_access_checker, &project_ids).await
+}
+
+#[utoipa::path(
+    get, tag = "AI Applications", path = "/ai/applications",
+    responses((status = 200, body = Vec<ApplicationResponse>), (status = 401), (status = 403)),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_applications(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Vec<ApplicationResponse>>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let applications = state.applications.list(auth.user_id()).await?;
+    let mut visible = Vec::with_capacity(applications.len());
+    for application in applications {
+        let project_ids = application
+            .projects
+            .iter()
+            .map(|project| project.id)
+            .collect::<Vec<_>>();
+        ensure_application_project_access(&auth, &state.project_access_checker, &project_ids)
+            .await?;
+        visible.push(ApplicationResponse::from(application));
+    }
+    Ok(Json(visible))
+}
+
+#[utoipa::path(
+    post, tag = "AI Applications", path = "/ai/applications",
+    request_body = CreateApplicationRequest,
+    responses((status = 201, body = ApplicationResponse), (status = 400), (status = 401), (status = 403)),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_application(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<CreateApplicationRequest>,
+) -> Result<(StatusCode, Json<ApplicationResponse>), Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    deny_deployment_token!(auth);
+    ensure_application_project_access(&auth, &state.project_access_checker, &request.project_ids)
+        .await?;
+    let application = state
+        .applications
+        .create(
+            auth.user_id(),
+            &request.name,
+            request.description.as_deref(),
+            &request.project_ids,
+        )
+        .await?;
+    state
+        .audit(&ApplicationCreatedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            application_id: application.application.public_id.clone(),
+            project_ids: request.project_ids,
+        })
+        .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ApplicationResponse::from(application)),
+    ))
+}
+
+#[utoipa::path(
+    get, tag = "AI Applications", path = "/ai/applications/{application_public_id}",
+    params(("application_public_id" = String, Path,)),
+    responses((status = 200, body = ApplicationResponse), (status = 401), (status = 403), (status = 404)),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_application(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(application_public_id): Path<String>,
+) -> Result<Json<ApplicationResponse>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let application = state
+        .applications
+        .get(auth.user_id(), &application_public_id)
+        .await?;
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_access(&auth, &state.project_access_checker, &project_ids).await?;
+    Ok(Json(ApplicationResponse::from(application)))
+}
+
+#[utoipa::path(
+    get, tag = "AI Applications", path = "/ai/applications/{application_public_id}/conversations",
+    params(("application_public_id" = String, Path,)),
+    responses((status = 200, body = Vec<ConversationResponse>), (status = 401), (status = 403), (status = 404)),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_application_conversations(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path(application_public_id): Path<String>,
+) -> Result<Json<Vec<ConversationResponse>>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let application = state
+        .applications
+        .get(auth.user_id(), &application_public_id)
+        .await?;
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_access(&auth, &state.project_access_checker, &project_ids).await?;
+    let conversations = state
+        .applications
+        .conversations(application.application.id, auth.user_id())
+        .await?;
+    Ok(Json(
+        conversations
+            .into_iter()
+            .map(ConversationResponse::from)
+            .collect(),
+    ))
+}
+
+#[utoipa::path(
+    post, tag = "AI Applications", path = "/ai/applications/{application_public_id}/conversations",
+    params(("application_public_id" = String, Path,)), request_body = CreateApplicationConversationRequest,
+    responses((status = 201, body = ConversationResponse), (status = 401), (status = 403), (status = 404)),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_application_conversation(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(application_public_id): Path<String>,
+    Json(request): Json<CreateApplicationConversationRequest>,
+) -> Result<(StatusCode, Json<ConversationResponse>), Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    deny_deployment_token!(auth);
+    let application = state
+        .applications
+        .get(auth.user_id(), &application_public_id)
+        .await?;
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_access(&auth, &state.project_access_checker, &project_ids).await?;
+    let anchor_project_id = project_ids
+        .first()
+        .copied()
+        .ok_or(ApplicationError::InvalidProjects)?;
+    for project_id in &project_ids {
+        ensure_enabled(&state, *project_id).await?;
+    }
+    let context_id = format!(
+        "{}:{}",
+        application_public_id,
+        uuid::Uuid::new_v4().simple()
+    );
+    let runtime = state
+        .service
+        .resolve_get_or_create_runtime(
+            anchor_project_id,
+            "application",
+            &context_id,
+            auth.user_id(),
+            request.ai_provider.as_deref(),
+            request.ai_model.as_deref(),
+            request.ai_thinking_level.as_deref(),
+            request.ai_permission_mode.as_deref(),
+        )
+        .await?;
+    ensure_runtime_permission(
+        &auth,
+        Some(&runtime.provider),
+        Some(&runtime.permission_mode),
+    )?;
+    let conversation = state
+        .service
+        .get_or_create(
+            anchor_project_id,
+            "application",
+            &context_id,
+            auth.user_id(),
+            Some(&runtime.provider),
+            Some(&runtime.model),
+            runtime.thinking_level.as_deref(),
+            Some(&runtime.permission_mode),
+        )
+        .await?;
+    state
+        .audit(&ConversationCreatedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            project_id: anchor_project_id,
+            conversation_id: conversation.public_id.clone(),
+            context_type: "application".to_string(),
+        })
+        .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ConversationResponse::from(conversation)),
+    ))
+}
+
+#[utoipa::path(
+    get, tag = "AI Applications", path = "/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts",
+    params(("application_public_id" = String, Path,), ("conversation_public_id" = String, Path,)),
+    responses((status = 200, body = Vec<ThreadArtifactResponse>), (status = 401), (status = 403), (status = 404)),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_thread_artifacts(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Path((application_public_id, conversation_public_id)): Path<(String, String)>,
+) -> Result<Json<Vec<ThreadArtifactResponse>>, Problem> {
+    permission_guard!(auth, ProjectsRead);
+    deny_deployment_token!(auth);
+    let application = state
+        .applications
+        .get(auth.user_id(), &application_public_id)
+        .await?;
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_access(&auth, &state.project_access_checker, &project_ids).await?;
+    let artifacts = state
+        .applications
+        .artifacts(
+            application.application.id,
+            &conversation_public_id,
+            auth.user_id(),
+        )
+        .await?;
+    Ok(Json(
+        artifacts
+            .into_iter()
+            .map(ThreadArtifactResponse::from)
+            .collect(),
+    ))
+}
+
+#[utoipa::path(
+    post, tag = "AI Applications", path = "/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts",
+    params(("application_public_id" = String, Path,), ("conversation_public_id" = String, Path,)), request_body = CreateThreadArtifactRequest,
+    responses((status = 201, body = ThreadArtifactResponse), (status = 400), (status = 401), (status = 403), (status = 404)),
+    security(("bearer_auth" = []))
+)]
+pub async fn create_thread_artifact(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path((application_public_id, conversation_public_id)): Path<(String, String)>,
+    Json(request): Json<CreateThreadArtifactRequest>,
+) -> Result<(StatusCode, Json<ThreadArtifactResponse>), Problem> {
+    permission_guard!(auth, ProjectsWrite);
+    deny_deployment_token!(auth);
+    let application = state
+        .applications
+        .get(auth.user_id(), &application_public_id)
+        .await?;
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    ensure_application_project_access(&auth, &state.project_access_checker, &project_ids).await?;
+    let artifact = state
+        .applications
+        .create_artifact(
+            application.application.id,
+            &conversation_public_id,
+            auth.user_id(),
+            &request.kind,
+            request.title.as_deref(),
+            request.payload,
+        )
+        .await?;
+    state
+        .audit(&ThreadArtifactCreatedAudit {
+            context: AuditContext {
+                user_id: auth.user_id(),
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            application_id: application_public_id,
+            conversation_id: conversation_public_id,
+            artifact_id: artifact.public_id.clone(),
+            kind: artifact.kind.clone(),
+        })
+        .await;
+    Ok((
+        StatusCode::CREATED,
+        Json(ThreadArtifactResponse::from(artifact)),
+    ))
+}
+
 // --- handlers ----------------------------------------------------------------
 
 /// Find the current user's existing chat for a context (returns `null` if none
@@ -688,6 +1197,9 @@ pub async fn find_conversation(
         .service
         .find_by_context(project_id, auth.user_id(), &q.context_type, &q.context_id)
         .await?;
+    if let Some(conversation) = found.as_ref() {
+        ensure_application_conversation_access(&state, &auth, conversation).await?;
+    }
     Ok(Json(found.map(ConversationResponse::from)))
 }
 
@@ -714,28 +1226,56 @@ pub async fn list_all_conversations(
         .service
         .list_all_conversations(auth.user_id(), &hidden_project_ids)
         .await?;
-    Ok(Json(
-        items
-            .into_iter()
-            .filter(|i| can_read_context(&auth, &i.conversation.context_type))
-            .map(|i| GlobalConversationResponse {
-                public_id: i.conversation.public_id,
-                project_id: i.conversation.project_id,
-                project_name: i.project_name,
-                project_slug: i.project_slug,
-                context_type: i.conversation.context_type,
-                context_id: i.conversation.context_id,
-                title: i.conversation.title,
-                status: i.conversation.status,
-                created_at: i.conversation.created_at.to_rfc3339(),
-                last_activity_at: i.conversation.last_activity_at.to_rfc3339(),
-                ai_provider: i.conversation.ai_provider,
-                ai_model: i.conversation.ai_model,
-                ai_thinking_level: i.conversation.ai_thinking_level,
-                ai_permission_mode: i.conversation.ai_permission_mode,
-            })
-            .collect(),
-    ))
+    let mut conversations = Vec::with_capacity(items.len());
+    for item in items {
+        if !can_read_context(&auth, &item.conversation.context_type) {
+            continue;
+        }
+        if item.conversation.context_type == "application" {
+            let application_public_id =
+                item.conversation
+                    .context_id
+                    .split(':')
+                    .next()
+                    .ok_or_else(|| {
+                        ApplicationError::ConversationNotFound(item.conversation.public_id.clone())
+                    })?;
+            let application = state
+                .applications
+                .get(auth.user_id(), application_public_id)
+                .await?;
+            let project_ids = application
+                .projects
+                .iter()
+                .map(|project| project.id)
+                .collect::<Vec<_>>();
+            if !has_application_project_access(&auth, &state.project_access_checker, &project_ids)
+                .await?
+            {
+                // Global lists should remain useful when a collaborator loses
+                // access to one member project; omit the now-inaccessible
+                // thread rather than leaking its name, title, or activity.
+                continue;
+            }
+        }
+        conversations.push(GlobalConversationResponse {
+            public_id: item.conversation.public_id,
+            project_id: item.conversation.project_id,
+            project_name: item.project_name,
+            project_slug: item.project_slug,
+            context_type: item.conversation.context_type,
+            context_id: item.conversation.context_id,
+            title: item.conversation.title,
+            status: item.conversation.status,
+            created_at: item.conversation.created_at.to_rfc3339(),
+            last_activity_at: item.conversation.last_activity_at.to_rfc3339(),
+            ai_provider: item.conversation.ai_provider,
+            ai_model: item.conversation.ai_model,
+            ai_thinking_level: item.conversation.ai_thinking_level,
+            ai_permission_mode: item.conversation.ai_permission_mode,
+        });
+    }
+    Ok(Json(conversations))
 }
 
 /// List the current user's active conversations for a project,
@@ -760,13 +1300,15 @@ pub async fn list_conversations(
         .service
         .list_conversations(project_id, auth.user_id())
         .await?;
-    Ok(Json(
-        conversations
-            .into_iter()
-            .filter(|c| can_read_context(&auth, &c.context_type))
-            .map(ConversationResponse::from)
-            .collect(),
-    ))
+    let mut responses = Vec::with_capacity(conversations.len());
+    for conversation in conversations {
+        if !can_read_context(&auth, &conversation.context_type) {
+            continue;
+        }
+        ensure_application_conversation_access(&state, &auth, &conversation).await?;
+        responses.push(ConversationResponse::from(conversation));
+    }
+    Ok(Json(responses))
 }
 
 /// Get-or-create the current user's private chat for a context.
@@ -794,6 +1336,13 @@ pub async fn create_conversation(
     }
     if req.context_id.len() > MAX_CONTEXT_ID_LEN {
         return Err(too_long("context_id", MAX_CONTEXT_ID_LEN));
+    }
+    if req.context_type == "application" {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Use the AI Application Thread Endpoint")
+            .with_detail(
+                "Application threads must be created through /ai/applications/{application_id}/conversations so access can be checked across every linked project.",
+            ));
     }
     ensure_context_read_permission(&auth, &req.context_type)?;
     ensure_enabled(&state, project_id).await?;
@@ -864,6 +1413,7 @@ pub async fn get_conversation(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
     ensure_conversation_read_permission(&auth, &conv)?;
     let messages = state
         .service
@@ -906,6 +1456,7 @@ pub async fn conversation_stream(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
     ensure_conversation_read_permission(&auth, &conv)?;
 
     let rx = state.service.subscribe_conversation(conv.id);
@@ -988,6 +1539,16 @@ pub async fn send_message(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
+    if conv.context_type == "application"
+        && crate::sensitive::contains_likely_credential(&req.content)
+    {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Credential Blocked From AI Chat")
+            .with_detail(
+                "This message looks like it contains a credential. Add the value through the secure project secret or connector flow; the AI receives only an opaque reference.",
+            ));
+    }
     let effective_permission = req
         .ai_permission_mode
         .as_deref()
@@ -1146,6 +1707,7 @@ pub async fn archive_conversation(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
     ensure_conversation_read_permission(&auth, &conv)?;
     state.service.archive(&conv).await?;
     state
@@ -1244,6 +1806,7 @@ pub async fn resolve_permission(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
     ensure_runtime_permission(
         &auth,
         Some(&conv.ai_provider),
@@ -1421,6 +1984,7 @@ pub async fn rename_conversation(
         .service
         .get_by_public_id(project_id, auth.user_id(), &public_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     let updated = state.service.rename(&conv, title).await?;
 
@@ -1470,6 +2034,7 @@ pub async fn list_pending_actions(
         .service
         .get_by_public_id(project_id, auth.user_id(), &conv_public_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     let rows = state
         .pending_actions
@@ -1693,6 +2258,19 @@ pub async fn get_chat_readiness(
 
 pub fn configure_routes() -> Router<Arc<AppState>> {
     Router::new()
+        .route(
+            "/ai/applications",
+            get(list_applications).post(create_application),
+        )
+        .route("/ai/applications/{application_public_id}", get(get_application))
+        .route(
+            "/ai/applications/{application_public_id}/conversations",
+            get(list_application_conversations).post(create_application_conversation),
+        )
+        .route(
+            "/ai/applications/{application_public_id}/conversations/{conversation_public_id}/artifacts",
+            get(list_thread_artifacts).post(create_thread_artifact),
+        )
         // Readiness for the chat, so the UI can onboard instead of guessing.
         .route(
             "/projects/{project_id}/ai/readiness",
@@ -1757,6 +2335,13 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        list_applications,
+        create_application,
+        get_application,
+        list_application_conversations,
+        create_application_conversation,
+        list_thread_artifacts,
+        create_thread_artifact,
         get_chat_readiness,
         find_conversation,
         list_conversations,
@@ -1773,6 +2358,12 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         reject_pending_action,
     ),
     components(schemas(
+        ApplicationProjectResponse,
+        ApplicationResponse,
+        CreateApplicationRequest,
+        CreateApplicationConversationRequest,
+        ThreadArtifactResponse,
+        CreateThreadArtifactRequest,
         ConversationResponse,
         GlobalConversationResponse,
         MessageResponse,
@@ -1938,6 +2529,7 @@ mod tests {
             id: 1,
             public_id: "conversation-1".to_string(),
             project_id: 1,
+            application_id: None,
             context_type: "project".to_string(),
             context_id: "1".to_string(),
             title: None,

@@ -10,6 +10,7 @@
 //! deployment provider seeds from a failure diagnosis). Built on the `temps-ai`
 //! foundation; the AI is injected as `Arc<dyn AiService>`.
 
+pub mod applications;
 pub mod audit;
 pub mod handlers;
 pub mod pending_actions;
@@ -19,11 +20,13 @@ pub mod providers;
 mod sensitive;
 pub mod service;
 
+pub use applications::{ApplicationError, ApplicationService};
 pub use pending_actions::{PendingActionError, PendingActionService};
 pub use plugin::AiChatPlugin;
 pub use provider::{ConversationContextProvider, ConversationSeed};
 pub use providers::alert::AlertChatProvider;
 pub use providers::api_tools::ApiToolsProvider;
+pub use providers::application::ApplicationChatProvider;
 pub use providers::deployment::DeploymentChatProvider;
 pub use providers::project::ProjectChatProvider;
 pub use service::{ChatStreamEvent, ConversationService, PendingPermissionEntry};

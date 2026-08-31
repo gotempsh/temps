@@ -19,6 +19,8 @@ pub struct Model {
     /// URL-safe opaque id used in the API.
     pub public_id: String,
     pub project_id: i32,
+    /// Optional multi-project application scope for AI-first threads.
+    pub application_id: Option<i64>,
     /// `"deployment" | "alert" | "error_group" | "general"`.
     pub context_type: String,
     /// The attached entity's id (ints stringified).

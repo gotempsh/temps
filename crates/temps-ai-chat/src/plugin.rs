@@ -25,6 +25,7 @@ use crate::provider::ConversationContextProvider;
 use crate::providers::alert::AlertChatProvider;
 use crate::providers::alert_suggest::AlertSuggestChatProvider;
 use crate::providers::api_tools::ApiToolsProvider;
+use crate::providers::application::ApplicationChatProvider;
 use crate::providers::deployment::DeploymentChatProvider;
 use crate::providers::project::ProjectChatProvider;
 use crate::providers::repo_tools::RepoToolsProvider;
@@ -102,12 +103,19 @@ impl TempsPlugin for AiChatPlugin {
                 Arc::new(DeploymentChatProvider::new(db.clone(), log_service)),
                 Arc::new(AlertChatProvider::new(db.clone())),
                 Arc::new(AlertSuggestChatProvider::new()),
+                Arc::new(ApplicationChatProvider::new(
+                    db.clone(),
+                    audit_service.clone(),
+                )),
                 Arc::new(ProjectChatProvider::new(db.clone())),
                 // ADR-024: generic API meta-tools (search_api, describe_api, call_api).
                 // Uses the sentinel context_type "__api_tools__" — never selected as a
                 // primary provider, but its tools() output is merged into every context
                 // by the ConversationService tool-gathering loop.
-                Arc::new(ApiToolsProvider::new(api_tools_handle)),
+                Arc::new(ApiToolsProvider::with_database(
+                    api_tools_handle,
+                    db.clone(),
+                )),
                 // Git-repository exploration tools (read_repo_file, list_repo_dir,
                 // list_repo_branches, list_repo_tags). Uses the sentinel "__repo_tools__"
                 // — merged into every context when the project has a Git connection.
@@ -127,11 +135,15 @@ impl TempsPlugin for AiChatPlugin {
             let service = Arc::new(service);
             context.register_service(service.clone());
 
+            let applications = Arc::new(crate::ApplicationService::new(db.clone()));
+            context.register_service(applications.clone());
+
             let app_state = Arc::new(AppState {
                 service,
                 db,
                 audit_service,
                 pending_actions,
+                applications,
                 project_access_checker: None,
             });
             context.register_plugin_state("ai_chat", app_state);
@@ -149,6 +161,7 @@ impl TempsPlugin for AiChatPlugin {
             db: old.db.clone(),
             audit_service: old.audit_service.clone(),
             pending_actions: old.pending_actions.clone(),
+            applications: old.applications.clone(),
             project_access_checker,
         });
         let router = handlers::configure_routes().with_state(app_state);

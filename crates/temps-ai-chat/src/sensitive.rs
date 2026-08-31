@@ -9,6 +9,30 @@ use temps_core::EncryptionService;
 const CIPHERTEXT_FIELD: &str = "__temps_encrypted_v1";
 const DISPLAY_FIELD: &str = "__temps_display";
 
+/// Conservative detector used before an application-chat message or generated
+/// artifact can be persisted. False positives are intentionally diverted to
+/// the credential broker; plaintext must never enter the AI transcript.
+pub(crate) fn contains_likely_credential(value: &str) -> bool {
+    static CREDENTIAL: OnceLock<regex::Regex> = OnceLock::new();
+    CREDENTIAL
+        .get_or_init(|| {
+            regex::Regex::new(
+                r#"(?ix)
+                -----BEGIN\s+(?:RSA\s+|EC\s+|OPENSSH\s+)?PRIVATE\s+KEY-----
+                |\b(?:sk|pk)_(?:live|test)_[a-z0-9_-]{12,}\b
+                |\bgh[oprsu]_[a-z0-9]{20,}\b
+                |\bgithub_pat_[a-z0-9_]{20,}\b
+                |\b(?:api[_-]?key|password|passwd|secret|token)\s*[:=]\s*[^\s]{8,}
+                |(?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?):\/\/[^\s:@]+:[^\s@]+@
+                |\bAKIA[A-Z0-9]{16}\b
+                |\bxox[baprs]-[a-z0-9-]{10,}\b
+                "#,
+            )
+            .expect("static credential-detection regex")
+        })
+        .is_match(value)
+}
+
 /// Recursively replace values under credential-like keys.
 pub(crate) fn redact_value(value: &serde_json::Value) -> serde_json::Value {
     const SENSITIVE: &[&str] = &["value", "secret", "password", "token", "key"];
@@ -205,6 +229,24 @@ fn cli_token_spans(input: &str) -> Vec<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn likely_credentials_are_detected_before_ai_persistence() {
+        for value in [
+            "STRIPE_KEY=sk_test_1234567890123456",
+            "token: github_pat_12345678901234567890",
+            "postgres://admin:supersecret@db.internal/app",
+            "-----BEGIN PRIVATE KEY-----",
+        ] {
+            assert!(
+                contains_likely_credential(value),
+                "missed credential: {value}"
+            );
+        }
+        assert!(!contains_likely_credential(
+            "We need a payments capability and a credential_ref."
+        ));
+    }
 
     #[test]
     fn encrypted_payload_round_trips_but_display_is_redacted() {
