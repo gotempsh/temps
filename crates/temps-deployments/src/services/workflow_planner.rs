@@ -14,6 +14,9 @@ use temps_logs::LogService;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
+use super::env_resolver::merge_environment_variable_layers;
+use super::managed_environment_variables::{public_sentry_dsn_var, public_sentry_tunnel_var};
+
 #[derive(Debug, Error)]
 pub enum WorkflowPlanningError {
     #[error(
@@ -345,7 +348,7 @@ impl WorkflowPlanner {
     /// 1. Environment variables from the env_vars table for the specific environment (via env_var_environments junction table)
     /// 2. Runtime environment variables from external services linked to the project
     /// 3. Sentry DSN environment variables - auto-generated per project/environment:
-    ///    - `SENTRY_DSN` is always added (server-side / generic).
+    ///    - `SENTRY_DSN` and `SENTRY_TUNNEL` are always added (server-side / generic).
     ///    - A framework-specific public-DSN var is added so client bundlers expose it.
     ///      The exact name follows each framework's public-prefix convention so
     ///      `import.meta.env.<VAR>` / `process.env.<VAR>` resolves at build time:
@@ -380,6 +383,7 @@ impl WorkflowPlanner {
         use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
+        let mut explicit_project_vars = HashMap::new();
 
         // Add default HOST environment variable
         // This ensures containers bind to all network interfaces (0.0.0.0)
@@ -420,13 +424,13 @@ impl WorkflowPlanner {
                 } else {
                     env_var.value
                 };
-                env_vars_map.insert(env_var.key, value);
+                explicit_project_vars.insert(env_var.key, value);
             }
         }
 
         debug!(
             "📦 Loaded {} environment variables from env_vars table via env_var_environments",
-            env_vars_map.len()
+            explicit_project_vars.len()
         );
 
         // 2. Get runtime environment variables from external services
@@ -444,6 +448,7 @@ impl WorkflowPlanner {
 
         // Track failed services to provide detailed error messages
         let mut failed_services: Vec<(i32, String)> = Vec::new();
+        let mut linked_service_vars = HashMap::new();
 
         // Get runtime environment variables from each external service
         for project_service in project_services_list {
@@ -468,8 +473,7 @@ impl WorkflowPlanner {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    // Merge service env vars into the main map
-                    env_vars_map.extend(service_env_vars);
+                    linked_service_vars.extend(service_env_vars);
                 }
                 Err(e) => {
                     // Collect the error - we'll fail the entire deployment if any service fails
@@ -502,6 +506,14 @@ impl WorkflowPlanner {
 
             return Err(anyhow::anyhow!(error_message));
         }
+
+        // Linked-service variables are defaults. Explicit project variables
+        // express user intent and therefore take precedence on collisions.
+        merge_environment_variable_layers(
+            &mut env_vars_map,
+            linked_service_vars,
+            explicit_project_vars,
+        );
 
         // 2b. Secrets-manager bindings (EE only — strict no-op when resolver is absent).
         //
@@ -597,6 +609,10 @@ impl WorkflowPlanner {
                         // Always add SENTRY_DSN for server-side usage
                         env_vars_map.insert("SENTRY_DSN".to_string(), project_dsn.dsn.clone());
 
+                        let sentry_tunnel =
+                            format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH);
+                        env_vars_map.insert("SENTRY_TUNNEL".to_string(), sentry_tunnel.clone());
+
                         // Add framework-specific public DSN env var based on preset.
                         // Each client bundler only exposes vars matching its own prefix
                         // convention to the browser bundle, so we mirror that mapping.
@@ -611,10 +627,7 @@ impl WorkflowPlanner {
                         // the path can change in one place (here) without touching
                         // deployed apps' source or docs.
                         if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
-                            env_vars_map.insert(
-                                tunnel_var.to_string(),
-                                format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH),
-                            );
+                            env_vars_map.insert(tunnel_var.to_string(), sentry_tunnel);
                         }
                     }
                     Err(e) => {
@@ -733,7 +746,9 @@ impl WorkflowPlanner {
 
             // Use commit SHA as service version when available
             if let Some(ref commit_sha) = deployment.commit_sha {
-                env_vars_map.insert("OTEL_SERVICE_VERSION".to_string(), commit_sha.clone());
+                env_vars_map
+                    .entry("OTEL_SERVICE_VERSION".to_string())
+                    .or_insert_with(|| commit_sha.clone());
             }
 
             debug!(
@@ -1322,17 +1337,28 @@ impl WorkflowPlanner {
             );
         }
 
-        // Inject TEMPS_ASSET_PREFIX for stale-chunk prevention.
+        // Inject deployment-owned runtime variables for stale-chunk prevention
+        // and a deterministic default port. Source-specific planners may
+        // replace PORT later after inspecting an external image.
         // Frameworks can use this to namespace static assets per deployment:
         //   Next.js: assetPrefix: process.env.NEXT_PUBLIC_TEMPS_ASSET_PREFIX || ''
         //   Vite:    base: process.env.TEMPS_ASSET_PREFIX || '/'
         // The value is the deployment slug, which is unique and URL-safe.
-        let asset_prefix = format!("/_temps/assets/{}", deployment.slug);
-        env_vars.insert("TEMPS_ASSET_PREFIX".to_string(), asset_prefix.clone());
-        // NEXT_PUBLIC_ prefix makes it available at build time in Next.js client bundles
-        if project.preset == temps_entities::preset::Preset::NextJs {
-            env_vars.insert("NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string(), asset_prefix);
-        }
+        let default_port = if project.preset == temps_entities::preset::Preset::DockerCompose {
+            None
+        } else {
+            Some(
+                self.resolve_exposed_port(environment, project, None)
+                    .await
+                    .into(),
+            )
+        };
+        super::env_resolver::apply_deployment_owned_variables(
+            &mut env_vars,
+            project.preset,
+            &deployment.slug,
+            default_port,
+        );
 
         debug!(
             "📦 Gathered {} environment variables for deployment",
@@ -1575,8 +1601,44 @@ impl WorkflowPlanner {
             vec![]
         };
 
-        // Determine deployment strategy: Static or Container
-        let deploy_job_id = if let Some(output_dir) = static_output_dir {
+        // Presets that have nothing to build (a plain static site: no
+        // package.json, no build tool) skip Docker/autopack entirely — a
+        // single job deploys straight from the downloaded checkout. Building
+        // an image just to immediately discard it (or, worse, run it as a
+        // long-lived container purely to serve files) is pure overhead for
+        // content with zero compile step.
+        let needs_container_build = preset_instance
+            .as_ref()
+            .map(|preset| preset.needs_container_build())
+            .unwrap_or(true);
+
+        // Determine deployment strategy: source-only, static (build + extract), or Container
+        let deploy_job_id = if !needs_container_build {
+            debug!(
+                "📄 Using source-only static deployment for preset {} (no build step)",
+                project.preset
+            );
+
+            jobs.push(JobDefinition {
+                job_id: "deploy_static".to_string(),
+                job_type: "DeployStaticFromSourceJob".to_string(),
+                name: "Deploy Static Files".to_string(),
+                description: Some(
+                    "Deploy static files directly from the repository — no build, no container"
+                        .to_string(),
+                ),
+                dependencies: build_dependencies.clone(),
+                job_config: Some(serde_json::json!({
+                    "directory": project.directory,
+                    "project_slug": project.slug,
+                    "environment_slug": environment.slug,
+                    "deployment_slug": deployment.slug
+                })),
+                required_for_completion: true,
+            });
+
+            "deploy_static".to_string()
+        } else if let Some(output_dir) = static_output_dir {
             // Static deployment path: BuildImageJob + DeployStaticJob
             debug!("📦 Using static deployment for preset {}", project.preset);
             debug!("📂 Static output directory: {}", output_dir);
@@ -1984,10 +2046,12 @@ impl WorkflowPlanner {
             debug!("Skipping screenshot job - screenshots are disabled in config");
         }
 
-        // Job 7: Scan for vulnerabilities (only if git info is available)
+        // Job 7: Scan for vulnerabilities (only if git info is available AND a
+        // container image was actually built — a source-only static deployment
+        // has no image to scan)
         // This runs in parallel with other post-deployment jobs AFTER deployment is marked complete
         // NOT required for deployment completion - if it fails, deployment still succeeds
-        if has_git_info {
+        if has_git_info && needs_container_build {
             jobs.push(JobDefinition {
                 job_id: "scan_vulnerabilities".to_string(),
                 job_type: "ScanVulnerabilitiesJob".to_string(),
@@ -2015,8 +2079,9 @@ impl WorkflowPlanner {
         }
 
         // Job 8: Capture source maps (only for JS-based presets with git info)
-        // Extracts .map files from the built image for error symbolication
-        if has_git_info {
+        // Extracts .map files from the built image for error symbolication —
+        // a source-only static deployment has no build output to extract from
+        if has_git_info && needs_container_build {
             // Search paths are relative to the image's WORKDIR (detected at runtime).
             // The CaptureSourceMapsJob inspects the image to find the WORKDIR and
             // prepends it to these relative paths.
@@ -2592,91 +2657,6 @@ impl WorkflowPlanner {
             project.name
         );
         Ok(jobs)
-    }
-}
-
-/// Returns the framework-specific public-DSN env var name for a preset, or
-/// `None` if the preset has no client bundler (backend-only) or has no
-/// build-time public-prefix convention (Angular reads from `environment.ts`,
-/// generic Docker/Nixpacks/Static presets don't know the framework).
-///
-/// Each entry follows the bundler's own public-prefix rule — that's the only
-/// prefix the bundler will inline into the browser bundle.
-pub(crate) fn public_sentry_dsn_var(
-    preset: temps_entities::preset::Preset,
-) -> Option<&'static str> {
-    use temps_entities::preset::Preset;
-    match preset {
-        // Next.js: `NEXT_PUBLIC_*` is inlined into the client bundle.
-        Preset::NextJs => Some("NEXT_PUBLIC_SENTRY_DSN"),
-        // Nuxt 3+: `NUXT_PUBLIC_*` is exposed via `useRuntimeConfig().public`.
-        Preset::Nuxt => Some("NUXT_PUBLIC_SENTRY_DSN"),
-        // Vite-based frameworks (Remix uses Vite since v2.5; SolidStart is Vinxi/Vite).
-        Preset::Vite | Preset::React | Preset::Vue | Preset::SolidStart | Preset::Remix => {
-            Some("VITE_SENTRY_DSN")
-        }
-        // SvelteKit / Astro / Rsbuild all use `PUBLIC_*` as their public prefix.
-        Preset::SvelteKit | Preset::Astro | Preset::Rsbuild => Some("PUBLIC_SENTRY_DSN"),
-        // Docusaurus is webpack-based and exposes `REACT_APP_*` via DefinePlugin.
-        Preset::Docusaurus => Some("REACT_APP_SENTRY_DSN"),
-        // Angular has no build-time public prefix; users wire `SENTRY_DSN` into
-        // `environment.ts` themselves. Backend / generic presets only need
-        // server-side `SENTRY_DSN`, which is always added.
-        Preset::Angular
-        | Preset::Python
-        | Preset::FastApi
-        | Preset::Flask
-        | Preset::Django
-        | Preset::Rails
-        | Preset::Go
-        | Preset::Rust
-        | Preset::Java
-        | Preset::Laravel
-        | Preset::NodeJs
-        | Preset::Dockerfile
-        | Preset::DockerCompose
-        | Preset::Nixpacks
-        | Preset::Autopack
-        | Preset::Static => None,
-    }
-}
-
-/// Public-prefix env var carrying the same-origin Sentry tunnel path for
-/// browser presets (see `temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH` for
-/// what it points at and why). Mirrors `public_sentry_dsn_var`'s preset
-/// groups exactly — a browser bundle that gets the DSN gets the tunnel path
-/// too, under the same public prefix, so both env vars land in the same
-/// `Sentry.init({ dsn, tunnel })` call. `None` for the same presets that get
-/// no public DSN var (server-only, or no build-time public-prefix
-/// convention).
-pub(crate) fn public_sentry_tunnel_var(
-    preset: temps_entities::preset::Preset,
-) -> Option<&'static str> {
-    use temps_entities::preset::Preset;
-    match preset {
-        Preset::NextJs => Some("NEXT_PUBLIC_SENTRY_TUNNEL"),
-        Preset::Nuxt => Some("NUXT_PUBLIC_SENTRY_TUNNEL"),
-        Preset::Vite | Preset::React | Preset::Vue | Preset::SolidStart | Preset::Remix => {
-            Some("VITE_SENTRY_TUNNEL")
-        }
-        Preset::SvelteKit | Preset::Astro | Preset::Rsbuild => Some("PUBLIC_SENTRY_TUNNEL"),
-        Preset::Docusaurus => Some("REACT_APP_SENTRY_TUNNEL"),
-        Preset::Angular
-        | Preset::Python
-        | Preset::FastApi
-        | Preset::Flask
-        | Preset::Django
-        | Preset::Rails
-        | Preset::Go
-        | Preset::Rust
-        | Preset::Java
-        | Preset::Laravel
-        | Preset::NodeJs
-        | Preset::Dockerfile
-        | Preset::DockerCompose
-        | Preset::Nixpacks
-        | Preset::Autopack
-        | Preset::Static => None,
     }
 }
 

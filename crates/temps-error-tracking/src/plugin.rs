@@ -3,12 +3,13 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
 use temps_core::{Job, JobQueue, JobReceiver};
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -104,6 +105,13 @@ impl TempsPlugin for ErrorTrackingPlugin {
             let error_tracking_service = Arc::new(ErrorTrackingService::new(db.clone()));
             error_tracking_service.set_source_map_service(source_map_service);
 
+            // AlarmService isn't registered yet at this point (Monitoring
+            // registers after Error Tracking) — wired in via
+            // `initialize_plugin_services`, then read from this slot inside
+            // the notification callback below.
+            let alarm_service_slot: Arc<OnceLock<Arc<AlarmService>>> = Arc::new(OnceLock::new());
+            context.register_service(alarm_service_slot.clone());
+
             // Wire up notification callback if NotificationService is available
             if let Some(notification_service) =
                 context.get_service::<temps_notifications::services::NotificationService>()
@@ -111,10 +119,51 @@ impl TempsPlugin for ErrorTrackingPlugin {
                 tracing::info!("Error tracking: notification callback wired successfully");
                 let ns = notification_service.clone();
                 let notif_db = db.clone();
+                let alarm_slot = alarm_service_slot.clone();
                 error_tracking_service.set_notification_callback(Arc::new(move |alert| {
                     let ns = ns.clone();
                     let db = notif_db.clone();
+                    let alarm_slot = alarm_slot.clone();
                     Box::pin(async move {
+                        // Persist an alarm row (no separate notification —
+                        // the richer, deep-linked one below is the actual
+                        // delivery) so the error threshold shows up in
+                        // /monitoring/alarms and can be silenced like any
+                        // other alert. Known limitation: with no error-group
+                        // scope column on `alarms`, different error groups in
+                        // the same project/environment share one cooldown
+                        // bucket, same as the disk-space monitor.
+                        if let Some(alarm_service) = alarm_slot.get() {
+                            let severity = match alert.priority.as_str() {
+                                "Critical" => AlarmSeverity::Critical,
+                                "Low" => AlarmSeverity::Info,
+                                _ => AlarmSeverity::Warning,
+                            };
+                            let request = FireAlarmRequest {
+                                project_id: Some(alert.project_id),
+                                environment_id: alert.environment_id,
+                                deployment_id: None,
+                                container_id: None,
+                                service_id: None,
+                                alarm_type: AlarmType::ErrorTrackingThreshold,
+                                severity,
+                                title: alert.group_title.clone(),
+                                message: alert.message.clone(),
+                                metadata: Some(serde_json::json!({
+                                    "trigger": alert.trigger_type,
+                                    "rule": alert.rule_name,
+                                    "error_type": alert.error_type,
+                                    "occurrences": alert.total_count,
+                                    "first_seen": alert.first_seen,
+                                    "last_seen": alert.last_seen,
+                                    "group_id": alert.group_id,
+                                })),
+                            };
+                            if let Err(e) = alarm_service.fire_alarm_silent(request).await {
+                                tracing::error!("Failed to persist error tracking alarm: {}", e);
+                            }
+                        }
+
                         use temps_notifications::types::{Notification, NotificationPriority};
                         let priority = match alert.priority.as_str() {
                             "Low" => NotificationPriority::Low,
@@ -241,6 +290,24 @@ impl TempsPlugin for ErrorTrackingPlugin {
             tracing::debug!(
                 "Error tracking plugin services registered successfully (including Sentry)"
             );
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(alarm_service) = context.get_service::<AlarmService>() {
+                let alarm_service_slot = context.require_service::<OnceLock<Arc<AlarmService>>>();
+                let _ = alarm_service_slot.set(alarm_service);
+                tracing::debug!("AlarmService wired into error tracking notification callback");
+            } else {
+                tracing::warn!(
+                    "AlarmService not available - error tracking alarms will not be persisted"
+                );
+            }
             Ok(())
         })
     }

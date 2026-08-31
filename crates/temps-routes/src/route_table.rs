@@ -713,24 +713,40 @@ impl CachedPeerTable {
                     if let Some(deployment) = deployments_cache.get(&deployment_id) {
                         // Load all active containers for this deployment
                         use temps_entities::deployment_containers;
-                        let containers = deployment_containers::Entity::find()
-                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                            .filter(deployment_containers::Column::DeletedAt.is_null())
-                            // A container row survives (deleted_at stays NULL) for the
-                            // deployment's whole lifecycle, but `status` still moves
-                            // through "running" -> "stopped"/"removing"/"removed" (e.g.
-                            // deployment pause, or a manual per-container stop) without
-                            // ever being soft-deleted. Only route live traffic to
-                            // containers that are actually up, or where a container has
-                            // never had a status recorded yet.
-                            .filter(
-                                Condition::any()
-                                    .add(deployment_containers::Column::Status.is_null())
-                                    .add(deployment_containers::Column::Status.eq("running")),
-                            )
-                            .all(self.db.as_ref())
-                            .await
-                            .unwrap_or_default();
+                        let containers = if deployment.state == "paused" {
+                            // `pause_deployment` flips this row to "paused" BEFORE
+                            // touching any container, and per-container `status`
+                            // writes happen afterward with best-effort retry — if
+                            // one of those writes fails even after retrying, the
+                            // container row can be left stuck at "running" even
+                            // though Docker actually stopped it. Trusting
+                            // `deployment.state` here (rather than only the
+                            // per-container status) closes that gap: a paused
+                            // deployment is never routable, independent of
+                            // whether every container's own status row caught up.
+                            Vec::new()
+                        } else {
+                            deployment_containers::Entity::find()
+                                .filter(
+                                    deployment_containers::Column::DeploymentId.eq(deployment_id),
+                                )
+                                .filter(deployment_containers::Column::DeletedAt.is_null())
+                                // A container row survives (deleted_at stays NULL) for the
+                                // deployment's whole lifecycle, but `status` still moves
+                                // through "running" -> "stopped"/"removing"/"removed" (e.g.
+                                // deployment pause, or a manual per-container stop) without
+                                // ever being soft-deleted. Only route live traffic to
+                                // containers that are actually up, or where a container has
+                                // never had a status recorded yet.
+                                .filter(
+                                    Condition::any()
+                                        .add(deployment_containers::Column::Status.is_null())
+                                        .add(deployment_containers::Column::Status.eq("running")),
+                                )
+                                .all(self.db.as_ref())
+                                .await
+                                .unwrap_or_default()
+                        };
 
                         // Fetch project if not cached
                         if !projects_cache.contains_key(&environment.project_id) {
@@ -974,24 +990,34 @@ impl CachedPeerTable {
                     if let Some(deployment) = deployments_cache.get(&deployment_id) {
                         // Load all active containers for this deployment
                         use temps_entities::deployment_containers;
-                        let containers = deployment_containers::Entity::find()
-                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                            .filter(deployment_containers::Column::DeletedAt.is_null())
-                            // A container row survives (deleted_at stays NULL) for the
-                            // deployment's whole lifecycle, but `status` still moves
-                            // through "running" -> "stopped"/"removing"/"removed" (e.g.
-                            // deployment pause, or a manual per-container stop) without
-                            // ever being soft-deleted. Only route live traffic to
-                            // containers that are actually up, or where a container has
-                            // never had a status recorded yet.
-                            .filter(
-                                Condition::any()
-                                    .add(deployment_containers::Column::Status.is_null())
-                                    .add(deployment_containers::Column::Status.eq("running")),
-                            )
-                            .all(self.db.as_ref())
-                            .await
-                            .unwrap_or_default();
+                        let containers = if deployment.state == "paused" {
+                            // See the matching comment in the primary-domain branch
+                            // above: trust `deployment.state` over per-container
+                            // `status`, which can lag behind on a retry-exhausted
+                            // write.
+                            Vec::new()
+                        } else {
+                            deployment_containers::Entity::find()
+                                .filter(
+                                    deployment_containers::Column::DeploymentId.eq(deployment_id),
+                                )
+                                .filter(deployment_containers::Column::DeletedAt.is_null())
+                                // A container row survives (deleted_at stays NULL) for the
+                                // deployment's whole lifecycle, but `status` still moves
+                                // through "running" -> "stopped"/"removing"/"removed" (e.g.
+                                // deployment pause, or a manual per-container stop) without
+                                // ever being soft-deleted. Only route live traffic to
+                                // containers that are actually up, or where a container has
+                                // never had a status recorded yet.
+                                .filter(
+                                    Condition::any()
+                                        .add(deployment_containers::Column::Status.is_null())
+                                        .add(deployment_containers::Column::Status.eq("running")),
+                                )
+                                .all(self.db.as_ref())
+                                .await
+                                .unwrap_or_default()
+                        };
 
                         // Fetch project if not cached
                         if !projects_cache.contains_key(&custom_domain.project_id) {
@@ -1161,20 +1187,33 @@ impl CachedPeerTable {
                 if let Some(deployment) = deployments_cache.get(&deployment_id) {
                     // Load all active containers for this deployment
                     use temps_entities::deployment_containers;
-                    let containers = deployment_containers::Entity::find()
-                        .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                        .filter(deployment_containers::Column::DeletedAt.is_null())
-                        // See the matching comment above: `status` (not just
-                        // `deleted_at`) governs routability, so a paused/stopped
-                        // deployment's containers don't keep serving live traffic.
-                        .filter(
-                            Condition::any()
-                                .add(deployment_containers::Column::Status.is_null())
-                                .add(deployment_containers::Column::Status.eq("running")),
-                        )
-                        .all(self.db.as_ref())
-                        .await
-                        .unwrap_or_default();
+                    // "paused" is deliberately checked here rather than folded into
+                    // the "accept any state" comment above it: that comment is about
+                    // NOT filtering on state (e.g. "completed") to avoid a race with
+                    // `mark_deployment_complete`'s write ordering. Excluding "paused"
+                    // is unrelated to that race — it's a deliberate, terminal,
+                    // user-initiated state, not a transient one a deploy passes
+                    // through — and (per the matching comment two branches up) it's
+                    // more trustworthy than per-container `status`, which can lag
+                    // behind on a retry-exhausted write.
+                    let containers = if deployment.state == "paused" {
+                        Vec::new()
+                    } else {
+                        deployment_containers::Entity::find()
+                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+                            .filter(deployment_containers::Column::DeletedAt.is_null())
+                            // See the matching comment above: `status` (not just
+                            // `deleted_at`) governs routability, so a paused/stopped
+                            // deployment's containers don't keep serving live traffic.
+                            .filter(
+                                Condition::any()
+                                    .add(deployment_containers::Column::Status.is_null())
+                                    .add(deployment_containers::Column::Status.eq("running")),
+                            )
+                            .all(self.db.as_ref())
+                            .await
+                            .unwrap_or_default()
+                    };
 
                     // Fetch project if not cached
                     if !projects_cache.contains_key(&env.project_id) {
@@ -1552,20 +1591,27 @@ impl CachedPeerTable {
                 ) {
                     // Load all active containers for this deployment
                     use temps_entities::deployment_containers;
-                    let containers = deployment_containers::Entity::find()
-                        .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
-                        .filter(deployment_containers::Column::DeletedAt.is_null())
-                        // See the matching comment above: `status` (not just
-                        // `deleted_at`) governs routability, so a paused/stopped
-                        // deployment's containers don't keep serving live traffic.
-                        .filter(
-                            Condition::any()
-                                .add(deployment_containers::Column::Status.is_null())
-                                .add(deployment_containers::Column::Status.eq("running")),
-                        )
-                        .all(self.db.as_ref())
-                        .await
-                        .unwrap_or_default();
+                    let containers = if deployment.state == "paused" {
+                        // See the matching comment further up: trust
+                        // `deployment.state` over per-container `status`, which
+                        // can lag behind on a retry-exhausted write.
+                        Vec::new()
+                    } else {
+                        deployment_containers::Entity::find()
+                            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+                            .filter(deployment_containers::Column::DeletedAt.is_null())
+                            // See the matching comment above: `status` (not just
+                            // `deleted_at`) governs routability, so a paused/stopped
+                            // deployment's containers don't keep serving live traffic.
+                            .filter(
+                                Condition::any()
+                                    .add(deployment_containers::Column::Status.is_null())
+                                    .add(deployment_containers::Column::Status.eq("running")),
+                            )
+                            .all(self.db.as_ref())
+                            .await
+                            .unwrap_or_default()
+                    };
 
                     // Determine backend type: static directory or upstream containers
                     let backend = if let Some(static_dir) = &deployment.static_dir_location {

@@ -35,10 +35,20 @@ pub async fn auth_middleware(
             user = ctx.user.clone();
             Some(ctx)
         }
-        Err(_) => {
-            // For routes that don't require auth, continue without context
-            // The RequireAuth extractor will handle the error later
-            None
+        // Genuinely no/expired/invalid credentials: for routes that don't
+        // require auth, continue without context. The RequireAuth extractor
+        // will handle the error later with the correct 401.
+        Err(AuthError::Unauthorized(_)) => None,
+        // The auth backend itself failed to answer (DB error surfaced while
+        // validating a session/API key/token). Treating this as "no auth
+        // context" would let RequireAuth reject with a generic "Authentication
+        // Required" 401, which the frontend cannot distinguish from a real
+        // logout -- it force-redirects to the login screen. Surface the
+        // actual failure instead so a transient backend issue doesn't look
+        // like every session died at once.
+        Err(AuthError::InternalServerError(reason)) => {
+            warn!("Auth validation failed due to an internal error, refusing to treat the request as unauthenticated: {}", reason);
+            return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     };
 
@@ -225,7 +235,15 @@ async fn validate_session_cookie(
                     verified.session_id,
                 )));
             }
-            Err(_) => return Ok(None),
+            // A session row that genuinely doesn't exist (never created,
+            // expired, or the user was deleted) is the only case that means
+            // "not authenticated". Every other error here is the session
+            // store itself failing to answer (DB connection drop, pool
+            // exhaustion, timeout) -- that must NOT be reported as "no
+            // session", or a transient DB blip silently logs every active
+            // user out and bounces them to the login screen.
+            Err(crate::auth_service::AuthError::NotFound(_)) => return Ok(None),
+            Err(e) => return Err(e.into()),
         }
     }
 

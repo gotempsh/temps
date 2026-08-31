@@ -9,7 +9,7 @@
 
 use chrono::{Duration, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, DatabaseConnection,
     EntityTrait, Order, PaginatorTrait, QueryFilter, QueryOrder, Set, Statement,
 };
 use serde::{Deserialize, Serialize};
@@ -51,6 +51,31 @@ pub enum AlarmType {
     /// metric points are written as `otel.rate_limited_requests` /
     /// `otel.quota_exceeded_requests` on `SourceKind::Node` (node_id 0).
     OtelRateLimited,
+    /// A monitored external service (database, cache, object storage) failed
+    /// its health check.
+    ExternalServiceDown,
+    /// A scheduled or manual backup reached a terminal `failed` state.
+    BackupFailed,
+    /// Automatic TLS certificate renewal failed and the cert needs manual
+    /// attention before it expires.
+    TlsRenewalFailed,
+    /// A TLS certificate is approaching expiry and renewal has not
+    /// succeeded yet.
+    TlsCertExpiring,
+    /// A git provider connection (GitHub/GitLab/Gitea) failed its health
+    /// check (auth failure, rate limit, API unreachable).
+    GitProviderConnectionDown,
+    /// An error-tracking rule's threshold was crossed for a project.
+    ErrorTrackingThreshold,
+    /// A vulnerability scan found high/critical severity findings.
+    VulnerabilityFound,
+    /// Host or container disk usage crossed the configured threshold.
+    DiskSpaceLow,
+    /// A worker/agent node stopped responding to heartbeats.
+    NodeOffline,
+    /// A worker/agent node's CPU/memory/disk usage crossed the configured
+    /// threshold.
+    NodeResourcePressure,
 }
 
 impl AlarmType {
@@ -70,6 +95,16 @@ impl AlarmType {
             Self::DeploymentMetricThreshold => "deployment_metric_threshold",
             Self::NodeMetricThreshold => "node_metric_threshold",
             Self::OtelRateLimited => "otel_rate_limited",
+            Self::ExternalServiceDown => "external_service_down",
+            Self::BackupFailed => "backup_failed",
+            Self::TlsRenewalFailed => "tls_renewal_failed",
+            Self::TlsCertExpiring => "tls_cert_expiring",
+            Self::GitProviderConnectionDown => "git_provider_connection_down",
+            Self::ErrorTrackingThreshold => "error_tracking_threshold",
+            Self::VulnerabilityFound => "vulnerability_found",
+            Self::DiskSpaceLow => "disk_space_low",
+            Self::NodeOffline => "node_offline",
+            Self::NodeResourcePressure => "node_resource_pressure",
         }
     }
 
@@ -89,6 +124,16 @@ impl AlarmType {
             "deployment_metric_threshold" => Some(Self::DeploymentMetricThreshold),
             "node_metric_threshold" => Some(Self::NodeMetricThreshold),
             "otel_rate_limited" => Some(Self::OtelRateLimited),
+            "external_service_down" => Some(Self::ExternalServiceDown),
+            "backup_failed" => Some(Self::BackupFailed),
+            "tls_renewal_failed" => Some(Self::TlsRenewalFailed),
+            "tls_cert_expiring" => Some(Self::TlsCertExpiring),
+            "git_provider_connection_down" => Some(Self::GitProviderConnectionDown),
+            "error_tracking_threshold" => Some(Self::ErrorTrackingThreshold),
+            "vulnerability_found" => Some(Self::VulnerabilityFound),
+            "disk_space_low" => Some(Self::DiskSpaceLow),
+            "node_offline" => Some(Self::NodeOffline),
+            "node_resource_pressure" => Some(Self::NodeResourcePressure),
             _ => None,
         }
     }
@@ -154,7 +199,9 @@ impl AlarmStatus {
 /// Container, outage, and deployment-scoped alarms always provide `Some(...)`.
 #[derive(Debug, Clone)]
 pub struct FireAlarmRequest {
-    pub project_id: i32,
+    /// `None` for host/control-plane-wide alarms with no associated project
+    /// (disk space, node offline/resource pressure).
+    pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
     pub container_id: Option<i32>,
@@ -170,8 +217,11 @@ pub struct FireAlarmRequest {
 
 #[derive(Debug, Error)]
 pub enum AlarmError {
-    #[error("Alarm {alarm_id} not found in project {project_id}")]
-    NotFound { alarm_id: i32, project_id: i32 },
+    #[error("Alarm {alarm_id} not found in project {project_id:?}")]
+    NotFound {
+        alarm_id: i32,
+        project_id: Option<i32>,
+    },
 
     #[error("Database error while {operation}: {reason}")]
     Database { operation: String, reason: String },
@@ -194,6 +244,15 @@ impl From<sea_orm::DbErr> for AlarmError {
 
 /// Alarm service handles creating, resolving, and querying alarms.
 /// Uses the existing NotificationService for alerting and JobQueue for event propagation.
+/// Filter expression scoping an alarms query to a project (`Some`) or to
+/// host/control-plane-wide "system" alarms with no project (`None`).
+fn project_id_filter(project_id: Option<i32>) -> sea_orm::sea_query::SimpleExpr {
+    match project_id {
+        Some(id) => alarms::Column::ProjectId.eq(id),
+        None => alarms::Column::ProjectId.is_null(),
+    }
+}
+
 pub struct AlarmService {
     db: Arc<DatabaseConnection>,
     notification_service: Arc<dyn NotificationService>,
@@ -298,7 +357,7 @@ impl AlarmService {
         let alarm_id = result.id;
 
         info!(
-            "Alarm fired: id={}, type={}, severity={}, project={}, env={:?}, deployment={:?}",
+            "Alarm fired: id={}, type={}, severity={}, project={:?}, env={:?}, deployment={:?}",
             alarm_id,
             request.alarm_type.as_str(),
             request.severity.as_str(),
@@ -334,10 +393,15 @@ impl AlarmService {
         Ok(Some(alarm_id))
     }
 
-    /// Resolve an alarm by ID
-    pub async fn resolve_alarm(&self, alarm_id: i32, project_id: i32) -> Result<(), AlarmError> {
+    /// Resolve an alarm by ID. `project_id: None` scopes to host/control-plane-wide
+    /// (system) alarms rather than a specific project.
+    pub async fn resolve_alarm(
+        &self,
+        alarm_id: i32,
+        project_id: Option<i32>,
+    ) -> Result<(), AlarmError> {
         let alarm = alarms::Entity::find_by_id(alarm_id)
-            .filter(alarms::Column::ProjectId.eq(project_id))
+            .filter(project_id_filter(project_id))
             .one(self.db.as_ref())
             .await?
             .ok_or(AlarmError::NotFound {
@@ -496,15 +560,136 @@ impl AlarmService {
         Ok(ids)
     }
 
+    /// Resolve all firing alarms of `alarm_type` matching the given scope.
+    /// Unlike [`Self::resolve_alarms_by_type`] (deployment-only, requires a
+    /// concrete `deployment_id`), this accepts the same
+    /// (project, environment, deployment, container, service) scope shape as
+    /// [`FireAlarmRequest`], so it also works for service-scoped alarms
+    /// (external service health, TLS, git provider connections) that have no
+    /// deployment at all.
+    pub async fn resolve_alarms_by_scope(
+        &self,
+        project_id: Option<i32>,
+        environment_id: Option<i32>,
+        deployment_id: Option<i32>,
+        container_id: Option<i32>,
+        service_id: Option<i32>,
+        alarm_type: AlarmType,
+    ) -> Result<Vec<i32>, AlarmError> {
+        use sea_orm::TransactionTrait;
+
+        let mut query = alarms::Entity::find()
+            .filter(project_id_filter(project_id))
+            .filter(alarms::Column::AlarmType.eq(alarm_type.as_str()))
+            .filter(alarms::Column::Status.eq(AlarmStatus::Firing.as_str()));
+
+        query = match environment_id {
+            Some(id) => query.filter(alarms::Column::EnvironmentId.eq(id)),
+            None => query.filter(alarms::Column::EnvironmentId.is_null()),
+        };
+        query = match deployment_id {
+            Some(id) => query.filter(alarms::Column::DeploymentId.eq(id)),
+            None => query.filter(alarms::Column::DeploymentId.is_null()),
+        };
+        query = match container_id {
+            Some(id) => query.filter(alarms::Column::ContainerId.eq(id)),
+            None => query.filter(alarms::Column::ContainerId.is_null()),
+        };
+        query = match service_id {
+            Some(id) => query.filter(alarms::Column::ServiceId.eq(id)),
+            None => query.filter(alarms::Column::ServiceId.is_null()),
+        };
+
+        let firing_alarms = query.all(self.db.as_ref()).await?;
+        if firing_alarms.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let ids: Vec<i32> = firing_alarms.iter().map(|a| a.id).collect();
+        let now = Utc::now();
+
+        let txn = self.db.begin().await.map_err(|e| AlarmError::Database {
+            operation: format!(
+                "begin transaction for resolve_alarms_by_scope type={}",
+                alarm_type.as_str()
+            ),
+            reason: e.to_string(),
+        })?;
+
+        let id_list = ids
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let update_sql = format!(
+            "UPDATE alarms SET status = 'resolved', resolved_at = '{now}' \
+             WHERE id IN ({id_list}) AND status = 'firing'",
+            now = now.to_rfc3339(),
+            id_list = id_list,
+        );
+
+        txn.execute(Statement::from_string(
+            DatabaseBackend::Postgres,
+            update_sql,
+        ))
+        .await
+        .map_err(|e| AlarmError::Database {
+            operation: format!(
+                "batch resolve alarms (by scope) type={}",
+                alarm_type.as_str()
+            ),
+            reason: e.to_string(),
+        })?;
+
+        txn.commit().await.map_err(|e| AlarmError::Database {
+            operation: format!(
+                "commit resolve_alarms_by_scope type={}",
+                alarm_type.as_str()
+            ),
+            reason: e.to_string(),
+        })?;
+
+        info!(
+            "Resolved {} alarm(s) of type={} by scope",
+            ids.len(),
+            alarm_type.as_str(),
+        );
+
+        for alarm in &firing_alarms {
+            let job = Job::AlarmResolved(AlarmResolvedJob {
+                alarm_id: alarm.id,
+                project_id: alarm.project_id,
+                environment_id: alarm.environment_id,
+                deployment_id: alarm.deployment_id,
+                alarm_type: alarm.alarm_type.clone(),
+                title: alarm.title.clone(),
+            });
+
+            if let Err(e) = self.job_queue.send(job).await {
+                error!(
+                    "Failed to emit AlarmResolved job for alarm {}: {}",
+                    alarm.id, e
+                );
+            }
+
+            self.send_resolved_notification(alarm).await;
+        }
+
+        Ok(ids)
+    }
+
     /// Acknowledge an alarm (mark it as seen but not resolved)
+    /// `project_id: None` scopes to host/control-plane-wide (system) alarms
+    /// rather than a specific project.
     pub async fn acknowledge_alarm(
         &self,
         alarm_id: i32,
-        project_id: i32,
+        project_id: Option<i32>,
         user_id: i32,
     ) -> Result<(), AlarmError> {
         let alarm = alarms::Entity::find_by_id(alarm_id)
-            .filter(alarms::Column::ProjectId.eq(project_id))
+            .filter(project_id_filter(project_id))
             .one(self.db.as_ref())
             .await?
             .ok_or(AlarmError::NotFound {
@@ -533,17 +718,63 @@ impl AlarmService {
         Ok(())
     }
 
-    /// List alarms for a project with optional filters
+    /// Mute an alarm — and any future re-fire of the same
+    /// (project, alarm_type, deployment, container, service) scope — until
+    /// `Utc::now() + duration`. Unlike acknowledge/resolve this is not a
+    /// terminal lifecycle transition: `status` is left as-is, and the mute
+    /// simply expires on its own once `silenced_until` passes. Silencing an
+    /// already-resolved alarm is a no-op — there's nothing left to mute.
+    pub async fn silence_alarm(
+        &self,
+        alarm_id: i32,
+        project_id: Option<i32>,
+        duration: Duration,
+    ) -> Result<(), AlarmError> {
+        let alarm = alarms::Entity::find_by_id(alarm_id)
+            .filter(project_id_filter(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(AlarmError::NotFound {
+                alarm_id,
+                project_id,
+            })?;
+
+        if alarm.status == AlarmStatus::Resolved.as_str() {
+            return Ok(());
+        }
+
+        let silenced_until = Utc::now() + duration;
+        let mut active: alarms::ActiveModel = alarm.into();
+        active.silenced_until = Set(Some(silenced_until));
+        active
+            .update(self.db.as_ref())
+            .await
+            .map_err(|e| AlarmError::Database {
+                operation: format!("silence alarm {}", alarm_id),
+                reason: e.to_string(),
+            })?;
+
+        info!(
+            "Alarm silenced: id={}, until={}",
+            alarm_id,
+            silenced_until.to_rfc3339()
+        );
+
+        Ok(())
+    }
+
+    /// List alarms for a project with optional filters. `project_id: None`
+    /// lists host/control-plane-wide (system) alarms instead.
     pub async fn list_alarms(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
         filters: AlarmFilters,
         page: u64,
         page_size: u64,
     ) -> Result<(Vec<alarms::Model>, u64), AlarmError> {
         let page_size = std::cmp::min(page_size, 100);
 
-        let mut query = alarms::Entity::find().filter(alarms::Column::ProjectId.eq(project_id));
+        let mut query = alarms::Entity::find().filter(project_id_filter(project_id));
 
         if let Some(environment_id) = filters.environment_id {
             query = query.filter(alarms::Column::EnvironmentId.eq(environment_id));
@@ -579,15 +810,24 @@ impl AlarmService {
     ///
     /// Uses a single aggregating SQL query (`GROUP BY status, severity`) instead
     /// of loading all non-resolved alarms into memory, which is unsafe at scale.
-    pub async fn get_alarm_summary(&self, project_id: i32) -> Result<AlarmSummary, AlarmError> {
+    /// `project_id: None` summarizes host/control-plane-wide (system) alarms
+    /// instead of a specific project's.
+    pub async fn get_alarm_summary(
+        &self,
+        project_id: Option<i32>,
+    ) -> Result<AlarmSummary, AlarmError> {
+        let project_id_sql = match project_id {
+            Some(id) => format!("project_id = {id}"),
+            None => "project_id IS NULL".to_string(),
+        };
+
         // Aggregate by status + severity in one round-trip.
         let status_severity_sql = format!(
             "SELECT status, severity, COUNT(*)::bigint AS cnt \
              FROM alarms \
-             WHERE project_id = {project_id} \
+             WHERE {project_id_sql} \
                AND status != 'resolved' \
              GROUP BY status, severity",
-            project_id = project_id,
         );
 
         let ss_rows = self
@@ -606,10 +846,9 @@ impl AlarmService {
         let type_sql = format!(
             "SELECT alarm_type, COUNT(*)::bigint AS cnt \
              FROM alarms \
-             WHERE project_id = {project_id} \
+             WHERE {project_id_sql} \
                AND status != 'resolved' \
              GROUP BY alarm_type",
-            project_id = project_id,
         );
 
         let type_rows = self
@@ -684,9 +923,17 @@ impl AlarmService {
         let cutoff = Utc::now() - self.cooldown;
 
         let mut query = alarms::Entity::find()
-            .filter(alarms::Column::ProjectId.eq(request.project_id))
+            .filter(project_id_filter(request.project_id))
             .filter(alarms::Column::AlarmType.eq(request.alarm_type.as_str()))
-            .filter(alarms::Column::FiredAt.gte(cutoff));
+            .filter(
+                Condition::any()
+                    .add(alarms::Column::FiredAt.gte(cutoff))
+                    // A still-active silence also suppresses a re-fire, no
+                    // matter how long ago the silenced alarm originally fired
+                    // — that's the whole point of silencing something for a
+                    // chosen duration rather than just its normal cooldown.
+                    .add(alarms::Column::SilencedUntil.gt(Utc::now())),
+            );
 
         match request.deployment_id {
             Some(deployment_id) => {
@@ -738,18 +985,21 @@ impl AlarmService {
     /// skip that row rather than fall back to a bare ID.
     async fn build_notification_metadata(
         &self,
-        project_id: i32,
+        project_id: Option<i32>,
         service_id: Option<i32>,
         environment_id: Option<i32>,
     ) -> HashMap<String, String> {
         let mut metadata: HashMap<String, String> = HashMap::new();
 
         // Project → slug (preferred) so the reader sees "my-app", not "4".
-        if let Ok(Some(project)) = temps_entities::projects::Entity::find_by_id(project_id)
-            .one(self.db.as_ref())
-            .await
-        {
-            metadata.insert("project".to_string(), project.slug);
+        // `None` for host/control-plane-wide alarms with no project.
+        if let Some(project_id) = project_id {
+            if let Ok(Some(project)) = temps_entities::projects::Entity::find_by_id(project_id)
+                .one(self.db.as_ref())
+                .await
+            {
+                metadata.insert("project".to_string(), project.slug);
+            }
         }
 
         // Service → "name (type)" e.g. "cache (redis)" so the operator knows
@@ -844,7 +1094,7 @@ impl AlarmService {
         metadata: Option<serde_json::Value>,
     ) {
         let mut notification_metadata = self
-            .build_notification_metadata(project_id, None, None)
+            .build_notification_metadata(Some(project_id), None, None)
             .await;
         // Merge caller-supplied detail (e.g. the digest's fired-series list) so the
         // channels can render it — same mapping as `send_alarm_notification`.
@@ -1031,7 +1281,7 @@ mod tests {
     fn sample_alarm(id: i32, alarm_type: &str, severity: &str, status: &str) -> alarms::Model {
         alarms::Model {
             id,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(100),
@@ -1046,6 +1296,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1053,7 +1304,7 @@ mod tests {
 
     fn sample_fire_request() -> FireAlarmRequest {
         FireAlarmRequest {
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(100),
@@ -1073,13 +1324,28 @@ mod tests {
         let types = [
             AlarmType::ContainerRestart,
             AlarmType::ContainerOomKilled,
+            AlarmType::ContainerCrash,
             AlarmType::HighResponseTime,
             AlarmType::Outage,
             AlarmType::HighCpu,
             AlarmType::HighMemory,
             AlarmType::DeploymentFailed,
             AlarmType::HealthCheckFailed,
+            AlarmType::DatabaseMetricThreshold,
+            AlarmType::ContainerMetricThreshold,
+            AlarmType::DeploymentMetricThreshold,
+            AlarmType::NodeMetricThreshold,
             AlarmType::OtelRateLimited,
+            AlarmType::ExternalServiceDown,
+            AlarmType::BackupFailed,
+            AlarmType::TlsRenewalFailed,
+            AlarmType::TlsCertExpiring,
+            AlarmType::GitProviderConnectionDown,
+            AlarmType::ErrorTrackingThreshold,
+            AlarmType::VulnerabilityFound,
+            AlarmType::DiskSpaceLow,
+            AlarmType::NodeOffline,
+            AlarmType::NodeResourcePressure,
         ];
 
         for t in &types {
@@ -1156,9 +1422,12 @@ mod tests {
     fn test_alarm_error_display() {
         let not_found = AlarmError::NotFound {
             alarm_id: 42,
-            project_id: 7,
+            project_id: Some(7),
         };
-        assert_eq!(not_found.to_string(), "Alarm 42 not found in project 7");
+        assert_eq!(
+            not_found.to_string(),
+            "Alarm 42 not found in project Some(7)"
+        );
 
         let db_err = AlarmError::Database {
             operation: "insert alarm".to_string(),
@@ -1279,6 +1548,7 @@ mod tests {
             default_backup_provisioned: false,
             ai_data_access: false,
             container_name: None,
+            created_by_user_id: None,
         }
     }
 
@@ -1287,7 +1557,7 @@ mod tests {
     /// a Redis/Postgres threshold rule.
     fn service_scoped_fire_request(service_id: i32) -> FireAlarmRequest {
         FireAlarmRequest {
-            project_id: 4,
+            project_id: Some(4),
             environment_id: None,
             deployment_id: None,
             container_id: None,
@@ -1463,7 +1733,7 @@ mod tests {
             job_queue.clone(),
         );
 
-        let result = service.resolve_alarm(1, 1).await;
+        let result = service.resolve_alarm(1, Some(1)).await;
         assert!(result.is_ok());
 
         // Should send resolved notification + AlarmResolved job
@@ -1487,13 +1757,13 @@ mod tests {
             job_queue.clone(),
         );
 
-        let result = service.resolve_alarm(999, 1).await;
+        let result = service.resolve_alarm(999, Some(1)).await;
         assert!(result.is_err());
         assert!(matches!(
             result.unwrap_err(),
             AlarmError::NotFound {
                 alarm_id: 999,
-                project_id: 1
+                project_id: Some(1)
             }
         ));
 
@@ -1520,7 +1790,7 @@ mod tests {
             job_queue.clone(),
         );
 
-        let result = service.resolve_alarm(1, 1).await;
+        let result = service.resolve_alarm(1, Some(1)).await;
         assert!(result.is_ok());
 
         // No notification or job: it was already resolved
@@ -1617,7 +1887,7 @@ mod tests {
 
         let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
 
-        let result = service.acknowledge_alarm(1, 1, 42).await;
+        let result = service.acknowledge_alarm(1, Some(1), 42).await;
         assert!(result.is_ok());
     }
 
@@ -1632,12 +1902,12 @@ mod tests {
 
         let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
 
-        let result = service.acknowledge_alarm(999, 1, 42).await;
+        let result = service.acknowledge_alarm(999, Some(1), 42).await;
         assert!(matches!(
             result.unwrap_err(),
             AlarmError::NotFound {
                 alarm_id: 999,
-                project_id: 1
+                project_id: Some(1)
             }
         ));
     }
@@ -1656,8 +1926,103 @@ mod tests {
 
         let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
 
-        let result = service.acknowledge_alarm(1, 1, 42).await;
+        let result = service.acknowledge_alarm(1, Some(1), 42).await;
         assert!(result.is_ok()); // noop, no error
+    }
+
+    // ── AlarmService.silence_alarm tests ───────────────────────────────
+
+    #[tokio::test]
+    async fn test_silence_alarm_success() {
+        let alarm = sample_alarm(1, "high_cpu", "warning", "firing");
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![alarm.clone()]])
+            .append_query_results(vec![vec![alarm]])
+            .append_exec_results(vec![MockExecResult {
+                last_insert_id: 1,
+                rows_affected: 1,
+            }])
+            .into_connection();
+
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
+
+        let result = service.silence_alarm(1, Some(1), Duration::hours(24)).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_silence_alarm_not_found() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<alarms::Model>::new()])
+            .into_connection();
+
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
+
+        let result = service
+            .silence_alarm(999, Some(1), Duration::hours(24))
+            .await;
+        assert!(matches!(
+            result.unwrap_err(),
+            AlarmError::NotFound {
+                alarm_id: 999,
+                project_id: Some(1)
+            }
+        ));
+    }
+
+    /// Silencing an already-resolved alarm is a no-op — there's nothing left
+    /// to mute, matching `acknowledge_alarm`'s behavior for the same case.
+    #[tokio::test]
+    async fn test_silence_already_resolved_is_noop() {
+        let alarm = sample_alarm(1, "high_cpu", "warning", "resolved");
+
+        // Mock: find only (no update since it's already resolved)
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![alarm]])
+            .into_connection();
+
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
+
+        let result = service.silence_alarm(1, Some(1), Duration::hours(24)).await;
+        assert!(result.is_ok()); // noop, no error
+    }
+
+    /// The whole point of silencing: a still-silenced alarm must suppress a
+    /// new fire of the same (project, type, deployment, container, service)
+    /// scope, even when its `fired_at` is long outside the normal cooldown
+    /// window — `is_in_cooldown`'s `Condition::any()` treats an unexpired
+    /// `silenced_until` as an independent hit alongside the `fired_at` check.
+    #[tokio::test]
+    async fn test_fire_alarm_suppressed_by_active_silence() {
+        // Mock: cooldown check returns count > 0 (the silenced row matches
+        // via `silenced_until > now`, regardless of `fired_at`).
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([[maplit::btreemap! {
+                "num_items" => sea_orm::Value::BigInt(Some(1)),
+            }]])
+            .into_connection();
+
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+        let service = AlarmService::new(Arc::new(db), notification_service.clone(), job_queue);
+
+        let result = service.fire_alarm(sample_fire_request()).await;
+        assert_eq!(
+            result.unwrap(),
+            None,
+            "an active silence must suppress the new fire, same as an ordinary cooldown hit"
+        );
+        assert_eq!(notification_service.send_count(), 0);
     }
 
     // ── AlarmService.get_alarm_summary tests ──────────────────────────
@@ -1715,7 +2080,7 @@ mod tests {
 
         let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
 
-        let summary = service.get_alarm_summary(1).await.unwrap();
+        let summary = service.get_alarm_summary(Some(1)).await.unwrap();
         assert_eq!(summary.firing, 3); // 1 warning + 2 critical
         assert_eq!(summary.acknowledged, 1);
         assert_eq!(summary.total_active, 4);
@@ -1743,7 +2108,7 @@ mod tests {
 
         let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
 
-        let summary = service.get_alarm_summary(1).await.unwrap();
+        let summary = service.get_alarm_summary(Some(1)).await.unwrap();
         assert_eq!(summary.total_active, 0);
         assert_eq!(summary.firing, 0);
         assert_eq!(summary.acknowledged, 0);
@@ -1773,7 +2138,7 @@ mod tests {
         let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
 
         let (items, total) = service
-            .list_alarms(1, AlarmFilters::default(), 1, 20)
+            .list_alarms(Some(1), AlarmFilters::default(), 1, 20)
             .await
             .unwrap();
 
@@ -1799,7 +2164,7 @@ mod tests {
         let service = AlarmService::new(Arc::new(db), notification_service, job_queue);
 
         let result = service
-            .list_alarms(1, AlarmFilters::default(), 1, 500)
+            .list_alarms(Some(1), AlarmFilters::default(), 1, 500)
             .await;
         assert!(result.is_ok());
     }

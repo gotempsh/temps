@@ -12,7 +12,7 @@ use super::types::GitAppState as AppState;
 use crate::services::cache::{CachedPresetInfo, PublicBranchCacheKey, PublicPresetCacheKey};
 use crate::services::git_provider::Branch;
 use crate::services::public_repo::{
-    detect_presets_from_files, PublicRepoError, PublicRepoProviderFactory,
+    detect_presets_from_files, PublicRepoError, PublicRepoProvider, PublicRepoProviderFactory,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -22,22 +22,36 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::AuthContext;
+use temps_auth::{AuthContext, Permission};
 use temps_core::problemdetails::{new as problem_new, Problem};
 use temps_entities::preset::ComposePortMapping;
+use tracing::warn;
 use utoipa::{IntoParams, OpenApi, ToSchema};
+
+const MAX_PUBLIC_DOCKERFILES_TO_SCAN: usize = 1;
 
 /// Query parameters for public repository endpoints
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PublicRepoQueryParams {
+    /// HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+    pub base_url: Option<String>,
     /// Force fetch fresh data, bypassing cache (default: false)
     #[serde(default)]
     pub fresh: bool,
 }
 
+/// Query parameters for endpoints that do not expose cache controls.
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct PublicGitLabQueryParams {
+    /// HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+    pub base_url: Option<String>,
+}
+
 /// Query parameters for preset detection
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PresetQueryParams {
+    /// HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+    pub base_url: Option<String>,
     /// Branch name to detect presets for (default: repository's default branch)
     pub branch: Option<String>,
     /// Force fetch fresh data, bypassing cache (default: false)
@@ -48,6 +62,8 @@ pub struct PresetQueryParams {
 /// Query parameters for env-example detection.
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct EnvExampleQueryParams {
+    /// HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+    pub base_url: Option<String>,
     /// Branch name to inspect (default: repository's default branch)
     pub branch: Option<String>,
     /// Project root directory to search (default: repository root)
@@ -131,6 +147,8 @@ pub struct PublicEnvExampleResponse {
 /// Query params for public compose-file service preview
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct PublicComposeFileQueryParams {
+    /// HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+    pub base_url: Option<String>,
     /// Branch to read the compose file from (default: repository's default branch)
     pub branch: Option<String>,
     /// Compose file path to fetch and parse (from the `compose_files` list
@@ -236,6 +254,14 @@ fn map_error(err: PublicRepoError, owner: &str, repo: &str) -> Problem {
         PublicRepoError::Internal(msg) => problem_new(StatusCode::INTERNAL_SERVER_ERROR)
             .with_title("Internal Error")
             .with_detail(format!("An unexpected error occurred: {}", msg)),
+        PublicRepoError::ResponseTooLarge {
+            context,
+            limit_bytes,
+        } => problem_new(StatusCode::BAD_GATEWAY)
+            .with_title("Git Provider Response Too Large")
+            .with_detail(format!(
+                "The provider response for {context} exceeded the {limit_bytes}-byte safety limit."
+            )),
     }
 }
 
@@ -265,15 +291,20 @@ async fn provider_for_public_request(
     provider: &str,
     owner: &str,
     repo: &str,
+    base_url: Option<&str>,
 ) -> Result<
     (
         Box<dyn crate::services::public_repo::PublicRepoProvider>,
         crate::services::public_repo::PublicRepoInfo,
+        String,
     ),
     Problem,
 > {
     let token = if provider.eq_ignore_ascii_case("github") {
-        if let Some(user_id) = auth.and_then(AuthContext::user_id_opt) {
+        if let Some(user_id) = auth
+            .filter(|auth| auth.has_permission(&Permission::GitRepositoriesRead))
+            .and_then(AuthContext::user_id_opt)
+        {
             state
                 .git_provider_manager
                 .get_valid_github_token_for_user(user_id)
@@ -284,8 +315,17 @@ async fn provider_for_public_request(
     } else {
         None
     };
-    let repo_provider = PublicRepoProviderFactory::create_with_token(provider, token)
-        .map_err(|error| map_error(error, owner, repo))?;
+    authorize_custom_gitlab_origin(auth, base_url)?;
+    let gitlab_instance = validated_gitlab_instance(provider, base_url).await?;
+    let cache_scope = public_cache_scope(
+        provider,
+        gitlab_instance
+            .as_ref()
+            .map(|(base_url, _, _)| base_url.as_str()),
+    );
+    let repo_provider =
+        PublicRepoProviderFactory::create_with_gitlab_instance(provider, token, gitlab_instance)
+            .map_err(|error| map_error(error, owner, repo))?;
 
     // Always verify current visibility, including before shared cache hits.
     // A repository can become private while a branch or preset entry remains
@@ -296,7 +336,133 @@ async fn provider_for_public_request(
         .map_err(|error| map_error(error, owner, repo))?;
     let info = require_public_repository(info, owner, repo)
         .map_err(|error| map_error(error, owner, repo))?;
-    Ok((repo_provider, info))
+    Ok((repo_provider, info, cache_scope))
+}
+
+fn public_cache_scope(provider: &str, gitlab_base_url: Option<&str>) -> String {
+    gitlab_base_url
+        .map(|base_url| format!("gitlab@{base_url}"))
+        .unwrap_or_else(|| provider.to_ascii_lowercase())
+}
+
+fn authorize_custom_gitlab_origin(
+    auth: Option<&AuthContext>,
+    base_url: Option<&str>,
+) -> Result<(), Problem> {
+    let has_custom_origin = base_url
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_custom_origin {
+        return Ok(());
+    }
+
+    let auth = auth.ok_or_else(|| {
+        problem_new(StatusCode::UNAUTHORIZED)
+            .with_title("Authentication Required")
+            .with_detail("Authentication is required to access a custom GitLab instance.")
+    })?;
+    if !auth.has_permission(&Permission::GitRepositoriesRead) {
+        return Err(problem_new(StatusCode::FORBIDDEN)
+            .with_title("Insufficient Permissions")
+            .with_detail(
+                "Accessing a custom GitLab instance requires the git_repositories:read permission.",
+            ));
+    }
+
+    Ok(())
+}
+
+fn authorize_public_preset_refresh(auth: Option<&AuthContext>, fresh: bool) -> Result<(), Problem> {
+    if !fresh {
+        return Ok(());
+    }
+    let auth = auth.ok_or_else(|| {
+        problem_new(StatusCode::UNAUTHORIZED)
+            .with_title("Authentication Required")
+            .with_detail("Refreshing public repository presets requires authentication.")
+    })?;
+    if !auth.has_permission(&Permission::GitRepositoriesRead) {
+        return Err(problem_new(StatusCode::FORBIDDEN)
+            .with_title("Insufficient Permissions")
+            .with_detail(
+                "Refreshing public repository presets requires the git_repositories:read permission.",
+            ));
+    }
+    Ok(())
+}
+
+/// Validate and normalize a user-supplied self-hosted GitLab origin.
+///
+/// The result contains the normalized origin, hostname, and the exact public
+/// addresses the HTTP client must use. Redirects are disabled by the provider.
+async fn validated_gitlab_instance(
+    provider: &str,
+    base_url: Option<&str>,
+) -> Result<Option<(String, String, Vec<std::net::SocketAddr>)>, Problem> {
+    let Some(base_url) = base_url.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    if !provider.eq_ignore_ascii_case("gitlab") {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Git Provider URL")
+            .with_detail("A custom base_url can only be used with the GitLab provider."));
+    }
+
+    let mut parsed =
+        temps_core::url_validation::validate_external_url(base_url).map_err(|error| {
+            problem_new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid GitLab Instance URL")
+                .with_detail(format!(
+                    "The GitLab base_url is not a safe external URL: {error}"
+                ))
+        })?;
+    if parsed.scheme() != "https" {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid GitLab Instance URL")
+            .with_detail("The GitLab base_url must use HTTPS."));
+    }
+    if parsed.port_or_known_default() != Some(443) {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid GitLab Instance URL")
+            .with_detail("The GitLab base_url must use the standard HTTPS port 443."));
+    }
+    if !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || !matches!(parsed.path(), "" | "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid GitLab Instance URL")
+            .with_detail(
+                "The GitLab base_url must be an HTTPS origin without credentials, a path, a query, or a fragment.",
+            ));
+    }
+
+    let hostname = parsed.host_str().ok_or_else(|| {
+        problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid GitLab Instance URL")
+            .with_detail("The GitLab base_url must include a hostname.")
+    })?;
+    let addresses = temps_core::url_validation::resolve_and_validate_domain(
+        hostname,
+        parsed.port_or_known_default().unwrap_or(443),
+    )
+    .await
+    .map_err(|error| {
+        problem_new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid GitLab Instance URL")
+            .with_detail(format!(
+                "The GitLab base_url did not resolve exclusively to public addresses: {error}"
+            ))
+    })?;
+    let hostname = hostname.to_string();
+    parsed.set_path("");
+    Ok(Some((
+        parsed.as_str().trim_end_matches('/').to_string(),
+        hostname,
+        addresses,
+    )))
 }
 
 /// Get branches for a public repository (supports GitHub and GitLab)
@@ -312,6 +478,7 @@ async fn provider_for_public_request(
     responses(
         (status = 200, description = "List of branches", body = BranchListResponse),
         (status = 400, description = "Provider not supported"),
+        (status = 401, description = "Authentication required for custom GitLab origins"),
         (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 429, description = "API rate limit exceeded"),
@@ -325,17 +492,18 @@ pub async fn get_public_branches(
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PublicRepoQueryParams>,
 ) -> Result<Json<BranchListResponse>, Problem> {
-    let (repo_provider, _) = provider_for_public_request(
+    let (repo_provider, _, cache_scope) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
         &provider,
         &owner,
         &repo,
+        params.base_url.as_deref(),
     )
     .await?;
 
     // Create cache key for public repos
-    let cache_key = PublicBranchCacheKey::new(provider.clone(), owner.clone(), repo.clone());
+    let cache_key = PublicBranchCacheKey::new(cache_scope, owner.clone(), repo.clone());
 
     // Try cache first (unless fresh=true)
     if !params.fresh {
@@ -404,6 +572,7 @@ pub async fn get_public_branches(
     responses(
         (status = 200, description = "Detected presets", body = PublicPresetResponse),
         (status = 400, description = "Provider not supported"),
+        (status = 401, description = "Authentication required for custom GitLab origins"),
         (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository or branch not found"),
         (status = 429, description = "API rate limit exceeded"),
@@ -417,12 +586,15 @@ pub async fn detect_public_presets(
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PresetQueryParams>,
 ) -> Result<Json<PublicPresetResponse>, Problem> {
-    let (repo_provider, repo_info) = provider_for_public_request(
+    authorize_public_preset_refresh(auth.as_ref().map(|Extension(auth)| auth), params.fresh)?;
+
+    let (repo_provider, repo_info, cache_scope) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
         &provider,
         &owner,
         &repo,
+        params.base_url.as_deref(),
     )
     .await?;
 
@@ -435,7 +607,7 @@ pub async fn detect_public_presets(
 
     // Create cache key
     let cache_key = PublicPresetCacheKey::new(
-        provider.clone(),
+        cache_scope,
         owner.clone(),
         repo.clone(),
         target_branch.clone(),
@@ -471,7 +643,15 @@ pub async fn detect_public_presets(
         .map_err(|e| map_error(e, &owner, &repo))?;
 
     // Use centralized preset detection
-    let detected = detect_presets_from_files(&files);
+    let mut detected = detect_presets_from_files(&files);
+    enrich_public_dockerfile_exposed_ports(
+        repo_provider.as_ref(),
+        &owner,
+        &repo,
+        &target_branch,
+        &mut detected,
+    )
+    .await;
 
     // Convert to CachedPresetInfo for caching
     let cached_presets: Vec<CachedPresetInfo> = detected
@@ -514,6 +694,50 @@ pub async fn detect_public_presets(
     }))
 }
 
+async fn enrich_public_dockerfile_exposed_ports(
+    repo_provider: &dyn PublicRepoProvider,
+    owner: &str,
+    repository_name: &str,
+    target_branch: &str,
+    detected: &mut [crate::services::public_repo::DetectedPreset],
+) {
+    let dockerfiles: Vec<(usize, String)> = detected
+        .iter()
+        .enumerate()
+        .filter(|(_, preset)| preset.preset == "dockerfile")
+        .take(MAX_PUBLIC_DOCKERFILES_TO_SCAN)
+        .map(|(index, preset)| {
+            let path = if preset.path == "./" || preset.path.is_empty() {
+                "Dockerfile".to_string()
+            } else {
+                format!("{}/Dockerfile", preset.path.trim_end_matches('/'))
+            };
+            (index, path)
+        })
+        .collect();
+
+    for (preset_index, dockerfile_path) in dockerfiles {
+        match repo_provider
+            .get_file_content(owner, repository_name, &dockerfile_path, target_branch)
+            .await
+        {
+            Ok(file) => {
+                let content = decode_file_content(&file.content, &file.encoding);
+                detected[preset_index].exposed_port =
+                    temps_presets::detect_primary_exposed_port(&content).map(i32::from);
+            }
+            Err(error) => warn!(
+                owner,
+                repository = repository_name,
+                branch = target_branch,
+                dockerfile = dockerfile_path,
+                error = %error,
+                "Could not inspect public Dockerfile EXPOSE metadata during preset detection"
+            ),
+        }
+    }
+}
+
 /// Decode a provider file's content. GitHub and GitLab both return base64
 /// (with embedded newlines in GitHub's case); falls back to the raw string
 /// if decoding fails or the encoding isn't base64.
@@ -542,6 +766,8 @@ fn decode_file_content(content: &str, encoding: &str) -> String {
     responses(
         (status = 200, description = "Detected env-example variables", body = PublicEnvExampleResponse),
         (status = 400, description = "Provider not supported"),
+        (status = 401, description = "Authentication required for custom GitLab origins"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository or branch not found"),
         (status = 429, description = "API rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -554,12 +780,13 @@ pub async fn detect_public_env_example(
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<EnvExampleQueryParams>,
 ) -> Result<Json<PublicEnvExampleResponse>, Problem> {
-    let (repo_provider, repo_info) = provider_for_public_request(
+    let (repo_provider, repo_info, _) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
         &provider,
         &owner,
         &repo,
+        params.base_url.as_deref(),
     )
     .await?;
 
@@ -625,6 +852,8 @@ pub async fn detect_public_env_example(
     responses(
         (status = 200, description = "Compose services parsed successfully", body = PublicComposeServicesResponse),
         (status = 400, description = "Provider not supported, or the compose file could not be parsed"),
+        (status = 401, description = "Authentication required for custom GitLab origins"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository, branch, or compose file not found"),
         (status = 429, description = "API rate limit exceeded"),
         (status = 500, description = "Internal server error")
@@ -637,12 +866,13 @@ pub async fn get_public_compose_services(
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PublicComposeFileQueryParams>,
 ) -> Result<Json<PublicComposeServicesResponse>, Problem> {
-    let (repo_provider, repo_info) = provider_for_public_request(
+    let (repo_provider, repo_info, _) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
         &provider,
         &owner,
         &repo,
+        params.base_url.as_deref(),
     )
     .await?;
 
@@ -693,12 +923,15 @@ pub async fn get_public_compose_services(
     params(
         ("provider" = String, Path, description = "Git provider (github or gitlab)"),
         ("owner" = String, Path, description = "Repository owner"),
-        ("repo" = String, Path, description = "Repository name")
+        ("repo" = String, Path, description = "Repository name"),
+        PublicGitLabQueryParams
     ),
     request_body = PublicComposePreviewRequest,
     responses(
         (status = 200, description = "Effective Compose preview rendered", body = PublicComposePreviewResponse),
         (status = 400, description = "Compose file or override is invalid"),
+        (status = 401, description = "Authentication required for custom GitLab origins"),
+        (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository, branch, or compose file not found")
     ),
     tag = "Public Repositories"
@@ -707,14 +940,16 @@ pub async fn get_public_compose_preview(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthContext>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
+    Query(params): Query<PublicGitLabQueryParams>,
     Json(request): Json<PublicComposePreviewRequest>,
 ) -> Result<Json<PublicComposePreviewResponse>, Problem> {
-    let (repo_provider, repo_info) = provider_for_public_request(
+    let (repo_provider, repo_info, _) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
         &provider,
         &owner,
         &repo,
+        params.base_url.as_deref(),
     )
     .await?;
     let target_branch = if let Some(branch) = request.branch {
@@ -759,10 +994,12 @@ pub async fn get_public_compose_preview(
         ("provider" = String, Path, description = "Git provider (github or gitlab)"),
         ("owner" = String, Path, description = "Repository owner"),
         ("repo" = String, Path, description = "Repository name"),
+        PublicGitLabQueryParams
     ),
     responses(
         (status = 200, description = "Repository information", body = PublicRepositoryInfo),
         (status = 400, description = "Provider not supported"),
+        (status = 401, description = "Authentication required for custom GitLab origins"),
         (status = 403, description = "Git provider permission required"),
         (status = 404, description = "Repository not found"),
         (status = 429, description = "API rate limit exceeded"),
@@ -774,13 +1011,15 @@ pub async fn get_public_repository(
     State(state): State<Arc<AppState>>,
     auth: Option<Extension<AuthContext>>,
     Path((provider, owner, repo)): Path<(String, String, String)>,
+    Query(params): Query<PublicGitLabQueryParams>,
 ) -> Result<Json<PublicRepositoryInfo>, Problem> {
-    let (_repo_provider, repo_info) = provider_for_public_request(
+    let (_repo_provider, repo_info, _) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
         &provider,
         &owner,
         &repo,
+        params.base_url.as_deref(),
     )
     .await?;
 
@@ -859,13 +1098,223 @@ pub struct PublicRepositoriesApiDoc;
 mod tests {
     use super::*;
     use crate::services::cache::GitProviderCacheManager;
+    use crate::services::git_provider::FileContent;
     use crate::services::public_repo::{
-        GitHubPublicProvider, GitLabPublicProvider, PublicRepoProvider,
+        GitHubPublicProvider, GitLabPublicProvider, PublicBranch, PublicRepoInfo,
+        PublicRepoProvider,
     };
+
+    struct DockerfilePortProvider {
+        fail_reads: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl PublicRepoProvider for DockerfilePortProvider {
+        fn provider_name(&self) -> &'static str {
+            "test"
+        }
+
+        async fn get_repository(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<PublicRepoInfo, PublicRepoError> {
+            panic!("repository metadata is not needed for this test")
+        }
+
+        async fn list_branches(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+            panic!("branch listing is not needed for this test")
+        }
+
+        async fn get_file_tree(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _reference: &str,
+        ) -> Result<Vec<String>, PublicRepoError> {
+            panic!("file tree lookup is not needed for this test")
+        }
+
+        async fn get_file_content(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            path: &str,
+            _reference: &str,
+        ) -> Result<FileContent, PublicRepoError> {
+            if self.fail_reads {
+                return Err(PublicRepoError::ApiError(format!(
+                    "simulated read failure for {path}"
+                )));
+            }
+            let content = match path {
+                "Dockerfile" => "FROM alpine\nEXPOSE 3000\n",
+                "apps/api/Dockerfile" => "FROM alpine\nEXPOSE 8080\n",
+                other => panic!("unexpected Dockerfile path: {other}"),
+            };
+            Ok(FileContent {
+                path: path.to_string(),
+                content: content.to_string(),
+                encoding: "utf-8".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn public_preset_detection_limits_anonymous_provider_work() {
+        let files = vec!["Dockerfile".to_string(), "apps/api/Dockerfile".to_string()];
+        let mut presets = detect_presets_from_files(&files);
+
+        enrich_public_dockerfile_exposed_ports(
+            &DockerfilePortProvider { fail_reads: false },
+            "example-owner",
+            "example-repository",
+            "main",
+            &mut presets,
+        )
+        .await;
+
+        let root = presets
+            .iter()
+            .find(|preset| preset.path == "./")
+            .expect("root Dockerfile preset should be detected");
+        let api = presets
+            .iter()
+            .find(|preset| preset.path == "apps/api")
+            .expect("nested Dockerfile preset should be detected");
+        assert_eq!(root.exposed_port, Some(3000));
+        assert_eq!(api.exposed_port, None);
+    }
+
+    #[tokio::test]
+    async fn dockerfile_read_failure_keeps_detected_preset_available() {
+        let mut presets = detect_presets_from_files(&["Dockerfile".to_string()]);
+
+        enrich_public_dockerfile_exposed_ports(
+            &DockerfilePortProvider { fail_reads: true },
+            "example-owner",
+            "example-repository",
+            "main",
+            &mut presets,
+        )
+        .await;
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].preset, "dockerfile");
+        assert_eq!(presets[0].exposed_port, None);
+    }
 
     // =============================================================================
     // Unit Tests - Cache Key Tests
     // =============================================================================
+
+    #[test]
+    fn self_hosted_gitlab_instances_use_separate_cache_scopes() {
+        let first = public_cache_scope("gitlab", Some("https://gitlab-one.example"));
+        let second = public_cache_scope("gitlab", Some("https://gitlab-two.example"));
+
+        assert_ne!(first, second);
+        assert_eq!(public_cache_scope("GitLab", None), "gitlab");
+    }
+
+    #[tokio::test]
+    async fn rejects_custom_origins_for_non_gitlab_providers() {
+        assert!(
+            validated_gitlab_instance("github", Some("https://gitlab.example.com"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn custom_gitlab_origins_require_authentication() {
+        let error = authorize_custom_gitlab_origin(None, Some("https://source.example.com"))
+            .expect_err("custom origins must not create unauthenticated egress");
+        assert_eq!(error.status_code, StatusCode::UNAUTHORIZED);
+
+        let deployment_token = AuthContext::new_deployment_token(
+            1,
+            None,
+            None,
+            1,
+            "test-token".to_string(),
+            Vec::new(),
+        );
+        let error = authorize_custom_gitlab_origin(
+            Some(&deployment_token),
+            Some("https://source.example.com"),
+        )
+        .expect_err("a principal without repository-read permission must be denied");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert!(authorize_custom_gitlab_origin(None, None).is_ok());
+    }
+
+    #[test]
+    fn fresh_public_preset_detection_requires_repository_read_permission() {
+        assert!(authorize_public_preset_refresh(None, false).is_ok());
+        let error = authorize_public_preset_refresh(None, true)
+            .expect_err("anonymous callers must not bypass the shared preset cache");
+        assert_eq!(error.status_code, StatusCode::UNAUTHORIZED);
+
+        let deployment_token = AuthContext::new_deployment_token(
+            1,
+            None,
+            None,
+            1,
+            "test-token".to_string(),
+            Vec::new(),
+        );
+        let error = authorize_public_preset_refresh(Some(&deployment_token), true)
+            .expect_err("unrelated authenticated principals must not bypass the cache");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn rejects_private_and_non_origin_gitlab_urls() {
+        assert!(
+            validated_gitlab_instance("gitlab", Some("https://127.0.0.1"))
+                .await
+                .is_err()
+        );
+        assert!(
+            validated_gitlab_instance("gitlab", Some("https://gitlab.example.com/group"))
+                .await
+                .is_err()
+        );
+        assert!(
+            validated_gitlab_instance("gitlab", Some("https://gitlab.example.com:8443"))
+                .await
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn every_public_repository_operation_documents_the_gitlab_origin() {
+        let document = serde_json::to_value(PublicRepositoriesApiDoc::openapi())
+            .expect("serialize the public repository OpenAPI document");
+        for (path, method) in [
+            ("/git/public/{provider}/{owner}/{repo}", "get"),
+            ("/git/public/{provider}/{owner}/{repo}/branches", "get"),
+            ("/git/public/{provider}/{owner}/{repo}/compose-file", "get"),
+            ("/git/public/{provider}/{owner}/{repo}/compose-file", "post"),
+            ("/git/public/{provider}/{owner}/{repo}/env-example", "get"),
+            ("/git/public/{provider}/{owner}/{repo}/presets", "get"),
+        ] {
+            let parameters = document["paths"][path][method]["parameters"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{method} {path} must document query parameters"));
+            assert!(
+                parameters
+                    .iter()
+                    .any(|parameter| parameter["name"] == "base_url"),
+                "{method} {path} must document base_url"
+            );
+        }
+    }
 
     #[test]
     fn test_public_branch_cache_key_equality() {
@@ -1345,7 +1794,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_provider_get_repository() {
-        let provider = GitLabPublicProvider::new(None);
+        let provider = GitLabPublicProvider::new();
 
         // Using gitlab-org/gitlab as a well-known public repo
         match provider.get_repository("gitlab-org", "gitlab").await {
@@ -1363,7 +1812,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_provider_list_branches() {
-        let provider = GitLabPublicProvider::new(None);
+        let provider = GitLabPublicProvider::new();
 
         // Using a smaller public GitLab repo for faster testing
         match provider.list_branches("gitlab-org", "gitlab-runner").await {
@@ -1389,7 +1838,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_gitlab_provider_nonexistent_repo() {
-        let provider = GitLabPublicProvider::new(None);
+        let provider = GitLabPublicProvider::new();
 
         let result = provider
             .get_repository("this-does-not-exist-12345", "fake-repo")

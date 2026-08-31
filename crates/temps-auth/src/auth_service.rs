@@ -1030,12 +1030,13 @@ impl AuthService {
 /// - Contains at least one digit
 /// - Contains at least one special character
 pub fn validate_password_complexity(password: &str) -> Result<(), UserAuthError> {
-    if password.len() < 8 {
+    let char_count = password.chars().count();
+    if char_count < 8 {
         return Err(UserAuthError::WeakPassword(
             "Password must be at least 8 characters long".to_string(),
         ));
     }
-    if password.len() > 128 {
+    if char_count > 128 {
         return Err(UserAuthError::WeakPassword(
             "Password must not exceed 128 characters".to_string(),
         ));
@@ -2446,6 +2447,20 @@ mod tests {
     fn test_password_empty() {
         let result = validate_password_complexity("");
         assert!(result.is_err());
+        assert!(
+            matches!(result.unwrap_err(), UserAuthError::WeakPassword(msg) if msg.contains("8 characters"))
+        );
+    }
+
+    #[test]
+    fn test_password_multibyte_characters_minimum_length() {
+        // "Aa1!🦀" is 5 characters (A, a, 1, !, 🦀) but 8 UTF-8 bytes.
+        // It must be rejected because it is under the 8 character minimum.
+        let result = validate_password_complexity("Aa1!🦀");
+        assert!(
+            result.is_err(),
+            "Password with 5 characters must be rejected even if 8 bytes"
+        );
         assert!(
             matches!(result.unwrap_err(), UserAuthError::WeakPassword(msg) if msg.contains("8 characters"))
         );

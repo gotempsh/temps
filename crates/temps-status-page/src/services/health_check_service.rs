@@ -150,8 +150,26 @@ impl HealthCheckService {
             .one(db.as_ref())
             .await?
             .ok_or_else(|| StatusPageError::NotFound)?;
-        if environment.current_deployment_id.is_none() {
+        let Some(current_deployment_id) = environment.current_deployment_id else {
             warn!("Environment {} has no current deployment", env_id);
+            return Ok(());
+        };
+
+        // Skip monitors whose deployment was intentionally paused by the
+        // user. This is a live read (not a value cached earlier in the
+        // caller) so it also covers the immediate check fired right after a
+        // monitor is created, and it can't be stale relative to
+        // `pause_deployment`, which persists `state = "paused"` before it
+        // stops any containers. This is only the cheap early exit — it
+        // avoids the HTTP round trip in the common case, but a pause can
+        // still land *during* the request below (which may take several
+        // seconds across retries), so `record_check` re-checks live again
+        // right before persisting any outcome.
+        if Self::is_deployment_paused(&db, current_deployment_id).await {
+            debug!(
+                "Skipping monitor {} for paused deployment {}",
+                monitor.id, current_deployment_id
+            );
             return Ok(());
         }
 
@@ -198,6 +216,7 @@ impl HealthCheckService {
                 Self::record_check(
                     &db,
                     monitor.id,
+                    current_deployment_id,
                     "degraded".to_string(),
                     None,
                     Some(format!("Failed to determine public URL: {:?}", e)),
@@ -271,6 +290,7 @@ impl HealthCheckService {
                     return Self::record_check(
                         &db,
                         monitor.id,
+                        current_deployment_id,
                         status.to_string(),
                         Some(total_response_time_ms),
                         if status != "operational" {
@@ -318,6 +338,7 @@ impl HealthCheckService {
                     return Self::record_check(
                         &db,
                         monitor.id,
+                        current_deployment_id,
                         "major_outage".to_string(),
                         Some(total_response_time_ms),
                         Some(format!(
@@ -347,6 +368,7 @@ impl HealthCheckService {
                     return Self::record_check(
                         &db,
                         monitor.id,
+                        current_deployment_id,
                         "major_outage".to_string(),
                         Some(10000), // Max timeout
                         Some(format!(
@@ -365,6 +387,7 @@ impl HealthCheckService {
         Self::record_check(
             &db,
             monitor.id,
+            current_deployment_id,
             "major_outage".to_string(),
             Some(total_response_time_ms),
             Some(last_error.unwrap_or_else(|| "Unknown error after retries".to_string())),
@@ -373,15 +396,46 @@ impl HealthCheckService {
         .await
     }
 
-    /// Record a check result in the database with retry logic and emit job for outage detection
+    /// Check if a deployment is currently paused. Always a live read (never
+    /// cached or captured earlier), since it feeds an alarm-suppression
+    /// decision that must reflect `pause_deployment`'s state at the moment
+    /// the caller is about to act, not at some earlier point in the check.
+    async fn is_deployment_paused(db: &Arc<DatabaseConnection>, deployment_id: i32) -> bool {
+        deployments::Entity::find_by_id(deployment_id)
+            .one(db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.state == "paused")
+            .unwrap_or(false)
+    }
+
+    /// Record a check result in the database with retry logic and emit job for outage detection.
+    ///
+    /// Re-checks `deployment_id` for a pause live, right before persisting
+    /// anything: `check_monitor`'s own paused guard only runs once, before
+    /// the HTTP request, but that request (with retries) can take several
+    /// seconds — long enough for a pause to land in between. Without this,
+    /// an in-flight check that started against a running deployment could
+    /// still record a "major_outage" for one that finished pausing seconds
+    /// later.
     async fn record_check(
         db: &Arc<DatabaseConnection>,
         monitor_id: i32,
+        deployment_id: i32,
         status: String,
         response_time_ms: Option<i32>,
         error_message: Option<String>,
         job_queue: &Arc<dyn JobQueue>,
     ) -> Result<(), StatusPageError> {
+        if Self::is_deployment_paused(db, deployment_id).await {
+            debug!(
+                "Skipping check result for monitor {}: deployment {} was paused mid-check",
+                monitor_id, deployment_id
+            );
+            return Ok(());
+        }
+
         let check = status_checks::ActiveModel {
             monitor_id: Set(monitor_id),
             status: Set(status.clone()),
@@ -860,5 +914,271 @@ mod tests {
                 "HTTP {status} should not be operational"
             );
         }
+    }
+
+    // ── check_monitor: paused-deployment skip ──────────────────────────
+    //
+    // Regression coverage for the gap Greptile flagged on PR #835: the
+    // paused check used to live only in `run_all_checks`'s pre-filter, so
+    // the immediate check fired by the `MonitorCreated` job (which calls
+    // `check_monitor` directly, bypassing that pre-filter) still reported a
+    // freshly-paused deployment as down. The check now lives inside
+    // `check_monitor` itself — the single place every caller goes through —
+    // and reads deployment state live rather than from a value the caller
+    // captured earlier, so it can't be stale relative to
+    // `pause_deployment`, which persists `state = "paused"` before it stops
+    // any containers.
+
+    struct NeverJobQueue;
+    #[async_trait::async_trait]
+    impl temps_core::JobQueue for NeverJobQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            struct NeverReceiver;
+            #[async_trait::async_trait]
+            impl temps_core::JobReceiver for NeverReceiver {
+                async fn recv(&mut self) -> Result<temps_core::Job, temps_core::QueueError> {
+                    std::future::pending().await
+                }
+            }
+            Box::new(NeverReceiver)
+        }
+    }
+
+    fn test_config_service(
+        db: &Arc<DatabaseConnection>,
+        database_url: &str,
+    ) -> Arc<temps_config::ConfigService> {
+        let config = temps_config::ServerConfig::new(
+            "127.0.0.1:3000".to_string(),
+            database_url.to_string(),
+            None,
+            None,
+        )
+        .expect("failed to build test ServerConfig");
+        Arc::new(temps_config::ConfigService::new(
+            Arc::new(config),
+            db.clone(),
+        ))
+    }
+
+    #[tokio::test]
+    async fn test_check_monitor_skips_paused_deployment() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Paused Skip Test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set("paused-skip-test".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("paused-skip-test-production".to_string()),
+            host: Set("paused-skip-test-production.test.local".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("paused-skip-test-1".to_string()),
+            state: Set("paused".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+        active_environment.current_deployment_id = Set(Some(deployment.id));
+        let environment = active_environment.update(db.as_ref()).await.unwrap();
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("production health".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let config_service = test_config_service(&db, &test_db.database_url);
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+
+        // If the paused check were skipped or stale, this would try to hit
+        // `paused-skip-test-production.test.local`, which doesn't resolve —
+        // the call would still return `Ok(())` (check_monitor treats a
+        // failed request as a recorded outage, not an error) but it would
+        // insert a `status_checks` row. Assert none was written instead of
+        // asserting on the return value, so the test fails loudly if the
+        // guard regresses instead of passing for the wrong reason.
+        let result = HealthCheckService::check_monitor(
+            db.clone(),
+            reqwest::Client::new(),
+            config_service,
+            monitor.clone(),
+            job_queue,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "check_monitor must not perform an HTTP check against a paused deployment"
+        );
+    }
+
+    /// Regression test for the mid-check race Greptile flagged: `check_monitor`'s
+    /// own paused guard only runs once, before the HTTP request — but that
+    /// request (with up to 3 retries) can take several seconds, long enough
+    /// for a pause to land in between. `record_check` must re-check live,
+    /// right before persisting any outcome, regardless of what the caller
+    /// observed earlier. Exercise `record_check` directly (rather than the
+    /// full `check_monitor`, whose early guard would trivially skip a
+    /// deployment that's already paused at entry) so this only passes if the
+    /// *late* guard inside `record_check` itself is the one doing the work.
+    #[tokio::test]
+    async fn test_record_check_skips_paused_deployment_mid_check() {
+        let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+
+        let project = temps_entities::projects::ActiveModel {
+            name: Set("Mid-Check Pause Test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            slug: Set("mid-check-pause-test".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            directory: Set("/test".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set("mid-check-pause-test-production".to_string()),
+            host: Set("mid-check-pause-test-production.test.local".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Deployment starts NOT paused — modeling "check_monitor's early
+        // guard saw a running deployment and proceeded to the HTTP request".
+        // It's paused (below) only after that point, simulating the pause
+        // landing while the check is in flight.
+        let deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("mid-check-pause-test-1".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(deployments::DeploymentMetadata::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        let monitor = status_monitors::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(Some(environment.id)),
+            name: Set("production health".to_string()),
+            monitor_type: Set("web".to_string()),
+            check_interval_seconds: Set(60),
+            is_active: Set(true),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .unwrap();
+
+        // Pause lands mid-check, after the (simulated) early guard already
+        // passed.
+        let mut active_deployment: deployments::ActiveModel = deployment.clone().into();
+        active_deployment.state = Set("paused".to_string());
+        active_deployment.update(db.as_ref()).await.unwrap();
+
+        let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+
+        let result = HealthCheckService::record_check(
+            &db,
+            monitor.id,
+            deployment.id,
+            "major_outage".to_string(),
+            Some(5000),
+            Some("Connection failed".to_string()),
+            &job_queue,
+        )
+        .await;
+        assert!(result.is_ok());
+
+        let checks = status_checks::Entity::find()
+            .filter(status_checks::Column::MonitorId.eq(monitor.id))
+            .all(db.as_ref())
+            .await
+            .unwrap();
+        assert!(
+            checks.is_empty(),
+            "record_check must not persist a check result for a deployment paused mid-check, \
+             even when the caller's own paused guard already passed"
+        );
     }
 }

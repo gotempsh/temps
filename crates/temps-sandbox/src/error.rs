@@ -16,7 +16,8 @@ use temps_agents::error::AgentError;
 ///
 /// HTTP mappings:
 /// - `NotFound` → 404
-/// - `NotReady` | `CrossBackendRestore` | `QuotaExceeded` | `InvalidState` → 422
+/// - `NotReady` | `CrossBackendRestore` | `QuotaExceeded` | `InvalidState` |
+///   `LegacyArtifactUnsupported` → 422
 /// - `NotSupported` → 501
 /// - `ScrubFailed` | `DigestMismatch` | `ArtifactMissing` | `SandboxNotFound` → 500
 /// - `Database` | `Io` | `Provider` → 500
@@ -38,7 +39,7 @@ pub enum SandboxSnapshotError {
         target_backend: String,
     },
 
-    /// The backend does not support snapshots (e.g. Firecracker v1, Local).
+    /// The backend does not support snapshots (for example, Local).
     #[error("Snapshot is not supported by backend '{backend}'")]
     NotSupported { backend: String },
 
@@ -78,6 +79,16 @@ pub enum SandboxSnapshotError {
     /// The artifact file is missing from disk (stale or never written).
     #[error("Snapshot artifact missing at path: {path}")]
     ArtifactMissing { path: String },
+
+    /// The persisted companion-artifact metadata is malformed.
+    #[error("Snapshot {snapshot_id} has invalid artifact metadata: {reason}")]
+    InvalidArtifactMetadata { snapshot_id: String, reason: String },
+
+    /// A snapshot predates the integrity/workspace metadata required by the
+    /// current restore implementation. It remains deletable but cannot be
+    /// restored safely or without silently losing workspace state.
+    #[error("Snapshot {snapshot_id} uses an unsupported legacy artifact format: {reason}")]
+    LegacyArtifactUnsupported { snapshot_id: String, reason: String },
 
     /// The source sandbox doesn't exist or was already destroyed.
     #[error("Sandbox {sandbox_id} not found")]
@@ -232,6 +243,9 @@ pub fn from_agent_error(sandbox_id: &str, err: AgentError) -> SandboxError {
         AgentError::SandboxExecFailed { reason, .. } => SandboxError::ExecFailed {
             sandbox_id: sandbox_id.to_string(),
             reason,
+        },
+        limit_error @ AgentError::SnapshotSizeLimitExceeded { .. } => SandboxError::Validation {
+            message: limit_error.to_string(),
         },
         AgentError::Io(e) => SandboxError::Io(e),
         other => SandboxError::ExecFailed {

@@ -4,11 +4,12 @@
 use moka::future::Cache;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use temps_core::static_files::MAX_STATIC_ASSET_URL_PATH_BYTES;
 use temps_database::DbConnection;
-use temps_entities::static_asset_cache;
+use temps_entities::{deployments, static_asset_cache};
 use tokio::sync::Semaphore;
 use tracing::debug;
 
@@ -51,6 +52,19 @@ struct StaticAssetCacheKey {
     environment_id: i32,
     deployment_id: i32,
     url_path_digest: [u8; 32],
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct LegacyAssetOriginCacheKey {
+    project_id: i32,
+    source_deployment_id: i32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LegacyAssetOrigin {
+    pub deployment_id: i32,
+    pub environment_id: i32,
+    pub slug: String,
 }
 
 impl StaticAssetCacheKey {
@@ -98,6 +112,9 @@ pub struct StaticAssetLookup {
     db: Arc<DbConnection>,
     /// `(project_id, environment_id, deployment_id, url_path) → asset metadata`.
     cache: Cache<StaticAssetCacheKey, Option<StaticAssetMetadata>>,
+    /// Legacy reuse rows omitted the source slug. Cache the resolved immutable
+    /// build origin so compatibility never adds an uncached query per asset.
+    legacy_origin_cache: Cache<LegacyAssetOriginCacheKey, Option<LegacyAssetOrigin>>,
     db_lookup_slots: Arc<Semaphore>,
 }
 
@@ -122,11 +139,101 @@ impl StaticAssetLookup {
             .max_capacity(ASSET_STORE_CACHE_MAX_CAPACITY)
             .time_to_live(ttl)
             .build();
+        let legacy_origin_cache = Cache::builder()
+            .max_capacity(ASSET_STORE_CACHE_MAX_CAPACITY)
+            .time_to_live(ttl)
+            .build();
         Self {
             db,
             cache,
+            legacy_origin_cache,
             db_lookup_slots: Arc::new(Semaphore::new(max_concurrent_db_lookups)),
         }
+    }
+
+    /// Resolve the immutable build behind pre-source-slug promotion and
+    /// rollback metadata. Results (including missing/cyclic metadata) are
+    /// cached and project-scoped to prevent cross-project ID traversal.
+    pub async fn resolve_legacy_asset_origin(
+        &self,
+        project_id: i32,
+        source_deployment_id: i32,
+    ) -> Option<LegacyAssetOrigin> {
+        let key = LegacyAssetOriginCacheKey {
+            project_id,
+            source_deployment_id,
+        };
+        if let Some(cached) = self.legacy_origin_cache.get(&key).await {
+            return cached;
+        }
+
+        let db = self.db.clone();
+        let db_lookup_slots = self.db_lookup_slots.clone();
+        self.legacy_origin_cache
+            .try_get_with(key, async move {
+                let _permit = db_lookup_slots
+                    .try_acquire_owned()
+                    .map_err(|_| AssetStoreLookupSaturated)?;
+                let mut current_id = source_deployment_id;
+                let mut visited = HashSet::new();
+
+                loop {
+                    if !visited.insert(current_id) {
+                        return Ok::<Option<LegacyAssetOrigin>, AssetStoreLookupSaturated>(None);
+                    }
+                    let Some(deployment) = deployments::Entity::find_by_id(current_id)
+                        .filter(deployments::Column::ProjectId.eq(project_id))
+                        .one(db.as_ref())
+                        .await
+                        .ok()
+                        .flatten()
+                    else {
+                        return Ok::<Option<LegacyAssetOrigin>, AssetStoreLookupSaturated>(None);
+                    };
+
+                    let context = deployment.context_vars.as_ref();
+                    let nested_source_id = context
+                        .and_then(|value| value.get("source_deployment_id"))
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok());
+                    let complete_source_environment_id = context
+                        .and_then(|value| value.get("source_environment_id"))
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok());
+                    let complete_source_slug = context
+                        .and_then(|value| value.get("source_deployment_slug"))
+                        .and_then(serde_json::Value::as_str);
+
+                    match (
+                        nested_source_id,
+                        complete_source_environment_id,
+                        complete_source_slug,
+                    ) {
+                        (Some(deployment_id), Some(environment_id), Some(slug)) => {
+                            return Ok::<Option<LegacyAssetOrigin>, AssetStoreLookupSaturated>(
+                                Some(LegacyAssetOrigin {
+                                    deployment_id,
+                                    environment_id,
+                                    slug: slug.to_string(),
+                                }),
+                            );
+                        }
+                        (Some(next_id), _, _) => current_id = next_id,
+                        (None, _, _) => {
+                            return Ok::<Option<LegacyAssetOrigin>, AssetStoreLookupSaturated>(
+                                Some(LegacyAssetOrigin {
+                                    deployment_id: deployment.id,
+                                    environment_id: deployment.environment_id,
+                                    slug: deployment.slug,
+                                }),
+                            );
+                        }
+                    }
+                }
+            })
+            .await
+            .ok()
+            .flatten()
     }
 
     /// Return bounded-serving metadata for the exact routed deployment, or
@@ -252,6 +359,105 @@ mod tests {
             size_bytes: 1024,
             created_at: Utc::now(),
         }
+    }
+
+    fn deployment_model(
+        id: i32,
+        project_id: i32,
+        environment_id: i32,
+        slug: &str,
+        context_vars: Option<serde_json::Value>,
+    ) -> deployments::Model {
+        deployments::Model {
+            id,
+            project_id,
+            environment_id,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            slug: slug.to_string(),
+            state: "deployed".to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars,
+            branch_ref: None,
+            tag_ref: None,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_reuse_origin_walks_to_original_build_and_is_cached() {
+        let legacy_promotion = deployment_model(
+            20,
+            7,
+            3,
+            "legacy-promotion",
+            Some(serde_json::json!({
+                "trigger": "promotion",
+                "source_deployment_id": 10,
+                "source_environment_id": 2,
+            })),
+        );
+        let original = deployment_model(10, 7, 2, "original-build", None);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![legacy_promotion], vec![original]])
+                .into_connection(),
+        );
+        let lookup = StaticAssetLookup::new(db.clone());
+
+        let origin = lookup
+            .resolve_legacy_asset_origin(7, 20)
+            .await
+            .expect("legacy origin should resolve");
+        assert_eq!(
+            origin,
+            LegacyAssetOrigin {
+                deployment_id: 10,
+                environment_id: 2,
+                slug: "original-build".to_string(),
+            }
+        );
+        assert_eq!(
+            lookup.resolve_legacy_asset_origin(7, 20).await,
+            Some(origin)
+        );
+
+        drop(lookup);
+        let db = Arc::try_unwrap(db).expect("lookup releases database");
+        assert_eq!(db.into_transaction_log().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_reuse_origin_fails_closed_when_source_is_outside_project() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<deployments::Model>::new()])
+                .into_connection(),
+        );
+        let lookup = StaticAssetLookup::new(db.clone());
+
+        assert!(lookup.resolve_legacy_asset_origin(7, 99).await.is_none());
+
+        drop(lookup);
+        let db = Arc::try_unwrap(db).expect("lookup releases database");
+        let transactions = db.into_transaction_log();
+        assert_eq!(transactions.len(), 1);
+        assert!(transactions[0].statements()[0]
+            .to_string()
+            .contains("\"project_id\" = 7"));
     }
 
     /// A repeated miss for the same `(project_id, url_path)` within the TTL

@@ -28,6 +28,7 @@ export type ComposePreviewRepository =
       provider: string
       owner: string
       repo: string
+      baseUrl?: string
     }
 
 export function composePreviewEndpoint(repository: ComposePreviewRepository): {
@@ -68,6 +69,7 @@ export async function fetchComposePreview(
             owner: repository.owner,
             repo: repository.repo,
           },
+          query: { base_url: repository.baseUrl },
           body: request,
           signal,
           throwOnError: false,

@@ -5,13 +5,11 @@
 //!
 //! Monitors disk usage and triggers alerts when thresholds are exceeded.
 
+use crate::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use std::sync::Arc;
 use temps_config::ConfigService;
-use temps_core::notifications::{
-    NotificationData, NotificationPriority, NotificationService, NotificationType,
-};
 use temps_core::DiskSpaceAlertSettings;
 use thiserror::Error;
 use tokio::sync::RwLock;
@@ -38,7 +36,7 @@ pub enum DiskSpaceError {
 /// Disk space monitoring service
 pub struct DiskSpaceMonitor {
     config_service: Arc<ConfigService>,
-    notification_service: Arc<dyn NotificationService>,
+    alarm_service: Arc<AlarmService>,
     last_alert_time: RwLock<Option<DateTime<Utc>>>,
 }
 
@@ -49,13 +47,10 @@ impl DiskSpaceMonitor {
     /// `temps_config::disk_status` collector: all mounted writable volumes by
     /// default, or only the disk backing `disk_space_alert.monitor_path` when
     /// that is set.
-    pub fn new(
-        config_service: Arc<ConfigService>,
-        notification_service: Arc<dyn NotificationService>,
-    ) -> Self {
+    pub fn new(config_service: Arc<ConfigService>, alarm_service: Arc<AlarmService>) -> Self {
         Self {
             config_service,
-            notification_service,
+            alarm_service,
             last_alert_time: RwLock::new(None),
         }
     }
@@ -108,26 +103,13 @@ impl DiskSpaceMonitor {
 
     /// Send alert notifications for disks exceeding threshold
     async fn send_alerts(&self, alerts: &[DiskSpaceAlert], settings: &DiskSpaceAlertSettings) {
-        // Check if notification service is configured
-        match self.notification_service.is_configured().await {
-            Ok(false) => {
-                debug!("Notification service not configured, skipping disk space alert");
-                return;
-            }
-            Err(e) => {
-                error!("Failed to check notification service configuration: {}", e);
-                return;
-            }
-            Ok(true) => {}
-        }
-
         for alert in alerts {
             let severity = if alert.usage_percent >= 95.0 {
-                NotificationPriority::Critical
+                AlarmSeverity::Critical
             } else if alert.usage_percent >= 90.0 {
-                NotificationPriority::High
+                AlarmSeverity::Warning
             } else {
-                NotificationPriority::Normal
+                AlarmSeverity::Info
             };
 
             let title = format!(
@@ -145,49 +127,54 @@ impl DiskSpaceMonitor {
                 alert.available_human
             );
 
-            let notification = NotificationData {
-                id: temps_core::uuid::Uuid::new_v4().to_string(),
+            // Host/control-plane-wide: no project/environment/deployment owns
+            // "the disk". Note this also means every over-threshold mount
+            // shares one cooldown bucket (there's no per-disk scope column to
+            // key on) — a second disk breaching seconds after the first can
+            // get folded into the same cooldown window rather than alerting
+            // independently. Acceptable for the common single/few-disk case;
+            // revisit if multi-disk instances report missed alerts.
+            let request = FireAlarmRequest {
+                project_id: None,
+                environment_id: None,
+                deployment_id: None,
+                container_id: None,
+                service_id: None,
+                alarm_type: AlarmType::DiskSpaceLow,
+                severity,
                 title,
                 message,
-                notification_type: NotificationType::Warning,
-                priority: severity,
-                severity: Some("warning".to_string()),
-                timestamp: Utc::now(),
-                metadata: [
-                    ("mount_point".to_string(), alert.mount_point.clone()),
-                    (
-                        "usage_percent".to_string(),
-                        format!("{:.1}", alert.usage_percent),
-                    ),
-                    (
-                        "threshold_percent".to_string(),
-                        settings.threshold_percent.to_string(),
-                    ),
-                    ("available_bytes".to_string(), alert.available_human.clone()),
-                ]
-                .into_iter()
-                .collect(),
-                bypass_throttling: false,
+                metadata: Some(serde_json::json!({
+                    "mount_point": alert.mount_point,
+                    "usage_percent": format!("{:.1}", alert.usage_percent),
+                    "threshold_percent": settings.threshold_percent,
+                    "available_bytes": alert.available_human,
+                })),
             };
 
-            if let Err(e) = self
-                .notification_service
-                .send_notification(notification)
-                .await
-            {
-                error!(
-                    "Failed to send disk space alert for {}: {}",
-                    alert.mount_point, e
-                );
-            } else {
-                info!(
-                    "Sent disk space alert for {} ({:.1}%)",
-                    alert.mount_point, alert.usage_percent
-                );
+            match self.alarm_service.fire_alarm(request).await {
+                Ok(Some(_)) => {
+                    info!(
+                        "Sent disk space alert for {} ({:.1}%)",
+                        alert.mount_point, alert.usage_percent
+                    );
 
-                // Update last alert time
-                let mut last_alert = self.last_alert_time.write().await;
-                *last_alert = Some(Utc::now());
+                    // Update last alert time
+                    let mut last_alert = self.last_alert_time.write().await;
+                    *last_alert = Some(Utc::now());
+                }
+                Ok(None) => {
+                    debug!(
+                        "Disk space alert for {} suppressed by cooldown/silence",
+                        alert.mount_point
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        "Failed to fire disk space alarm for {}: {}",
+                        alert.mount_point, e
+                    );
+                }
             }
         }
     }
@@ -249,7 +236,6 @@ mod tests {
     use super::*;
     use async_trait::async_trait;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use tokio::sync::Mutex;
 
     // NOTE: disk inspection + threshold/format logic is owned and unit-tested in
     // `temps_config::disk_status`. The tests here cover only the
@@ -276,19 +262,15 @@ mod tests {
         assert!(critical_alert.usage_percent >= 95.0);
     }
 
-    // Mock notification service for testing
+    // Minimal mocks for exercising `send_alerts` -> `AlarmService::fire_alarm`.
     struct MockNotificationService {
         notifications_sent: AtomicUsize,
-        last_notification: Mutex<Option<NotificationData>>,
-        is_configured: bool,
     }
 
     impl MockNotificationService {
-        fn new(is_configured: bool) -> Self {
+        fn new() -> Self {
             Self {
                 notifications_sent: AtomicUsize::new(0),
-                last_notification: Mutex::new(None),
-                is_configured,
             }
         }
 
@@ -298,7 +280,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl NotificationService for MockNotificationService {
+    impl temps_core::notifications::NotificationService for MockNotificationService {
         async fn send_email(
             &self,
             _message: temps_core::notifications::EmailMessage,
@@ -308,52 +290,113 @@ mod tests {
 
         async fn send_notification(
             &self,
-            notification: NotificationData,
+            _notification: temps_core::notifications::NotificationData,
         ) -> std::result::Result<(), temps_core::notifications::NotificationError> {
             self.notifications_sent.fetch_add(1, Ordering::SeqCst);
-            let mut last = self.last_notification.lock().await;
-            *last = Some(notification);
             Ok(())
         }
 
         async fn is_configured(
             &self,
         ) -> std::result::Result<bool, temps_core::notifications::NotificationError> {
-            Ok(self.is_configured)
+            Ok(true)
         }
     }
 
-    #[tokio::test]
-    async fn test_notification_service_integration() {
-        let mock_service = Arc::new(MockNotificationService::new(true));
+    struct NoopJobQueue;
 
-        // Simulate sending a disk space alert notification
-        let notification = NotificationData {
-            id: "test-id".to_string(),
-            title: "Disk Space Alert: / at 85.0%".to_string(),
-            message: "Disk usage has exceeded threshold".to_string(),
-            notification_type: NotificationType::Warning,
-            priority: NotificationPriority::Normal,
-            severity: Some("warning".to_string()),
-            timestamp: Utc::now(),
-            metadata: std::collections::HashMap::new(),
-            bypass_throttling: false,
-        };
-
-        mock_service.send_notification(notification).await.unwrap();
-        assert_eq!(mock_service.notification_count(), 1);
+    #[async_trait]
+    impl temps_core::JobQueue for NoopJobQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::jobs::QueueError> {
+            Ok(())
+        }
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("not needed in tests")
+        }
     }
 
+    /// `send_alerts` must persist a `disk_space_low` alarm (not just send a
+    /// bare notification) so it shows up in `/monitoring/alarms` and can be
+    /// acknowledged/silenced — this is the exact gap that motivated routing
+    /// disk-space alerts through `AlarmService::fire_alarm`.
     #[tokio::test]
-    async fn test_notification_not_sent_when_unconfigured() {
-        let mock_service = Arc::new(MockNotificationService::new(false));
+    async fn test_send_alerts_fires_alarm_via_alarm_service() {
+        use sea_orm::{DatabaseBackend, MockDatabase};
 
-        // Check that is_configured returns false
-        let is_configured = mock_service.is_configured().await.unwrap();
-        assert!(!is_configured);
+        let inserted_alarm = temps_entities::alarms::Model {
+            id: 1,
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::DiskSpaceLow.as_str().to_string(),
+            severity: AlarmSeverity::Warning.as_str().to_string(),
+            status: "firing".to_string(),
+            title: "Disk Space Alert: / at 92.0%".to_string(),
+            message: None,
+            metadata: None,
+            fired_at: Utc::now(),
+            acknowledged_at: None,
+            acknowledged_by: None,
+            resolved_at: None,
+            silenced_until: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
 
-        // In real code, this would prevent notification from being sent
-        assert_eq!(mock_service.notification_count(), 0);
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // is_in_cooldown: no recent/silenced alarm for this scope.
+            .append_query_results([[maplit::btreemap! {
+                "num_items" => sea_orm::Value::BigInt(Some(0)),
+            }]])
+            // insert (Postgres RETURNING * comes back as a query result)
+            .append_query_results(vec![vec![inserted_alarm]])
+            .into_connection();
+
+        let notification_service = Arc::new(MockNotificationService::new());
+        let alarm_service = Arc::new(AlarmService::new(
+            Arc::new(db),
+            notification_service.clone(),
+            Arc::new(NoopJobQueue),
+        ));
+
+        let config_service = {
+            let server_config = Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    Some("127.0.0.1:8000".to_string()),
+                )
+                .unwrap(),
+            );
+            Arc::new(ConfigService::new(
+                server_config,
+                Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+            ))
+        };
+        let monitor = DiskSpaceMonitor::new(config_service, alarm_service.clone());
+
+        let alert = DiskSpaceAlert {
+            mount_point: "/".to_string(),
+            usage_percent: 92.0,
+            threshold_percent: 80,
+            available_bytes: 1024 * 1024 * 1024,
+            available_human: "1.00 GB".to_string(),
+        };
+        let settings = DiskSpaceAlertSettings {
+            threshold_percent: 80,
+            ..Default::default()
+        };
+
+        monitor.send_alerts(&[alert], &settings).await;
+
+        assert_eq!(
+            notification_service.notification_count(),
+            1,
+            "fire_alarm should have persisted the alarm AND sent one notification"
+        );
     }
 
     #[test]

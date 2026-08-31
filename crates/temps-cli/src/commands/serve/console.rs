@@ -2777,15 +2777,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         );
     }
 
-    // Start disk space monitoring if ConfigService and NotificationService are available
-    if let (Some(config_service), Some(notification_service)) = (
+    // Start disk space monitoring if ConfigService and AlarmService are available
+    if let (Some(config_service), Some(alarm_service)) = (
         service_context.get_service::<temps_config::ConfigService>(),
-        service_context.get_service::<dyn temps_core::notifications::NotificationService>(),
+        service_context.get_service::<AlarmService>(),
     ) {
-        let monitor = Arc::new(DiskSpaceMonitor::new(
-            config_service.clone(),
-            notification_service,
-        ));
+        let monitor = Arc::new(DiskSpaceMonitor::new(config_service.clone(), alarm_service));
 
         tokio::spawn(async move {
             monitor.start_monitoring().await;
@@ -2794,7 +2791,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("Disk space monitoring started in background");
     } else {
         tracing::warn!(
-            "ConfigService or NotificationService not available - disk space monitoring disabled."
+            "ConfigService or AlarmService not available - disk space monitoring disabled."
         );
     }
 
@@ -3030,8 +3027,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     }
 
     // Start external service health monitoring (Postgres/Redis/MongoDB/RustFS TCP probes)
-    if let (Some(notification_service), Some(external_service_manager)) = (
-        service_context.get_service::<dyn temps_core::notifications::NotificationService>(),
+    if let (Some(alarm_service), Some(external_service_manager)) = (
+        service_context.get_service::<AlarmService>(),
         service_context.get_service::<temps_providers::ExternalServiceManager>(),
     ) {
         use temps_providers::health_monitor::{
@@ -3040,7 +3037,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let mut health_monitor = ExternalServiceHealthMonitor::new(
             db.clone(),
             external_service_manager,
-            notification_service,
+            alarm_service,
             ExternalServiceHealthConfig::default(),
             docker.clone(),
             service_context.require_service::<temps_core::EncryptionService>(),
@@ -3069,7 +3066,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("External service health monitor started (poll interval: 30s)");
     } else {
         tracing::warn!(
-            "NotificationService or ExternalServiceManager not available - external service health monitoring disabled."
+            "AlarmService or ExternalServiceManager not available - external service health monitoring disabled."
         );
     }
 
@@ -3099,8 +3096,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         telemetry: node_telemetry,
         rate_limiter: Arc::new(temps_deployments::handlers::nodes::RegistrationRateLimiter::new()),
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
-        notification_service: service_context
-            .get_service::<dyn temps_core::notifications::NotificationService>(),
+        alarm_service: service_context.get_service::<AlarmService>(),
         audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
     });
     let node_routes =
@@ -3112,8 +3108,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let health_db = db.clone();
         let deployment_service_for_failover =
             service_context.get_service::<temps_deployments::DeploymentService>();
-        let health_notification_service =
-            service_context.get_service::<dyn temps_core::notifications::NotificationService>();
+        let health_alarm_service = service_context.get_service::<AlarmService>();
         let health_config_service = service_context.get_service::<temps_config::ConfigService>();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -3130,13 +3125,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         offline_ids.len()
                     );
                     // Alert operators that worker node(s) went down (best-effort).
-                    if let Some(ref notification_service) = health_notification_service {
-                        notify_nodes_offline(
-                            &offline_ids,
-                            &health_node_service,
-                            notification_service,
-                        )
-                        .await;
+                    if let Some(ref alarm_service) = health_alarm_service {
+                        notify_nodes_offline(&offline_ids, &health_node_service, alarm_service)
+                            .await;
                     }
                     // Trigger failover redeployment for affected environments
                     if let Some(ref deployment_service) = deployment_service_for_failover {
@@ -3151,14 +3142,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
                 // Alert on node resource pressure (CPU/mem/disk) against the
                 // operator-configurable thresholds in settings.multi_node.
-                if let (Some(ref notification_service), Some(ref config_service)) =
-                    (&health_notification_service, &health_config_service)
+                if let (Some(ref alarm_service), Some(ref config_service)) =
+                    (&health_alarm_service, &health_config_service)
                 {
-                    check_node_resources(health_db.as_ref(), config_service, notification_service)
-                        .await;
+                    check_node_resources(health_db.as_ref(), config_service, alarm_service).await;
                     // The control plane isn't a `nodes` row, so it's excluded
                     // from the query above — alert on its own metrics separately.
-                    check_control_plane_resources(config_service, notification_service).await;
+                    check_control_plane_resources(config_service, alarm_service).await;
                 }
 
                 // Transition fully-drained nodes from "draining" to "drained".

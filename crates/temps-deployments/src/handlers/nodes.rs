@@ -49,9 +49,10 @@ pub struct NodeAppState {
     pub rate_limiter: Arc<RegistrationRateLimiter>,
     /// Short-lived, single-use node enrollment tokens (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
-    /// Notification pipeline — used to alert operators when a node recovers
-    /// (offline->active on heartbeat). Optional: absent if no provider is wired.
-    pub notification_service: Option<Arc<dyn temps_core::notifications::NotificationService>>,
+    /// Alarm pipeline — used to resolve the node-offline alarm when a node
+    /// recovers (offline->active on heartbeat). Optional: absent if
+    /// `AlarmService` wasn't available when this state was built.
+    pub alarm_service: Option<Arc<temps_monitoring::alarm_service::AlarmService>>,
     /// Audit trail. A node's reported architecture decides where images are
     /// placed, so a change to it is recorded like any other write.
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
@@ -1340,11 +1341,11 @@ async fn node_heartbeat(
     // active. Alert operators (recovery counterpart to the node-offline alert).
     if was_offline {
         info!(node_id, node_name = %node.name, "Node recovered (offline -> active)");
-        if let Some(ref notification_service) = app_state.notification_service {
+        if let Some(ref alarm_service) = app_state.alarm_service {
             crate::jobs::node_health_check::notify_node_recovered(
                 node_id,
                 &node.name,
-                notification_service,
+                alarm_service,
             )
             .await;
         }
@@ -2974,7 +2975,7 @@ mod tests {
             enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(
                 test_db_for_enrollment,
             )),
-            notification_service: None,
+            alarm_service: None,
             audit_service: Arc::new(RecordingAuditLogger::default()),
         });
         // The production router is served with connect info; tests use `oneshot`

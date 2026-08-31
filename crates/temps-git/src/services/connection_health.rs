@@ -9,15 +9,13 @@
 //! notifications crate handles throttling via `batch_key` + priority window,
 //! so we don't re-implement rate limiting here.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use chrono::Utc;
 use futures::stream::{self, StreamExt};
 use sea_orm::{ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, Set};
-use temps_core::notifications::{
-    DynNotificationService, NotificationData, NotificationPriority, NotificationType,
-};
 use temps_entities::{git_provider_connections, git_providers};
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -61,7 +59,10 @@ pub struct ConnectionHealthService {
     db: Arc<DatabaseConnection>,
     git_provider_manager: Arc<GitProviderManager>,
     github_service: Arc<GithubAppService>,
-    notification_service: Option<DynNotificationService>,
+    /// Set post-construction via `set_alarm_service` once all plugins have
+    /// registered — `GitPlugin` registers before `MonitoringPlugin`, so
+    /// `AlarmService` isn't available yet during `register_services`.
+    alarm_service: OnceLock<Arc<AlarmService>>,
     /// Base URL used for deep-links inside notifications (e.g. admin console).
     console_base_url: String,
 }
@@ -71,16 +72,21 @@ impl ConnectionHealthService {
         db: Arc<DatabaseConnection>,
         git_provider_manager: Arc<GitProviderManager>,
         github_service: Arc<GithubAppService>,
-        notification_service: Option<DynNotificationService>,
         console_base_url: String,
     ) -> Self {
         Self {
             db,
             git_provider_manager,
             github_service,
-            notification_service,
+            alarm_service: OnceLock::new(),
             console_base_url,
         }
+    }
+
+    /// Wire the `AlarmService` after construction. Idempotent — only the
+    /// first call takes effect. Called from `GitPlugin::initialize_plugin_services`.
+    pub fn set_alarm_service(&self, alarm_service: Arc<AlarmService>) {
+        let _ = self.alarm_service.set(alarm_service);
     }
 
     /// Probe every active connection. Runs with bounded concurrency so a slow
@@ -356,26 +362,30 @@ impl ConnectionHealthService {
         new_message: Option<&str>,
         previous_message: Option<&str>,
     ) {
-        let Some(svc) = self.notification_service.as_ref() else {
+        let Some(alarm_service) = self.alarm_service.get() else {
             debug!(
                 connection_id = connection.id,
-                "No notification service registered; skipping transition notification"
+                "AlarmService not wired yet; skipping transition alarm"
             );
             return;
         };
 
-        // Always scope the batch key to the connection so failures on different
-        // connections never collapse into one throttled entry.
-        let batch_key = format!("git-connection-health:{}", connection.id);
         let provider_detail_url = format!(
             "{}/git-providers/{}",
             self.console_base_url.trim_end_matches('/'),
             provider.id
         );
 
-        let notification = if new_status == HEALTH_STATUS_UNHEALTHY {
+        if new_status == HEALTH_STATUS_UNHEALTHY {
             let reason = new_message.unwrap_or("Unknown failure");
-            let mut data = NotificationData {
+            let request = FireAlarmRequest {
+                project_id: None,
+                environment_id: None,
+                deployment_id: None,
+                container_id: None,
+                service_id: None,
+                alarm_type: AlarmType::GitProviderConnectionDown,
+                severity: AlarmSeverity::Critical,
                 title: format!(
                     "Git connection unhealthy: {} ({})",
                     connection.account_name, provider.name
@@ -387,73 +397,55 @@ impl ConnectionHealthService {
                      Manage it at: {}",
                     connection.account_name, provider.name, reason, provider_detail_url,
                 ),
-                notification_type: NotificationType::Error,
-                priority: NotificationPriority::Critical,
-                severity: Some("critical".to_string()),
-                ..Default::default()
+                metadata: Some(serde_json::json!({
+                    "connection_id": connection.id,
+                    "provider_id": provider.id,
+                    "account_name": connection.account_name,
+                    "failure_reason": reason,
+                    "previous_status": previous_status,
+                })),
             };
-            data.metadata
-                .insert("batch_key".to_string(), batch_key.clone());
-            data.metadata
-                .insert("event".to_string(), "git_connection_unhealthy".to_string());
-            data.metadata
-                .insert("connection_id".to_string(), connection.id.to_string());
-            data.metadata
-                .insert("provider_id".to_string(), provider.id.to_string());
-            data.metadata
-                .insert("account_name".to_string(), connection.account_name.clone());
-            data.metadata
-                .insert("failure_reason".to_string(), reason.to_string());
-            data.metadata
-                .insert("previous_status".to_string(), previous_status.to_string());
-            data
+
+            if let Err(e) = alarm_service.fire_alarm(request).await {
+                error!(
+                    connection_id = connection.id,
+                    error = %e,
+                    "Failed to fire git connection unhealthy alarm"
+                );
+            }
         } else if new_status == HEALTH_STATUS_HEALTHY && previous_status == HEALTH_STATUS_UNHEALTHY
         {
-            let mut data = NotificationData {
-                title: format!(
-                    "Git connection recovered: {} ({})",
-                    connection.account_name, provider.name
-                ),
-                message: format!(
-                    "The git connection '{}' on provider '{}' is healthy again after a prior failure{}.\n\n\
-                     Manage it at: {}",
-                    connection.account_name,
-                    provider.name,
-                    previous_message
-                        .map(|m| format!(" ({})", m))
-                        .unwrap_or_default(),
-                    provider_detail_url,
-                ),
-                notification_type: NotificationType::Info,
-                priority: NotificationPriority::Normal,
-                severity: Some("info".to_string()),
-                ..Default::default()
-            };
-            data.metadata
-                .insert("batch_key".to_string(), batch_key.clone());
-            data.metadata
-                .insert("event".to_string(), "git_connection_recovered".to_string());
-            data.metadata
-                .insert("connection_id".to_string(), connection.id.to_string());
-            data.metadata
-                .insert("provider_id".to_string(), provider.id.to_string());
-            data.metadata
-                .insert("account_name".to_string(), connection.account_name.clone());
-            data
+            debug!(
+                connection_id = connection.id,
+                ?previous_message,
+                "Git connection recovered; resolving alarm"
+            );
+            // NOTE: `alarms` has no scope column for an individual git
+            // connection, so this resolves every unhealthy connection alarm
+            // system-wide rather than just this one — same known limitation
+            // as the disk-space monitor's shared cooldown bucket.
+            if let Err(e) = alarm_service
+                .resolve_alarms_by_scope(
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    AlarmType::GitProviderConnectionDown,
+                )
+                .await
+            {
+                error!(
+                    connection_id = connection.id,
+                    error = %e,
+                    "Failed to resolve git connection unhealthy alarm(s)"
+                );
+            }
         } else {
             // unknown -> healthy (first successful check): don't spam admins.
             debug!(
                 connection_id = connection.id,
-                previous_status, new_status, "Skipping notification for benign transition"
-            );
-            return;
-        };
-
-        if let Err(e) = svc.send_notification(notification).await {
-            error!(
-                connection_id = connection.id,
-                error = %e,
-                "Failed to deliver git connection health notification"
+                previous_status, new_status, "Skipping alarm for benign transition"
             );
         }
     }

@@ -60,10 +60,6 @@ impl TempsPlugin for DomainsPlugin {
                 repository.clone(),
             ));
 
-            // Try to get notification service (optional)
-            let notification_service =
-                context.get_service::<dyn temps_core::notifications::NotificationService>();
-
             // Required so background renewals can read `letsencrypt.email` (see
             // `TlsService::get_acme_email`) -- without this, auto-renewal always fails
             // with "User email is required" regardless of what's configured.
@@ -89,7 +85,7 @@ impl TempsPlugin for DomainsPlugin {
             ));
 
             // Create TLS service
-            let mut tls_service = TlsServiceBuilder::new()
+            let tls_service = TlsServiceBuilder::new()
                 .with_repository(repository.clone())
                 .with_cert_provider(cert_provider.clone())
                 .build()
@@ -103,16 +99,9 @@ impl TempsPlugin for DomainsPlugin {
                 .with_dns_automation_gate(dns_automation_gate)
                 .with_audit_logger(audit_service.clone());
 
-            // Add notification service if available
-            if let Some(notif_service) = notification_service {
-                tls_service = tls_service.with_notification_service(notif_service);
-                tracing::debug!("Notification service integrated with TLS service");
-            } else {
-                tracing::debug!(
-                    "No notification service available - renewal notifications will be skipped"
-                );
-            }
-
+            // AlarmService isn't registered yet at this point (Monitoring
+            // registers after Domains) — wired in via `initialize_plugin_services`
+            // once every plugin's Phase 1 has completed.
             let tls_service = Arc::new(tls_service);
             context.register_service(tls_service.clone());
 
@@ -146,6 +135,26 @@ impl TempsPlugin for DomainsPlugin {
             context.register_service(domain_app_state);
 
             tracing::debug!("Domains plugin services registered successfully");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(alarm_service) =
+                context.get_service::<temps_monitoring::alarm_service::AlarmService>()
+            {
+                let tls_service = context.require_service::<crate::tls::TlsService>();
+                tls_service.set_alarm_service(alarm_service);
+                tracing::debug!("AlarmService wired into TLS service");
+            } else {
+                tracing::warn!(
+                    "AlarmService not available - certificate renewal alarms will be skipped"
+                );
+            }
             Ok(())
         })
     }

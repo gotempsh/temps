@@ -9,8 +9,8 @@ use crate::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequ
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, Order, QueryFilter, QueryOrder,
-    Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, Order, QueryFilter, QueryOrder, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,7 +19,7 @@ use temps_core::notifications::{
     NotificationData, NotificationPriority, NotificationService, NotificationType,
 };
 use temps_core::{AutopilotTriggerJob, Job, JobQueue, JobReceiver};
-use temps_entities::{environments, status_checks, status_incidents, status_monitors};
+use temps_entities::{deployments, environments, status_checks, status_incidents, status_monitors};
 use thiserror::Error;
 use tokio::sync::RwLock;
 use tracing::{debug, error, info, warn};
@@ -181,6 +181,46 @@ impl OutageDetectionService {
         self
     }
 
+    /// Check if the environment's current deployment is paused. Always a
+    /// live read: this gates whether a status check gets to create an
+    /// incident/notification at all, so it must reflect `pause_deployment`'s
+    /// state at the moment this specific check is processed.
+    async fn is_deployment_paused(&self, environment_id: Option<i32>) -> bool {
+        Self::is_deployment_paused_conn(self.db.as_ref(), environment_id).await
+    }
+
+    /// Same check as [`Self::is_deployment_paused`], but against a caller-supplied
+    /// connection/transaction rather than always `self.db`. Used by
+    /// [`Self::handle_outage_event`] to re-check pause state and create the
+    /// incident inside the SAME transaction, holding a Postgres advisory lock
+    /// keyed on the environment for the whole thing — see that function's
+    /// comment for why a plain re-check (a separate read followed later by a
+    /// separate write) isn't actually enough to close the race.
+    async fn is_deployment_paused_conn<C: ConnectionTrait>(
+        conn: &C,
+        environment_id: Option<i32>,
+    ) -> bool {
+        let Some(environment_id) = environment_id else {
+            return false;
+        };
+        let Some(current_deployment_id) = environments::Entity::find_by_id(environment_id)
+            .one(conn)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|e| e.current_deployment_id)
+        else {
+            return false;
+        };
+        deployments::Entity::find_by_id(current_deployment_id)
+            .one(conn)
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.state == "paused")
+            .unwrap_or(false)
+    }
+
     /// Process a new status check and detect state transitions
     pub async fn process_check(
         &self,
@@ -195,6 +235,25 @@ impl OutageDetectionService {
             .one(self.db.as_ref())
             .await?
             .ok_or(OutageError::MonitorNotFound(monitor_id))?;
+
+        // Final gate before anything reaches a user: `record_check`'s own
+        // paused guard (in temps-status-page) and this one are two separate
+        // reads with an unavoidable gap between them — a pause committing in
+        // that narrow window could still get this far. This job is
+        // dispatched async after that check (queue send + receive), which
+        // only shrinks the reachable window further, but re-checking live
+        // here — right before an incident/notification would actually be
+        // created — is what makes an intentional pause never actually
+        // produce a downtime alert, regardless of timing upstream. Treat a
+        // check for a now-paused deployment as if it never happened: no
+        // state transition, no incident, no notification.
+        if self.is_deployment_paused(monitor.environment_id).await {
+            debug!(
+                "Monitor {} - deployment is paused, ignoring status check",
+                monitor_id
+            );
+            return Ok(None);
+        }
 
         let mut states = self.monitor_states.write().await;
         let previous_state = states.get(&monitor_id).cloned();
@@ -300,14 +359,109 @@ impl OutageDetectionService {
     /// Handle an outage event: create/resolve incidents, fire/resolve alarms, and send notifications
     async fn handle_outage_event(&self, event: &OutageEvent) -> Result<(), OutageError> {
         if event.current_status.is_outage() {
-            // New outage - create incident
-            let incident_id = self.create_incident(event).await?;
+            // A plain re-check-then-insert still races: the read and the
+            // write are two separate round-trips, and `pause_deployment`
+            // could commit its state flip in the gap between them no matter
+            // how close together they're placed in this function. Closing
+            // that for real means the check and the incident insert have to
+            // happen inside one transaction that also holds a Postgres
+            // advisory lock keyed on the environment — `pause_deployment`
+            // takes the SAME lock before flipping `deployments.state` to
+            // "paused" (see its comment), so the two paths serialize: either
+            // this transaction observes "paused" (because pause_deployment's
+            // lock-holding write already committed) and drops the event, or
+            // it runs first and pause_deployment blocks until this commits,
+            // meaning the incident was correctly created for a deployment
+            // that was genuinely still unpaused at that instant.
+            let Some(environment_id) = event.environment_id else {
+                // No environment to lock on — fall back to a live read; this
+                // only affects monitors with no environment association.
+                if self.is_deployment_paused(event.environment_id).await {
+                    debug!(
+                        "Monitor {} - deployment paused just before incident creation, dropping outage event",
+                        event.monitor_id
+                    );
+                    return Ok(());
+                }
+                let incident_id = self.create_incident(event).await?;
+                self.send_outage_notification(event, incident_id).await?;
+                self.fire_outage_alarm(event).await;
+                self.trigger_downtime_workflows(event).await;
+                let mut states = self.monitor_states.write().await;
+                if let Some(state) = states.get_mut(&event.monitor_id) {
+                    state.active_incident_id = Some(incident_id);
+                }
+                return Ok(());
+            };
+
+            let txn = self.db.begin().await?;
+            txn.execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "SELECT pg_advisory_xact_lock($1)",
+                [sea_orm::Value::BigInt(Some(environment_id as i64))],
+            ))
+            .await?;
+
+            if Self::is_deployment_paused_conn(&txn, event.environment_id).await {
+                txn.rollback().await?;
+                debug!(
+                    "Monitor {} - deployment paused just before incident creation, dropping outage event",
+                    event.monitor_id
+                );
+                return Ok(());
+            }
+
+            // New outage - create incident, still holding the lock so no
+            // pause can commit between the check above and this insert.
+            let incident_id = Self::create_incident_conn(&txn, event).await?;
+            txn.commit().await?;
+
+            // The lock only covers the incident insert — sending the
+            // notification, firing the alarm, and triggering workflows all
+            // happen after releasing it, since those are external I/O
+            // (webhook/email delivery, job queue send) that can't
+            // reasonably sit inside a DB transaction, so there's no way to
+            // hold this lock across them.
+            //
+            // Rather than re-guessing "is the deployment paused right now"
+            // before each of those three calls (still just as racy a
+            // read-then-act, only repeated three times), key off the
+            // incident row itself: `pause_deployment` resolves every open
+            // incident for the environment as part of its own locked
+            // transaction (see its comment), so this incident's `status` is
+            // the canonical, actively-maintained signal for "did a pause
+            // land after I was created." Re-checking it live, right before
+            // each side effect, is what actually catches a pause landing
+            // mid-sequence (e.g. between the notification and the alarm),
+            // not just one landing before the first of the three.
+            if !self.incident_is_open(incident_id).await {
+                debug!(
+                    "Monitor {} - incident {} was resolved (deployment paused) before the \
+                     notification could be sent; skipping",
+                    event.monitor_id, incident_id
+                );
+                return Ok(());
+            }
             self.send_outage_notification(event, incident_id).await?;
 
-            // Fire alarm for the outage
+            if !self.incident_is_open(incident_id).await {
+                debug!(
+                    "Monitor {} - incident {} was resolved (deployment paused) after the \
+                     notification but before the alarm; skipping",
+                    event.monitor_id, incident_id
+                );
+                return Ok(());
+            }
             self.fire_outage_alarm(event).await;
 
-            // Trigger any workflows configured to run on monitoring.downtime
+            if !self.incident_is_open(incident_id).await {
+                debug!(
+                    "Monitor {} - incident {} was resolved (deployment paused) after the alarm \
+                     but before the workflow trigger; skipping",
+                    event.monitor_id, incident_id
+                );
+                return Ok(());
+            }
             self.trigger_downtime_workflows(event).await;
 
             // Update cached state with incident ID
@@ -409,7 +563,7 @@ impl OutageDetectionService {
         };
 
         let request = FireAlarmRequest {
-            project_id: event.project_id,
+            project_id: Some(event.project_id),
             environment_id: Some(environment_id),
             deployment_id: Some(deployment_id),
             container_id: None,
@@ -482,6 +636,16 @@ impl OutageDetectionService {
 
     /// Create a new incident for an outage
     async fn create_incident(&self, event: &OutageEvent) -> Result<i32, OutageError> {
+        Self::create_incident_conn(self.db.as_ref(), event).await
+    }
+
+    /// Same insert as [`Self::create_incident`], parameterized over the
+    /// connection so [`Self::handle_outage_event`] can run it inside the same
+    /// locked transaction as its pause re-check.
+    async fn create_incident_conn<C: ConnectionTrait>(
+        conn: &C,
+        event: &OutageEvent,
+    ) -> Result<i32, OutageError> {
         let severity = IncidentSeverity::from_status(event.current_status);
 
         let incident = status_incidents::ActiveModel {
@@ -500,7 +664,7 @@ impl OutageDetectionService {
             ..Default::default()
         };
 
-        let result = incident.insert(self.db.as_ref()).await?;
+        let result = incident.insert(conn).await?;
         info!(
             "Created incident {} for monitor {} ({})",
             result.id, event.monitor_id, event.monitor_name
@@ -510,6 +674,23 @@ impl OutageDetectionService {
     }
 
     /// Resolve an existing incident
+    /// Live check of whether an incident is still open (not `resolved`).
+    /// `pause_deployment` resolves every open incident for an environment as
+    /// part of its own locked transaction (see its comment), so this is the
+    /// canonical way for `handle_outage_event` to notice a pause that landed
+    /// after the incident was created, without re-guessing deployment pause
+    /// state on every call. Missing incidents are treated as not-open —
+    /// there's nothing left to alert about either way.
+    async fn incident_is_open(&self, incident_id: i32) -> bool {
+        status_incidents::Entity::find_by_id(incident_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|i| i.status != "resolved")
+            .unwrap_or(false)
+    }
+
     async fn resolve_incident(&self, incident_id: i32) -> Result<(), OutageError> {
         let incident = status_incidents::Entity::find_by_id(incident_id)
             .one(self.db.as_ref())
@@ -1131,10 +1312,55 @@ mod tests {
         }
     }
 
+    fn make_deployment_model(id: i32, state: &str) -> temps_entities::deployments::Model {
+        temps_entities::deployments::Model {
+            id,
+            project_id: 1,
+            environment_id: 1,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            slug: format!("deploy-{id}"),
+            state: state.to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: None,
+            branch_ref: None,
+            tag_ref: None,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+        }
+    }
+
+    fn make_status_monitor_model(id: i32, environment_id: Option<i32>) -> status_monitors::Model {
+        status_monitors::Model {
+            id,
+            project_id: 1,
+            environment_id,
+            name: "API Health".to_string(),
+            monitor_type: "web".to_string(),
+            check_path: None,
+            check_interval_seconds: 60,
+            is_active: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
     fn make_alarm_model(id: i32, alarm_type: &str, status: &str) -> temps_entities::alarms::Model {
         temps_entities::alarms::Model {
             id,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: None,
@@ -1149,6 +1375,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -1391,6 +1618,202 @@ mod tests {
             notification_service.send_count(),
             0,
             "No notifications when no alarms to resolve"
+        );
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    /// Final-gate regression test: `process_check` is what `StatusCheckCompleted`
+    /// jobs are dispatched to (async, after `record_check`'s own paused
+    /// guard already ran) and it's the layer that actually creates an
+    /// incident and sends a notification. Even if a pause commits in the
+    /// narrow gap between that upstream guard and its DB insert, this must
+    /// still refuse to turn a "down" status check for a paused deployment
+    /// into a real incident/notification.
+    #[tokio::test]
+    async fn test_process_check_skips_paused_deployment() {
+        let monitor = make_status_monitor_model(1, Some(1));
+
+        // Query order: monitor lookup, then is_deployment_paused's
+        // environment lookup, then its deployment lookup (paused). No
+        // further queries (no incident creation, no alarm/notification
+        // machinery) should happen after that.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![monitor]])
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "paused")]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            notification_service.clone(),
+            job_queue.clone(),
+        ));
+
+        let service = OutageDetectionService::new(db, notification_service.clone(), alarm_service);
+
+        let result = service
+            .process_check(
+                1,
+                MonitorStatus::Down,
+                Some("Connection refused".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            result.is_none(),
+            "a status check for a paused deployment must not produce an outage event"
+        );
+        assert_eq!(
+            notification_service.send_count(),
+            0,
+            "no notification for an intentional pause"
+        );
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    /// Even narrower window than `test_process_check_skips_paused_deployment`:
+    /// the deployment is still unpaused when `process_check`'s own guard
+    /// runs, and only becomes paused afterward — while the in-memory
+    /// state-transition logic and lock acquisition run. The
+    /// `handle_outage_event` guard is what has to catch this, right before
+    /// the incident row would otherwise be inserted.
+    #[tokio::test]
+    async fn test_handle_outage_event_skips_deployment_paused_after_process_check_guard() {
+        let monitor = make_status_monitor_model(1, Some(1));
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![monitor]])
+            // process_check's guard: still unpaused.
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // handle_outage_event's guard runs inside a transaction that
+            // first takes an advisory lock (an exec, not a query) before
+            // re-reading pause state: paused by now.
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "paused")]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            notification_service.clone(),
+            job_queue.clone(),
+        ));
+
+        let service = OutageDetectionService::new(db, notification_service.clone(), alarm_service);
+
+        // process_check itself still reports the computed transition (the
+        // pause hadn't landed yet when it ran) — the guarantee under test is
+        // that handle_outage_event, which owns the actual incident row and
+        // notification, refuses to act on it once the deployment is paused.
+        service
+            .process_check(
+                1,
+                MonitorStatus::Down,
+                Some("Connection refused".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            notification_service.send_count(),
+            0,
+            "no notification when the pause lands right before incident creation"
+        );
+        assert_eq!(job_queue.send_count(), 0);
+    }
+
+    /// Narrower still: the deployment is genuinely unpaused for the whole
+    /// locked check-and-insert (so the incident is correctly created), and
+    /// only becomes paused in the small gap between the transaction
+    /// committing and the notification/alarm/workflow side effects that
+    /// follow it — the one window the advisory lock can't cover, since it
+    /// only wraps the DB write, not delivery to external systems.
+    /// `pause_deployment` resolves the incident as part of ITS locked
+    /// transaction (see its comment); this asserts that
+    /// `handle_outage_event`'s live re-read of the incident's own status —
+    /// not a fresh deployment-pause guess — is what catches that and skips
+    /// the now-stale notification.
+    #[tokio::test]
+    async fn test_handle_outage_event_skips_notification_when_incident_resolved_right_after_creation(
+    ) {
+        let monitor = make_status_monitor_model(1, Some(1));
+        let open_incident = status_incidents::Model {
+            id: 42,
+            project_id: 1,
+            environment_id: Some(1),
+            monitor_id: Some(1),
+            title: "API Health is down".to_string(),
+            description: Some("Connection refused".to_string()),
+            severity: "critical".to_string(),
+            status: "investigating".to_string(),
+            started_at: Utc::now(),
+            resolved_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let resolved_incident = status_incidents::Model {
+            status: "resolved".to_string(),
+            resolved_at: Some(Utc::now()),
+            ..open_incident.clone()
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![vec![monitor]])
+            // process_check's guard: still unpaused.
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // handle_outage_event's locked guard: still unpaused.
+            .append_exec_results(vec![sea_orm::MockExecResult {
+                last_insert_id: 0,
+                rows_affected: 0,
+            }])
+            .append_query_results(vec![vec![make_environment_model(1, Some(10))]])
+            .append_query_results(vec![vec![make_deployment_model(10, "running")]])
+            // create_incident_conn's insert.
+            .append_query_results(vec![vec![open_incident]])
+            // incident_is_open, right before the notification: `pause_deployment`
+            // resolved it in the meantime.
+            .append_query_results(vec![vec![resolved_incident]])
+            .into_connection();
+
+        let db = Arc::new(db);
+        let notification_service = Arc::new(TrackingNotificationService::new());
+        let job_queue = Arc::new(TrackingJobQueue::new());
+
+        let alarm_service = Arc::new(AlarmService::new(
+            db.clone(),
+            notification_service.clone(),
+            job_queue.clone(),
+        ));
+
+        let service = OutageDetectionService::new(db, notification_service.clone(), alarm_service);
+
+        service
+            .process_check(
+                1,
+                MonitorStatus::Down,
+                Some("Connection refused".to_string()),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            notification_service.send_count(),
+            0,
+            "no notification once the incident's own status shows it was resolved"
         );
         assert_eq!(job_queue.send_count(), 0);
     }

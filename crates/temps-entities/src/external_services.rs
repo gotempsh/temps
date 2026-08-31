@@ -75,6 +75,10 @@ pub struct Model {
     /// `m20260804_000001_add_ai_data_access_to_external_services`.
     #[sea_orm(default_value = false)]
     pub ai_data_access: bool,
+    /// Human principal that created this service through the authenticated
+    /// API. This allows a newly-created, not-yet-linked service to be claimed
+    /// by that same user during project creation without trusting a guessed ID.
+    pub created_by_user_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

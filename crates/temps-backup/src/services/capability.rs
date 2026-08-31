@@ -352,6 +352,7 @@ mod tests {
             metrics_enabled: false,
             default_backup_provisioned: false,
             ai_data_access: false,
+            created_by_user_id: None,
             container_name: None,
         }
     }

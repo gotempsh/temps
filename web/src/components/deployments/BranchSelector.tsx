@@ -40,15 +40,7 @@ import { useMemo, useState, useEffect } from 'react'
 import { isExpiredTokenError } from '@/utils/errorHandling'
 import { Link } from 'react-router'
 import { toast } from 'sonner'
-
-/** Detect git provider from a git URL */
-function detectProviderFromUrl(gitUrl: string): 'github' | 'gitlab' | null {
-  if (gitUrl.includes('github.com') || gitUrl.includes('github'))
-    return 'github'
-  if (gitUrl.includes('gitlab.com') || gitUrl.includes('gitlab'))
-    return 'gitlab'
-  return null
-}
+import { parsePublicRepositoryUrl } from '@/lib/public-repository'
 
 /** Normalized branch shape the combobox renders, regardless of source. */
 export interface ResolvedBranch {
@@ -95,13 +87,16 @@ export function BranchSelector({
   const queryClient = useQueryClient()
 
   // Detect if this is a public repo (no connection but has gitUrl)
-  const publicProvider = useMemo(() => {
+  const publicRepository = useMemo(() => {
     if (connectionId) return null
-    if (gitUrl) return detectProviderFromUrl(gitUrl)
+    if (gitUrl) return parsePublicRepositoryUrl(gitUrl)
     // Default to github if we have owner/name but no connection
-    if (repoOwner && repoName) return 'github' as const
+    if (repoOwner && repoName) {
+      return { provider: 'github' as const, owner: repoOwner, name: repoName }
+    }
     return null
   }, [connectionId, gitUrl, repoOwner, repoName])
+  const publicProvider = publicRepository?.provider ?? null
 
   // Fetch branches from authenticated API (when connectionId exists)
   const branchesQuery = useQuery({
@@ -127,6 +122,7 @@ export function BranchSelector({
         owner: repoOwner,
         repo: repoName,
       },
+      query: { base_url: publicRepository?.instanceUrl },
     }),
     enabled:
       !providedBranches &&
@@ -188,6 +184,7 @@ export function BranchSelector({
                 owner: repoOwner,
                 repo: repoName,
               },
+              query: { base_url: publicRepository?.instanceUrl },
             }).queryKey,
           })
         }

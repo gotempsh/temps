@@ -158,7 +158,7 @@ function ParamField({
             ) : (
               <Input
                 {...field}
-                value={field.value as string}
+                value={(field.value as string | undefined) ?? ''}
                 type={
                   paramObj.encrypted
                     ? 'password'

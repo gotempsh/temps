@@ -65,8 +65,8 @@ impl TempsPlugin for BackupPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let external_service_manager =
                 context.require_service::<temps_providers::ExternalServiceManager>();
-            let notification_service =
-                context.require_service::<temps_notifications::NotificationService>();
+            let alarm_service =
+                context.require_service::<temps_monitoring::alarm_service::AlarmService>();
             let config_service = context.require_service::<temps_config::ConfigService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
@@ -74,7 +74,7 @@ impl TempsPlugin for BackupPlugin {
             let backup_service = Arc::new(BackupService::new(
                 db.clone(),
                 external_service_manager.clone(),
-                notification_service.clone(),
+                alarm_service.clone(),
                 config_service.clone(),
                 encryption_service.clone(),
             ));
@@ -117,13 +117,9 @@ impl TempsPlugin for BackupPlugin {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4);
 
-            // Cast Arc<temps_notifications::NotificationService> to
-            // Arc<dyn temps_core::notifications::NotificationService> so the
-            // adapter accepts it.
-            let core_notif_svc: Arc<dyn temps_core::notifications::NotificationService> =
-                notification_service.clone();
-            let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> =
-                Arc::new(BackupNotificationAdapter::new(core_notif_svc, db.clone()));
+            let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> = Arc::new(
+                BackupNotificationAdapter::new(alarm_service.clone(), db.clone()),
+            );
 
             // Shared workspace JobQueue. Producers (BackupService) publish
             // Job::BackupRequested here; the BackupJobProcessor subscribes

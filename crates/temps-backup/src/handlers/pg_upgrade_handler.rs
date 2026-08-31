@@ -621,6 +621,19 @@ mod tests {
         }
     }
 
+    struct NoopJobQueue;
+
+    #[async_trait]
+    impl temps_core::JobQueue for NoopJobQueue {
+        async fn send(&self, _job: temps_core::Job) -> Result<(), temps_core::QueueError> {
+            Ok(())
+        }
+
+        fn subscribe(&self) -> Box<dyn temps_core::JobReceiver> {
+            unimplemented!("NoopJobQueue does not support subscribing in tests")
+        }
+    }
+
     #[derive(Default)]
     struct RecordingAuditLogger {
         operations: Mutex<Vec<(String, String)>>,
@@ -870,10 +883,15 @@ mod tests {
             docker.clone(),
             Arc::new(temps_providers::DnsRegistry::new(db.clone())),
         ));
+        let alarm_service = Arc::new(temps_monitoring::alarm_service::AlarmService::new(
+            db.clone(),
+            Arc::new(NoopNotifications),
+            Arc::new(NoopJobQueue),
+        ));
         let backup_service = Arc::new(BackupService::new(
             db.clone(),
             external_service_manager.clone(),
-            Arc::new(NoopNotifications),
+            alarm_service,
             Arc::new(temps_config::ConfigService::new(
                 Arc::new(server_config()),
                 db.clone(),

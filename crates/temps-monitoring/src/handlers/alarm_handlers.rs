@@ -82,7 +82,8 @@ impl From<AlarmError> for Problem {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AlarmResponse {
     pub id: i32,
-    pub project_id: i32,
+    /// `None` for host/control-plane-wide alarms with no associated project.
+    pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
     pub container_id: Option<i32>,
@@ -102,6 +103,12 @@ pub struct AlarmResponse {
     pub acknowledged_by: Option<i32>,
     /// ISO-8601 UTC timestamp when the alarm was resolved, if any.
     pub resolved_at: Option<String>,
+    /// ISO-8601 UTC timestamp this alarm (and future re-fires of the same
+    /// type/scope) are muted until, if currently silenced. Not cleared when
+    /// the silence expires — check against the current time, or compare to
+    /// `fired_at` on a *new* alarm of the same scope to know a silence has
+    /// lapsed.
+    pub silenced_until: Option<String>,
     /// ISO-8601 UTC timestamp when the row was created.
     pub created_at: String,
     /// ISO-8601 UTC timestamp when the row was last updated.
@@ -127,6 +134,7 @@ impl From<temps_entities::alarms::Model> for AlarmResponse {
             acknowledged_at: m.acknowledged_at.map(|t| t.to_rfc3339()),
             acknowledged_by: m.acknowledged_by,
             resolved_at: m.resolved_at.map(|t| t.to_rfc3339()),
+            silenced_until: m.silenced_until.map(|t| t.to_rfc3339()),
             created_at: m.created_at.to_rfc3339(),
             updated_at: m.updated_at.to_rfc3339(),
         }
@@ -191,6 +199,14 @@ pub struct ListAlarmsQuery {
     pub page_size: Option<u64>,
 }
 
+/// Request body for `POST .../alarms/{alarm_id}/silence`.
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct SilenceAlarmRequest {
+    /// How long to mute this alarm (and future re-fires of the same
+    /// type/scope) for, in hours. Must be between 1 and 168 (7 days).
+    pub duration_hours: i64,
+}
+
 // ---------------------------------------------------------------------------
 // Audit structs
 // ---------------------------------------------------------------------------
@@ -199,7 +215,7 @@ pub struct ListAlarmsQuery {
 struct AlarmAcknowledgedAudit {
     context: AuditContext,
     alarm_id: i32,
-    project_id: i32,
+    project_id: Option<i32>,
 }
 
 impl AuditOperation for AlarmAcknowledgedAudit {
@@ -229,7 +245,7 @@ impl AuditOperation for AlarmAcknowledgedAudit {
 struct AlarmResolvedAudit {
     context: AuditContext,
     alarm_id: i32,
-    project_id: i32,
+    project_id: Option<i32>,
 }
 
 impl AuditOperation for AlarmResolvedAudit {
@@ -252,6 +268,37 @@ impl AuditOperation for AlarmResolvedAudit {
     fn serialize(&self) -> anyhow::Result<String> {
         serde_json::to_string(self)
             .map_err(|e| anyhow::anyhow!("Failed to serialize AlarmResolvedAudit: {}", e))
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AlarmSilencedAudit {
+    context: AuditContext,
+    alarm_id: i32,
+    project_id: Option<i32>,
+    duration_hours: i64,
+}
+
+impl AuditOperation for AlarmSilencedAudit {
+    fn operation_type(&self) -> String {
+        "ALARM_SILENCED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize AlarmSilencedAudit: {}", e))
     }
 }
 
@@ -345,7 +392,7 @@ pub async fn list_project_alarms(
 
     let (items, total) = state
         .alarm_service
-        .list_alarms(project_id, filters, page, page_size)
+        .list_alarms(Some(project_id), filters, page, page_size)
         .await
         .map_err(Problem::from)?;
 
@@ -387,7 +434,7 @@ pub async fn get_project_alarms_summary(
 
     let summary = state
         .alarm_service
-        .get_alarm_summary(project_id)
+        .get_alarm_summary(Some(project_id))
         .await
         .map_err(Problem::from)?;
 
@@ -425,7 +472,7 @@ pub async fn acknowledge_alarm(
 
     state
         .alarm_service
-        .acknowledge_alarm(alarm_id, project_id, auth.user_id())
+        .acknowledge_alarm(alarm_id, Some(project_id), auth.user_id())
         .await
         .map_err(Problem::from)?;
 
@@ -437,7 +484,7 @@ pub async fn acknowledge_alarm(
             user_agent: metadata.user_agent.clone(),
         },
         alarm_id,
-        project_id,
+        project_id: Some(project_id),
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!(
@@ -480,7 +527,7 @@ pub async fn resolve_alarm(
 
     state
         .alarm_service
-        .resolve_alarm(alarm_id, project_id)
+        .resolve_alarm(alarm_id, Some(project_id))
         .await
         .map_err(Problem::from)?;
 
@@ -492,11 +539,366 @@ pub async fn resolve_alarm(
             user_agent: metadata.user_agent.clone(),
         },
         alarm_id,
-        project_id,
+        project_id: Some(project_id),
     };
     if let Err(e) = state.audit_service.create_audit_log(&audit).await {
         error!(
             "Failed to create audit log for alarm resolve {}: {}",
+            alarm_id, e
+        );
+    }
+
+    Ok(StatusCode::OK)
+}
+
+/// Silence an alarm (and future re-fires of the same type/scope) for a
+/// chosen duration, without permanently resolving it.
+#[utoipa::path(
+    post,
+    path = "/projects/{project_id}/alarms/{alarm_id}/silence",
+    tag = "Alarms",
+    operation_id = "silenceAlarm",
+    params(
+        ("project_id" = i32, Path, description = "Project ID"),
+        ("alarm_id" = i32, Path, description = "Alarm ID"),
+    ),
+    request_body = SilenceAlarmRequest,
+    responses(
+        (status = 200, description = "Alarm silenced"),
+        (status = 400, description = "Invalid duration"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alarm not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn silence_alarm(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+    Path((project_id, alarm_id)): Path<(i32, i32)>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(body): Json<SilenceAlarmRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, DeploymentsWrite);
+    project_scope_guard!(auth, project_id);
+    project_access_guard!(auth, project_id, state.project_access_checker);
+
+    if !(1..=168).contains(&body.duration_hours) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid duration")
+            .with_detail("duration_hours must be between 1 and 168 (7 days)"));
+    }
+
+    state
+        .alarm_service
+        .silence_alarm(
+            alarm_id,
+            Some(project_id),
+            chrono::Duration::hours(body.duration_hours),
+        )
+        .await
+        .map_err(Problem::from)?;
+
+    // Audit log — failure is non-fatal
+    let audit = AlarmSilencedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        alarm_id,
+        project_id: Some(project_id),
+        duration_hours: body.duration_hours,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for alarm silence {}: {}",
+            alarm_id, e
+        );
+    }
+
+    Ok(StatusCode::OK)
+}
+
+// ---------------------------------------------------------------------------
+// System alarms — host/control-plane-wide alarms with no associated project
+// (disk space, worker node offline/resource pressure). Gated on
+// `SystemAdmin` rather than a project permission, since there is no project
+// to scope access to.
+// ---------------------------------------------------------------------------
+
+/// List host/control-plane-wide alarms with optional filters.
+#[utoipa::path(
+    get,
+    path = "/system/alarms",
+    tag = "Alarms",
+    operation_id = "listSystemAlarms",
+    params(ListAlarmsQuery),
+    responses(
+        (status = 200, description = "Paginated list of system alarms", body = AlarmListResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn list_system_alarms(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+    Query(params): Query<ListAlarmsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    let page = params.page.unwrap_or(1);
+    let page_size = params.page_size.unwrap_or(20);
+
+    let alarm_type_filter = match &params.alarm_type {
+        Some(s) => match AlarmType::parse_alarm_type(s) {
+            Some(t) => Some(t),
+            None => {
+                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid alarm_type")
+                    .with_detail(format!("Unknown alarm type: {}", s)));
+            }
+        },
+        None => None,
+    };
+
+    let status_filter = match params.status.as_deref() {
+        Some("firing") => Some(crate::alarm_service::AlarmStatus::Firing),
+        Some("acknowledged") => Some(crate::alarm_service::AlarmStatus::Acknowledged),
+        Some("resolved") => Some(crate::alarm_service::AlarmStatus::Resolved),
+        Some(s) => {
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid status")
+                .with_detail(format!(
+                    "Unknown alarm status '{}': must be firing, acknowledged, or resolved",
+                    s
+                )));
+        }
+        None => None,
+    };
+
+    let severity_filter = match params.severity.as_deref() {
+        Some("info") => Some(crate::alarm_service::AlarmSeverity::Info),
+        Some("warning") => Some(crate::alarm_service::AlarmSeverity::Warning),
+        Some("critical") => Some(crate::alarm_service::AlarmSeverity::Critical),
+        Some(s) => {
+            return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                .with_title("Invalid severity")
+                .with_detail(format!(
+                    "Unknown severity '{}': must be info, warning, or critical",
+                    s
+                )));
+        }
+        None => None,
+    };
+
+    let filters = AlarmFilters {
+        environment_id: params.environment_id,
+        deployment_id: params.deployment_id,
+        alarm_type: alarm_type_filter,
+        status: status_filter,
+        severity: severity_filter,
+    };
+
+    let (items, total) = state
+        .alarm_service
+        .list_alarms(None, filters, page, page_size)
+        .await
+        .map_err(Problem::from)?;
+
+    let effective_page_size = std::cmp::min(page_size, 100);
+
+    Ok(Json(AlarmListResponse {
+        items: items.into_iter().map(AlarmResponse::from).collect(),
+        total,
+        page,
+        page_size: effective_page_size,
+    }))
+}
+
+/// Get alarm counts by status/severity/type for system alarms (dashboard summary widget).
+#[utoipa::path(
+    get,
+    path = "/system/alarms/summary",
+    tag = "Alarms",
+    operation_id = "getSystemAlarmsSummary",
+    responses(
+        (status = 200, description = "System alarm summary counts", body = AlarmSummaryResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_system_alarms_summary(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    let summary = state
+        .alarm_service
+        .get_alarm_summary(None)
+        .await
+        .map_err(Problem::from)?;
+
+    Ok(Json(AlarmSummaryResponse::from(summary)))
+}
+
+/// Acknowledge a firing system alarm.
+#[utoipa::path(
+    post,
+    path = "/system/alarms/{alarm_id}/acknowledge",
+    tag = "Alarms",
+    operation_id = "acknowledgeSystemAlarm",
+    params(("alarm_id" = i32, Path, description = "Alarm ID")),
+    responses(
+        (status = 200, description = "Alarm acknowledged"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alarm not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn acknowledge_system_alarm(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+    Path(alarm_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    state
+        .alarm_service
+        .acknowledge_alarm(alarm_id, None, auth.user_id())
+        .await
+        .map_err(Problem::from)?;
+
+    let audit = AlarmAcknowledgedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        alarm_id,
+        project_id: None,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for system alarm acknowledge {}: {}",
+            alarm_id, e
+        );
+    }
+
+    Ok(StatusCode::OK)
+}
+
+/// Resolve a system alarm.
+#[utoipa::path(
+    post,
+    path = "/system/alarms/{alarm_id}/resolve",
+    tag = "Alarms",
+    operation_id = "resolveSystemAlarm",
+    params(("alarm_id" = i32, Path, description = "Alarm ID")),
+    responses(
+        (status = 200, description = "Alarm resolved"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alarm not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn resolve_system_alarm(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+    Path(alarm_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    state
+        .alarm_service
+        .resolve_alarm(alarm_id, None)
+        .await
+        .map_err(Problem::from)?;
+
+    let audit = AlarmResolvedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        alarm_id,
+        project_id: None,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for system alarm resolve {}: {}",
+            alarm_id, e
+        );
+    }
+
+    Ok(StatusCode::OK)
+}
+
+/// Silence a system alarm (and future re-fires of the same type/scope) for a
+/// chosen duration, without permanently resolving it.
+#[utoipa::path(
+    post,
+    path = "/system/alarms/{alarm_id}/silence",
+    tag = "Alarms",
+    operation_id = "silenceSystemAlarm",
+    params(("alarm_id" = i32, Path, description = "Alarm ID")),
+    request_body = SilenceAlarmRequest,
+    responses(
+        (status = 200, description = "Alarm silenced"),
+        (status = 400, description = "Invalid duration"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "Alarm not found"),
+        (status = 500, description = "Internal server error"),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn silence_system_alarm(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<Arc<AlarmAppState>>,
+    Path(alarm_id): Path<i32>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(body): Json<SilenceAlarmRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SystemAdmin);
+
+    if !(1..=168).contains(&body.duration_hours) {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid duration")
+            .with_detail("duration_hours must be between 1 and 168 (7 days)"));
+    }
+
+    state
+        .alarm_service
+        .silence_alarm(alarm_id, None, chrono::Duration::hours(body.duration_hours))
+        .await
+        .map_err(Problem::from)?;
+
+    let audit = AlarmSilencedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        alarm_id,
+        project_id: None,
+        duration_hours: body.duration_hours,
+    };
+    if let Err(e) = state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for system alarm silence {}: {}",
             alarm_id, e
         );
     }
@@ -523,6 +925,24 @@ pub fn configure_routes() -> Router<Arc<AlarmAppState>> {
             "/projects/{project_id}/alarms/{alarm_id}/resolve",
             post(resolve_alarm),
         )
+        .route(
+            "/projects/{project_id}/alarms/{alarm_id}/silence",
+            post(silence_alarm),
+        )
+        .route("/system/alarms", get(list_system_alarms))
+        .route("/system/alarms/summary", get(get_system_alarms_summary))
+        .route(
+            "/system/alarms/{alarm_id}/acknowledge",
+            post(acknowledge_system_alarm),
+        )
+        .route(
+            "/system/alarms/{alarm_id}/resolve",
+            post(resolve_system_alarm),
+        )
+        .route(
+            "/system/alarms/{alarm_id}/silence",
+            post(silence_system_alarm),
+        )
 }
 
 // ---------------------------------------------------------------------------
@@ -536,11 +956,18 @@ pub fn configure_routes() -> Router<Arc<AlarmAppState>> {
         get_project_alarms_summary,
         acknowledge_alarm,
         resolve_alarm,
+        silence_alarm,
+        list_system_alarms,
+        get_system_alarms_summary,
+        acknowledge_system_alarm,
+        resolve_system_alarm,
+        silence_system_alarm,
     ),
     components(schemas(
         AlarmResponse,
         AlarmListResponse,
         AlarmSummaryResponse,
+        SilenceAlarmRequest,
     )),
     info(
         title = "Alarms API",
@@ -601,7 +1028,7 @@ mod tests {
     fn sample_alarm(id: i32) -> alarms::Model {
         alarms::Model {
             id,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: None,
@@ -616,6 +1043,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -637,7 +1065,7 @@ mod tests {
         let resp = AlarmResponse::from(model.clone());
 
         assert_eq!(resp.id, 42);
-        assert_eq!(resp.project_id, 1);
+        assert_eq!(resp.project_id, Some(1));
         assert_eq!(resp.alarm_type, "container_restart");
         assert_eq!(resp.severity, "warning");
         assert_eq!(resp.status, "firing");
@@ -692,7 +1120,7 @@ mod tests {
     fn test_alarm_not_found_maps_to_404() {
         let err = AlarmError::NotFound {
             alarm_id: 5,
-            project_id: 1,
+            project_id: Some(1),
         };
         let problem = Problem::from(err);
         assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
@@ -743,7 +1171,7 @@ mod tests {
 
         let service = make_alarm_service(db);
         let (items, total) = service
-            .list_alarms(1, AlarmFilters::default(), 1, 20)
+            .list_alarms(Some(1), AlarmFilters::default(), 1, 20)
             .await
             .unwrap();
 
@@ -762,7 +1190,7 @@ mod tests {
 
         let service = make_alarm_service(db);
         let (items, total) = service
-            .list_alarms(1, AlarmFilters::default(), 1, 20)
+            .list_alarms(Some(1), AlarmFilters::default(), 1, 20)
             .await
             .unwrap();
 
@@ -784,7 +1212,7 @@ mod tests {
             alarm_type: Some(AlarmType::ContainerRestart),
             ..Default::default()
         };
-        let (items, total) = service.list_alarms(1, filters, 1, 20).await.unwrap();
+        let (items, total) = service.list_alarms(Some(1), filters, 1, 20).await.unwrap();
 
         assert_eq!(total, 1);
         assert_eq!(items[0].alarm_type, "container_restart");
@@ -799,7 +1227,7 @@ mod tests {
             .into_connection();
 
         let service = make_alarm_service(db);
-        let result = service.acknowledge_alarm(999, 1, 42).await;
+        let result = service.acknowledge_alarm(999, Some(1), 42).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -807,7 +1235,7 @@ mod tests {
             err,
             AlarmError::NotFound {
                 alarm_id: 999,
-                project_id: 1
+                project_id: Some(1)
             }
         ));
 
@@ -825,7 +1253,7 @@ mod tests {
             .into_connection();
 
         let service = make_alarm_service(db);
-        let result = service.resolve_alarm(888, 1).await;
+        let result = service.resolve_alarm(888, Some(1)).await;
 
         assert!(result.is_err());
         let err = result.unwrap_err();
@@ -833,7 +1261,7 @@ mod tests {
             err,
             AlarmError::NotFound {
                 alarm_id: 888,
-                project_id: 1
+                project_id: Some(1)
             }
         ));
 
@@ -859,7 +1287,7 @@ mod tests {
             .into_connection();
 
         let service = make_alarm_service(db);
-        let result = service.resolve_alarm(1, 1).await;
+        let result = service.resolve_alarm(1, Some(1)).await;
         assert!(result.is_ok());
     }
 
@@ -879,7 +1307,7 @@ mod tests {
             .into_connection();
 
         let service = make_alarm_service(db);
-        let result = service.acknowledge_alarm(1, 1, 42).await;
+        let result = service.acknowledge_alarm(1, Some(1), 42).await;
         assert!(result.is_ok());
     }
 

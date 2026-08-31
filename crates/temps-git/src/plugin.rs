@@ -146,22 +146,18 @@ impl TempsPlugin for GitPlugin {
             // Create cache manager
             let cache_manager = Arc::new(crate::services::cache::GitProviderCacheManager::new());
 
-            // Notifications are optional — if the notifications plugin hasn't
-            // registered a service, health checks still run and persist status,
-            // we just can't alert anyone.
-            let notification_service =
-                context.get_service::<dyn temps_core::notifications::NotificationService>();
-
             let console_base_url = {
                 let server_config = config_service.get_server_config();
                 format!("http://{}", server_config.console_address)
             };
 
+            // AlarmService isn't registered yet at this point (Monitoring
+            // registers after Git) — wired in via `initialize_plugin_services`
+            // once every plugin's Phase 1 has completed.
             let connection_health_service = Arc::new(ConnectionHealthService::new(
                 db.clone(),
                 git_provider_manager.clone(),
                 github_service.clone(),
-                notification_service,
                 console_base_url,
             ));
             context.register_service(connection_health_service.clone());
@@ -221,6 +217,27 @@ impl TempsPlugin for GitPlugin {
             context.register_plugin_state("git", git_app_state);
 
             tracing::debug!("Git plugin services registered successfully");
+            Ok(())
+        })
+    }
+
+    fn initialize_plugin_services<'a>(
+        &'a self,
+        context: &'a PluginContext,
+    ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(alarm_service) =
+                context.get_service::<temps_monitoring::alarm_service::AlarmService>()
+            {
+                let connection_health_service =
+                    context.require_service::<ConnectionHealthService>();
+                connection_health_service.set_alarm_service(alarm_service);
+                tracing::debug!("AlarmService wired into git connection health service");
+            } else {
+                tracing::warn!(
+                    "AlarmService not available - git connection health alarms will be skipped"
+                );
+            }
             Ok(())
         })
     }

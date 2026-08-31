@@ -95,7 +95,7 @@ pub struct AlertEvaluator {
 /// environment and deployment are `None` and the alarm row stores NULL for
 /// both, matching the nullable FK shape on `alarms.environment_id`,
 /// `alarms.deployment_id`, and `alarms.service_id`.
-type AlarmContext = (i32, Option<i32>, Option<i32>, Option<i32>);
+type AlarmContext = (Option<i32>, Option<i32>, Option<i32>, Option<i32>);
 
 impl AlertEvaluator {
     /// Create a new evaluator.
@@ -406,7 +406,7 @@ impl AlertEvaluator {
                 let ctx = context_cache
                     .get(&rule.id)
                     .copied()
-                    .unwrap_or((0, None, None, None));
+                    .unwrap_or((None, None, None, None));
                 if let Err(e) = self.evaluate_rule(rule, &latest, ctx).await {
                     warn!(
                         rule_id = rule.id,
@@ -633,7 +633,12 @@ impl AlertEvaluator {
                 .await
             {
                 // Deployment-scoped rules have no associated service.
-                return (dep.project_id, Some(dep.environment_id), Some(dep_id), None);
+                return (
+                    Some(dep.project_id),
+                    Some(dep.environment_id),
+                    Some(dep_id),
+                    None,
+                );
             }
         }
 
@@ -648,13 +653,17 @@ impl AlertEvaluator {
                 // deployment context — store NULL for those so the FK
                 // constraints hold — but DO carry the service_id so the alarm
                 // (and its notification) records which service breached.
-                return (ps.project_id, None, None, Some(svc_id));
+                return (Some(ps.project_id), None, None, Some(svc_id));
             }
         }
 
-        // Fallback — no context found. project_id=0 keeps existing behaviour
-        // for unsuppressed errors elsewhere; env/deployment/service stay None.
-        (0, None, None, None)
+        // Node-scoped rules (and the fallback for a rule whose deployment/
+        // service row has since been deleted) have no project: `node_id` on
+        // `monitoring_alert_rules` has no project relation at all — worker
+        // nodes aren't owned by a single project. `project_id: None` marks
+        // these as host/control-plane-wide "system" alarms rather than
+        // misattributing them to project id 0 as a sentinel.
+        (None, None, None, None)
     }
 }
 
@@ -1720,7 +1729,7 @@ mod tests {
         let (project_id, environment_id, deployment_id, service_id) =
             evaluator.resolve_alarm_context(&rule).await;
 
-        assert_eq!(project_id, 4);
+        assert_eq!(project_id, Some(4));
         assert_eq!(environment_id, None);
         assert_eq!(deployment_id, None);
         assert_eq!(
@@ -1731,8 +1740,8 @@ mod tests {
     }
 
     /// A service-scoped rule whose service has no owning project falls back to
-    /// the sentinel context but still preserves the service_id so the alarm can
-    /// at least name the service.
+    /// a host-wide (project_id: None) "system" alarm context but still
+    /// preserves the service_id so the alarm can at least name the service.
     #[tokio::test]
     async fn resolve_alarm_context_service_rule_without_project_keeps_service_id() {
         let rule = make_rule(Some(9), None);
@@ -1746,21 +1755,23 @@ mod tests {
         let (project_id, environment_id, deployment_id, service_id) =
             evaluator.resolve_alarm_context(&rule).await;
 
-        // Falls through to the sentinel — no project mapping found.
-        assert_eq!(project_id, 0);
+        // Falls through to a system-wide (no project) alarm — no project
+        // mapping found, and there's no project to misattribute it to.
+        assert_eq!(project_id, None);
         assert_eq!(environment_id, None);
         assert_eq!(deployment_id, None);
         // service_id is None here because the fallback path can't attribute it
-        // to a project; the alarm is still stored under the sentinel project.
+        // to a project; the alarm is still stored as system-wide.
         assert_eq!(service_id, None);
     }
 
     /// Node-scoped rules (proxy metrics) have no project/service/deployment
-    /// context — they must resolve to the sentinel context without issuing any
-    /// DB queries (the MockDatabase has no results queued; a lookup would
-    /// error, not return the sentinel).
+    /// context — worker nodes aren't owned by a single project — so they must
+    /// resolve to a host-wide (project_id: None) "system" alarm context
+    /// without issuing any DB queries (the MockDatabase has no results
+    /// queued; a lookup would error, not return the fallback).
     #[tokio::test]
-    async fn resolve_alarm_context_node_rule_uses_sentinel_without_queries() {
+    async fn resolve_alarm_context_node_rule_has_no_project_without_queries() {
         let rule = make_rule_with_node(None, None, Some(0));
 
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
@@ -1769,7 +1780,7 @@ mod tests {
         let (project_id, environment_id, deployment_id, service_id) =
             evaluator.resolve_alarm_context(&rule).await;
 
-        assert_eq!(project_id, 0);
+        assert_eq!(project_id, None);
         assert_eq!(environment_id, None);
         assert_eq!(deployment_id, None);
         assert_eq!(service_id, None);

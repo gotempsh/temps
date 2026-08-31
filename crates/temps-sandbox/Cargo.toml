@@ -47,3 +47,4 @@ tar = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tower = { workspace = true }
+tempfile = { workspace = true }

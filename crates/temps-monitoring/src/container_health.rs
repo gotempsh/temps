@@ -307,7 +307,7 @@ impl ContainerHealthMonitor {
         };
 
         let request = FireAlarmRequest {
-            project_id: deployment.project_id,
+            project_id: Some(deployment.project_id),
             environment_id: Some(deployment.environment_id),
             deployment_id: Some(deployment.id),
             container_id: Some(container.id),
@@ -367,6 +367,23 @@ impl ContainerHealthMonitor {
                     return;
                 }
 
+                // Skip alarm if the deployment was intentionally paused by the
+                // user — `pause_deployment` stops containers on purpose, so
+                // this exit is expected, not a crash. Re-read the deployment
+                // live rather than trusting `deployment.state`: that value is
+                // a snapshot batch-loaded once at the start of the current
+                // poll cycle (see `check_all_containers`), so a pause that
+                // commits mid-cycle — after the snapshot was taken but before
+                // this container is reached — would otherwise still look
+                // unpaused here.
+                if self.is_deployment_paused(deployment.id).await {
+                    debug!(
+                        "Container {} ({}) is {} but deployment {} is paused, skipping alarm",
+                        container.id, container.container_name, status_str, deployment.id
+                    );
+                    return;
+                }
+
                 warn!(
                     "Container {} ({}) is in '{}' state (reason: {})",
                     container.id,
@@ -390,7 +407,7 @@ impl ContainerHealthMonitor {
                     .unwrap_or_else(|| status_str.clone());
 
                 let request = FireAlarmRequest {
-                    project_id: deployment.project_id,
+                    project_id: Some(deployment.project_id),
                     environment_id: Some(deployment.environment_id),
                     deployment_id: Some(deployment.id),
                     container_id: Some(container.id),
@@ -483,6 +500,20 @@ impl ContainerHealthMonitor {
             Ok(Some(env)) => env.sleeping,
             _ => false,
         }
+    }
+
+    /// Check if a deployment is currently paused. Always a live read (never
+    /// cached or batch-snapshotted) since this feeds an alarm-suppression
+    /// decision that must reflect `pause_deployment`'s state at the moment
+    /// the alarm would fire, not at the start of the poll cycle.
+    async fn is_deployment_paused(&self, deployment_id: i32) -> bool {
+        deployments::Entity::find_by_id(deployment_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|d| d.state == "paused")
+            .unwrap_or(false)
     }
 
     /// Check CPU and memory usage against thresholds
@@ -775,7 +806,7 @@ impl ContainerHealthMonitor {
         }
 
         let request = FireAlarmRequest {
-            project_id: deployment.project_id,
+            project_id: Some(deployment.project_id),
             environment_id: Some(deployment.environment_id),
             deployment_id: Some(deployment.id),
             container_id: Some(container.id),
@@ -1085,7 +1116,7 @@ mod tests {
         // DB calls: cooldown check (count=0) + insert alarm
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(1),
@@ -1100,6 +1131,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1182,7 +1214,7 @@ mod tests {
 
         let alarm_model = temps_entities::alarms::Model {
             id: 1,
-            project_id: 1,
+            project_id: Some(1),
             environment_id: Some(1),
             deployment_id: Some(10),
             container_id: Some(1),
@@ -1197,6 +1229,7 @@ mod tests {
             acknowledged_at: None,
             acknowledged_by: None,
             resolved_at: None,
+            silenced_until: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1221,6 +1254,89 @@ mod tests {
         // Should fire alarm for exited container
         monitor
             .check_container_status(&container, &deployment, &info)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn test_check_container_status_exited_skips_alarm_when_paused() {
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Exited));
+        let container = make_container_model(1);
+        let deployment = deployments::Model {
+            state: "paused".to_string(),
+            ..make_deployment_model()
+        };
+
+        // Query order: `is_on_demand_sleeping` reads `environments` first (not
+        // found here, so it reports "not sleeping"), then `is_deployment_paused`
+        // reads `deployments` live and must see `state == "paused"` — this is
+        // the live re-read added after PR #835 review found the deployment
+        // model passed into `check_container_status` can be a stale snapshot
+        // batch-loaded once per poll cycle. No alarm-related DB calls
+        // (cooldown check / insert) should happen after that: if the paused
+        // check were skipped, the monitor would try to query for them and
+        // this MockDatabase (with no further results queued) would surface it.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::environments::Model>::new()])
+            .append_query_results(vec![vec![deployment.clone()]])
+            .into_connection();
+        let db = Arc::new(db);
+        let alarm_service = make_alarm_service(db.clone());
+
+        let monitor = ContainerHealthMonitor::new(
+            db,
+            deployer.clone(),
+            alarm_service,
+            ContainerHealthConfig::default(),
+        );
+
+        let info = deployer.get_container_info("abc123").await.unwrap();
+        monitor
+            .check_container_status(&container, &deployment, &info)
+            .await;
+    }
+
+    /// Regression test: `check_all_containers` batch-loads its deployments
+    /// map once per poll cycle, so the `deployment` snapshot passed into
+    /// `check_container_status` can be stale by the time a specific
+    /// container is reached — e.g. a pause that commits mid-cycle, after the
+    /// snapshot was taken. The alarm decision must be driven by a live read,
+    /// not by `deployment.state` on the passed-in snapshot: here the
+    /// snapshot still says "ready" (not paused) but the live DB row is
+    /// "paused", and the alarm must still be skipped.
+    #[tokio::test]
+    async fn test_check_container_status_uses_live_state_not_stale_snapshot() {
+        let deployer = Arc::new(MockDeployer::new(0, ContainerStatus::Exited));
+        let container = make_container_model(1);
+        let stale_snapshot = deployments::Model {
+            state: "ready".to_string(),
+            ..make_deployment_model()
+        };
+        let live_paused_row = deployments::Model {
+            state: "paused".to_string(),
+            ..make_deployment_model()
+        };
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::environments::Model>::new()])
+            .append_query_results(vec![vec![live_paused_row]])
+            .into_connection();
+        let db = Arc::new(db);
+        let alarm_service = make_alarm_service(db.clone());
+
+        let monitor = ContainerHealthMonitor::new(
+            db,
+            deployer.clone(),
+            alarm_service,
+            ContainerHealthConfig::default(),
+        );
+
+        let info = deployer.get_container_info("abc123").await.unwrap();
+        // Passing the stale, still-"ready" snapshot: if the implementation
+        // regressed to reading `stale_snapshot.state` instead of doing a
+        // live lookup, it would try to fire an alarm here and hit
+        // unmocked DB calls this MockDatabase has no results queued for.
+        monitor
+            .check_container_status(&container, &stale_snapshot, &info)
             .await;
     }
 

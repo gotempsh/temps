@@ -26,15 +26,13 @@ use sea_orm::{
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use temps_core::notifications::{
-    NotificationData, NotificationPriority, NotificationService, NotificationType,
-};
 use temps_core::EncryptionService;
 use temps_entities::{
     backup_schedule_services, backup_schedules, external_service_health_checks, external_services,
-    s3_sources,
+    project_services, s3_sources,
 };
 use temps_metrics::{MetricKind, MetricPoint, MetricsStore, SourceKind};
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -83,7 +81,7 @@ pub enum HealthMonitorError {
 pub struct ExternalServiceHealthMonitor {
     db: Arc<DatabaseConnection>,
     manager: Arc<ExternalServiceManager>,
-    notification_service: Arc<dyn NotificationService>,
+    alarm_service: Arc<AlarmService>,
     config: ExternalServiceHealthConfig,
     /// Docker handle used by the per-service MariaDB binlog archiver to read
     /// closed binlog segments out of the container.
@@ -111,7 +109,7 @@ impl ExternalServiceHealthMonitor {
     pub fn new(
         db: Arc<DatabaseConnection>,
         manager: Arc<ExternalServiceManager>,
-        notification_service: Arc<dyn NotificationService>,
+        alarm_service: Arc<AlarmService>,
         config: ExternalServiceHealthConfig,
         docker: Arc<Docker>,
         encryption_service: Arc<EncryptionService>,
@@ -119,7 +117,7 @@ impl ExternalServiceHealthMonitor {
         Self {
             db,
             manager,
-            notification_service,
+            alarm_service,
             config,
             docker,
             encryption_service,
@@ -669,6 +667,19 @@ impl ExternalServiceHealthMonitor {
         }
     }
 
+    /// Resolve the project a service belongs to, for scoping its alarm.
+    /// External services have no `project_id` column of their own — it's
+    /// only known via the `project_services` join table.
+    async fn resolve_project_id(&self, service_id: i32) -> Option<i32> {
+        project_services::Entity::find()
+            .filter(project_services::Column::ServiceId.eq(service_id))
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|ps| ps.project_id)
+    }
+
     async fn send_down_alert(
         &self,
         service: &external_services::Model,
@@ -684,76 +695,61 @@ impl ExternalServiceHealthMonitor {
             error_message.unwrap_or("(no details)")
         );
 
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
+        let project_id = self.resolve_project_id(service.id).await;
+        let request = FireAlarmRequest {
+            project_id,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: Some(service.id),
+            alarm_type: AlarmType::ExternalServiceDown,
+            severity: AlarmSeverity::Critical,
             title,
             message,
-            notification_type: NotificationType::Error,
-            priority: NotificationPriority::Critical,
-            severity: Some("critical".to_string()),
-            timestamp: Utc::now(),
-            metadata: [
-                ("source".to_string(), "external_service_health".to_string()),
-                ("service_id".to_string(), service.id.to_string()),
-                ("service_name".to_string(), service.name.clone()),
-                ("service_type".to_string(), service.service_type.clone()),
-            ]
-            .into_iter()
-            .collect(),
-            bypass_throttling: true,
+            metadata: Some(serde_json::json!({
+                "service_name": service.name,
+                "service_type": service.service_type,
+            })),
         };
 
-        if let Err(e) = self
-            .notification_service
-            .send_notification(notification)
-            .await
-        {
-            error!(
-                "Failed to send down-alert notification for service {}: {}",
-                service.id, e
-            );
-        } else {
-            info!(
+        match self.alarm_service.fire_alarm(request).await {
+            Ok(Some(_)) => info!(
                 "Sent health-check down alert for service {} ({})",
                 service.id, service.name
-            );
+            ),
+            Ok(None) => debug!(
+                "Down alert for service {} suppressed by cooldown/silence",
+                service.id
+            ),
+            Err(e) => error!(
+                "Failed to fire down-alert alarm for service {}: {}",
+                service.id, e
+            ),
         }
     }
 
     async fn send_recovered_alert(&self, service: &external_services::Model) {
-        let title = format!("Service recovered: {}", service.name);
-        let message = format!(
-            "External service '{}' ({}) is responding to health checks again.",
-            service.name, service.service_type,
-        );
-
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
-            title,
-            message,
-            notification_type: NotificationType::Info,
-            priority: NotificationPriority::Normal,
-            severity: None,
-            timestamp: Utc::now(),
-            metadata: [
-                ("source".to_string(), "external_service_health".to_string()),
-                ("service_id".to_string(), service.id.to_string()),
-                ("service_name".to_string(), service.name.clone()),
-                ("status".to_string(), "recovered".to_string()),
-            ]
-            .into_iter()
-            .collect(),
-            bypass_throttling: false,
-        };
-
+        let project_id = self.resolve_project_id(service.id).await;
         if let Err(e) = self
-            .notification_service
-            .send_notification(notification)
+            .alarm_service
+            .resolve_alarms_by_scope(
+                project_id,
+                None,
+                None,
+                None,
+                Some(service.id),
+                AlarmType::ExternalServiceDown,
+            )
             .await
         {
             error!(
-                "Failed to send recovery notification for service {}: {}",
+                "Failed to resolve down-alert alarm(s) for recovered service {}: {}",
                 service.id, e
+            );
+        } else {
+            info!(
+                "Service {} ({}) recovered — resolved its down alarm(s)",
+                service.id, service.name
             );
         }
     }

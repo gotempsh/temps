@@ -302,20 +302,6 @@ impl TempsPlugin for DeploymentsPlugin {
             // Get DSN service for automatic Sentry DSN generation (required)
             let dsn_service = context.require_service::<temps_error_tracking::DSNService>();
 
-            // Wire the shared environment-variable resolver into DeploymentService
-            // so the inline promote/rollback deploy paths resolve env from the
-            // selected environment (the SAME set as a normal deploy) instead of
-            // starting the reused image with no config. See services::env_resolver.
-            let env_resolver = Arc::new(crate::services::env_resolver::DeploymentEnvResolver {
-                db: db.clone(),
-                encryption_service: encryption_service.clone(),
-                config_service: config_service.clone(),
-                external_service_manager: external_service_manager.clone(),
-                dsn_service: dsn_service.clone(),
-                deployment_token_service: deployment_token_service.clone(),
-            });
-            deployment_service.set_env_resolver(env_resolver);
-
             // Create JobProcessor with workflow execution capability
             let job_receiver = queue_service.subscribe();
             let workflow_planner = Arc::new(WorkflowPlanner::new(
@@ -323,8 +309,8 @@ impl TempsPlugin for DeploymentsPlugin {
                 log_service.clone(),
                 external_service_manager.clone(),
                 config_service.clone(),
-                dsn_service,
-                encryption_service,
+                dsn_service.clone(),
+                encryption_service.clone(),
             ));
 
             // Capture the secrets-resolver handle BEFORE moving workflow_planner
@@ -335,6 +321,21 @@ impl TempsPlugin for DeploymentsPlugin {
             // SecretsManagerResolver will register AFTER this plugin, so looking
             // it up here with get_service would always return None.
             let secrets_resolver_handle = workflow_planner.secrets_resolver_handle();
+
+            // Wire the shared environment-variable resolver into
+            // DeploymentService. It shares the same late-bound EE secrets
+            // resolver as WorkflowPlanner so normal, promotion, and rollback
+            // deployments use the same precedence layers.
+            let env_resolver = Arc::new(crate::services::env_resolver::DeploymentEnvResolver {
+                db: db.clone(),
+                encryption_service: encryption_service.clone(),
+                config_service: config_service.clone(),
+                external_service_manager: external_service_manager.clone(),
+                dsn_service: dsn_service.clone(),
+                deployment_token_service: deployment_token_service.clone(),
+                secrets_resolver: secrets_resolver_handle.clone(),
+            });
+            deployment_service.set_env_resolver(env_resolver);
 
             // Clone workflow_execution_service before passing to job processor
             // (the job processor takes ownership, but we need to register it too)

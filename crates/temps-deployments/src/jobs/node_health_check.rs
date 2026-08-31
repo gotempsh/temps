@@ -12,6 +12,7 @@
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
 
 use temps_entities::nodes;
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 
 use crate::services::node_service::NodeService;
 use crate::DeploymentService;
@@ -90,10 +91,8 @@ pub async fn check_node_health(node_service: &NodeService, db: &DatabaseConnecti
 pub async fn notify_nodes_offline(
     offline_node_ids: &[i32],
     node_service: &NodeService,
-    notification_service: &std::sync::Arc<dyn temps_core::notifications::NotificationService>,
+    alarm_service: &std::sync::Arc<AlarmService>,
 ) {
-    use temps_core::notifications::{NotificationData, NotificationPriority, NotificationType};
-
     for &node_id in offline_node_ids {
         let name = node_service
             .get_by_id(node_id)
@@ -101,29 +100,37 @@ pub async fn notify_nodes_offline(
             .map(|n| n.name)
             .unwrap_or_else(|_| format!("node-{}", node_id));
 
-        let mut metadata = std::collections::HashMap::new();
-        metadata.insert("event".to_string(), "node_offline".to_string());
-        metadata.insert("node_id".to_string(), node_id.to_string());
-        metadata.insert("node_name".to_string(), name.clone());
-
-        let notification = NotificationData {
+        // Nodes are host-wide, not project-scoped, and `alarms` has no
+        // node-scope column, so this fires as a single system-wide alarm —
+        // same known limitation as the disk-space monitor's shared cooldown
+        // bucket (concurrent offline events for different nodes within the
+        // cooldown window collapse into one alarm).
+        let request = FireAlarmRequest {
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::NodeOffline,
+            severity: AlarmSeverity::Critical,
             title: format!("Worker node '{}' is offline", name),
             message: format!(
                 "Node '{}' (id {}) stopped sending heartbeats for over {}s and was marked offline. \
                  Affected workloads are being failed over to healthy nodes.",
                 name, node_id, HEARTBEAT_STALE_THRESHOLD_SECS
             ),
-            notification_type: NotificationType::Alert,
-            priority: NotificationPriority::Critical,
-            ..Default::default()
+            metadata: Some(serde_json::json!({
+                "node_id": node_id,
+                "node_name": name,
+            })),
         };
 
-        match notification_service.send_notification(notification).await {
-            Ok(()) => tracing::info!(node_id, node_name = %name, "Sent node-offline alert"),
+        match alarm_service.fire_alarm(request).await {
+            Ok(_) => tracing::info!(node_id, node_name = %name, "Fired node-offline alarm"),
             Err(e) => tracing::error!(
                 node_id,
                 node_name = %name,
-                "Failed to send node-offline alert: {}",
+                "Failed to fire node-offline alarm: {}",
                 e
             ),
         }
@@ -139,33 +146,17 @@ pub async fn notify_nodes_offline(
 pub async fn notify_node_recovered(
     node_id: i32,
     node_name: &str,
-    notification_service: &std::sync::Arc<dyn temps_core::notifications::NotificationService>,
+    alarm_service: &std::sync::Arc<AlarmService>,
 ) {
-    use temps_core::notifications::{NotificationData, NotificationPriority, NotificationType};
-
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert("event".to_string(), "node_recovered".to_string());
-    metadata.insert("node_id".to_string(), node_id.to_string());
-    metadata.insert("node_name".to_string(), node_name.to_string());
-
-    let notification = NotificationData {
-        title: format!("Worker node '{}' is back online", node_name),
-        message: format!(
-            "Node '{}' (id {}) resumed sending heartbeats and was marked active again.",
-            node_name, node_id
-        ),
-        notification_type: NotificationType::Info,
-        priority: NotificationPriority::Normal,
-        metadata,
-        ..Default::default()
-    };
-
-    match notification_service.send_notification(notification).await {
-        Ok(()) => tracing::info!(node_id, node_name = %node_name, "Sent node-recovery alert"),
+    match alarm_service
+        .resolve_alarms_by_scope(None, None, None, None, None, AlarmType::NodeOffline)
+        .await
+    {
+        Ok(_) => tracing::info!(node_id, node_name = %node_name, "Resolved node-offline alarm(s)"),
         Err(e) => tracing::error!(
             node_id,
             node_name = %node_name,
-            "Failed to send node-recovery alert: {}",
+            "Failed to resolve node-offline alarm(s): {}",
             e
         ),
     }
@@ -175,36 +166,41 @@ pub async fn notify_node_recovered(
 /// body) so the notification pipeline's batch-key throttle collapses repeated
 /// alerts for the same node+metric instead of firing every 60s cycle.
 async fn send_node_resource_alert(
-    notification_service: &std::sync::Arc<dyn temps_core::notifications::NotificationService>,
+    alarm_service: &std::sync::Arc<AlarmService>,
     node_name: &str,
     node_id: i32,
     metric: &str,
     value: f64,
     threshold: f64,
 ) {
-    use temps_core::notifications::{NotificationData, NotificationPriority, NotificationType};
-    let mut metadata = std::collections::HashMap::new();
-    metadata.insert("event".to_string(), "node_resource_high".to_string());
-    metadata.insert("node_id".to_string(), node_id.to_string());
-    metadata.insert("node_name".to_string(), node_name.to_string());
-    metadata.insert("metric".to_string(), metric.to_string());
-    metadata.insert("value_percent".to_string(), format!("{:.1}", value));
-    metadata.insert("threshold_percent".to_string(), format!("{:.0}", threshold));
-    let notification = NotificationData {
+    // Same system-wide-scope limitation as `notify_nodes_offline`: no
+    // node/metric-scope column exists on `alarms`, so a breach on one
+    // node+metric shares its cooldown bucket with breaches on any other.
+    let request = FireAlarmRequest {
+        project_id: None,
+        environment_id: None,
+        deployment_id: None,
+        container_id: None,
+        service_id: None,
+        alarm_type: AlarmType::NodeResourcePressure,
+        severity: AlarmSeverity::Warning,
         title: format!("Worker node '{}' {} usage is high", node_name, metric),
         message: format!(
             "{} on node '{}' (id {}) is at {:.1}% (alert threshold {:.0}%).",
             metric, node_name, node_id, value, threshold
         ),
-        notification_type: NotificationType::Warning,
-        priority: NotificationPriority::High,
-        metadata,
-        ..Default::default()
+        metadata: Some(serde_json::json!({
+            "node_id": node_id,
+            "node_name": node_name,
+            "metric": metric,
+            "value_percent": value,
+            "threshold_percent": threshold,
+        })),
     };
-    if let Err(e) = notification_service.send_notification(notification).await {
-        tracing::error!(node_id, metric, "Failed to send node resource alert: {}", e);
+    if let Err(e) = alarm_service.fire_alarm(request).await {
+        tracing::error!(node_id, metric, "Failed to fire node resource alarm: {}", e);
     } else {
-        tracing::info!(node_id, node_name = %node_name, metric, value, "Sent node resource alert");
+        tracing::info!(node_id, node_name = %node_name, metric, value, "Fired node resource alarm");
     }
 }
 
@@ -215,7 +211,7 @@ async fn send_node_resource_alert(
 pub async fn check_node_resources(
     db: &DatabaseConnection,
     config_service: &temps_config::ConfigService,
-    notification_service: &std::sync::Arc<dyn temps_core::notifications::NotificationService>,
+    alarm_service: &std::sync::Arc<AlarmService>,
 ) {
     // Operator-configurable thresholds (settings.multi_node.node_*_alert_percent);
     // `None` disables alerting for that metric. Defaults to 90%.
@@ -249,15 +245,8 @@ pub async fn check_node_resources(
         for (metric, value, threshold) in
             resource_breaches(&node.capacity, cpu_threshold, mem_threshold, disk_threshold)
         {
-            send_node_resource_alert(
-                notification_service,
-                &node.name,
-                node.id,
-                metric,
-                value,
-                threshold,
-            )
-            .await;
+            send_node_resource_alert(alarm_service, &node.name, node.id, metric, value, threshold)
+                .await;
         }
     }
 }
@@ -380,7 +369,7 @@ pub fn refresh_control_plane_metrics() {
 /// gap. No-op until the first `refresh_control_plane_metrics()`.
 pub async fn check_control_plane_resources(
     config_service: &temps_config::ConfigService,
-    notification_service: &std::sync::Arc<dyn temps_core::notifications::NotificationService>,
+    alarm_service: &std::sync::Arc<AlarmService>,
 ) {
     let Some((capacity, _)) = latest_control_plane_metrics() else {
         return;
@@ -402,7 +391,7 @@ pub async fn check_control_plane_resources(
         settings.multi_node.node_disk_alert_percent,
     ) {
         send_node_resource_alert(
-            notification_service,
+            alarm_service,
             "control-plane",
             CONTROL_PLANE_NODE_ID,
             metric,

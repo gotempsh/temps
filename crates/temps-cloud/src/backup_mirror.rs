@@ -2337,6 +2337,7 @@ mod tests {
             default_backup_provisioned: false,
             container_name: None,
             ai_data_access: false,
+            created_by_user_id: None,
         };
         let source = temps_entities::s3_sources::Model {
             id: 7,

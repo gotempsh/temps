@@ -10,12 +10,10 @@ use hickory_resolver::net::runtime::TokioRuntimeProvider;
 use hickory_resolver::Resolver;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use serde::Serialize;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use temps_core::notifications::{
-    NotificationData, NotificationPriority, NotificationService, NotificationType,
-};
 use temps_core::{AuditLogger, AuditOperation};
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use tracing::{error, info, warn};
 
 use super::errors::{BuilderError, TlsError};
@@ -85,7 +83,10 @@ pub struct TlsService {
     repository: Arc<dyn CertificateRepository>,
     cert_provider: Arc<dyn CertificateProvider>,
     resolver: Arc<TokioResolver>,
-    notification_service: Option<Arc<dyn NotificationService>>,
+    /// Set post-construction via `set_alarm_service` once all plugins have
+    /// registered — `DomainsPlugin` registers before `MonitoringPlugin`, so
+    /// `AlarmService` isn't available yet during `register_services`.
+    alarm_service: OnceLock<Arc<AlarmService>>,
     config_service: Option<Arc<temps_config::ConfigService>>,
     db: Option<Arc<temps_database::DbConnection>>,
     /// Domain service used to drive the order-based ACME flow during background
@@ -135,7 +136,7 @@ impl TlsService {
             repository,
             cert_provider,
             resolver,
-            notification_service: None,
+            alarm_service: OnceLock::new(),
             config_service: None,
             db: None,
             domain_service: None,
@@ -146,12 +147,12 @@ impl TlsService {
         }
     }
 
-    pub fn with_notification_service(
-        mut self,
-        notification_service: Arc<dyn NotificationService>,
-    ) -> Self {
-        self.notification_service = Some(notification_service);
-        self
+    /// Wire the `AlarmService` after construction. Idempotent — only the
+    /// first call takes effect. Called from `DomainsPlugin::initialize_plugin_services`,
+    /// which runs only after every plugin (including Monitoring) has finished
+    /// `register_services`.
+    pub fn set_alarm_service(&self, alarm_service: Arc<AlarmService>) {
+        let _ = self.alarm_service.set(alarm_service);
     }
 
     pub fn with_config_service(mut self, config_service: Arc<temps_config::ConfigService>) -> Self {
@@ -1021,9 +1022,15 @@ impl TlsService {
             return;
         }
 
-        let Some(notif_service) = &self.notification_service else {
+        let Some(alarm_service) = self.alarm_service.get() else {
             return;
         };
+
+        // Only fire an alarm when the cycle produced something actionable —
+        // an all-green summary isn't worth persisting as an alarm.
+        if report.renewal_failed.is_empty() && report.manual_action_needed.is_empty() {
+            return;
+        }
 
         let mut message = format!(
             "Certificate Renewal Report\n\nTotal Checked: {}\n",
@@ -1063,41 +1070,34 @@ impl TlsService {
             }
         }
 
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
+        // Renewal cycles run on a schedule shared across every domain on the
+        // host, so this fires as a single system-wide alarm (no per-domain
+        // scope column exists on `alarms`) — same known limitation as the
+        // disk-space monitor's cooldown bucket.
+        let request = FireAlarmRequest {
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::TlsRenewalFailed,
+            severity: if report.renewal_failed.is_empty() {
+                AlarmSeverity::Warning
+            } else {
+                AlarmSeverity::Critical
+            },
             title: "Certificate Renewal Report".to_string(),
             message,
-            notification_type: if report.renewal_failed.is_empty() {
-                NotificationType::Info
-            } else {
-                NotificationType::Warning
-            },
-            priority: if report.renewal_failed.is_empty() {
-                NotificationPriority::Normal
-            } else {
-                NotificationPriority::High
-            },
-            severity: None,
-            timestamp: Utc::now(),
-            metadata: std::collections::HashMap::from([
-                (
-                    "auto_renewed".to_string(),
-                    report.auto_renewed.len().to_string(),
-                ),
-                (
-                    "failed".to_string(),
-                    report.renewal_failed.len().to_string(),
-                ),
-                (
-                    "manual_needed".to_string(),
-                    report.manual_action_needed.len().to_string(),
-                ),
-            ]),
-            bypass_throttling: false,
+            metadata: Some(serde_json::json!({
+                "auto_renewed": report.auto_renewed.len(),
+                "failed": report.renewal_failed.len(),
+                "manual_needed": report.manual_action_needed.len(),
+            })),
         };
 
-        if let Err(e) = notif_service.send_notification(notification).await {
-            error!("Failed to send renewal summary notification: {}", e);
+        match alarm_service.fire_alarm(request).await {
+            Ok(_) => {}
+            Err(e) => error!("Failed to fire renewal summary alarm: {}", e),
         }
     }
 
@@ -1107,39 +1107,37 @@ impl TlsService {
         error: &str,
         verification_method: &str,
     ) {
-        let Some(notif_service) = &self.notification_service else {
+        let Some(alarm_service) = self.alarm_service.get() else {
             return;
         };
 
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
+        let request = FireAlarmRequest {
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::TlsRenewalFailed,
+            severity: AlarmSeverity::Critical,
             title: format!("Certificate Renewal Failed: {}", domain),
             message: format!(
                 "Failed to automatically renew certificate for {}.\n\nError: {}\n\nPlease renew this certificate manually in the Temps dashboard.",
                 domain, error
             ),
-            notification_type: NotificationType::Error,
-            priority: NotificationPriority::High,
-            severity: Some("error".to_string()),
-            timestamp: Utc::now(),
-            metadata: std::collections::HashMap::from([
-                ("domain".to_string(), domain.to_string()),
-                ("error".to_string(), error.to_string()),
-                (
-                    "verification_method".to_string(),
-                    verification_method.to_string(),
-                ),
-            ]),
-            bypass_throttling: true,
+            metadata: Some(serde_json::json!({
+                "domain": domain,
+                "error": error,
+                "verification_method": verification_method,
+            })),
         };
 
-        if let Err(e) = notif_service.send_notification(notification).await {
-            error!("Failed to send renewal failure notification: {}", e);
+        if let Err(e) = alarm_service.fire_alarm(request).await {
+            error!("Failed to fire renewal failure alarm: {}", e);
         }
     }
 
     async fn send_manual_renewal_notification(&self, cert: &Certificate) {
-        let Some(notif_service) = &self.notification_service else {
+        let Some(alarm_service) = self.alarm_service.get() else {
             return;
         };
 
@@ -1151,8 +1149,20 @@ impl TlsService {
             "certificate"
         };
 
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
+        let request = FireAlarmRequest {
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::TlsCertExpiring,
+            severity: if days_remaining <= 7 {
+                AlarmSeverity::Critical
+            } else if days_remaining <= 14 {
+                AlarmSeverity::Warning
+            } else {
+                AlarmSeverity::Info
+            },
             title: format!("Action Required: Renew Certificate for {}", cert.domain),
             message: format!(
                 "Your {} for {} will expire in {} days.\n\nSince this is a DNS-01 certificate, you need to manually renew it:\n1. Go to Temps Dashboard → Domains → {}\n2. Click 'Renew Certificate'\n3. Add the provided DNS TXT record\n4. Click 'Finalize Renewal'\n\nYour current certificate remains active during renewal.",
@@ -1161,38 +1171,17 @@ impl TlsService {
                 days_remaining,
                 cert.domain
             ),
-            notification_type: if days_remaining <= 7 {
-                NotificationType::Alert
-            } else {
-                NotificationType::Warning
-            },
-            priority: if days_remaining <= 7 {
-                NotificationPriority::Critical
-            } else if days_remaining <= 14 {
-                NotificationPriority::High
-            } else {
-                NotificationPriority::Normal
-            },
-            severity: if days_remaining <= 7 {
-                Some("critical".to_string())
-            } else if days_remaining <= 14 {
-                Some("warning".to_string())
-            } else {
-                Some("info".to_string())
-            },
-            timestamp: Utc::now(),
-            metadata: std::collections::HashMap::from([
-                ("domain".to_string(), cert.domain.clone()),
-                ("expires_at".to_string(), cert.expiration_time.to_rfc3339()),
-                ("days_remaining".to_string(), days_remaining.to_string()),
-                ("verification_method".to_string(), "dns-01".to_string()),
-                ("is_wildcard".to_string(), cert.is_wildcard.to_string()),
-            ]),
-            bypass_throttling: days_remaining <= 7,
+            metadata: Some(serde_json::json!({
+                "domain": cert.domain,
+                "expires_at": cert.expiration_time.to_rfc3339(),
+                "days_remaining": days_remaining,
+                "verification_method": "dns-01",
+                "is_wildcard": cert.is_wildcard,
+            })),
         };
 
-        if let Err(e) = notif_service.send_notification(notification).await {
-            error!("Failed to send manual renewal notification: {}", e);
+        if let Err(e) = alarm_service.fire_alarm(request).await {
+            error!("Failed to fire manual renewal alarm: {}", e);
         }
     }
 

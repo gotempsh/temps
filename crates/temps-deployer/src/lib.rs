@@ -17,6 +17,14 @@ use std::pin::Pin;
 use temps_core::UtcDateTime;
 use thiserror::Error;
 
+/// Backpressure-aware byte stream used when importing an OCI image.
+///
+/// Keeping this at the trait boundary lets remote agents forward an upload
+/// directly to Docker instead of first materializing the complete archive in
+/// a temporary file (and charging that file's page cache to the agent cgroup).
+pub type ImageImportStream =
+    Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, std::io::Error>> + Send>>;
+
 pub mod compose;
 
 /// Callback function type for processing build logs in real-time
@@ -575,6 +583,60 @@ pub trait ImageBuilder: Send + Sync {
 
     /// Import an image from a tar archive
     async fn import_image(&self, image_path: PathBuf, tag: &str) -> Result<String, BuilderError>;
+
+    /// Import an image from a backpressure-aware byte stream.
+    ///
+    /// Implementations that accept remote uploads should override this. The
+    /// default preserves compatibility for builders that only support files.
+    async fn import_image_stream(
+        &self,
+        mut stream: ImageImportStream,
+        tag: &str,
+    ) -> Result<String, BuilderError> {
+        use futures::StreamExt;
+        use tokio::io::AsyncWriteExt;
+
+        // File-only builders keep their previous behavior. DockerRuntime
+        // overrides this method and forwards chunks directly to dockerd, so
+        // worker image transfers do not take this compatibility path.
+        let archive = tempfile::NamedTempFile::new().map_err(|source| {
+            BuilderError::IoError(std::io::Error::new(
+                source.kind(),
+                format!("Failed to create temporary image archive for '{tag}': {source}"),
+            ))
+        })?;
+        let archive_file = archive.reopen().map_err(|source| {
+            BuilderError::IoError(std::io::Error::new(
+                source.kind(),
+                format!("Failed to open temporary image archive for '{tag}': {source}"),
+            ))
+        })?;
+        let mut archive_file = tokio::fs::File::from_std(archive_file);
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|source| {
+                BuilderError::IoError(std::io::Error::new(
+                    source.kind(),
+                    format!("Failed while receiving image archive for '{tag}': {source}"),
+                ))
+            })?;
+            archive_file.write_all(&chunk).await.map_err(|source| {
+                BuilderError::IoError(std::io::Error::new(
+                    source.kind(),
+                    format!("Failed to write temporary image archive for '{tag}': {source}"),
+                ))
+            })?;
+        }
+        archive_file.flush().await.map_err(|source| {
+            BuilderError::IoError(std::io::Error::new(
+                source.kind(),
+                format!("Failed to flush temporary image archive for '{tag}': {source}"),
+            ))
+        })?;
+        drop(archive_file);
+
+        self.import_image(archive.path().to_path_buf(), tag).await
+    }
 
     /// Export (save) an image to a tar archive file.
     /// Equivalent to `docker save <image_name> -o <output_path>`.

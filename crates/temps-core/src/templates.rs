@@ -813,6 +813,10 @@ templates:
             starter.services.iter().any(|s| s == "postgres"),
             "observability-starter must depend on postgres"
         );
+        assert!(
+            starter.env_vars.is_empty(),
+            "observability-starter must not ask for platform-managed observability variables"
+        );
     }
 
     #[test]

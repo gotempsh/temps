@@ -8,6 +8,7 @@ mod autopack_preset;
 mod build_system;
 mod docker;
 pub mod docker_compose;
+pub mod dockerfile_expose;
 mod docker_custom;
 mod docusaurus;
 pub mod env_example;
@@ -315,6 +316,20 @@ pub trait Preset: fmt::Display + Send + Sync {
     fn static_output_dir(&self) -> Option<String> {
         None // Default: requires runtime server
     }
+
+    /// Whether this preset needs a container build step at all.
+    ///
+    /// `true` for every preset that compiles something (even static-capable
+    /// ones like Vite still need `npm run build` inside a container) or that
+    /// runs as a long-lived server. `false` only for presets whose deployable
+    /// output *is* the checked-out source with no build step — there the
+    /// workflow planner skips Docker/image-build entirely and deploys
+    /// directly from the downloaded repository, since building an image just
+    /// to immediately discard it (or, worse, run it as a container purely to
+    /// serve static files) is pure overhead.
+    fn needs_container_build(&self) -> bool {
+        true
+    }
 }
 
 pub fn all_presets() -> Vec<Box<dyn Preset>> {
@@ -537,6 +552,13 @@ pub fn detect_all_presets_from_files(files: &[String]) -> Vec<Box<dyn Preset>> {
     // Only detect Nixpacks if there's an explicit nixpacks.toml file
     if files.iter().any(|path| path.ends_with("nixpacks.toml")) {
         presets.push(Box::new(NixpacksPreset::auto()));
+    }
+
+    // Static site fallback: a plain index.html with no build system found above.
+    // Checked last, mirroring `detect_project_candidates` and autopack's own
+    // static provider (registered last, only claims what no language claims).
+    if presets.is_empty() && files.iter().any(|path| path.ends_with("index.html")) {
+        presets.push(Box::new(NixpacksPreset::new(NixpacksProvider::Static)));
     }
 
     presets

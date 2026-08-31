@@ -21,7 +21,7 @@ use std::sync::Arc;
 use temps_auth::{
     permission_guard, project_access_guard, project_permission_guard, project_scope_guard,
 };
-use temps_auth::{AuthContext, RequireAuth};
+use temps_auth::{AuthContext, Permission, RequireAuth, Role};
 use temps_core::RequestMetadata;
 use tracing::{debug, error, info, warn};
 
@@ -35,7 +35,7 @@ use super::types::{
 use crate::services::types::CreateProjectEnvVar;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use temps_core::problemdetails;
 use temps_core::problemdetails::Problem;
@@ -103,6 +103,134 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
         )
         // Merge custom domain routes
         .merge(custom_domain_routes)
+}
+
+fn storage_service_access_denied() -> Problem {
+    problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("Insufficient Permissions")
+        .with_detail("You do not have access to one or more selected databases")
+}
+
+async fn require_storage_services_access(
+    state: &AppState,
+    auth: &AuthContext,
+    service_ids: &[i32],
+) -> Result<Vec<i32>, Problem> {
+    if service_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let scopes = state
+        .external_service_manager
+        .project_scopes_for_services(service_ids)
+        .await
+        .map_err(|error| match error {
+            temps_providers::ExternalServiceError::ServiceNotFound { .. } => {
+                storage_service_access_denied()
+            }
+            error => {
+                error!(error = %error, "failed to resolve selected database access scopes");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Database Authorization Failed")
+                    .with_detail("The selected databases could not be authorized")
+            }
+        })?;
+
+    authorize_storage_service_scopes(auth, state.project_access_checker.as_deref(), &scopes).await
+}
+
+async fn authorize_storage_service_scopes(
+    auth: &AuthContext,
+    checker: Option<&dyn temps_core::ProjectAccessChecker>,
+    scopes: &[temps_providers::ExternalServiceProjectScope],
+) -> Result<Vec<i32>, Problem> {
+    if auth.is_admin() || auth.has_role(&Role::PlatformAdmin) {
+        return Ok(Vec::new());
+    }
+    let Some(checker) = checker else {
+        // Plain OSS has no team boundary.
+        return Ok(Vec::new());
+    };
+
+    let project_ids: Vec<i32> = scopes
+        .iter()
+        .flat_map(|scope| scope.project_ids.iter().copied())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let permissions = checker
+        .effective_project_permissions_batch(auth.user_id(), &project_ids)
+        .await
+        .map_err(|checker_error| {
+            error!(
+                user_id = auth.user_id(),
+                ?project_ids,
+                error = %checker_error,
+                "selected database permission resolution failed closed"
+            );
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Authorization Failed")
+                .with_detail("Project permissions for the selected databases could not be resolved")
+        })?;
+    if project_ids
+        .iter()
+        .any(|project_id| !permissions.contains_key(project_id))
+    {
+        error!(
+            user_id = auth.user_id(),
+            ?project_ids,
+            "selected database permission result omitted a project"
+        );
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Database Authorization Failed")
+            .with_detail("Project permissions for the selected databases were incomplete"));
+    }
+
+    let fallback_ids: Vec<i32> = project_ids
+        .iter()
+        .copied()
+        .filter(|project_id| matches!(permissions.get(project_id), Some(None)))
+        .collect();
+    let coarse_access = checker
+        .user_can_access_projects(auth.user_id(), &fallback_ids)
+        .await
+        .map_err(|checker_error| {
+            error!(
+                user_id = auth.user_id(),
+                ?fallback_ids,
+                error = %checker_error,
+                "selected database membership resolution failed closed"
+            );
+            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Database Authorization Failed")
+                .with_detail("Project access for the selected databases could not be resolved")
+        })?;
+    if fallback_ids
+        .iter()
+        .any(|project_id| !coarse_access.contains_key(project_id))
+    {
+        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .with_title("Database Authorization Failed")
+            .with_detail("Project access for the selected databases was incomplete"));
+    }
+
+    let required_permission = Permission::ExternalServicesWrite.to_string();
+    let can_access_project = |project_id: &i32| match permissions.get(project_id) {
+        Some(Some(project_permissions)) => project_permissions.contains(&required_permission),
+        Some(None) => coarse_access.get(project_id).copied().unwrap_or(false),
+        None => false,
+    };
+    let mut creator_claims = Vec::new();
+    for scope in scopes {
+        if scope.project_ids.is_empty() && scope.created_by_user_id == Some(auth.user_id()) {
+            creator_claims.push(scope.service_id);
+        } else if scope.project_ids.is_empty() || !scope.project_ids.iter().any(can_access_project)
+        {
+            return Err(storage_service_access_denied());
+        }
+    }
+
+    Ok(creator_claims)
 }
 
 #[derive(OpenApi)]
@@ -552,6 +680,12 @@ pub async fn create_project(
     Json(project): Json<CreateProjectRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsCreate);
+    let storage_service_claim_ids = if !project.storage_service_ids.is_empty() {
+        permission_guard!(auth, ExternalServicesWrite);
+        require_storage_services_access(state.as_ref(), &auth, &project.storage_service_ids).await?
+    } else {
+        Vec::new()
+    };
 
     // Only require repo_name and repo_owner for Git source type
     // For docker_image and static_files, Git info is optional
@@ -577,6 +711,8 @@ pub async fn create_project(
         environment_variables: project.environment_variables,
         automatic_deploy: project.automatic_deploy.unwrap_or(false),
         storage_service_ids: project.storage_service_ids,
+        storage_service_claim_ids,
+        storage_service_claim_user_id: Some(auth.user_id()),
         is_public_repo: project.is_public_repo,
         git_url: project.git_url,
         git_provider_connection_id: project.git_provider_connection_id,
@@ -850,6 +986,8 @@ pub async fn update_project(
         environment_variables: project.environment_variables.clone(),
         automatic_deploy: project.automatic_deploy.unwrap_or(false),
         storage_service_ids: project.storage_service_ids.clone(),
+        storage_service_claim_ids: Vec::new(),
+        storage_service_claim_user_id: None,
         is_public_repo: None,               // Keep existing setting
         git_url: None,                      // Keep existing setting
         git_provider_connection_id: None,   // Keep existing setting
@@ -2091,6 +2229,12 @@ pub async fn create_project_from_template(
     Json(request): Json<super::templates::CreateProjectFromTemplateRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, ProjectsCreate);
+    let storage_service_claim_ids = if !request.storage_service_ids.is_empty() {
+        permission_guard!(auth, ExternalServicesWrite);
+        require_storage_services_access(state.as_ref(), &auth, &request.storage_service_ids).await?
+    } else {
+        Vec::new()
+    };
 
     // 1. Get the template
     let template = state
@@ -2155,6 +2299,8 @@ pub async fn create_project_from_template(
             environment_variables: env_vars,
             automatic_deploy: false,
             storage_service_ids: request.storage_service_ids.clone(),
+            storage_service_claim_ids: storage_service_claim_ids.clone(),
+            storage_service_claim_user_id: Some(auth.user_id()),
             is_public_repo: None,
             git_url: None,
             git_provider_connection_id: None,
@@ -2227,6 +2373,8 @@ pub async fn create_project_from_template(
                     environment_variables: env_vars,
                     automatic_deploy: request.automatic_deploy,
                     storage_service_ids: request.storage_service_ids.clone(),
+                    storage_service_claim_ids: storage_service_claim_ids.clone(),
+                    storage_service_claim_user_id: Some(auth.user_id()),
                     is_public_repo: Some(!new_repo.private),
                     git_url: Some(new_repo.clone_url.clone()),
                     git_provider_connection_id: Some(connection_id),
@@ -2273,6 +2421,8 @@ pub async fn create_project_from_template(
                     // auto-deploy-on-push is meaningless here regardless of request.
                     automatic_deploy: false,
                     storage_service_ids: request.storage_service_ids.clone(),
+                    storage_service_claim_ids: storage_service_claim_ids.clone(),
+                    storage_service_claim_user_id: Some(auth.user_id()),
                     is_public_repo: Some(true),
                     git_url: Some(template.git.url.clone()),
                     git_provider_connection_id: None,
@@ -2385,13 +2535,16 @@ pub async fn create_project_from_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        compose_path_for_candidate, parse_owner_repo_from_git_url,
-        project_created_from_template_telemetry_event, require_git_settings_permissions,
+        authorize_storage_service_scopes, compose_path_for_candidate,
+        parse_owner_repo_from_git_url, project_created_from_template_telemetry_event,
+        require_git_settings_permissions,
     };
+    use axum::http::StatusCode;
     use chrono::Utc;
     use std::collections::BTreeMap;
     use temps_auth::{AuthContext, Permission};
     use temps_entities::users;
+    use temps_providers::ExternalServiceProjectScope;
 
     fn custom_api_key(permissions: Vec<Permission>) -> AuthContext {
         let now = Utc::now();
@@ -2436,6 +2589,217 @@ mod tests {
             Permission::GitRepositoriesRead,
         ]);
         assert!(require_git_settings_permissions(&authorized).is_ok());
+    }
+
+    struct StorageAccessChecker {
+        permissions: BTreeMap<i32, Option<Vec<String>>>,
+        coarse_access: BTreeMap<i32, bool>,
+    }
+
+    #[temps_core::async_trait::async_trait]
+    impl temps_core::ProjectAccessChecker for StorageAccessChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self
+                .coarse_access
+                .get(&project_id)
+                .copied()
+                .unwrap_or(false))
+        }
+
+        async fn user_can_access_projects(
+            &self,
+            _user_id: i32,
+            project_ids: &[i32],
+        ) -> Result<BTreeMap<i32, bool>, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(project_ids
+                .iter()
+                .filter_map(|project_id| {
+                    self.coarse_access
+                        .get(project_id)
+                        .copied()
+                        .map(|allowed| (*project_id, allowed))
+                })
+                .collect())
+        }
+
+        async fn effective_project_permissions_batch(
+            &self,
+            _user_id: i32,
+            project_ids: &[i32],
+        ) -> Result<BTreeMap<i32, Option<Vec<String>>>, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(project_ids
+                .iter()
+                .filter_map(|project_id| {
+                    self.permissions
+                        .get(project_id)
+                        .cloned()
+                        .map(|permissions| (*project_id, permissions))
+                })
+                .collect())
+        }
+    }
+
+    fn service_scope(service_id: i32, project_ids: Vec<i32>) -> ExternalServiceProjectScope {
+        ExternalServiceProjectScope {
+            service_id,
+            project_ids,
+            created_by_user_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn selected_database_requires_write_access_to_each_service_scope() {
+        let auth = custom_api_key(vec![
+            Permission::ProjectsCreate,
+            Permission::ExternalServicesWrite,
+        ]);
+        let checker = StorageAccessChecker {
+            permissions: BTreeMap::from([
+                (7, Some(vec![Permission::ExternalServicesWrite.to_string()])),
+                (8, Some(vec![Permission::ExternalServicesRead.to_string()])),
+            ]),
+            coarse_access: BTreeMap::new(),
+        };
+
+        let allowed =
+            authorize_storage_service_scopes(&auth, Some(&checker), &[service_scope(1, vec![7])])
+                .await;
+        assert!(allowed.is_ok());
+
+        let denied = authorize_storage_service_scopes(
+            &auth,
+            Some(&checker),
+            &[service_scope(1, vec![7]), service_scope(2, vec![8])],
+        )
+        .await
+        .expect_err("every selected database must be authorized");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn selected_unlinked_database_is_denied_when_project_auth_is_active() {
+        let auth = custom_api_key(vec![
+            Permission::ProjectsCreate,
+            Permission::ExternalServicesWrite,
+        ]);
+        let checker = StorageAccessChecker {
+            permissions: BTreeMap::new(),
+            coarse_access: BTreeMap::new(),
+        };
+
+        let denied = authorize_storage_service_scopes(
+            &auth,
+            Some(&checker),
+            &[service_scope(1, Vec::new())],
+        )
+        .await
+        .expect_err("unlinked databases have no trustworthy tenant owner");
+
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn creator_can_claim_a_new_unlinked_database_for_project_creation() {
+        let auth = custom_api_key(vec![
+            Permission::ProjectsCreate,
+            Permission::ExternalServicesWrite,
+        ]);
+        let checker = StorageAccessChecker {
+            permissions: BTreeMap::new(),
+            coarse_access: BTreeMap::new(),
+        };
+        let owned_scope = ExternalServiceProjectScope {
+            service_id: 1,
+            project_ids: Vec::new(),
+            created_by_user_id: Some(auth.user_id()),
+        };
+
+        let claims = authorize_storage_service_scopes(&auth, Some(&checker), &[owned_scope])
+            .await
+            .expect("creator should receive the one-time bootstrap claim");
+        assert_eq!(claims, vec![1]);
+    }
+
+    #[tokio::test]
+    async fn creator_cannot_bypass_permissions_after_database_is_linked() {
+        let auth = custom_api_key(vec![
+            Permission::ProjectsCreate,
+            Permission::ExternalServicesWrite,
+        ]);
+        let checker = StorageAccessChecker {
+            permissions: BTreeMap::from([(
+                7,
+                Some(vec![Permission::ExternalServicesRead.to_string()]),
+            )]),
+            coarse_access: BTreeMap::new(),
+        };
+        let linked_scope = ExternalServiceProjectScope {
+            service_id: 1,
+            project_ids: vec![7],
+            created_by_user_id: Some(auth.user_id()),
+        };
+
+        let denied = authorize_storage_service_scopes(&auth, Some(&checker), &[linked_scope])
+            .await
+            .expect_err("creator marker must not bypass linked-project permissions");
+        assert_eq!(denied.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn selected_database_coarse_access_fallback_and_oss_mode_are_supported() {
+        let auth = custom_api_key(vec![
+            Permission::ProjectsCreate,
+            Permission::ExternalServicesWrite,
+        ]);
+        let checker = StorageAccessChecker {
+            permissions: BTreeMap::from([(7, None)]),
+            coarse_access: BTreeMap::from([(7, true)]),
+        };
+        let scopes = [service_scope(1, vec![7])];
+
+        assert!(
+            authorize_storage_service_scopes(&auth, Some(&checker), &scopes)
+                .await
+                .is_ok()
+        );
+        assert!(authorize_storage_service_scopes(&auth, None, &scopes)
+            .await
+            .is_ok());
+    }
+
+    #[test]
+    fn project_creation_handlers_preflight_selected_database_permissions() {
+        let source = include_str!("handlers.rs");
+        for handler_name in ["create_project", "create_project_from_template"] {
+            let start = source
+                .find(&format!("pub async fn {handler_name}"))
+                .expect("project creation handler exists");
+            let tail = &source[start + 1..];
+            let end = tail.find("pub async fn").unwrap_or(tail.len());
+            let body = &source[start..start + 1 + end];
+
+            assert!(body.contains("permission_guard!(auth, ExternalServicesWrite)"));
+            assert!(body.contains("require_storage_services_access"));
+        }
+
+        let template_start = source
+            .find("pub async fn create_project_from_template")
+            .expect("template handler exists");
+        let template_body = &source[template_start..];
+        assert!(
+            template_body
+                .find("require_storage_services_access")
+                .expect("authorization preflight")
+                < template_body
+                    .find("get_template(&request.template_slug)")
+                    .expect("template lookup"),
+            "database authorization must precede template/repository side effects"
+        );
     }
 
     #[test]

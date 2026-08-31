@@ -9,11 +9,18 @@ import {
   listProjectAlarmsOptions,
   listProjectAlarmsQueryKey,
   resolveAlarmMutation,
+  silenceAlarmMutation,
 } from '@/api/client/@tanstack/react-query.gen'
 import type { AlarmResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { EmptyState } from '@/components/ui/empty-state'
 import {
   Select,
@@ -36,10 +43,17 @@ import { usePageTitle } from '@/hooks/usePageTitle'
 import { cn } from '@/lib/utils'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format, formatDistanceToNow } from 'date-fns'
-import { AlarmClock, Check, CheckCircle2, X } from 'lucide-react'
+import { AlarmClock, BellOff, Check, CheckCircle2, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { useSearchParams } from 'react-router'
 import { toast } from 'sonner'
+
+const SILENCE_OPTIONS = [
+  { label: '1 hour', hours: 1 },
+  { label: '4 hours', hours: 4 },
+  { label: '24 hours', hours: 24 },
+  { label: '7 days', hours: 24 * 7 },
+] as const
 
 const PAGE_SIZE = 20
 const ALL = '__all__'
@@ -86,6 +100,12 @@ function statusBadge(status: string) {
         </Badge>
       )
   }
+}
+
+function isSilenced(alarm: AlarmResponse): boolean {
+  return (
+    !!alarm.silenced_until && new Date(alarm.silenced_until).getTime() > Date.now()
+  )
 }
 
 function scopeLabel(alarm: AlarmResponse): string {
@@ -214,11 +234,23 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
     onError: (err: Error) => toast.error(`Failed to resolve: ${err.message}`),
   })
 
+  const silence = useMutation({
+    ...silenceAlarmMutation(),
+    onSuccess: (_data, variables) => {
+      const hours = variables.body?.duration_hours ?? 0
+      const label =
+        SILENCE_OPTIONS.find((o) => o.hours === hours)?.label ?? `${hours}h`
+      toast.success(`Alarm silenced for ${label}`)
+      invalidate()
+    },
+    onError: (err: Error) => toast.error(`Failed to silence: ${err.message}`),
+  })
+
   const items = data?.items ?? []
   const total = data?.total ?? 0
   const totalPages = Math.max(1, Math.ceil(total / PAGE_SIZE))
   const hasFilters = status !== ALL || severity !== ALL || alarmType !== ALL
-  const isMutating = acknowledge.isPending || resolve.isPending
+  const isMutating = acknowledge.isPending || resolve.isPending || silence.isPending
 
   // Once the deep-linked alarm's row is on the page, scroll it into view. The
   // row itself keeps a persistent highlight (below) while the param is present.
@@ -460,7 +492,27 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                     <TableCell className="hidden text-xs text-muted-foreground lg:table-cell">
                       {scopeLabel(alarm)}
                     </TableCell>
-                    <TableCell>{statusBadge(alarm.status)}</TableCell>
+                    <TableCell>
+                      <div className="flex flex-col gap-1">
+                        {statusBadge(alarm.status)}
+                        {isSilenced(alarm) && (
+                          <span
+                            className="flex items-center gap-1 text-[11px] text-muted-foreground"
+                            title={format(
+                              new Date(alarm.silenced_until as string),
+                              'PPpp'
+                            )}
+                          >
+                            <BellOff className="h-3 w-3" />
+                            Silenced{' '}
+                            {formatDistanceToNow(
+                              new Date(alarm.silenced_until as string),
+                              { addSuffix: true }
+                            )}
+                          </span>
+                        )}
+                      </div>
+                    </TableCell>
                     <TableCell
                       className="hidden text-right text-xs text-muted-foreground md:table-cell"
                       title={format(new Date(alarm.fired_at), 'PPpp')}
@@ -506,6 +558,38 @@ export function Alarms({ embedded = false }: { embedded?: boolean } = {}) {
                             <CheckCircle2 className="mr-1 h-3.5 w-3.5" />
                             Resolve
                           </Button>
+                        )}
+                        {alarm.status !== 'resolved' && (
+                          <DropdownMenu>
+                            <DropdownMenuTrigger asChild>
+                              <Button
+                                variant="outline"
+                                size="sm"
+                                disabled={isMutating}
+                              >
+                                <BellOff className="mr-1 h-3.5 w-3.5" />
+                                Silence
+                              </Button>
+                            </DropdownMenuTrigger>
+                            <DropdownMenuContent align="end">
+                              {SILENCE_OPTIONS.map((opt) => (
+                                <DropdownMenuItem
+                                  key={opt.hours}
+                                  onClick={() =>
+                                    silence.mutate({
+                                      path: {
+                                        project_id: effectiveProjectId ?? 0,
+                                        alarm_id: alarm.id,
+                                      },
+                                      body: { duration_hours: opt.hours },
+                                    })
+                                  }
+                                >
+                                  {opt.label}
+                                </DropdownMenuItem>
+                              ))}
+                            </DropdownMenuContent>
+                          </DropdownMenu>
                         )}
                       </div>
                     </TableCell>

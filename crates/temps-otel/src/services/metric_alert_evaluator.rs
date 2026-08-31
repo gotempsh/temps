@@ -1857,7 +1857,7 @@ impl MetricAlertEvaluator {
         }
 
         let request = FireAlarmRequest {
-            project_id: rule.project_id,
+            project_id: Some(rule.project_id),
             environment_id: None,
             deployment_id: None,
             container_id: None,
@@ -1960,7 +1960,7 @@ impl MetricAlertEvaluator {
         }
 
         let request = FireAlarmRequest {
-            project_id: rule.project_id,
+            project_id: Some(rule.project_id),
             environment_id: None,
             deployment_id: None,
             container_id: None,
@@ -2167,7 +2167,11 @@ impl MetricAlertEvaluator {
     async fn resolve(&self, rule_id: i32, project_id: i32) {
         let alarm_id = self.firing.write().await.remove(&rule_id);
         if let Some(alarm_id) = alarm_id {
-            if let Err(e) = self.alarm_service.resolve_alarm(alarm_id, project_id).await {
+            if let Err(e) = self
+                .alarm_service
+                .resolve_alarm(alarm_id, Some(project_id))
+                .await
+            {
                 error!(
                     rule_id,
                     alarm_id,
@@ -2188,7 +2192,7 @@ impl MetricAlertEvaluator {
     async fn resolve_series(&self, rule_id: i32, project_id: i32, alarm_id: i32) {
         if let Err(e) = self
             .alarm_service_dynamic
-            .resolve_alarm(alarm_id, project_id)
+            .resolve_alarm(alarm_id, Some(project_id))
             .await
         {
             error!(

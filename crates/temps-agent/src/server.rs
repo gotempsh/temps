@@ -59,6 +59,7 @@ pub fn build_router(
         overlay_peers,
         platform,
     });
+    let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
     let auth = Arc::new(AgentAuth::new(&config.token));
 
@@ -141,6 +142,7 @@ pub fn build_router(
         )
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth))
+        .layer(Extension(resource_limits))
         .with_state(state);
 
     // Swagger UI — no auth required so it's accessible for documentation

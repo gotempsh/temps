@@ -12,6 +12,7 @@ homepage.workspace = true
 
 [dependencies]
 temps-backup-core = { path = "../temps-backup-core" }
+temps-monitoring = { path = "../temps-monitoring" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }

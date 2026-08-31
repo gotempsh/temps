@@ -5,48 +5,42 @@
 //! `temps-backup` (deliverable 3).
 //!
 //! Lives in `temps-backup` so it can reach:
-//! - [`temps_core::notifications::NotificationService`] (for dispatch)
+//! - [`temps_monitoring::alarm_service::AlarmService`] (for persistence + dispatch)
 //! - The `backups` entity (to look up schedule name)
 //! - The `backup_schedules` entity (to look up schedule name for the notification)
 //!
 //! The adapter is wired into the `BackupRunner` via `runner.with_notifier(...)` in
 //! `plugin.rs`.
+//!
+//! Backups are host-wide resources — a schedule can fan out across every
+//! external service on the host and `backups`/`backup_schedules` carry no
+//! `project_id` — so failures are fired as system alarms (`project_id: None`).
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use sea_orm::{DatabaseConnection, EntityTrait};
 use temps_backup_core::{BackupFailureContext, BackupFailureNotifier};
-use temps_core::notifications::{
-    NotificationData, NotificationPriority, NotificationService, NotificationType,
-};
-use tracing::error;
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
+use tracing::{debug, error, info};
 
-/// Dispatches a `NotificationData` event via the platform notification service
-/// whenever a backup job reaches the terminal `failed` state.
+/// Dispatches a [`FireAlarmRequest`] via [`AlarmService`] whenever a backup
+/// job reaches the terminal `failed` state.
 ///
-/// The adapter performs a DB lookup to enrich the notification with the
-/// schedule name (when available).  Any internal error is logged via
-/// `tracing::error!` and swallowed — a notification failure must never
-/// surface to the caller.
+/// The adapter performs a DB lookup to enrich the alarm with the schedule
+/// name (when available).  Any internal error is logged via `tracing::error!`
+/// and swallowed — a notification failure must never surface to the caller.
 pub struct BackupNotificationAdapter {
-    notification_service: Arc<dyn NotificationService>,
+    alarm_service: Arc<AlarmService>,
     db: Arc<DatabaseConnection>,
 }
 
 impl BackupNotificationAdapter {
     /// Create a new adapter.
     ///
-    /// Both `notification_service` and `db` must be fully initialised before
+    /// Both `alarm_service` and `db` must be fully initialised before
     /// calling this constructor.
-    pub fn new(
-        notification_service: Arc<dyn NotificationService>,
-        db: Arc<DatabaseConnection>,
-    ) -> Self {
-        Self {
-            notification_service,
-            db,
-        }
+    pub fn new(alarm_service: Arc<AlarmService>, db: Arc<DatabaseConnection>) -> Self {
+        Self { alarm_service, db }
     }
 }
 
@@ -101,39 +95,47 @@ impl BackupFailureNotifier for BackupNotificationAdapter {
             }
         };
 
-        let mut metadata: HashMap<String, String> = HashMap::new();
-        metadata.insert("backup_id".to_string(), ctx.backup_id.to_string());
-        metadata.insert("engine".to_string(), ctx.engine.clone());
-        metadata.insert("attempts".to_string(), ctx.attempts.to_string());
-        metadata.insert("max_attempts".to_string(), ctx.max_attempts.to_string());
-        metadata.insert("failed_at".to_string(), ctx.failed_at.to_rfc3339());
+        let title = format!("Backup Failed: {}", schedule_name);
+        let message = format!(
+            "Backup failed for {} (engine: {}, attempt {}/{}): {}",
+            schedule_name, ctx.engine, ctx.attempts, ctx.max_attempts, ctx.error_message,
+        );
 
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
-            title: format!("Backup Failed: {}", schedule_name),
-            message: format!(
-                "Backup failed for {} (engine: {}, attempt {}/{}): {}",
-                schedule_name, ctx.engine, ctx.attempts, ctx.max_attempts, ctx.error_message,
-            ),
-            notification_type: NotificationType::Error,
-            priority: NotificationPriority::High,
-            severity: Some("error".to_string()),
-            timestamp: ctx.failed_at,
-            metadata,
-            bypass_throttling: false,
+        let request = FireAlarmRequest {
+            project_id: None,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: None,
+            alarm_type: AlarmType::BackupFailed,
+            severity: AlarmSeverity::Critical,
+            title,
+            message,
+            metadata: Some(serde_json::json!({
+                "backup_id": ctx.backup_id,
+                "engine": ctx.engine,
+                "attempts": ctx.attempts,
+                "max_attempts": ctx.max_attempts,
+                "failed_at": ctx.failed_at.to_rfc3339(),
+            })),
         };
 
-        if let Err(e) = self
-            .notification_service
-            .send_notification(notification)
-            .await
-        {
-            error!(
+        match self.alarm_service.fire_alarm(request).await {
+            Ok(Some(_)) => info!(
+                backup_id = ctx.backup_id,
+                engine = %ctx.engine,
+                "BackupNotificationAdapter: fired backup-failed alarm",
+            ),
+            Ok(None) => debug!(
+                backup_id = ctx.backup_id,
+                "Backup-failed alarm suppressed by cooldown/silence",
+            ),
+            Err(e) => error!(
                 backup_id = ctx.backup_id,
                 engine = %ctx.engine,
                 error = %e,
-                "BackupNotificationAdapter: failed to dispatch failure notification (non-fatal)",
-            );
+                "BackupNotificationAdapter: failed to fire failure alarm (non-fatal)",
+            ),
         }
     }
 }

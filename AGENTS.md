@@ -197,6 +197,25 @@ Always use `git commit -s` (and `-s` on `--amend`/`revert`). Like the
 Changelog check, the DCO check validates every commit in `base..HEAD`,
 not just the tip.
 
+This is a mandatory agent pre-commit gate. Never run a plain `git commit`:
+
+```bash
+git commit -s -m "type(scope): description"
+```
+
+If a commit was created without the trailer, repair it before pushing:
+
+```bash
+git commit --amend --no-edit -s
+```
+
+Before opening or updating a PR, verify every commit in the PR range contains
+the trailer. Do not assume the pre-commit hooks add it automatically:
+
+```bash
+git log origin/main..HEAD --format='%h%n%B%n---'
+```
+
 ## Per-record config columns, not env vars
 
 When adding a new runtime knob, default to a column on the relevant
@@ -291,6 +310,23 @@ show one stable row with labeled Previous and Next buttons around compact
 `{page} / {totalPages}` context; hide page-size, first/last, and direct-page
 controls. At `sm` and above, show the full `Showing X–Y of Z` summary and
 advanced controls.
+
+## Never name a real third party in anything that leaves this machine
+
+This repo is **public**. Full rule and examples in
+[`CLAUDE.md` → Critical Rules](./CLAUDE.md#critical-rules); the part agents
+most often miss:
+
+A user handing you a real URL, repo, or account as the **live target of a
+task** ("deploy this: github.com/someone/their-repo") is not permission to
+cite it. It's scratch input, not evidence — it must not end up in test
+comments, fixture data, commit messages, PR titles/descriptions, or issue
+text as an illustrative example. Write the test/PR against a generic
+equivalent ("a repo with no build manifest, just an `index.html`") instead
+of naming the real one, even though the user supplied it themselves and it
+feels like harmless context. Grep your diff and any PR body you write for
+the real name before it leaves this machine — a PR description can't be
+un-published once it reaches GitHub.
 
 ## Don't sweep unrelated dirty files into your commits
 

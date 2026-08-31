@@ -12,7 +12,9 @@ use temps_core::DBDateTime;
 pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
-    pub project_id: i32,
+    /// `None` for host/control-plane-wide alarms with no associated project
+    /// (disk space, node offline/resource pressure).
+    pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
     pub container_id: Option<i32>,
@@ -33,6 +35,11 @@ pub struct Model {
     pub acknowledged_at: Option<DBDateTime>,
     pub acknowledged_by: Option<i32>,
     pub resolved_at: Option<DBDateTime>,
+    /// If set and in the future, this alarm (and future re-fires of the same
+    /// type/scope) are muted until this time — a temporary, self-expiring
+    /// mute, distinct from the permanent `acknowledged_at`/`resolved_at`
+    /// lifecycle transitions.
+    pub silenced_until: Option<DBDateTime>,
 
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,

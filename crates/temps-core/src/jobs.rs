@@ -250,7 +250,8 @@ pub struct StatusCheckCompletedJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmFiredJob {
     pub alarm_id: i32,
-    pub project_id: i32,
+    /// `None` for host/control-plane-wide alarms with no associated project.
+    pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
     pub alarm_type: String,
@@ -275,7 +276,8 @@ pub struct AutopilotTriggerJob {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AlarmResolvedJob {
     pub alarm_id: i32,
-    pub project_id: i32,
+    /// `None` for host/control-plane-wide alarms with no associated project.
+    pub project_id: Option<i32>,
     pub environment_id: Option<i32>,
     pub deployment_id: Option<i32>,
     pub alarm_type: String,
@@ -493,8 +495,8 @@ impl fmt::Display for Job {
             Job::StatusCheckCompleted(job) => write!(f, "StatusCheckCompleted(monitor: {}, status: {})", job.monitor_id, job.status),
             Job::RouteTableUpdated(job) => write!(f, "RouteTableUpdated(env: {:?}, deployment: {:?}, routes: {})", job.environment_id, job.deployment_id, job.route_count),
             Job::ForceRouteReload(job) => write!(f, "ForceRouteReload(env: {:?}, deployment: {:?})", job.environment_id, job.deployment_id),
-            Job::AlarmFired(job) => write!(f, "AlarmFired(id: {}, project: {}, type: {}, severity: {})", job.alarm_id, job.project_id, job.alarm_type, job.severity),
-            Job::AlarmResolved(job) => write!(f, "AlarmResolved(id: {}, project: {}, type: {})", job.alarm_id, job.project_id, job.alarm_type),
+            Job::AlarmFired(job) => write!(f, "AlarmFired(id: {}, project: {:?}, type: {}, severity: {})", job.alarm_id, job.project_id, job.alarm_type, job.severity),
+            Job::AlarmResolved(job) => write!(f, "AlarmResolved(id: {}, project: {:?}, type: {})", job.alarm_id, job.project_id, job.alarm_type),
             Job::AutopilotTrigger(job) => write!(f, "AutopilotTrigger(project: {}, type: {}, source: {:?})", job.project_id, job.trigger_type, job.trigger_source_id),
             Job::BackupRequested(job) => write!(f, "BackupRequested(backup: {}, engine: {})", job.backup_id, job.engine),
             Job::BackupCompleted(job) => write!(f, "BackupCompleted(backup: {}, engine: {}, size: {:?})", job.backup_id, job.engine, job.size_bytes),

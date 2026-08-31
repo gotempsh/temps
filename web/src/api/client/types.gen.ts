@@ -938,13 +938,24 @@ export type AlarmResponse = {
      * Arbitrary JSON metadata attached by the alarm source.
      */
     metadata?: unknown;
-    project_id: number;
+    /**
+     * `None` for host/control-plane-wide alarms with no associated project.
+     */
+    project_id?: number | null;
     /**
      * ISO-8601 UTC timestamp when the alarm was resolved, if any.
      */
     resolved_at?: string | null;
     service_id?: number | null;
     severity: string;
+    /**
+     * ISO-8601 UTC timestamp this alarm (and future re-fires of the same
+     * type/scope) are muted until, if currently silenced. Not cleared when
+     * the silence expires — check against the current time, or compare to
+     * `fired_at` on a *new* alarm of the same scope to know a silence has
+     * lapsed.
+     */
+    silenced_until?: string | null;
     status: string;
     title: string;
     /**
@@ -1517,7 +1528,7 @@ export type AppSettingsResponse = {
     /**
      * Managed control-plane destination and explicit export consent flags.
      */
-    cloud: CloudSettings;
+    cloud?: CloudSettings;
     /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
      * needed — `enabled` is a plain bool with no sensitive content. Passed
@@ -3275,6 +3286,11 @@ export type ContainerHistoryEntry = {
 
 export type ContainerHistoryListResponse = {
     containers: Array<ContainerHistoryEntry>;
+    /**
+     * Total number of container rows matching the filter, before `limit`
+     * was applied — lets the client show "20 of 627".
+     */
+    total_count: number;
 };
 
 export type ContainerInfoResponse = {
@@ -10625,6 +10641,20 @@ export type ManagedDomainResponse = {
     zone_id?: string | null;
 };
 
+export type ManagedEnvironmentVariable = {
+    description: string;
+    is_secret: boolean;
+    /**
+     * Whether a user-defined value is intentionally allowed to replace the
+     * generated default. When false, the deployment pipeline wins.
+     */
+    is_user_overridable: boolean;
+    name: string;
+    source: ManagedEnvironmentVariableSource;
+};
+
+export type ManagedEnvironmentVariableSource = 'error_tracking' | 'open_telemetry' | 'temps';
+
 /**
  * A manual action the user must perform outside of the automated migration
  */
@@ -11024,8 +11054,8 @@ export type MintEnrollmentTokenRequest = {
 
 export type MintEnrollmentTokenResponse = {
     /**
-     * SHA-256 fingerprint of the cluster CA. Token issuance initializes the
-     * CA when needed, so every newly minted token carries a trust pin.
+     * SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
+     * worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
      */
     ca_fingerprint?: string | null;
     expires_at: string;
@@ -11279,10 +11309,9 @@ export type MultiNodeSettings = {
      */
     private_address?: string | null;
     /**
-     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). New installations
-     * default to `true`. Existing serialized settings that predate this field
-     * deserialize it as `false`, providing an explicit migration window rather
-     * than unexpectedly disconnecting legacy workers. When `true`, the CP signs
+     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`
+     * (default), the control plane ignores join-time CSRs and nodes keep
+     * serving plaintext HTTP — zero behavior change. When `true`, the CP signs
      * node CSRs, nodes serve mutual TLS, and every CP→agent call uses the
      * cluster client cert. Observe-then-enforce: flip this on only once all
      * workers have re-enrolled with certs.
@@ -11299,6 +11328,10 @@ export type MultiNodeSettingsMasked = {
      * verify it out of band; the CA private key is never exposed).
      */
     cluster_ca_fingerprint?: string | null;
+    /**
+     * Effective cluster-wide container address pool. `None` only when the
+     * singleton network configuration could not be read.
+     */
     cluster_network?: null | ClusterNetworkSettings;
     has_join_token: boolean;
     /**
@@ -11390,16 +11423,6 @@ export type NetworkConfiguration = {
  */
 export type NetworkMode = 'bridge' | 'host' | 'none' | {
     custom: string;
-};
-
-/**
- * Cluster-wide pool which every node must use. This is intentionally sent
- * alongside the local allocation so operators and agents can detect stale or
- * independently configured nodes before routes are changed.
- */
-export type NetworkPoolEntry = {
-    compute_pool_cidr: string;
-    subnet_prefix_len: number;
 };
 
 /**
@@ -12714,7 +12737,6 @@ export type PeerListResponse = {
      * and newer version skew degrades to the safe default of `false`.
      */
     cluster_dns_enabled: boolean;
-    network: NetworkPoolEntry;
     /**
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
@@ -14901,10 +14923,6 @@ export type RegisterNodeResponse = {
     cert_pem?: string | null;
     id: number;
     message: string;
-    /**
-     * Whether this node must serve mTLS and reject plaintext agent traffic.
-     */
-    mtls_required: boolean;
     name: string;
     status: string;
 };
@@ -15669,25 +15687,6 @@ export type RootfsVmEntry = {
     sandbox_name: string;
 };
 
-export type RotateClusterCaRequest = {
-    /**
-     * Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
-     */
-    confirmation: string;
-    /**
-     * Fingerprint observed through a trusted operator channel immediately
-     * before rotation. The request fails if the active root changed.
-     */
-    expected_fingerprint: string;
-};
-
-export type RotateClusterCaResponse = {
-    message: string;
-    new_fingerprint: string;
-    previous_fingerprint: string;
-    revoked_enrollment_tokens: number;
-};
-
 export type RouteRefreshResponse = {
     /**
      * Human-readable message
@@ -15812,9 +15811,7 @@ export type S3SourceResponse = {
     id: number;
     is_default: boolean;
     /**
-     * True when this source was auto-provisioned by a Temps Cloud link
-     * rather than entered by an operator. Managed sources cannot be edited
-     * or deleted from this API; disconnect Temps Cloud to remove one.
+     * True when this source was auto-provisioned by a Temps Cloud link rather than entered by an operator. Managed sources cannot be edited or deleted from this API; disconnect Temps Cloud to remove one.
      */
     managed_by_cloud: boolean;
     name: string;
@@ -17461,6 +17458,17 @@ export type SiblingRef = {
      * URL slug used to link into the sibling project's single-project trace view.
      */
     project_slug: string;
+};
+
+/**
+ * Request body for `POST .../alarms/{alarm_id}/silence`.
+ */
+export type SilenceAlarmRequest = {
+    /**
+     * How long to mute this alarm (and future re-fires of the same
+     * type/scope) for, in hours. Must be between 1 and 168 (7 days).
+     */
+    duration_hours: number;
 };
 
 export type SkillDefinitionResponse = {
@@ -21594,9 +21602,7 @@ export type S3SourceResponseWritable = {
     id: number;
     is_default: boolean;
     /**
-     * True when this source was auto-provisioned by a Temps Cloud link
-     * rather than entered by an operator. Managed sources cannot be edited
-     * or deleted from this API; disconnect Temps Cloud to remove one.
+     * True when this source was auto-provisioned by a Temps Cloud link rather than entered by an operator. Managed sources cannot be edited or deleted from this API; disconnect Temps Cloud to remove one.
      */
     managed_by_cloud: boolean;
     name: string;
@@ -27565,6 +27571,42 @@ export type GetLatestDeploymentMediaResponses = {
 };
 
 export type GetLatestDeploymentMediaResponse = GetLatestDeploymentMediaResponses[keyof GetLatestDeploymentMediaResponses];
+
+export type ListManagedEnvironmentVariablesData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Framework preset used to select public browser variable names.
+         */
+        preset: string;
+    };
+    url: '/deployments/managed-environment-variables';
+};
+
+export type ListManagedEnvironmentVariablesErrors = {
+    /**
+     * Unknown deployment preset
+     */
+    400: unknown;
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Missing project creation permission
+     */
+    403: unknown;
+};
+
+export type ListManagedEnvironmentVariablesResponses = {
+    /**
+     * Platform-managed environment variable metadata
+     */
+    200: Array<ManagedEnvironmentVariable>;
+};
+
+export type ListManagedEnvironmentVariablesResponse = ListManagedEnvironmentVariablesResponses[keyof ListManagedEnvironmentVariablesResponses];
 
 export type GetScanByDeploymentData = {
     body?: never;
@@ -34271,7 +34313,12 @@ export type GetPublicRepositoryData = {
          */
         repo: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+    };
     url: '/git/public/{provider}/{owner}/{repo}';
 };
 
@@ -34280,6 +34327,10 @@ export type GetPublicRepositoryErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
     /**
      * Git provider permission required
      */
@@ -34325,6 +34376,10 @@ export type GetPublicBranchesData = {
     };
     query?: {
         /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+        /**
          * Force fetch fresh data, bypassing cache (default: false)
          */
         fresh?: boolean;
@@ -34337,6 +34392,10 @@ export type GetPublicBranchesErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
     /**
      * Git provider permission required
      */
@@ -34382,6 +34441,10 @@ export type GetPublicComposeServicesData = {
     };
     query: {
         /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+        /**
          * Branch to read the compose file from (default: repository's default branch)
          */
         branch?: string | null;
@@ -34399,6 +34462,14 @@ export type GetPublicComposeServicesErrors = {
      * Provider not supported, or the compose file could not be parsed
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository, branch, or compose file not found
      */
@@ -34438,7 +34509,12 @@ export type GetPublicComposePreviewData = {
          */
         repo: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+    };
     url: '/git/public/{provider}/{owner}/{repo}/compose-file';
 };
 
@@ -34447,6 +34523,14 @@ export type GetPublicComposePreviewErrors = {
      * Compose file or override is invalid
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository, branch, or compose file not found
      */
@@ -34480,6 +34564,10 @@ export type DetectPublicEnvExampleData = {
     };
     query?: {
         /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+        /**
          * Branch name to inspect (default: repository's default branch)
          */
         branch?: string | null;
@@ -34496,6 +34584,14 @@ export type DetectPublicEnvExampleErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
+    /**
+     * Git provider permission required
+     */
+    403: unknown;
     /**
      * Repository or branch not found
      */
@@ -34537,6 +34633,10 @@ export type DetectPublicPresetsData = {
     };
     query?: {
         /**
+         * HTTPS/443 origin of a self-hosted GitLab instance. Requires authentication and git_repositories:read.
+         */
+        base_url?: string | null;
+        /**
          * Branch name to detect presets for (default: repository's default branch)
          */
         branch?: string | null;
@@ -34553,6 +34653,10 @@ export type DetectPublicPresetsErrors = {
      * Provider not supported
      */
     400: unknown;
+    /**
+     * Authentication required for custom GitLab origins
+     */
+    401: unknown;
     /**
      * Git provider permission required
      */
@@ -41860,6 +41964,52 @@ export type ResolveAlarmResponses = {
     200: unknown;
 };
 
+export type SilenceAlarmData = {
+    body: SilenceAlarmRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/alarms/{alarm_id}/silence';
+};
+
+export type SilenceAlarmErrors = {
+    /**
+     * Invalid duration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SilenceAlarmResponses = {
+    /**
+     * Alarm silenced
+     */
+    200: unknown;
+};
+
 export type GetApiCallersData = {
     body?: never;
     path: {
@@ -44862,13 +45012,27 @@ export type ListContainerHistoryData = {
          */
         environment_id: number;
     };
-    query?: never;
+    query?: {
+        /**
+         * Only return containers belonging to this deployment. Omit to list
+         * containers across every deployment the environment has ever had.
+         */
+        deployment_id?: number | null;
+        /**
+         * Maximum number of *replaced* container rows to return, most recently
+         * replaced first (default 20, max 100). Every currently-running
+         * container is always included and does not count against this limit —
+         * it only bounds how much historical (replaced-by-redeploy) context
+         * comes back alongside them.
+         */
+        limit?: number | null;
+    };
     url: '/projects/{project_id}/environments/{environment_id}/container-history';
 };
 
 export type ListContainerHistoryErrors = {
     /**
-     * Environment not found
+     * Environment or deployment not found
      */
     404: ProblemDetails;
     /**
@@ -44881,7 +45045,7 @@ export type ListContainerHistoryError = ListContainerHistoryErrors[keyof ListCon
 
 export type ListContainerHistoryResponses = {
     /**
-     * Every container that has ever run for this environment, current and replaced
+     * Containers that have run for this environment: every currently-running one first (uncapped), then the newest replaced ones up to `limit`
      */
     200: ContainerHistoryListResponse;
 };
@@ -51963,49 +52127,6 @@ export type SaveAiProviderCredentialResponses = {
 
 export type SaveAiProviderCredentialResponse = SaveAiProviderCredentialResponses[keyof SaveAiProviderCredentialResponses];
 
-export type RotateClusterCaData = {
-    body: RotateClusterCaRequest;
-    path?: never;
-    query?: never;
-    url: '/settings/cluster-ca/rotate';
-};
-
-export type RotateClusterCaErrors = {
-    /**
-     * Invalid confirmation or CA state
-     */
-    400: unknown;
-    /**
-     * Unauthorized
-     */
-    401: unknown;
-    /**
-     * Insufficient permissions
-     */
-    403: unknown;
-    /**
-     * Expected fingerprint is stale
-     */
-    409: unknown;
-    /**
-     * Fresh MFA verification required
-     */
-    428: unknown;
-    /**
-     * Internal server error
-     */
-    500: unknown;
-};
-
-export type RotateClusterCaResponses = {
-    /**
-     * Cluster CA rotated
-     */
-    200: RotateClusterCaResponse;
-};
-
-export type RotateClusterCaResponse2 = RotateClusterCaResponses[keyof RotateClusterCaResponses];
-
 export type GetDiskStatusData = {
     body?: never;
     path?: never;
@@ -52860,6 +52981,219 @@ export type CheckForUpdateResponses = {
 };
 
 export type CheckForUpdateResponse = CheckForUpdateResponses[keyof CheckForUpdateResponses];
+
+export type ListSystemAlarmsData = {
+    body?: never;
+    path?: never;
+    query?: {
+        /**
+         * Filter by alarm type (e.g. `container_restart`, `outage`).
+         */
+        alarm_type?: string | null;
+        /**
+         * Filter by status: `firing`, `acknowledged`, or `resolved`.
+         */
+        status?: string | null;
+        /**
+         * Filter by severity: `info`, `warning`, or `critical`.
+         */
+        severity?: string | null;
+        /**
+         * Filter by environment ID.
+         */
+        environment_id?: number | null;
+        /**
+         * Filter by deployment ID.
+         */
+        deployment_id?: number | null;
+        /**
+         * Filter by external service ID.
+         */
+        service_id?: number | null;
+        /**
+         * Page number (1-based, default 1).
+         */
+        page?: number | null;
+        /**
+         * Items per page (default 20, max 100).
+         */
+        page_size?: number | null;
+    };
+    url: '/system/alarms';
+};
+
+export type ListSystemAlarmsErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListSystemAlarmsResponses = {
+    /**
+     * Paginated list of system alarms
+     */
+    200: AlarmListResponse;
+};
+
+export type ListSystemAlarmsResponse = ListSystemAlarmsResponses[keyof ListSystemAlarmsResponses];
+
+export type GetSystemAlarmsSummaryData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/system/alarms/summary';
+};
+
+export type GetSystemAlarmsSummaryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type GetSystemAlarmsSummaryResponses = {
+    /**
+     * System alarm summary counts
+     */
+    200: AlarmSummaryResponse;
+};
+
+export type GetSystemAlarmsSummaryResponse = GetSystemAlarmsSummaryResponses[keyof GetSystemAlarmsSummaryResponses];
+
+export type AcknowledgeSystemAlarmData = {
+    body?: never;
+    path: {
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/system/alarms/{alarm_id}/acknowledge';
+};
+
+export type AcknowledgeSystemAlarmErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type AcknowledgeSystemAlarmResponses = {
+    /**
+     * Alarm acknowledged
+     */
+    200: unknown;
+};
+
+export type ResolveSystemAlarmData = {
+    body?: never;
+    path: {
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/system/alarms/{alarm_id}/resolve';
+};
+
+export type ResolveSystemAlarmErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ResolveSystemAlarmResponses = {
+    /**
+     * Alarm resolved
+     */
+    200: unknown;
+};
+
+export type SilenceSystemAlarmData = {
+    body: SilenceAlarmRequest;
+    path: {
+        /**
+         * Alarm ID
+         */
+        alarm_id: number;
+    };
+    query?: never;
+    url: '/system/alarms/{alarm_id}/silence';
+};
+
+export type SilenceSystemAlarmErrors = {
+    /**
+     * Invalid duration
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Alarm not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type SilenceSystemAlarmResponses = {
+    /**
+     * Alarm silenced
+     */
+    200: unknown;
+};
 
 export type ListTeamsData = {
     body?: never;

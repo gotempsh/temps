@@ -321,6 +321,19 @@ pub fn setup_proxy_server(
     // for why that is an accepted limitation rather than a bug.
     project_ip_gate: Arc<dyn temps_core::ProjectIpGate>,
 ) -> Result<()> {
+    // Fail fast and loud if the configured ports are already taken. Without
+    // this, a bind conflict is only discovered deep inside Pingora's own
+    // listener setup (`Service::start_service` in pingora-core, which does
+    // `.expect("Failed to build listeners")` inside a spawned tokio task).
+    // Tokio swallows a panicking task silently -- the process keeps running
+    // with that one listener simply never up, so e.g. a port-80 conflict
+    // doesn't crash the proxy, it just means HTTP-01 challenges start timing
+    // out against a host that never answers, with nothing in the logs
+    // pointing at "port 80 was already in use at startup". Checking here,
+    // before any of the setup below runs, turns that into an ordinary
+    // startup error the existing callers already log and exit on.
+    preflight_check_listen_addresses(&proxy_config)?;
+
     // Setup plugin system (async operation in sync context)
     // A `current_thread` runtime is enough here: plugin registration awaits a
     // bounded file-existence poll and otherwise does sync work, so a worker
@@ -594,6 +607,76 @@ pub fn setup_proxy_server(
     Ok(())
 }
 
+/// Bind every configured proxy listener address, holding all of them open
+/// simultaneously until every check has run, so a port conflict is reported
+/// as a normal startup error instead of a silently swallowed panic inside
+/// Pingora (see the comment at the top of `setup_proxy_server`).
+///
+/// Binding must overlap, not just happen -- Pingora opens `TEMPS_ADDRESS` and
+/// `TEMPS_TLS_ADDRESS` *concurrently*, so if they're accidentally set to the
+/// same address, checking each one in isolation (bind, then immediately
+/// release before checking the next) would let both checks pass: the first
+/// probe frees the port before the second one binds it. Only the same
+/// address held open at once actually reproduces Pingora's real conflict.
+///
+/// `std::net::TcpListener::bind` sets `SO_REUSEADDR` on Unix, so this only
+/// rejects an address something is *actively listening* on -- it does not
+/// false-positive on a socket still winding down in `TIME_WAIT`, which is
+/// exactly the case Pingora's own bind retries are designed to tolerate.
+fn preflight_check_listen_addresses(proxy_config: &ProxyConfig) -> Result<()> {
+    let _http_listener = bind_or_report(&proxy_config.address, "TEMPS_ADDRESS")?;
+    if let Some(ref tls_address) = proxy_config.tls_address {
+        let _tls_listener = bind_or_report(tls_address, "TEMPS_TLS_ADDRESS")?;
+    }
+    Ok(())
+}
+
+/// Test-only convenience wrapper around `bind_or_report` for exercising a
+/// single address in isolation; production code always goes through
+/// `preflight_check_listen_addresses`, which must hold multiple listeners
+/// open at once (see its doc comment for why).
+#[cfg(test)]
+fn check_address_bindable(address: &str, env_var: &str) -> Result<()> {
+    bind_or_report(address, env_var).map(|_| ())
+}
+
+fn bind_or_report(address: &str, env_var: &str) -> Result<std::net::TcpListener> {
+    std::net::TcpListener::bind(address)
+        .map_err(|e| anyhow::anyhow!(bind_failure_message(address, env_var, e.kind(), &e)))
+}
+
+/// Render an actionable message for a failed bind, distinguishing "something
+/// else already has this port" from "we're not allowed to bind this port" --
+/// binding to a port below 1024 without root/`CAP_NET_BIND_SERVICE` fails
+/// with `PermissionDenied`, not `AddrInUse`, and is common enough (`temps
+/// serve` run as a non-root user against the default 80/443) that lumping it
+/// into "another process is listening" would send the operator chasing a
+/// process that doesn't exist.
+fn bind_failure_message(
+    address: &str,
+    env_var: &str,
+    kind: std::io::ErrorKind,
+    err: &dyn std::fmt::Display,
+) -> String {
+    if kind == std::io::ErrorKind::PermissionDenied {
+        format!(
+            "Cannot start the proxy: not permitted to bind to {address}: {err}. Binding to \
+             ports below 1024 usually requires root or `CAP_NET_BIND_SERVICE` (Linux: \
+             `sudo setcap 'cap_net_bind_service=+ep' $(which temps)`). Either run Temps with \
+             that capability, or set {env_var} to a port >= 1024 and restart."
+        )
+    } else {
+        let port = address.rsplit(':').next().unwrap_or(address);
+        format!(
+            "Cannot start the proxy: failed to bind to {address}: {err}. Another process on \
+             this machine is already listening on that port -- find it with \
+             `lsof -iTCP:{port} -sTCP:LISTEN -n -P` (macOS/Linux) or `ss -ltnp | grep :{port}` \
+             (Linux), stop it, then restart Temps. To use a different port instead, set \
+             {env_var} and restart."
+        )
+    }
+}
+
 /// Create a proxy service with the given configuration
 pub fn create_proxy_service(
     db: Arc<DbConnection>,
@@ -699,4 +782,126 @@ pub fn create_proxy_service(
     );
 
     Ok(lb)
+}
+
+#[cfg(test)]
+mod preflight_bind_tests {
+    use super::*;
+
+    #[test]
+    fn check_address_bindable_succeeds_on_free_port() {
+        // Bind to an OS-assigned ephemeral port, then release it immediately so
+        // the address is free again for the check itself to bind.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let result = check_address_bindable(&addr, "TEMPS_ADDRESS");
+        assert!(result.is_ok(), "expected free port to bind, got {result:?}");
+    }
+
+    #[test]
+    fn bind_failure_message_explains_permission_denied_separately_from_port_taken() {
+        // Can't reliably trigger a real EACCES portably (CI may run as root),
+        // so exercise the pure message-selection logic directly instead of
+        // going through an actual privileged bind.
+        let message = bind_failure_message(
+            "0.0.0.0:80",
+            "TEMPS_ADDRESS",
+            std::io::ErrorKind::PermissionDenied,
+            &"permission denied (os error 13)",
+        );
+        assert!(
+            message.contains("CAP_NET_BIND_SERVICE"),
+            "permission-denied message should explain the capability fix: {message}"
+        );
+        assert!(
+            message.contains("TEMPS_ADDRESS"),
+            "permission-denied message should name the env var to reconfigure: {message}"
+        );
+        assert!(
+            !message.contains("lsof"),
+            "permission-denied message should not send the operator hunting for a process \
+             that doesn't exist: {message}"
+        );
+    }
+
+    #[test]
+    fn check_address_bindable_fails_with_actionable_message_when_port_taken() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = held.local_addr().unwrap().to_string();
+        let port = held.local_addr().unwrap().port();
+
+        let result = check_address_bindable(&addr, "TEMPS_TLS_ADDRESS");
+
+        let err = result.expect_err("expected bind conflict to be reported as an error");
+        let message = err.to_string();
+        assert!(
+            message.contains(&addr),
+            "error should name the conflicting address: {message}"
+        );
+        assert!(
+            message.contains(&format!("lsof -iTCP:{port}")),
+            "error should give an actionable command to find the offending process: {message}"
+        );
+        assert!(
+            message.contains("TEMPS_TLS_ADDRESS"),
+            "error should name the env var to reconfigure: {message}"
+        );
+
+        drop(held);
+    }
+
+    #[test]
+    fn preflight_check_listen_addresses_reports_tls_port_conflict() {
+        let held = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let held_addr = held.local_addr().unwrap().to_string();
+
+        let free_probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let free_addr = free_probe.local_addr().unwrap().to_string();
+        drop(free_probe);
+
+        let proxy_config = ProxyConfig {
+            address: free_addr,
+            tls_address: Some(held_addr.clone()),
+            ..Default::default()
+        };
+
+        let result = preflight_check_listen_addresses(&proxy_config);
+
+        let message = result
+            .expect_err("expected TLS address conflict to fail preflight")
+            .to_string();
+        assert!(message.contains(&held_addr));
+
+        drop(held);
+    }
+
+    #[test]
+    fn preflight_check_listen_addresses_rejects_identical_http_and_tls_addresses() {
+        // Reproduces TEMPS_ADDRESS and TEMPS_TLS_ADDRESS accidentally set to
+        // the same value. Pingora binds both listeners concurrently, so this
+        // must fail even though each address is individually free -- a naive
+        // "bind, then release, then bind the next one" check would let both
+        // probes pass since neither overlaps with the other in time.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let proxy_config = ProxyConfig {
+            address: addr.clone(),
+            tls_address: Some(addr.clone()),
+            ..Default::default()
+        };
+
+        let result = preflight_check_listen_addresses(&proxy_config);
+
+        let message = result
+            .expect_err("expected identical HTTP/TLS addresses to be reported as a conflict")
+            .to_string();
+        assert!(
+            message.contains(&addr),
+            "error should name the conflicting address: {message}"
+        );
+    }
 }
