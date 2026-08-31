@@ -8,4 +8,6 @@ export {
   isTestEnvironment,
   sendAnalytics,
   sendAnalyticsReliable,
+  ingestKeyHeaders,
+  withIngestKey,
 } from "@temps-sdk/analytics-core";

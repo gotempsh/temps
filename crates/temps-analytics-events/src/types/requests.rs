@@ -198,6 +198,13 @@ pub struct EventMetricsPayload {
     /// Client-generated session id fallback (see `visitor_id`).
     #[serde(default, alias = "sessionId")]
     pub session_id: Option<String>,
+    /// The tracked site's own domain, computed client-side by the SDK's
+    /// `resolveDomain()` and sent as a sibling of `event_data` (not nested
+    /// inside it). Used on the keyed ingest path (ADR-040 §3) to attribute
+    /// self-referrals/channels correctly: there, `Host` names the Temps
+    /// server rather than the customer's site, so it can't be used for that.
+    #[serde(default)]
+    pub domain: Option<String>,
     // Performance metrics (web vitals) - optional
     /// Time to First Byte (milliseconds)
     pub ttfb: Option<f32>,

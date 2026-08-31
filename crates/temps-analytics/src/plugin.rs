@@ -21,6 +21,10 @@ use utoipa::{openapi::OpenApi, OpenApi as OpenApiTrait};
 
 use crate::api_traffic::ApiTrafficService;
 use crate::handler::{configure_routes, AnalyticsApiDoc, AppState};
+use crate::ingest_keys::{
+    configure_ingest_key_routes, AnalyticsIngestKeyApiDoc, AnalyticsIngestKeyService,
+    AnalyticsIngestKeysAppState, AnalyticsIngestRateLimiter,
+};
 use crate::{Analytics, AnalyticsService};
 
 /// Analytics Plugin for web analytics and visitor tracking
@@ -71,6 +75,14 @@ impl TempsPlugin for AnalyticsPlugin {
             let analytics_trait: Arc<dyn Analytics> = analytics_service;
             context.register_service(analytics_trait);
 
+            // ADR-040 ingest keys. Registered as shared singletons because the
+            // three analytics ingest crates must observe the *same* resolution
+            // cache and the same rate-limit windows as the admin CRUD surface
+            // — a second instance would keep serving a key that this one just
+            // revoked.
+            context.register_service(Arc::new(AnalyticsIngestKeyService::new(db.clone())));
+            context.register_service(Arc::new(AnalyticsIngestRateLimiter::new()));
+
             tracing::debug!("Analytics plugin services registered successfully");
             Ok(())
         })
@@ -89,8 +101,24 @@ impl TempsPlugin for AnalyticsPlugin {
             api_traffic_service,
         });
 
+        // ADR-040 ingest-key admin CRUD. Its own state so the key service and
+        // audit logger are held directly rather than reached through the
+        // analytics service.
+        let ingest_keys_state = Arc::new(AnalyticsIngestKeysAppState {
+            ingest_key_service: context.require_service::<AnalyticsIngestKeyService>(),
+            // The very same limiter the public ingest handlers resolve, not a
+            // second one: revoking a key must release the bucket that ingest
+            // has been filling, and a private instance here would release
+            // nothing.
+            rate_limiter: context.require_service::<AnalyticsIngestRateLimiter>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+        });
+
         // Configure routes with the state
-        let routes = configure_routes().with_state(app_state);
+        let routes = configure_routes()
+            .with_state(app_state)
+            .merge(configure_ingest_key_routes().with_state(ingest_keys_state));
 
         Some(PluginRoutes::new(routes))
     }
@@ -119,7 +147,9 @@ impl TempsPlugin for AnalyticsPlugin {
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(AnalyticsApiDoc::openapi())
+        let mut doc = AnalyticsApiDoc::openapi();
+        doc.merge(AnalyticsIngestKeyApiDoc::openapi());
+        Some(doc)
     }
 }
 

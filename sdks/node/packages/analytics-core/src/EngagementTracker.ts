@@ -7,6 +7,8 @@ import type { JsonValue } from "./types";
 
 export interface EngagementTrackerOptions {
   basePath?: string;
+  /** Analytics ingest key (`pa_…`). See `AnalyticsClientOptions.ingestKey`. */
+  ingestKey?: string;
   domain?: string;
   heartbeatInterval?: number;
   inactivityTimeout?: number;
@@ -40,6 +42,7 @@ export class EngagementTracker {
   private inactivityTimer: ReturnType<typeof setTimeout> | null = null;
   private hasTrackedLeave: boolean = false;
   private readonly basePath: string;
+  private readonly ingestKey?: string;
   private readonly domain: string;
   private readonly onHeartbeat?: (data: EngagementData) => void;
   private readonly onPageLeave?: (data: EngagementData) => void;
@@ -47,6 +50,7 @@ export class EngagementTracker {
 
   constructor(options: EngagementTrackerOptions = {}) {
     this.basePath = options.basePath || DEFAULT_BASE_PATH;
+    this.ingestKey = options.ingestKey;
     this.domain = options.domain || window.location.hostname;
     this.heartbeatInterval = options.heartbeatInterval || 30000;
     this.inactivityTimeout = options.inactivityTimeout || 30000;
@@ -199,7 +203,8 @@ export class EngagementTracker {
         } as Record<string, JsonValue>,
       },
       "POST",
-      this.basePath
+      this.basePath,
+      this.ingestKey
     );
 
     if (this.isActive && this.isVisible) {
@@ -235,7 +240,8 @@ export class EngagementTracker {
           referrer: document.referrer,
         } as Record<string, JsonValue>,
       },
-      this.basePath
+      this.basePath,
+      this.ingestKey
     );
   };
 

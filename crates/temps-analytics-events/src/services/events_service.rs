@@ -1500,24 +1500,7 @@ WHERE project_id = $1
         let session_id =
             Some(session_id.unwrap_or_else(|| temps_core::uuid::Uuid::new_v4().to_string()));
 
-        // Resolve the hostname of the tracked site. Priority:
-        //   1. `site_hostname` — the request Host header the ingest handler
-        //      already resolved against the route table, so it is the site the
-        //      event actually happened on.
-        //   2. `event_data.hostname` — legacy/server-side callers that embed it.
-        //   3. "localhost" — last resort so the column is never empty.
-        //
-        // Priority 1 matters beyond the stored column: without a site hostname
-        // `get_channel` cannot recognise a self-referral, so every internal
-        // page-to-page navigation gets attributed to the "Referral" channel and
-        // swamps the real acquisition channels. No browser SDK has ever sent
-        // `event_data.hostname` (the React SDK sends a top-level `domain`), so
-        // relying on it alone left self-referral detection permanently off.
-        let hostname = site_hostname
-            .filter(|h| !h.is_empty())
-            .or_else(|| event_data.get("hostname").and_then(|v| v.as_str()))
-            .unwrap_or("localhost")
-            .to_string();
+        let hostname = resolve_site_hostname(site_hostname, &event_data);
 
         let href = event_data
             .get("href")
@@ -2181,6 +2164,45 @@ impl crate::services::traits::AnalyticsEvents for AnalyticsEventsService {
     }
 }
 
+/// Resolve the hostname of the **tracked site** — the customer's site, not
+/// Temps. Priority:
+///
+///   1. `site_hostname`, when the caller could establish it. On the
+///      Host-resolved ingest path that is the request `Host` header, which the
+///      handler already matched against the route table. On the keyed
+///      (cross-origin) path the handler passes `None`, because the request
+///      terminates at the Temps server and `Host` names *Temps*, not the site.
+///   2. `event_data.domain` — the field name the browser SDK uses for the
+///      site's own domain (`resolveDomain()` in
+///      `sdks/node/packages/analytics-core/src/Analytics.ts`).
+///   3. `event_data.hostname` — older/server-side callers that embed it under
+///      that name. Checked last and kept only for compatibility: no first-party
+///      SDK has ever populated it, which is why relying on it alone left the
+///      fallback permanently dead.
+///   4. `"localhost"` — last resort so the column is never empty.
+///
+/// This matters well beyond the stored column: `get_channel` needs the site's
+/// own host to recognise a self-referral. Get it wrong and every internal
+/// page-to-page navigation is attributed to the "Referral" channel, swamping
+/// the real acquisition channels; get it *wrong in a specific way* — by
+/// inheriting the Temps server's hostname on the keyed path — and the referrer
+/// never matches, so nothing is ever a self-referral.
+fn resolve_site_hostname(site_hostname: Option<&str>, event_data: &serde_json::Value) -> String {
+    let from_event_data = |key: &str| {
+        event_data
+            .get(key)
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+    };
+
+    site_hostname
+        .filter(|host| !host.is_empty())
+        .or_else(|| from_event_data("domain"))
+        .or_else(|| from_event_data("hostname"))
+        .unwrap_or("localhost")
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2191,6 +2213,91 @@ mod tests {
 
     async fn setup_test_db() -> Result<DatabaseConnection, DbErr> {
         Database::connect("sqlite::memory:").await
+    }
+
+    // ── resolve_site_hostname ────────────────────────────────────────────
+
+    #[test]
+    fn site_hostname_wins_when_the_caller_resolved_one() {
+        // The Host-resolved ingest path: the Host header is the tracked site,
+        // and must beat anything the (attacker-controlled) payload claims.
+        assert_eq!(
+            resolve_site_hostname(
+                Some("app.example.test"),
+                &serde_json::json!({ "domain": "spoofed.example.com" })
+            ),
+            "app.example.test"
+        );
+    }
+
+    #[test]
+    fn site_hostname_falls_back_to_the_payload_domain() {
+        // The keyed (cross-origin) path passes `None` precisely so this
+        // fallback runs — the Host header there names the Temps server.
+        assert_eq!(
+            resolve_site_hostname(None, &serde_json::json!({ "domain": "shop.example.com" })),
+            "shop.example.com"
+        );
+    }
+
+    #[test]
+    fn site_hostname_still_accepts_the_legacy_hostname_key() {
+        assert_eq!(
+            resolve_site_hostname(
+                None,
+                &serde_json::json!({ "hostname": "legacy.example.com" })
+            ),
+            "legacy.example.com"
+        );
+        // `domain` is the name the browser SDK uses, so it takes precedence.
+        assert_eq!(
+            resolve_site_hostname(
+                None,
+                &serde_json::json!({
+                    "domain": "shop.example.com",
+                    "hostname": "legacy.example.com",
+                })
+            ),
+            "shop.example.com"
+        );
+    }
+
+    #[test]
+    fn site_hostname_treats_empty_values_as_absent() {
+        assert_eq!(
+            resolve_site_hostname(
+                Some(""),
+                &serde_json::json!({ "domain": "shop.example.com" })
+            ),
+            "shop.example.com"
+        );
+        assert_eq!(
+            resolve_site_hostname(
+                None,
+                &serde_json::json!({ "domain": "", "hostname": "legacy.example.com" })
+            ),
+            "legacy.example.com"
+        );
+        assert_eq!(
+            resolve_site_hostname(None, &serde_json::json!({ "domain": "", "hostname": "" })),
+            "localhost"
+        );
+    }
+
+    #[test]
+    fn site_hostname_defaults_to_localhost_and_ignores_non_strings() {
+        assert_eq!(
+            resolve_site_hostname(None, &serde_json::json!({})),
+            "localhost"
+        );
+        assert_eq!(
+            resolve_site_hostname(None, &serde_json::json!({ "domain": 42 })),
+            "localhost"
+        );
+        assert_eq!(
+            resolve_site_hostname(None, &serde_json::Value::Null),
+            "localhost"
+        );
     }
 
     #[allow(dead_code)]

@@ -88,6 +88,10 @@ impl TempsPlugin for EventsPlugin {
             cookie_crypto,
             telemetry,
             project_access_checker,
+            ingest_key_service: context
+                .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
+            ingest_rate_limiter: context
+                .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
         });
 
         let routes = crate::handlers::configure_routes().with_state(state);
@@ -116,6 +120,13 @@ impl TempsPlugin for EventsPlugin {
             cookie_crypto,
             telemetry,
             project_access_checker: None,
+            // ADR-040: the keyed ingest path. Required, not optional — an
+            // absent key service would silently turn every keyed request back
+            // into a Host lookup, which is the exact failure this replaces.
+            ingest_key_service: context
+                .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
+            ingest_rate_limiter: context
+                .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
         });
 
         let routes = crate::handlers::configure_public_routes().with_state(state);

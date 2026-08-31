@@ -208,6 +208,7 @@ mod m20260827_000001_create_notification_routes;
 mod m20260828_000001_alarms_nullable_project;
 mod m20260828_000002_add_alarms_silenced_until;
 mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
+mod m20260831_000001_create_analytics_ingest_keys;
 
 pub struct Migrator;
 
@@ -450,6 +451,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260828_000001_alarms_nullable_project::Migration),
             Box::new(m20260828_000002_add_alarms_silenced_until::Migration),
             Box::new(m20260829_000001_allow_duplicate_ready_snapshot_digests::Migration),
+            Box::new(m20260831_000001_create_analytics_ingest_keys::Migration),
         ]
     }
 }
@@ -499,5 +501,25 @@ mod registry_tests {
                 "shipped migration '{shipped}' must precede '{added}'"
             );
         }
+    }
+
+    /// The analytics ingest-key migration also drops `NOT NULL` on
+    /// `performance_metrics` / `session_replay_sessions` scope columns, which
+    /// the entity models already assume. An unregistered migration means those
+    /// entities decode `Option<i32>` out of a `NOT NULL` column and every
+    /// no-deployment ingest keeps failing — so registration is asserted, not
+    /// left to review.
+    #[test]
+    fn analytics_ingest_keys_migration_is_registered_last() {
+        let names = Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names.last().map(String::as_str),
+            Some("m20260831_000001_create_analytics_ingest_keys"),
+            "the newest migration must be registered last so it runs in date order"
+        );
     }
 }

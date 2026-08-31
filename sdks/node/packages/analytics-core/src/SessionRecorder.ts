@@ -5,10 +5,13 @@ import { record, type eventWithTime } from "rrweb";
 import { pack } from "@rrweb/packer";
 import { SESSION_RECORDER_ENDPOINT, DEFAULT_BASE_PATH, DEFAULT_EXCLUDED_PATHS } from "./constants";
 import { getOrCreateVisitorId } from "./identity";
+import { ingestKeyHeaders, withIngestKey } from "./utils";
 import type { SessionRecordingConfig } from "./types";
 
 export interface SessionRecorderOptions extends SessionRecordingConfig {
   basePath?: string;
+  /** Analytics ingest key (`pa_…`). See `AnalyticsClientOptions.ingestKey`. */
+  ingestKey?: string;
   domain?: string;
   enabled?: boolean;
   ignoreSelector?: string;
@@ -96,6 +99,7 @@ function getSessionMetadata(): Record<string, unknown> {
  */
 export class SessionRecorder {
   private readonly basePath: string;
+  private readonly ingestKey?: string;
   private readonly excludedPaths: string[];
   private readonly sessionSampleRate: number;
   private readonly maskAllInputs: boolean;
@@ -159,6 +163,7 @@ export class SessionRecorder {
 
   constructor(options: SessionRecorderOptions = {}) {
     this.basePath = options.basePath || DEFAULT_BASE_PATH;
+    this.ingestKey = options.ingestKey;
     this.excludedPaths =
       options.useDefaultExcludedPaths === false
         ? options.excludedPaths || []
@@ -248,7 +253,10 @@ export class SessionRecorder {
       const metadata = { sessionId, ...getSessionMetadata() };
       const response = await fetch(`${this.basePath}/${SESSION_RECORDER_ENDPOINT}/init`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          ...ingestKeyHeaders(this.ingestKey),
+        },
         body: JSON.stringify(metadata),
       });
 
@@ -314,14 +322,18 @@ export class SessionRecorder {
         events: encodedEvents,
       };
       const url = `${this.basePath}/${SESSION_RECORDER_ENDPOINT}/events`;
+      // The unload path cannot set headers (sendBeacon) and must not trigger a
+      // CORS preflight (keepalive fetch), so it carries the ingest key in the
+      // query string instead. Identical to `url` when no key is configured.
+      const unloadUrl = withIngestKey(url, this.ingestKey);
 
       if (isReliable) {
         // sendBeacon reports queueing, not delivery, so there is no ack to wait
         // for: release the batch and accept the small risk of loss on unload.
         if (navigator.sendBeacon) {
           const blob = new Blob([JSON.stringify(payload)], { type: "application/json" });
-          if (!navigator.sendBeacon(url, blob)) {
-            await fetch(url, {
+          if (!navigator.sendBeacon(unloadUrl, blob)) {
+            await fetch(unloadUrl, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify(payload),
@@ -329,7 +341,7 @@ export class SessionRecorder {
             });
           }
         } else {
-          await fetch(url, {
+          await fetch(unloadUrl, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify(payload),
@@ -341,7 +353,10 @@ export class SessionRecorder {
       } else {
         const response = await fetch(url, {
           method: "POST",
-          headers: { "Content-Type": "application/json" },
+          headers: {
+            "Content-Type": "application/json",
+            ...ingestKeyHeaders(this.ingestKey),
+          },
           body: JSON.stringify(payload),
         });
 

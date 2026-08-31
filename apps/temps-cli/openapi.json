@@ -2115,6 +2115,104 @@
         ],
         "type": "object"
       },
+      "AnalyticsIngestKey": {
+        "description": "An analytics ingest key as returned by the admin API.\n\n`public_key` is present in full on every response — see the module docs.",
+        "properties": {
+          "allowed_origins": {
+            "description": "Exact origins (`scheme://host[:port]`) permitted to use this key from a\nbrowser. `None` or `[]` means any origin. This is a browser-enforced\nconvenience control, not authentication — a non-browser client ignores\n`Origin` entirely.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "created_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "`None` means the key is scoped to the whole project. An\nenvironment-scoped key additionally attributes ingested data to that\nenvironment's current deployment, when it has one.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "event_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "last_used_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Operator-facing label.",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "public_key": {
+            "description": "The ingest key itself, `pa_` + 64 hex characters.\n\n**Not a secret.** It is designed to ship in client-side JavaScript and\nis returned unmasked so operators can copy it. See the module docs.",
+            "type": "string"
+          },
+          "rate_limit_per_minute": {
+            "description": "`None` or `<= 0` means unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "revoked_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "public_key",
+          "is_active",
+          "event_count",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "AnalyticsSessionEventsResponse": {
         "properties": {
           "events": {
@@ -7503,6 +7601,45 @@
           "name",
           "trigger_type"
         ],
+        "type": "object"
+      },
+      "CreateAnalyticsIngestKeyRequest": {
+        "description": "Request body for minting a new ingest key.",
+        "properties": {
+          "allowed_origins": {
+            "description": "Exact origins permitted to use this key from a browser. Omit or send an\nempty array to allow any origin.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "Scope the key to a single environment. Recommended: it lets Temps\nattribute ingested data to that environment's current deployment.\nOmit for a project-wide key.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Operator-facing label. Defaults to \"Default ingest key\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rate_limit_per_minute": {
+            "description": "Requests per minute for this key. Omit for the 600/min default; send a\nnon-positive value for unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "CreateApiKeyRequest": {
@@ -15775,6 +15912,13 @@
             "format": "float",
             "type": [
               "number",
+              "null"
+            ]
+          },
+          "domain": {
+            "description": "The tracked site's own domain, computed client-side by the SDK's\n`resolveDomain()` and sent as a sibling of `event_data` (not nested\ninside it). Used on the keyed ingest path (ADR-040 §3) to attribute\nself-referrals/channels correctly: there, `Host` names the Temps\nserver rather than the customer's site, so it can't be used for that.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -42419,6 +42563,37 @@
         },
         "type": "object"
       },
+      "UpdateAnalyticsIngestKeyRequest": {
+        "description": "Request body for a partial update.\n\n`allowed_origins` and `rate_limit_per_minute` use the three-state\ndouble-`Option` encoding: field absent = leave unchanged, explicit `null` =\nclear, value = set. Plain `Option<Option<T>>` alone cannot express this\nbecause serde collapses an explicit JSON `null` into the outer `None`.",
+        "properties": {
+          "allowed_origins": {
+            "description": "Absent = unchanged, `null` = clear (any origin allowed), array = replace.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "New operator-facing label. Absent leaves it unchanged. The column is\n`NOT NULL`, so there is no \"clear\" state — send a new label instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rate_limit_per_minute": {
+            "description": "Absent = unchanged, `null` = clear (unlimited), value = replace.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateApiKeyRequest": {
         "properties": {
           "expires_at": {
@@ -47511,6 +47686,29 @@
     "/_temps/event": {
       "post": {
         "operationId": "record_event_metrics",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -47585,6 +47783,29 @@
     "/_temps/session-replay/events": {
       "post": {
         "operationId": "add_session_replay_events",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used to flush the final replay batch on page unload). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -47647,6 +47868,29 @@
     "/_temps/session-replay/init": {
       "post": {
         "operationId": "init_session_replay",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -47699,6 +47943,29 @@
     "/_temps/speed": {
       "post": {
         "operationId": "record_speed_metrics",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -47753,6 +48020,29 @@
     "/_temps/speed/update": {
       "post": {
         "operationId": "update_speed_metrics",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers. This endpoint is called via `navigator.sendBeacon` on page unload, so the query form is the only one available there. Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -79787,6 +80077,311 @@
         ]
       }
     },
+    "/projects/{project_id}/analytics/ingest-keys": {
+      "get": {
+        "description": "Includes revoked keys: revocation is soft, and an operator investigating\n\"which key sent this?\" needs to see the rows that no longer work. Every\n`public_key` is returned unmasked — see [`create_analytics_ingest_key`].",
+        "operationId": "list_analytics_ingest_keys",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AnalyticsIngestKey"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Ingest keys, active and revoked, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's analytics ingest keys, newest first.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      },
+      "post": {
+        "description": "The returned `public_key` is **not a secret**: it is designed to be embedded\nin client-side JavaScript and sent as `X-Temps-Analytics-Key` or\n`?temps_key=`. It is returned in full here and on every subsequent read, so\nan operator can copy it at any time; there is no \"reveal\" step because there\nis nothing to conceal.",
+        "operationId": "create_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAnalyticsIngestKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "Ingest key created"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Mint a new analytics ingest key.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys/{key_id}": {
+      "patch": {
+        "description": "`allowed_origins` and `rate_limit_per_minute` are three-state: omit to leave\nunchanged, send `null` to clear, send a value to replace. Clearing\n`allowed_origins` allows any origin; clearing `rate_limit_per_minute`\nremoves the limit.",
+        "operationId": "update_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAnalyticsIngestKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "Ingest key updated"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update an ingest key's label, origin allowlist, or rate limit.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys/{key_id}/revoke": {
+      "post": {
+        "description": "Soft by design: the row is kept with `is_active = false` and `revoked_at`\nset, so the record of which key ingested what survives. The key stops\nresolving immediately.",
+        "operationId": "revoke_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Ingest key revoked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Revoke an ingest key.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys/{key_id}/rotate": {
+      "post": {
+        "description": "The previous value stops working immediately — the resolution cache entry\nfor it is evicted synchronously rather than left to expire. Any client still\nsending the old value will start receiving 401s, so roll out the new value\nbefore rotating.",
+        "operationId": "rotate_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "Ingest key rotated"
+          },
+          "400": {
+            "description": "The key is revoked and cannot be rotated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace an ingest key's value, keeping the same row and scope.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
     "/projects/{project_id}/api-analytics/callers": {
       "get": {
         "description": "IP addresses are returned as-is from `proxy_logs.client_ip`. The caller\nis responsible for any presentation-layer masking required by their privacy\npolicy.",
@@ -101976,6 +102571,10 @@
     {
       "description": "Provider preference and availability endpoints",
       "name": "AI Provider Status"
+    },
+    {
+      "description": "Manage non-secret analytics ingest keys for apps Temps does not deploy",
+      "name": "Analytics Ingest Keys"
     },
     {
       "description": "Git provider management endpoints",

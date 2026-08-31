@@ -15,6 +15,13 @@ export interface UsePageLeaveOptions {
   enabled?: boolean;
   /** Override base path (falls back to the one used by the plugin). */
   basePath?: string;
+  /**
+   * Analytics ingest key (`pa_…`). This hook sends its unload beacon directly
+   * rather than through the plugin instance, so a cross-origin setup has to
+   * repeat the key the plugin was initialized with — otherwise this one event
+   * is rejected while every other event is attributed fine.
+   */
+  ingestKey?: string;
 }
 
 export function usePageLeave(options: UsePageLeaveOptions = {}): {
@@ -25,6 +32,7 @@ export function usePageLeave(options: UsePageLeaveOptions = {}): {
     eventData = {},
     enabled = true,
     basePath = DEFAULT_BASE_PATH,
+    ingestKey,
   } = options;
 
   const analytics = useTempsAnalytics();
@@ -50,7 +58,8 @@ export function usePageLeave(options: UsePageLeaveOptions = {}): {
           referrer: document.referrer,
         },
       },
-      basePath
+      basePath,
+      ingestKey
     );
   };
 
