@@ -539,6 +539,13 @@ pub fn detect_all_presets_from_files(files: &[String]) -> Vec<Box<dyn Preset>> {
         presets.push(Box::new(NixpacksPreset::auto()));
     }
 
+    // Static site fallback: a plain index.html with no build system found above.
+    // Checked last, mirroring `detect_project_candidates` and autopack's own
+    // static provider (registered last, only claims what no language claims).
+    if presets.is_empty() && files.iter().any(|path| path.ends_with("index.html")) {
+        presets.push(Box::new(NixpacksPreset::new(NixpacksProvider::Static)));
+    }
+
     presets
 }
 

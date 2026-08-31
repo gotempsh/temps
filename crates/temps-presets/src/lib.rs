@@ -115,6 +115,36 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_static_site_preset() {
+        // A plain HTML/CSS/JS repo with no build system should fall back to
+        // the static-file preset instead of failing to auto-detect.
+        let files = vec![
+            "index.html".to_string(),
+            "README.md".to_string(),
+            ".gitignore".to_string(),
+        ];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "nixpacks-static");
+    }
+
+    #[test]
+    fn test_static_site_is_not_detected_when_a_framework_matches() {
+        // index.html alone must never outrank a real framework/build-system
+        // match — it is the last-resort fallback, not an additional option.
+        let files = vec![
+            "vite.config.ts".to_string(),
+            "package.json".to_string(),
+            "index.html".to_string(),
+        ];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "vite");
+    }
+
+    #[test]
     fn test_no_preset_for_random_files() {
         // Random files should NOT auto-detect any preset
         let files = vec![
@@ -309,6 +339,25 @@ mod tests {
 
         assert_eq!(presets.len(), 1);
         assert_eq!(presets[0].slug, "nixpacks");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_static_site() {
+        // Same shape as a plain HTML/CSS/JS repo connected via a git URL:
+        // no framework manifest, just files to serve. The repository-connect
+        // UI (`calculate_repository_preset_live`) calls this function, so an
+        // empty result here is what previously made static repos look
+        // unsupported when connecting via git.
+        let files = vec![
+            "index.html".to_string(),
+            "README.md".to_string(),
+            ".gitignore".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].path, "./");
+        assert_eq!(presets[0].slug, "nixpacks-static");
     }
 
     #[test]
