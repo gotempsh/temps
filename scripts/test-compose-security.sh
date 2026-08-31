@@ -5,6 +5,19 @@
 set -euo pipefail
 trap 'echo "test-compose-security.sh failed at line ${LINENO}: ${BASH_COMMAND}" >&2' ERR
 
+if ! command -v docker >/dev/null 2>&1; then
+  echo "SKIP: Docker is not installed; Compose security tests require Docker"
+  exit 0
+fi
+if ! docker info >/dev/null 2>&1; then
+  echo "SKIP: Docker daemon is unavailable; Compose security tests require Docker"
+  exit 0
+fi
+if ! docker compose version >/dev/null 2>&1; then
+  echo "SKIP: Docker Compose is unavailable; Compose security tests require Docker Compose"
+  exit 0
+fi
+
 project="temps-compose-security-${GITHUB_RUN_ID:-local}-$$"
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 config_compose=(docker compose --project-name "$project" --file docker-compose.yml
@@ -25,6 +38,7 @@ safe_clickhouse="23456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0
 old_clickhouse="3456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012"
 workload_probe_name="${project}-workload-probe"
 saturation_probe_name="${project}-saturation-probe"
+admin_saturation_probe_name="${project}-admin-saturation-probe"
 export TEMPS_NETWORK_NAME="${TEMPS_NETWORK_NAME:-temps-docker-workloads}"
 export CLICKHOUSE_PASSWORD="$safe_clickhouse"
 export TEMPS_ADMIN_EMAIL="Admin@Example.TEST"
@@ -32,6 +46,8 @@ admin_secret_dir="$(mktemp -d)"
 chmod 700 "$admin_secret_dir"
 admin_password_file="$admin_secret_dir/admin_password"
 admin_ingress_password_file="$admin_secret_dir/admin_ingress_password"
+sse_response_file="$admin_secret_dir/sse_response"
+sse_curl_pid=""
 admin_ingress_password='iI4!0123456789abcdef0123456789abcdef'
 printf 'tT3!0123456789abcdef0123456789abcdef\n' >"$admin_password_file"
 printf '%s\n' "$admin_ingress_password" >"$admin_ingress_password_file"
@@ -48,11 +64,16 @@ fi
 export DOCKER_GID
 
 cleanup() {
+  if [[ -n "$sse_curl_pid" ]]; then
+    kill "$sse_curl_pid" >/dev/null 2>&1 || true
+    wait "$sse_curl_pid" >/dev/null 2>&1 || true
+  fi
+  docker rm --force "$admin_saturation_probe_name" >/dev/null 2>&1 || true
   docker rm --force "$saturation_probe_name" >/dev/null 2>&1 || true
   docker rm --force "$workload_probe_name" >/dev/null 2>&1 || true
   POSTGRES_PASSWORD="$safe_postgres" \
     "${compose[@]}" down --volumes --remove-orphans >/dev/null 2>&1 || true
-  rm -f "$admin_password_file" "$admin_ingress_password_file"
+  rm -f "$admin_password_file" "$admin_ingress_password_file" "$sse_response_file"
   rmdir "$admin_secret_dir" 2>/dev/null || true
 }
 trap cleanup EXIT
@@ -82,6 +103,65 @@ wait_for_completed_service() {
   "${compose[@]}" logs postgres "$service" >&2 || true
   echo "$description failed or timed out" >&2
   return 1
+}
+
+assert_runtime_loopback_binding() {
+  local container="$1"
+  local container_port="$2"
+
+  if ! docker inspect "$container" | jq -e --arg port "${container_port}/tcp" '
+    .[0].NetworkSettings.Ports[$port] as $bindings
+    | ($bindings | length) == 1
+      and ($bindings[0].HostIp == "127.0.0.1")
+  ' >/dev/null; then
+    echo "$container port $container_port is not published exclusively on 127.0.0.1" >&2
+    docker inspect --format '{{json .NetworkSettings.Ports}}' "$container" >&2 || true
+    return 1
+  fi
+}
+
+assert_admin_ingress_secret_rejected() {
+  local description="$1"
+  local secret_value="$2"
+  local probe_id=""
+  local probe_state=""
+  local probe_exit_code=""
+  local probe_logs=""
+
+  chmod 600 "$admin_ingress_password_file"
+  printf '%s' "$secret_value" >"$admin_ingress_password_file"
+  chmod 444 "$admin_ingress_password_file"
+
+  probe_id="$(POSTGRES_PASSWORD="$safe_postgres" \
+    "${compose[@]}" run --detach --no-deps temps-admin-ingress)"
+  for _ in {1..20}; do
+    probe_state="$(docker inspect --format '{{.State.Status}}' "$probe_id")"
+    if [[ "$probe_state" == "exited" ]]; then
+      break
+    fi
+    sleep 0.25
+  done
+  probe_logs="$(docker logs "$probe_id" 2>&1 || true)"
+  if [[ "$probe_state" == "exited" ]]; then
+    probe_exit_code="$(docker inspect --format '{{.State.ExitCode}}' "$probe_id")"
+  fi
+  docker rm --force "$probe_id" >/dev/null 2>&1 || true
+
+  chmod 600 "$admin_ingress_password_file"
+  printf '%s\n' "$admin_ingress_password" >"$admin_ingress_password_file"
+  chmod 444 "$admin_ingress_password_file"
+
+  if [[ "$probe_state" != "exited" || "$probe_exit_code" == "0" ]]; then
+    printf '%s\n' "$probe_logs" >&2
+    echo "admin ingress unexpectedly accepted a $description secret" >&2
+    return 1
+  fi
+  if ! grep -Eq 'must be a single line|must contain only printable ASCII characters|must contain between 16 and 72 bytes|must not be blank or whitespace-only' \
+    <<<"$probe_logs"; then
+    printf '%s\n' "$probe_logs" >&2
+    echo "admin ingress rejected a $description secret without a contextual validation error" >&2
+    return 1
+  fi
 }
 
 if env -u POSTGRES_PASSWORD "${config_compose[@]}" config --quiet 2>/dev/null; then
@@ -203,6 +283,20 @@ for ignore_file in .gitignore .dockerignore; do
     exit 1
   fi
 done
+
+# The ingress must fail closed before Nginx starts when its independent Basic
+# credential is empty or contains only whitespace.
+POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" build temps-admin-ingress >/dev/null
+assert_admin_ingress_secret_rejected "empty" ""
+assert_admin_ingress_secret_rejected "whitespace-only" "                    "
+assert_admin_ingress_secret_rejected "short" "too-short"
+assert_admin_ingress_secret_rejected "overlong" \
+  "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678"
+assert_admin_ingress_secret_rejected "embedded-newline" \
+  $'0123456789abcdef\n0123456789abcdef'
+assert_admin_ingress_secret_rejected "multiple-trailing-newlines" \
+  $'0123456789abcdef0123456789abcdef\n\n'
 
 old_postgres="temps_password_change_me"
 POSTGRES_PASSWORD="$old_postgres" \
@@ -371,6 +465,15 @@ if [[ "$(docker inspect --format '{{.State.Health.Status}}' temps-admin-ingress)
   exit 1
 fi
 
+# Rendered Compose configuration is necessary but not sufficient: verify the
+# effective bindings installed in Docker after all overrides are applied.
+assert_runtime_loopback_binding temps-postgres 5432
+assert_runtime_loopback_binding temps-clickhouse 8123
+assert_runtime_loopback_binding temps-ingress 3000
+assert_runtime_loopback_binding temps-ingress 3443
+assert_runtime_loopback_binding temps-ingress 9000
+assert_runtime_loopback_binding temps-admin-ingress 9001
+
 # Docker-mode routing must use the explicitly named workload network and
 # internal ports even while malicious private-service aliases are present.
 for _ in {1..30}; do
@@ -481,6 +584,48 @@ if [[ "$admin_authenticated" != "true" ]]; then
   exit 1
 fi
 
+# Slow/incomplete requests must be bounded before HTTP parsing and Basic auth.
+# Saturate one reachable source and prove a separate loopback administrator can
+# still authenticate while the attack is active.
+admin_ingress_network="$(docker inspect temps-admin-ingress | jq -r '
+  .[0].NetworkSettings.Networks | keys[]
+  | select(endswith("_temps-ingress-network"))
+')"
+if [[ -z "$admin_ingress_network" ]]; then
+  echo "could not determine the dedicated admin ingress network" >&2
+  exit 1
+fi
+docker run --detach --rm --name "$admin_saturation_probe_name" \
+  --network "$admin_ingress_network" alpine:3.22 sleep 300 >/dev/null
+docker exec --detach "$admin_saturation_probe_name" sh -ec '
+  index=0
+  while [ "$index" -lt 64 ]; do
+    { printf "GET /slow HTTP/1.1\r\nHost: temps"; sleep 30; } \
+      | nc -w 35 temps-admin-ingress 9001 >/dev/null 2>&1 &
+    index=$((index + 1))
+  done
+  wait
+'
+admin_connection_limit_enforced=false
+for _ in {1..20}; do
+  admin_ingress_logs="$(docker logs temps-admin-ingress 2>&1)"
+  if grep -Fq 'limiting connections by zone "admin_clients"' <<<"$admin_ingress_logs"; then
+    admin_connection_limit_enforced=true
+    break
+  fi
+  sleep 0.5
+done
+if [[ "$admin_connection_limit_enforced" != "true" ]]; then
+  echo "admin ingress did not enforce its pre-authentication connection ceiling" >&2
+  exit 1
+fi
+if ! curl --fail --silent --user "temps:${admin_ingress_password}" \
+  "http://${admin_binding}/" >/dev/null; then
+  echo "admin ingress saturation denied access to a separate loopback administrator" >&2
+  exit 1
+fi
+docker rm --force "$admin_saturation_probe_name" >/dev/null
+
 # Exercise an actual HTTP/1.1 upgrade through the same admin ingress image.
 # The mock upstream records the forwarded request so the test also proves the
 # independent Basic credential is removed before application traffic.
@@ -516,6 +661,63 @@ if ! grep -Eiq '^Upgrade:[[:space:]]*websocket$' <<<"$websocket_request_clean" |
 fi
 if grep -Eiq '^Authorization:' <<<"$websocket_request_clean"; then
   echo "admin ingress forwarded its Basic Authorization credential upstream" >&2
+  exit 1
+fi
+
+# Verify real response-side SSE semantics through the authenticated HTTP proxy:
+# the first event must not be buffered, the stream must survive more than ten
+# quiet seconds, and a later event must reach the client on the same response.
+POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" up --detach sse-ingress-probe >/dev/null
+sse_container_id="$(POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" ps --quiet sse-ingress-probe)"
+assert_runtime_loopback_binding "$sse_container_id" 9001
+sse_binding="$(POSTGRES_PASSWORD="$safe_postgres" \
+  "${compose[@]}" port sse-ingress-probe 9001)"
+sse_listener_ready=false
+for _ in {1..20}; do
+  if nc -z -w 1 "${sse_binding%:*}" "${sse_binding##*:}" >/dev/null 2>&1; then
+    sse_listener_ready=true
+    break
+  fi
+  sleep 0.5
+done
+if [[ "$sse_listener_ready" != "true" ]]; then
+  POSTGRES_PASSWORD="$safe_postgres" \
+    "${compose[@]}" logs sse-ingress-probe sse-upstream-probe >&2 || true
+  echo "SSE ingress regression fixture did not become ready" >&2
+  exit 1
+fi
+: >"$sse_response_file"
+curl --http1.1 --no-buffer --fail --silent --show-error --max-time 25 \
+  --user "temps:${admin_ingress_password}" "http://${sse_binding}/events" \
+  >"$sse_response_file" &
+sse_curl_pid=$!
+sse_first_event_received=false
+for _ in {1..20}; do
+  if grep -Fqx 'data: first' "$sse_response_file"; then
+    sse_first_event_received=true
+    break
+  fi
+  if ! kill -0 "$sse_curl_pid" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 0.25
+done
+if [[ "$sse_first_event_received" != "true" ]]; then
+  echo "admin ingress buffered or dropped the initial SSE event" >&2
+  exit 1
+fi
+if ! wait "$sse_curl_pid"; then
+  sse_curl_pid=""
+  printf '%s\n' "$(cat "$sse_response_file")" >&2
+  echo "admin ingress dropped the SSE stream during its quiet interval" >&2
+  exit 1
+fi
+sse_curl_pid=""
+if ! grep -Fqx 'data: second' "$sse_response_file"; then
+  printf '%s\n' "$(cat "$sse_response_file")" >&2
+  echo "admin ingress did not deliver the SSE event after the quiet interval" >&2
   exit 1
 fi
 

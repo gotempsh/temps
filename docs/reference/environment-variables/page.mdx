@@ -71,7 +71,7 @@ existing route, change the subnet and all three addresses together:
 | `TEMPS_ADMIN_INGRESS_IP` | `198.19.255.10` | Admin proxy address on its dedicated bridge |
 | `TEMPS_INGRESS_GATEWAY_IP` | `198.19.255.1` | Dedicated admin bridge gateway |
 | `TEMPS_ADMIN_PASSWORD_FILE` | `./secrets/admin_password` | Initial Temps administrator password secret |
-| `TEMPS_ADMIN_INGRESS_PASSWORD_FILE` | `./secrets/admin_ingress_password` | Independent Basic-auth secret for loopback admin ingress (username `temps`) |
+| `TEMPS_ADMIN_INGRESS_PASSWORD_FILE` | `./secrets/admin_ingress_password` | Independent single-line Basic-auth secret (16–72 non-blank printable ASCII bytes) for loopback admin ingress (username `temps`) |
 
 ### Admin Listener (optional)
 

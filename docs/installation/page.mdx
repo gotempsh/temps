@@ -259,7 +259,9 @@ on port `9000`; the UI and management API are on port `9001`, protected by the
 independent Basic-auth password in `secrets/admin_ingress_password` and then by
 Temps' own authentication. Use username `temps` at the Basic-auth prompt. Use a
 TLS-terminating reverse proxy, mTLS, or a secure tunnel before making any port
-reachable from another host. Temps connects to ClickHouse automatically for
+reachable from another host. The ingress password file must contain one
+non-blank line of 16–72 printable ASCII bytes; ingress startup fails closed for
+invalid content. Temps connects to ClickHouse automatically for
 analytics, request logs, metrics, and OpenTelemetry storage.
 Temps joins the private dependency network and the separately named
 `TEMPS_NETWORK_NAME` workload network. PostgreSQL, ClickHouse, and the Temps

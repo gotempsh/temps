@@ -56,6 +56,61 @@ services:
       temps-ingress-network:
         ipv4_address: 198.19.255.20
 
+  # A response-side SSE probe: the first event must arrive immediately, the
+  # connection must survive a quiet interval, and the second event must arrive
+  # without HTTP proxy buffering.
+  sse-upstream-probe:
+    image: alpine:3.22
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        while true; do
+          nc -l -p 8080 -e /bin/sh -c '
+            while IFS= read -r header; do
+              [ "$$header" = "$$(printf "\r")" ] && break
+            done
+            printf "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+            printf "data: first\n\n"
+            sleep 12
+            printf "data: second\n\n"
+          ' || true
+        done
+    networks:
+      temps-network:
+        ipv4_address: 198.18.255.22
+
+  sse-ingress-probe:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingress
+    cap_drop:
+      - ALL
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    depends_on:
+      sse-upstream-probe:
+        condition: service_started
+    environment:
+      TEMPS_CONTROL_INTERNAL_IP: 198.18.255.22
+      TEMPS_ADMIN_UPSTREAM_PORT: 8080
+      TEMPS_INGRESS_MODE: admin
+      TEMPS_INGRESS_LISTEN_IP: 198.19.255.21
+    secrets:
+      - source: temps_admin_ingress_password
+        target: temps_admin_ingress_password
+    ports:
+      - target: 9001
+        host_ip: 127.0.0.1
+        published: "0"
+    networks:
+      temps-network:
+      temps-ingress-network:
+        ipv4_address: 198.19.255.21
+
   idle-stream-upstream-probe:
     image: alpine:3.22
     command:
