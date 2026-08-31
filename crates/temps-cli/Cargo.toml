@@ -91,7 +91,7 @@ chrono = { workspace = true }
 # ClickHouse client for the `temps backfill clickhouse --domain ...` data copy.
 # Same version/features as the domain crates so the row structs line up.
 clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
-argon2 = "0.5"
+argon2 = "0.6"
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
