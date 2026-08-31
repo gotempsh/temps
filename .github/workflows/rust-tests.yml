@@ -59,6 +59,31 @@ jobs:
       - name: Verify source attribution headers
         run: python3 scripts/source_attribution.py check
 
+  otel-protobuf-compat:
+    name: OTEL protobuf compatibility (Ubuntu 22.04)
+    # The release workflow uses Ubuntu 22.04, whose protobuf compiler requires
+    # an explicit proto3-optional flag for the OpenTelemetry metrics schema.
+    # Keep this check on the same runner so newer `protoc` versions cannot mask
+    # a release-only build failure.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7.0.1
+
+      - name: Install protobuf compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          toolchain: stable
+
+      - name: Compile OTEL protobuf bindings
+        run: cargo check --lib -p temps-otel
+
   # ---------------------------------------------------------------------------
   # One `temps` binary, two consumers.
   #
