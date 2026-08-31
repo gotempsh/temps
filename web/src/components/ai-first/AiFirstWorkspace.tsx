@@ -180,11 +180,15 @@ export function AiFirstWorkspace() {
     }
   }, [activeApplicationId, activeConversationId])
 
-  const handleApplicationCreated = (application: ApplicationResponse) => {
+  const handleApplicationCreated = (
+    application: ApplicationResponse,
+    conversation: ConversationResponse
+  ) => {
     setApplications((current) => [application, ...current])
     setActiveApplicationId(application.public_id)
+    setConversations([conversation])
+    setActiveConversationId(conversation.public_id)
     setApplicationDialogOpen(false)
-    setThreadDialogOpen(true)
   }
 
   const selectApplication = (applicationId: string) => {
@@ -499,7 +503,10 @@ function CreateApplicationDialog({
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
-  onCreated: (application: ApplicationResponse) => void
+  onCreated: (
+    application: ApplicationResponse,
+    conversation: ConversationResponse
+  ) => void
   providers: ChatProviderOption[]
   session: number
 }) {
@@ -514,9 +521,14 @@ function CreateApplicationDialog({
   const [localFolderName, setLocalFolderName] = useState<string | null>(null)
   const [provisionedProject, setProvisionedProject] =
     useState<ProjectResponse | null>(null)
+  const [provisionedApplication, setProvisionedApplication] =
+    useState<ApplicationResponse | null>(null)
+  const [harnessId, setHarnessId] = useState<string | null>(null)
   const [loadedSession, setLoadedSession] = useState(-1)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
+
+  const selectedHarnessId = harnessId ?? providers[0]?.id ?? null
 
   useEffect(() => {
     if (!open) return
@@ -570,6 +582,7 @@ function CreateApplicationDialog({
     if (
       !name.trim() ||
       !startMode ||
+      !selectedHarnessId ||
       (startMode === 'existing' && selected.length === 0) ||
       (startMode === 'new' && newProjectMode === 'local' && !localFolderName)
     ) {
@@ -627,21 +640,48 @@ function CreateApplicationDialog({
           }
         }
       }
-      const { data } = await createApplication({
-        body: {
-          name: name.trim(),
-          description: description.trim() || null,
-          project_ids: projectIds,
-        },
-        throwOnError: true,
-      })
-      onCreated(data)
+      const application =
+        provisionedApplication ??
+        (
+          await createApplication({
+            body: {
+              name: name.trim(),
+              description: description.trim() || null,
+              project_ids: projectIds,
+            },
+            throwOnError: true,
+          })
+        ).data
+      if (!provisionedApplication) {
+        setProvisionedApplication(application)
+      }
+      let conversation: ConversationResponse
+      try {
+        const { data } = await createApplicationConversation({
+          path: { application_public_id: application.public_id },
+          body: { ai_provider: selectedHarnessId },
+          throwOnError: true,
+        })
+        conversation = data
+      } catch (cause) {
+        const reason =
+          cause instanceof Error
+            ? cause.message
+            : 'The selected harness could not start a thread.'
+        throw new Error(
+          `Application “${application.name}” was created, but its starter thread could not start with the selected harness: ${reason}`,
+          { cause }
+        )
+      }
+      onCreated(application, conversation)
       setName('')
       setDescription('')
       setSelected([])
       setNewProjectMode('workspace')
       setLocalFolderName(null)
       setProvisionedProject(null)
+      setProvisionedApplication(null)
+      setHarnessId(null)
     } catch (cause) {
       setError(
         cause instanceof Error ? cause.message : 'Could not create application.'
@@ -728,7 +768,11 @@ function CreateApplicationDialog({
                   placeholder="Describe the product, the services it needs, and what success looks like…"
                 />
               </div>
-              <HarnessSummary providers={providers} />
+              <HarnessPicker
+                providers={providers}
+                selectedId={selectedHarnessId}
+                onSelect={setHarnessId}
+              />
               <div className="space-y-4">
                 {startMode === 'existing' && (
                   <div className="space-y-2">
@@ -859,6 +903,7 @@ function CreateApplicationDialog({
                   saving ||
                   startMode === null ||
                   !name.trim() ||
+                  !selectedHarnessId ||
                   (startMode === 'existing' && selected.length === 0) ||
                   (startMode === 'new' &&
                     newProjectMode === 'local' &&
@@ -887,15 +932,23 @@ function projectNameFromApplication(name: string) {
   return slug || 'application'
 }
 
-function HarnessSummary({ providers }: { providers: ChatProviderOption[] }) {
+function HarnessPicker({
+  providers,
+  selectedId,
+  onSelect,
+}: {
+  providers: ChatProviderOption[]
+  selectedId: string | null
+  onSelect: (providerId: string) => void
+}) {
   return (
     <section className="rounded-lg border border-border bg-muted/40 p-3">
       <div className="flex items-center justify-between gap-3">
         <div>
           <p className="text-sm font-medium">Detected harnesses</p>
           <p className="mt-0.5 text-xs text-muted-foreground">
-            Choose the harness for the first thread after the application is
-            created. It remains pinned to that thread.
+            The selected harness starts the first thread and remains pinned to
+            it.
           </p>
         </div>
         <TerminalSquare className="size-4 shrink-0 text-muted-foreground" />
@@ -903,9 +956,16 @@ function HarnessSummary({ providers }: { providers: ChatProviderOption[] }) {
       {providers.length > 0 ? (
         <div className="mt-3 flex flex-wrap gap-2">
           {providers.map((provider) => (
-            <span
+            <button
               key={provider.id}
-              className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+              type="button"
+              onClick={() => onSelect(provider.id)}
+              className={cn(
+                'rounded-md border px-2.5 py-1.5 text-left text-xs',
+                provider.id === selectedId
+                  ? 'border-primary bg-accent text-accent-foreground'
+                  : 'border-border bg-background text-foreground hover:bg-accent'
+              )}
             >
               {chatProviderLabel(provider)}
               {provider.default_model_id && (
@@ -913,7 +973,7 @@ function HarnessSummary({ providers }: { providers: ChatProviderOption[] }) {
                   · {provider.default_model_id}
                 </span>
               )}
-            </span>
+            </button>
           ))}
         </div>
       ) : (

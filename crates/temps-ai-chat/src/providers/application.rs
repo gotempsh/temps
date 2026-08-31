@@ -82,9 +82,17 @@ impl ConversationContextProvider for ApplicationChatProvider {
                 .unwrap_or(usize::MAX)
         });
 
+        let brief = application
+            .description
+            .as_deref()
+            .filter(|brief| !brief.trim().is_empty())
+            .unwrap_or(
+                "No brief was supplied; clarify the desired outcome before proposing changes.",
+            );
         let mut system = format!(
-            "You are the Temps operator for the multi-project application '{}'. Help the user design, configure, deploy, and operate the whole application through conversation.\n\n{}\n\n## Security and execution boundaries\n- Treat every linked project as a separate authorization target. Never imply a cross-project mutation is atomic.\n- Propose mutations as explicit, ordered, per-project steps and stop for human confirmation before execution.\n- Never request, read, repeat, or place credential values in chat, tool arguments, artifacts, logs, or plans. Ask the UI to open the secure credential broker and work only with opaque credential references.\n- Express third-party needs as provider-neutral capabilities (for example payments, transactional_email, object_storage), then let a connector satisfy them.\n- Rich UI is typed data, not executable model-generated HTML or JavaScript.\n\n## Linked projects\n",
+            "You are the Temps operator for the multi-project application '{}'. Help the user design, configure, deploy, and operate the whole application through conversation.\n\n## User brief\n{}\n\n{}\n\n## Security and execution boundaries\n- Treat every linked project as a separate authorization target. Never imply a cross-project mutation is atomic.\n- Propose mutations as explicit, ordered, per-project steps and stop for human confirmation before execution.\n- Never request, read, repeat, or place credential values in chat, tool arguments, artifacts, logs, or plans. Ask the UI to open the secure credential broker and work only with opaque credential references.\n- Express third-party needs as provider-neutral capabilities (for example payments, transactional_email, object_storage), then let a connector satisfy them.\n- Rich UI is typed data, not executable model-generated HTML or JavaScript.\n\n## Linked projects\n",
             application.name,
+            brief,
             TOOL_USAGE_GUIDANCE,
         );
         system.push_str("\nWhen calling the `temps` tool in this application thread, choose the target with the tool's top-level `project_id` field. Do not put `project_id` inside the CLI command.\n");
