@@ -22,6 +22,7 @@ anyhow = { workspace = true }
 regex = "1.11"
 toml = "1.1"
 serde_yaml = "0.9"
+url = { workspace = true }
 utoipa = { workspace = true, optional = true }
 
 # The build engine. Pinned to a commit rather than a branch: a build plan that

@@ -17,7 +17,7 @@ export type RepositoryInfo = {
 
 export type ProjectBuildSource = {
   label: string
-  kind: GitProvider | 'docker' | 'source'
+  kind: GitProvider | 'docker' | 'compose' | 'source'
 }
 
 const PROVIDER_LABELS: Record<GitProvider, string> = {
@@ -123,6 +123,10 @@ export function projectBuildSource(
 
   if (project.source_type === 'docker_image') {
     return { kind: 'docker', label: 'Docker image' }
+  }
+
+  if (project.source_type === 'compose') {
+    return { kind: 'compose', label: 'Docker Compose' }
   }
 
   return { kind: 'source', label: 'Source upload' }

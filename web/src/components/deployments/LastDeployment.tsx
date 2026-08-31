@@ -10,6 +10,7 @@ import { TimeAgo } from '@/components/utils/TimeAgo'
 import { ArrowRight, Camera, ExternalLink, GitBranch } from 'lucide-react'
 import { Link } from 'react-router'
 import { normalizeUrl } from '@/lib/deployment-url'
+import { deploymentSourceLabel } from '@/lib/deployment-source-label'
 import { DeploymentStatusBadge } from '../deployment/DeploymentStatusBadge'
 
 interface LastDeploymentProps {
@@ -61,7 +62,7 @@ export function LastDeployment({
                 <p className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
                   <GitBranch className="size-3.5 shrink-0" />
                   <span className="truncate">
-                    {deployment.branch || 'uploaded source'}
+                    {deploymentSourceLabel(deployment)}
                     {deployment.commit_hash
                       ? ` · ${deployment.commit_hash.slice(0, 7)}`
                       : ''}

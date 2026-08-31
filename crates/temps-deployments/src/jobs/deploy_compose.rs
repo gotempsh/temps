@@ -416,6 +416,7 @@ impl WorkflowTask for DeployComposeJob {
                         looks_like_database: s.looks_like_database,
                         detected_service_type: s.detected_service_type,
                         ports: s.ports,
+                        health_check_path: s.health_check_path,
                     })
                     .collect()
             })
@@ -1093,6 +1094,7 @@ mod tests {
                 service: "webserver".to_string(),
                 port: 8000,
                 published: Some(18005),
+                health_check_path: None,
             }])
             .log_service(Arc::new(LogService::new(std::env::temp_dir())))
             .build()
@@ -1123,6 +1125,7 @@ mod tests {
             service: "gitlab".to_string(),
             port: 8929,
             published: Some(8929),
+            health_check_path: None,
         }];
 
         let selected = route_binding_for_service("gitlab", &bindings, &public_ports).unwrap();

@@ -104,7 +104,16 @@ impl HealthCheckService {
             let http_client = self.http_client.clone();
             let config_service = self.config_service.clone();
             let job_queue = self.job_queue.clone();
-            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let permit = match semaphore.clone().acquire_owned().await {
+                Ok(permit) => permit,
+                Err(error) => {
+                    error!(
+                        ?error,
+                        "Health-check concurrency limiter closed unexpectedly"
+                    );
+                    break;
+                }
+            };
 
             let task = tokio::spawn(async move {
                 let _permit = permit; // Hold permit until task completes
@@ -127,6 +136,40 @@ impl HealthCheckService {
 
         debug!("Health check cycle completed");
         Ok(())
+    }
+
+    /// Recompute all active monitors for one deployed environment.
+    ///
+    /// Deployment success calls this after updating the monitor's health path,
+    /// avoiding up to a minute of stale Down/Unknown state while preserving the
+    /// periodic scheduler's scale-to-zero exclusion for on-demand environments.
+    pub async fn check_monitors_for_environment(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+    ) -> Result<usize, StatusPageError> {
+        let monitors_with_envs = status_monitors::Entity::find()
+            .filter(status_monitors::Column::ProjectId.eq(project_id))
+            .filter(status_monitors::Column::EnvironmentId.eq(Some(environment_id)))
+            .filter(status_monitors::Column::IsActive.eq(true))
+            .find_also_related(environments::Entity)
+            .all(self.db.as_ref())
+            .await?;
+        let monitors = Self::filter_on_demand_monitors(monitors_with_envs);
+        let monitor_count = monitors.len();
+
+        for monitor in monitors {
+            Self::check_monitor(
+                self.db.clone(),
+                self.http_client.clone(),
+                self.config_service.clone(),
+                monitor,
+                self.job_queue.clone(),
+            )
+            .await?;
+        }
+
+        Ok(monitor_count)
     }
 
     /// Check a single monitor
@@ -965,7 +1008,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_check_monitor_skips_paused_deployment() {
+    async fn test_environment_recheck_selects_monitor_and_skips_paused_deployment() {
         let Ok(test_db) = temps_database::test_utils::TestDatabase::with_migrations().await else {
             println!("Docker not available, skipping");
             return;
@@ -1039,6 +1082,7 @@ mod tests {
 
         let config_service = test_config_service(&db, &test_db.database_url);
         let job_queue: Arc<dyn temps_core::JobQueue> = Arc::new(NeverJobQueue);
+        let health_check_service = HealthCheckService::new(db.clone(), config_service, job_queue);
 
         // If the paused check were skipped or stale, this would try to hit
         // `paused-skip-test-production.test.local`, which doesn't resolve —
@@ -1047,15 +1091,11 @@ mod tests {
         // insert a `status_checks` row. Assert none was written instead of
         // asserting on the return value, so the test fails loudly if the
         // guard regresses instead of passing for the wrong reason.
-        let result = HealthCheckService::check_monitor(
-            db.clone(),
-            reqwest::Client::new(),
-            config_service,
-            monitor.clone(),
-            job_queue,
-        )
-        .await;
-        assert!(result.is_ok());
+        let checked = health_check_service
+            .check_monitors_for_environment(project.id, environment.id)
+            .await
+            .expect("post-deploy environment recheck should succeed");
+        assert_eq!(checked, 1, "the environment's active monitor is selected");
 
         let checks = status_checks::Entity::find()
             .filter(status_checks::Column::MonitorId.eq(monitor.id))

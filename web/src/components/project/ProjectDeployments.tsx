@@ -56,6 +56,7 @@ import {
   UploadCloud,
 } from 'lucide-react'
 import { EmptyPlaceholder } from '@/components/ui/empty-placeholder'
+import { deployComposeSource } from '@/lib/compose-source-api'
 
 const ITEMS_PER_PAGE = 10
 
@@ -199,6 +200,19 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     },
   })
 
+  const redeployCompose = useMutation({
+    mutationFn: (environmentId: number) =>
+      deployComposeSource(project.id, environmentId),
+    meta: {
+      errorTitle: 'Failed to deploy Compose source',
+    },
+    onSuccess: () => {
+      toast.success('Compose deployment triggered successfully')
+      setIsRedeployModalOpen(false)
+      refetch()
+    },
+  })
+
   const cancelDeployment = useMutation({
     ...cancelDeploymentMutation(),
     meta: {
@@ -318,6 +332,11 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         path: { project_id: project.id, environment_id: environmentId },
         body: { image_ref: ref },
       })
+      return
+    }
+
+    if (project.source_type === 'compose') {
+      await redeployCompose.mutateAsync(environmentId)
       return
     }
 
@@ -899,7 +918,11 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
           deploymentsData?.deployments.find((d) => d.id === selectedDeployment)
             ?.environment_id ?? undefined
         }
-        isLoading={createDeployment.isPending || redeployImage.isPending}
+        isLoading={
+          createDeployment.isPending ||
+          redeployImage.isPending ||
+          redeployCompose.isPending
+        }
         imageRef={imageRef}
       />
 

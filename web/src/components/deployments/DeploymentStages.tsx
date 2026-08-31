@@ -438,7 +438,11 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
           <div className="text-xs font-mono p-4 w-max min-w-full">
             {logs.length === 0 ? (
               <div className="text-muted-foreground">
-                Connecting to log stream...
+                {connectionStatus === 'error'
+                  ? 'Could not connect to the log stream. Retrying…'
+                  : connectionStatus === 'connected'
+                    ? 'Connected. Waiting for log output…'
+                    : 'Connecting to log stream…'}
               </div>
             ) : filteredLogs.length === 0 ? (
               <div className="text-muted-foreground">

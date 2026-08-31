@@ -112,10 +112,45 @@ pub struct CatalogSnapshot {
 #[derive(Debug, Clone)]
 pub struct CatalogTemplateAnalysis {
     pub service_count: usize,
+    pub backing_services: Vec<TemplateBackingService>,
     pub installable: bool,
     pub compatibility_tier: TemplateCompatibilityTier,
     pub compatibility_issues: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TemplateBackingServiceKind {
+    Postgres,
+    Redis,
+    MongoDb,
+    S3,
+}
+
+impl TemplateBackingServiceKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgres",
+            Self::Redis => "redis",
+            Self::MongoDb => "mongodb",
+            Self::S3 => "s3",
+        }
+    }
+
+    pub fn discovery_tag(self) -> &'static str {
+        match self {
+            Self::Postgres => "postgresql",
+            Self::Redis => "redis",
+            Self::MongoDb => "mongodb",
+            Self::S3 => "s3",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TemplateBackingService {
+    pub service: String,
+    pub kind: TemplateBackingServiceKind,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +246,7 @@ pub struct TemplateRoute {
     pub service: String,
     pub port: u16,
     pub variable_names: Vec<String>,
+    pub health_check_path: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -247,6 +283,7 @@ impl TemplateCompatibilityTier {
 pub struct PreparedServiceTemplate {
     pub compose: String,
     pub service_count: usize,
+    pub backing_services: Vec<TemplateBackingService>,
     pub routes: Vec<TemplateRoute>,
     pub variables: Vec<TemplateVariable>,
     pub compatibility_issues: Vec<String>,
@@ -298,9 +335,21 @@ impl PreparedServiceTemplate {
         for route in &self.routes {
             digest_field(&mut hasher, route.service.as_bytes());
             digest_field(&mut hasher, &route.port.to_be_bytes());
+            digest_field(
+                &mut hasher,
+                route
+                    .health_check_path
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
             for variable_name in &route.variable_names {
                 digest_field(&mut hasher, variable_name.as_bytes());
             }
+        }
+        for backing_service in &self.backing_services {
+            digest_field(&mut hasher, backing_service.kind.as_str().as_bytes());
+            digest_field(&mut hasher, backing_service.service.as_bytes());
         }
         let digest = hasher.finalize();
         let mut encoded = String::with_capacity(digest.len() * 2);
@@ -887,15 +936,21 @@ impl ServiceTemplateCatalog {
                 .iter()
                 .map(|(slug, template)| {
                     let analysis = match prepare_template(slug, template) {
-                        Ok(prepared) => CatalogTemplateAnalysis {
-                            service_count: prepared.service_count,
-                            installable: prepared.installable(),
-                            compatibility_tier: prepared.compatibility_tier(),
-                            compatibility_issues: prepared.compatibility_issues,
-                            warnings: prepared.warnings,
-                        },
+                        Ok(prepared) => {
+                            let installable = prepared.installable();
+                            let compatibility_tier = prepared.compatibility_tier();
+                            CatalogTemplateAnalysis {
+                                service_count: prepared.service_count,
+                                backing_services: prepared.backing_services,
+                                installable,
+                                compatibility_tier,
+                                compatibility_issues: prepared.compatibility_issues,
+                                warnings: prepared.warnings,
+                            }
+                        }
                         Err(error) => CatalogTemplateAnalysis {
                             service_count: 0,
+                            backing_services: Vec::new(),
                             installable: false,
                             compatibility_tier: TemplateCompatibilityTier::Blocked,
                             compatibility_issues: vec![error.to_string()],
@@ -995,6 +1050,7 @@ pub fn prepare_template(
         .and_then(YamlValue::as_mapping)
         .map(Mapping::len)
         .unwrap_or(0);
+    let backing_services = discover_backing_services(&root);
     let variables = extract_variables(&root, &routes);
     for variable in variables.iter().filter(|variable| {
         variable.name.starts_with("COMPOSE_") || variable.name.starts_with("DOCKER_")
@@ -1025,6 +1081,7 @@ pub fn prepare_template(
     Ok(PreparedServiceTemplate {
         compose,
         service_count,
+        backing_services,
         routes,
         variables,
         compatibility_issues,
@@ -1032,6 +1089,62 @@ pub fn prepare_template(
         transformations,
         capability_requirements,
     })
+}
+
+fn discover_backing_services(root: &YamlValue) -> Vec<TemplateBackingService> {
+    let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
+        return Vec::new();
+    };
+    let mut backing_services = services
+        .iter()
+        .filter_map(|(name, definition)| {
+            let service = name.as_str()?;
+            let image = definition
+                .as_mapping()?
+                .get("image")
+                .and_then(YamlValue::as_str)?;
+            classify_backing_service_image(image).map(|kind| TemplateBackingService {
+                service: service.to_string(),
+                kind,
+            })
+        })
+        .collect::<Vec<_>>();
+    backing_services.sort();
+    backing_services.dedup();
+    backing_services
+}
+
+fn classify_backing_service_image(image: &str) -> Option<TemplateBackingServiceKind> {
+    let image = image.trim().split('@').next().unwrap_or_default();
+    let last_slash = image.rfind('/');
+    let repository = match image.rfind(':') {
+        Some(colon) if last_slash.is_none_or(|slash| colon > slash) => &image[..colon],
+        _ => image,
+    }
+    .to_ascii_lowercase();
+    let image_name = repository.rsplit('/').next().unwrap_or(repository.as_str());
+
+    if image_name == "postgres"
+        || matches!(repository.as_str(), "postgis/postgis" | "pgvector/pgvector")
+        || repository.starts_with("timescale/timescaledb")
+        || repository.starts_with("supabase/postgres")
+    {
+        return Some(TemplateBackingServiceKind::Postgres);
+    }
+    if image_name == "redis"
+        || matches!(image_name, "redis-stack" | "redis-stack-server")
+        || image_name == "valkey"
+        || image_name == "dragonfly"
+    {
+        return Some(TemplateBackingServiceKind::Redis);
+    }
+    if image_name == "mongo" || image_name == "mongodb" {
+        return Some(TemplateBackingServiceKind::MongoDb);
+    }
+    if image_name == "minio" || image_name == "rustfs" || image_name == "garage" {
+        return Some(TemplateBackingServiceKind::S3);
+    }
+    None
 }
 
 fn first_service_name(root: &YamlValue) -> Option<String> {
@@ -1100,6 +1213,7 @@ fn discover_routes(
     if candidates.is_empty() {
         if let (Some(service), Some(port)) = (first_service_name(root), template_port) {
             return vec![TemplateRoute {
+                health_check_path: infer_service_health_path(root, &service),
                 service,
                 port,
                 variable_names: Vec::new(),
@@ -1126,6 +1240,7 @@ fn discover_routes(
         };
         match port {
             Some(port) => routes.push(TemplateRoute {
+                health_check_path: infer_service_health_path(root, &candidate.service),
                 service: candidate.service,
                 port,
                 variable_names: candidate.variable_names,
@@ -1137,6 +1252,15 @@ fn discover_routes(
         }
     }
     routes
+}
+
+fn infer_service_health_path(root: &YamlValue, service_name: &str) -> Option<String> {
+    root.get("services")?
+        .as_mapping()?
+        .get(service_name)?
+        .as_mapping()?
+        .get("healthcheck")
+        .and_then(temps_presets::http_healthcheck_path)
 }
 
 fn is_public_magic_variable(key: &str) -> bool {
@@ -1770,7 +1894,7 @@ fn extract_variables(root: &YamlValue, routes: &[TemplateRoute]) -> Vec<Template
                                 assigned
                                     .filter(|value| !value.is_empty())
                                     .map(str::to_string),
-                                true,
+                                false,
                             );
                         }
                     }
@@ -1781,7 +1905,7 @@ fn extract_variables(root: &YamlValue, routes: &[TemplateRoute]) -> Vec<Template
                             continue;
                         };
                         if value.is_null() {
-                            insert_variable(&mut found, key, None, true);
+                            insert_variable(&mut found, key, None, false);
                         } else if key.starts_with("SERVICE_URL_")
                             || key.starts_with("SERVICE_FQDN_")
                         {
@@ -1812,6 +1936,7 @@ fn extract_variables(root: &YamlValue, routes: &[TemplateRoute]) -> Vec<Template
                     .entry(name.clone())
                     .and_modify(|variable| {
                         variable.route_service = Some(route.service.clone());
+                        variable.required |= name == *declared_name;
                     })
                     .or_insert_with(|| TemplateVariable {
                         kind: variable_kind(&name),
@@ -1891,9 +2016,12 @@ fn extract_interpolated_variables(value: &str, found: &mut BTreeMap<String, Temp
                 let default = default_expression
                     .filter(|value| !value.contains('$'))
                     .map(str::to_string);
-                let required = operator.starts_with(":?")
-                    || operator.starts_with('?')
-                    || default_expression.is_none();
+                // Docker Compose substitutes an empty value for `${VAR}` and
+                // `$VAR`. Only the `?` / `:?` operators make interpolation
+                // fail when the value is absent. Optional app integrations
+                // (SMTP, AI providers, OAuth, etc.) commonly use plain
+                // interpolation and must not block installation.
+                let required = operator.starts_with(":?") || operator.starts_with('?');
                 insert_variable(found, name, default, required);
             }
             // Advance one byte so nested variables inside a default expression
@@ -1909,7 +2037,7 @@ fn extract_interpolated_variables(value: &str, found: &mut BTreeMap<String, Temp
             .unwrap_or(bytes.len());
         let name = &value[start..end];
         if is_environment_name(name) {
-            insert_variable(found, name, None, true);
+            insert_variable(found, name, None, false);
         }
         index = end.max(index + 1);
     }
@@ -2164,6 +2292,74 @@ mod tests {
             .unwrap();
         assert!(api_key.required);
         assert_eq!(api_key.kind, TemplateVariableKind::UserInput);
+    }
+
+    #[test]
+    fn plain_and_passthrough_variables_are_optional_like_docker_compose() {
+        let prepared = prepare_template(
+            "optional-integrations",
+            &template(
+                r#"services:
+  app:
+    image: example/app:1
+    environment:
+      - COPILOT_FAL_API_KEY
+      - COPILOT_OPENAI_API_KEY=${COPILOT_OPENAI_API_KEY}
+      - MAILER_HOST
+      - MAILER_PASSWORD=${MAILER_PASSWORD:-}
+      - REQUIRED_TOKEN=${REQUIRED_TOKEN:?token required}
+"#,
+                None,
+            ),
+        )
+        .unwrap();
+
+        for name in [
+            "COPILOT_FAL_API_KEY",
+            "COPILOT_OPENAI_API_KEY",
+            "MAILER_HOST",
+            "MAILER_PASSWORD",
+        ] {
+            let variable = prepared
+                .variables
+                .iter()
+                .find(|variable| variable.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert!(!variable.required, "{name} should be optional");
+        }
+        assert!(prepared
+            .variables
+            .iter()
+            .find(|variable| variable.name == "REQUIRED_TOKEN")
+            .is_some_and(|variable| variable.required));
+    }
+
+    #[test]
+    fn route_reuses_browserless_compose_health_path() {
+        let prepared = prepare_template(
+            "browserless",
+            &template(
+                r#"services:
+  browserless:
+    image: ghcr.io/browserless/chromium
+    environment:
+      - SERVICE_URL_BROWSERLESS_3000
+    expose:
+      - 3000
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:3000/docs"]
+"#,
+                Some("3000"),
+            ),
+        )
+        .expect("Browserless template should prepare");
+
+        assert_eq!(prepared.routes.len(), 1);
+        assert_eq!(prepared.routes[0].service, "browserless");
+        assert_eq!(
+            prepared.routes[0].health_check_path.as_deref(),
+            Some("/docs")
+        );
     }
 
     #[test]
@@ -2699,6 +2895,55 @@ networks:
             metadata_changed.install_plan_digest(&metadata_changed_template)
         );
         assert_eq!(first.install_plan_digest(&first_template).len(), 64);
+    }
+
+    #[test]
+    fn discovers_bundled_backing_service_families() {
+        let prepared = prepare_template(
+            "dependencies",
+            &template(
+                r#"services:
+  db:
+    image: registry.example.test:5000/postgres:17
+  cache:
+    image: valkey/valkey:8
+  documents:
+    image: mongo:8
+  objects:
+    image: minio/minio:latest
+  app:
+    image: example/app:1
+"#,
+                None,
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            prepared
+                .backing_services
+                .iter()
+                .map(|service| (service.service.as_str(), service.kind.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("cache", "redis"),
+                ("db", "postgres"),
+                ("documents", "mongodb"),
+                ("objects", "s3"),
+            ]
+        );
+    }
+
+    #[test]
+    fn backing_service_detection_does_not_match_unrelated_names() {
+        for image in [
+            "example/postgres-exporter:latest",
+            "example/redis-commander:latest",
+            "example/mongodb-ui:latest",
+            "example/minio-client:latest",
+        ] {
+            assert_eq!(classify_backing_service_image(image), None, "{image}");
+        }
     }
 
     #[test]

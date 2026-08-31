@@ -972,6 +972,9 @@ pub struct ComposeServiceSnapshot {
     /// proxy must use; `published` is only Docker's optional host-side port.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<ComposePortMapping>,
+    /// HTTP path discovered from this service's loopback Compose healthcheck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_path: Option<String>,
 }
 
 /// A Docker Compose service port mapping, reduced to the information the UI
@@ -1005,6 +1008,10 @@ pub struct ComposePublicPort {
     /// this port when Temps runs on the host or reaches a remote node.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub published: Option<u16>,
+    /// Optional user override for the public health probe. When absent, Temps
+    /// uses the path discovered from this service's Compose healthcheck.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_check_path: Option<String>,
 }
 
 /// A Nixpacks build provider.
@@ -1509,6 +1516,7 @@ mod tests {
                 published: Some(15432),
                 protocol: "tcp".to_string(),
             }],
+            health_check_path: None,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(

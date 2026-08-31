@@ -11,6 +11,7 @@ describe('project header deploy action', () => {
   test('opens a dialog in place for deployable project sources', () => {
     expect(projectDeployLaunchMode('git')).toBe('dialog')
     expect(projectDeployLaunchMode('docker_image')).toBe('dialog')
+    expect(projectDeployLaunchMode('compose')).toBe('dialog')
   })
 
   test('keeps file-backed projects in their upload flow', () => {

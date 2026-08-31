@@ -359,6 +359,19 @@ fn validate_compose_public_ports(
                 route.service
             )));
         }
+        if let Some(path) = route.health_check_path.as_deref() {
+            if path.len() > 2048
+                || !path.starts_with('/')
+                || path.contains('@')
+                || path.contains("://")
+                || path.chars().any(char::is_control)
+            {
+                return Err(ProjectError::InvalidInput(format!(
+                    "Compose public route health path '{}' for service '{}' must be a safe relative HTTP path starting with '/'",
+                    path, route.service
+                )));
+            }
+        }
         if !services.insert(route.service.as_str()) {
             return Err(ProjectError::InvalidInput(format!(
                 "Compose service '{}' can have only one public URL",
@@ -4443,6 +4456,7 @@ mod tests {
             service: service.to_string(),
             port: 80,
             published: Some(15_455),
+            health_check_path: None,
         };
         let base = DockerComposeConfig {
             compose_services: vec![ComposeServiceSnapshot {
@@ -4491,6 +4505,7 @@ mod tests {
                 service: "web".to_string(),
                 port: 80,
                 published: Some(15_455),
+                health_check_path: None,
             }],
             compose_services: vec![ComposeServiceSnapshot {
                 name: "web".to_string(),
@@ -4500,6 +4515,23 @@ mod tests {
         };
 
         assert!(validate_compose_public_ports(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_compose_public_ports_rejects_absolute_health_urls() {
+        use temps_entities::preset::{ComposePublicPort, DockerComposeConfig};
+        let cfg = DockerComposeConfig {
+            public_ports: vec![ComposePublicPort {
+                service: "web".to_string(),
+                port: 80,
+                health_check_path: Some("https://attacker.example/ready".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        let error = validate_compose_public_ports(&cfg).expect_err("absolute URL must fail");
+        assert!(error.to_string().contains("safe relative HTTP path"));
     }
 
     use std::sync::Arc;

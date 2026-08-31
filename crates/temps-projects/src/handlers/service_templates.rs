@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
@@ -16,13 +16,15 @@ use utoipa::{OpenApi, ToSchema};
 use super::AppState;
 use crate::services::service_templates::{
     preflight_template, prepare_template, CatalogTemplateAnalysis, CoolifyTemplate,
-    PreparedServiceTemplate, ServiceTemplateCatalogError, TemplateCapabilityRequirement,
-    TemplateRoute, TemplateTransformation, TemplateVariable, COOLIFY_CATALOG_URL,
-    COOLIFY_REPOSITORY_URL,
+    PreparedServiceTemplate, ServiceTemplateCatalogError, TemplateBackingService,
+    TemplateCapabilityRequirement, TemplateRoute, TemplateTransformation, TemplateVariable,
+    COOLIFY_CATALOG_URL, COOLIFY_REPOSITORY_URL,
 };
 
 const DEFAULT_PER_PAGE: usize = 24;
 const MAX_PER_PAGE: usize = 100;
+const MAX_POPULAR_TAGS: usize = 16;
+const MAX_TEMPLATE_TAGS: usize = 16;
 
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct ListServiceTemplatesQuery {
@@ -30,6 +32,8 @@ pub struct ListServiceTemplatesQuery {
     pub search: Option<String>,
     /// Exact case-insensitive category filter.
     pub category: Option<String>,
+    /// Exact normalized discovery-tag filter.
+    pub tag: Option<String>,
     /// One-based page number. Defaults to 1.
     pub page: Option<usize>,
     /// Results per page. Defaults to 24 and is capped at 100.
@@ -45,6 +49,7 @@ pub struct ServiceTemplateSummaryResponse {
     pub logo_url: Option<String>,
     pub category: String,
     pub tags: Vec<String>,
+    pub backing_services: Vec<ServiceTemplateBackingServiceResponse>,
     pub port: Option<u16>,
     pub service_count: usize,
     pub installable: bool,
@@ -58,10 +63,39 @@ pub struct ServiceTemplateSummaryResponse {
     pub template_last_updated_at: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ServiceTemplateBackingServiceResponse {
+    /// Compose service name that provides this dependency.
+    pub service: String,
+    /// Temps service family: `postgres`, `redis`, `mongodb`, or `s3`.
+    pub kind: String,
+    /// Bundled services remain in this Compose snapshot. Safe managed-service
+    /// replacement requires a template adapter that rewrites its connection contract.
+    pub mode: String,
+}
+
+impl From<TemplateBackingService> for ServiceTemplateBackingServiceResponse {
+    fn from(backing_service: TemplateBackingService) -> Self {
+        Self {
+            service: backing_service.service,
+            kind: backing_service.kind.as_str().to_string(),
+            mode: "bundled".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ServiceTemplateDiscoveryTagResponse {
+    pub name: String,
+    pub count: usize,
+}
+
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ListServiceTemplatesResponse {
     pub templates: Vec<ServiceTemplateSummaryResponse>,
     pub categories: Vec<String>,
+    /// Most common normalized tags across the complete catalog.
+    pub popular_tags: Vec<ServiceTemplateDiscoveryTagResponse>,
     /// Total entries in the upstream catalog before filters are applied.
     pub catalog_total: usize,
     /// Total entries matching the current search and category filters.
@@ -113,6 +147,8 @@ pub struct ServiceTemplateRouteResponse {
     pub service: String,
     pub port: u16,
     pub variable_names: Vec<String>,
+    /// HTTP path detected from this service's Compose healthcheck.
+    pub health_check_path: Option<String>,
 }
 
 impl From<TemplateRoute> for ServiceTemplateRouteResponse {
@@ -121,6 +157,7 @@ impl From<TemplateRoute> for ServiceTemplateRouteResponse {
             service: route.service,
             port: route.port,
             variable_names: route.variable_names,
+            health_check_path: route.health_check_path,
         }
     }
 }
@@ -208,6 +245,8 @@ pub struct PreflightServiceTemplateResponse {
     components(schemas(
         ListServiceTemplatesQuery,
         ServiceTemplateSummaryResponse,
+        ServiceTemplateBackingServiceResponse,
+        ServiceTemplateDiscoveryTagResponse,
         ListServiceTemplatesResponse,
         ServiceTemplateVariableResponse,
         ServiceTemplateDetailResponse,
@@ -231,6 +270,7 @@ pub struct ServiceTemplatesApiDoc;
     params(
         ("search" = Option<String>, Query, description = "Search name, description, category, and tags"),
         ("category" = Option<String>, Query, description = "Filter by category"),
+        ("tag" = Option<String>, Query, description = "Filter by exact normalized discovery tag"),
         ("page" = Option<usize>, Query, description = "One-based page number"),
         ("per_page" = Option<usize>, Query, description = "Results per page, maximum 100")
     ),
@@ -265,6 +305,7 @@ pub async fn list_service_templates(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_lowercase);
+    let tag = query.tag.as_deref().and_then(normalize_discovery_tag);
     let page = query.page.unwrap_or(1).max(1);
     let per_page = query
         .per_page
@@ -278,6 +319,7 @@ pub async fn list_service_templates(
         .collect::<Vec<_>>();
     categories.sort_by_key(|value| value.to_ascii_lowercase());
     categories.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let popular_tags = popular_discovery_tags(&snapshot.templates, &snapshot.analyses);
 
     let mut compatibility = ServiceTemplateCompatibilitySummaryResponse::default();
     for analysis in snapshot.analyses.values() {
@@ -292,7 +334,14 @@ pub async fn list_service_templates(
         .templates
         .iter()
         .filter(|(slug, template)| {
-            template_matches(slug, template, search.as_deref(), category.as_deref())
+            template_matches(
+                slug,
+                template,
+                snapshot.analyses.get(slug.as_str()),
+                search.as_deref(),
+                category.as_deref(),
+                tag.as_deref(),
+            )
         })
         .collect::<Vec<_>>();
     filtered.sort_by(|(left_slug, _), (right_slug, _)| {
@@ -313,6 +362,7 @@ pub async fn list_service_templates(
     Ok(Json(ListServiceTemplatesResponse {
         templates,
         categories,
+        popular_tags,
         catalog_total: snapshot.templates.len(),
         total,
         page,
@@ -555,7 +605,13 @@ fn summary_response(
             documentation_url: template.documentation.as_deref().and_then(safe_http_url),
             logo_url: template.logo.as_deref().and_then(logo_url),
             category: template_category(template),
-            tags: template.tags.clone(),
+            tags: template_discovery_tags(template, &analysis.backing_services),
+            backing_services: analysis
+                .backing_services
+                .clone()
+                .into_iter()
+                .map(Into::into)
+                .collect(),
             port: template.port.as_deref().and_then(|port| port.parse().ok()),
             service_count: analysis.service_count,
             installable: analysis.installable,
@@ -573,7 +629,8 @@ fn summary_response(
             documentation_url: template.documentation.as_deref().and_then(safe_http_url),
             logo_url: template.logo.as_deref().and_then(logo_url),
             category: template_category(template),
-            tags: template.tags.clone(),
+            tags: template_discovery_tags(template, &[]),
+            backing_services: Vec::new(),
             port: template.port.as_deref().and_then(|port| port.parse().ok()),
             service_count: 0,
             installable: false,
@@ -599,7 +656,13 @@ fn prepared_summary_response(
         documentation_url: template.documentation.as_deref().and_then(safe_http_url),
         logo_url: template.logo.as_deref().and_then(logo_url),
         category: template_category(template),
-        tags: template.tags.clone(),
+        tags: template_discovery_tags(template, &prepared.backing_services),
+        backing_services: prepared
+            .backing_services
+            .clone()
+            .into_iter()
+            .map(Into::into)
+            .collect(),
         port: prepared.routes.first().map(|route| route.port),
         service_count: prepared.service_count,
         installable: prepared.installable(),
@@ -639,21 +702,114 @@ fn template_category(template: &CoolifyTemplate) -> String {
 fn template_matches(
     slug: &str,
     template: &CoolifyTemplate,
+    analysis: Option<&CatalogTemplateAnalysis>,
     search: Option<&str>,
     category: Option<&str>,
+    tag: Option<&str>,
 ) -> bool {
+    let discovery_tags = template_discovery_tags(
+        template,
+        analysis
+            .map(|analysis| analysis.backing_services.as_slice())
+            .unwrap_or_default(),
+    );
     category.is_none_or(|category| template_category(template).to_ascii_lowercase() == category)
+        && tag.is_none_or(|tag| discovery_tags.iter().any(|candidate| candidate == tag))
         && search.is_none_or(|search| {
             let mut haystack = format!(
                 "{} {} {} {}",
                 slug,
                 template.slogan.as_deref().unwrap_or_default(),
                 template_category(template),
-                template.tags.join(" ")
+                discovery_tags.join(" ")
             );
             haystack.make_ascii_lowercase();
             haystack.contains(search)
         })
+}
+
+fn template_discovery_tags(
+    template: &CoolifyTemplate,
+    backing_services: &[TemplateBackingService],
+) -> Vec<String> {
+    let mut tags = BTreeSet::new();
+    for category in template_category(template).split([',', '/', '&']) {
+        if let Some(tag) = normalize_discovery_tag(category) {
+            tags.insert(tag);
+        }
+    }
+    for upstream_tag in &template.tags {
+        if let Some(tag) = normalize_discovery_tag(upstream_tag) {
+            tags.insert(tag);
+        }
+    }
+    for backing_service in backing_services {
+        tags.insert(backing_service.kind.discovery_tag().to_string());
+    }
+    tags.into_iter().take(MAX_TEMPLATE_TAGS).collect()
+}
+
+fn normalize_discovery_tag(value: &str) -> Option<String> {
+    let mut normalized = String::new();
+    let mut separator_pending = false;
+    for character in value.trim().to_lowercase().chars() {
+        if character.is_alphanumeric() {
+            if separator_pending && !normalized.is_empty() {
+                normalized.push('-');
+            }
+            normalized.push(character);
+            separator_pending = false;
+        } else if !normalized.is_empty() {
+            separator_pending = true;
+        }
+    }
+    let normalized = normalized.trim_matches('-');
+    if normalized.is_empty() || normalized.len() > 40 {
+        return None;
+    }
+    let canonical = match normalized {
+        "opensource" | "open-source" => "open-source",
+        "nocode" | "no-code" => "no-code",
+        "machinelearning" | "machine-learning" => "machine-learning",
+        "versioncontrol" | "version-control" => "version-control",
+        "devtools" | "dev-tools" | "developer-tools" | "development-tools" => "developer-tools",
+        "postgres" | "postgresql" => "postgresql",
+        "mongo" | "mongo-db" | "mongodb" => "mongodb",
+        "object-storage" | "s3-storage" | "minio" => "s3",
+        "auth" => "authentication",
+        "open" | "source" | "self-hosted" | "server" | "web" | "application" | "applications"
+        | "platform" | "low" => return None,
+        value => value,
+    };
+    Some(canonical.to_string())
+}
+
+fn popular_discovery_tags(
+    templates: &BTreeMap<String, CoolifyTemplate>,
+    analyses: &BTreeMap<String, CatalogTemplateAnalysis>,
+) -> Vec<ServiceTemplateDiscoveryTagResponse> {
+    let mut counts = BTreeMap::<String, usize>::new();
+    for (slug, template) in templates {
+        let backing_services = analyses
+            .get(slug)
+            .map(|analysis| analysis.backing_services.as_slice())
+            .unwrap_or_default();
+        for tag in template_discovery_tags(template, backing_services) {
+            *counts.entry(tag).or_default() += 1;
+        }
+    }
+    let mut tags = counts
+        .into_iter()
+        .map(|(name, count)| ServiceTemplateDiscoveryTagResponse { name, count })
+        .collect::<Vec<_>>();
+    tags.sort_by(|left, right| {
+        right
+            .count
+            .cmp(&left.count)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    tags.truncate(MAX_POPULAR_TAGS);
+    tags
 }
 
 fn require_service_template_access(auth: &AuthContext) -> Result<(), Problem> {
@@ -662,8 +818,24 @@ fn require_service_template_access(auth: &AuthContext) -> Result<(), Problem> {
 }
 
 fn safe_http_url(value: &str) -> Option<String> {
-    let url = reqwest::Url::parse(value).ok()?;
-    matches!(url.scheme(), "http" | "https").then(|| url.to_string())
+    let mut url = reqwest::Url::parse(value).ok()?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return None;
+    }
+    let query = url
+        .query_pairs()
+        .map(|(name, value)| {
+            if name.eq_ignore_ascii_case("utm_source") {
+                (name.into_owned(), "temps.sh".to_string())
+            } else {
+                (name.into_owned(), value.into_owned())
+            }
+        })
+        .collect::<Vec<_>>();
+    if url.query().is_some() {
+        url.query_pairs_mut().clear().extend_pairs(query);
+    }
+    Some(url.to_string())
 }
 
 fn logo_url(path: &str) -> Option<String> {
@@ -807,6 +979,10 @@ mod tests {
             Some("https://example.com/docs".to_string())
         );
         assert_eq!(safe_http_url("javascript:alert(1)"), None);
+        assert_eq!(
+            safe_http_url("https://www.keycloak.org/?utm_source=coolify.io&utm_medium=referral"),
+            Some("https://www.keycloak.org/?utm_source=temps.sh&utm_medium=referral".to_string())
+        );
     }
 
     #[test]
@@ -838,20 +1014,42 @@ mod tests {
         assert!(template_matches(
             "actualbudget",
             &template,
+            None,
             Some("finance"),
-            Some("productivity")
+            Some("productivity"),
+            None,
         ));
         assert!(template_matches(
             "actualbudget",
             &template,
+            None,
             Some("budget"),
-            None
+            None,
+            None,
         ));
         assert!(!template_matches(
             "actualbudget",
             &template,
             None,
-            Some("database")
+            None,
+            Some("database"),
+            None,
+        ));
+        assert!(template_matches(
+            "actualbudget",
+            &template,
+            None,
+            None,
+            None,
+            Some("finance"),
+        ));
+        assert!(!template_matches(
+            "actualbudget",
+            &template,
+            None,
+            None,
+            None,
+            Some("fin"),
         ));
     }
 

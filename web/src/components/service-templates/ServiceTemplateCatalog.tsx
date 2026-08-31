@@ -3,7 +3,6 @@
 
 import {
   createProject,
-  deployFromUploadedSource,
   getEnvironments,
   preflightServiceTemplate,
 } from '@/api/client'
@@ -36,36 +35,97 @@ import {
   SelectValue,
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
-import { prepareDrop } from '@/lib/drop-archive'
+import {
+  deployComposeSource,
+  saveComposeSource,
+} from '@/lib/compose-source-api'
 import {
   createServiceTemplateWithSlugRetry,
   generateDependentServiceTemplateValue,
   generateServiceTemplateValue,
   serviceTemplateVariableIsGenerated,
 } from '@/lib/service-template-values'
-import { extractProblemDetails, getErrorMessage } from '@/utils/errorHandling'
-import { useQuery } from '@tanstack/react-query'
 import {
+  serviceCategoryIcon,
+  toggleServiceTag,
+  type ServiceCategoryIcon,
+} from '@/lib/service-template-discovery'
+import { useDebounce } from '@/hooks/useDebounce'
+import { extractProblemDetails, getErrorMessage } from '@/utils/errorHandling'
+import Editor from '@monaco-editor/react'
+import { keepPreviousData, useQuery } from '@tanstack/react-query'
+import {
+  Activity,
   AlertTriangle,
   ArrowLeft,
+  Bot,
   Box,
+  Boxes,
+  Braces,
   CheckCircle2,
   ChevronLeft,
   ChevronRight,
+  Cloud,
+  Code2,
+  Coins,
+  Database,
   ExternalLink,
   Eye,
   EyeOff,
+  FolderKanban,
+  HardDrive,
   Loader2,
+  MessageCircle,
+  Network,
+  Play,
   RefreshCw,
   Search,
+  Shield,
   ShieldAlert,
   Sparkles,
+  WandSparkles,
+  Zap,
 } from 'lucide-react'
-import { useDeferredValue, useEffect, useState } from 'react'
+import { useTheme } from 'next-themes'
+import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
 
 const PER_PAGE = 24
+
+const CATEGORY_ICONS: Record<
+  ServiceCategoryIcon,
+  React.ComponentType<{ className?: string }>
+> = {
+  ai: Bot,
+  automation: WandSparkles,
+  communication: MessageCircle,
+  database: Database,
+  developer: Code2,
+  finance: Coins,
+  media: Play,
+  monitoring: Activity,
+  productivity: FolderKanban,
+  security: Shield,
+  storage: HardDrive,
+  generic: Boxes,
+}
+
+function CategoryBadge({ category }: { category: string }) {
+  const Icon = CATEGORY_ICONS[serviceCategoryIcon(category)]
+  return (
+    <Badge variant="outline">
+      <Icon className="mr-1 size-3" />
+      {category}
+    </Badge>
+  )
+}
+
+function backingServiceIcon(kind: string) {
+  if (kind === 'redis') return Zap
+  if (kind === 's3') return Cloud
+  return Database
+}
 
 function templateLogo(template: ServiceTemplateSummaryResponse) {
   if (!template.logo_url) {
@@ -151,13 +211,37 @@ function TemplateCard({
       </CardHeader>
       <CardContent className="mt-auto space-y-4">
         <div className="flex flex-wrap gap-1.5">
-          <Badge variant="outline">{template.category}</Badge>
+          <CategoryBadge category={template.category} />
           <Badge variant="outline">
             {template.service_count}{' '}
             {template.service_count === 1 ? 'container' : 'containers'}
           </Badge>
           {template.amd_only && <Badge variant="outline">AMD64 only</Badge>}
           {template.arm_only && <Badge variant="outline">ARM64 only</Badge>}
+          {template.backing_services.map((service) => {
+            const Icon = backingServiceIcon(service.kind)
+            return (
+              <Badge
+                key={`${service.service}-${service.kind}`}
+                variant="secondary"
+              >
+                <Icon className="mr-1 size-3" />
+                {service.kind}
+              </Badge>
+            )
+          })}
+          {template.tags
+            .filter((item) => item !== template.category.toLowerCase())
+            .slice(0, 3)
+            .map((item) => (
+              <Badge
+                key={item}
+                variant="outline"
+                className="text-muted-foreground"
+              >
+                {item}
+              </Badge>
+            ))}
         </div>
         <Button
           type="button"
@@ -400,14 +484,6 @@ function TemplateInstaller({
         return response.data
       }
       const preflight = await runPreflight()
-      const archive = await prepareDrop([
-        {
-          file: new File([detail.compose], 'docker-compose.yml', {
-            type: 'application/yaml',
-          }),
-          path: 'docker-compose.yml',
-        },
-      ])
       const publicPorts = detail.routes.map((route) => ({
         service: route.service,
         port: route.port,
@@ -425,7 +501,7 @@ function TemplateInstaller({
             directory: '.',
             main_branch: 'main',
             preset: 'docker-compose',
-            source_type: 'uploaded_source',
+            source_type: 'compose',
             project_type: 'server',
             automatic_deploy: false,
             storage_service_ids: [],
@@ -468,6 +544,12 @@ function TemplateInstaller({
       if (!created.data) throw new Error('Temps created no project record')
       createdProjectSlug = created.data.slug
 
+      const source = await saveComposeSource(
+        created.data.id,
+        detail.compose,
+        null
+      )
+
       const environments = await getEnvironments({
         throwOnError: true,
         path: { project_id: created.data.id },
@@ -479,17 +561,13 @@ function TemplateInstaller({
       if (!environment)
         throw new Error('The project has no production environment')
 
-      const deployed = await deployFromUploadedSource({
-        throwOnError: true,
-        path: {
-          project_id: created.data.id,
-          environment_id: environment.id,
-        },
-        body: { file: archive.file },
-      })
-      if (!deployed.data) throw new Error('Temps accepted no deployment')
+      const deployed = await deployComposeSource(
+        created.data.id,
+        environment.id,
+        source.revision
+      )
       toast.success(`${detail.name} installation started`)
-      navigate(`/projects/${created.data.slug}/deployments/${deployed.data.id}`)
+      navigate(`/projects/${created.data.slug}/deployments/${deployed.id}`)
     } catch (error) {
       let message = getErrorMessage(error, 'Service installation failed')
       if (createdProjectSlug) {
@@ -520,7 +598,7 @@ function TemplateInstaller({
                     'A self-hosted Docker Compose service.'}
                 </CardDescription>
                 <div className="mt-3 flex flex-wrap gap-2">
-                  <Badge variant="outline">{detail.category}</Badge>
+                  <CategoryBadge category={detail.category} />
                   <Badge variant="outline">
                     {detail.service_count} containers
                   </Badge>
@@ -581,6 +659,39 @@ function TemplateInstaller({
               </Alert>
             )}
 
+            {detail.backing_services.length > 0 && (
+              <Alert>
+                <Network className="size-4" />
+                <AlertTitle>Bundled data services detected</AlertTitle>
+                <AlertDescription>
+                  <p>
+                    This Compose stack currently owns these dependencies. Temps
+                    keeps them bundled so the template’s internal hostnames,
+                    credentials, volumes, and startup order continue to work.
+                  </p>
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {detail.backing_services.map((service) => {
+                      const Icon = backingServiceIcon(service.kind)
+                      return (
+                        <Badge
+                          key={`${service.service}-${service.kind}`}
+                          variant="outline"
+                        >
+                          <Icon className="mr-1 size-3" />
+                          {service.service}: {service.kind} (bundled)
+                        </Badge>
+                      )
+                    })}
+                  </div>
+                  <p className="mt-3 text-xs">
+                    A managed Temps replacement will only be offered when a
+                    service-specific adapter can safely rewrite the complete
+                    connection contract.
+                  </p>
+                </AlertDescription>
+              </Alert>
+            )}
+
             <div className="space-y-2">
               <Label htmlFor="service-project-name">Project name</Label>
               <Input
@@ -614,6 +725,12 @@ function TemplateInstaller({
                         <code className="text-sm">{route.service}</code>
                         <Badge variant="outline">:{route.port}</Badge>
                       </div>
+                      {'health_check_path' in route &&
+                        typeof route.health_check_path === 'string' && (
+                          <p className="mt-1 font-mono text-xs text-emerald-700 dark:text-emerald-300">
+                            Health {route.health_check_path}
+                          </p>
+                        )}
                       <p className="mt-1 break-all text-xs text-muted-foreground">
                         Canonical hostname generated by Temps during validation
                       </p>
@@ -669,8 +786,8 @@ function TemplateInstaller({
                 <div>
                   <h3 className="font-medium">Configuration</h3>
                   <p className="text-sm text-muted-foreground">
-                    Common Coolify magic values are generated locally. Review
-                    any service-specific inputs before installation.
+                    Common generated values are created locally by Temps.
+                    Optional integrations can be left blank.
                   </p>
                 </div>
                 <div className="grid gap-4 md:grid-cols-2">
@@ -686,6 +803,11 @@ function TemplateInstaller({
                             {variable.name}
                             {variable.required && (
                               <span className="text-destructive"> *</span>
+                            )}
+                            {!variable.required && !generated && (
+                              <span className="ml-1 text-xs font-normal text-muted-foreground">
+                                optional
+                              </span>
                             )}
                           </Label>
                           {generated && (
@@ -785,10 +907,10 @@ function TemplateInstaller({
                 <li>
                   1. Validate variables, architecture, and Compose syntax.
                 </li>
-                <li>2. Create an uploaded-source Docker Compose project.</li>
+                <li>2. Create a Temps-owned Docker Compose project.</li>
                 <li>3. Save configuration as project environment variables.</li>
                 <li>
-                  4. Copy this normalized Compose snapshot into the project.
+                  4. Save this normalized Compose as an editable revision.
                 </li>
                 <li>5. Run the normal Docker Compose deployment pipeline.</li>
               </ol>
@@ -854,22 +976,239 @@ function TemplateInstaller({
   )
 }
 
+const DEFAULT_CUSTOM_COMPOSE = `services:
+  app:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    restart: unless-stopped
+`
+
+function CustomComposeInstaller({ onBack }: { onBack: () => void }) {
+  const navigate = useNavigate()
+  const { resolvedTheme } = useTheme()
+  const [name, setName] = useState('Custom service')
+  const [service, setService] = useState('app')
+  const [port, setPort] = useState('80')
+  const [compose, setCompose] = useState(DEFAULT_CUSTOM_COMPOSE)
+  const [installing, setInstalling] = useState(false)
+  const [createdProject, setCreatedProject] = useState<{
+    id: number
+    slug: string
+  } | null>(null)
+  const [savedRevision, setSavedRevision] = useState<number | null>(null)
+
+  const createAndDeploy = async () => {
+    if (installing) return
+    const parsedPort = Number(port)
+    if (!name.trim() || !service.trim()) {
+      toast.error('Project name and public service are required')
+      return
+    }
+    if (!Number.isInteger(parsedPort) || parsedPort < 1 || parsedPort > 65535) {
+      toast.error('Public container port must be between 1 and 65535')
+      return
+    }
+
+    let projectForRecovery = createdProject
+    setInstalling(true)
+    try {
+      let project = projectForRecovery
+      if (!project) {
+        const created = await createProject({
+          throwOnError: true,
+          body: {
+            name: name.trim(),
+            directory: '.',
+            main_branch: 'main',
+            preset: 'docker-compose',
+            source_type: 'compose',
+            project_type: 'server',
+            automatic_deploy: false,
+            storage_service_ids: [],
+            preset_config: {
+              composePath: 'docker-compose.yml',
+              publicPorts: [{ service: service.trim(), port: parsedPort }],
+            },
+            environment_variables: [],
+          },
+        })
+        if (!created.data) throw new Error('Temps created no project record')
+        project = { id: created.data.id, slug: created.data.slug }
+        projectForRecovery = project
+        setCreatedProject(project)
+      }
+
+      const source = await saveComposeSource(project.id, compose, savedRevision)
+      setSavedRevision(source.revision)
+      const environments = await getEnvironments({
+        throwOnError: true,
+        path: { project_id: project.id },
+      })
+      const environment =
+        environments.data?.find(
+          (candidate) => candidate.name.toLowerCase() === 'production'
+        ) ?? environments.data?.find((candidate) => !candidate.is_preview)
+      if (!environment)
+        throw new Error('The project has no production environment')
+
+      const deployed = await deployComposeSource(
+        project.id,
+        environment.id,
+        source.revision
+      )
+      toast.success('Custom Compose deployment started')
+      navigate(`/projects/${project.slug}/deployments/${deployed.id}`)
+    } catch (error) {
+      let message = getErrorMessage(
+        error,
+        'Could not create the custom Compose service'
+      )
+      if (projectForRecovery) {
+        message += ` Project '${projectForRecovery.slug}' was kept; correct the YAML and retry.`
+      }
+      toast.error(message)
+    } finally {
+      setInstalling(false)
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      <Button type="button" variant="ghost" size="sm" onClick={onBack}>
+        <ArrowLeft className="mr-2 size-4" />
+        Back to services
+      </Button>
+
+      <div className="grid gap-6 xl:grid-cols-[minmax(0,1fr)_22rem]">
+        <Card>
+          <CardHeader>
+            <CardTitle className="flex items-center gap-2">
+              <Braces className="size-5" />
+              Custom Docker Compose
+            </CardTitle>
+            <CardDescription>
+              Start from your own YAML. Temps stores it as an editable,
+              revisioned source that you can change and redeploy at any time.
+            </CardDescription>
+          </CardHeader>
+          <CardContent className="space-y-5">
+            <div className="grid gap-4 sm:grid-cols-2">
+              <div className="space-y-2 sm:col-span-2">
+                <Label htmlFor="custom-compose-name">Project name</Label>
+                <Input
+                  id="custom-compose-name"
+                  value={name}
+                  onChange={(event) => setName(event.target.value)}
+                  disabled={Boolean(createdProject) || installing}
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="custom-compose-service">
+                  Public Compose service
+                </Label>
+                <Input
+                  id="custom-compose-service"
+                  value={service}
+                  onChange={(event) => setService(event.target.value)}
+                  disabled={Boolean(createdProject) || installing}
+                  className="font-mono"
+                />
+              </div>
+              <div className="space-y-2">
+                <Label htmlFor="custom-compose-port">Container port</Label>
+                <Input
+                  id="custom-compose-port"
+                  inputMode="numeric"
+                  value={port}
+                  onChange={(event) => setPort(event.target.value)}
+                  disabled={Boolean(createdProject) || installing}
+                  className="font-mono"
+                />
+              </div>
+            </div>
+
+            <div className="overflow-hidden rounded-lg border bg-background dark:bg-zinc-950">
+              <Editor
+                height="32rem"
+                language="yaml"
+                theme={resolvedTheme === 'dark' ? 'vs-dark' : 'light'}
+                value={compose}
+                onChange={(value) => setCompose(value ?? '')}
+                options={{
+                  minimap: { enabled: false },
+                  fontSize: 13,
+                  lineNumbersMinChars: 3,
+                  scrollBeyondLastLine: false,
+                  tabSize: 2,
+                  wordWrap: 'on',
+                }}
+              />
+            </div>
+          </CardContent>
+        </Card>
+
+        <div className="space-y-4">
+          <Alert>
+            <ShieldAlert className="size-4" />
+            <AlertTitle>You own this source</AlertTitle>
+            <AlertDescription>
+              Temps validates the Compose document, saves immutable revisions,
+              and snapshots the selected revision into every deployment. Put
+              credentials in project environment variables after creation.
+            </AlertDescription>
+          </Alert>
+          <Button
+            type="button"
+            className="w-full"
+            size="lg"
+            disabled={installing || !compose.trim()}
+            onClick={() => void createAndDeploy()}
+          >
+            {installing ? (
+              <Loader2 className="mr-2 size-4 animate-spin" />
+            ) : (
+              <Box className="mr-2 size-4" />
+            )}
+            {createdProject ? 'Validate & retry deployment' : 'Create & deploy'}
+          </Button>
+          {createdProject && (
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={() =>
+                navigate(`/projects/${createdProject.slug}/build?tab=build`)
+              }
+            >
+              Open project build settings
+            </Button>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
 export function ServiceTemplateCatalog() {
   const [search, setSearch] = useState('')
-  const deferredSearch = useDeferredValue(search)
+  const debouncedSearch = useDebounce(search, 300)
   const [category, setCategory] = useState('all')
+  const [tag, setTag] = useState<string | null>(null)
   const [page, setPage] = useState(1)
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null)
+  const [creatingCustom, setCreatingCustom] = useState(false)
 
   const catalog = useQuery({
     ...listServiceTemplatesOptions({
       query: {
-        search: deferredSearch || undefined,
+        search: debouncedSearch || undefined,
         category: category === 'all' ? undefined : category,
+        tag: tag || undefined,
         page,
         per_page: PER_PAGE,
       },
     }),
+    placeholderData: keepPreviousData,
   })
   const detail = useQuery({
     ...getServiceTemplateOptions({
@@ -877,6 +1216,10 @@ export function ServiceTemplateCatalog() {
     }),
     enabled: Boolean(selectedSlug),
   })
+
+  if (creatingCustom) {
+    return <CustomComposeInstaller onBack={() => setCreatingCustom(false)} />
+  }
 
   if (selectedSlug) {
     if (detail.isPending) {
@@ -934,10 +1277,26 @@ export function ServiceTemplateCatalog() {
   }
   if (catalog.isError || !catalog.data) {
     return (
-      <CatalogError
-        error={catalog.error}
-        retry={() => void catalog.refetch()}
-      />
+      <div className="space-y-4">
+        <Card>
+          <CardHeader className="sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle className="text-base">Use your own Compose</CardTitle>
+              <CardDescription>
+                Creating a Temps service never depends on the community catalog.
+              </CardDescription>
+            </div>
+            <Button onClick={() => setCreatingCustom(true)}>
+              <Braces className="mr-2 size-4" />
+              Custom Docker Compose
+            </Button>
+          </CardHeader>
+        </Card>
+        <CatalogError
+          error={catalog.error}
+          retry={() => void catalog.refetch()}
+        />
+      </div>
     )
   }
 
@@ -967,9 +1326,18 @@ export function ServiceTemplateCatalog() {
           </div>
         </div>
         <div className="flex flex-col gap-2 sm:flex-row">
+          <Button
+            type="button"
+            variant="outline"
+            onClick={() => setCreatingCustom(true)}
+          >
+            <Braces className="mr-2 size-4" />
+            Custom Compose
+          </Button>
           <div className="relative sm:w-72">
             <Search className="absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
             <Input
+              aria-label="Search services"
               value={search}
               onChange={(event) => {
                 setSearch(event.target.value)
@@ -1001,12 +1369,36 @@ export function ServiceTemplateCatalog() {
         </div>
       </div>
 
+      {catalog.data.popular_tags.length > 0 && (
+        <div className="flex flex-wrap items-center gap-2">
+          <span className="text-xs font-medium text-muted-foreground">
+            Discover by tag
+          </span>
+          {catalog.data.popular_tags.slice(0, 12).map((item) => (
+            <Button
+              key={item.name}
+              type="button"
+              variant={tag === item.name ? 'secondary' : 'outline'}
+              size="sm"
+              className="h-7 rounded-full px-2.5 text-xs"
+              onClick={() => {
+                setTag((current) => toggleServiceTag(current, item.name))
+                setPage(1)
+              }}
+            >
+              {item.name}
+              <span className="ml-1 text-muted-foreground">{item.count}</span>
+            </Button>
+          ))}
+        </div>
+      )}
+
       {catalog.data.templates.length === 0 ? (
         <Card>
           <CardContent className="py-12 text-center">
             <p className="font-medium">No services match this search</p>
             <p className="mt-1 text-sm text-muted-foreground">
-              Try another name or clear the category filter.
+              Try another name or clear the category or tag filter.
             </p>
           </CardContent>
         </Card>
@@ -1033,7 +1425,8 @@ export function ServiceTemplateCatalog() {
           >
             Coolify
           </a>{' '}
-          (Apache-2.0). Each install keeps its own Compose snapshot.
+          (Apache-2.0). Each install becomes an independent, editable
+          Temps-owned Compose source.
         </p>
         <div className="flex items-center gap-2">
           <span>

@@ -1157,6 +1157,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deployment_health_path_update_is_visible_to_the_next_check() {
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.connection_arc();
+        let service = MonitorService::new(db.clone(), create_mock_config_service(&db));
+        let project = create_test_project(&db).await;
+        let environment = create_test_environment(&db, project.id).await;
+        let monitor = service
+            .create_monitor(
+                project.id,
+                CreateMonitorRequest {
+                    name: "Compose service".to_string(),
+                    monitor_type: "web".to_string(),
+                    environment_id: environment.id,
+                    check_interval_seconds: Some(60),
+                    check_path: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        service
+            .update_check_path_for_environment(project.id, environment.id, "/docs")
+            .await
+            .unwrap();
+
+        let refreshed = service.get_monitor(monitor.id).await.unwrap();
+        assert_eq!(refreshed.check_path.as_deref(), Some("/docs"));
+    }
+
+    #[tokio::test]
     async fn create_monitor_rejects_environment_from_another_project_without_writing() {
         let test_db = TestDatabase::with_migrations().await.unwrap();
         let db = test_db.connection_arc();

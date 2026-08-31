@@ -1432,6 +1432,17 @@ impl WorkflowPlanner {
                 )
                 .await
             }
+            SourceType::Compose => {
+                self.plan_git_deployment(
+                    project,
+                    environment,
+                    deployment,
+                    env_vars,
+                    remote_env_plan,
+                    secrets,
+                )
+                .await
+            }
             SourceType::Manual => {
                 // Manual projects without explicit deployment method
                 // This happens when someone tries to deploy a Manual project without specifying

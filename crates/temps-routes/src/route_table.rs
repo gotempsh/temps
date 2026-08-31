@@ -2749,6 +2749,7 @@ mod tests {
             service: "web".to_string(),
             port: 8080,
             published: Some(18080),
+            health_check_path: None,
         };
 
         let selected = select_public_route_containers(&containers, Some(&public_port)).unwrap();
@@ -2774,6 +2775,7 @@ mod tests {
             service: "web".to_string(),
             port: 80,
             published: Some(65535),
+            health_check_path: None,
         };
 
         let addr = build_public_compose_backend_addr(
@@ -2794,6 +2796,7 @@ mod tests {
             service: "web".to_string(),
             port: 80,
             published: Some(15455),
+            health_check_path: None,
         };
 
         let addr = build_public_compose_backend_addr(
@@ -2834,6 +2837,7 @@ mod tests {
             service: "web".to_string(),
             port: 80,
             published: Some(65535),
+            health_check_path: None,
         };
 
         let addr = build_public_compose_backend_addr(
@@ -2854,6 +2858,7 @@ mod tests {
             service: "web".to_string(),
             port: 80,
             published: None,
+            health_check_path: None,
         };
 
         let addr = build_public_compose_backend_addr(
@@ -2874,6 +2879,7 @@ mod tests {
             service: "web".to_string(),
             port: 8211,
             published: Some(8211),
+            health_check_path: None,
         };
 
         assert_eq!(
@@ -2895,6 +2901,7 @@ mod tests {
             service: "web".to_string(),
             port: 80,
             published: Some(8211),
+            health_check_path: None,
         };
 
         let addr = build_public_compose_backend_addr(

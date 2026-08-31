@@ -31,6 +31,7 @@ type SourceType =
   | 'docker_image'
   | 'static_files'
   | 'uploaded_source'
+  | 'compose'
   | 'manual'
 
 /** How each source type reads in the "keeps deploying from X" sentence. */
@@ -39,6 +40,7 @@ const SOURCE_LABELS: Record<SourceType, string> = {
   docker_image: 'a Docker image',
   static_files: 'an uploaded static bundle',
   uploaded_source: 'an uploaded source archive',
+  compose: 'an editable Docker Compose document',
   manual: 'its configured source',
 }
 
@@ -181,7 +183,9 @@ export function DeploymentSourceCard({
     <Card>
       <CardHeader>
         <CardTitle>Deployment source</CardTitle>
-        <CardDescription>How this project is built and deployed.</CardDescription>
+        <CardDescription>
+          How this project is built and deployed.
+        </CardDescription>
       </CardHeader>
       <CardContent className="space-y-2">
         {SOURCE_TYPES.map((t) => (

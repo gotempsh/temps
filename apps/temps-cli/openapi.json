@@ -5995,6 +5995,13 @@
       "ComposePublicPort": {
         "description": "A port that should be exposed publicly through the proxy for a compose service.",
         "properties": {
+          "healthCheckPath": {
+            "description": "Optional user override for the public health probe. When absent, Temps\nuses the path discovered from this service's Compose healthcheck.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "port": {
             "description": "Container port to expose (e.g. 8123)",
             "format": "int32",
@@ -6084,6 +6091,95 @@
           "dependsOn",
           "environmentVariables",
           "looksLikeDatabase",
+          "ports"
+        ],
+        "type": "object"
+      },
+      "ComposeSourceResponse": {
+        "properties": {
+          "checksum": {
+            "description": "Content checksum used for diagnostics and cache validation.",
+            "type": "string"
+          },
+          "content": {
+            "description": "Editable Docker Compose YAML owned by Temps.",
+            "type": "string"
+          },
+          "origin": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComposeTemplateOrigin"
+              }
+            ]
+          },
+          "revision": {
+            "description": "Immutable source-bundle ID. Deployments snapshot this revision.",
+            "format": "int32",
+            "type": "integer"
+          },
+          "services": {
+            "items": {
+              "$ref": "#/components/schemas/ComposeSourceServiceResponse"
+            },
+            "type": "array"
+          },
+          "updated_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "content",
+          "revision",
+          "checksum",
+          "updated_at",
+          "services"
+        ],
+        "type": "object"
+      },
+      "ComposeSourceServiceResponse": {
+        "properties": {
+          "detected_service_type": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ComposeServiceFamily"
+              }
+            ]
+          },
+          "health_check_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "looks_like_database": {
+            "type": "boolean"
+          },
+          "name": {
+            "type": "string"
+          },
+          "ports": {
+            "items": {
+              "$ref": "#/components/schemas/ComposePortMapping"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "looks_like_database",
           "ports"
         ],
         "type": "object"
@@ -10458,6 +10554,19 @@
         "required": [
           "deleted"
         ],
+        "type": "object"
+      },
+      "DeployComposeSourceRequest": {
+        "properties": {
+          "revision": {
+            "description": "Omit to deploy the current saved revision. Supplying a revision is used\nby deterministic rollback/replay flows.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "DeployFromImageRequest": {
@@ -22509,6 +22618,13 @@
               "string",
               "null"
             ]
+          },
+          "tag": {
+            "description": "Exact normalized discovery-tag filter.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "type": "object"
@@ -22539,6 +22655,13 @@
           "per_page": {
             "minimum": 0,
             "type": "integer"
+          },
+          "popular_tags": {
+            "description": "Most common normalized tags across the complete catalog.",
+            "items": {
+              "$ref": "#/components/schemas/ServiceTemplateDiscoveryTagResponse"
+            },
+            "type": "array"
           },
           "source_repository_url": {
             "type": "string"
@@ -22571,6 +22694,7 @@
         "required": [
           "templates",
           "categories",
+          "popular_tags",
           "catalog_total",
           "total",
           "page",
@@ -31667,6 +31791,13 @@
             },
             "type": "array"
           },
+          "health_check_path": {
+            "description": "HTTP path declared by a loopback Compose healthcheck, if unambiguous.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "image": {
             "type": [
               "string",
@@ -35016,6 +35147,26 @@
         ],
         "type": "object"
       },
+      "SaveComposeSourceRequest": {
+        "properties": {
+          "content": {
+            "description": "Complete Docker Compose YAML document.",
+            "type": "string"
+          },
+          "expected_revision": {
+            "description": "Last revision read by the editor. A mismatch returns 409 instead of\nsilently overwriting another save.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "content"
+        ],
+        "type": "object"
+      },
       "SaveCredentialRequest": {
         "properties": {
           "auth_type": {
@@ -37158,6 +37309,28 @@
         ],
         "type": "object"
       },
+      "ServiceTemplateBackingServiceResponse": {
+        "properties": {
+          "kind": {
+            "description": "Temps service family: `postgres`, `redis`, `mongodb`, or `s3`.",
+            "type": "string"
+          },
+          "mode": {
+            "description": "Bundled services remain in this Compose snapshot. Safe managed-service\nreplacement requires a template adapter that rewrites its connection contract.",
+            "type": "string"
+          },
+          "service": {
+            "description": "Compose service name that provides this dependency.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "service",
+          "kind",
+          "mode"
+        ],
+        "type": "object"
+      },
       "ServiceTemplateCapabilityRequirementResponse": {
         "properties": {
           "capability": {
@@ -37269,8 +37442,31 @@
           }
         ]
       },
+      "ServiceTemplateDiscoveryTagResponse": {
+        "properties": {
+          "count": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "count"
+        ],
+        "type": "object"
+      },
       "ServiceTemplateRouteResponse": {
         "properties": {
+          "health_check_path": {
+            "description": "HTTP path detected from this service's Compose healthcheck.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "port": {
             "format": "int32",
             "minimum": 0,
@@ -37300,6 +37496,12 @@
           },
           "arm_only": {
             "type": "boolean"
+          },
+          "backing_services": {
+            "items": {
+              "$ref": "#/components/schemas/ServiceTemplateBackingServiceResponse"
+            },
+            "type": "array"
           },
           "category": {
             "type": "string"
@@ -37378,6 +37580,7 @@
           "name",
           "category",
           "tags",
+          "backing_services",
           "service_count",
           "installable",
           "compatibility_tier",
@@ -39639,12 +39842,13 @@
         "type": "object"
       },
       "SourceType": {
-        "description": "Source type for project deployments\n\nDetermines where the deployment artifacts come from:\n- `Git`: Source code from a Git repository (traditional flow)\n- `DockerImage`: Pre-built Docker image from external registry\n- `StaticFiles`: Pre-built static files uploaded as a bundle\n- `UploadedSource`: Source archive uploaded without a Git repository\n- `Manual`: Flexible type that accepts any deployment method",
+        "description": "Source type for project deployments\n\nDetermines where the deployment artifacts come from:\n- `Git`: Source code from a Git repository (traditional flow)\n- `DockerImage`: Pre-built Docker image from external registry\n- `StaticFiles`: Pre-built static files uploaded as a bundle\n- `UploadedSource`: Source archive uploaded without a Git repository\n- `Compose`: Temps-owned, editable Docker Compose document\n- `Manual`: Flexible type that accepts any deployment method",
         "enum": [
           "git",
           "docker_image",
           "static_files",
           "uploaded_source",
+          "compose",
           "manual"
         ],
         "type": "string"
@@ -82706,6 +82910,100 @@
         ]
       }
     },
+    "/projects/{project_id}/compose-source": {
+      "get": {
+        "operationId": "get_compose_source",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeSourceResponse"
+                }
+              }
+            },
+            "description": "Current editable Compose source"
+          },
+          "404": {
+            "description": "Project or Compose source not found"
+          },
+          "409": {
+            "description": "Project is not an editable Compose service"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Read the current Temps-owned Docker Compose source.",
+        "tags": [
+          "Deployments"
+        ]
+      },
+      "put": {
+        "operationId": "save_compose_source",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SaveComposeSourceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ComposeSourceResponse"
+                }
+              }
+            },
+            "description": "Compose source saved"
+          },
+          "400": {
+            "description": "Invalid Compose YAML or health-check path"
+          },
+          "409": {
+            "description": "Revision conflict or incompatible project"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Validate and save a new immutable revision of a Temps-owned Compose source.",
+        "tags": [
+          "Deployments"
+        ]
+      }
+    },
     "/projects/{project_id}/custom-domains": {
       "get": {
         "operationId": "list_custom_domains_for_project",
@@ -86836,6 +87134,68 @@
         "summary": "Stop a specific container",
         "tags": [
           "Containers"
+        ]
+      }
+    },
+    "/projects/{project_id}/environments/{environment_id}/deploy/compose": {
+      "post": {
+        "operationId": "deploy_compose_source",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DeployComposeSourceRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RemoteDeploymentResponse"
+                }
+              }
+            },
+            "description": "Compose deployment started"
+          },
+          "404": {
+            "description": "Project, environment, or source revision not found"
+          },
+          "409": {
+            "description": "Project is not an editable Compose service"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Deploy the current (or explicitly selected) immutable Compose source revision.",
+        "tags": [
+          "Deployments"
         ]
       }
     },
@@ -97579,6 +97939,15 @@
             "description": "Filter by category",
             "in": "query",
             "name": "category",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by exact normalized discovery tag",
+            "in": "query",
+            "name": "tag",
             "required": false,
             "schema": {
               "type": "string"

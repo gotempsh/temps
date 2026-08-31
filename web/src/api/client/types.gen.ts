@@ -2977,6 +2977,11 @@ export type ComposePreviewResponse = {
  */
 export type ComposePublicPort = {
     /**
+     * Optional user override for the public health probe. When absent, Temps
+     * uses the path discovered from this service's Compose healthcheck.
+     */
+    healthCheckPath?: string | null;
+    /**
      * Container port to expose (e.g. 8123)
      */
     port: number;
@@ -3024,6 +3029,33 @@ export type ComposeServicePreviewResponse = {
      * Ports declared by Compose. Route `target`, not `published`: the latter
      * is only the optional host-side Docker port.
      */
+    ports: Array<ComposePortMapping>;
+};
+
+export type ComposeSourceResponse = {
+    /**
+     * Content checksum used for diagnostics and cache validation.
+     */
+    checksum: string;
+    /**
+     * Editable Docker Compose YAML owned by Temps.
+     */
+    content: string;
+    origin?: null | ComposeTemplateOrigin;
+    /**
+     * Immutable source-bundle ID. Deployments snapshot this revision.
+     */
+    revision: number;
+    services: Array<ComposeSourceServiceResponse>;
+    updated_at: string;
+};
+
+export type ComposeSourceServiceResponse = {
+    detected_service_type?: null | ComposeServiceFamily;
+    health_check_path?: string | null;
+    image?: string | null;
+    looks_like_database: boolean;
+    name: string;
     ports: Array<ComposePortMapping>;
 };
 
@@ -5115,6 +5147,14 @@ export type DeleteBlobResponse = {
 
 export type DeleteResponse = {
     deleted: number;
+};
+
+export type DeployComposeSourceRequest = {
+    /**
+     * Omit to deploy the current saved revision. Supplying a revision is used
+     * by deterministic rollback/replay flows.
+     */
+    revision?: number | null;
 };
 
 export type DeployFromImageRequest = {
@@ -10519,6 +10559,10 @@ export type ListServiceTemplatesQuery = {
      * Case-insensitive search across name, description, category, and tags.
      */
     search?: string | null;
+    /**
+     * Exact normalized discovery-tag filter.
+     */
+    tag?: string | null;
 };
 
 export type ListServiceTemplatesResponse = {
@@ -10531,6 +10575,10 @@ export type ListServiceTemplatesResponse = {
     compatibility: ServiceTemplateCompatibilitySummaryResponse;
     page: number;
     per_page: number;
+    /**
+     * Most common normalized tags across the complete catalog.
+     */
+    popular_tags: Array<ServiceTemplateDiscoveryTagResponse>;
     source_repository_url: string;
     source_revision?: string | null;
     source_url: string;
@@ -14582,6 +14630,10 @@ export type PublicComposeServicePreview = {
      * intentionally omitted.
      */
     environment_variables: Array<string>;
+    /**
+     * HTTP path declared by a loopback Compose healthcheck, if unambiguous.
+     */
+    health_check_path?: string | null;
     image?: string | null;
     /**
      * True when the image looks like a well-known database engine
@@ -16169,6 +16221,18 @@ export type SaveAgentTokenResponse = {
     saved: boolean;
 };
 
+export type SaveComposeSourceRequest = {
+    /**
+     * Complete Docker Compose YAML document.
+     */
+    content: string;
+    /**
+     * Last revision read by the editor. A mismatch returns 409 instead of
+     * silently overwriting another save.
+     */
+    expected_revision?: number | null;
+};
+
 export type SaveCredentialRequest = {
     /**
      * Auth flavor id (must match one of the provider's catalog entries).
@@ -17279,6 +17343,22 @@ export type ServiceStatsReport = {
     topology: string;
 };
 
+export type ServiceTemplateBackingServiceResponse = {
+    /**
+     * Temps service family: `postgres`, `redis`, `mongodb`, or `s3`.
+     */
+    kind: string;
+    /**
+     * Bundled services remain in this Compose snapshot. Safe managed-service
+     * replacement requires a template adapter that rewrites its connection contract.
+     */
+    mode: string;
+    /**
+     * Compose service name that provides this dependency.
+     */
+    service: string;
+};
+
 export type ServiceTemplateCapabilityRequirementResponse = {
     capability: string;
     reason: string;
@@ -17310,7 +17390,16 @@ export type ServiceTemplateDetailResponse = ServiceTemplateSummaryResponse & {
     variables: Array<ServiceTemplateVariableResponse>;
 };
 
+export type ServiceTemplateDiscoveryTagResponse = {
+    count: number;
+    name: string;
+};
+
 export type ServiceTemplateRouteResponse = {
+    /**
+     * HTTP path detected from this service's Compose healthcheck.
+     */
+    health_check_path?: string | null;
     port: number;
     service: string;
     variable_names: Array<string>;
@@ -17319,6 +17408,7 @@ export type ServiceTemplateRouteResponse = {
 export type ServiceTemplateSummaryResponse = {
     amd_only: boolean;
     arm_only: boolean;
+    backing_services: Array<ServiceTemplateBackingServiceResponse>;
     category: string;
     compatibility_issues: Array<string>;
     /**
@@ -18217,9 +18307,10 @@ export type SourceMapResponse = {
  * - `DockerImage`: Pre-built Docker image from external registry
  * - `StaticFiles`: Pre-built static files uploaded as a bundle
  * - `UploadedSource`: Source archive uploaded without a Git repository
+ * - `Compose`: Temps-owned, editable Docker Compose document
  * - `Manual`: Flexible type that accepts any deployment method
  */
-export type SourceType = 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'manual';
+export type SourceType = 'git' | 'docker_image' | 'static_files' | 'uploaded_source' | 'compose' | 'manual';
 
 /**
  * A span event (log-like annotation on a span).
@@ -43510,6 +43601,64 @@ export type UpdateAutomaticDeployResponses = {
 
 export type UpdateAutomaticDeployResponse = UpdateAutomaticDeployResponses[keyof UpdateAutomaticDeployResponses];
 
+export type GetComposeSourceData = {
+    body?: never;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/compose-source';
+};
+
+export type GetComposeSourceErrors = {
+    /**
+     * Project or Compose source not found
+     */
+    404: unknown;
+    /**
+     * Project is not an editable Compose service
+     */
+    409: unknown;
+};
+
+export type GetComposeSourceResponses = {
+    /**
+     * Current editable Compose source
+     */
+    200: ComposeSourceResponse;
+};
+
+export type GetComposeSourceResponse = GetComposeSourceResponses[keyof GetComposeSourceResponses];
+
+export type SaveComposeSourceData = {
+    body: SaveComposeSourceRequest;
+    path: {
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/compose-source';
+};
+
+export type SaveComposeSourceErrors = {
+    /**
+     * Invalid Compose YAML or health-check path
+     */
+    400: unknown;
+    /**
+     * Revision conflict or incompatible project
+     */
+    409: unknown;
+};
+
+export type SaveComposeSourceResponses = {
+    /**
+     * Compose source saved
+     */
+    200: ComposeSourceResponse;
+};
+
+export type SaveComposeSourceResponse = SaveComposeSourceResponses[keyof SaveComposeSourceResponses];
+
 export type ListCustomDomainsForProjectData = {
     body?: never;
     path: {
@@ -46342,6 +46491,36 @@ export type StopContainerResponses = {
 };
 
 export type StopContainerResponse = StopContainerResponses[keyof StopContainerResponses];
+
+export type DeployComposeSourceData = {
+    body: DeployComposeSourceRequest;
+    path: {
+        project_id: number;
+        environment_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/environments/{environment_id}/deploy/compose';
+};
+
+export type DeployComposeSourceErrors = {
+    /**
+     * Project, environment, or source revision not found
+     */
+    404: unknown;
+    /**
+     * Project is not an editable Compose service
+     */
+    409: unknown;
+};
+
+export type DeployComposeSourceResponses = {
+    /**
+     * Compose deployment started
+     */
+    202: RemoteDeploymentResponse;
+};
+
+export type DeployComposeSourceResponse = DeployComposeSourceResponses[keyof DeployComposeSourceResponses];
 
 export type DeployFromImageData = {
     body: DeployFromImageRequest;
@@ -52638,6 +52817,10 @@ export type ListServiceTemplatesData = {
          * Filter by category
          */
         category?: string;
+        /**
+         * Filter by exact normalized discovery tag
+         */
+        tag?: string;
         /**
          * One-based page number
          */

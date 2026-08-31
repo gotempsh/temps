@@ -4358,6 +4358,10 @@ mod tests {
 
         let remote_deployment_service =
             Arc::new(crate::services::RemoteDeploymentService::new(db.clone()));
+        let compose_source_service = Arc::new(crate::services::ComposeSourceService::new(
+            db.clone(),
+            temp_dir.clone(),
+        ));
 
         let external_service_manager = Arc::new(temps_providers::ExternalServiceManager::new(
             db.clone(),
@@ -4451,6 +4455,7 @@ mod tests {
             cron_service,
             external_deployment_manager: Arc::new(crate::services::ExternalDeploymentManager::new()),
             remote_deployment_service,
+            compose_source_service,
             db: db.clone(),
             workflow_planner,
             workflow_executor,

@@ -46,6 +46,7 @@ import {
   TooltipTrigger,
 } from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
+import { deployComposeSource } from '@/lib/compose-source-api'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
@@ -938,6 +939,17 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     },
   })
 
+  const redeployCompose = useMutation({
+    mutationFn: (environmentId: number) =>
+      deployComposeSource(project.id, environmentId),
+    meta: {
+      errorTitle: 'Failed to deploy Compose source',
+    },
+    onSuccess: () => {
+      setIsRedeployModalOpen(false)
+    },
+  })
+
   const pauseDeployment = useMutation({
     ...pauseDeploymentMutation(),
     meta: {
@@ -1006,6 +1018,12 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         path: { project_id: project.id, environment_id: environmentId },
         body: { image_ref: ref },
       })
+      navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
+      return
+    }
+
+    if (project.source_type === 'compose') {
+      await redeployCompose.mutateAsync(environmentId)
       navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
       return
     }
@@ -1403,7 +1421,11 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
             deployment.tag ? 'tag' : deployment.branch ? 'branch' : 'commit'
           }
           defaultEnvironment={deployment.environment_id || 0}
-          isLoading={createDeployment.isPending || redeployImage.isPending}
+          isLoading={
+            createDeployment.isPending ||
+            redeployImage.isPending ||
+            redeployCompose.isPending
+          }
           imageRef={deployment.metadata?.externalImageRef}
         />
       </div>
