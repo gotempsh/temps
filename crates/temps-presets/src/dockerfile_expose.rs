@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 
+const MAX_DOCKERFILE_BYTES: usize = 1024 * 1024;
+
 /// Return the first TCP port exposed by the Dockerfile's final stage.
 ///
 /// Docker routes image metadata from the final stage, so ports declared only
@@ -16,12 +18,17 @@ use std::collections::HashMap;
 /// intentionally ignored rather than guessed; the built image remains the
 /// source of truth for those Dockerfiles.
 pub fn detect_primary_exposed_port(dockerfile: &str) -> Option<u16> {
-    let mut named_stages: HashMap<String, Vec<u16>> = HashMap::new();
+    if dockerfile.len() > MAX_DOCKERFILE_BYTES {
+        return None;
+    }
+
+    let escape_character = dockerfile_escape_character(dockerfile);
+    let mut named_stages: HashMap<String, Option<u16>> = HashMap::new();
     let mut current_alias: Option<String> = None;
-    let mut current_ports = Vec::new();
+    let mut current_port = None;
     let mut saw_from = false;
 
-    for line in logical_lines(dockerfile) {
+    for line in logical_lines(dockerfile, escape_character) {
         let Some((instruction, arguments)) = split_instruction(&line) else {
             continue;
         };
@@ -29,40 +36,57 @@ pub fn detect_primary_exposed_port(dockerfile: &str) -> Option<u16> {
         if instruction.eq_ignore_ascii_case("FROM") {
             if saw_from {
                 if let Some(alias) = current_alias.take() {
-                    named_stages.insert(alias, current_ports.clone());
+                    named_stages.insert(alias, current_port);
                 }
             }
 
             let Some((base, alias)) = parse_from(arguments) else {
                 continue;
             };
-            current_ports = named_stages
+            current_port = named_stages
                 .get(&base.to_ascii_lowercase())
-                .cloned()
+                .copied()
                 .unwrap_or_default();
             current_alias = alias.map(|value| value.to_ascii_lowercase());
             saw_from = true;
             continue;
         }
 
-        if instruction.eq_ignore_ascii_case("EXPOSE") {
-            for token in arguments.split_whitespace() {
-                if token.starts_with('#') {
-                    break;
-                }
-                if let Some(port) = parse_tcp_port(token) {
-                    if !current_ports.contains(&port) {
-                        current_ports.push(port);
-                    }
-                }
-            }
+        if instruction.eq_ignore_ascii_case("EXPOSE") && current_port.is_none() {
+            current_port = arguments
+                .split_whitespace()
+                .take_while(|token| !token.starts_with('#'))
+                .find_map(parse_tcp_port);
         }
     }
 
-    current_ports.first().copied()
+    current_port
 }
 
-fn logical_lines(dockerfile: &str) -> Vec<String> {
+fn dockerfile_escape_character(dockerfile: &str) -> char {
+    for raw_line in dockerfile.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Some(comment) = trimmed.strip_prefix('#') else {
+            break;
+        };
+        let Some((name, value)) = comment.trim().split_once('=') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case("escape") {
+            return match value.trim() {
+                "`" => '`',
+                "\\" => '\\',
+                _ => '\\',
+            };
+        }
+    }
+    '\\'
+}
+
+fn logical_lines(dockerfile: &str, escape_character: char) -> Vec<String> {
     let mut lines = Vec::new();
     let mut current = String::new();
 
@@ -72,9 +96,9 @@ fn logical_lines(dockerfile: &str) -> Vec<String> {
             continue;
         }
 
-        let continued = trimmed.ends_with('\\');
+        let continued = trimmed.ends_with(escape_character);
         let part = if continued {
-            trimmed.trim_end_matches('\\').trim_end()
+            trimmed.trim_end_matches(escape_character).trim_end()
         } else {
             trimmed
         };
@@ -180,5 +204,30 @@ mod tests {
         let dockerfile = "FROM alpine\nEXPOSE 3000 # 4000 is documentation only\n";
 
         assert_eq!(detect_primary_exposed_port(dockerfile), Some(3000));
+    }
+
+    #[test]
+    fn honors_backtick_escape_directive() {
+        let dockerfile = "# escape=`\nFROM alpine\nEXPOSE `\n  8080/tcp\n";
+
+        assert_eq!(detect_primary_exposed_port(dockerfile), Some(8080));
+    }
+
+    #[test]
+    fn rejects_oversized_dockerfiles_before_parsing() {
+        let dockerfile = format!("FROM alpine\nEXPOSE 8080\n{}", "#".repeat(1024 * 1024));
+
+        assert_eq!(detect_primary_exposed_port(&dockerfile), None);
+    }
+
+    #[test]
+    fn large_expose_lists_return_without_quadratic_deduplication() {
+        let ports = (1..=u16::MAX)
+            .map(|port| port.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let dockerfile = format!("FROM alpine\nEXPOSE {ports}\n");
+
+        assert_eq!(detect_primary_exposed_port(&dockerfile), Some(1));
     }
 }

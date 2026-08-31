@@ -41,4 +41,27 @@ describe('detectedPortForSelection', () => {
       detectedPortForSelection(presets, 'dockerfile::apps/worker')
     ).toBeUndefined()
   })
+
+  test('accepts only finite TCP port boundaries', () => {
+    expect(
+      detectedPortForSelection(
+        [{ preset: 'dockerfile', path: './', exposedPort: 65535 }],
+        'dockerfile::root'
+      )
+    ).toBe(65535)
+    for (const exposedPort of [-1, 65536, Number.NaN]) {
+      expect(
+        detectedPortForSelection(
+          [{ preset: 'dockerfile', path: './', exposedPort }],
+          'dockerfile::root'
+        )
+      ).toBeUndefined()
+    }
+  })
+
+  test('normalizes a trailing slash in nested preset paths', () => {
+    expect(
+      detectedPortForSelection(presets, 'dockerfile::apps/api/')
+    ).toBe(8080)
+  })
 })

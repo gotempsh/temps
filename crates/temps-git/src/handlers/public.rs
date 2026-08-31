@@ -28,7 +28,7 @@ use temps_entities::preset::ComposePortMapping;
 use tracing::warn;
 use utoipa::{IntoParams, OpenApi, ToSchema};
 
-const MAX_DOCKERFILES_TO_SCAN: usize = 16;
+const MAX_PUBLIC_DOCKERFILES_TO_SCAN: usize = 1;
 
 /// Query parameters for public repository endpoints
 #[derive(Debug, Deserialize, IntoParams)]
@@ -100,7 +100,7 @@ pub struct PresetInfo {
     pub preset: String,
     /// Human-readable preset label
     pub preset_label: String,
-    /// Detected Dockerfile EXPOSE port, or the preset's default port
+    /// Default exposed port for this preset
     pub exposed_port: Option<i32>,
     /// Icon URL for this preset
     pub icon_url: Option<String>,
@@ -301,7 +301,10 @@ async fn provider_for_public_request(
     Problem,
 > {
     let token = if provider.eq_ignore_ascii_case("github") {
-        if let Some(user_id) = auth.and_then(AuthContext::user_id_opt) {
+        if let Some(user_id) = auth
+            .filter(|auth| auth.has_permission(&Permission::GitRepositoriesRead))
+            .and_then(AuthContext::user_id_opt)
+        {
             state
                 .git_provider_manager
                 .get_valid_github_token_for_user(user_id)
@@ -366,6 +369,25 @@ fn authorize_custom_gitlab_origin(
             ));
     }
 
+    Ok(())
+}
+
+fn authorize_public_preset_refresh(auth: Option<&AuthContext>, fresh: bool) -> Result<(), Problem> {
+    if !fresh {
+        return Ok(());
+    }
+    let auth = auth.ok_or_else(|| {
+        problem_new(StatusCode::UNAUTHORIZED)
+            .with_title("Authentication Required")
+            .with_detail("Refreshing public repository presets requires authentication.")
+    })?;
+    if !auth.has_permission(&Permission::GitRepositoriesRead) {
+        return Err(problem_new(StatusCode::FORBIDDEN)
+            .with_title("Insufficient Permissions")
+            .with_detail(
+                "Refreshing public repository presets requires the git_repositories:read permission.",
+            ));
+    }
     Ok(())
 }
 
@@ -564,6 +586,8 @@ pub async fn detect_public_presets(
     Path((provider, owner, repo)): Path<(String, String, String)>,
     Query(params): Query<PresetQueryParams>,
 ) -> Result<Json<PublicPresetResponse>, Problem> {
+    authorize_public_preset_refresh(auth.as_ref().map(|Extension(auth)| auth), params.fresh)?;
+
     let (repo_provider, repo_info, cache_scope) = provider_for_public_request(
         state.as_ref(),
         auth.as_ref().map(|Extension(auth)| auth),
@@ -681,7 +705,7 @@ async fn enrich_public_dockerfile_exposed_ports(
         .iter()
         .enumerate()
         .filter(|(_, preset)| preset.preset == "dockerfile")
-        .take(MAX_DOCKERFILES_TO_SCAN)
+        .take(MAX_PUBLIC_DOCKERFILES_TO_SCAN)
         .map(|(index, preset)| {
             let path = if preset.path == "./" || preset.path.is_empty() {
                 "Dockerfile".to_string()
@@ -1141,7 +1165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn public_preset_detection_enriches_each_dockerfile_port() {
+    async fn public_preset_detection_limits_anonymous_provider_work() {
         let files = vec!["Dockerfile".to_string(), "apps/api/Dockerfile".to_string()];
         let mut presets = detect_presets_from_files(&files);
 
@@ -1163,7 +1187,7 @@ mod tests {
             .find(|preset| preset.path == "apps/api")
             .expect("nested Dockerfile preset should be detected");
         assert_eq!(root.exposed_port, Some(3000));
-        assert_eq!(api.exposed_port, Some(8080));
+        assert_eq!(api.exposed_port, None);
     }
 
     #[tokio::test]
@@ -1227,6 +1251,26 @@ mod tests {
         .expect_err("a principal without repository-read permission must be denied");
         assert_eq!(error.status_code, StatusCode::FORBIDDEN);
         assert!(authorize_custom_gitlab_origin(None, None).is_ok());
+    }
+
+    #[test]
+    fn fresh_public_preset_detection_requires_repository_read_permission() {
+        assert!(authorize_public_preset_refresh(None, false).is_ok());
+        let error = authorize_public_preset_refresh(None, true)
+            .expect_err("anonymous callers must not bypass the shared preset cache");
+        assert_eq!(error.status_code, StatusCode::UNAUTHORIZED);
+
+        let deployment_token = AuthContext::new_deployment_token(
+            1,
+            None,
+            None,
+            1,
+            "test-token".to_string(),
+            Vec::new(),
+        );
+        let error = authorize_public_preset_refresh(Some(&deployment_token), true)
+            .expect_err("unrelated authenticated principals must not bypass the cache");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
     }
 
     #[tokio::test]

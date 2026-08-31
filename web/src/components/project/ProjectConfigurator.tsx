@@ -5,6 +5,7 @@ import {
   createProjectMutation,
   getRepositoryBranchesOptions,
   getRepositoryPresetLiveOptions,
+  detectPublicPresetsOptions,
   getRepositoryEnvExampleLiveOptions,
   detectPublicEnvExampleOptions,
   getRepositoryComposeServicesLiveOptions,
@@ -12,6 +13,7 @@ import {
   listPresetsOptions,
   revealServiceEnvironmentVariablesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { detectPublicPresets } from '@/api/client/sdk.gen'
 import {
   CreatableServiceTypeRoute,
   RepositoryResponse,
@@ -562,17 +564,14 @@ interface ProjectConfiguratorProps {
 
   // Optional data
   branches?: BranchInfo[]
-  /** Pre-loaded preset data (for public repos or when already fetched) */
+  /** Pre-loaded preset data for callers that already fetched it */
   presetData?: ProjectPresetResponse[]
   /**
    * Overrides the "Refresh" button's default behavior of refetching this
-   * component's own `getRepositoryPresetLive` query. Required whenever
+   * component's own preset query. Required whenever
    * `presetData` is supplied: that internal query is keyed on `repository.id`,
    * which is a real value only when the repo comes from `getRepositoryById`.
-   * Callers that source presets another way (e.g. `detectPublicPresets` for a
-   * public "git URL" import, where `repository.id` is a synthetic `0`) must
-   * pass their own refetch here, or the button will hit a nonexistent
-   * `repositories/0` route.
+   * Callers that source presets another way must pass their own refetch here.
    */
   onRefreshPresets?: () => Promise<unknown>
   /**
@@ -752,22 +751,54 @@ export function ProjectConfigurator({
     name: 'rootDirectory',
   })
 
-  // Fetch preset data (will refetch when branch changes due to query key)
-  // Skip fetching if presetData is already provided (e.g., for public repos)
+  // Fetch connected preset data (will refetch when branch changes due to query key).
   const {
     data: fetchedPresetData,
-    isLoading: presetLoading,
-    isFetching: presetFetching,
-    error: presetError,
+    isLoading: connectedPresetLoading,
+    isFetching: connectedPresetFetching,
+    error: connectedPresetError,
     refetch: refetchPresets,
   } = useQuery({
     ...getRepositoryPresetLiveOptions({
       path: { repository_id: repository.id || 0 },
       query: { branch: selectedBranch },
     }),
-    enabled: !providedPresetData && !!repository.id && !!selectedBranch,
+    enabled:
+      !providedPresetData &&
+      !publicRepo &&
+      !!repository.id &&
+      !!selectedBranch,
     // Key includes branch, so React Query will refetch when branch changes
   })
+
+  const publicPresetQueryOptions = detectPublicPresetsOptions({
+    path: {
+      provider: publicRepo?.provider || 'github',
+      owner: publicRepo?.owner || '',
+      repo: publicRepo?.repo || '',
+    },
+    query: {
+      branch: selectedBranch,
+      base_url: publicRepo?.baseUrl,
+    },
+  })
+  const {
+    data: fetchedPublicPresetData,
+    isLoading: publicPresetLoading,
+    isFetching: publicPresetFetching,
+    error: publicPresetError,
+  } = useQuery({
+    ...publicPresetQueryOptions,
+    enabled: !providedPresetData && !!publicRepo && !!selectedBranch,
+  })
+
+  const presetLoading = publicRepo
+    ? publicPresetLoading
+    : connectedPresetLoading
+  const presetFetching = publicRepo
+    ? publicPresetFetching
+    : connectedPresetFetching
+  const presetError = publicRepo ? publicPresetError : connectedPresetError
 
   // Holds the manual "Refresh" click for a minimum visible duration so a
   // fast response doesn't cut the spin icon off before it completes a turn.
@@ -776,9 +807,33 @@ export function ProjectConfigurator({
   const handleRefreshPresets = async () => {
     setIsManuallyRefreshingPresets(true)
     try {
-      await withMinDuration(() =>
-        onRefreshPresets ? onRefreshPresets() : refetchPresets()
-      )
+      await withMinDuration(async () => {
+        if (onRefreshPresets) {
+          await onRefreshPresets()
+          return
+        }
+        if (publicRepo) {
+          const response = await detectPublicPresets({
+            path: {
+              provider: publicRepo.provider,
+              owner: publicRepo.owner,
+              repo: publicRepo.repo,
+            },
+            query: {
+              branch: selectedBranch,
+              base_url: publicRepo.baseUrl,
+              fresh: true,
+            },
+            throwOnError: true,
+          })
+          queryClient.setQueryData(
+            publicPresetQueryOptions.queryKey,
+            response.data
+          )
+          return
+        }
+        await refetchPresets()
+      })
     } finally {
       setIsManuallyRefreshingPresets(false)
     }
@@ -790,8 +845,21 @@ export function ProjectConfigurator({
     if (providedPresetData) {
       return { presets: providedPresetData }
     }
+    if (fetchedPublicPresetData) {
+      return {
+        presets: fetchedPublicPresetData.presets.map((preset) => ({
+          preset: preset.preset,
+          presetLabel: preset.preset_label,
+          exposedPort: preset.exposed_port,
+          iconUrl: preset.icon_url,
+          projectType: preset.project_type,
+          path: preset.path,
+          composeFiles: preset.compose_files,
+        })),
+      }
+    }
     return fetchedPresetData
-  }, [providedPresetData, fetchedPresetData])
+  }, [providedPresetData, fetchedPublicPresetData, fetchedPresetData])
 
   // Detect a .env.example (or common variant) directly inside the selected
   // project root. Including the root directory in the query key makes preset
@@ -1011,7 +1079,7 @@ export function ProjectConfigurator({
     effectiveDetectedPort !== undefined &&
     selectedPort !== undefined &&
     selectedPort !== effectiveDetectedPort
-  const lastAutoPortPreset = useRef<string | null>(null)
+  const portWasManuallyEdited = useRef(false)
 
   // Auto-update port based on selected preset
   useEffect(() => {
@@ -1019,10 +1087,7 @@ export function ProjectConfigurator({
       return
     }
 
-    if (
-      lastAutoPortPreset.current === selectedPreset &&
-      form.getFieldState('port').isDirty
-    ) {
+    if (portWasManuallyEdited.current) {
       return
     }
 
@@ -1031,7 +1096,6 @@ export function ProjectConfigurator({
         shouldValidate: true,
         shouldDirty: false,
       })
-      lastAutoPortPreset.current = selectedPreset
       return
     }
 
@@ -1055,7 +1119,6 @@ export function ProjectConfigurator({
         shouldValidate: true,
         shouldDirty: false,
       })
-      lastAutoPortPreset.current = selectedPreset
     }
   }, [selectedPreset, effectiveDetectedPort, allPresetsData, form])
 
@@ -1550,6 +1613,7 @@ export function ProjectConfigurator({
                   onBlur={field.onBlur}
                   value={field.value ?? 3000}
                   onChange={(e) => {
+                    portWasManuallyEdited.current = true
                     const v = e.target.valueAsNumber
                     field.onChange(Number.isNaN(v) ? undefined : v)
                   }}

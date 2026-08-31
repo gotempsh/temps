@@ -6420,6 +6420,140 @@ services:
         file_content.assert_async().await;
     }
 
+    #[tokio::test]
+    async fn connected_preset_detection_uses_selected_branch_and_preserves_read_failures() {
+        use crate::services::git_provider::{AuthMethod, GitProviderService};
+        use crate::services::github_provider::GitHubProvider;
+        use base64::Engine;
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let mut server = mockito::Server::new_async().await;
+        let validate_token = server
+            .mock("GET", "/rate_limit")
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"resources":{"core":{"remaining":4999}}}"#)
+            .expect(3)
+            .create_async()
+            .await;
+        let tree = server
+            .mock(
+                "GET",
+                "/repos/example-owner/example-repository/git/trees/release-port",
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "recursive".to_string(),
+                "1".to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tree":[{"path":"Dockerfile","type":"blob"},{"path":"apps/api/Dockerfile","type":"blob"}]}"#,
+            )
+            .create_async()
+            .await;
+        let missing_nested_dockerfile = server
+            .mock(
+                "GET",
+                "/repos/example-owner/example-repository/contents/apps/api/Dockerfile",
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "ref".to_string(),
+                "release-port".to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"simulated missing file"}"#)
+            .create_async()
+            .await;
+        let dockerfile = server
+            .mock(
+                "GET",
+                "/repos/example-owner/example-repository/contents/Dockerfile",
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "ref".to_string(),
+                "release-port".to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "path": "Dockerfile",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode("FROM alpine\nEXPOSE 4321\n"),
+                    "encoding": "base64"
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key should be valid"),
+        );
+        let mut connection = connection_fixture(11, Some(5));
+        connection.access_token = Some(
+            encryption_service
+                .encrypt_string("test-access-token")
+                .expect("test access token should encrypt"),
+        );
+        let repository = repository_fixture(connection.id);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[repository.clone()]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection]])
+                .append_query_results([[repository]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+        let provider: Arc<dyn GitProviderService> = Arc::new(GitHubProvider::new(
+            Some(server.url()),
+            AuthMethod::PersonalAccessToken {
+                token: "unused-constructor-token".to_string(),
+            },
+        ));
+        manager.providers_cache.write().await.insert(7, provider);
+
+        let result = manager
+            .calculate_repository_preset_live(42, Some("release-port".to_string()))
+            .await
+            .expect("connected preset detection should succeed");
+
+        assert_eq!(result.presets.len(), 2);
+        let root = result
+            .presets
+            .iter()
+            .find(|preset| preset.path == "./")
+            .expect("root Dockerfile preset should remain available");
+        let nested = result
+            .presets
+            .iter()
+            .find(|preset| preset.path == "apps/api")
+            .expect("unreadable nested Dockerfile preset should remain available");
+        assert_eq!(root.exposed_port, Some(4321));
+        assert_eq!(nested.exposed_port, None);
+        validate_token.assert_async().await;
+        tree.assert_async().await;
+        dockerfile.assert_async().await;
+        missing_nested_dockerfile.assert_async().await;
+    }
+
     // Helper function to create a test ConfigService
     fn create_test_config_service(db: Arc<DatabaseConnection>) -> Arc<temps_config::ConfigService> {
         let server_config = Arc::new(
