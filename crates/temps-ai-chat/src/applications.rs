@@ -336,7 +336,17 @@ fn validate_secret_free_payload(value: &Value, path: &str) -> Result<(), Applica
                 ]
                 .iter()
                 .any(|marker| normalized == *marker || normalized.ends_with(&format!("_{marker}")));
-                if is_secret_field && !is_reference && !child.is_null() {
+                // References are not a free-form escape hatch. The only value
+                // that may sit under a reference key is a canonical, opaque
+                // broker id; accepting arbitrary strings here would persist a
+                // caller-supplied secret in an artifact.
+                if is_reference {
+                    if !child.as_str().is_some_and(is_opaque_credential_reference) {
+                        return Err(ApplicationError::SecretValue(child_path));
+                    }
+                    continue;
+                }
+                if is_secret_field && !child.is_null() {
                     return Err(ApplicationError::SecretValue(child_path));
                 }
                 validate_secret_free_payload(child, &child_path)?;
@@ -353,6 +363,22 @@ fn validate_secret_free_payload(value: &Value, path: &str) -> Result<(), Applica
         _ => {}
     }
     Ok(())
+}
+
+/// References issued by the credential broker contain an object id only; no
+/// provider, token, or secret material can be encoded in them. New broker
+/// schemes must be added deliberately here rather than relying on a suffix in
+/// an untrusted artifact payload.
+fn is_opaque_credential_reference(value: &str) -> bool {
+    static REFERENCE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    REFERENCE
+        .get_or_init(|| {
+            regex::Regex::new(
+                r"^(?:vault://connections/conn_|temps://credentials/cred_)[A-Za-z0-9_-]{1,128}$",
+            )
+            .expect("static credential reference regex")
+        })
+        .is_match(value)
 }
 
 #[cfg(test)]
@@ -388,6 +414,17 @@ mod tests {
         assert!(matches!(
             validate_secret_free_payload(&payload, "$"),
             Err(ApplicationError::SecretValue(path)) if path == "$.content"
+        ));
+    }
+
+    #[test]
+    fn artifact_payload_rejects_arbitrary_reference_values() {
+        let payload = serde_json::json!({
+            "credential_ref": "this-is-a-real-secret-that-is-not-a-broker-reference"
+        });
+        assert!(matches!(
+            validate_secret_free_payload(&payload, "$"),
+            Err(ApplicationError::SecretValue(path)) if path == "$.credential_ref"
         ));
     }
 }

@@ -983,7 +983,6 @@ const AppContent = () => {
             <Suspense fallback={<PageLoader />}>
               <Routes>
                 {/* Public routes that don't require authentication */}
-                <Route path="/ai-first" element={<AiFirstPrototype />} />
                 <Route path="/mfa-verify" element={<MfaVerify />} />
                 <Route path="/forgot-password" element={<ForgotPassword />} />
                 {/* Target of the password-reset email link
@@ -1016,28 +1015,7 @@ const AppContent = () => {
   )
 }
 
-/**
- * Keep the speculative AI-first surface self-contained when opened directly.
- * It is intentionally usable before an API or account exists so the concept
- * can be reviewed without bootstrapping a full Temps instance. In-app
- * navigation still uses the public route declared inside AppContent above.
- */
-const PrototypeAwareAppContent = () => {
-  if (
-    typeof window !== 'undefined' &&
-    window.location.pathname === '/ai-first'
-  ) {
-    return (
-      <BrowserRouter>
-        <Suspense fallback={<PageLoader />}>
-          <AiFirstPrototype />
-        </Suspense>
-      </BrowserRouter>
-    )
-  }
-
-  return <AppContent />
-}
+const PrototypeAwareAppContent = () => <AppContent />
 
 // Helper to generate friendly error titles from mutation operations
 const getErrorTitle = (

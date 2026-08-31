@@ -31,6 +31,44 @@ pub(crate) fn contains_likely_credential(value: &str) -> bool {
             .expect("static credential-detection regex")
         })
         .is_match(value)
+        || contains_high_entropy_token(value)
+}
+
+/// Catch opaque tokens which cannot be identified safely by provider prefix.
+/// This deliberately errs on the side of blocking a token-looking fragment in
+/// application chat; credentials have a dedicated secret/connector flow.
+fn contains_high_entropy_token(value: &str) -> bool {
+    value
+        .split(|character: char| {
+            !(character.is_ascii_alphanumeric()
+                || matches!(character, '_' | '-' | '~' | '+' | '/' | '='))
+        })
+        .any(|candidate| {
+            candidate.len() >= 24
+                && !looks_like_uuid(candidate)
+                && character_classes(candidate) >= 3
+        })
+}
+
+fn looks_like_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(index, character)| {
+            matches!(index, 8 | 13 | 18 | 23) && character == '-' || character.is_ascii_hexdigit()
+        })
+}
+
+fn character_classes(value: &str) -> usize {
+    let mut lower = false;
+    let mut upper = false;
+    let mut digit = false;
+    let mut symbol = false;
+    for character in value.chars() {
+        lower |= character.is_ascii_lowercase();
+        upper |= character.is_ascii_uppercase();
+        digit |= character.is_ascii_digit();
+        symbol |= !character.is_ascii_alphanumeric();
+    }
+    usize::from(lower) + usize::from(upper) + usize::from(digit) + usize::from(symbol)
 }
 
 /// Recursively replace values under credential-like keys.
@@ -285,6 +323,17 @@ mod tests {
             let display = redact_json_string(&arguments);
             assert!(!display.contains(secret), "secret leaked from {arguments}");
             assert!(display.contains("--value ***"));
+        }
+    }
+
+    #[test]
+    fn opaque_and_jwt_like_tokens_are_detected_before_ai_persistence() {
+        for value in [
+            "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.signature",
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            "Ab3dEf5Gh7Jk9Lm2Np4Qr6St8Uv0WxYz",
+        ] {
+            assert!(contains_likely_credential(value), "missed {value}");
         }
     }
 

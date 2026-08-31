@@ -70,6 +70,7 @@ export function AiFirstWorkspace() {
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [applicationDialogOpen, setApplicationDialogOpen] = useState(false)
+  const [applicationDialogSession, setApplicationDialogSession] = useState(0)
   const [threadDialogOpen, setThreadDialogOpen] = useState(false)
 
   const activeApplication = applications.find(
@@ -199,6 +200,14 @@ export function AiFirstWorkspace() {
     setThreadDialogOpen(false)
   }
 
+  const openApplicationDialog = () => {
+    // The dialog receives a new session before it becomes visible, so it can
+    // wait for the current project inventory instead of briefly showing a
+    // stale “new” or “existing” decision from the previous opening.
+    setApplicationDialogSession((current) => current + 1)
+    setApplicationDialogOpen(true)
+  }
+
   return (
     <div className="fixed inset-0 z-40 overflow-hidden bg-background text-foreground antialiased">
       <header className="flex h-14 items-center justify-between border-b border-border bg-card px-4">
@@ -238,7 +247,7 @@ export function AiFirstWorkspace() {
             </span>
             <button
               type="button"
-              onClick={() => setApplicationDialogOpen(true)}
+              onClick={openApplicationDialog}
               className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
               aria-label="New application"
             >
@@ -331,7 +340,7 @@ export function AiFirstWorkspace() {
               title="Build and operate an application through chat"
               detail="Group one or more Temps projects, choose a local AI harness or API provider, and keep every decision in a persistent thread."
               action="Create application"
-              onAction={() => setApplicationDialogOpen(true)}
+              onAction={openApplicationDialog}
             />
           ) : !activeConversation ? (
             <CenteredMessage
@@ -391,6 +400,8 @@ export function AiFirstWorkspace() {
         open={applicationDialogOpen}
         onOpenChange={setApplicationDialogOpen}
         onCreated={handleApplicationCreated}
+        providers={providers}
+        session={applicationDialogSession}
       />
       {activeApplication && (
         <CreateThreadDialog
@@ -483,21 +494,27 @@ function CreateApplicationDialog({
   open,
   onOpenChange,
   onCreated,
+  providers,
+  session,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   onCreated: (application: ApplicationResponse) => void
+  providers: ChatProviderOption[]
+  session: number
 }) {
   const [projects, setProjects] = useState<ProjectResponse[]>([])
   const [name, setName] = useState('')
   const [description, setDescription] = useState('')
   const [selected, setSelected] = useState<number[]>([])
   const [startMode, setStartMode] = useState<'existing' | 'new' | null>(null)
-  const [newProjectName, setNewProjectName] = useState('')
   const [newProjectMode, setNewProjectMode] = useState<
     'manual' | 'workspace' | 'local'
   >('workspace')
   const [localFolderName, setLocalFolderName] = useState<string | null>(null)
+  const [provisionedProject, setProvisionedProject] =
+    useState<ProjectResponse | null>(null)
+  const [loadedSession, setLoadedSession] = useState(-1)
   const [saving, setSaving] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -510,7 +527,8 @@ function CreateApplicationDialog({
         const next = data?.projects ?? []
         setError(null)
         setProjects(next)
-        setStartMode(next.length === 0 ? 'new' : null)
+        setStartMode(provisionedProject || next.length === 0 ? 'new' : null)
+        setLoadedSession(session)
       })
       .catch(() => {
         if (cancelled) return
@@ -519,11 +537,12 @@ function CreateApplicationDialog({
         setError(
           'Could not load existing projects. You can still start a new one.'
         )
+        setLoadedSession(session)
       })
     return () => {
       cancelled = true
     }
-  }, [open])
+  }, [open, provisionedProject, session])
 
   const chooseLocalFolder = async () => {
     type DirectoryPickerWindow = Window & {
@@ -552,7 +571,6 @@ function CreateApplicationDialog({
       !name.trim() ||
       !startMode ||
       (startMode === 'existing' && selected.length === 0) ||
-      (startMode === 'new' && !newProjectName.trim()) ||
       (startMode === 'new' && newProjectMode === 'local' && !localFolderName)
     ) {
       return
@@ -562,22 +580,29 @@ function CreateApplicationDialog({
     try {
       let projectIds = selected
       if (startMode === 'new') {
-        const { data: project } = await createProject({
-          body: {
-            name: newProjectName.trim(),
-            preset: 'dockerfile',
-            directory: './',
-            main_branch: 'main',
-            source_type: 'manual',
-            project_type: 'docker',
-            automatic_deploy: false,
-            exposed_port: 3000,
-            storage_service_ids: [],
-          },
-          throwOnError: true,
-        })
-        projectIds = [...projectIds, project.id]
-        setProjects((current) => [project, ...current])
+        const project =
+          provisionedProject ??
+          (
+            await createProject({
+              body: {
+                name: projectNameFromApplication(name),
+                preset: 'dockerfile',
+                directory: './',
+                main_branch: 'main',
+                source_type: 'manual',
+                project_type: 'docker',
+                automatic_deploy: false,
+                exposed_port: 3000,
+                storage_service_ids: [],
+              },
+              throwOnError: true,
+            })
+          ).data
+        if (!provisionedProject) {
+          setProvisionedProject(project)
+          setProjects((current) => [project, ...current])
+        }
+        projectIds = [project.id]
 
         if (newProjectMode === 'workspace') {
           try {
@@ -614,9 +639,9 @@ function CreateApplicationDialog({
       setName('')
       setDescription('')
       setSelected([])
-      setNewProjectName('')
       setNewProjectMode('workspace')
       setLocalFolderName(null)
+      setProvisionedProject(null)
     } catch (cause) {
       setError(
         cause instanceof Error ? cause.message : 'Could not create application.'
@@ -636,7 +661,12 @@ function CreateApplicationDialog({
             Access is checked against every linked project on every request.
           </DialogDescription>
         </DialogHeader>
-        {startMode === null ? (
+        {loadedSession !== session ? (
+          <div className="flex min-h-44 items-center justify-center text-sm text-muted-foreground">
+            <Loader2 className="mr-2 size-4 animate-spin" /> Loading project
+            choices…
+          </div>
+        ) : startMode === null ? (
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">
               What should this application start from?
@@ -647,7 +677,6 @@ function CreateApplicationDialog({
                 icon={Boxes}
                 label="Use existing projects"
                 onSelect={() => {
-                  setNewProjectName('')
                   setLocalFolderName(null)
                   setStartMode('existing')
                 }}
@@ -689,14 +718,17 @@ function CreateApplicationDialog({
                 />
               </div>
               <div className="space-y-2">
-                <Label htmlFor="ai-app-description">Outcome</Label>
+                <Label htmlFor="ai-app-description">
+                  What are you building?
+                </Label>
                 <Textarea
                   id="ai-app-description"
                   value={description}
                   onChange={(event) => setDescription(event.target.value)}
-                  placeholder="What should this application do?"
+                  placeholder="Describe the product, the services it needs, and what success looks like…"
                 />
               </div>
+              <HarnessSummary providers={providers} />
               <div className="space-y-4">
                 {startMode === 'existing' && (
                   <div className="space-y-2">
@@ -741,24 +773,14 @@ function CreateApplicationDialog({
                   </div>
                 )}
                 {startMode === 'new' && (
-                  <div className="space-y-2">
-                    <Label htmlFor="ai-new-project-name">First project</Label>
-                    <Input
-                      id="ai-new-project-name"
-                      value={newProjectName}
-                      onChange={(event) =>
-                        setNewProjectName(event.target.value)
-                      }
-                      placeholder="storefront-web"
-                    />
-                    <p className="text-xs text-muted-foreground">
-                      A deployable, Git-optional Temps project is created before
-                      the application thread starts.
-                    </p>
-                  </div>
+                  <p className="rounded-md border border-border bg-muted/50 p-3 text-xs leading-5 text-muted-foreground">
+                    {provisionedProject
+                      ? `Using the already provisioned project “${provisionedProject.name}”.`
+                      : 'Temps creates the initial deployable project from this application name. The first thread turns your brief into a multi-project topology and asks before adding or changing projects.'}
+                  </p>
                 )}
               </div>
-              {startMode === 'new' && newProjectName.trim() && (
+              {startMode === 'new' && name.trim() && (
                 <fieldset className="space-y-2">
                   <legend className="text-sm font-medium">
                     Development location
@@ -838,7 +860,6 @@ function CreateApplicationDialog({
                   startMode === null ||
                   !name.trim() ||
                   (startMode === 'existing' && selected.length === 0) ||
-                  (startMode === 'new' && !newProjectName.trim()) ||
                   (startMode === 'new' &&
                     newProjectMode === 'local' &&
                     !localFolderName)
@@ -853,6 +874,55 @@ function CreateApplicationDialog({
         )}
       </DialogContent>
     </Dialog>
+  )
+}
+
+function projectNameFromApplication(name: string) {
+  const slug = name
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+  return slug || 'application'
+}
+
+function HarnessSummary({ providers }: { providers: ChatProviderOption[] }) {
+  return (
+    <section className="rounded-lg border border-border bg-muted/40 p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-sm font-medium">Detected harnesses</p>
+          <p className="mt-0.5 text-xs text-muted-foreground">
+            Choose the harness for the first thread after the application is
+            created. It remains pinned to that thread.
+          </p>
+        </div>
+        <TerminalSquare className="size-4 shrink-0 text-muted-foreground" />
+      </div>
+      {providers.length > 0 ? (
+        <div className="mt-3 flex flex-wrap gap-2">
+          {providers.map((provider) => (
+            <span
+              key={provider.id}
+              className="rounded-md border border-border bg-background px-2.5 py-1.5 text-xs"
+            >
+              {chatProviderLabel(provider)}
+              {provider.default_model_id && (
+                <span className="ml-1 text-muted-foreground">
+                  · {provider.default_model_id}
+                </span>
+              )}
+            </span>
+          ))}
+        </div>
+      ) : (
+        <p className="mt-3 text-xs text-amber-600 dark:text-amber-400">
+          No authenticated Claude, Codex, OpenCode, or API provider is ready
+          yet. Connect one in AI Gateway before starting the first thread.
+        </p>
+      )}
+    </section>
   )
 }
 

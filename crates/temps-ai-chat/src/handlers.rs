@@ -8,6 +8,7 @@
 //! of the assistant reply), `POST .../{public_id}/archive`. All gated on the
 //! per-project `ai_debug_chat_enabled` toggle + AI being configured.
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -192,7 +193,10 @@ impl From<temps_entities::ai_thread_artifacts::Model> for ThreadArtifactResponse
             kind: value.kind,
             schema_version: value.schema_version,
             title: value.title,
-            payload: value.payload,
+            // Artifact writes reject plaintext credentials. Redact again on
+            // the response boundary so a legacy row or future validation
+            // regression cannot expose credential-like JSON to the browser.
+            payload: redact_value(&value.payload),
             status: value.status,
             created_at: value.created_at.to_rfc3339(),
             updated_at: value.updated_at.to_rfc3339(),
@@ -804,11 +808,26 @@ async fn has_application_project_access(
     checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
     project_ids: &[i32],
 ) -> Result<bool, Problem> {
+    let access = application_project_access_map(auth, checker, project_ids).await?;
+    Ok(access.is_none_or(|access| {
+        project_ids
+            .iter()
+            .all(|project_id| access.get(project_id).copied().unwrap_or(false))
+    }))
+}
+
+/// Return an access map when a team checker is configured. `None` represents
+/// the OSS/admin path where every requested project is visible.
+async fn application_project_access_map(
+    auth: &AuthContext,
+    checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    project_ids: &[i32],
+) -> Result<Option<std::collections::BTreeMap<i32, bool>>, Problem> {
     if auth.is_admin() || auth.has_role(&temps_auth::permissions::Role::PlatformAdmin) {
-        return Ok(true);
+        return Ok(None);
     }
     let Some(checker) = checker else {
-        return Ok(true);
+        return Ok(None);
     };
     let user_id = auth.user_id_opt().ok_or_else(|| {
         problemdetails::new(StatusCode::FORBIDDEN)
@@ -824,9 +843,7 @@ async fn has_application_project_access(
                 .with_title("Project Access Check Failed")
                 .with_detail("Could not verify project access; please try again")
         })?;
-    Ok(project_ids
-        .iter()
-        .all(|project_id| access.get(project_id).copied().unwrap_or(false)))
+    Ok(Some(access))
 }
 
 async fn ensure_application_conversation_access(
@@ -853,6 +870,40 @@ async fn ensure_application_conversation_access(
     ensure_application_project_access(auth, &state.project_access_checker, &project_ids).await
 }
 
+/// Resolve one application membership decision per application in list views.
+/// This keeps multiple threads from the same application from multiplying
+/// database topology reads and team-access checks.
+async fn application_conversation_is_visible(
+    state: &AppState,
+    auth: &AuthContext,
+    conversation: &ai_conversations::Model,
+    visibility: &mut HashMap<String, bool>,
+) -> Result<bool, Problem> {
+    if conversation.context_type != "application" {
+        return Ok(true);
+    }
+    let application_public_id =
+        conversation.context_id.split(':').next().ok_or_else(|| {
+            ApplicationError::ConversationNotFound(conversation.public_id.clone())
+        })?;
+    if let Some(visible) = visibility.get(application_public_id) {
+        return Ok(*visible);
+    }
+    let application = state
+        .applications
+        .get(auth.user_id(), application_public_id)
+        .await?;
+    let project_ids = application
+        .projects
+        .iter()
+        .map(|project| project.id)
+        .collect::<Vec<_>>();
+    let visible =
+        has_application_project_access(auth, &state.project_access_checker, &project_ids).await?;
+    visibility.insert(application_public_id.to_string(), visible);
+    Ok(visible)
+}
+
 #[utoipa::path(
     get, tag = "AI Applications", path = "/ai/applications",
     responses((status = 200, body = Vec<ApplicationResponse>), (status = 401), (status = 403)),
@@ -865,16 +916,23 @@ pub async fn list_applications(
     permission_guard!(auth, ProjectsRead);
     deny_deployment_token!(auth);
     let applications = state.applications.list(auth.user_id()).await?;
+    let project_ids = applications
+        .iter()
+        .flat_map(|application| application.projects.iter().map(|project| project.id))
+        .collect::<Vec<_>>();
+    let access =
+        application_project_access_map(&auth, &state.project_access_checker, &project_ids).await?;
     let mut visible = Vec::with_capacity(applications.len());
     for application in applications {
-        let project_ids = application
-            .projects
-            .iter()
-            .map(|project| project.id)
-            .collect::<Vec<_>>();
-        ensure_application_project_access(&auth, &state.project_access_checker, &project_ids)
-            .await?;
-        visible.push(ApplicationResponse::from(application));
+        let application_visible = access.as_ref().is_none_or(|access| {
+            application
+                .projects
+                .iter()
+                .all(|project| access.get(&project.id).copied().unwrap_or(false))
+        });
+        if application_visible {
+            visible.push(ApplicationResponse::from(application));
+        }
     }
     Ok(Json(visible))
 }
@@ -1227,36 +1285,23 @@ pub async fn list_all_conversations(
         .list_all_conversations(auth.user_id(), &hidden_project_ids)
         .await?;
     let mut conversations = Vec::with_capacity(items.len());
+    let mut application_visibility = HashMap::new();
     for item in items {
         if !can_read_context(&auth, &item.conversation.context_type) {
             continue;
         }
-        if item.conversation.context_type == "application" {
-            let application_public_id =
-                item.conversation
-                    .context_id
-                    .split(':')
-                    .next()
-                    .ok_or_else(|| {
-                        ApplicationError::ConversationNotFound(item.conversation.public_id.clone())
-                    })?;
-            let application = state
-                .applications
-                .get(auth.user_id(), application_public_id)
-                .await?;
-            let project_ids = application
-                .projects
-                .iter()
-                .map(|project| project.id)
-                .collect::<Vec<_>>();
-            if !has_application_project_access(&auth, &state.project_access_checker, &project_ids)
-                .await?
-            {
-                // Global lists should remain useful when a collaborator loses
-                // access to one member project; omit the now-inaccessible
-                // thread rather than leaking its name, title, or activity.
-                continue;
-            }
+        if !application_conversation_is_visible(
+            &state,
+            &auth,
+            &item.conversation,
+            &mut application_visibility,
+        )
+        .await?
+        {
+            // Global lists should remain useful when a collaborator loses
+            // access to one member project; omit the now-inaccessible thread
+            // rather than leaking its name, title, or activity.
+            continue;
         }
         conversations.push(GlobalConversationResponse {
             public_id: item.conversation.public_id,
@@ -1301,11 +1346,21 @@ pub async fn list_conversations(
         .list_conversations(project_id, auth.user_id())
         .await?;
     let mut responses = Vec::with_capacity(conversations.len());
+    let mut application_visibility = HashMap::new();
     for conversation in conversations {
         if !can_read_context(&auth, &conversation.context_type) {
             continue;
         }
-        ensure_application_conversation_access(&state, &auth, &conversation).await?;
+        if !application_conversation_is_visible(
+            &state,
+            &auth,
+            &conversation,
+            &mut application_visibility,
+        )
+        .await?
+        {
+            continue;
+        }
         responses.push(ConversationResponse::from(conversation));
     }
     Ok(Json(responses))
@@ -1574,6 +1629,15 @@ pub async fn send_message(
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty() && s.len() <= MAX_PAGE_CONTEXT_LEN);
+    if conv.context_type == "application"
+        && page_context.is_some_and(crate::sensitive::contains_likely_credential)
+    {
+        return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Credential Blocked From AI Chat")
+            .with_detail(
+                "Page context looks like it contains a credential. Remove it and use the secure project secret or connector flow instead.",
+            ));
+    }
     // `send_message` persists the user turn before returning the stream, so the
     // turn is durable by the time we audit it.
     let token_stream = state
@@ -2078,6 +2142,7 @@ pub async fn get_pending_action(
         .service
         .get_by_id(project_id, auth.user_id(), action.conversation_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     Ok(Json(PendingActionResponse::from(action)))
 }
@@ -2116,6 +2181,7 @@ pub async fn confirm_pending_action(
         .service
         .get_by_id(project_id, auth.user_id(), action.conversation_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     let confirmed_by = Some(auth.user_id());
     let updated = state
@@ -2177,6 +2243,7 @@ pub async fn reject_pending_action(
         .service
         .get_by_id(project_id, auth.user_id(), action.conversation_id)
         .await?;
+    ensure_application_conversation_access(&state, &auth, &conv).await?;
     ensure_context_read_permission(&auth, &conv.context_type)?;
     let rejected_by = Some(auth.user_id());
     let updated = state
