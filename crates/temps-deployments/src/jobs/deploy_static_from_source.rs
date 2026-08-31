@@ -17,6 +17,9 @@ use temps_core::{
     static_files::is_sensitive_static_path, JobResult, WorkflowContext, WorkflowError, WorkflowTask,
 };
 use temps_deployer::static_deployer::{StaticDeployRequest, StaticDeployer};
+use temps_deployer::static_ingestion::{
+    MAX_STATIC_ENTRIES, MAX_STATIC_ENTRY_BYTES, MAX_STATIC_TOTAL_BYTES,
+};
 use temps_logs::{LogLevel, LogService};
 
 use super::RepositoryOutput;
@@ -173,16 +176,29 @@ impl DeployStaticFromSourceJob {
     /// time by `StaticDeployer::deploy` on whatever survives this filter, and
     /// a third time per-request by the proxy — this only changes the failure
     /// mode for the *first* of those three checks.
+    ///
+    /// Enforces the same `MAX_STATIC_ENTRIES`/`MAX_STATIC_ENTRY_BYTES`/
+    /// `MAX_STATIC_TOTAL_BYTES` bounds `StaticDeployer::deploy` enforces on its
+    /// own copy, so an oversized repository can't fill disk during *this*
+    /// tempdir copy before those limits get a chance to reject it on the
+    /// second, final copy.
     fn copy_publishable_tree<'a>(
         source_root: &'a Path,
         source: &'a Path,
         dest: &'a Path,
-        skipped: &'a mut Vec<String>,
+        stats: &'a mut CopyStats,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send + 'a>> {
         Box::pin(async move {
             tokio::fs::create_dir_all(dest).await?;
             let mut entries = tokio::fs::read_dir(source).await?;
             while let Some(entry) = entries.next_entry().await? {
+                stats.entry_count += 1;
+                if stats.entry_count > MAX_STATIC_ENTRIES {
+                    return Err(std::io::Error::other(format!(
+                        "deployment exceeds the {MAX_STATIC_ENTRIES} entry limit"
+                    )));
+                }
+
                 let file_type = entry.file_type().await?;
                 let source_path = entry.path();
                 let relative = source_path
@@ -190,7 +206,7 @@ impl DeployStaticFromSourceJob {
                     .unwrap_or(&source_path);
 
                 if is_sensitive_static_path(relative) {
-                    skipped.push(relative.display().to_string());
+                    stats.skipped.push(relative.display().to_string());
                     continue;
                 }
 
@@ -198,18 +214,42 @@ impl DeployStaticFromSourceJob {
                 if file_type.is_symlink() {
                     // Symlinks are rejected by the shared policy layer when
                     // present; skip rather than follow them here too.
-                    skipped.push(relative.display().to_string());
+                    stats.skipped.push(relative.display().to_string());
                     continue;
                 } else if file_type.is_dir() {
-                    Self::copy_publishable_tree(source_root, &source_path, &dest_path, skipped)
+                    Self::copy_publishable_tree(source_root, &source_path, &dest_path, stats)
                         .await?;
                 } else {
+                    let size = entry.metadata().await?.len();
+                    if size > MAX_STATIC_ENTRY_BYTES {
+                        return Err(std::io::Error::other(format!(
+                            "file '{}' exceeds the {MAX_STATIC_ENTRY_BYTES} byte per-file limit",
+                            relative.display()
+                        )));
+                    }
+                    stats.total_bytes = stats.total_bytes.saturating_add(size);
+                    if stats.total_bytes > MAX_STATIC_TOTAL_BYTES {
+                        return Err(std::io::Error::other(format!(
+                            "deployment exceeds the {MAX_STATIC_TOTAL_BYTES} byte aggregate limit"
+                        )));
+                    }
                     tokio::fs::copy(&source_path, &dest_path).await?;
                 }
             }
             Ok(())
         })
     }
+}
+
+/// Running totals threaded through the recursive [`DeployStaticFromSourceJob::copy_publishable_tree`]
+/// walk, mirroring `StaticDeployer`'s own `CopyStats` so both copies of a
+/// deployment (this tempdir staging copy, and `StaticDeployer::deploy`'s
+/// final copy) are bounded by the same limits.
+#[derive(Default)]
+struct CopyStats {
+    skipped: Vec<String>,
+    entry_count: u32,
+    total_bytes: u64,
 }
 
 #[async_trait]
@@ -277,10 +317,9 @@ impl WorkflowTask for DeployStaticFromSourceJob {
         )
         .await?;
 
-        let mut skipped = Vec::new();
+        let mut stats = CopyStats::default();
         if let Err(error) =
-            Self::copy_publishable_tree(&source_dir, &source_dir, temp_dir.path(), &mut skipped)
-                .await
+            Self::copy_publishable_tree(&source_dir, &source_dir, temp_dir.path(), &mut stats).await
         {
             return Err(self
                 .log_and_fail(
@@ -293,13 +332,14 @@ impl WorkflowTask for DeployStaticFromSourceJob {
                 .await);
         }
 
-        if !skipped.is_empty() {
+        if !stats.skipped.is_empty() {
             self.log(
                 &context,
                 format!(
                     "⏭️  Skipped {} non-publishable path(s), e.g. {}",
-                    skipped.len(),
-                    skipped
+                    stats.skipped.len(),
+                    stats
+                        .skipped
                         .iter()
                         .take(5)
                         .cloned()
@@ -476,5 +516,65 @@ mod tests {
         let context = context_with_repo_dir(repo.path());
         let result = job.execute(context).await;
         assert!(result.is_err(), "parent-dir escape must be rejected");
+    }
+
+    #[tokio::test]
+    async fn refuses_a_repository_over_the_entry_count_limit() {
+        let repo = tempfile::tempdir().unwrap();
+        for i in 0..=MAX_STATIC_ENTRIES {
+            write_file(&repo.path().join(format!("file-{i}.txt")), "x");
+        }
+
+        let base_dir = tempfile::tempdir().unwrap();
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.path().to_path_buf()));
+
+        let job = DeployStaticFromSourceJob::new(
+            "deploy_static".to_string(),
+            "download_repo".to_string(),
+            ".".to_string(),
+            "my-project".to_string(),
+            "production".to_string(),
+            "deploy-123".to_string(),
+            deployer,
+        );
+
+        let context = context_with_repo_dir(repo.path());
+        let result = job.execute(context).await;
+        assert!(
+            result.is_err(),
+            "a repository over MAX_STATIC_ENTRIES must be rejected, not copied to disk"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_a_file_over_the_per_file_byte_limit() {
+        let repo = tempfile::tempdir().unwrap();
+        write_file(&repo.path().join("index.html"), "<h1>hi</h1>");
+        // Sparse file: declares an oversized length without writing real bytes,
+        // so the test stays fast while still exercising the size check.
+        std::fs::File::create(repo.path().join("huge.bin"))
+            .unwrap()
+            .set_len(MAX_STATIC_ENTRY_BYTES + 1)
+            .unwrap();
+
+        let base_dir = tempfile::tempdir().unwrap();
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.path().to_path_buf()));
+
+        let job = DeployStaticFromSourceJob::new(
+            "deploy_static".to_string(),
+            "download_repo".to_string(),
+            ".".to_string(),
+            "my-project".to_string(),
+            "production".to_string(),
+            "deploy-123".to_string(),
+            deployer,
+        );
+
+        let context = context_with_repo_dir(repo.path());
+        let result = job.execute(context).await;
+        assert!(
+            result.is_err(),
+            "a file over MAX_STATIC_ENTRY_BYTES must be rejected before being copied to disk"
+        );
     }
 }
