@@ -517,7 +517,7 @@ mod registry_tests {
                 "m20260815_000001_default_preview_inclusion_off",
             ),
             (
-                "m20260829_000001_allow_duplicate_ready_snapshot_digests",
+                "m20260830_000001_add_external_service_creator",
                 "m20260831_000001_add_source_bundle_kind",
             ),
             (
