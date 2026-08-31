@@ -1517,7 +1517,7 @@ export type AppSettingsResponse = {
     /**
      * Managed control-plane destination and explicit export consent flags.
      */
-    cloud?: CloudSettings;
+    cloud: CloudSettings;
     /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
      * needed — `enabled` is a plain bool with no sensitive content. Passed
@@ -11024,8 +11024,8 @@ export type MintEnrollmentTokenRequest = {
 
 export type MintEnrollmentTokenResponse = {
     /**
-     * SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
-     * worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+     * SHA-256 fingerprint of the cluster CA. Token issuance initializes the
+     * CA when needed, so every newly minted token carries a trust pin.
      */
     ca_fingerprint?: string | null;
     expires_at: string;
@@ -11279,9 +11279,10 @@ export type MultiNodeSettings = {
      */
     private_address?: string | null;
     /**
-     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`
-     * (default), the control plane ignores join-time CSRs and nodes keep
-     * serving plaintext HTTP — zero behavior change. When `true`, the CP signs
+     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). New installations
+     * default to `true`. Existing serialized settings that predate this field
+     * deserialize it as `false`, providing an explicit migration window rather
+     * than unexpectedly disconnecting legacy workers. When `true`, the CP signs
      * node CSRs, nodes serve mutual TLS, and every CP→agent call uses the
      * cluster client cert. Observe-then-enforce: flip this on only once all
      * workers have re-enrolled with certs.
@@ -11298,10 +11299,6 @@ export type MultiNodeSettingsMasked = {
      * verify it out of band; the CA private key is never exposed).
      */
     cluster_ca_fingerprint?: string | null;
-    /**
-     * Effective cluster-wide container address pool. `None` only when the
-     * singleton network configuration could not be read.
-     */
     cluster_network?: null | ClusterNetworkSettings;
     has_join_token: boolean;
     /**
@@ -11393,6 +11390,16 @@ export type NetworkConfiguration = {
  */
 export type NetworkMode = 'bridge' | 'host' | 'none' | {
     custom: string;
+};
+
+/**
+ * Cluster-wide pool which every node must use. This is intentionally sent
+ * alongside the local allocation so operators and agents can detect stale or
+ * independently configured nodes before routes are changed.
+ */
+export type NetworkPoolEntry = {
+    compute_pool_cidr: string;
+    subnet_prefix_len: number;
 };
 
 /**
@@ -12707,6 +12714,7 @@ export type PeerListResponse = {
      * and newer version skew degrades to the safe default of `false`.
      */
     cluster_dns_enabled: boolean;
+    network: NetworkPoolEntry;
     /**
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
@@ -14893,6 +14901,10 @@ export type RegisterNodeResponse = {
     cert_pem?: string | null;
     id: number;
     message: string;
+    /**
+     * Whether this node must serve mTLS and reject plaintext agent traffic.
+     */
+    mtls_required: boolean;
     name: string;
     status: string;
 };
@@ -15657,6 +15669,25 @@ export type RootfsVmEntry = {
     sandbox_name: string;
 };
 
+export type RotateClusterCaRequest = {
+    /**
+     * Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
+     */
+    confirmation: string;
+    /**
+     * Fingerprint observed through a trusted operator channel immediately
+     * before rotation. The request fails if the active root changed.
+     */
+    expected_fingerprint: string;
+};
+
+export type RotateClusterCaResponse = {
+    message: string;
+    new_fingerprint: string;
+    previous_fingerprint: string;
+    revoked_enrollment_tokens: number;
+};
+
 export type RouteRefreshResponse = {
     /**
      * Human-readable message
@@ -15780,6 +15811,12 @@ export type S3SourceResponse = {
     force_path_style?: boolean | null;
     id: number;
     is_default: boolean;
+    /**
+     * True when this source was auto-provisioned by a Temps Cloud link
+     * rather than entered by an operator. Managed sources cannot be edited
+     * or deleted from this API; disconnect Temps Cloud to remove one.
+     */
+    managed_by_cloud: boolean;
     name: string;
     region: string;
     updated_at: number;
@@ -21556,6 +21593,12 @@ export type S3SourceResponseWritable = {
     force_path_style?: boolean | null;
     id: number;
     is_default: boolean;
+    /**
+     * True when this source was auto-provisioned by a Temps Cloud link
+     * rather than entered by an operator. Managed sources cannot be edited
+     * or deleted from this API; disconnect Temps Cloud to remove one.
+     */
+    managed_by_cloud: boolean;
     name: string;
     region: string;
     secret_key: string;
@@ -51919,6 +51962,49 @@ export type SaveAiProviderCredentialResponses = {
 };
 
 export type SaveAiProviderCredentialResponse = SaveAiProviderCredentialResponses[keyof SaveAiProviderCredentialResponses];
+
+export type RotateClusterCaData = {
+    body: RotateClusterCaRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-ca/rotate';
+};
+
+export type RotateClusterCaErrors = {
+    /**
+     * Invalid confirmation or CA state
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Expected fingerprint is stale
+     */
+    409: unknown;
+    /**
+     * Fresh MFA verification required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RotateClusterCaResponses = {
+    /**
+     * Cluster CA rotated
+     */
+    200: RotateClusterCaResponse;
+};
+
+export type RotateClusterCaResponse2 = RotateClusterCaResponses[keyof RotateClusterCaResponses];
 
 export type GetDiskStatusData = {
     body?: never;
