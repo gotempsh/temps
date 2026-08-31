@@ -38,7 +38,15 @@ export default defineConfig({
         // dev-cluster control plane on :80): TEMPS_API_TARGET=http://localhost:80
         target: process.env.TEMPS_API_TARGET || 'http://localhost:8080',
         headers: {},
-        changeOrigin: true,
+        // `changeOrigin: true` would rewrite the outgoing Host header to the
+        // backend's host:port while the browser's Origin header still names the
+        // dev server. The backend's WebSocket handler (log tailing) rejects any
+        // request where Origin's authority doesn't match Host, as a same-origin
+        // check against WS's lack of CORS -- so a rewritten Host 403s every
+        // dev-server WebSocket even though the browser and dev server really
+        // are same-origin. Leave Host untouched; this backend is single-tenant
+        // and doesn't route on it, so nothing else depends on the rewrite.
+        changeOrigin: false,
         ws: true,
       },
     },
