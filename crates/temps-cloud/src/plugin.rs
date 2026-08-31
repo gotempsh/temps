@@ -53,22 +53,25 @@ impl TempsPlugin for CloudPlugin {
         Box::pin(async move {
             let config = context.require_service::<ConfigService>();
             let encryption = context.require_service::<temps_core::EncryptionService>();
+            let db = context.require_service::<sea_orm::DatabaseConnection>();
             let link = if self.allow_loopback_development {
                 Arc::new(CloudLink::load_encrypted_for_loopback_development(
                     self.data_dir.clone(),
                     self.agent_version.clone(),
-                    encryption,
+                    encryption.clone(),
                 ))
             } else {
                 Arc::new(CloudLink::load_encrypted(
                     self.data_dir.clone(),
                     self.agent_version.clone(),
-                    encryption,
+                    encryption.clone(),
                 ))
             };
             let service = Arc::new(CloudService::new(
                 link.clone(),
                 config,
+                db,
+                encryption.clone(),
                 self.allow_loopback_development,
             ));
             context.register_service(link);
@@ -88,6 +91,7 @@ impl TempsPlugin for CloudPlugin {
                     context.require_service::<sea_orm::DatabaseConnection>(),
                     context.require_service::<temps_core::EncryptionService>(),
                 );
+                service.start_backup_credential_rotation();
             }
             Ok(())
         })

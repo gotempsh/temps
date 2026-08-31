@@ -547,6 +547,10 @@ pub struct S3SourceResponse {
     pub endpoint: Option<String>,
     pub force_path_style: Option<bool>,
     pub is_default: bool,
+    /// True when this source was auto-provisioned by a Temps Cloud link
+    /// rather than entered by an operator. Managed sources cannot be edited
+    /// or deleted from this API; disconnect Temps Cloud to remove one.
+    pub managed_by_cloud: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -751,6 +755,7 @@ impl From<temps_entities::s3_sources::Model> for S3SourceResponse {
             endpoint: source.endpoint,
             force_path_style: source.force_path_style,
             is_default: source.is_default,
+            managed_by_cloud: source.managed_by_cloud,
             created_at: source.created_at.timestamp_millis(),
             updated_at: source.updated_at.timestamp_millis(),
         }

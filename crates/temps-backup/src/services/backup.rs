@@ -4855,21 +4855,6 @@ impl BackupService {
         self.test_and_create_s3_bucket(&s3_client, &request.bucket_name)
             .await?;
 
-        // Encrypt sensitive credentials before storing
-        let encrypted_access_key = self
-            .encryption_service
-            .encrypt_string(&request.access_key_id)
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to encrypt access key: {}", e),
-            })?;
-
-        let encrypted_secret_key = self
-            .encryption_service
-            .encrypt_string(&request.secret_key)
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to encrypt secret key: {}", e),
-            })?;
-
         // First source is automatically default; subsequent sources require an explicit
         // set-default call. An explicit `is_default: true` in the request is honored and
         // will swap default atomically.
@@ -4893,22 +4878,29 @@ impl BackupService {
                 .await?;
         }
 
-        let new_source = temps_entities::s3_sources::ActiveModel {
-            id: sea_orm::NotSet,
-            name: sea_orm::Set(request.name.clone()),
-            bucket_name: sea_orm::Set(request.bucket_name),
-            bucket_path: sea_orm::Set(request.bucket_path),
-            access_key_id: sea_orm::Set(encrypted_access_key),
-            secret_key: sea_orm::Set(encrypted_secret_key),
-            region: sea_orm::Set(request.region),
-            created_at: sea_orm::Set(Utc::now()),
-            updated_at: sea_orm::Set(Utc::now()),
-            endpoint: sea_orm::Set(request.endpoint),
-            force_path_style: sea_orm::Set(request.force_path_style),
-            is_default: sea_orm::Set(should_be_default),
-        };
-
-        let source = new_source.insert(&txn).await?;
+        // Encrypt sensitive credentials and insert — shared with
+        // `temps-cloud`'s Cloud-managed backup credential provisioning so the
+        // encryption call site and the persisted row shape never drift.
+        let source = temps_entities::s3_sources::insert_encrypted(
+            &txn,
+            &self.encryption_service,
+            temps_entities::s3_sources::S3SourceCredentials {
+                name: request.name.clone(),
+                bucket_name: request.bucket_name,
+                bucket_path: request.bucket_path,
+                access_key_id: request.access_key_id,
+                secret_key: request.secret_key,
+                region: request.region,
+                endpoint: request.endpoint,
+                force_path_style: request.force_path_style,
+            },
+            should_be_default,
+            false,
+        )
+        .await
+        .map_err(|error| BackupError::Internal {
+            message: format!("Failed to create S3 source '{}': {}", request.name, error),
+        })?;
         txn.commit().await?;
 
         debug!(
@@ -5065,6 +5057,18 @@ impl BackupService {
     pub async fn delete_s3_source(&self, id: i32) -> Result<bool, BackupError> {
         // First check if source exists and is not in use
         let source = self.get_s3_source(id).await?;
+
+        // Refuse to delete a Cloud-managed source. It was not created by an
+        // operator and cannot be recreated by one; only Temps Cloud's own
+        // disconnect cleanup (which does not go through this method) may
+        // remove it.
+        if source.managed_by_cloud {
+            return Err(BackupError::Validation(format!(
+                "S3 source '{}' is managed by Temps Cloud and cannot be deleted manually. \
+                 Disconnect Temps Cloud to remove it.",
+                source.name
+            )));
+        }
 
         // Refuse to delete the default source while other sources exist. The caller
         // should set a different source as default first.
@@ -7124,6 +7128,16 @@ RETURNING id
                 resource: "S3Source".to_string(),
                 detail: "S3 source not found".to_string(),
             })?;
+
+        // Refuse to edit a Cloud-managed source. Its credentials are rotated
+        // by Temps Cloud's own provisioning path, not by an operator editing
+        // this row by hand.
+        if current.managed_by_cloud {
+            return Err(BackupError::Validation(format!(
+                "S3 source '{}' is managed by Temps Cloud and cannot be edited manually.",
+                current.name
+            )));
+        }
 
         let mut active = current.into_active_model();
 
@@ -9399,6 +9413,7 @@ mod tests {
             endpoint: None,
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9462,6 +9477,7 @@ mod tests {
             endpoint: None,
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9496,6 +9512,106 @@ mod tests {
             db.into_transaction_log().len(),
             3,
             "validation must stop after source lookup and the two reference counts, before DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_s3_source_refuses_a_cloud_managed_row() {
+        let source = s3_sources::Model {
+            id: 21,
+            name: "Temps Cloud managed backups".to_string(),
+            bucket_name: "cloud-bucket".to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(false),
+            is_default: false,
+            managed_by_cloud: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+        let error = service
+            .delete_s3_source(21)
+            .await
+            .expect_err("a Cloud-managed source must refuse user-initiated deletion");
+
+        assert!(matches!(
+            error,
+            BackupError::Validation(ref message)
+                if message.contains("Temps Cloud managed backups")
+                    && message.contains("managed by Temps Cloud")
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            1,
+            "the managed_by_cloud guard must stop the delete before any reference-count query"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_s3_source_refuses_a_cloud_managed_row() {
+        let source = s3_sources::Model {
+            id: 22,
+            name: "Temps Cloud managed backups".to_string(),
+            bucket_name: "cloud-bucket".to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(false),
+            is_default: false,
+            managed_by_cloud: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+        let error = service
+            .update_s3_source(
+                22,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: Some("renamed".to_string()),
+                    bucket_name: None,
+                    bucket_path: None,
+                    access_key_id: Some("attacker-key".to_string()),
+                    secret_key: Some("attacker-secret".to_string()),
+                    region: None,
+                    endpoint: None,
+                    force_path_style: None,
+                },
+            )
+            .await
+            .expect_err("a Cloud-managed source must refuse manual credential edits");
+
+        assert!(matches!(
+            error,
+            BackupError::Validation(ref message)
+                if message.contains("Temps Cloud managed backups")
+                    && message.contains("managed by Temps Cloud")
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            1,
+            "the managed_by_cloud guard must stop the update before any write"
         );
     }
 
@@ -9595,6 +9711,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9799,6 +9916,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9928,6 +10046,7 @@ mod tests {
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10978,6 +11097,7 @@ mod tests {
             secret_key: "secret".to_string(),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -12016,6 +12136,7 @@ mod tests {
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -12197,6 +12318,7 @@ mod tests {
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -12357,6 +12479,7 @@ mod tests {
                     endpoint: None,
                     force_path_style: Some(true),
                     is_default: true,
+                    managed_by_cloud: false,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 }]])
@@ -12490,6 +12613,7 @@ mod tests {
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -12632,6 +12756,7 @@ mod tests {
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }

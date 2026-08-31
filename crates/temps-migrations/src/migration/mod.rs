@@ -208,6 +208,7 @@ mod m20260825_000001_add_dns_resolver_health_to_nodes;
 mod m20260827_000001_add_control_plane_overlay_allocation;
 mod m20260827_000001_create_notification_routes;
 mod m20260827_000002_add_control_plane_setup_generation;
+mod m20260830_000001_add_managed_by_cloud_to_s3_sources;
 
 pub struct Migrator;
 
@@ -450,6 +451,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260827_000001_add_control_plane_overlay_allocation::Migration),
             Box::new(m20260827_000001_create_notification_routes::Migration),
             Box::new(m20260827_000002_add_control_plane_setup_generation::Migration),
+            Box::new(m20260830_000001_add_managed_by_cloud_to_s3_sources::Migration),
         ]
     }
 }

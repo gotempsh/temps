@@ -57,10 +57,10 @@ use sha2::{Digest, Sha256};
 use temps_cloud_protocol::{
     BackupArtifact, BackupCompleted, BackupTarget, BackupTargetRequest, EnrollRequest,
     EnrollResponse, IngestAck, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
-    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedNotificationAccepted,
-    ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest, SpanRecord, TelemetryBatch,
-    WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
-    WalGSnapshotCompleted, WalGSnapshotRequest,
+    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedBackupCapability,
+    ManagedNotificationAccepted, ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest,
+    SpanRecord, TelemetryBatch, WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest,
+    WalGSnapshot, WalGSnapshotCompleted, WalGSnapshotRequest,
 };
 use temps_core::url_validation::{validate_ipv4, validate_ipv6};
 use thiserror::Error;
@@ -341,6 +341,25 @@ impl CloudClient {
         let response = self
             .http
             .get(self.backend.endpoint("/v1/ai/capability"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|error| CloudError::Unreachable {
+                reason: error.to_string(),
+                spooled_bytes: 0,
+            })?;
+        decode_managed_response(response).await
+    }
+
+    /// Describe (or vend) a managed backup destination for this tenant, without
+    /// uploading or reading any local backup bytes.
+    pub async fn managed_backup_credentials(
+        &self,
+        token: &str,
+    ) -> Result<ManagedBackupCapability, CloudError> {
+        let response = self
+            .http
+            .get(self.backend.endpoint("/v1/backups/managed/capability"))
             .bearer_auth(token)
             .send()
             .await

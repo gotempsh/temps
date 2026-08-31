@@ -17,7 +17,10 @@ use temps_core::{
 };
 use utoipa::{OpenApi, ToSchema};
 
-use crate::{CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus};
+use crate::{
+    CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,
+    ManagedBackupOutcome,
+};
 use temps_cloud_client::CloudFeatureSwitches;
 
 #[derive(Clone)]
@@ -112,6 +115,8 @@ fn problem(error: CloudServiceError) -> Problem {
         CloudServiceError::Configuration(_)
         | CloudServiceError::InvalidBackend { .. }
         | CloudServiceError::State(_)
+        | CloudServiceError::Database(_)
+        | CloudServiceError::ManagedBackupCredential(_)
         | CloudServiceError::Client(
             temps_cloud_client::CloudError::InvalidBackendUrl { .. }
             | temps_cloud_client::CloudError::ClientConfiguration { .. },
@@ -214,12 +219,43 @@ async fn enroll_cloud(
             .detail("Enrollment code cannot be empty")
             .build());
     }
-    let result = state
+    let (result, backup_outcome) = state
         .service
         .enroll(&request.enrollment_code)
         .await
         .map_err(problem)?;
     audit(&state, &auth, &metadata, "CLOUD_LINK_CONNECTED", None, None).await;
+    match &backup_outcome {
+        ManagedBackupOutcome::Provisioned => {
+            audit(
+                &state,
+                &auth,
+                &metadata,
+                "cloud.backup_credential.issued",
+                None,
+                None,
+            )
+            .await;
+        }
+        // A distinct, loud action name: this should never happen under a
+        // correct backend tenant->bucket contract (see the doc comment on
+        // this variant). Full detail (both bucket names) is already in the
+        // server log via the `tracing::error!` in `provision_managed_backup_source`;
+        // the audit trail just needs to make clear this run differs from a
+        // routine rotation, since it means backups may have been orphaned.
+        ManagedBackupOutcome::ProvisionedBucketChanged { .. } => {
+            audit(
+                &state,
+                &auth,
+                &metadata,
+                "cloud.backup_credential.bucket_changed",
+                None,
+                None,
+            )
+            .await;
+        }
+        ManagedBackupOutcome::NotConfigured | ManagedBackupOutcome::Unavailable(_) => {}
+    }
     Ok(Json(result))
 }
 
@@ -230,7 +266,7 @@ async fn disconnect_cloud(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<Json<CloudStatus>, Problem> {
     permission_guard!(auth, SettingsWrite);
-    let result = state.service.disconnect().await.map_err(problem)?;
+    let (result, backup_credential_revoked) = state.service.disconnect().await.map_err(problem)?;
     audit(
         &state,
         &auth,
@@ -240,6 +276,17 @@ async fn disconnect_cloud(
         None,
     )
     .await;
+    if backup_credential_revoked {
+        audit(
+            &state,
+            &auth,
+            &metadata,
+            "cloud.backup_credential.revoked",
+            None,
+            None,
+        )
+        .await;
+    }
     Ok(Json(result))
 }
 

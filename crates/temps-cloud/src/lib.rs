@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+mod backup_credential_rotation;
 mod backup_mirror;
 mod handler;
 mod plugin;
@@ -14,4 +15,5 @@ pub use handler::{cloud_routes, CloudApiDoc};
 pub use plugin::CloudPlugin;
 pub use service::{
     CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,
+    ManagedBackupOutcome,
 };

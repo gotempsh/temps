@@ -3779,6 +3779,7 @@ mod tests {
                     secret_key: Set("test-secret-key".to_string()),
                     force_path_style: Set(Some(true)),
                     is_default: Set(true),
+                    managed_by_cloud: Set(false),
                     created_at: Set(now),
                     updated_at: Set(now),
                 }

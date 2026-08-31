@@ -920,6 +920,7 @@ impl BackupCommand {
                 .ok()
                 .and_then(|v| v.parse().ok()),
             is_default: false,
+            managed_by_cloud: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

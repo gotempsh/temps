@@ -2349,6 +2349,7 @@ mod tests {
             secret_key: "encrypted".to_owned(),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: now,
             updated_at: now,
         };

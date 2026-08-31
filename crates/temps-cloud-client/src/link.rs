@@ -24,9 +24,9 @@ use tokio::sync::{mpsc, watch};
 
 use temps_cloud_protocol::{
     BackupArtifact, BackupTarget, ManagedAiAnalysisRequest, ManagedAiAnalysisResponse,
-    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedNotificationAccepted,
-    ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest, SpanRecord,
-    WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
+    ManagedAiCapability, ManagedAiChatRequest, ManagedAiChatResponse, ManagedBackupCapability,
+    ManagedNotificationAccepted, ManagedNotificationRequest, NativeSnapshot, NativeSnapshotRequest,
+    SpanRecord, WalGObjectCompleted, WalGObjectTarget, WalGObjectTargetRequest, WalGSnapshot,
     WalGSnapshotCompleted, WalGSnapshotRequest,
 };
 use uuid::Uuid;
@@ -630,6 +630,18 @@ impl CloudLink {
         let backend = self.parse_backend(&base_url)?;
         CloudClient::new(backend)?
             .managed_ai_capability(&token)
+            .await
+    }
+
+    /// Describe or vend a managed backup destination for this tenant. Does
+    /// not require the `backups` feature switch: whether Cloud is *willing*
+    /// to hand out a destination is a separate question from whether the
+    /// operator has opted the local backup mirror into exporting to it.
+    pub async fn managed_backup_credentials(&self) -> Result<ManagedBackupCapability, CloudError> {
+        let (base_url, token) = self.linked_credential()?;
+        let backend = self.parse_backend(&base_url)?;
+        CloudClient::new(backend)?
+            .managed_backup_credentials(&token)
             .await
     }
 

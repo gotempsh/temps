@@ -6365,6 +6365,7 @@ mod tests {
             endpoint: None,
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

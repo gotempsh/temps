@@ -490,6 +490,50 @@ pub struct ManagedAiCapability {
     pub setup_path: String,
 }
 
+// ---------------------------------------------------------------------------
+// Managed backups — Cloud vends a ready-to-use S3-compatible destination
+// ---------------------------------------------------------------------------
+
+/// What Cloud can hand back for offsite backup storage on this tenant's plan.
+///
+/// All fields beyond `configured` and `reason` are only present once
+/// `configured` is `true`; a backend that has not provisioned a destination
+/// yet, or a tier that does not include managed backups, returns `configured:
+/// false` with a human-readable `reason` so the instance can onboard the
+/// operator instead of silently doing nothing.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ManagedBackupCapability {
+    pub configured: bool,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub bucket_name: Option<String>,
+    pub bucket_path: Option<String>,
+    pub access_key_id: Option<String>,
+    /// Never logged; the [`Debug`] impl below redacts it the same way
+    /// [`EnrollResponse`] redacts `instance_token`.
+    pub secret_key: Option<String>,
+    /// e.g. "not available on Starter" — surfaced verbatim to the operator.
+    pub reason: Option<String>,
+}
+
+impl std::fmt::Debug for ManagedBackupCapability {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ManagedBackupCapability")
+            .field("configured", &self.configured)
+            .field("endpoint", &self.endpoint)
+            .field("region", &self.region)
+            .field("bucket_name", &self.bucket_name)
+            .field("bucket_path", &self.bucket_path)
+            .field("access_key_id", &self.access_key_id)
+            .field(
+                "secret_key",
+                &self.secret_key.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("reason", &self.reason)
+            .finish()
+    }
+}
+
 /// One OpenAI-compatible completion proxied by Cloud for a connected OSS
 /// instance. The body remains opaque at the control-plane protocol layer so
 /// OpenAI-compatible additive fields do not require a protocol-version bump.
@@ -693,6 +737,42 @@ mod tests {
 
         assert!(!format!("{request:?}").contains("secret-code"));
         assert!(!format!("{response:?}").contains("inst_secret"));
+    }
+
+    #[test]
+    fn managed_backup_capability_debug_output_redacts_the_secret_key() {
+        let capability = ManagedBackupCapability {
+            configured: true,
+            endpoint: Some("https://objects.example.com".into()),
+            region: Some("auto".into()),
+            bucket_name: Some("tenant-bucket".into()),
+            bucket_path: Some("tenant-42".into()),
+            access_key_id: Some("AKIA-VISIBLE".into()),
+            secret_key: Some("super-secret-value".into()),
+            reason: None,
+        };
+
+        let debug_output = format!("{capability:?}");
+        assert!(!debug_output.contains("super-secret-value"));
+        assert!(debug_output.contains("AKIA-VISIBLE"));
+    }
+
+    #[test]
+    fn managed_backup_capability_not_configured_round_trips_with_a_reason() {
+        let capability = ManagedBackupCapability {
+            configured: false,
+            endpoint: None,
+            region: None,
+            bucket_name: None,
+            bucket_path: None,
+            access_key_id: None,
+            secret_key: None,
+            reason: Some("not available on Starter".into()),
+        };
+        let json = serde_json::to_string(&capability).unwrap();
+        let decoded: ManagedBackupCapability = serde_json::from_str(&json).unwrap();
+        assert!(!decoded.configured);
+        assert_eq!(decoded.reason.as_deref(), Some("not available on Starter"));
     }
 
     #[test]

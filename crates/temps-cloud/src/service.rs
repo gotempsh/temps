@@ -6,10 +6,14 @@ use std::{
     time::Duration,
 };
 
+use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::Serialize;
 use temps_cloud_client::{BackendUrl, CloudError, CloudFeatureSwitches, CloudLink};
-use temps_cloud_protocol::{ManagedNotificationAccepted, ManagedNotificationRequest};
+use temps_cloud_protocol::{
+    ManagedBackupCapability, ManagedNotificationAccepted, ManagedNotificationRequest,
+};
 use temps_config::{ConfigService, ConfigServiceError};
+use temps_core::EncryptionService;
 use thiserror::Error;
 use tokio::sync::watch;
 use utoipa::ToSchema;
@@ -17,6 +21,9 @@ use uuid::Uuid;
 
 const SETUP_PATH: &str = "/settings/cloud";
 const SHUTDOWN_TASK_TIMEOUT: Duration = Duration::from_secs(6);
+/// Name given to the auto-provisioned Cloud-managed `s3_sources` row.
+/// Distinct from any operator-chosen name so it is unmistakable in the UI.
+const MANAGED_BACKUP_SOURCE_NAME: &str = "Temps Cloud managed backups";
 
 #[derive(Debug, Error)]
 pub enum CloudServiceError {
@@ -28,6 +35,54 @@ pub enum CloudServiceError {
     Client(CloudError),
     #[error("Could not persist the managed-control-plane link: {0}")]
     State(temps_cloud_client::state::StateError),
+    #[error("Database error: {0}")]
+    Database(#[from] sea_orm::DbErr),
+    #[error("Could not persist the managed Cloud backup credential: {0}")]
+    ManagedBackupCredential(#[from] temps_entities::s3_sources::S3SourceCredentialError),
+}
+
+/// Outcome of attempting to provision a Cloud-managed backup source as part
+/// of [`CloudService::enroll`]. Never turns enrollment itself into a failure
+/// — a tenant without managed backups, or a backend that is not ready yet,
+/// still gets a fully linked instance.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ManagedBackupOutcome {
+    /// Cloud reported `configured: false` (tier does not include managed
+    /// backups, or the backend has not provisioned one yet).
+    NotConfigured,
+    /// A Cloud-managed `s3_sources` row now exists (inserted, or rotated
+    /// in place against the same bucket it already pointed at).
+    Provisioned,
+    /// Cloud returned a *different* `bucket_name` than the one already on
+    /// record for this instance's managed source. The credential was still
+    /// rotated in place — refusing would strand the instance without a
+    /// usable managed source — but this should never happen under a correct
+    /// backend contract (the tenant->bucket mapping must be a stable 1:1
+    /// record, established once): it either means an unannounced storage
+    /// migration on Cloud's side, or a backend bug re-provisioning a fresh
+    /// bucket per call. Either way, backups already written under the
+    /// previous bucket are now orphaned from this instance's `s3_sources`
+    /// row and invisible in the UI, so this is surfaced loudly rather than
+    /// treated as a routine rotation.
+    ProvisionedBucketChanged {
+        previous_bucket_name: String,
+        new_bucket_name: String,
+    },
+    /// The capability call or the local persistence failed. Enrollment still
+    /// succeeded; the reason is logged and available here for the caller to
+    /// decide whether to surface it.
+    Unavailable(String),
+}
+
+/// Outcome of upserting the local `managed_by_cloud` row, distinguishing a
+/// routine credential rotation from one that landed on a different bucket
+/// than what was already on record (see [`ManagedBackupOutcome::ProvisionedBucketChanged`]).
+enum UpsertOutcome {
+    SameBucket,
+    BucketChanged {
+        previous_bucket_name: String,
+        new_bucket_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -64,9 +119,12 @@ pub struct CloudStatus {
 pub struct CloudService {
     link: Arc<CloudLink>,
     config: Arc<ConfigService>,
+    db: Arc<DatabaseConnection>,
+    encryption: Arc<EncryptionService>,
     cancel: watch::Sender<bool>,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     backup_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     allow_loopback_development: bool,
     configuration_issue: RwLock<Option<String>>,
 }
@@ -75,15 +133,20 @@ impl CloudService {
     pub fn new(
         link: Arc<CloudLink>,
         config: Arc<ConfigService>,
+        db: Arc<DatabaseConnection>,
+        encryption: Arc<EncryptionService>,
         allow_loopback_development: bool,
     ) -> Self {
         let (cancel, _) = watch::channel(false);
         Self {
             link,
             config,
+            db,
+            encryption,
             cancel,
             task: Mutex::new(None),
             backup_task: Mutex::new(None),
+            backup_credential_rotation_task: Mutex::new(None),
             allow_loopback_development,
             configuration_issue: RwLock::new(None),
         }
@@ -135,6 +198,29 @@ impl CloudService {
             }));
         } else {
             tracing::debug!("Cloud backup mirror task is already registered");
+        }
+    }
+
+    /// Launch the background loop that keeps the Cloud-managed backup
+    /// credential from ever going stale. Cloud-issued credentials are
+    /// ephemeral — expiring at least daily by contract — so a linked
+    /// instance that only ever provisioned once at enroll time would start
+    /// silently failing every backup once that credential expired. This
+    /// re-fetches and rotates it well inside that window regardless.
+    pub fn start_backup_credential_rotation(self: &Arc<Self>) {
+        let mut task = self
+            .backup_credential_rotation_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if task.is_none() {
+            tracing::info!("Cloud service launching backup credential rotation task");
+            let service = self.clone();
+            let cancel = self.cancel.subscribe();
+            *task = Some(tokio::spawn(async move {
+                crate::backup_credential_rotation::run(service, cancel).await;
+            }));
+        } else {
+            tracing::debug!("Cloud backup credential rotation task is already registered");
         }
     }
 
@@ -349,7 +435,13 @@ impl CloudService {
         self.status().await
     }
 
-    pub async fn enroll(&self, code: &str) -> Result<CloudStatus, CloudServiceError> {
+    /// Enroll this instance and, if the tenant's plan includes it, provision
+    /// a Cloud-managed offsite backup destination. Backup provisioning never
+    /// fails enrollment itself — see [`ManagedBackupOutcome`].
+    pub async fn enroll(
+        &self,
+        code: &str,
+    ) -> Result<(CloudStatus, ManagedBackupOutcome), CloudServiceError> {
         let settings = self.config.get_settings().await?;
         let backend = parse_backend(
             &settings.cloud.backend_url,
@@ -373,16 +465,170 @@ impl CloudService {
             .enroll(code)
             .await
             .map_err(CloudServiceError::Client)?;
-        self.status().await
+        let backup_outcome = self.provision_managed_backup_source().await;
+        let status = self.status().await?;
+        Ok((status, backup_outcome))
     }
 
-    pub async fn disconnect(&self) -> Result<CloudStatus, CloudServiceError> {
+    /// Fetch (or refresh) the tenant's managed backup credential and upsert
+    /// it into `s3_sources`. Failures are logged and returned as
+    /// [`ManagedBackupOutcome::Unavailable`] rather than propagated — a
+    /// linked instance must never lose its link over this.
+    pub(crate) async fn provision_managed_backup_source(&self) -> ManagedBackupOutcome {
+        let capability = match self.link.managed_backup_credentials().await {
+            Ok(capability) => capability,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "could not fetch a managed Cloud backup credential; continuing without one"
+                );
+                return ManagedBackupOutcome::Unavailable(error.to_string());
+            }
+        };
+        if !capability.configured {
+            tracing::info!(
+                reason = capability.reason.as_deref().unwrap_or("no reason given"),
+                "Temps Cloud did not provision a managed backup destination for this tenant"
+            );
+            return ManagedBackupOutcome::NotConfigured;
+        }
+        let credentials = match managed_backup_credentials_from_capability(capability) {
+            Ok(credentials) => credentials,
+            Err(reason) => {
+                tracing::error!(
+                    reason,
+                    "managed backend reported configured=true but omitted required backup credential fields"
+                );
+                return ManagedBackupOutcome::Unavailable(reason);
+            }
+        };
+        match self.upsert_managed_backup_source(credentials).await {
+            Ok(UpsertOutcome::SameBucket) => ManagedBackupOutcome::Provisioned,
+            Ok(UpsertOutcome::BucketChanged {
+                previous_bucket_name,
+                new_bucket_name,
+            }) => {
+                tracing::error!(
+                    previous_bucket_name,
+                    new_bucket_name,
+                    "Temps Cloud returned a different bucket for this tenant's managed backup \
+                     source than the one already on record — the tenant->bucket mapping should \
+                     be stable. Rotated the credential in place, but any backups already written \
+                     to the previous bucket are now orphaned from this instance's S3 Sources list."
+                );
+                ManagedBackupOutcome::ProvisionedBucketChanged {
+                    previous_bucket_name,
+                    new_bucket_name,
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to persist the Cloud-managed backup source");
+                ManagedBackupOutcome::Unavailable(error.to_string())
+            }
+        }
+    }
+
+    async fn upsert_managed_backup_source(
+        &self,
+        credentials: temps_entities::s3_sources::S3SourceCredentials,
+    ) -> Result<UpsertOutcome, CloudServiceError> {
+        let existing = temps_entities::s3_sources::Entity::find()
+            .filter(temps_entities::s3_sources::Column::ManagedByCloud.eq(true))
+            .one(self.db.as_ref())
+            .await?;
+        match existing {
+            Some(row) => {
+                let previous_bucket_name = row.bucket_name.clone();
+                let bucket_changed = previous_bucket_name != credentials.bucket_name;
+                let new_bucket_name = credentials.bucket_name.clone();
+                temps_entities::s3_sources::update_encrypted(
+                    self.db.as_ref(),
+                    &self.encryption,
+                    row.id,
+                    credentials,
+                )
+                .await?;
+                Ok(if bucket_changed {
+                    UpsertOutcome::BucketChanged {
+                        previous_bucket_name,
+                        new_bucket_name,
+                    }
+                } else {
+                    UpsertOutcome::SameBucket
+                })
+            }
+            None => {
+                let existing_count = temps_entities::s3_sources::Entity::find()
+                    .count(self.db.as_ref())
+                    .await?;
+                temps_entities::s3_sources::insert_encrypted(
+                    self.db.as_ref(),
+                    &self.encryption,
+                    credentials,
+                    existing_count == 0,
+                    true,
+                )
+                .await?;
+                Ok(UpsertOutcome::SameBucket)
+            }
+        }
+    }
+
+    /// Disconnect this instance and remove any Cloud-managed backup source.
+    /// Returns whether a managed source was found and removed, so the caller
+    /// can decide whether to audit a credential revocation.
+    pub async fn disconnect(&self) -> Result<(CloudStatus, bool), CloudServiceError> {
         match self.link.revoke().await {
             Ok(()) | Err(CloudError::CredentialRejected) => {}
             Err(error) => return Err(CloudServiceError::Client(error)),
         }
         self.link.disconnect().map_err(CloudServiceError::State)?;
-        self.status().await
+        let removed = self.remove_managed_backup_source().await?;
+        let status = self.status().await?;
+        Ok((status, removed))
+    }
+
+    /// Remove the Cloud-managed `s3_sources` row created by
+    /// [`CloudService::enroll`], bypassing the user-facing `is_default` and
+    /// `managed_by_cloud` guards in `temps-backup` — this is a system
+    /// cleanup, not a user action. Still refuses to delete a row still
+    /// referenced by backup schedules or retained backup records: `s3_sources`
+    /// has an `ON DELETE CASCADE` foreign key from both, so deleting it out
+    /// from under an operator's backup history on disconnect would silently
+    /// destroy that history instead of merely removing a credential.
+    async fn remove_managed_backup_source(&self) -> Result<bool, CloudServiceError> {
+        let Some(source) = temps_entities::s3_sources::Entity::find()
+            .filter(temps_entities::s3_sources::Column::ManagedByCloud.eq(true))
+            .one(self.db.as_ref())
+            .await?
+        else {
+            return Ok(false);
+        };
+
+        let schedule_count = temps_entities::backup_schedules::Entity::find()
+            .filter(temps_entities::backup_schedules::Column::S3SourceId.eq(source.id))
+            .count(self.db.as_ref())
+            .await?;
+        let backup_count = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::S3SourceId.eq(source.id))
+            .count(self.db.as_ref())
+            .await?;
+        if schedule_count > 0 || backup_count > 0 {
+            tracing::warn!(
+                s3_source_id = source.id,
+                schedule_count,
+                backup_count,
+                "Cloud-managed S3 source is still referenced by backup schedules or records; \
+                 leaving it in place on disconnect instead of cascading away backup history. \
+                 Remove the schedules, then delete the source manually."
+            );
+            return Ok(false);
+        }
+
+        temps_entities::s3_sources::Entity::delete_by_id(source.id)
+            .exec(self.db.as_ref())
+            .await?;
+        Ok(true)
     }
 
     pub async fn send_notification(
@@ -413,6 +659,19 @@ impl CloudService {
         if let Some(task) = backup_task {
             await_task_shutdown(task, "Cloud backup mirror", SHUTDOWN_TASK_TIMEOUT).await;
         }
+        let rotation_task = self
+            .backup_credential_rotation_task
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(task) = rotation_task {
+            await_task_shutdown(
+                task,
+                "Cloud backup credential rotation",
+                SHUTDOWN_TASK_TIMEOUT,
+            )
+            .await;
+        }
     }
 }
 
@@ -434,6 +693,41 @@ async fn await_task_shutdown(
             let _ = task.await;
         }
     }
+}
+
+/// Validate that a `configured: true` capability actually carries every
+/// field required to build a usable S3 source, and translate it. `endpoint`
+/// alone stays optional — some providers (plain AWS S3) don't need one.
+fn managed_backup_credentials_from_capability(
+    capability: ManagedBackupCapability,
+) -> Result<temps_entities::s3_sources::S3SourceCredentials, String> {
+    let region = capability
+        .region
+        .ok_or_else(|| "managed backend response was missing `region`".to_string())?;
+    let bucket_name = capability
+        .bucket_name
+        .ok_or_else(|| "managed backend response was missing `bucket_name`".to_string())?;
+    let bucket_path = capability
+        .bucket_path
+        .ok_or_else(|| "managed backend response was missing `bucket_path`".to_string())?;
+    let access_key_id = capability
+        .access_key_id
+        .ok_or_else(|| "managed backend response was missing `access_key_id`".to_string())?;
+    let secret_key = capability
+        .secret_key
+        .ok_or_else(|| "managed backend response was missing `secret_key`".to_string())?;
+    Ok(temps_entities::s3_sources::S3SourceCredentials {
+        name: MANAGED_BACKUP_SOURCE_NAME.to_string(),
+        bucket_name,
+        bucket_path,
+        access_key_id,
+        secret_key,
+        region,
+        endpoint: capability.endpoint,
+        // Cloud-issued endpoints are always virtual-hosted-style S3 APIs;
+        // path-style is the OSS-only MinIO/dev-loopback convention.
+        force_path_style: Some(false),
+    })
 }
 
 fn parse_backend(value: &str, allow_loopback_development: bool) -> Result<BackendUrl, CloudError> {
@@ -511,5 +805,107 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    fn test_credentials(bucket_name: &str) -> temps_entities::s3_sources::S3SourceCredentials {
+        temps_entities::s3_sources::S3SourceCredentials {
+            name: MANAGED_BACKUP_SOURCE_NAME.to_string(),
+            bucket_name: bucket_name.to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "AKIA-rotated".to_string(),
+            secret_key: "rotated-secret".to_string(),
+            region: "auto".to_string(),
+            endpoint: Some("https://example.r2.cloudflarestorage.com".to_string()),
+            force_path_style: Some(false),
+        }
+    }
+
+    fn test_cloud_service(db: Arc<sea_orm::DatabaseConnection>) -> CloudService {
+        let temp = tempfile::tempdir().expect("cloud-link state dir");
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            temp.path().to_path_buf(),
+            "test-agent",
+        ));
+        // Never started, and never read by `upsert_managed_backup_source` —
+        // just needed to satisfy the constructor.
+        let config = Arc::new(ConfigService::new(
+            Arc::new(
+                temps_config::ServerConfig::new(
+                    "127.0.0.1:3000".to_string(),
+                    "postgresql://test".to_string(),
+                    None,
+                    Some("127.0.0.1:8000".to_string()),
+                )
+                .expect("ServerConfig::new"),
+            ),
+            db.clone(),
+        ));
+        let encryption = Arc::new(EncryptionService::new_from_password("cloud-service-test"));
+        CloudService::new(link, config, db, encryption, true)
+    }
+
+    fn managed_row(id: i32, bucket_name: &str) -> temps_entities::s3_sources::Model {
+        temps_entities::s3_sources::Model {
+            id,
+            name: MANAGED_BACKUP_SOURCE_NAME.to_string(),
+            bucket_name: bucket_name.to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "AKIA-old".to_string(),
+            secret_key: "old-secret".to_string(),
+            region: "auto".to_string(),
+            endpoint: Some("https://example.r2.cloudflarestorage.com".to_string()),
+            force_path_style: Some(false),
+            is_default: true,
+            managed_by_cloud: true,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    #[tokio::test]
+    async fn upsert_rotates_in_place_when_the_bucket_is_unchanged() {
+        let existing = managed_row(1, "temps-cloud-tenant-abc");
+        let updated = managed_row(1, "temps-cloud-tenant-abc");
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![existing], vec![updated]])
+                .into_connection(),
+        );
+        let service = test_cloud_service(db);
+
+        let outcome = service
+            .upsert_managed_backup_source(test_credentials("temps-cloud-tenant-abc"))
+            .await
+            .expect("rotation against the same bucket should succeed");
+
+        assert!(matches!(outcome, UpsertOutcome::SameBucket));
+    }
+
+    #[tokio::test]
+    async fn upsert_flags_a_bucket_change_instead_of_rotating_silently() {
+        let existing = managed_row(1, "temps-cloud-tenant-abc");
+        let updated = managed_row(1, "temps-cloud-tenant-XYZ-different");
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![existing], vec![updated]])
+                .into_connection(),
+        );
+        let service = test_cloud_service(db);
+
+        let outcome = service
+            .upsert_managed_backup_source(test_credentials("temps-cloud-tenant-XYZ-different"))
+            .await
+            .expect("the credential should still be rotated even when the bucket changed");
+
+        match outcome {
+            UpsertOutcome::BucketChanged {
+                previous_bucket_name,
+                new_bucket_name,
+            } => {
+                assert_eq!(previous_bucket_name, "temps-cloud-tenant-abc");
+                assert_eq!(new_bucket_name, "temps-cloud-tenant-XYZ-different");
+            }
+            UpsertOutcome::SameBucket => panic!("expected a bucket-changed outcome"),
+        }
     }
 }
