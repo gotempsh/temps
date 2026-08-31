@@ -8,6 +8,7 @@ mod autopack_preset;
 mod build_system;
 mod docker;
 pub mod docker_compose;
+pub mod dockerfile_expose;
 mod docker_custom;
 mod docusaurus;
 pub mod env_example;

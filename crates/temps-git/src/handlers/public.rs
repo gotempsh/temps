@@ -12,7 +12,7 @@ use super::types::GitAppState as AppState;
 use crate::services::cache::{CachedPresetInfo, PublicBranchCacheKey, PublicPresetCacheKey};
 use crate::services::git_provider::Branch;
 use crate::services::public_repo::{
-    detect_presets_from_files, PublicRepoError, PublicRepoProviderFactory,
+    detect_presets_from_files, PublicRepoError, PublicRepoProvider, PublicRepoProviderFactory,
 };
 use axum::{
     extract::{Path, Query, State},
@@ -25,7 +25,10 @@ use std::sync::Arc;
 use temps_auth::{AuthContext, Permission};
 use temps_core::problemdetails::{new as problem_new, Problem};
 use temps_entities::preset::ComposePortMapping;
+use tracing::warn;
 use utoipa::{IntoParams, OpenApi, ToSchema};
+
+const MAX_DOCKERFILES_TO_SCAN: usize = 16;
 
 /// Query parameters for public repository endpoints
 #[derive(Debug, Deserialize, IntoParams)]
@@ -97,7 +100,7 @@ pub struct PresetInfo {
     pub preset: String,
     /// Human-readable preset label
     pub preset_label: String,
-    /// Default exposed port for this preset
+    /// Detected Dockerfile EXPOSE port, or the preset's default port
     pub exposed_port: Option<i32>,
     /// Icon URL for this preset
     pub icon_url: Option<String>,
@@ -616,7 +619,15 @@ pub async fn detect_public_presets(
         .map_err(|e| map_error(e, &owner, &repo))?;
 
     // Use centralized preset detection
-    let detected = detect_presets_from_files(&files);
+    let mut detected = detect_presets_from_files(&files);
+    enrich_public_dockerfile_exposed_ports(
+        repo_provider.as_ref(),
+        &owner,
+        &repo,
+        &target_branch,
+        &mut detected,
+    )
+    .await;
 
     // Convert to CachedPresetInfo for caching
     let cached_presets: Vec<CachedPresetInfo> = detected
@@ -657,6 +668,50 @@ pub async fn detect_public_presets(
         branch: target_branch,
         presets,
     }))
+}
+
+async fn enrich_public_dockerfile_exposed_ports(
+    repo_provider: &dyn PublicRepoProvider,
+    owner: &str,
+    repository_name: &str,
+    target_branch: &str,
+    detected: &mut [crate::services::public_repo::DetectedPreset],
+) {
+    let dockerfiles: Vec<(usize, String)> = detected
+        .iter()
+        .enumerate()
+        .filter(|(_, preset)| preset.preset == "dockerfile")
+        .take(MAX_DOCKERFILES_TO_SCAN)
+        .map(|(index, preset)| {
+            let path = if preset.path == "./" || preset.path.is_empty() {
+                "Dockerfile".to_string()
+            } else {
+                format!("{}/Dockerfile", preset.path.trim_end_matches('/'))
+            };
+            (index, path)
+        })
+        .collect();
+
+    for (preset_index, dockerfile_path) in dockerfiles {
+        match repo_provider
+            .get_file_content(owner, repository_name, &dockerfile_path, target_branch)
+            .await
+        {
+            Ok(file) => {
+                let content = decode_file_content(&file.content, &file.encoding);
+                detected[preset_index].exposed_port =
+                    temps_presets::detect_primary_exposed_port(&content).map(i32::from);
+            }
+            Err(error) => warn!(
+                owner,
+                repository = repository_name,
+                branch = target_branch,
+                dockerfile = dockerfile_path,
+                error = %error,
+                "Could not inspect public Dockerfile EXPOSE metadata during preset detection"
+            ),
+        }
+    }
 }
 
 /// Decode a provider file's content. GitHub and GitLab both return base64
@@ -1019,9 +1074,115 @@ pub struct PublicRepositoriesApiDoc;
 mod tests {
     use super::*;
     use crate::services::cache::GitProviderCacheManager;
+    use crate::services::git_provider::FileContent;
     use crate::services::public_repo::{
-        GitHubPublicProvider, GitLabPublicProvider, PublicRepoProvider,
+        GitHubPublicProvider, GitLabPublicProvider, PublicBranch, PublicRepoInfo,
+        PublicRepoProvider,
     };
+
+    struct DockerfilePortProvider {
+        fail_reads: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl PublicRepoProvider for DockerfilePortProvider {
+        fn provider_name(&self) -> &'static str {
+            "test"
+        }
+
+        async fn get_repository(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<PublicRepoInfo, PublicRepoError> {
+            panic!("repository metadata is not needed for this test")
+        }
+
+        async fn list_branches(
+            &self,
+            _owner: &str,
+            _repo: &str,
+        ) -> Result<Vec<PublicBranch>, PublicRepoError> {
+            panic!("branch listing is not needed for this test")
+        }
+
+        async fn get_file_tree(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            _reference: &str,
+        ) -> Result<Vec<String>, PublicRepoError> {
+            panic!("file tree lookup is not needed for this test")
+        }
+
+        async fn get_file_content(
+            &self,
+            _owner: &str,
+            _repo: &str,
+            path: &str,
+            _reference: &str,
+        ) -> Result<FileContent, PublicRepoError> {
+            if self.fail_reads {
+                return Err(PublicRepoError::ApiError(format!(
+                    "simulated read failure for {path}"
+                )));
+            }
+            let content = match path {
+                "Dockerfile" => "FROM alpine\nEXPOSE 3000\n",
+                "apps/api/Dockerfile" => "FROM alpine\nEXPOSE 8080\n",
+                other => panic!("unexpected Dockerfile path: {other}"),
+            };
+            Ok(FileContent {
+                path: path.to_string(),
+                content: content.to_string(),
+                encoding: "utf-8".to_string(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn public_preset_detection_enriches_each_dockerfile_port() {
+        let files = vec!["Dockerfile".to_string(), "apps/api/Dockerfile".to_string()];
+        let mut presets = detect_presets_from_files(&files);
+
+        enrich_public_dockerfile_exposed_ports(
+            &DockerfilePortProvider { fail_reads: false },
+            "example-owner",
+            "example-repository",
+            "main",
+            &mut presets,
+        )
+        .await;
+
+        let root = presets
+            .iter()
+            .find(|preset| preset.path == "./")
+            .expect("root Dockerfile preset should be detected");
+        let api = presets
+            .iter()
+            .find(|preset| preset.path == "apps/api")
+            .expect("nested Dockerfile preset should be detected");
+        assert_eq!(root.exposed_port, Some(3000));
+        assert_eq!(api.exposed_port, Some(8080));
+    }
+
+    #[tokio::test]
+    async fn dockerfile_read_failure_keeps_detected_preset_available() {
+        let mut presets = detect_presets_from_files(&["Dockerfile".to_string()]);
+
+        enrich_public_dockerfile_exposed_ports(
+            &DockerfilePortProvider { fail_reads: true },
+            "example-owner",
+            "example-repository",
+            "main",
+            &mut presets,
+        )
+        .await;
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].preset, "dockerfile");
+        assert_eq!(presets[0].exposed_port, None);
+    }
 
     // =============================================================================
     // Unit Tests - Cache Key Tests

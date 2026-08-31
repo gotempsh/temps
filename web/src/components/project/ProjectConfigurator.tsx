@@ -115,6 +115,7 @@ import {
   toggleDatabaseSelection,
 } from '@/lib/template-service-requirements'
 import { useAllServices } from '@/hooks/useAllServices'
+import { detectedPortForSelection } from '@/lib/dockerfile-port'
 
 // Derives a browsable repo URL from whatever the API gave us. clone_url is an
 // HTTPS URL (possibly `.git`-suffixed) for connected providers, but for the
@@ -987,11 +988,54 @@ export function ProjectConfigurator({
     control: form.control,
     name: 'preset',
   })
+  const selectedPort = useWatch({
+    control: form.control,
+    name: 'port',
+  })
+  const selectedDockerfilePath = useWatch({
+    control: form.control,
+    name: 'dockerfilePath',
+  })
+  const detectedPresetPort = useMemo(
+    () => detectedPortForSelection(presetData?.presets, selectedPreset),
+    [presetData?.presets, selectedPreset]
+  )
+  const selectedPresetName = selectedPreset?.split('::')[0]?.toLowerCase()
+  const effectiveDetectedPort =
+    selectedPresetName === 'dockerfile' &&
+    (selectedDockerfilePath || 'Dockerfile') === 'Dockerfile'
+      ? detectedPresetPort
+      : undefined
+  const hasDockerfilePortMismatch =
+    selectedPresetName === 'dockerfile' &&
+    effectiveDetectedPort !== undefined &&
+    selectedPort !== undefined &&
+    selectedPort !== effectiveDetectedPort
+  const lastAutoPortPreset = useRef<string | null>(null)
+
   // Auto-update port based on selected preset
   useEffect(() => {
-    if (!selectedPreset || !allPresetsData?.presets) {
+    if (!selectedPreset) {
       return
     }
+
+    if (
+      lastAutoPortPreset.current === selectedPreset &&
+      form.getFieldState('port').isDirty
+    ) {
+      return
+    }
+
+    if (effectiveDetectedPort !== undefined) {
+      form.setValue('port', effectiveDetectedPort, {
+        shouldValidate: true,
+        shouldDirty: false,
+      })
+      lastAutoPortPreset.current = selectedPreset
+      return
+    }
+
+    if (!allPresetsData?.presets) return
 
     // Extract preset name from "preset::path" format
     const [presetName] = selectedPreset.split('::')
@@ -1011,8 +1055,9 @@ export function ProjectConfigurator({
         shouldValidate: true,
         shouldDirty: false,
       })
+      lastAutoPortPreset.current = selectedPreset
     }
-  }, [selectedPreset, allPresetsData, form])
+  }, [selectedPreset, effectiveDetectedPort, allPresetsData, form])
 
   // Environment variable management
   const addEnvironmentVariable = () => {
@@ -1511,8 +1556,23 @@ export function ProjectConfigurator({
                 />
               </FormControl>
               <p className="text-xs text-muted-foreground">
-                Port your application will listen on (e.g., 3000, 8080)
+                {effectiveDetectedPort !== undefined
+                  ? `Detected from EXPOSE ${effectiveDetectedPort} in this Dockerfile.`
+                  : 'Port your application will listen on (e.g., 3000, 8080)'}
               </p>
+              {hasDockerfilePortMismatch && (
+                <Alert variant="destructive" className="mt-2">
+                  <AlertCircle className="h-4 w-4" />
+                  <AlertDescription>
+                    This Dockerfile exposes port {effectiveDetectedPort}, but
+                    the project is configured for port {selectedPort}. Temps
+                    routes to the exposed image port after the build, so an app
+                    that listens on the configured PORT value may fail its
+                    health check. Make these ports match unless your startup
+                    command intentionally ignores PORT.
+                  </AlertDescription>
+                </Alert>
+              )}
               <FormMessage />
             </FormItem>
           )}

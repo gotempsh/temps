@@ -526,7 +526,7 @@ pub struct ProjectPresetResponse {
     pub path: String,
     pub preset: String,
     pub preset_label: String,
-    /// Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
+    /// Detected Dockerfile EXPOSE port, or the preset's default port.
     pub exposed_port: Option<i32>,
     /// Icon URL for the preset
     pub icon_url: Option<String>,
