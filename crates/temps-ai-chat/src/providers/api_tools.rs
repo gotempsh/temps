@@ -122,10 +122,12 @@ const ANALYTICS_PLAYBOOK: &str = "\
 For a question about countries, referrers, bounce rate, entry/exit rate, page \
 views, or unique visitors for one page, use `analytics get_page_path_detail`. \
 Pass the URL path as `--page_path` (not `--path`) plus `--start_date` and \
-`--end_date`. Its response already contains an aggregated `countries` list \
-with visitor counts, page-view counts, and percentages. If the user did not \
-specify a date range and none is present in page context, use the last 30 days \
-ending now and state that range in the answer.
+`--end_date`. Use full ISO 8601 timestamps such as `2026-08-01T00:00:00Z`; \
+date-only values such as `2026-08-01` are invalid. Its response already \
+contains an aggregated `countries` list with visitor counts, page-view counts, \
+and percentages. If the user did not specify a date range and none is present \
+in page context, use the last 30 days ending now and state that range in the \
+answer.
 
 Do not use `get_analytics_visitor_sessions` for a page aggregate. That \
 operation is only for investigating an individual visitor after you have a \
@@ -335,6 +337,8 @@ mod tests {
         assert!(appendix.contains("--page_path"));
         assert!(appendix.contains("--start_date"));
         assert!(appendix.contains("--end_date"));
+        assert!(appendix.contains("2026-08-01T00:00:00Z"));
+        assert!(appendix.contains("date-only values"));
         assert!(appendix.contains("countries"));
         assert!(appendix.contains("last 30 days"));
         assert!(appendix.contains("Do not use `get_analytics_visitor_sessions`"));
