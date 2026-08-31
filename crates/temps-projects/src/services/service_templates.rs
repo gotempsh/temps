@@ -266,6 +266,7 @@ pub struct TemplateCapabilityRequirement {
 pub enum TemplateCompatibilityTier {
     Standard,
     Elevated,
+    HostAccess,
     Blocked,
 }
 
@@ -274,6 +275,7 @@ impl TemplateCompatibilityTier {
         match self {
             Self::Standard => "standard",
             Self::Elevated => "elevated",
+            Self::HostAccess => "host_access",
             Self::Blocked => "blocked",
         }
     }
@@ -290,6 +292,9 @@ pub struct PreparedServiceTemplate {
     pub warnings: Vec<String>,
     pub transformations: Vec<TemplateTransformation>,
     pub capability_requirements: Vec<TemplateCapabilityRequirement>,
+    /// The template asks to cross the project sandbox into host-owned
+    /// resources such as the Docker API, host namespaces, or devices.
+    pub requires_host_access: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -313,7 +318,11 @@ impl PreparedServiceTemplate {
 
     pub fn compatibility_tier(&self) -> TemplateCompatibilityTier {
         if !self.installable() {
-            TemplateCompatibilityTier::Blocked
+            if self.requires_host_access {
+                TemplateCompatibilityTier::HostAccess
+            } else {
+                TemplateCompatibilityTier::Blocked
+            }
         } else if self.capability_requirements.is_empty() {
             TemplateCompatibilityTier::Standard
         } else {
@@ -997,6 +1006,7 @@ pub fn prepare_template(
     normalize_project_owned_names(&mut root, &mut transformations);
     externalize_literal_credentials(&mut root, &mut transformations);
     let mut compatibility_issues = compatibility_issues(&root);
+    let requires_host_access = requires_host_access(&root);
     let mut warnings = compatibility_warnings(&root);
     normalize_published_ports(&mut root, &mut compatibility_issues, &mut transformations);
     let routes = discover_routes(&root, template, &mut compatibility_issues);
@@ -1020,7 +1030,15 @@ pub fn prepare_template(
             variable.name
         ));
     }
-    let capability_requirements = capability_requirements(&root);
+    // Capability approval is meaningful only for an otherwise installable
+    // plan. Asking the user to approve volume initialization on a stack that
+    // already requires a Docker socket or another unsupported feature implies
+    // that the approval could unblock it, which is both confusing and unsafe.
+    let capability_requirements = if compatibility_issues.is_empty() {
+        capability_requirements(&root)
+    } else {
+        Vec::new()
+    };
     if !capability_requirements.is_empty() {
         warnings.push(
             "Some images commonly need limited startup capabilities to initialize persistent data; explicit approval is required before installation"
@@ -1048,6 +1066,7 @@ pub fn prepare_template(
         warnings,
         transformations,
         capability_requirements,
+        requires_host_access,
     })
 }
 
@@ -1815,6 +1834,95 @@ fn compatibility_issues(root: &YamlValue) -> Vec<String> {
     issues
 }
 
+/// Return true when installing the document would require authority outside
+/// the project-scoped Compose sandbox. This is intentionally separate from
+/// generic incompatibility: a missing bundled file may become supportable,
+/// while a Docker socket or host namespace is an administrator-level trust
+/// decision and must never be presented as ordinary "manual work".
+fn requires_host_access(root: &YamlValue) -> bool {
+    if root
+        .get("volumes")
+        .and_then(YamlValue::as_mapping)
+        .is_some_and(|items| {
+            items.values().any(|definition| {
+                definition.as_mapping().is_some_and(|definition| {
+                    definition.get("external").and_then(YamlValue::as_bool) == Some(true)
+                        || definition.contains_key("name")
+                        || !definition.is_empty()
+                })
+            })
+        })
+        || root
+            .get("networks")
+            .and_then(YamlValue::as_mapping)
+            .is_some_and(|items| {
+                items.values().any(|definition| {
+                    definition.as_mapping().is_some_and(|definition| {
+                        definition.get("external").and_then(YamlValue::as_bool) == Some(true)
+                            || definition.contains_key("name")
+                            || !definition.is_empty()
+                    })
+                })
+            })
+    {
+        return true;
+    }
+
+    let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
+        return false;
+    };
+    services.values().any(|definition| {
+        let Some(service) = definition.as_mapping() else {
+            return false;
+        };
+        if service.get("privileged").and_then(YamlValue::as_bool) == Some(true)
+            || [
+                "cap_add",
+                "cgroup",
+                "cgroup_parent",
+                "credential_spec",
+                "device_cgroup_rules",
+                "devices",
+                "gpus",
+                "group_add",
+                "isolation",
+                "network_mode",
+                "pid",
+                "ipc",
+                "runtime",
+                "security_opt",
+                "storage_opt",
+                "sysctls",
+                "use_api_socket",
+                "userns_mode",
+                "uts",
+                "volumes_from",
+            ]
+            .iter()
+            .any(|field| service.contains_key(*field))
+            || service
+                .get("deploy")
+                .and_then(YamlValue::as_mapping)
+                .and_then(|deploy| deploy.get("resources"))
+                .and_then(YamlValue::as_mapping)
+                .and_then(|resources| resources.get("reservations"))
+                .and_then(YamlValue::as_mapping)
+                .is_some_and(|reservations| reservations.contains_key("devices"))
+        {
+            return true;
+        }
+        service
+            .get("volumes")
+            .and_then(YamlValue::as_sequence)
+            .is_some_and(|volumes| {
+                volumes.iter().any(|volume| {
+                    value_contains_interpolation(volume)
+                        || volume_source(volume).is_some_and(is_unsafe_volume_source)
+                })
+            })
+    })
+}
+
 fn compatibility_warnings(root: &YamlValue) -> Vec<String> {
     let mut warnings = Vec::new();
     let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
@@ -2446,6 +2554,9 @@ mod tests {
     privileged: true
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock
+      - manager-data:/data
+volumes:
+  manager-data:
 "#,
                 None,
             ),
@@ -2453,6 +2564,10 @@ mod tests {
         .unwrap();
 
         assert!(!prepared.installable());
+        assert_eq!(
+            prepared.compatibility_tier(),
+            TemplateCompatibilityTier::HostAccess
+        );
         assert!(prepared
             .compatibility_issues
             .iter()
@@ -2461,6 +2576,27 @@ mod tests {
             .compatibility_issues
             .iter()
             .any(|issue| issue.contains("/var/run/docker.sock")));
+        assert!(prepared.capability_requirements.is_empty());
+        assert!(!prepared
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("limited startup capabilities")));
+    }
+
+    #[test]
+    fn distinguishes_non_host_incompatibility_from_host_access() {
+        let prepared = prepare_template(
+            "missing-image",
+            &template("services:\n  app:\n    command: echo unsupported\n", None),
+        )
+        .unwrap();
+
+        assert!(!prepared.installable());
+        assert_eq!(
+            prepared.compatibility_tier(),
+            TemplateCompatibilityTier::Blocked
+        );
+        assert!(!prepared.requires_host_access);
     }
 
     #[test]

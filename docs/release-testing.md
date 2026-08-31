@@ -577,6 +577,208 @@ Conventions used below:
 
 ---
 
+## 12. Service template catalog (Beta)
+
+Run this section for every release that changes the service-template catalog,
+Compose deployment path, project source revisions, runtime logs, routes, or
+status monitors. Use a fresh staging database and a clean Docker host unless a
+scenario explicitly tests an upgrade.
+
+### 12.1 Maturity and discoverability
+
+- **Setup**: Admin and project-creator accounts; no catalog request made yet.
+- **Steps**: Open **New Project** and select **Services** with each account.
+- **Pass**:
+  - Services is visible and carries the canonical **Beta** badge in the source
+    picker and catalog title.
+  - `GET /api/service-templates` has OpenAPI `x-maturity: beta` and requires
+    both project-create and deployment-create permissions.
+  - The UI explains Beta limits without hiding Custom Compose or unsupported
+    templates.
+
+### 12.2 Catalog availability, bounds, and stale-cache behavior
+
+- **Setup**: A mock catalog endpoint plus a staging host whose outbound access
+  to `cdn.coollabs.io` can be toggled.
+- **Steps**: Load a valid catalog, exceed the response/entry/Compose limits,
+  return invalid JSON, time out, then disable outbound access after one good
+  refresh.
+- **Pass**:
+  - The first valid load is paginated and cached; concurrent readers cause one
+    upstream refresh.
+  - Oversized, invalid, redirected, and timed-out responses return typed,
+    actionable errors without excessive memory or task growth.
+  - A prior successful snapshot remains usable during a refresh outage; a
+    fresh host shows the retryable connectivity error and keeps Custom Compose
+    available.
+  - A catalog refresh never mutates an installed project's Compose revision.
+
+### 12.3 Compatibility inventory and host-access boundary
+
+- **Setup**: Current production catalog snapshot.
+- **Steps**: Export every template's tier and issue codes; inspect all entries
+  containing Docker/Podman sockets, absolute bind mounts, devices, privileged
+  mode, host namespaces, external Docker resources, or guarded interpolation.
+- **Pass**:
+  - `standard + elevated + blocked == catalog_total`; `host_access` is reported
+    as an explicit subset of blocked templates.
+  - Every raw Docker socket and equivalent host-control request is
+    `host_access`, cannot preflight, and cannot be installed through a direct
+    API call.
+  - The final `ComposeExecutor` policy independently rejects the same document
+    even if catalog analysis is bypassed.
+  - No template can grant its own capability approval or convert a host path
+    through environment interpolation.
+
+### 12.4 Standard single-service installation
+
+- **Setup**: A standard template with one HTTP route and no writable volume.
+- **Steps**: Search, inspect, preflight, install, follow deployment logs, and
+  open the generated URL.
+- **Pass**:
+  - Search retains keyboard focus while debounced requests run.
+  - Fixed host ports become random loopback bindings and no fixed container or
+    Compose project name survives normalization.
+  - Preflight returns the planned slug and canonical public variables; create
+    claims that exact slug or safely replans after a collision.
+  - Deployment succeeds, the route serves the expected response, and both the
+    Compose stage log stream and runtime container log stream contain data.
+
+### 12.5 Elevated multi-service installation
+
+- **Setup**: A template with an application plus a bundled Postgres/Redis
+  dependency and writable named volumes.
+- **Steps**: Try preflight without approval, approve only the named services,
+  install, restart all containers, and redeploy unchanged.
+- **Pass**:
+  - Missing approval blocks preflight with each exact service/reason; unrelated
+    approval is ignored with a warning.
+  - Only the limited startup capability profile is restored—never privileged
+    mode, arbitrary `cap_add`, host networking, or devices.
+  - Dependencies remain project-scoped, persist across restart/redeploy, and
+    do not collide with another project installed from the same template.
+
+### 12.6 Variables, defaults, and secrets
+
+- **Setup**: Templates containing optional variables, required `${VAR?}` and
+  `${VAR:?}` expressions, generated credentials, shared literal bootstrap
+  credentials, URL/FQDN variables, and Supabase JWT dependencies.
+- **Steps**: Leave optional fields empty, omit each required field, generate
+  values twice, install, then inspect API responses, deployment files, logs,
+  and the database.
+- **Pass**:
+  - Optional variables have no required marker and do not block preflight;
+    required variables fail with their exact name.
+  - Generated values use Web Crypto, preserve required equality, and are never
+    returned by catalog/preflight responses or printed in logs.
+  - Stored secrets are encrypted/write-only and Compose receives the exact
+    value, including quotes, dollar signs, and Unicode, without interpolation.
+
+### 12.7 Routes, health, and monitor convergence
+
+- **Setup**: Templates whose root path returns 404, whose Compose healthcheck
+  targets a non-root HTTP path, and whose stack exposes multiple services.
+- **Steps**: Install each template and observe deployment, route, and monitor
+  state from cold start through healthy.
+- **Pass**:
+  - The detected health path is snapshotted on the deployment and used by the
+    managed monitor; a non-200 `/` does not mark an otherwise healthy service
+    down.
+  - Deployment success triggers an immediate monitor check/reconciliation;
+    the project header and monitor detail converge without waiting for a stale
+    pre-deployment interval.
+  - Each supported public service receives the correct route and container
+    port; ambiguous multi-port services remain blocked with a specific reason.
+
+### 12.8 Editable source, redeploy, and rollback
+
+- **Setup**: A successfully installed template with image tag `v1`.
+- **Steps**: Change the stored Compose source to `v2`, save, deploy, redeploy
+  the `v2` deployment, then redeploy/roll back to the historical `v1`
+  deployment.
+- **Pass**:
+  - Build settings identify the source as **Compose**, show editable YAML, and
+    save an immutable revision using optimistic concurrency.
+  - Each deployment uses its selected source revision, Compose path, working
+    directory, environment snapshot, public services, and health path—not the
+    latest mutable project fields.
+  - Historical redeploy restores `v1`; a stale editor save returns 409 without
+    losing either revision.
+
+### 12.9 Failure, cancellation, and concurrent deployment safety
+
+- **Setup**: One live stack plus candidate revisions that fail during pull,
+  create, and health wait; two simultaneous deploy requests.
+- **Steps**: Fail/cancel before teardown and after teardown begins; race two
+  deployments and restart the workflow executor between attempts.
+- **Pass**:
+  - Pre-teardown failure leaves the old stack and secrets live.
+  - Post-teardown failure/cancellation performs compensating container,
+    network, candidate-secret, and temporary-source cleanup with a contextual
+    deployment error.
+  - The per-data-directory/Compose-project lock serializes all executor
+    instances; no orphan stack or plaintext generation remains.
+
+### 12.10 Lifecycle cleanup and resource isolation
+
+- **Setup**: Two projects from the same template, including volumes, networks,
+  env files, and random loopback ports.
+- **Steps**: Deploy both, delete one, reinstall it, and run source/stack garbage
+  collection.
+- **Pass**:
+  - Project names, containers, networks, volumes, ports, and source generations
+    do not collide.
+  - Delete removes only the selected project's containers/network and preserves
+    data according to the explicit volume-retention contract.
+  - Temporary preflight directories and obsolete secret/source generations are
+    bounded and reclaimed.
+
+### 12.11 Architecture, remote worker, and resource pressure
+
+- **Setup**: amd64 and arm64 workers plus the 3-vCPU/4-GB reference host.
+- **Steps**: Preflight architecture-pinned templates, deploy a representative
+  standard/elevated matrix locally and remotely, refresh the catalog under 50
+  concurrent readers, and install two stacks concurrently.
+- **Pass**:
+  - Architecture mismatches fail before project creation; matching remote
+    workers receive the complete immutable source bundle and policy metadata.
+  - Catalog analysis does not block the async runtime, respects the four-slot
+    preflight limit, and stays within the documented response/memory bounds.
+  - Proxy latency and unrelated deployments remain within their release SLOs.
+
+### 12.12 Beta release gate
+
+The feature may ship as Beta only when all scenarios above that apply to the
+changed surface pass, zero critical/high security findings remain, and the
+qualification matrix records three cold installs for at least 30 installable
+templates spanning every represented category, bundled dependency kind, and
+both compatibility tiers. Record every failure with template revision,
+architecture, stage, and sanitized logs; do not relabel a failing template as
+supported to improve the percentage.
+
+### 12.13 Stable graduation gate
+
+Remove the Beta label only after all of the following are true for two
+consecutive releases:
+
+- A pinned nightly matrix automatically preflights every catalog entry and
+  cold-deploys every installable entry on amd64; architecture-compatible entries
+  also run on arm64.
+- At least 95% of entries classified installable complete three consecutive
+  cold installs, reach their declared health target, stream deployment and
+  runtime logs, and converge their managed monitor. Any remaining failure is
+  reclassified with a reviewed, actionable reason before release.
+- Source edit/redeploy/rollback, cancellation compensation, catalog outage,
+  catalog drift, RBAC, and cross-project isolation have dedicated automated
+  end-to-end coverage.
+- A seven-day staging soak shows no orphan containers/networks, plaintext
+  generations, stuck deployments, stale monitors, or unbounded catalog/cache
+  growth.
+- The public API/source-revision contract is frozen for the documented
+  compatibility window, upgrade/rollback migrations are proven, operator and
+  troubleshooting docs are published, and security review approves the final
+  host-access boundary.
+
 ## How to use this document
 
 1. Open a `RELEASE_CHECKLIST_vX.Y.Z.md` for the release in flight.

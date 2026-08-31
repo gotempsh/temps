@@ -37353,10 +37353,16 @@
       "ServiceTemplateCompatibilitySummaryResponse": {
         "properties": {
           "blocked": {
+            "description": "All non-installable templates, including `host_access` entries.",
             "minimum": 0,
             "type": "integer"
           },
           "elevated": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "host_access": {
+            "description": "Blocked templates that require administrator-level host authority.\nThis is a subset of `blocked`.",
             "minimum": 0,
             "type": "integer"
           },
@@ -37368,6 +37374,7 @@
         "required": [
           "standard",
           "elevated",
+          "host_access",
           "blocked"
         ],
         "type": "object"
@@ -37513,7 +37520,7 @@
             "type": "array"
           },
           "compatibility_tier": {
-            "description": "`standard`, `elevated`, or `blocked`.",
+            "description": "`standard`, `elevated`, `host_access`, or `blocked`.",
             "type": "string"
           },
           "description": {
@@ -98003,7 +98010,8 @@
         "summary": "Browse Coolify's one-click Docker Compose catalog.",
         "tags": [
           "Service Templates"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/service-templates/{slug}": {
@@ -98055,7 +98063,8 @@
         "summary": "Inspect a normalized service template before installing it.",
         "tags": [
           "Service Templates"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/service-templates/{slug}/preflight": {
@@ -98126,7 +98135,8 @@
         "summary": "Validate a fully configured template without creating a project or containers.",
         "tags": [
           "Service Templates"
-        ]
+        ],
+        "x-maturity": "beta"
       }
     },
     "/session-replays": {

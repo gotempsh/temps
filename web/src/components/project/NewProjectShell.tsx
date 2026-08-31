@@ -9,6 +9,7 @@ import {
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
+import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
 import {
   Link as LinkIcon,
@@ -85,10 +86,16 @@ export function NewProjectShell({
     key: ProjectSource
     icon: ComponentType<{ className?: string }>
     title: string
+    featureKey?: string
   }> = [
     { key: 'browse', icon: browsePill.icon, title: browsePill.title },
     { key: 'templates', icon: LayoutTemplate, title: 'Template' },
-    { key: 'services', icon: Boxes, title: 'Services' },
+    {
+      key: 'services',
+      icon: Boxes,
+      title: 'Services',
+      featureKey: 'service-template-catalog',
+    },
     { key: 'git-url', icon: LinkIcon, title: 'Git URL' },
     { key: 'manual', icon: Container, title: 'Docker Image' },
     { key: 'drop', icon: UploadCloud, title: 'Drop files' },
@@ -151,6 +158,7 @@ export function NewProjectShell({
             >
               <Icon className="h-4 w-4 shrink-0" />
               {s.title}
+              <FeatureMaturityBadge featureKey={s.featureKey} compact />
             </button>
           )
         })}

@@ -16,6 +16,7 @@ import type {
 } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
+import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
 import {
@@ -194,6 +195,11 @@ function TemplateCard({
             <Badge className="border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300">
               <ShieldAlert className="mr-1 size-3" />
               Approval required
+            </Badge>
+          ) : template.compatibility_tier === 'host_access' ? (
+            <Badge className="border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-300">
+              <ShieldAlert className="mr-1 size-3" />
+              Host access
             </Badge>
           ) : (
             <Badge variant="outline" className="text-muted-foreground">
@@ -614,7 +620,9 @@ function TemplateInstaller({
               <Alert variant="destructive">
                 <ShieldAlert className="size-4" />
                 <AlertTitle>
-                  This template needs manual compatibility work
+                  {detail.compatibility_tier === 'host_access'
+                    ? 'This service requires administrator-level host access'
+                    : 'This template needs compatibility work'}
                 </AlertTitle>
                 <AlertDescription>
                   <ul className="mt-2 list-disc space-y-1 pl-5">
@@ -622,11 +630,20 @@ function TemplateInstaller({
                       <li key={issue}>{issue}</li>
                     ))}
                   </ul>
-                  <p className="mt-3">
-                    It remains visible so you can inspect the limitation; Temps
-                    will not silently grant host access or start a partial
-                    stack.
-                  </p>
+                  {detail.compatibility_tier === 'host_access' ? (
+                    <p className="mt-3">
+                      Docker sockets, host namespaces, devices, and host paths
+                      can control or read other projects on this server. Temps
+                      will support these only through a separately reviewed,
+                      administrator-controlled server integration—not by
+                      weakening a project deployment.
+                    </p>
+                  ) : (
+                    <p className="mt-3">
+                      It remains visible so you can inspect the limitation;
+                      Temps will not start a partial stack.
+                    </p>
+                  )}
                 </AlertDescription>
               </Alert>
             )}
@@ -1304,7 +1321,10 @@ export function ServiceTemplateCatalog() {
     <div className="space-y-6">
       <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
         <div>
-          <h2 className="text-xl font-semibold">Install a service</h2>
+          <div className="flex items-center gap-2">
+            <h2 className="text-xl font-semibold">Install a service</h2>
+            <FeatureMaturityBadge featureKey="service-template-catalog" />
+          </div>
           <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
             Deploy from {catalog.data.catalog_total} community-maintained Docker
             Compose templates. Temps reviews compatibility before anything
@@ -1321,7 +1341,15 @@ export function ServiceTemplateCatalog() {
               {catalog.data.compatibility.elevated} need approval
             </Badge>
             <Badge variant="outline" className="text-muted-foreground">
-              {catalog.data.compatibility.blocked} need manual work
+              {catalog.data.compatibility.host_access} require host access
+            </Badge>
+            <Badge variant="outline" className="text-muted-foreground">
+              {Math.max(
+                0,
+                catalog.data.compatibility.blocked -
+                  catalog.data.compatibility.host_access
+              )}{' '}
+              need compatibility work
             </Badge>
           </div>
         </div>

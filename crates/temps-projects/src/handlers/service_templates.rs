@@ -53,7 +53,7 @@ pub struct ServiceTemplateSummaryResponse {
     pub port: Option<u16>,
     pub service_count: usize,
     pub installable: bool,
-    /// `standard`, `elevated`, or `blocked`.
+    /// `standard`, `elevated`, `host_access`, or `blocked`.
     pub compatibility_tier: String,
     pub compatibility_issues: Vec<String>,
     pub warnings: Vec<String>,
@@ -114,6 +114,10 @@ pub struct ListServiceTemplatesResponse {
 pub struct ServiceTemplateCompatibilitySummaryResponse {
     pub standard: usize,
     pub elevated: usize,
+    /// Blocked templates that require administrator-level host authority.
+    /// This is a subset of `blocked`.
+    pub host_access: usize,
+    /// All non-installable templates, including `host_access` entries.
     pub blocked: usize,
 }
 
@@ -326,6 +330,10 @@ pub async fn list_service_templates(
         match analysis.compatibility_tier.as_str() {
             "standard" => compatibility.standard += 1,
             "elevated" => compatibility.elevated += 1,
+            "host_access" => {
+                compatibility.host_access += 1;
+                compatibility.blocked += 1;
+            }
             _ => compatibility.blocked += 1,
         }
     }

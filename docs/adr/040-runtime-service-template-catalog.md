@@ -4,6 +4,16 @@
 
 Accepted
 
+## Feature maturity
+
+**Beta.** The project, source-revision, redeploy, and security boundaries are
+implemented, but community-template compatibility is not yet continuously
+qualified across the supported host architectures. Templates that require the
+Docker API, host namespaces, devices, privileged mode, or arbitrary host paths
+are classified as `host_access` and remain unavailable as project workloads.
+They require a separate administrator-controlled server-integration design;
+the Beta must not weaken the project sandbox to increase its install count.
+
 ## Context
 
 Temps already deploys Docker Compose projects, while Coolify maintains an

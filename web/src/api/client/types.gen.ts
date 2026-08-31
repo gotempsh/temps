@@ -17366,8 +17366,16 @@ export type ServiceTemplateCapabilityRequirementResponse = {
 };
 
 export type ServiceTemplateCompatibilitySummaryResponse = {
+    /**
+     * All non-installable templates, including `host_access` entries.
+     */
     blocked: number;
     elevated: number;
+    /**
+     * Blocked templates that require administrator-level host authority.
+     * This is a subset of `blocked`.
+     */
+    host_access: number;
     standard: number;
 };
 
@@ -17412,7 +17420,7 @@ export type ServiceTemplateSummaryResponse = {
     category: string;
     compatibility_issues: Array<string>;
     /**
-     * `standard`, `elevated`, or `blocked`.
+     * `standard`, `elevated`, `host_access`, or `blocked`.
      */
     compatibility_tier: string;
     description?: string | null;

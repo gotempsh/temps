@@ -70,6 +70,11 @@ pub const FEATURE_MATURITY: &[FeatureMaturity] = &[
     feature("cli", Maturity::Stable, STABLE_REASON),
     feature("console-core", Maturity::Stable, STABLE_REASON),
     feature(
+        "service-template-catalog",
+        Maturity::Beta,
+        "Community Compose compatibility is still being qualified; host-integrated templates remain unavailable until they can be isolated safely.",
+    ),
+    feature(
         "web-analytics",
         Maturity::Beta,
         "The analytics data model and query implementation are still being hardened.",
@@ -235,6 +240,9 @@ pub fn feature_key_for_api_path(path: &str) -> Option<&'static str> {
     if path.starts_with("/revenue") || path.contains("/revenue/") {
         return Some("revenue-tracking");
     }
+    if path.starts_with("/service-templates") {
+        return Some("service-template-catalog");
+    }
     if path.starts_with("/otel/genai") {
         return Some("ai-agents-workflows");
     }
@@ -399,6 +407,10 @@ mod tests {
         assert_eq!(
             feature_key_for_api_path("/projects/{project_id}/has-error-groups"),
             Some("error-tracking")
+        );
+        assert_eq!(
+            feature_key_for_api_path("/service-templates/{slug}/preflight"),
+            Some("service-template-catalog")
         );
         assert_eq!(feature_key_for_api_path("/projects"), None);
     }
