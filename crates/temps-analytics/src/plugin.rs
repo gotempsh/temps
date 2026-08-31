@@ -142,6 +142,38 @@ impl TempsPlugin for AnalyticsPlugin {
                     "analytics: no storage-neutral API traffic source registered; falling back to TimescaleDB"
                 );
             }
+
+            // ADR-040: a deployment transition updates
+            // `environments.current_deployment_id` without touching
+            // `analytics_ingest_keys` at all, so the ingest-key resolve
+            // cache's targeted invalidation (on rotate/revoke/update) never
+            // fires for it. An environment-scoped key would otherwise keep
+            // attributing events to the previous deployment for up to
+            // `RESOLVE_CACHE_TTL` after every deploy. `Job::RouteTableUpdated`
+            // — the same in-process signal the route table itself reloads
+            // on — fires exactly when that column changes, so subscribing
+            // here closes the window immediately instead of waiting it out.
+            let job_queue = context.require_service::<dyn temps_core::JobQueue>();
+            let ingest_key_service = context.require_service::<AnalyticsIngestKeyService>();
+            let mut job_receiver = job_queue.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match job_receiver.recv().await {
+                        Ok(temps_core::Job::RouteTableUpdated(_)) => {
+                            ingest_key_service.invalidate_all_cached_scopes();
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            tracing::error!(
+                                "analytics: error receiving job for ingest-key cache invalidation: {:?}",
+                                e
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        }
+                    }
+                }
+            });
+
             Ok(())
         })
     }

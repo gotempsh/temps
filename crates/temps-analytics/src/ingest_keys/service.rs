@@ -491,6 +491,23 @@ impl AnalyticsIngestKeyService {
     async fn invalidate(&self, public_key: &str) {
         self.resolve_cache.invalidate(public_key).await;
     }
+
+    /// Drop every cached resolution.
+    ///
+    /// `resolve`'s cached [`ResolvedIngestScope`] embeds `deployment_id`,
+    /// derived from `environments.current_deployment_id` at cache-fill time.
+    /// A deployment transition updates that column without touching
+    /// `analytics_ingest_keys` at all, so `rotate`/`revoke`/`update`'s
+    /// targeted [`invalidate`](Self::invalidate) never fires for it — an
+    /// environment-scoped key would otherwise keep attributing events to the
+    /// previous deployment for up to [`RESOLVE_CACHE_TTL`] after a deploy.
+    /// The caller (the analytics plugin's `Job::RouteTableUpdated` subscriber)
+    /// has no per-key index to target, and deployments are infrequent enough
+    /// that clearing the whole cache is cheap — the next resolution per key
+    /// just re-reads the current value.
+    pub fn invalidate_all_cached_scopes(&self) {
+        self.resolve_cache.invalidate_all();
+    }
 }
 
 /// The single hot-path lookup: one `LEFT JOIN` from the key to its
@@ -1414,6 +1431,48 @@ mod tests {
         let second = service.resolve(&public_key).await.expect("second");
         assert_eq!(first, second);
         assert!(first.is_some());
+    }
+
+    /// A deployment transition changes `environments.current_deployment_id`
+    /// without touching `analytics_ingest_keys`, so nothing in `rotate`,
+    /// `revoke` or `update` would ever evict this key's cached scope. The
+    /// analytics plugin's `Job::RouteTableUpdated` subscriber closes that gap
+    /// by calling `invalidate_all_cached_scopes` on every route reload —
+    /// this proves the method it calls actually forces a re-query rather
+    /// than continuing to serve the stale `deployment_id`.
+    #[tokio::test]
+    async fn invalidate_all_cached_scopes_forces_a_fresh_deployment_id() {
+        let key = key_model(10, 1, Some(5));
+        let public_key = key.public_key.clone();
+        let env_before_deploy = environment_model(5, 1, Some(100));
+        let env_after_deploy = environment_model(5, 1, Some(200));
+        let db = MockDatabase::new(DatabaseBackend::Postgres).append_query_results([
+            vec![(key.clone(), Some(env_before_deploy))],
+            vec![(key, Some(env_after_deploy))],
+        ]);
+        let service = service_with(db);
+
+        let before = service
+            .resolve(&public_key)
+            .await
+            .expect("first resolve")
+            .expect("key should resolve");
+        assert_eq!(before.deployment_id, Some(100));
+
+        // Without invalidation, the cache would answer this from memory and
+        // the mock's second result set would never be consumed.
+        service.invalidate_all_cached_scopes();
+
+        let after = service
+            .resolve(&public_key)
+            .await
+            .expect("second resolve")
+            .expect("key should still resolve");
+        assert_eq!(
+            after.deployment_id,
+            Some(200),
+            "invalidate_all_cached_scopes must force a fresh lookup of the new deployment"
+        );
     }
 
     #[tokio::test]
