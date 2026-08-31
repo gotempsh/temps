@@ -776,7 +776,7 @@ function CreateApplicationDialog({
                   <p className="rounded-md border border-border bg-muted/50 p-3 text-xs leading-5 text-muted-foreground">
                     {provisionedProject
                       ? `Using the already provisioned project “${provisionedProject.name}”.`
-                      : 'Temps creates the initial deployable project from this application name. The first thread turns your brief into a multi-project topology and asks before adding or changing projects.'}
+                      : 'Temps creates the initial deployable project from this application name. The first thread turns your brief into a multi-project topology and asks before you create or change further projects.'}
                   </p>
                 )}
               </div>
