@@ -5257,6 +5257,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("legacy-promotion".to_string()),
             state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             context_vars: Set(Some(serde_json::json!({
                 "trigger": "promotion",
                 "source_deployment_id": original.id,
@@ -5275,6 +5278,9 @@ mod tests {
             environment_id: Set(environment.id),
             slug: Set("legacy-rollback".to_string()),
             state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
             context_vars: Set(Some(serde_json::json!({
                 "trigger": "rollback",
                 "source_deployment_id": first_reuse.id,
