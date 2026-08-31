@@ -108,14 +108,16 @@ wait_for_completed_service() {
 assert_runtime_loopback_binding() {
   local container="$1"
   local container_port="$2"
+  local -a bindings=()
 
-  if ! docker inspect "$container" | jq -e --arg port "${container_port}/tcp" '
-    .[0].NetworkSettings.Ports[$port] as $bindings
-    | ($bindings | length) == 1
-      and ($bindings[0].HostIp == "127.0.0.1")
-  ' >/dev/null; then
+  # `docker port` asks the daemon for the realized mapping. Some Docker Engine
+  # versions leave NetworkSettings.Ports empty even when HostConfig mappings
+  # are active, so inspecting that field is not portable runtime evidence.
+  mapfile -t bindings < <(docker port "$container" "${container_port}/tcp" 2>/dev/null || true)
+  if [[ "${#bindings[@]}" -ne 1 || \
+    ! "${bindings[0]:-}" =~ ^127\.0\.0\.1:[0-9]+$ ]]; then
     echo "$container port $container_port is not published exclusively on 127.0.0.1" >&2
-    docker inspect --format '{{json .NetworkSettings.Ports}}' "$container" >&2 || true
+    docker port "$container" >&2 || true
     return 1
   fi
 }
