@@ -311,6 +311,23 @@ show one stable row with labeled Previous and Next buttons around compact
 controls. At `sm` and above, show the full `Showing X–Y of Z` summary and
 advanced controls.
 
+## Never name a real third party in anything that leaves this machine
+
+This repo is **public**. Full rule and examples in
+[`CLAUDE.md` → Critical Rules](./CLAUDE.md#critical-rules); the part agents
+most often miss:
+
+A user handing you a real URL, repo, or account as the **live target of a
+task** ("deploy this: github.com/someone/their-repo") is not permission to
+cite it. It's scratch input, not evidence — it must not end up in test
+comments, fixture data, commit messages, PR titles/descriptions, or issue
+text as an illustrative example. Write the test/PR against a generic
+equivalent ("a repo with no build manifest, just an `index.html`") instead
+of naming the real one, even though the user supplied it themselves and it
+feels like harmless context. Grep your diff and any PR body you write for
+the real name before it leaves this machine — a PR description can't be
+un-published once it reaches GitHub.
+
 ## Don't sweep unrelated dirty files into your commits
 
 If you arrive at a working tree that's already dirty (because a
