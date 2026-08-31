@@ -67,20 +67,26 @@ fn dockerfile_escape_character(dockerfile: &str) -> char {
     for raw_line in dockerfile.lines() {
         let trimmed = raw_line.trim();
         if trimmed.is_empty() {
-            continue;
+            break;
         }
         let Some(comment) = trimmed.strip_prefix('#') else {
             break;
         };
         let Some((name, value)) = comment.trim().split_once('=') else {
-            continue;
+            break;
         };
-        if name.trim().eq_ignore_ascii_case("escape") {
-            return match value.trim() {
-                "`" => '`',
-                "\\" => '\\',
-                _ => '\\',
-            };
+        match name.trim().to_ascii_lowercase().as_str() {
+            "escape" => {
+                return match value.trim() {
+                    "`" => '`',
+                    "\\" => '\\',
+                    _ => '\\',
+                };
+            }
+            // Docker permits multiple parser directives in the initial
+            // directive block. Other comments end that block.
+            "syntax" | "check" => continue,
+            _ => break,
         }
     }
     '\\'
@@ -208,7 +214,16 @@ mod tests {
 
     #[test]
     fn honors_backtick_escape_directive() {
-        let dockerfile = "# escape=`\nFROM alpine\nEXPOSE `\n  8080/tcp\n";
+        let dockerfile =
+            "# syntax=docker/dockerfile:1\n# escape=`\nFROM alpine\nEXPOSE `\n  8080/tcp\n";
+
+        assert_eq!(detect_primary_exposed_port(dockerfile), Some(8080));
+    }
+
+    #[test]
+    fn ignores_escape_comments_after_the_parser_directive_block() {
+        let dockerfile =
+            "# ordinary comment\n# escape=`\nFROM alpine\nEXPOSE \\\n  8080/tcp\n";
 
         assert_eq!(detect_primary_exposed_port(dockerfile), Some(8080));
     }
