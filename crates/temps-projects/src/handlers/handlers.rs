@@ -35,6 +35,7 @@ use super::types::{
     UpdateAutomaticDeployRequest, UpdateDeploymentConfigRequest, UpdateGitSettingsRequest,
     UpdateProjectSettingsRequest,
 };
+use crate::services::service_templates::{prepare_template, COOLIFY_CATALOG_URL};
 use crate::services::types::CreateProjectEnvVar;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::Serialize;
@@ -686,6 +687,40 @@ fn inspect_zip_manifests(path: &std::path::Path) -> Result<BTreeMap<String, Stri
     Ok(manifests)
 }
 
+fn service_template_origin_attestation(
+    origin: &temps_entities::preset::ComposeTemplateOrigin,
+    actual_install_plan_digest: &str,
+    compose: &str,
+) -> Option<String> {
+    if origin.provider != "coolify"
+        || origin.source_url != COOLIFY_CATALOG_URL
+        || origin.install_plan_digest.as_deref() != Some(actual_install_plan_digest)
+    {
+        return None;
+    }
+    temps_core::templates::pending_service_catalog_template_provenance(&origin.slug, compose)
+}
+
+async fn attested_service_template_provenance(
+    state: &AppState,
+    project: &CreateProjectRequest,
+) -> Option<String> {
+    if project.source_type != SourceType::Compose || project.preset != "docker-compose" {
+        return None;
+    }
+    let config: temps_presets::preset_config_schema::DockerComposePresetConfig =
+        serde_json::from_value(project.preset_config.clone()?).ok()?;
+    let origin = config.template_origin?;
+    let (template, _) = state
+        .service_template_catalog
+        .get(&origin.slug)
+        .await
+        .ok()?;
+    let prepared = prepare_template(&origin.slug, &template).ok()?;
+    let actual_install_plan_digest = prepared.install_plan_digest(&template);
+    service_template_origin_attestation(&origin, &actual_install_plan_digest, &prepared.compose)
+}
+
 /// Create a new project
 #[utoipa::path(
     post,
@@ -729,6 +764,15 @@ pub async fn create_project(
             ));
     }
 
+    // The generic project API deliberately ignores client-provided template
+    // labels. For catalog services the backend persists a pending, source-bound
+    // marker only after replaying the catalog digest attestation. The first
+    // immutable Compose save promotes it to telemetry provenance only when its
+    // exact bytes match, so arbitrary user text cannot leave the instance as a
+    // template slug and unrelated Compose cannot poison install metrics.
+    let service_template_provenance =
+        attested_service_template_provenance(state.as_ref(), &project).await;
+
     let project_req = crate::services::types::CreateProjectRequest {
         name: project.name,
         expected_slug: project.expected_slug,
@@ -748,7 +792,7 @@ pub async fn create_project(
         git_provider_connection_id: project.git_provider_connection_id,
         exposed_port: project.exposed_port,
         source_type: project.source_type,
-        template_slug: None,
+        template_slug: service_template_provenance,
     };
 
     let new_project = state
@@ -2571,7 +2615,7 @@ mod tests {
     use super::{
         authorize_storage_service_scopes, compose_path_for_candidate, drop_preset_candidate_from,
         parse_owner_repo_from_git_url, project_created_from_template_telemetry_event,
-        require_git_settings_permissions, DropPresetCandidate,
+        require_git_settings_permissions, service_template_origin_attestation, DropPresetCandidate,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -2965,6 +3009,42 @@ mod tests {
 
         assert_eq!(event.properties["template_source"], "bundled");
         assert_eq!(event.properties["template_slug"], "observability-starter");
+    }
+
+    #[test]
+    fn service_catalog_provenance_requires_exact_server_attestation() {
+        let compose = "services:\n  keycloak:\n    image: quay.io/keycloak/keycloak:26.3.2\n";
+        let origin = temps_entities::preset::ComposeTemplateOrigin {
+            provider: "coolify".to_string(),
+            slug: "keycloak".to_string(),
+            source_url: crate::services::service_templates::COOLIFY_CATALOG_URL.to_string(),
+            install_plan_digest: Some("reviewed-digest".to_string()),
+            source_revision: Some("public-revision".to_string()),
+            template_last_updated_at: None,
+        };
+
+        let pending = service_template_origin_attestation(&origin, "reviewed-digest", compose)
+            .expect("matching catalog metadata should create pending provenance");
+        assert_eq!(
+            temps_core::templates::resolve_pending_service_catalog_template_provenance(
+                &pending, compose
+            ),
+            temps_core::templates::PendingServiceCatalogResolution::Matched(
+                "service_catalog:keycloak".to_string()
+            )
+        );
+
+        let mut mismatched = origin.clone();
+        mismatched.install_plan_digest = Some("different-digest".to_string());
+        assert!(
+            service_template_origin_attestation(&mismatched, "reviewed-digest", compose).is_none()
+        );
+
+        let mut untrusted = origin;
+        untrusted.slug = "customer@example.com".to_string();
+        assert!(
+            service_template_origin_attestation(&untrusted, "reviewed-digest", compose).is_none()
+        );
     }
 
     /// Regression test for ADR-028 finding #2: `get_project_by_slug` guard bypass.

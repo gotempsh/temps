@@ -134,6 +134,15 @@ Compose size, and pagination are bounded. Credentials are generated in the
 browser using Web Crypto, submitted once, encrypted at rest by the existing
 project environment-variable service, and never returned by the catalog API.
 
+Anonymous deployment telemetry reuses the existing opt-out product funnel.
+The backend persists a service-catalog slug only after matching the public
+provider, canonical catalog URL, complete preflight install-plan digest, and
+exact first saved Compose revision. A mismatch clears the pending provenance
+instead of allowing a later revision to inherit it. Attempt, success, failure,
+and cancellation events can therefore carry that bounded public slug. Failures
+contain only the fixed classifier stage/code and version—never Compose, URLs,
+variable names or values, or raw error text.
+
 The installer deliberately rejects rather than auto-elevates templates that
 request Docker socket access, host namespaces, arbitrary extra capabilities,
 devices, or privileged mode. Fixed host ports are safe to normalize because

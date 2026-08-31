@@ -519,6 +519,7 @@ function TemplateInstaller({
                 provider: 'coolify',
                 slug: detail.slug,
                 sourceUrl: detail.source_url,
+                installPlanDigest: detail.install_plan_digest,
                 sourceRevision: detail.source_revision,
                 templateLastUpdatedAt: detail.template_last_updated_at,
               },

@@ -205,6 +205,23 @@ impl ComposeSourceService {
                 expected_revision,
             });
         }
+        let template_slug_update = if current_revision.is_none() {
+            project.template_slug.as_deref().and_then(|provenance| {
+                match temps_core::templates::resolve_pending_service_catalog_template_provenance(
+                    provenance, &content,
+                ) {
+                    temps_core::templates::PendingServiceCatalogResolution::NotPending => None,
+                    temps_core::templates::PendingServiceCatalogResolution::Matched(provenance) => {
+                        Some(Some(provenance))
+                    }
+                    temps_core::templates::PendingServiceCatalogResolution::Mismatched => {
+                        Some(None)
+                    }
+                }
+            })
+        } else {
+            None
+        };
 
         let archive_entry =
             compose_archive_entry_path(project_id, &project.directory, &compose_path)?;
@@ -287,6 +304,9 @@ impl ComposeSourceService {
         config.compose_services = service_snapshots(&services);
         let mut project_update: projects::ActiveModel = project.into();
         project_update.preset_config = Set(Some(PresetConfig::DockerCompose(config)));
+        if let Some(template_slug) = template_slug_update {
+            project_update.template_slug = Set(template_slug);
+        }
         if let Err(source) = project_update.update(&transaction).await {
             let _ = transaction.rollback().await;
             let _ = tokio::fs::remove_file(&absolute_path).await;
@@ -531,7 +551,7 @@ fn compose_path_and_origin(
             path: compose_path,
         });
     }
-    let origin = config.template_origin.clone();
+    let origin = config.template_origin.as_deref().cloned();
     Ok((compose_path, config, origin))
 }
 
@@ -872,6 +892,63 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn first_compose_source_promotes_only_matching_catalog_provenance() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let storage = tempfile::tempdir().unwrap();
+        let service = ComposeSourceService::new(db.clone(), storage.path().to_path_buf());
+        let catalog_compose =
+            "services:\n  keycloak:\n    image: quay.io/keycloak/keycloak:26.3.2\n";
+        let pending = temps_core::templates::pending_service_catalog_template_provenance(
+            "keycloak",
+            catalog_compose,
+        )
+        .unwrap();
+
+        let (matching_project, _) =
+            compose_project_fixture(db.as_ref(), "compose-catalog-match").await;
+        let mut matching_update: projects::ActiveModel = matching_project.clone().into();
+        matching_update.template_slug = Set(Some(pending.clone()));
+        matching_update.update(db.as_ref()).await.unwrap();
+        service
+            .save(matching_project.id, catalog_compose.to_string(), None)
+            .await
+            .unwrap();
+        let matching = projects::Entity::find_by_id(matching_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            matching.template_slug.as_deref(),
+            Some("service_catalog:keycloak")
+        );
+
+        let (mismatched_project, _) =
+            compose_project_fixture(db.as_ref(), "compose-catalog-mismatch").await;
+        let mut mismatched_update: projects::ActiveModel = mismatched_project.clone().into();
+        mismatched_update.template_slug = Set(Some(pending));
+        mismatched_update.update(db.as_ref()).await.unwrap();
+        service
+            .save(
+                mismatched_project.id,
+                "services:\n  unrelated:\n    image: example/unrelated:latest\n".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+        let mismatched = projects::Entity::find_by_id(mismatched_project.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(mismatched.template_slug, None);
     }
 
     #[tokio::test]

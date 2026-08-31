@@ -51,8 +51,10 @@ pub struct DockerComposePresetConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_override: Option<String>,
 
-    /// Informational catalog origin captured when a service template creates the project.
-    /// This is not a server-attested audit record.
+    /// Catalog origin captured when a service template creates the project.
+    /// Its digest and the first saved Compose source are revalidated for
+    /// anonymous telemetry provenance, but this is not a general-purpose audit
+    /// attestation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub template_origin: Option<ComposeTemplateOrigin>,
 

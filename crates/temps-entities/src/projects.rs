@@ -100,9 +100,10 @@ pub struct Model {
     /// (`drop`), so the same project can be shipped from git, a Docker image, or
     /// a local folder. NULL means off.
     pub allow_alternate_sources: Option<bool>,
-    /// Bounded template provenance: a reviewed bundled slug or `custom`.
-    /// NULL means the project was not created through the template catalog;
-    /// operator-defined slugs are never stored in this field.
+    /// Bounded template provenance: a reviewed bundled slug, `custom`, a
+    /// source-bound pending marker, or an attested
+    /// `service_catalog:<public-slug>` marker. Pending markers are promoted or
+    /// cleared on the first Compose save and are never emitted in telemetry.
     #[serde(skip_serializing)]
     pub template_slug: Option<String>,
     /// GitLab webhook ID returned by POST /projects/:id/hooks when we auto-install

@@ -4342,11 +4342,18 @@ impl DeploymentService {
         // (cancel_running_deployments) paths, since those fire automatically
         // on every push / restart and would swamp the funnel signal with
         // non-user-initiated noise.
+        let template_provenance = projects::Entity::find_by_id(project_id)
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .and_then(|project| project.template_slug);
         self.telemetry().report(
             temps_core::telemetry::TelemetryEvent::new(
                 temps_core::telemetry::TelemetryEventKind::DeployCancelled,
             )
-            .with("trigger", "user"),
+            .with("trigger", "user")
+            .with_template_provenance(template_provenance.as_deref()),
         );
 
         info!(

@@ -746,7 +746,30 @@ scenario explicitly tests an upgrade.
     preflight limit, and stays within the documented response/memory bounds.
   - Proxy latency and unrelated deployments remain within their release SLOs.
 
-### 12.12 Beta release gate
+### 12.12 Anonymous install telemetry
+
+- **Setup**: Enable anonymous product telemetry on staging; choose one standard
+  and one elevated service template plus a Compose revision with a deterministic
+  image-pull failure.
+- **Steps**: Deploy each healthy template, redeploy one, trigger the failing
+  revision, and cancel one in-progress attempt. Inspect only the outbound
+  telemetry envelopes—not the application's private analytics data.
+- **Pass**:
+  - `deploy_attempted`, `deploy_succeeded`, `deploy_failed`, and
+    `deploy_cancelled` carry `template_source=service_catalog` and the exact
+    public `template_slug` attested by the server against the first saved
+    Compose revision.
+  - Failure events include fixed `failure_stage`, `failure_code`, and
+    `classifier_version` properties; no raw error text is transmitted.
+  - A forged provider, source URL, install-plan digest, private slug, mismatched
+    first Compose source, or normal Custom Compose project never emits a
+    service-catalog slug.
+  - Telemetry disabled by the operator produces no outbound request and never
+    changes installation behavior, latency, or the user-visible result.
+  - Funnel counts reconcile: attempts equal terminal successes, failures, and
+    explicit cancellations plus deployments still in progress at query time.
+
+### 12.13 Beta release gate
 
 The feature may ship as Beta only when all scenarios above that apply to the
 changed surface pass, zero critical/high security findings remain, and the
@@ -756,7 +779,7 @@ both compatibility tiers. Record every failure with template revision,
 architecture, stage, and sanitized logs; do not relabel a failing template as
 supported to improve the percentage.
 
-### 12.13 Stable graduation gate
+### 12.14 Stable graduation gate
 
 Remove the Beta label only after all of the following are true for two
 consecutive releases:

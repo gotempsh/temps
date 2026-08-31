@@ -7,6 +7,7 @@
 //! Templates are defined in a YAML configuration file for easy customization.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -247,6 +248,26 @@ const BUNDLED_TEMPLATES: &str = include_str!("../templates.yaml");
 /// Maximum template slug length accepted by the catalog and project schema.
 pub const MAX_TEMPLATE_SLUG_CHARS: usize = 255;
 
+/// Prefix used for server-attested service-catalog provenance stored on a
+/// project. The suffix is a public catalog slug that was matched against the
+/// catalog and install-plan digest by the project-creation handler.
+pub const SERVICE_CATALOG_TEMPLATE_PREFIX: &str = "service_catalog:";
+
+/// Internal marker held only between project creation and the first saved
+/// Compose revision. It binds server-validated catalog metadata to the exact
+/// normalized Compose bytes before telemetry attribution is promoted.
+const PENDING_SERVICE_CATALOG_TEMPLATE_PREFIX: &str = "service_catalog_pending:";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingServiceCatalogResolution {
+    /// The stored value is not a pending service-catalog marker.
+    NotPending,
+    /// The first saved Compose source matches the server-attested template.
+    Matched(String),
+    /// The marker is malformed or the saved source does not match.
+    Mismatched,
+}
+
 /// Fixed, reviewable labels that are safe to include in anonymous telemetry.
 ///
 /// Operators can load private templates with arbitrary slugs. Those slugs must
@@ -267,6 +288,73 @@ pub fn telemetry_safe_template_slug(slug: &str) -> Option<&str> {
     BUNDLED_TELEMETRY_TEMPLATE_SLUGS
         .contains(&slug)
         .then_some(slug)
+}
+
+fn valid_service_catalog_slug(slug: &str) -> bool {
+    !slug.is_empty()
+        && slug.len() + SERVICE_CATALOG_TEMPLATE_PREFIX.len() <= MAX_TEMPLATE_SLUG_CHARS
+        && slug.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_' | b'.')
+        })
+}
+
+/// Build bounded provenance for a service-catalog template after the caller
+/// has verified the slug and install-plan digest against the live catalog.
+///
+/// This validates only the storage/wire shape. Callers must not use it as a
+/// substitute for catalog attestation because arbitrary user text must never
+/// be promoted into anonymous telemetry.
+pub fn service_catalog_template_provenance(slug: &str) -> Option<String> {
+    valid_service_catalog_slug(slug).then(|| format!("{SERVICE_CATALOG_TEMPLATE_PREFIX}{slug}"))
+}
+
+/// Build a server-only pending provenance marker bound to the exact Compose
+/// source returned by the catalog detail endpoint.
+pub fn pending_service_catalog_template_provenance(slug: &str, compose: &str) -> Option<String> {
+    if !valid_service_catalog_slug(slug) {
+        return None;
+    }
+    let checksum = hex::encode(Sha256::digest(compose.as_bytes()));
+    let provenance = format!("{PENDING_SERVICE_CATALOG_TEMPLATE_PREFIX}{slug}:{checksum}");
+    (provenance.len() <= MAX_TEMPLATE_SLUG_CHARS).then_some(provenance)
+}
+
+/// Resolve pending catalog provenance when the first immutable Compose source
+/// is saved. A mismatch is terminal: callers should clear the pending marker
+/// so unrelated content can never inherit a catalog template label later.
+pub fn resolve_pending_service_catalog_template_provenance(
+    provenance: &str,
+    compose: &str,
+) -> PendingServiceCatalogResolution {
+    let Some(payload) = provenance.strip_prefix(PENDING_SERVICE_CATALOG_TEMPLATE_PREFIX) else {
+        return PendingServiceCatalogResolution::NotPending;
+    };
+    let Some((slug, expected_checksum)) = payload.rsplit_once(':') else {
+        return PendingServiceCatalogResolution::Mismatched;
+    };
+    if !valid_service_catalog_slug(slug)
+        || expected_checksum.len() != 64
+        || !expected_checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return PendingServiceCatalogResolution::Mismatched;
+    }
+    let actual_checksum = hex::encode(Sha256::digest(compose.as_bytes()));
+    if actual_checksum != expected_checksum {
+        return PendingServiceCatalogResolution::Mismatched;
+    }
+    service_catalog_template_provenance(slug)
+        .map(PendingServiceCatalogResolution::Matched)
+        .unwrap_or(PendingServiceCatalogResolution::Mismatched)
+}
+
+/// Recover the public service-catalog slug from previously attested project
+/// provenance. Other provenance values, including operator templates, remain
+/// private and return `None`.
+pub fn telemetry_safe_service_catalog_slug(provenance: &str) -> Option<&str> {
+    let slug = provenance.strip_prefix(SERVICE_CATALOG_TEMPLATE_PREFIX)?;
+    valid_service_catalog_slug(slug).then_some(slug)
 }
 
 /// Return the public bundled slug only when the selected template exactly
@@ -840,6 +928,71 @@ templates:
             Some("observability-starter")
         );
         assert_eq!(telemetry_safe_template_slug("customer-acme-private"), None);
+    }
+
+    #[test]
+    fn service_catalog_provenance_is_bounded_and_round_trips_public_slugs() {
+        let provenance = service_catalog_template_provenance("keycloak").unwrap();
+        assert_eq!(provenance, "service_catalog:keycloak");
+        assert_eq!(
+            telemetry_safe_service_catalog_slug(&provenance),
+            Some("keycloak")
+        );
+
+        let too_long = "x".repeat(MAX_TEMPLATE_SLUG_CHARS);
+        for invalid in [
+            "",
+            "Private Service",
+            "../private",
+            "customer@example.com",
+            too_long.as_str(),
+        ] {
+            assert!(service_catalog_template_provenance(invalid).is_none());
+        }
+        assert!(telemetry_safe_service_catalog_slug("custom").is_none());
+    }
+
+    #[test]
+    fn pending_service_catalog_provenance_requires_the_exact_first_source() {
+        let compose = "services:\n  keycloak:\n    image: quay.io/keycloak/keycloak:26.3.2\n";
+        let pending = pending_service_catalog_template_provenance("keycloak", compose)
+            .expect("public catalog slug should produce pending provenance");
+
+        assert_eq!(
+            resolve_pending_service_catalog_template_provenance(&pending, compose),
+            PendingServiceCatalogResolution::Matched("service_catalog:keycloak".to_string())
+        );
+        assert_eq!(
+            resolve_pending_service_catalog_template_provenance(
+                &pending,
+                "services:\n  unrelated:\n    image: example/unrelated:latest\n"
+            ),
+            PendingServiceCatalogResolution::Mismatched
+        );
+        assert_eq!(
+            resolve_pending_service_catalog_template_provenance(
+                "service_catalog:keycloak",
+                compose
+            ),
+            PendingServiceCatalogResolution::NotPending
+        );
+        assert!(telemetry_safe_service_catalog_slug(&pending).is_none());
+    }
+
+    #[test]
+    fn pending_service_catalog_provenance_rejects_malformed_or_oversized_values() {
+        assert_eq!(
+            resolve_pending_service_catalog_template_provenance(
+                "service_catalog_pending:keycloak:not-a-sha256",
+                "services: {}\n"
+            ),
+            PendingServiceCatalogResolution::Mismatched
+        );
+        let oversized_slug = "x".repeat(MAX_TEMPLATE_SLUG_CHARS);
+        assert!(
+            pending_service_catalog_template_provenance(&oversized_slug, "services: {}\n")
+                .is_none()
+        );
     }
 
     #[test]

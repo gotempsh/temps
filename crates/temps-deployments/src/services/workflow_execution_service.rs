@@ -180,17 +180,7 @@ fn with_template_telemetry(
     event: temps_core::telemetry::TelemetryEvent,
     template_slug: Option<&str>,
 ) -> temps_core::telemetry::TelemetryEvent {
-    let safe_slug = template_slug.and_then(temps_core::templates::telemetry_safe_template_slug);
-    let template_source = match (template_slug, safe_slug) {
-        (None, _) => "none",
-        (Some(_), Some(_)) => "bundled",
-        (Some(_), None) => "custom",
-    };
-
-    event
-        .with("is_template", template_slug.is_some())
-        .with("template_source", template_source)
-        .with_opt("template_slug", safe_slug.map(str::to_string))
+    event.with_template_provenance(template_slug)
 }
 
 /// Preserve the pre-taxonomy `reason` wire value exactly for existing
@@ -2750,11 +2740,19 @@ impl WorkflowExecutionService {
                 // its own `deploy_cancelled` with trigger="user"). Tagging
                 // this one "workflow" keeps the two mutually exclusive so
                 // the funnel is never double-counted.
+                let template_provenance =
+                    projects::Entity::find_by_id(updated_deployment.project_id)
+                        .one(self.db.as_ref())
+                        .await
+                        .ok()
+                        .flatten()
+                        .and_then(|project| project.template_slug);
                 self.telemetry().report(
                     temps_core::telemetry::TelemetryEvent::new(
                         temps_core::telemetry::TelemetryEventKind::DeployCancelled,
                     )
-                    .with("trigger", "workflow"),
+                    .with("trigger", "workflow")
+                    .with_template_provenance(template_provenance.as_deref()),
                 );
             }
             _ => {}
@@ -3354,6 +3352,25 @@ mod tests {
             .properties
             .contains_key("template_slug"));
         assert!(!serialized.contains(private_slug));
+
+        let service_provenance =
+            temps_core::templates::service_catalog_template_provenance("keycloak").unwrap();
+        let service_failure = deploy_failed_telemetry_event(
+            Some("failed to pull image: manifest unknown"),
+            Some("compose".to_string()),
+            Some("docker-compose".to_string()),
+            Some(service_provenance),
+        );
+        assert_eq!(
+            service_failure.properties["template_source"],
+            "service_catalog"
+        );
+        assert_eq!(service_failure.properties["template_slug"], "keycloak");
+        assert_eq!(service_failure.properties["failure_stage"], "image");
+        assert_eq!(
+            service_failure.properties["failure_code"],
+            "base_image_pull"
+        );
     }
 
     #[test]

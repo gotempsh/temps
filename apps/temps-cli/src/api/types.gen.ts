@@ -3066,6 +3066,11 @@ export type ComposeSourceServiceResponse = {
  * attestation: API clients can supply project configuration directly.
  */
 export type ComposeTemplateOrigin = {
+    /**
+     * Digest of the complete normalized install plan reviewed during
+     * preflight. Used to attest anonymous catalog telemetry at creation time.
+     */
+    installPlanDigest?: string | null;
     provider: string;
     slug: string;
     sourceRevision?: string | null;

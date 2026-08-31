@@ -271,9 +271,9 @@ pub struct CreateProjectRequest {
     /// Source type for deployments (git, docker_image, or static_files)
     #[serde(default)]
     pub source_type: SourceType,
-    /// Bounded template provenance: a reviewed bundled slug or the fixed
-    /// `custom` marker. Internal only; normal project-creation paths leave it
-    /// unset and operator-defined slugs are never persisted here.
+    /// Bounded template provenance: a reviewed bundled slug, the fixed
+    /// `custom` marker, or a source-bound service-catalog marker. Internal only;
+    /// operator-defined slugs are never persisted here.
     #[serde(default)]
     pub template_slug: Option<String>,
 }

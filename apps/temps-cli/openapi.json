@@ -6187,6 +6187,13 @@
       "ComposeTemplateOrigin": {
         "description": "Informational catalog origin captured from the install request.\n\nThe server preserves it after creation, but it is not a cryptographic\nattestation: API clients can supply project configuration directly.",
         "properties": {
+          "installPlanDigest": {
+            "description": "Digest of the complete normalized install plan reviewed during\npreflight. Used to attest anonymous catalog telemetry at creation time.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "provider": {
             "type": "string"
           },
