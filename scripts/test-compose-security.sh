@@ -219,7 +219,9 @@ jq -e --arg workload_network "$TEMPS_NETWORK_NAME" '
   and (.services.temps.networks | has("temps-app-network"))
   and .services.temps.networks["temps-network"].ipv4_address == "198.18.255.10"
   and .services.postgres.networks["temps-network"].ipv4_address == "198.18.255.11"
+  and (.services.postgres.networks | has("temps-host-network"))
   and .services.clickhouse.networks["temps-network"].ipv4_address == "198.18.255.12"
+  and (.services.clickhouse.networks | has("temps-host-network"))
   and .services["temps-ingress"].networks["temps-app-network"].ipv4_address == "198.20.255.10"
   and (.services["temps-ingress"].networks | has("temps-ingress-network") | not)
   and (.services["temps-ingress"].cap_drop | index("ALL") != null)
@@ -235,6 +237,10 @@ jq -e --arg workload_network "$TEMPS_NETWORK_NAME" '
   and (.services["temps-admin-ingress"].environment | has("TEMPS_ADMIN_INGRESS_PASSWORD") | not)
   and .networks["temps-ingress-network"].driver_opts["com.docker.network.bridge.enable_icc"] == "false"
   and .networks["temps-ingress-network"].driver_opts["com.docker.network.bridge.trusted_host_interfaces"] == "lo"
+  and .networks["temps-host-network"].driver_opts["com.docker.network.bridge.enable_icc"] == "false"
+  and .networks["temps-host-network"].driver_opts["com.docker.network.bridge.enable_ip_masquerade"] == "false"
+  and .networks["temps-host-network"].driver_opts["com.docker.network.bridge.trusted_host_interfaces"] == "lo"
+  and (.networks["temps-host-network"].internal != true)
   and .networks["temps-network"].internal == true
   and .networks["temps-network"].ipam.config[0].subnet == "198.18.255.0/24"
   and .networks["temps-app-network"].name == $workload_network

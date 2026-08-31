@@ -70,6 +70,10 @@ services:
     networks:
       temps-network:
         ipv4_address: ${TEMPS_POSTGRES_INTERNAL_IP:-198.18.255.11}
+      # Docker does not realize published ports for containers attached only to
+      # an internal bridge. This dedicated bridge exists solely so the
+      # loopback-bound diagnostic port is actually reachable from the host.
+      temps-host-network:
     healthcheck:
       # Authenticated TCP query: unlike pg_isready, this catches a password
       # mismatch after upgrading an existing data volume.
@@ -146,6 +150,9 @@ services:
     networks:
       temps-network:
         ipv4_address: ${TEMPS_CLICKHOUSE_INTERNAL_IP:-198.18.255.12}
+      # Keep host publication separate from the internal control plane. ICC is
+      # disabled on this bridge; Temps still connects over temps-network.
+      temps-host-network:
     ulimits:
       nofile:
         soft: 262144
@@ -355,6 +362,16 @@ networks:
       config:
         - subnet: ${TEMPS_INGRESS_SUBNET:-198.19.255.0/24}
           gateway: ${TEMPS_INGRESS_GATEWAY_IP:-198.19.255.1}
+  temps-host-network:
+    # Docker Engine does not install host port mappings for a container that is
+    # attached only to an internal bridge. This non-internal bridge enables the
+    # explicitly loopback-bound PostgreSQL and ClickHouse diagnostic ports,
+    # while disabling direct container-to-container traffic on the bridge.
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.trusted_host_interfaces: "lo"
 
 secrets:
   temps_admin_password:
