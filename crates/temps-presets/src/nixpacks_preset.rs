@@ -360,7 +360,25 @@ impl Drop for StagedConfig {
 #[async_trait]
 impl Preset for NixpacksPreset {
     fn project_type(&self) -> ProjectType {
-        ProjectType::Server
+        // The static provider serves a directory of pre-built files with no
+        // language runtime (see `autopack_provider`'s "static" mapping) — it
+        // must report `Static` so the workflow planner routes it through
+        // `DeployStaticJob` (extract files from the built image, serve them
+        // straight off disk via temps-proxy) instead of `DeployImageJob`
+        // (run the image as a long-lived container). The container path is
+        // both unnecessary overhead for static content and actively broken
+        // for this specific image: the official `caddy:2-alpine` binary
+        // carries a `cap_net_bind_service` file capability, and Temps' own
+        // container hardening (`cap_drop: ALL`) makes the kernel refuse to
+        // exec a binary whose file capabilities exceed the process's
+        // capability bounding set. Rollback/promotion also branch on this
+        // (see `temps-deployments/src/services/services.rs`) to skip
+        // container redeploy entirely for static presets.
+        if self.display_provider() == NixpacksProvider::Static {
+            ProjectType::Static
+        } else {
+            ProjectType::Server
+        }
     }
 
     fn label(&self) -> String {
@@ -447,6 +465,17 @@ impl Preset for NixpacksPreset {
             [provider] => provider.variant_slug().to_string(),
             _ => "nixpacks".to_string(),
         }
+    }
+
+    fn needs_container_build(&self) -> bool {
+        // The static provider has nothing to build — it serves the checked-out
+        // source directly. Reporting `false` here (rather than the usual
+        // `static_output_dir()` override) means the workflow planner skips
+        // Docker/autopack entirely for this preset: no image, no Caddy, no
+        // container ever runs. `static_output_dir()` stays `None` (the
+        // default) since there is no build-tool output directory inside an
+        // image to extract from.
+        self.display_provider() != NixpacksProvider::Static
     }
 }
 
@@ -571,6 +600,44 @@ mod tests {
             NixpacksPreset::auto().stored_preset(),
             Some(temps_entities::preset::Preset::Nixpacks)
         );
+    }
+
+    #[test]
+    fn the_static_provider_skips_docker_entirely() {
+        // The workflow planner (`plan_git_deployment`) picks the source-only
+        // deployment path (`DeployStaticFromSourceJob`: no Docker, no
+        // autopack, no container) over the container path purely based on
+        // `needs_container_build()` being `false`. Getting this wrong for the
+        // static provider means an image gets built (and possibly *run*)
+        // for content that's just files to serve — wasted build time at
+        // best, and at worst a crash-looping container, since
+        // `caddy:2-alpine`'s binary carries a file capability Temps' hardened
+        // `cap_drop: ALL` containers cannot grant.
+        let preset = NixpacksPreset::new(NixpacksProvider::Static);
+        assert_eq!(preset.project_type(), ProjectType::Static);
+        assert!(!preset.needs_container_build());
+        // No build-tool output dir inside an image — there is no image.
+        assert_eq!(preset.static_output_dir(), None);
+
+        // Rollback/promotion (`temps-deployments/src/services/services.rs`)
+        // also key off `project_type()` to skip container redeploy for static
+        // presets — every other provider must keep reporting `Server` and
+        // still needing a container build.
+        for provider in [
+            NixpacksProvider::Node,
+            NixpacksProvider::Python,
+            NixpacksProvider::Rust,
+            NixpacksProvider::Go,
+        ] {
+            let preset = NixpacksPreset::new(provider);
+            assert_eq!(preset.project_type(), ProjectType::Server, "{provider:?}");
+            assert!(preset.needs_container_build(), "{provider:?}");
+        }
+
+        // Multi-provider / auto-detect configurations have no single static
+        // root to report — must not misreport `Static`.
+        assert_eq!(NixpacksPreset::auto().project_type(), ProjectType::Server);
+        assert!(NixpacksPreset::auto().needs_container_build());
     }
 
     #[tokio::test]

@@ -315,6 +315,20 @@ pub trait Preset: fmt::Display + Send + Sync {
     fn static_output_dir(&self) -> Option<String> {
         None // Default: requires runtime server
     }
+
+    /// Whether this preset needs a container build step at all.
+    ///
+    /// `true` for every preset that compiles something (even static-capable
+    /// ones like Vite still need `npm run build` inside a container) or that
+    /// runs as a long-lived server. `false` only for presets whose deployable
+    /// output *is* the checked-out source with no build step — there the
+    /// workflow planner skips Docker/image-build entirely and deploys
+    /// directly from the downloaded repository, since building an image just
+    /// to immediately discard it (or, worse, run it as a container purely to
+    /// serve static files) is pure overhead.
+    fn needs_container_build(&self) -> bool {
+        true
+    }
 }
 
 pub fn all_presets() -> Vec<Box<dyn Preset>> {

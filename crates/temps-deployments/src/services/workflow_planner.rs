@@ -1601,8 +1601,44 @@ impl WorkflowPlanner {
             vec![]
         };
 
-        // Determine deployment strategy: Static or Container
-        let deploy_job_id = if let Some(output_dir) = static_output_dir {
+        // Presets that have nothing to build (a plain static site: no
+        // package.json, no build tool) skip Docker/autopack entirely — a
+        // single job deploys straight from the downloaded checkout. Building
+        // an image just to immediately discard it (or, worse, run it as a
+        // long-lived container purely to serve files) is pure overhead for
+        // content with zero compile step.
+        let needs_container_build = preset_instance
+            .as_ref()
+            .map(|preset| preset.needs_container_build())
+            .unwrap_or(true);
+
+        // Determine deployment strategy: source-only, static (build + extract), or Container
+        let deploy_job_id = if !needs_container_build {
+            debug!(
+                "📄 Using source-only static deployment for preset {} (no build step)",
+                project.preset
+            );
+
+            jobs.push(JobDefinition {
+                job_id: "deploy_static".to_string(),
+                job_type: "DeployStaticFromSourceJob".to_string(),
+                name: "Deploy Static Files".to_string(),
+                description: Some(
+                    "Deploy static files directly from the repository — no build, no container"
+                        .to_string(),
+                ),
+                dependencies: build_dependencies.clone(),
+                job_config: Some(serde_json::json!({
+                    "directory": project.directory,
+                    "project_slug": project.slug,
+                    "environment_slug": environment.slug,
+                    "deployment_slug": deployment.slug
+                })),
+                required_for_completion: true,
+            });
+
+            "deploy_static".to_string()
+        } else if let Some(output_dir) = static_output_dir {
             // Static deployment path: BuildImageJob + DeployStaticJob
             debug!("📦 Using static deployment for preset {}", project.preset);
             debug!("📂 Static output directory: {}", output_dir);
@@ -2010,10 +2046,12 @@ impl WorkflowPlanner {
             debug!("Skipping screenshot job - screenshots are disabled in config");
         }
 
-        // Job 7: Scan for vulnerabilities (only if git info is available)
+        // Job 7: Scan for vulnerabilities (only if git info is available AND a
+        // container image was actually built — a source-only static deployment
+        // has no image to scan)
         // This runs in parallel with other post-deployment jobs AFTER deployment is marked complete
         // NOT required for deployment completion - if it fails, deployment still succeeds
-        if has_git_info {
+        if has_git_info && needs_container_build {
             jobs.push(JobDefinition {
                 job_id: "scan_vulnerabilities".to_string(),
                 job_type: "ScanVulnerabilitiesJob".to_string(),
@@ -2041,8 +2079,9 @@ impl WorkflowPlanner {
         }
 
         // Job 8: Capture source maps (only for JS-based presets with git info)
-        // Extracts .map files from the built image for error symbolication
-        if has_git_info {
+        // Extracts .map files from the built image for error symbolication —
+        // a source-only static deployment has no build output to extract from
+        if has_git_info && needs_container_build {
             // Search paths are relative to the image's WORKDIR (detected at runtime).
             // The CaptureSourceMapsJob inspects the image to find the WORKDIR and
             // prepends it to these relative paths.
