@@ -192,13 +192,6 @@ impl DeployStaticFromSourceJob {
             tokio::fs::create_dir_all(dest).await?;
             let mut entries = tokio::fs::read_dir(source).await?;
             while let Some(entry) = entries.next_entry().await? {
-                stats.entry_count += 1;
-                if stats.entry_count > MAX_STATIC_ENTRIES {
-                    return Err(std::io::Error::other(format!(
-                        "deployment exceeds the {MAX_STATIC_ENTRIES} entry limit"
-                    )));
-                }
-
                 let file_type = entry.file_type().await?;
                 let source_path = entry.path();
                 let relative = source_path
@@ -216,7 +209,22 @@ impl DeployStaticFromSourceJob {
                     // present; skip rather than follow them here too.
                     stats.skipped.push(relative.display().to_string());
                     continue;
-                } else if file_type.is_dir() {
+                }
+
+                // Only entries that survive both skip checks above are ones
+                // StaticDeployer's own copy will actually see and count, so
+                // this limit must be checked here too — not before the skips
+                // — or a tree with many harmless dotfiles/symlinks could be
+                // rejected even though the publishable artifact is well
+                // under the limit.
+                stats.entry_count += 1;
+                if stats.entry_count > MAX_STATIC_ENTRIES {
+                    return Err(std::io::Error::other(format!(
+                        "deployment exceeds the {MAX_STATIC_ENTRIES} entry limit"
+                    )));
+                }
+
+                if file_type.is_dir() {
                     Self::copy_publishable_tree(source_root, &source_path, &dest_path, stats)
                         .await?;
                 } else {
@@ -516,6 +524,49 @@ mod tests {
         let context = context_with_repo_dir(repo.path());
         let result = job.execute(context).await;
         assert!(result.is_err(), "parent-dir escape must be rejected");
+    }
+
+    #[tokio::test]
+    async fn skipped_entries_do_not_count_against_the_entry_limit() {
+        // A tree can have far more than MAX_STATIC_ENTRIES *raw* directory
+        // entries while still producing a small publishable artifact, if most
+        // of them are filtered out (dotfiles here) before ever being copied.
+        // The entry limit must be checked against what actually gets copied,
+        // not against every entry `read_dir` yields.
+        let repo = tempfile::tempdir().unwrap();
+        write_file(&repo.path().join("index.html"), "<h1>hi</h1>");
+        for i in 0..=MAX_STATIC_ENTRIES {
+            write_file(&repo.path().join(format!(".skip-{i}")), "x");
+        }
+
+        let base_dir = tempfile::tempdir().unwrap();
+        let deployer = Arc::new(FilesystemStaticDeployer::new(base_dir.path().to_path_buf()));
+
+        let job = DeployStaticFromSourceJob::new(
+            "deploy_static".to_string(),
+            "download_repo".to_string(),
+            ".".to_string(),
+            "my-project".to_string(),
+            "production".to_string(),
+            "deploy-123".to_string(),
+            deployer,
+        );
+
+        let context = context_with_repo_dir(repo.path());
+        let result = job.execute(context).await;
+        assert!(
+            result.is_ok(),
+            "a tree with one publishable file must not be rejected just because \
+             it also contains more than MAX_STATIC_ENTRIES skipped dotfiles: {:?}",
+            result.err()
+        );
+
+        let context = result.unwrap().context;
+        let file_count: u32 = context
+            .get_output("deploy_static", "file_count")
+            .unwrap()
+            .unwrap();
+        assert_eq!(file_count, 1, "only the one publishable file should count");
     }
 
     #[tokio::test]
