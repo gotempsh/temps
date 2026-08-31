@@ -333,7 +333,11 @@ mod tests {
 
         assert!(appendix.contains("analytics get_page_path_detail"));
         assert!(appendix.contains("--page_path"));
+        assert!(appendix.contains("--start_date"));
+        assert!(appendix.contains("--end_date"));
         assert!(appendix.contains("countries"));
+        assert!(appendix.contains("last 30 days"));
+        assert!(appendix.contains("Do not use `get_analytics_visitor_sessions`"));
         assert!(appendix.contains("get_analytics_visitor_sessions"));
         assert!(appendix.contains("individual visitor"));
     }

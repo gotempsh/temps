@@ -767,4 +767,41 @@ mod tests {
             "page-detail summary missing from recovery help: {message}"
         );
     }
+
+    #[test]
+    fn unknown_operation_recovery_only_lists_permitted_operations() {
+        let index = analytics_discovery_index();
+
+        let result = resolve(&index, "analytics get_analytics --path /managed", &|op| {
+            op.operation_id != "get_analytics_visitor_sessions"
+        });
+        let CliAction::Terminal(message) = result else {
+            panic!("unknown analytics operation unexpectedly resolved");
+        };
+
+        assert!(message.contains("get_page_path_detail"));
+        assert!(
+            !message.contains("get_analytics_visitor_sessions"),
+            "recovery help exposed an operation rejected by the permission filter: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_mutation_preserves_write_tool_redirect_and_section_help() {
+        let index = analytics_discovery_index();
+
+        let result = resolve(&index, "analytics delete_analytics", &|_| true);
+        let CliAction::Terminal(message) = result else {
+            panic!("unknown analytics mutation unexpectedly resolved");
+        };
+
+        assert!(
+            message.contains("temps_write"),
+            "redirect missing: {message}"
+        );
+        assert!(
+            message.contains("get_page_path_detail"),
+            "section recovery help missing: {message}"
+        );
+    }
 }
