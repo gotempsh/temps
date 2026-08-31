@@ -17,9 +17,9 @@ export type ServiceCategoryIcon =
 
 export function serviceCategoryIcon(category: string): ServiceCategoryIcon {
   const normalized = category.trim().toLowerCase()
+  const tokens = new Set(normalized.split(/[^a-z0-9]+/).filter(Boolean))
 
-  if (normalized.includes('ai') || normalized.includes('machine learning'))
-    return 'ai'
+  if (tokens.has('ai') || normalized.includes('machine learning')) return 'ai'
   if (normalized.includes('automat')) return 'automation'
   if (
     normalized.includes('communication') ||

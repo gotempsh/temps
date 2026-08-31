@@ -48,7 +48,10 @@ The backend:
    capability approval. Existing fixed host bindings become random
    loopback-only bindings; fixed project/container names are removed.
 5. Describes Coolify magic variables as typed generators or user inputs. The UI
-   generates credentials locally, including dependent Supabase JWT values. The
+   generates credentials locally, including dependent Supabase JWT values. Any
+   upstream literal credential default is replaced with a generated encrypted
+   variable while preserving equality where multiple services shared the same
+   bootstrap value. The
    backend plans the final project slug and derives URL/FQDN values through
    Temps' canonical hostname strategy. Project creation claims that exact slug
    or returns 409 so the installer can re-plan once. Sensitive values are
@@ -76,24 +79,32 @@ The backend:
    executed Compose rejection remains a 200 response with `ready: false` and
    actionable validation errors.
 
-Installing creates a regular `uploaded_source` project with the normalized
-`docker-compose.yml`, environment variables, all public service/port
-selections, capability approvals, an informational catalog-origin record, and
-the normal Temps deployment pipeline. Project creation optimistically claims
-the slug planned by preflight. If a concurrent create wins, it fails safely
-with 409 and the installer re-runs preflight once, so collision suffixes,
-truncation, and multi-route hostnames do not silently drift. If a later upload
-or deployment step fails, the created project is retained for inspection and
-safe retry instead of being deleted by a browser-side rollback.
+Installing creates a regular Temps-owned `compose` project with the normalized
+Compose YAML, environment variables, all public service/port selections,
+capability approvals, an informational catalog-origin record, and the normal
+Temps deployment pipeline. The initial YAML and every later edit are stored as
+immutable Compose source revisions. The Build settings editor can change an
+image version or any Compose setting, save a new revision with optimistic
+concurrency, and deploy it. Redeploying a historical deployment selects that
+deployment's saved revision rather than whichever document happens to be
+current.
 
-The selected Compose is copied into the project's source bundle. Updating the
-remote catalog therefore affects only future installs; existing deployments
-retain their reviewed configuration and remain operator-controlled. Images may
-still use mutable registry tags, so identical Compose does not yet guarantee
-bit-for-bit reproducible redeployment. The stored provider, slug, catalog
-revision, and template timestamp are preserved after creation and provide the
-basis for a future reviewable upstream diff. They are not a server-attested
-audit record because API clients can create projects directly.
+Project creation optimistically claims the slug planned by preflight. If a
+concurrent create wins, it fails safely with 409 and the installer re-runs
+preflight once, so collision suffixes, truncation, and multi-route hostnames do
+not silently drift. Catalog access requires both project-create and
+deployment-create permission so a custom API key is not offered an install it
+cannot complete. If a later source-save or deployment step fails, the created
+project and its actionable error remain available for inspection and retry.
+
+Updating the remote catalog affects only future installs; an existing project
+is independent of Coolify and retains its reviewed revisions. Each deployment
+snapshots the source bundle, Compose path, working directory, and discovered
+health path needed to replay it after later project edits. Images may still use
+mutable registry tags, so identical Compose does not yet guarantee bit-for-bit
+reproducible redeployment. The stored provider, slug, catalog revision, and
+template timestamp are informational provenance rather than a server-attested
+audit record.
 
 The page attributes the catalog to Coolify and links to both the upstream
 repository and each service's documentation. Coolify's catalog is distributed

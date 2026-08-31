@@ -47,6 +47,7 @@ import {
 } from '@/components/ui/tooltip'
 import { ErrorAlert } from '@/components/utils/ErrorAlert'
 import { deployComposeSource } from '@/lib/compose-source-api'
+import { composeRevisionForRedeploy } from '@/lib/project-deploy-action'
 import { ReloadableImage } from '@/components/utils/ReloadableImage'
 import GithubIcon from '@/icons/Github'
 import { useAssistantPageContext } from '@/components/ai/AiAssistantContext'
@@ -940,8 +941,13 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
   })
 
   const redeployCompose = useMutation({
-    mutationFn: (environmentId: number) =>
-      deployComposeSource(project.id, environmentId),
+    mutationFn: ({
+      environmentId,
+      revision,
+    }: {
+      environmentId: number
+      revision?: number
+    }) => deployComposeSource(project.id, environmentId, revision),
     meta: {
       errorTitle: 'Failed to deploy Compose source',
     },
@@ -1000,12 +1006,14 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     tag,
     environmentId,
     imageRef: editedImageRef,
+    composeRevision,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
     imageRef?: string
+    composeRevision?: number
   }) => {
     if (project.source_type === 'docker_image') {
       const ref =
@@ -1023,7 +1031,10 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     }
 
     if (project.source_type === 'compose') {
-      await redeployCompose.mutateAsync(environmentId)
+      await redeployCompose.mutateAsync({
+        environmentId,
+        revision: composeRevision,
+      })
       navigate(`/projects/${project.slug}/deployments?autoRefresh=true`)
       return
     }
@@ -1427,6 +1438,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
             redeployCompose.isPending
           }
           imageRef={deployment.metadata?.externalImageRef}
+          composeRevision={composeRevisionForRedeploy(deployment)}
         />
       </div>
     </div>

@@ -397,6 +397,17 @@ function LogViewer({ project, deployment, job }: LogViewerProps) {
         </div>
       </div>
 
+      {connectionStatus === 'error' && (
+        <div
+          role="status"
+          className="flex items-center gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm text-amber-800 dark:text-amber-200"
+        >
+          <AlertTriangle className="h-4 w-4 shrink-0" />
+          Log stream disconnected. Existing lines are preserved while Temps
+          reconnects.
+        </div>
+      )}
+
       {/* Log Viewer */}
       <div className="relative group">
         {/* Copy Button - CodeBlock Style */}

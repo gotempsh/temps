@@ -2394,10 +2394,15 @@ impl WorkflowExecutionService {
                     ));
                 }
                 let absolute_path = self.config_service.data_dir().join(archive_path);
+                let is_compose_source = config
+                    .get("compose_source")
+                    .and_then(|value| value.as_bool())
+                    .unwrap_or(false);
                 Ok(Arc::new(PrepareSourceBundleJob::new(
                     db_job.job_id.clone(),
                     absolute_path,
                     project.slug.clone(),
+                    is_compose_source,
                 )))
             }
 

@@ -814,6 +814,7 @@ fn popular_discovery_tags(
 
 fn require_service_template_access(auth: &AuthContext) -> Result<(), Problem> {
     permission_guard!(auth, ProjectsCreate);
+    permission_guard!(auth, DeploymentsCreate);
     Ok(())
 }
 
@@ -986,13 +987,28 @@ mod tests {
     }
 
     #[test]
-    fn catalog_access_requires_projects_create_permission() {
+    fn catalog_access_requires_project_and_deployment_create_permissions() {
         let denied = require_service_template_access(&api_key_auth(Vec::new()))
             .expect_err("custom key should be denied")
             .into_response();
         assert_eq!(denied.status(), StatusCode::FORBIDDEN);
 
-        let allowed = api_key_auth(vec![Permission::ProjectsCreate]);
+        let projects_only =
+            require_service_template_access(&api_key_auth(vec![Permission::ProjectsCreate]))
+                .expect_err("project-only key cannot complete the advertised install flow")
+                .into_response();
+        assert_eq!(projects_only.status(), StatusCode::FORBIDDEN);
+
+        let deployments_only =
+            require_service_template_access(&api_key_auth(vec![Permission::DeploymentsCreate]))
+                .expect_err("deployment-only key cannot create the template project")
+                .into_response();
+        assert_eq!(deployments_only.status(), StatusCode::FORBIDDEN);
+
+        let allowed = api_key_auth(vec![
+            Permission::ProjectsCreate,
+            Permission::DeploymentsCreate,
+        ]);
         assert!(require_service_template_access(&allowed).is_ok());
     }
 

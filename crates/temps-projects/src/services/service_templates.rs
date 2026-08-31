@@ -237,7 +237,7 @@ pub struct TemplateVariable {
 
 impl TemplateVariable {
     pub fn is_secret(&self) -> bool {
-        self.kind.is_secret() || variable_name_is_secret(&self.name)
+        self.kind.is_secret() || temps_presets::compose_environment_name_is_secret(&self.name)
     }
 }
 
@@ -366,57 +366,6 @@ fn digest_field(hasher: &mut Sha256, value: &[u8]) {
     hasher.update(value);
 }
 
-fn variable_name_is_secret(name: &str) -> bool {
-    let name = name.trim().to_ascii_uppercase();
-    if name.is_empty()
-        || name.starts_with("PUBLIC_")
-        || name.starts_with("NEXT_PUBLIC_")
-        || name.starts_with("NUXT_PUBLIC_")
-        || name.starts_with("VITE_")
-        || name.starts_with("REACT_APP_")
-        || name.contains("PUBLISHABLE_KEY")
-        || name.contains("PUBLIC_KEY")
-        || name.contains("KEY_PUBLIC")
-        || name.contains("SITE_KEY")
-        || name.contains("ANON_KEY")
-        || name.starts_with("SERVICE_URL_")
-        || name.starts_with("SERVICE_FQDN_")
-    {
-        return false;
-    }
-
-    const SECRET_MARKERS: &[&str] = &[
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "TOKEN",
-        "PRIVATE_KEY",
-        "API_KEY",
-        "ACCESS_KEY",
-        "DATABASE_URL",
-        "POSTGRES_URL",
-        "MYSQL_URL",
-        "MONGODB_URL",
-        "MONGODB_URI",
-        "REDIS_URL",
-        "AMQP_URL",
-        "CONNECTION_STRING",
-        "DSN",
-        "WEBHOOK_URL",
-    ];
-    SECRET_MARKERS.iter().any(|marker| {
-        name == *marker
-            || name.starts_with(&format!("{marker}_"))
-            || name.ends_with(&format!("_{marker}"))
-            || name.contains(&format!("_{marker}_"))
-    }) || name == "PASS"
-        || name.ends_with("_PASS")
-        || name == "PASSPHRASE"
-        || name.ends_with("_PASSPHRASE")
-        || name == "APP_KEY"
-        || name.split('_').any(|segment| segment == "KEY")
-}
-
 pub async fn preflight_template(
     slug: &str,
     template: &CoolifyTemplate,
@@ -480,6 +429,11 @@ pub async fn preflight_template(
     errors.dedup();
     warnings.sort();
     warnings.dedup();
+    if errors.is_empty() {
+        if let Err(error) = temps_presets::validate_compose_credentials(&prepared.compose) {
+            errors.push(error.to_string());
+        }
+    }
     let compose_validated = if errors.is_empty() {
         let _permit = PREFLIGHT_COMPOSE_SLOTS.try_acquire().map_err(|_| {
             ServiceTemplateCatalogError::PreflightBusy {
@@ -936,7 +890,12 @@ impl ServiceTemplateCatalog {
                 .iter()
                 .map(|(slug, template)| {
                     let analysis = match prepare_template(slug, template) {
-                        Ok(prepared) => {
+                        Ok(mut prepared) => {
+                            if let Err(error) =
+                                temps_presets::validate_compose_credentials(&prepared.compose)
+                            {
+                                prepared.compatibility_issues.push(error.to_string());
+                            }
                             let installable = prepared.installable();
                             let compatibility_tier = prepared.compatibility_tier();
                             CatalogTemplateAnalysis {
@@ -1036,6 +995,7 @@ pub fn prepare_template(
 
     let mut transformations = Vec::new();
     normalize_project_owned_names(&mut root, &mut transformations);
+    externalize_literal_credentials(&mut root, &mut transformations);
     let mut compatibility_issues = compatibility_issues(&root);
     let mut warnings = compatibility_warnings(&root);
     normalize_published_ports(&mut root, &mut compatibility_issues, &mut transformations);
@@ -1089,6 +1049,122 @@ pub fn prepare_template(
         transformations,
         capability_requirements,
     })
+}
+
+fn externalize_literal_credentials(
+    root: &mut YamlValue,
+    transformations: &mut Vec<TemplateTransformation>,
+) {
+    let mut variables_by_literal = BTreeMap::<String, String>::new();
+    let Some(services) = root.get_mut("services").and_then(YamlValue::as_mapping_mut) else {
+        return;
+    };
+    for (service_name, definition) in services {
+        let service_name = service_name.as_str().unwrap_or("service");
+        let Some(environment) = definition
+            .as_mapping_mut()
+            .and_then(|service| service.get_mut("environment"))
+        else {
+            continue;
+        };
+        match environment {
+            YamlValue::Sequence(entries) => {
+                for entry in entries {
+                    let Some(text) = entry.as_str().map(str::to_string) else {
+                        continue;
+                    };
+                    let Some((name, value)) = text.split_once('=') else {
+                        continue;
+                    };
+                    let name = name.to_string();
+                    if should_externalize_literal_credential(&name, value) {
+                        let variable = variables_by_literal
+                            .entry(value.to_string())
+                            .or_insert_with(|| generated_credential_variable(service_name, &name))
+                            .clone();
+                        *entry = YamlValue::String(format!("{name}=${{{variable}}}"));
+                        transformations.push(TemplateTransformation {
+                            code: "externalized_literal_credential",
+                            description: format!(
+                                "Replaced a plaintext credential default for {service_name}.{name} with a generated encrypted value"
+                            ),
+                        });
+                    }
+                }
+            }
+            YamlValue::Mapping(entries) => {
+                for (name, value) in entries {
+                    let (Some(name), Some(text)) = (name.as_str(), value.as_str()) else {
+                        continue;
+                    };
+                    if should_externalize_literal_credential(name, text) {
+                        let variable = variables_by_literal
+                            .entry(text.to_string())
+                            .or_insert_with(|| generated_credential_variable(service_name, name))
+                            .clone();
+                        *value = YamlValue::String(format!("${{{variable}}}"));
+                        transformations.push(TemplateTransformation {
+                            code: "externalized_literal_credential",
+                            description: format!(
+                                "Replaced a plaintext credential default for {service_name}.{name} with a generated encrypted value"
+                            ),
+                        });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn should_externalize_literal_credential(name: &str, value: &str) -> bool {
+    temps_presets::compose_environment_name_is_secret(name)
+        && !value.trim().is_empty()
+        && !safe_compose_variable_reference(value)
+        && !value.contains("://")
+        && !value.to_ascii_uppercase().contains("-----BEGIN ")
+}
+
+fn safe_compose_variable_reference(value: &str) -> bool {
+    let value = value.trim();
+    if let Some(name) = value.strip_prefix('$') {
+        if !name.starts_with('{') {
+            return is_environment_name(name);
+        }
+    }
+    let Some(expression) = value
+        .strip_prefix("${")
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return false;
+    };
+    let name_end = expression
+        .find([':', '-', '?', '+'])
+        .unwrap_or(expression.len());
+    let name = &expression[..name_end];
+    if !is_environment_name(name) {
+        return false;
+    }
+    let operator = &expression[name_end..];
+    operator.is_empty()
+        || operator.starts_with('?')
+        || operator.starts_with(":?")
+        || operator == ":-"
+        || operator == "-"
+}
+
+fn generated_credential_variable(service_name: &str, name: &str) -> String {
+    let suffix = format!("{service_name}_{name}")
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    format!("SERVICE_PASSWORD_{suffix}")
 }
 
 fn discover_backing_services(root: &YamlValue) -> Vec<TemplateBackingService> {
@@ -2204,6 +2280,46 @@ mod tests {
     }
 
     #[test]
+    fn replaces_literal_template_credentials_with_generated_encrypted_variables() {
+        let prepared = prepare_template(
+            "supabase",
+            &template(
+                r#"services:
+  realtime:
+    image: supabase/realtime:latest
+    environment:
+      DB_ENC_KEY: supabaserealtime
+      API_KEY_RATE_LIMIT: ${API_KEY_RATE_LIMIT:-60/minute}
+  worker:
+    image: example/worker
+    environment:
+      SHARED_SECRET: supabaserealtime
+"#,
+                None,
+            ),
+        )
+        .expect("template should be normalized");
+
+        assert!(prepared
+            .compose
+            .contains("DB_ENC_KEY: ${SERVICE_PASSWORD_REALTIME_DB_ENC_KEY}"));
+        assert!(prepared
+            .compose
+            .contains("SHARED_SECRET: ${SERVICE_PASSWORD_REALTIME_DB_ENC_KEY}"));
+        assert!(prepared
+            .compose
+            .contains("API_KEY_RATE_LIMIT: ${API_KEY_RATE_LIMIT:-60/minute}"));
+        assert!(prepared.variables.iter().any(|variable| {
+            variable.name == "SERVICE_PASSWORD_REALTIME_DB_ENC_KEY"
+                && variable.kind == TemplateVariableKind::GeneratedPassword
+        }));
+        assert_eq!(
+            temps_presets::validate_compose_credentials(&prepared.compose),
+            Ok(())
+        );
+    }
+
+    #[test]
     fn blocks_host_affecting_templates_with_context() {
         let prepared = prepare_template(
             "socket-manager",
@@ -2623,6 +2739,33 @@ volumes:
             .errors
             .iter()
             .any(|error| error.contains("explicit approval")));
+    }
+
+    #[tokio::test]
+    async fn preflight_rejects_embedded_credentials_before_project_creation() {
+        let result = preflight_template(
+            "literal-credential",
+            &template(
+                r#"services:
+  app:
+    image: example/app:1
+    environment:
+      DATABASE_URL: postgres://admin:literal-secret-that-must-not-be-stored@db/app
+"#,
+                None,
+            ),
+            &BTreeMap::new(),
+            &[],
+        )
+        .await
+        .unwrap();
+
+        assert!(!result.ready());
+        assert!(!result.compose_validated);
+        assert!(result.errors.iter().any(|error| {
+            error.contains("services.app.environment.DATABASE_URL")
+                && !error.contains("literal-secret-that-must-not-be-stored")
+        }));
     }
 
     #[tokio::test]

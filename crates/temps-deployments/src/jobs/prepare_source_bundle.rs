@@ -14,15 +14,22 @@ pub struct PrepareSourceBundleJob {
     job_id: String,
     archive_path: PathBuf,
     project_slug: String,
+    is_compose_source: bool,
     extraction_id: uuid::Uuid,
 }
 
 impl PrepareSourceBundleJob {
-    pub fn new(job_id: String, archive_path: PathBuf, project_slug: String) -> Self {
+    pub fn new(
+        job_id: String,
+        archive_path: PathBuf,
+        project_slug: String,
+        is_compose_source: bool,
+    ) -> Self {
         Self {
             job_id,
             archive_path,
             project_slug,
+            is_compose_source,
             extraction_id: uuid::Uuid::new_v4(),
         }
     }
@@ -159,10 +166,18 @@ impl WorkflowTask for PrepareSourceBundleJob {
         &self.job_id
     }
     fn name(&self) -> &str {
-        "Prepare Uploaded Source"
+        if self.is_compose_source {
+            "Prepare Compose Source"
+        } else {
+            "Prepare Uploaded Source"
+        }
     }
     fn description(&self) -> &str {
-        "Securely extracts uploaded source code for the preset builder"
+        if self.is_compose_source {
+            "Securely extracts the saved Compose revision"
+        } else {
+            "Securely extracts uploaded source code for the preset builder"
+        }
     }
 
     async fn execute(&self, mut context: WorkflowContext) -> Result<JobResult, WorkflowError> {

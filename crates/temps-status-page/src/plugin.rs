@@ -87,27 +87,25 @@ impl StatusPagePlugin {
                             // Persist the deployment's health path before checking so
                             // the first post-deploy result reflects the service's real
                             // health endpoint rather than a stale `/` probe.
-                            if let Some(ref health_path) = job.health_check_path {
-                                tracing::info!(
-                                    "Updating monitor check_path to '{}' for environment {} in project {}",
-                                    health_path,
+                            tracing::info!(
+                                health_path = ?job.health_check_path,
+                                environment_id = job.environment_id,
+                                project_id = job.project_id,
+                                "Synchronizing managed monitor path with successful deployment"
+                            );
+                            if let Err(e) = monitor_service
+                                .update_managed_check_path_for_environment(
+                                    job.project_id,
                                     job.environment_id,
-                                    job.project_id
+                                    job.health_check_path.as_deref(),
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    "Failed to synchronize managed monitor check_path for environment {}: {:?}",
+                                    job.environment_id,
+                                    e
                                 );
-                                if let Err(e) = monitor_service
-                                    .update_check_path_for_environment(
-                                        job.project_id,
-                                        job.environment_id,
-                                        health_path,
-                                    )
-                                    .await
-                                {
-                                    tracing::error!(
-                                        "Failed to update monitor check_path for environment {}: {:?}",
-                                        job.environment_id,
-                                        e
-                                    );
-                                }
                             }
 
                             // Existing monitors only receive MonitorCreated once, so
@@ -238,11 +236,13 @@ impl TempsPlugin for StatusPagePlugin {
 
             // Create health check service with mandatory ConfigService and JobQueue
             // The service will emit StatusCheckCompleted jobs for outage detection
-            let health_check_service = Arc::new(HealthCheckService::new(
-                db.clone(),
-                config_service,
-                queue_service.clone(),
-            ));
+            let health_check_service = Arc::new(
+                HealthCheckService::new(db.clone(), config_service, queue_service.clone())
+                    .map_err(|error| PluginError::PluginRegistrationFailed {
+                        plugin_name: "status-page".to_string(),
+                        error: error.to_string(),
+                    })?,
+            );
             context.register_service(health_check_service.clone());
 
             // Start the health check scheduler with job receiver for realtime monitor creation

@@ -5,6 +5,7 @@ import { getEnvironmentsOptions } from '@/api/client/@tanstack/react-query.gen'
 import type { ProjectResponse } from '@/api/client/types.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Card,
   CardContent,
@@ -123,8 +124,16 @@ export function ComposeSourceEditor({
   if (sourceQuery.isLoading) {
     return (
       <Card>
-        <CardContent className="flex min-h-40 items-center justify-center">
-          <Loader2 className="size-5 animate-spin text-muted-foreground" />
+        <CardHeader className="space-y-2">
+          <Skeleton className="h-5 w-48" />
+          <Skeleton className="h-4 w-full max-w-2xl" />
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <Skeleton className="h-96 w-full rounded-lg" />
+          <div className="flex justify-end gap-2">
+            <Skeleton className="h-9 w-24" />
+            <Skeleton className="h-9 w-32" />
+          </div>
         </CardContent>
       </Card>
     )

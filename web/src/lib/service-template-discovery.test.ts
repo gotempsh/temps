@@ -12,6 +12,8 @@ describe('service template discovery', () => {
     expect(serviceCategoryIcon('Developer Tools')).toBe('developer')
     expect(serviceCategoryIcon('Monitoring & Analytics')).toBe('monitoring')
     expect(serviceCategoryIcon('Authentication')).toBe('security')
+    expect(serviceCategoryIcon('Email')).toBe('generic')
+    expect(serviceCategoryIcon('AI & Machine Learning')).toBe('ai')
     expect(serviceCategoryIcon('Uncategorized')).toBe('generic')
   })
 

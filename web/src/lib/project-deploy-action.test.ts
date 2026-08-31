@@ -3,6 +3,7 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  composeRevisionForRedeploy,
   deploymentsAfterStartPath,
   projectDeployLaunchMode,
 } from './project-deploy-action'
@@ -23,5 +24,12 @@ describe('project header deploy action', () => {
     expect(deploymentsAfterStartPath('my-project')).toBe(
       '/projects/my-project/deployments?autoRefresh=true'
     )
+  })
+
+  test('redeploys a compose deployment from its immutable saved revision', () => {
+    expect(
+      composeRevisionForRedeploy({ metadata: { sourceBundleId: 42 } })
+    ).toBe(42)
+    expect(composeRevisionForRedeploy({ metadata: null })).toBeUndefined()
   })
 })

@@ -126,6 +126,7 @@ interface RedeploymentModalProps {
     tag?: string
     environmentId: number
     imageRef?: string
+    composeRevision?: number
   }) => Promise<void>
   defaultBranch?: string
   defaultType?: 'branch' | 'commit' | 'tag'
@@ -141,6 +142,8 @@ interface RedeploymentModalProps {
    * image via deploy_from_image instead of the git pipeline.
    */
   imageRef?: string | null
+  /** Immutable Compose source bundle selected by a historical deployment. */
+  composeRevision?: number
 }
 
 export function RedeploymentModal({
@@ -156,6 +159,7 @@ export function RedeploymentModal({
   isLoading,
   mode = 'new',
   imageRef,
+  composeRevision,
 }: RedeploymentModalProps) {
   // Image-based (docker_image) projects deploy a prebuilt image, not a git
   // ref — the parent routes confirmation through deploy_from_image.
@@ -440,7 +444,7 @@ export function RedeploymentModal({
         toast.error('No environment specified for deployment')
         return
       }
-      await onConfirm({ environmentId: envId })
+      await onConfirm({ environmentId: envId, composeRevision })
       return
     }
 
@@ -555,14 +559,20 @@ export function RedeploymentModal({
         {isComposeDeploy ? (
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">
-              Deploy the latest saved Docker Compose revision. Edit and save the
-              YAML in Build settings before deploying if you want to change an
-              image version or service configuration.
+              {composeRevision != null
+                ? `Redeploy saved Docker Compose revision #${composeRevision}.`
+                : 'Deploy the latest saved Docker Compose revision.'}{' '}
+              Edit and save the YAML in Build settings before deploying if you
+              want to change an image version or service configuration.
             </p>
             {mode === 'redeploy' ? (
               <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 rounded-md border bg-muted/50 p-4">
                 <div className="text-sm font-medium">Source:</div>
-                <div className="text-sm">Latest saved Compose revision</div>
+                <div className="text-sm">
+                  {composeRevision != null
+                    ? `Saved Compose revision #${composeRevision}`
+                    : 'Latest saved Compose revision'}
+                </div>
                 <div className="text-sm font-medium">Environment:</div>
                 <div className="text-sm">{environmentName || 'Loading...'}</div>
               </div>

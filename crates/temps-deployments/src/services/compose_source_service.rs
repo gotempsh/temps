@@ -120,7 +120,7 @@ impl ComposeSourceService {
 
     pub async fn get(&self, project_id: i32) -> Result<ComposeSourceDocument, ComposeSourceError> {
         let project = self.load_project(project_id).await?;
-        let (compose_path, _, origin) = compose_path_and_origin(&project)?;
+        let (current_compose_path, _, origin) = compose_path_and_origin(&project)?;
         let bundle = find_revision(self.db.as_ref(), project_id, None)
             .await
             .map_err(|source| ComposeSourceError::Database {
@@ -129,7 +129,20 @@ impl ComposeSourceService {
                 source,
             })?
             .ok_or_else(|| source_not_found(project_id, None))?;
-        let content = read_archive(&self.data_dir, project_id, &bundle, &compose_path).await?;
+        let (compose_path, _, archive_entry) = bundle_compose_location(
+            project_id,
+            &bundle,
+            &current_compose_path,
+            &project.directory,
+        )?;
+        let content = read_archive(
+            &self.data_dir,
+            project_id,
+            &bundle,
+            &archive_entry,
+            Some(&compose_path),
+        )
+        .await?;
         let services = parse_source(project_id, &content)?;
         Ok(ComposeSourceDocument {
             content,
@@ -193,8 +206,10 @@ impl ComposeSourceService {
             });
         }
 
+        let archive_entry =
+            compose_archive_entry_path(project_id, &project.directory, &compose_path)?;
         let archive_content = content.clone();
-        let archive_compose_path = compose_path.clone();
+        let archive_compose_path = archive_entry.clone();
         let archive = tokio::task::spawn_blocking(move || {
             create_archive(&archive_content, &archive_compose_path)
         })
@@ -247,6 +262,7 @@ impl ComposeSourceService {
             metadata: Set(Some(serde_json::json!({
                 "source_kind": COMPOSE_SOURCE_KIND,
                 "compose_path": compose_path,
+                "directory": project.directory,
                 "parent_revision": current_revision,
             }))),
             uploaded_at: Set(now),
@@ -304,8 +320,7 @@ impl ComposeSourceService {
         revision: Option<i32>,
     ) -> Result<PreparedComposeDeployment, ComposeSourceError> {
         let project = self.load_project(project_id).await?;
-        let health_check_path =
-            effective_health_check_path(project.id, project.preset_config.as_ref())?;
+        let (current_compose_path, mut config, _) = compose_path_and_origin(&project)?;
         let environment = environments::Entity::find_by_id(environment_id)
             .filter(environments::Column::ProjectId.eq(project_id))
             .filter(environments::Column::DeletedAt.is_null())
@@ -328,6 +343,32 @@ impl ComposeSourceService {
                 source,
             })?
             .ok_or_else(|| source_not_found(project_id, revision))?;
+        let (compose_path, directory, archive_entry) = bundle_compose_location(
+            project_id,
+            &bundle,
+            &current_compose_path,
+            &project.directory,
+        )?;
+        let content = read_archive(
+            &self.data_dir,
+            project_id,
+            &bundle,
+            &archive_entry,
+            Some(&compose_path),
+        )
+        .await?;
+        let parse_content = content.clone();
+        let selected_services =
+            tokio::task::spawn_blocking(move || parse_source(project_id, &parse_content))
+                .await
+                .map_err(|error| ComposeSourceError::Task {
+                    project_id,
+                    operation: "validate selected Compose revision",
+                    reason: error.to_string(),
+                })??;
+        config.compose_services = service_snapshots(&selected_services);
+        let health_check_path =
+            effective_health_check_path(project.id, Some(&PresetConfig::DockerCompose(config)))?;
 
         let now = Utc::now();
         let deployment = (deployments::ActiveModel {
@@ -351,6 +392,8 @@ impl ComposeSourceService {
                 "trigger": "compose_source",
                 "source": "compose",
                 "source_revision": bundle.id,
+                "compose_path": compose_path,
+                "directory": directory,
             }))),
             created_at: Set(now),
             updated_at: Set(now),
@@ -492,6 +535,61 @@ fn compose_path_and_origin(
     Ok((compose_path, config, origin))
 }
 
+fn compose_archive_entry_path(
+    project_id: i32,
+    directory: &str,
+    compose_path: &str,
+) -> Result<String, ComposeSourceError> {
+    let mut entry = PathBuf::new();
+    let directory = directory.trim();
+    if !directory.is_empty() && directory != "." && directory != "./" {
+        entry.push(directory);
+    }
+    entry.push(compose_path);
+    if entry.is_absolute()
+        || entry.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ComposeSourceError::UnsafeComposePath {
+            project_id,
+            path: entry.display().to_string(),
+        });
+    }
+    entry
+        .to_str()
+        .filter(|path| !path.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| ComposeSourceError::UnsafeComposePath {
+            project_id,
+            path: entry.display().to_string(),
+        })
+}
+
+fn bundle_compose_location(
+    project_id: i32,
+    bundle: &source_bundles::Model,
+    fallback_compose_path: &str,
+    fallback_directory: &str,
+) -> Result<(String, String, String), ComposeSourceError> {
+    let compose_path = bundle
+        .original_filename
+        .as_deref()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or(fallback_compose_path)
+        .to_string();
+    let directory = if bundle.directory.trim().is_empty() {
+        fallback_directory.to_string()
+    } else {
+        bundle.directory.clone()
+    };
+    let archive_entry = compose_archive_entry_path(project_id, &directory, &compose_path)?;
+    Ok((compose_path, directory, archive_entry))
+}
+
 fn parse_source(
     project_id: i32,
     content: &str,
@@ -519,294 +617,21 @@ fn parse_source(
 }
 
 fn reject_embedded_credentials(project_id: i32, content: &str) -> Result<(), ComposeSourceError> {
-    let mut root = serde_yaml::from_str::<serde_yaml::Value>(content).map_err(|error| {
-        ComposeSourceError::InvalidYaml {
-            project_id,
-            reason: error.to_string(),
+    match temps_presets::validate_compose_credentials(content) {
+        Ok(()) => Ok(()),
+        Err(temps_presets::ComposeCredentialValidationError::InvalidCompose(error)) => {
+            Err(ComposeSourceError::InvalidYaml {
+                project_id,
+                reason: error.to_string(),
+            })
         }
-    })?;
-    root.apply_merge()
-        .map_err(|error| ComposeSourceError::InvalidYaml {
-            project_id,
-            reason: format!("failed to expand YAML merge keys: {error}"),
-        })?;
-
-    if yaml_contains_private_key(&root) {
-        return Err(ComposeSourceError::EmbeddedCredential {
-            project_id,
-            location: "a private-key block".to_string(),
-        });
-    }
-
-    let Some(services) = root.get("services").and_then(serde_yaml::Value::as_mapping) else {
-        return Ok(());
-    };
-    for (service_name, definition) in services {
-        let service_name = service_name.as_str().unwrap_or("<unknown>");
-        let Some(environment) = definition.get("environment").and_then(|value| match value {
-            serde_yaml::Value::Sequence(_) | serde_yaml::Value::Mapping(_) => Some(value),
-            _ => None,
-        }) else {
-            continue;
-        };
-        match environment {
-            serde_yaml::Value::Sequence(entries) => {
-                for entry in entries.iter().filter_map(serde_yaml::Value::as_str) {
-                    let Some((name, value)) = entry.split_once('=') else {
-                        continue;
-                    };
-                    reject_environment_credential(project_id, service_name, name.trim(), value)?;
-                }
-            }
-            serde_yaml::Value::Mapping(entries) => {
-                for (name, value) in entries {
-                    let Some(name) = name.as_str() else {
-                        continue;
-                    };
-                    let Some(value) = yaml_scalar_string(value) else {
-                        continue;
-                    };
-                    reject_environment_credential(project_id, service_name, name, &value)?;
-                }
-            }
-            _ => {}
+        Err(temps_presets::ComposeCredentialValidationError::EmbeddedCredential { location }) => {
+            Err(ComposeSourceError::EmbeddedCredential {
+                project_id,
+                location,
+            })
         }
     }
-    Ok(())
-}
-
-fn reject_environment_credential(
-    project_id: i32,
-    service_name: &str,
-    name: &str,
-    value: &str,
-) -> Result<(), ComposeSourceError> {
-    let value = value.trim();
-    if value.is_empty() {
-        return Ok(());
-    }
-    let location = format!("services.{service_name}.environment.{name}");
-    if authenticated_url_has_literal_credentials(value) || url_query_has_literal_credential(value) {
-        return Err(ComposeSourceError::EmbeddedCredential {
-            project_id,
-            location,
-        });
-    }
-    if environment_name_is_secret(name)
-        && !variable_reference_only(value)
-        && !safe_database_url_template(name, value)
-    {
-        return Err(ComposeSourceError::EmbeddedCredential {
-            project_id,
-            location,
-        });
-    }
-    Ok(())
-}
-
-fn yaml_scalar_string(value: &serde_yaml::Value) -> Option<String> {
-    match value {
-        serde_yaml::Value::Null => None,
-        serde_yaml::Value::String(value) => Some(value.clone()),
-        serde_yaml::Value::Bool(value) => Some(value.to_string()),
-        serde_yaml::Value::Number(value) => Some(value.to_string()),
-        serde_yaml::Value::Sequence(_)
-        | serde_yaml::Value::Mapping(_)
-        | serde_yaml::Value::Tagged(_) => None,
-    }
-}
-
-fn yaml_contains_private_key(value: &serde_yaml::Value) -> bool {
-    match value {
-        serde_yaml::Value::String(value) => {
-            let uppercase = value.to_ascii_uppercase();
-            uppercase.contains("-----BEGIN PRIVATE KEY-----")
-                || uppercase.contains("-----BEGIN RSA PRIVATE KEY-----")
-                || uppercase.contains("-----BEGIN EC PRIVATE KEY-----")
-                || uppercase.contains("-----BEGIN OPENSSH PRIVATE KEY-----")
-        }
-        serde_yaml::Value::Sequence(values) => values.iter().any(yaml_contains_private_key),
-        serde_yaml::Value::Mapping(values) => values
-            .iter()
-            .any(|(key, value)| yaml_contains_private_key(key) || yaml_contains_private_key(value)),
-        serde_yaml::Value::Tagged(tagged) => yaml_contains_private_key(&tagged.value),
-        serde_yaml::Value::Null | serde_yaml::Value::Bool(_) | serde_yaml::Value::Number(_) => {
-            false
-        }
-    }
-}
-
-fn variable_reference_only(value: &str) -> bool {
-    let value = value.trim();
-    if let Some(name) = value.strip_prefix('$') {
-        if !name.starts_with('{') {
-            return environment_name_is_valid(name);
-        }
-    }
-    let Some(expression) = value
-        .strip_prefix("${")
-        .and_then(|value| value.strip_suffix('}'))
-    else {
-        return false;
-    };
-    let name_end = expression
-        .find([':', '-', '?', '+'])
-        .unwrap_or(expression.len());
-    let name = &expression[..name_end];
-    if !environment_name_is_valid(name) {
-        return false;
-    }
-    let operator = &expression[name_end..];
-    operator.is_empty()
-        || operator.starts_with('?')
-        || operator.starts_with(":?")
-        || operator == ":-"
-        || operator == "-"
-}
-
-fn authenticated_url_has_literal_credentials(value: &str) -> bool {
-    let Some((_, after_scheme)) = value.split_once("://") else {
-        return false;
-    };
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or_default();
-    let Some((userinfo, _)) = authority.rsplit_once('@') else {
-        return false;
-    };
-    let (username, password) = userinfo.split_once(':').unwrap_or((userinfo, ""));
-    (!username.is_empty() && !variable_reference_only(username))
-        || (!password.is_empty() && !variable_reference_only(password))
-}
-
-fn url_query_has_literal_credential(value: &str) -> bool {
-    let Some((_, query_and_fragment)) = value.split_once('?') else {
-        return false;
-    };
-    let query = query_and_fragment.split('#').next().unwrap_or_default();
-    url::form_urlencoded::parse(query.as_bytes()).any(|(name, value)| {
-        url_query_name_is_secret(&name)
-            && !value.trim().is_empty()
-            && !variable_reference_only(value.trim())
-    })
-}
-
-fn url_query_name_is_secret(name: &str) -> bool {
-    let normalized: String = name
-        .chars()
-        .map(|character| {
-            if character.is_ascii_alphanumeric() {
-                character.to_ascii_uppercase()
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    if environment_name_is_secret(&normalized) {
-        return true;
-    }
-
-    let compact: String = normalized
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .collect();
-    [
-        "PASSWORD",
-        "PASSWD",
-        "TOKEN",
-        "SECRET",
-        "APIKEY",
-        "ACCESSKEY",
-        "PRIVATEKEY",
-    ]
-    .iter()
-    .any(|marker| compact == *marker || compact.ends_with(marker))
-}
-
-fn safe_database_url_template(name: &str, value: &str) -> bool {
-    let uppercase = name.trim().to_ascii_uppercase();
-    let database_url = [
-        "DATABASE_URL",
-        "POSTGRES_URL",
-        "MYSQL_URL",
-        "MONGODB_URL",
-        "MONGODB_URI",
-        "REDIS_URL",
-        "AMQP_URL",
-        "CONNECTION_STRING",
-    ]
-    .iter()
-    .any(|marker| {
-        uppercase == *marker
-            || uppercase.starts_with(&format!("{marker}_"))
-            || uppercase.ends_with(&format!("_{marker}"))
-    });
-    database_url
-        && value.contains("://")
-        && !authenticated_url_has_literal_credentials(value)
-        && !url_query_has_literal_credential(value)
-}
-
-fn environment_name_is_secret(name: &str) -> bool {
-    let name = name.trim().to_ascii_uppercase();
-    if name.is_empty()
-        || name.starts_with("PUBLIC_")
-        || name.starts_with("NEXT_PUBLIC_")
-        || name.starts_with("NUXT_PUBLIC_")
-        || name.starts_with("VITE_")
-        || name.starts_with("REACT_APP_")
-        || name.contains("PUBLISHABLE_KEY")
-        || name.contains("PUBLIC_KEY")
-        || name.contains("KEY_PUBLIC")
-        || name.contains("SITE_KEY")
-        || name.contains("ANON_KEY")
-        || name.starts_with("SERVICE_URL_")
-        || name.starts_with("SERVICE_FQDN_")
-    {
-        return false;
-    }
-    const MARKERS: &[&str] = &[
-        "SECRET",
-        "PASSWORD",
-        "PASSWD",
-        "TOKEN",
-        "PRIVATE_KEY",
-        "API_KEY",
-        "ACCESS_KEY",
-        "DATABASE_URL",
-        "POSTGRES_URL",
-        "MYSQL_URL",
-        "MONGODB_URL",
-        "MONGODB_URI",
-        "REDIS_URL",
-        "AMQP_URL",
-        "CONNECTION_STRING",
-        "DSN",
-        "WEBHOOK_URL",
-    ];
-    MARKERS.iter().any(|marker| {
-        name == *marker
-            || name.starts_with(&format!("{marker}_"))
-            || name.ends_with(&format!("_{marker}"))
-            || name.contains(&format!("_{marker}_"))
-    }) || name == "PASS"
-        || name.ends_with("_PASS")
-        || name == "PASSPHRASE"
-        || name.ends_with("_PASSPHRASE")
-        || name == "APP_KEY"
-        || name.split('_').any(|segment| segment == "KEY")
-}
-
-fn environment_name_is_valid(value: &str) -> bool {
-    !value.is_empty()
-        && value
-            .bytes()
-            .next()
-            .is_some_and(|byte| byte.is_ascii_alphabetic() || byte == b'_')
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
 }
 
 fn create_archive(content: &str, compose_path: &str) -> Result<Vec<u8>, std::io::Error> {
@@ -829,23 +654,33 @@ async fn read_archive(
     data_dir: &Path,
     project_id: i32,
     bundle: &source_bundles::Model,
-    compose_path: &str,
+    archive_entry: &str,
+    legacy_entry: Option<&str>,
 ) -> Result<String, ComposeSourceError> {
     let archive_path = data_dir.join(&bundle.archive_path);
     let display_path = archive_path.display().to_string();
-    let compose_path = compose_path.to_string();
+    let mut entry_paths = vec![archive_entry.to_string()];
+    if let Some(legacy_entry) = legacy_entry.filter(|entry| *entry != archive_entry) {
+        entry_paths.push(legacy_entry.to_string());
+    }
     tokio::task::spawn_blocking(move || -> Result<String, std::io::Error> {
         let file = std::fs::File::open(&archive_path)?;
         let mut archive = zip::ZipArchive::new(file).map_err(std::io::Error::other)?;
-        let mut entry = archive
-            .by_name(&compose_path)
-            .map_err(std::io::Error::other)?;
-        if entry.size() > MAX_COMPOSE_SOURCE_BYTES as u64 {
-            return Err(std::io::Error::other("Compose source exceeds read limit"));
+        for entry_path in &entry_paths {
+            let Ok(mut entry) = archive.by_name(entry_path) else {
+                continue;
+            };
+            if entry.size() > MAX_COMPOSE_SOURCE_BYTES as u64 {
+                return Err(std::io::Error::other("Compose source exceeds read limit"));
+            }
+            let mut content = String::with_capacity(entry.size() as usize);
+            entry.read_to_string(&mut content)?;
+            return Ok(content);
         }
-        let mut content = String::with_capacity(entry.size() as usize);
-        entry.read_to_string(&mut content)?;
-        Ok(content)
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Compose entry not found (tried {})", entry_paths.join(", ")),
+        ))
     })
     .await
     .map_err(|error| ComposeSourceError::Task {
@@ -909,6 +744,164 @@ fn service_snapshots(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temps_database::test_utils::TestDatabase;
+    use temps_entities::upstream_config::UpstreamList;
+
+    async fn compose_project_fixture(
+        db: &DatabaseConnection,
+        slug: &str,
+    ) -> (projects::Model, environments::Model) {
+        let config = DockerComposeConfig {
+            compose_path: Some("stack/compose.yml".to_string()),
+            public_ports: vec![temps_entities::preset::ComposePublicPort {
+                service: "app".to_string(),
+                port: 8080,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let project = projects::ActiveModel {
+            name: Set(format!("Compose {slug}")),
+            repo_name: Set(String::new()),
+            repo_owner: Set(String::new()),
+            slug: Set(slug.to_string()),
+            preset: Set(Preset::DockerCompose),
+            preset_config: Set(Some(PresetConfig::DockerCompose(config))),
+            source_type: Set(SourceType::Compose),
+            directory: Set("saved-root".to_string()),
+            main_branch: Set("main".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            slug: Set("production".to_string()),
+            subdomain: Set(format!("{slug}-production")),
+            host: Set(format!("{slug}.test.local")),
+            upstreams: Set(UpstreamList::default()),
+            branch: Set(Some("main".to_string())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .unwrap();
+        (project, environment)
+    }
+
+    #[tokio::test]
+    async fn saved_revision_is_immutable_and_redeploys_from_its_snapshot() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let storage = tempfile::tempdir().unwrap();
+        let service = ComposeSourceService::new(db.clone(), storage.path().to_path_buf());
+        let (project, environment) = compose_project_fixture(db.as_ref(), "compose-snapshot").await;
+        let yaml = r#"services:
+  app:
+    image: example/app:1
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:8080/ready"]
+"#;
+
+        let saved = service
+            .save(project.id, yaml.to_string(), None)
+            .await
+            .unwrap();
+        assert_eq!(service.get(project.id).await.unwrap().content, yaml);
+        assert!(matches!(
+            service.save(project.id, yaml.to_string(), None).await,
+            Err(ComposeSourceError::RevisionConflict { .. })
+        ));
+
+        let changed_config = DockerComposeConfig {
+            compose_path: Some("current/compose.yaml".to_string()),
+            public_ports: vec![temps_entities::preset::ComposePublicPort {
+                service: "app".to_string(),
+                port: 8080,
+                ..Default::default()
+            }],
+            compose_services: vec![ComposeServiceSnapshot {
+                name: "app".to_string(),
+                health_check_path: Some("/current".to_string()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let mut changed_project: projects::ActiveModel = project.clone().into();
+        changed_project.directory = Set("current-root".to_string());
+        changed_project.preset_config = Set(Some(PresetConfig::DockerCompose(changed_config)));
+        changed_project.update(db.as_ref()).await.unwrap();
+
+        let prepared = service
+            .prepare_deployment(project.id, environment.id, Some(saved.bundle.id))
+            .await
+            .unwrap();
+        let context = prepared.deployment.context_vars.as_ref().unwrap();
+        assert_eq!(
+            context.get("compose_path").and_then(|v| v.as_str()),
+            Some("stack/compose.yml")
+        );
+        assert_eq!(
+            context.get("directory").and_then(|v| v.as_str()),
+            Some("saved-root")
+        );
+        assert_eq!(
+            prepared
+                .deployment
+                .metadata
+                .as_ref()
+                .and_then(|metadata| metadata.health_check_path.as_deref()),
+            Some("/ready")
+        );
+
+        service
+            .delete_unqueued_deployment(project.id, prepared.deployment.id)
+            .await
+            .unwrap();
+        assert!(deployments::Entity::find_by_id(prepared.deployment.id)
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn compose_deploy_rejects_an_environment_from_another_project() {
+        let Ok(test_db) = TestDatabase::with_migrations().await else {
+            println!("Docker not available, skipping");
+            return;
+        };
+        let db = test_db.connection_arc();
+        let storage = tempfile::tempdir().unwrap();
+        let service = ComposeSourceService::new(db.clone(), storage.path().to_path_buf());
+        let (project, _) = compose_project_fixture(db.as_ref(), "compose-owner").await;
+        let (_, foreign_environment) =
+            compose_project_fixture(db.as_ref(), "compose-foreign").await;
+        service
+            .save(
+                project.id,
+                "services:\n  app:\n    image: example/app:1\n".to_string(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            service
+                .prepare_deployment(project.id, foreign_environment.id, None)
+                .await,
+            Err(ComposeSourceError::EnvironmentNotFound { .. })
+        ));
+    }
 
     #[test]
     fn validation_discovers_editable_image_versions() {

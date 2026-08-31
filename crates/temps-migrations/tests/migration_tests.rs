@@ -3,7 +3,11 @@
 
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 use sea_orm_migration::MigratorTrait;
-use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
+use testcontainers::{
+    core::{ContainerPort, WaitFor},
+    runners::AsyncRunner,
+    GenericImage, ImageExt,
+};
 
 use temps_migrations::Migrator;
 
@@ -109,6 +113,26 @@ async fn source_bundle_kind_schema_state(db: &DatabaseConnection) -> anyhow::Res
     ))
 }
 
+async fn managed_monitor_schema_state(db: &DatabaseConnection) -> anyhow::Result<(bool, bool)> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'public' \
+                    AND table_name = 'status_monitors' \
+                    AND column_name = 'is_managed') AS has_column, \
+                to_regclass('idx_status_monitors_managed_environment') IS NOT NULL AS has_index"
+                .to_string(),
+        ))
+        .await?
+        .expect("schema-state query returns one row");
+    Ok((
+        row.try_get("", "has_column")?,
+        row.try_get("", "has_index")?,
+    ))
+}
+
 #[tokio::test]
 async fn test_source_bundle_kind_migration_up_down_and_reup() -> anyhow::Result<()> {
     if external_db_configured() {
@@ -120,6 +144,7 @@ async fn test_source_bundle_kind_migration_up_down_and_reup() -> anyhow::Result<
 
     let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
         .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
         .with_env_var("POSTGRES_DB", "postgres")
         .with_env_var("POSTGRES_USER", "postgres")
         .with_env_var("POSTGRES_PASSWORD", "postgres")
@@ -169,6 +194,108 @@ async fn test_source_bundle_kind_migration_up_down_and_reup() -> anyhow::Result<
     assert!(after_reup.0);
     assert!(after_reup.1);
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_managed_monitor_migration_backfill_uniqueness_down_and_reup() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!("Skipping managed-monitor migration test: external database configured");
+        return Ok(());
+    }
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_exposed_port(ContainerPort::Tcp(5432))
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping managed-monitor migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db = connect_with_retries(&format!(
+        "postgresql://postgres:postgres@localhost:{port}/postgres"
+    ))
+    .await?;
+    let target = "m20260831_000002_add_managed_status_monitors";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (false, false));
+
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('monitor-test', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), 'monitor-test')",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO environments (name, slug, subdomain, host, upstreams, created_at, updated_at, project_id) \
+         SELECT 'production', 'production', 'monitor-test-production', 'monitor.test', '[]', now(), now(), id \
+         FROM projects WHERE slug = 'monitor-test'",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, created_at, updated_at) \
+         SELECT project_id, id, 'production Monitor', 'web', 60, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-test-production'",
+    )
+    .await?;
+    db.execute_unprepared(
+        "INSERT INTO status_monitors \
+         (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, created_at, updated_at) \
+         SELECT project_id, id, 'Custom readiness', 'web', 60, true, now(), now() FROM environments \
+         WHERE subdomain = 'monitor-test-production'",
+    )
+    .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
+    let rows = db
+        .query_all(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT name, is_managed FROM status_monitors ORDER BY name".to_string(),
+        ))
+        .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].try_get::<String>("", "name")?, "Custom readiness");
+    assert!(!rows[0].try_get::<bool>("", "is_managed")?);
+    assert_eq!(rows[1].try_get::<String>("", "name")?, "production Monitor");
+    assert!(rows[1].try_get::<bool>("", "is_managed")?);
+
+    let duplicate = db
+        .execute_unprepared(
+            "INSERT INTO status_monitors \
+             (project_id, environment_id, name, monitor_type, check_interval_seconds, is_active, is_managed, created_at, updated_at) \
+             SELECT project_id, id, 'Duplicate managed', 'web', 60, true, true, now(), now() FROM environments \
+             WHERE subdomain = 'monitor-test-production'",
+        )
+        .await;
+    assert!(
+        duplicate.is_err(),
+        "only one managed monitor is allowed per environment"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (false, false));
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(managed_monitor_schema_state(&db).await?, (true, true));
     Ok(())
 }
 
