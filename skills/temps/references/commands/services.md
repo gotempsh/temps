@@ -25,6 +25,7 @@ Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing 
 - [`services logs`](#services-logs)
 - [`services slow-queries`](#services-slow-queries)
 - [`services enable-pg-stat-statements`](#services-enable-pg-stat-statements)
+- [`services metrics`](#services-metrics)
 - [`services restore-capabilities`](#services-restore-capabilities)
 - [`services list-backups`](#services-list-backups)
 - [`services restore`](#services-restore)
@@ -56,6 +57,7 @@ Manage external services (databases, caches, storage)
 - `logs` - View persisted logs for an external service
 - `slow-queries` - Show slowest PostgreSQL queries from pg_stat_statements
 - `enable-pg-stat-statements` - Enable pg_stat_statements on a standalone Postgres service by restarting its container (drops active connections briefly)
+- `metrics` - Resource and engine metrics for a database/cache/storage service
 - `restore-capabilities` - Show what restore modes a service supports (in-place / new service / PITR)
 - `list-backups` - List backups stored on an S3 source
 - `restore` - Restore a service from a backup (in-place, new service, or PITR)
@@ -302,6 +304,159 @@ Enable pg_stat_statements on a standalone Postgres service by restarting its con
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
 | `-y, --yes` | Skip the restart confirmation prompt (for automation) | - | No |
+
+### `services metrics`
+
+Resource and engine metrics for a database/cache/storage service
+
+**Subcommands:**
+
+- `latest` - Show the most recent value of every tracked metric
+- `range` - Show a time-series range for a single metric
+- `status` - Show when metrics were last received for a service
+- `by-database` - Per-database metric breakdown (PostgreSQL services only)
+- `enable` - Enable metric collection for a service (seeds default alert rules)
+- `disable` - Disable metric collection for a service
+- `alert-rules` - Manage monitoring alert rules for a service
+
+#### `services metrics latest`
+
+Show the most recent value of every tracked metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics range`
+
+Show a time-series range for a single metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-r, --range <window>` | Time window: 1h, 6h, 24h, 7d (default: 24h) | - | No |
+| `-p, --percentile <n>` | Histogram percentile (0-100) instead of a plain average | - | No |
+| `--json` | Output raw JSON instead of a formatted table | - | No |
+
+#### `services metrics status`
+
+Show when metrics were last received for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics by-database`
+
+Per-database metric breakdown (PostgreSQL services only)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics enable`
+
+Enable metric collection for a service (seeds default alert rules)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics disable`
+
+Disable metric collection for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics alert-rules`
+
+Manage monitoring alert rules for a service
+
+**Subcommands:**
+
+- `list` (`ls`) - List alert rules for a service
+- `create` (`add`) - Create an alert rule for a service
+- `update` - Update an existing alert rule
+- `remove` (`rm`) - Delete an alert rule
+
+##### `services metrics alert-rules list` (alias: `ls`)
+
+List alert rules for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules create` (alias: `add`)
+
+Create an alert rule for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | Yes |
+| `-t, --threshold <n>` | Threshold value that triggers the alert | - | Yes |
+| `-s, --severity <level>` | warning or critical (default: warning) | - | No |
+| `--for-duration <secs>` | Seconds the breach must persist before firing (default: 0) | - | No |
+| `--disabled` | Create the rule disabled | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules update`
+
+Update an existing alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | No |
+| `-m, --metric <name>` | Metric name | - | No |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | No |
+| `-t, --threshold <n>` | Threshold value | - | No |
+| `-s, --severity <level>` | warning or critical | - | No |
+| `--for-duration <secs>` | Seconds the breach must persist before firing | - | No |
+| `--enable` | Enable the rule | - | No |
+| `--disable` | Disable the rule | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules remove` (alias: `rm`)
+
+Delete an alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-y, --yes` | Skip confirmation prompt | - | No |
 
 ### `services restore-capabilities`
 
