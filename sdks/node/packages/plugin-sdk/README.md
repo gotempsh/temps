@@ -12,8 +12,12 @@ Rust plugin; the Temps host does not need Node.js or Bun at runtime.
 ## Install
 
 ```bash
-bun add @temps-sdk/plugin
+bun add @temps-sdk/plugin@beta
 ```
+
+SDK releases use the same version as Temps. For example, Temps
+`v0.1.0-beta.56` publishes `@temps-sdk/plugin@0.1.0-beta.56`; prereleases are
+also available through npm's `beta` dist-tag.
 
 ## Minimal plugin
 

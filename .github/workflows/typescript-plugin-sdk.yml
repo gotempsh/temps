@@ -6,14 +6,18 @@ on:
     paths:
       - "sdks/node/packages/plugin-sdk/**"
       - "sdks/node/examples/node-hello-plugin/**"
+      - "sdks/node/examples/deployment-pulse-plugin/**"
       - "sdks/node/bun.lock"
       - ".github/workflows/typescript-plugin-sdk.yml"
+      - ".github/workflows/publish-typescript-plugin-sdk.yml"
   pull_request:
     paths:
       - "sdks/node/packages/plugin-sdk/**"
       - "sdks/node/examples/node-hello-plugin/**"
+      - "sdks/node/examples/deployment-pulse-plugin/**"
       - "sdks/node/bun.lock"
       - ".github/workflows/typescript-plugin-sdk.yml"
+      - ".github/workflows/publish-typescript-plugin-sdk.yml"
 
 permissions:
   contents: read
@@ -41,3 +45,9 @@ jobs:
       - name: Test standalone plugin protocol
         working-directory: sdks/node/examples/node-hello-plugin
         run: bun run test
+      - name: Test Deployment Pulse
+        working-directory: sdks/node/examples/deployment-pulse-plugin
+        run: bun run test
+      - name: Build Deployment Pulse
+        working-directory: sdks/node/examples/deployment-pulse-plugin
+        run: bun run build
