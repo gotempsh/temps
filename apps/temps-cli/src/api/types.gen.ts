@@ -20888,6 +20888,16 @@ export type UpdateSpeedMetricsPayload = {
      * Interaction to Next Paint (milliseconds)
      */
     inp?: number | null;
+    /**
+     * Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+     */
+    sessionId?: string | null;
+    /**
+     * Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+     * Required to identify the right row on the keyed path, where there is
+     * no Temps-issued cookie to fall back on.
+     */
+    visitorId?: string | null;
 };
 
 /**

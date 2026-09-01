@@ -45175,6 +45175,20 @@
               "number",
               "null"
             ]
+          },
+          "sessionId": {
+            "description": "Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "visitorId": {
+            "description": "Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).\nRequired to identify the right row on the keyed path, where there is\nno Temps-issued cookie to fall back on.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "type": "object"

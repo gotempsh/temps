@@ -139,8 +139,10 @@ fn build_discovered_backend_addr(
     container_name: &str,
     container_port: i32,
     host_port: Option<i32>,
+    runtime_context: &RuntimeContext,
 ) -> Option<String> {
-    if DeploymentMode::is_baremetal() && host_port.is_none() {
+    if runtime_context.execution_environment() == ExecutionEnvironment::Host && host_port.is_none()
+    {
         return None;
     }
     Some(build_container_backend_addr(
@@ -148,6 +150,7 @@ fn build_discovered_backend_addr(
         container_port,
         host_port,
         None,
+        runtime_context,
     ))
 }
 
@@ -1937,6 +1940,7 @@ impl CachedPeerTable {
                 &discovered.target_container_name,
                 discovered.target_port,
                 discovered.target_host_port,
+                self.runtime_context.as_ref(),
             ) else {
                 warn!(
                     "Skipping Traefik-discovered route for '{}' (container '{}', port {}): this \
@@ -2323,12 +2327,6 @@ impl Drop for RouteTableListener {
 mod tests {
     use super::*;
 
-    /// Mutex to serialize tests that mutate the DEPLOYMENT_MODE env var.
-    /// Env vars are process-global, so parallel tests would race. Shared with
-    /// `route_table_test.rs`, whose DB-backed tests assert mode-dependent
-    /// addresses.
-    use super::DEPLOYMENT_MODE_ENV_MUTEX as ENV_MUTEX;
-
     /// Create a no-op queue for tests that don't need queue functionality
     fn test_queue() -> Arc<dyn temps_core::JobQueue> {
         struct NoOpQueue;
@@ -2682,10 +2680,8 @@ mod tests {
 
     #[test]
     fn discovered_backend_addr_uses_the_published_host_port_on_baremetal() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
-        let addr = build_discovered_backend_addr("whoami", 8000, Some(18000));
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        let addr =
+            build_discovered_backend_addr("whoami", 8000, Some(18000), &RuntimeContext::host());
         assert_eq!(addr.as_deref(), Some("127.0.0.1:18000"));
     }
 
@@ -2694,10 +2690,7 @@ mod tests {
     /// the Docker API on 2375, the console. Refuse to build an address at all.
     #[test]
     fn discovered_backend_addr_refuses_an_unpublished_port_on_baremetal() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
-        let addr = build_discovered_backend_addr("whoami", 5432, None);
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        let addr = build_discovered_backend_addr("whoami", 5432, None, &RuntimeContext::host());
         assert_eq!(
             addr, None,
             "a container port must never be reinterpreted as a loopback port on the host"
@@ -2710,10 +2703,7 @@ mod tests {
     /// `build_public_compose_backend_addr` already encodes it.
     #[test]
     fn discovered_backend_addr_allows_an_unpublished_port_in_docker_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-        let addr = build_discovered_backend_addr("whoami", 8000, None);
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        let addr = build_discovered_backend_addr("whoami", 8000, None, &RuntimeContext::docker());
         assert_eq!(addr.as_deref(), Some("whoami:8000"));
     }
 
