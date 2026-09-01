@@ -175,6 +175,18 @@ function seriesSlotKeys(series: TrendSeriesDef[]): Map<string, string> {
  * a bucket the API has no data for then stays `undefined`, which the chart
  * renders as a break in the line via `connectNulls`, instead of a false
  * zero.
+ *
+ * The grid must align to the SAME boundaries the backend's `time_bucket()`
+ * produces, not to the raw (unaligned) `start_time` — the query window is
+ * `now - range`, an arbitrary instant, while `time_bucket()` snaps to its
+ * own fixed origin independent of that window. Seeding from `start_time`
+ * directly would put every synthetic slot off by however far `start_time`
+ * sits from the nearest real boundary, so real points would land on new
+ * intermediate timestamps instead of merging into their pre-seeded slot —
+ * doubling the categories and corrupting the spacing this was meant to fix.
+ * Anchoring on one real point's timestamp (any series — they all share the
+ * same step) and walking by exact multiples of `stepMs` from there keeps
+ * every synthetic slot on the real grid.
  */
 function buildTrendRows(
   history: PipelineHistoryResponse | undefined,
@@ -187,8 +199,20 @@ function buildTrendRows(
   const stepMs = history.step_seconds * 1000
   const startMs = new Date(history.start_time).getTime()
   const endMs = new Date(history.end_time).getTime()
-  if (stepMs > 0 && Number.isFinite(startMs) && Number.isFinite(endMs)) {
-    for (let ts = startMs; ts <= endMs; ts += stepMs) {
+  const anchorMs = history.series
+    .flatMap((s) => s.points)
+    .map((p) => new Date(p.time).getTime())
+    .find((ts) => !Number.isNaN(ts))
+
+  if (
+    stepMs > 0 &&
+    anchorMs !== undefined &&
+    Number.isFinite(startMs) &&
+    Number.isFinite(endMs)
+  ) {
+    const firstGridTs =
+      anchorMs + Math.ceil((startMs - anchorMs) / stepMs) * stepMs
+    for (let ts = firstGridTs; ts <= endMs; ts += stepMs) {
       byTs.set(ts, { ts, label: labelFormatter(ts) })
     }
   }
