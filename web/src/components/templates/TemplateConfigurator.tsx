@@ -62,7 +62,10 @@ import {
   ProvidedEnvironmentVariables,
   ProvidedEnvironmentVariableWarning,
 } from '@/components/project/ProvidedEnvironmentVariables'
-import type { ProvidedEnvironmentVariableCollision } from '@/lib/provided-environment-variables'
+import {
+  isNonOverridableProvidedEnvironmentVariable,
+  type ProvidedEnvironmentVariableCollision,
+} from '@/lib/provided-environment-variables'
 import { TemplateImage } from '@/components/templates/TemplateImage'
 import {
   runGenerator,
@@ -75,7 +78,6 @@ import { cn } from '@/lib/utils'
 import { ADD_SERVICE_TYPES } from '@/lib/addServiceTypes'
 import {
   isLikelySecretProjectEnvironmentVariable,
-  isTempsManagedProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
 } from '@/lib/project-environment-variables'
 import {
@@ -215,7 +217,7 @@ export function TemplateConfigurator({
     ExternalServiceInfo[]
   >([])
   const [providedEnvironmentVariables, setProvidedEnvironmentVariables] =
-    useState<ProvidedEnvironmentVariableCollision[]>([])
+    useState<ProvidedEnvironmentVariableCollision[] | null>(null)
 
   // Fetch connections
   const { data: connectionsData, isLoading: isLoadingConnections } = useQuery({
@@ -281,10 +283,7 @@ export function TemplateConfigurator({
   )
 
   const configurableTemplateEnvVars = useMemo(
-    () =>
-      template.env_vars.filter(
-        (env) => !isTempsManagedProjectEnvironmentVariable(env.name)
-      ),
+    () => template.env_vars,
     [template.env_vars]
   )
 
@@ -317,6 +316,27 @@ export function TemplateConfigurator({
       }),
     },
   })
+
+  useEffect(() => {
+    if (providedEnvironmentVariables === null) return
+    const templateKeys = new Set(
+      template.env_vars.map((variable) => variable.name)
+    )
+    const currentVariables = form.getValues('environmentVariables') || []
+    const configurableVariables = currentVariables.filter(
+      (variable) =>
+        !templateKeys.has(variable.key) ||
+        !isNonOverridableProvidedEnvironmentVariable(
+          variable.key,
+          providedEnvironmentVariables
+        )
+    )
+    if (configurableVariables.length !== currentVariables.length) {
+      form.setValue('environmentVariables', configurableVariables, {
+        shouldValidate: false,
+      })
+    }
+  }, [form, providedEnvironmentVariables, template.env_vars])
 
   // Track which generator-produced values are still "untouched" by the user so
   // we can re-run repo-name-dependent generators (`app_url`) when the slug changes.
@@ -498,6 +518,23 @@ export function TemplateConfigurator({
     }
     if (isServicesError) {
       toast.error('Reload the database list before creating this project.')
+      return
+    }
+    if (providedEnvironmentVariables === null) {
+      toast.error('Wait for the provided environment variables to load.')
+      return
+    }
+    const blockedIndex = data.environmentVariables.findIndex((variable) =>
+      isNonOverridableProvidedEnvironmentVariable(
+        variable.key,
+        providedEnvironmentVariables
+      )
+    )
+    if (blockedIndex >= 0) {
+      form.setError(`environmentVariables.${blockedIndex}.key`, {
+        message: 'Temps provides this variable automatically at deployment',
+      })
+      toast.error('Remove the environment variable managed by Temps.')
       return
     }
     const missingServiceRequirements = getTemplateServiceRequirements(
@@ -1413,7 +1450,7 @@ export function TemplateConfigurator({
                                     <ProvidedEnvironmentVariableWarning
                                       variableName={envVar.key}
                                       providedVariables={
-                                        providedEnvironmentVariables
+                                        providedEnvironmentVariables ?? []
                                       }
                                     />
                                   </FormItem>

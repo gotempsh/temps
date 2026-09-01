@@ -4066,6 +4066,41 @@ mod ai_tool_allowlist_tests {
         assert!(catalog.contains("get_projects"), "catalog: {catalog}");
     }
 
+    /// Reproduces the page-country chat failure against the real analytics
+    /// OpenAPI document and the production AI read allowlist. This catches a
+    /// renamed/removed handler, missing allowlist entry, or parameter drift in
+    /// addition to the virtual CLI's unknown-operation recovery behavior.
+    #[tokio::test]
+    async fn page_country_analytics_recovers_through_real_api_contract() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller};
+
+        let openapi = temps_analytics::handler::AnalyticsApiDoc::openapi();
+        let caller =
+            InternalApiCaller::new_allowlisted(axum::Router::new(), &openapi, ai_read_allowlist());
+        let scope = ApiCallScope {
+            auth: admin_auth(),
+            project_ids: vec![1],
+        };
+
+        let recovery = caller
+            .run_cli("analytics get_analytics --path /managed", &scope)
+            .await;
+        assert!(
+            recovery.contains("get_page_path_detail"),
+            "page-level aggregate missing from recovery help: {recovery}"
+        );
+
+        let help = caller
+            .run_cli("analytics get_page_path_detail --help", &scope)
+            .await;
+        for flag in ["--page_path", "--start_date", "--end_date"] {
+            assert!(
+                help.contains(flag),
+                "real page-detail contract is missing `{flag}`: {help}"
+            );
+        }
+    }
+
     #[test]
     fn test_ai_read_allowlist_api_traffic_exposes_only_privacy_safe_operations() {
         let openapi = temps_analytics::handler::AnalyticsApiDoc::openapi();

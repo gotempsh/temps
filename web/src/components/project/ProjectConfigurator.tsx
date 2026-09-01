@@ -53,6 +53,7 @@ import {
 } from '@/components/ui/form'
 import { Input } from '@/components/ui/input'
 import { ServiceLogo } from '@/components/ui/service-logo'
+import { Skeleton } from '@/components/ui/skeleton'
 import {
   Tooltip,
   TooltipContent,
@@ -92,7 +93,10 @@ import {
   ProvidedEnvironmentVariables,
   ProvidedEnvironmentVariableWarning,
 } from './ProvidedEnvironmentVariables'
-import type { ProvidedEnvironmentVariableCollision } from '@/lib/provided-environment-variables'
+import {
+  isNonOverridableProvidedEnvironmentVariable,
+  type ProvidedEnvironmentVariableCollision,
+} from '@/lib/provided-environment-variables'
 import { repositoryFilePath } from '@/lib/repository-file-path'
 import { FrameworkSelector } from './FrameworkSelector'
 import { ProviderLogo } from '@/components/git/ProviderLogo'
@@ -109,7 +113,6 @@ import {
 import { useSettings } from '@/hooks/useSettings'
 import {
   isLikelySecretProjectEnvironmentVariable,
-  isTempsManagedProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
 } from '@/lib/project-environment-variables'
 import {
@@ -646,7 +649,7 @@ export function ProjectConfigurator({
   const [showSecrets, setShowSecrets] = useState<{ [key: number]: boolean }>({})
   const [isImportEnvOpen, setIsImportEnvOpen] = useState(false)
   const [providedEnvironmentVariables, setProvidedEnvironmentVariables] =
-    useState<ProvidedEnvironmentVariableCollision[]>([])
+    useState<ProvidedEnvironmentVariableCollision[] | null>(null)
   const [newlyCreatedServices, setNewlyCreatedServices] = useState<
     ExternalServiceInfo[]
   >([])
@@ -672,7 +675,12 @@ export function ProjectConfigurator({
   })
 
   // Fetch existing services
-  const { data: existingServices, refetch: refetchServices } = useAllServices()
+  const {
+    data: existingServices,
+    isPending: areServicesPending,
+    isError: didServicesFail,
+    refetch: refetchServices,
+  } = useAllServices()
   const availableServices = useMemo(() => {
     const servicesById = new Map<number, ExternalServiceInfo>()
     existingServices?.forEach((service) =>
@@ -927,9 +935,13 @@ export function ProjectConfigurator({
   const envExampleVariables = useMemo(
     () =>
       detectedEnvExampleVariables.filter(
-        (variable) => !isTempsManagedProjectEnvironmentVariable(variable.key)
+        (variable) =>
+          !isNonOverridableProvidedEnvironmentVariable(
+            variable.key,
+            providedEnvironmentVariables ?? []
+          )
       ),
-    [detectedEnvExampleVariables]
+    [detectedEnvExampleVariables, providedEnvironmentVariables]
   )
 
   const [envExampleDismissed, setEnvExampleDismissed] = useState(false)
@@ -1256,6 +1268,23 @@ export function ProjectConfigurator({
     if (isSubmittingRef.current) return
     isSubmittingRef.current = true
     try {
+      if (providedEnvironmentVariables === null) {
+        toast.error('Wait for the provided environment variables to load.')
+        return
+      }
+      const blockedIndex = data.environmentVariables.findIndex((variable) =>
+        isNonOverridableProvidedEnvironmentVariable(
+          variable.key,
+          providedEnvironmentVariables
+        )
+      )
+      if (blockedIndex >= 0) {
+        form.setError(`environmentVariables.${blockedIndex}.key`, {
+          message: 'Temps provides this variable automatically at deployment',
+        })
+        toast.error('Remove the environment variable managed by Temps.')
+        return
+      }
       setIsSubmitting(true)
 
       // Extract just the preset name from "preset::path" format for backend
@@ -1648,7 +1677,12 @@ export function ProjectConfigurator({
   const renderAddDatabaseMenu = () => (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button type="button" variant="outline" size="sm">
+        <Button
+          type="button"
+          variant="outline"
+          size="sm"
+          disabled={areServicesPending}
+        >
           <Plus className="h-4 w-4 mr-2" />
           Add Database
           <ChevronDown className="h-4 w-4 ml-1" />
@@ -1702,6 +1736,33 @@ export function ProjectConfigurator({
 
     return (
       <div className="space-y-4">
+        {areServicesPending && (
+          <div
+            className="grid grid-cols-1 gap-3 md:grid-cols-2"
+            aria-label="Loading databases"
+          >
+            <Skeleton className="h-20 w-full rounded-lg" />
+            <Skeleton className="h-20 w-full rounded-lg" />
+          </div>
+        )}
+
+        {didServicesFail && (
+          <Alert variant="destructive">
+            <AlertCircle className="h-4 w-4" />
+            <AlertDescription className="flex items-center justify-between gap-3">
+              <span>Databases could not be loaded.</span>
+              <Button
+                type="button"
+                variant="outline"
+                size="sm"
+                onClick={() => void refetchServices()}
+              >
+                Try again
+              </Button>
+            </AlertDescription>
+          </Alert>
+        )}
+
         {availableServices.length > 0 && (
           <div>
             <h4 className="text-sm font-medium mb-3">Existing Databases</h4>
@@ -1774,18 +1835,20 @@ export function ProjectConfigurator({
           </Alert>
         )}
 
-        {availableServices.length === 0 && (
-          <div className="text-center py-8">
-            <Database className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
-            <p className="text-sm text-muted-foreground">
-              No databases configured yet
-            </p>
-            <p className="text-xs text-muted-foreground mt-1">
-              Add PostgreSQL, Redis, MongoDB, or object storage when your app
-              needs it
-            </p>
-          </div>
-        )}
+        {!areServicesPending &&
+          !didServicesFail &&
+          availableServices.length === 0 && (
+            <div className="text-center py-8">
+              <Database className="h-12 w-12 mx-auto text-muted-foreground mb-3" />
+              <p className="text-sm text-muted-foreground">
+                No databases configured yet
+              </p>
+              <p className="text-xs text-muted-foreground mt-1">
+                Add PostgreSQL, Redis, MongoDB, or object storage when your app
+                needs it
+              </p>
+            </div>
+          )}
       </div>
     )
   }
@@ -2046,7 +2109,10 @@ export function ProjectConfigurator({
             const currentVars = form.getValues('environmentVariables') || []
             const configurableVariables = variables.filter(
               (variable) =>
-                !isTempsManagedProjectEnvironmentVariable(variable.key)
+                !isNonOverridableProvidedEnvironmentVariable(
+                  variable.key,
+                  providedEnvironmentVariables ?? []
+                )
             )
             const skippedCount = variables.length - configurableVariables.length
             const newVars = configurableVariables.map((v) => ({
@@ -2104,7 +2170,9 @@ export function ProjectConfigurator({
                           <FormMessage />
                           <ProvidedEnvironmentVariableWarning
                             variableName={watchedEnvVars[index]?.key ?? ''}
-                            providedVariables={providedEnvironmentVariables}
+                            providedVariables={
+                              providedEnvironmentVariables ?? []
+                            }
                           />
                         </FormItem>
                       )}

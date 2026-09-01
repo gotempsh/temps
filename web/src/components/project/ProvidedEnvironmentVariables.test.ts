@@ -7,12 +7,14 @@ import {
   databaseProvidedEnvironmentVariable,
   findProvidedEnvironmentVariableCollision,
   groupManagedEnvironmentVariables,
+  isNonOverridableProvidedEnvironmentVariable,
   normalizeCreationPreset,
 } from '@/lib/provided-environment-variables'
 
 describe('ProvidedEnvironmentVariables', () => {
   test('normalizes repository presets and keeps only the preset slug', () => {
     expect(normalizeCreationPreset('NextJS::apps/web')).toBe('nextjs')
+    expect(normalizeCreationPreset('custom')).toBe('static')
     expect(normalizeCreationPreset('')).toBe('dockerfile')
   })
 
@@ -82,5 +84,29 @@ describe('ProvidedEnvironmentVariables', () => {
       provider: 'database "app-db"',
       isUserOverridable: true,
     })
+  })
+
+  test('uses backend override metadata instead of a frontend reserved-key list', () => {
+    const providedVariables = [
+      { name: 'SENTRY_DSN', provider: 'Temps', isUserOverridable: false },
+      {
+        name: 'SENTRY_RELEASE',
+        provider: 'Temps',
+        isUserOverridable: true,
+      },
+    ]
+
+    expect(
+      isNonOverridableProvidedEnvironmentVariable(
+        'SENTRY_DSN',
+        providedVariables
+      )
+    ).toBe(true)
+    expect(
+      isNonOverridableProvidedEnvironmentVariable(
+        'SENTRY_RELEASE',
+        providedVariables
+      )
+    ).toBe(false)
   })
 })
