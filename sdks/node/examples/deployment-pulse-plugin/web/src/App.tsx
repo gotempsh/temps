@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { projectPath } from "./project-link";
 
 type HealthState = "healthy" | "failed" | "active" | "paused" | "never" | "unknown";
 
@@ -210,7 +211,11 @@ export function App() {
                   <span>{project.slug} · {project.preset}</span>
                 </div>
                 <div className="deployment-copy">
-                  <strong>{deployment?.commit_message || (project.error ?? "No deployment yet")}</strong>
+                  <strong>
+                    {deployment?.commit_message ||
+                      (project.error ??
+                        (deployment ? `Deployment #${deployment.id}` : "No deployment yet"))}
+                  </strong>
                   <span>{deployment?.branch || project.sourceType}{deployment?.commit_sha ? ` · ${deployment.commit_sha.slice(0, 7)}` : ""}</span>
                 </div>
                 <div className="success-rate">
@@ -222,7 +227,7 @@ export function App() {
                   <span>{deployment ? `#${deployment.id}` : "No history"}</span>
                 </div>
                 <div className={`status-pill ${project.health}`}><span />{STATUS_LABEL[project.health]}</div>
-                <a href={`/projects/${project.id}`} target="_top" aria-label={`Open ${project.name} in Temps`}><Icon name="arrow" /></a>
+                <a href={projectPath(project.slug)} target="_top" aria-label={`Open ${project.name} in Temps`}><Icon name="arrow" /></a>
               </article>
             );
           })}
