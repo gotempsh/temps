@@ -58,7 +58,9 @@ fn shell_export_assignment(line: &str) -> Option<String> {
 /// The `engine` hint is used to disambiguate formats that share location
 /// shapes. Object-store backups (s3/rustfs/blob/minio) are always a
 /// bucket-to-bucket mirror — their path has no extension — so we tag them
-/// `"mirror"` when the engine identifies them as such.
+/// `"mirror"` when the engine identifies them as such. MariaDB's logical
+/// dump shares the `.sql.gz` suffix with Postgres's legacy pg_dump, so it
+/// needs the hint too; its physical base (`base.mbstream.gz`) does not.
 fn classify_backup_format(location: &str, engine: Option<&str>) -> Option<String> {
     if location.is_empty() {
         return None;
@@ -74,6 +76,20 @@ fn classify_backup_format(location: &str, engine: Option<&str>) -> Option<String
     // Extension-based classification runs first — it's unambiguous when
     // the file suffix is present, regardless of whether the location is
     // an s3:// URL or a bare key.
+    //
+    // MariaDB's physical base carries a suffix no other engine produces, so
+    // it needs no engine hint.
+    if location.ends_with(".mbstream.gz") {
+        return Some("mariadb_physical".to_string());
+    }
+    // `.sql.gz` is the ONE genuinely ambiguous suffix: Postgres's legacy
+    // pg_dump and MariaDB's logical `dump.sql.gz` share it. Filenames can't
+    // separate them, so the engine hint decides — checked BEFORE the generic
+    // Postgres branch, which would otherwise label every MariaDB dump
+    // `pg_dump` and send the restore planner down the pg_restore path.
+    if location.ends_with(".sql.gz") && engine.is_some_and(|e| e.eq_ignore_ascii_case("mariadb")) {
+        return Some("mariadb_dump".to_string());
+    }
     if location.ends_with(".sql.gz") || location.ends_with(".pgdump.gz") {
         return Some("pg_dump".to_string());
     }
@@ -283,7 +299,13 @@ async fn list_walg_sentinels(
     Ok(out)
 }
 
-/// Find pg_dump / rdb / bson dump objects under a service prefix.
+/// Find pg_dump / rdb / bson / mariadb dump-or-base objects under a service
+/// prefix.
+///
+/// MariaDB is the one engine here with no `/walg/` prefix, so
+/// `scan_s3_for_orphan_backups`'s sentinel pass cannot see it at all: if a
+/// MariaDB suffix is missing from this allowlist, its backups are invisible
+/// to the disaster-recovery scan entirely.
 async fn list_dump_objects(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -313,7 +335,10 @@ async fn list_dump_objects(
                 || key.ends_with(".pgdump.gz")
                 || key.ends_with(".rdb.gz")
                 || key.ends_with(".bson.gz")
-                || key.ends_with(".archive"))
+                || key.ends_with(".archive")
+                // MariaDB physical base (`base.mbstream.gz`). Its logical
+                // dump is already covered by `.sql.gz` above.
+                || key.ends_with(".mbstream.gz"))
             {
                 continue;
             }
@@ -9629,6 +9654,50 @@ mod tests {
         // confidently mislabel.
         let unknown = "s3://bucket/external_services/postgres/svc/some/random/key";
         assert_eq!(classify_backup_format(unknown, Some("postgres")), None);
+    }
+
+    #[test]
+    fn classify_mariadb_physical_base_is_filename_driven() {
+        // `base.mbstream.gz` is produced by no other engine, so it classifies
+        // without an engine hint at all.
+        let loc = "s3://bucket/external_services/mariadb/svc/2026/05/01/uuid/base.mbstream.gz";
+        assert_eq!(
+            classify_backup_format(loc, Some("mariadb")),
+            Some("mariadb_physical".to_string())
+        );
+        assert_eq!(
+            classify_backup_format(loc, None),
+            Some("mariadb_physical".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_mariadb_dump_is_engine_driven_not_filename_driven() {
+        // Regression: MariaDB's logical dump is literally named
+        // `dump.sql.gz`, which the generic `.sql.gz` branch labels `pg_dump`.
+        // Only the engine hint can tell the two apart.
+        let mariadb = "s3://bucket/external_services/mariadb/svc/2026/05/01/uuid/dump.sql.gz";
+        assert_eq!(
+            classify_backup_format(mariadb, Some("mariadb")),
+            Some("mariadb_dump".to_string())
+        );
+        assert_eq!(
+            classify_backup_format(mariadb, Some("MariaDB")),
+            Some("mariadb_dump".to_string()),
+            "engine hint must be matched case-insensitively"
+        );
+
+        // Postgres behavior is unchanged: same suffix, different engine.
+        let postgres = "s3://bucket/external_services/postgres/svc/2026/05/01/uuid/dump.sql.gz";
+        assert_eq!(
+            classify_backup_format(postgres, Some("postgres")),
+            Some("pg_dump".to_string())
+        );
+        // ...including when no hint is available at all.
+        assert_eq!(
+            classify_backup_format(postgres, None),
+            Some("pg_dump".to_string())
+        );
     }
 
     // Simple mock notification service for testing

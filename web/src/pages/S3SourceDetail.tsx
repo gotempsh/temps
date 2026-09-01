@@ -51,7 +51,7 @@ import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { listSourceBackupsWithScan, testS3SourceConnection } from '@/lib/s3-sources'
 import { runScheduleNow } from '@/lib/schedule-runs'
-import { cn, formatBytes } from '@/lib/utils'
+import { cn, formatBytes, isPitrCapableFormat } from '@/lib/utils'
 import { iconForServiceType, serviceTypeRouteForEngine } from '@/lib/serviceIcons'
 import { ServiceLogo } from '@/components/ui/service-logo'
 import { Input } from '@/components/ui/input'
@@ -804,7 +804,7 @@ export function S3SourceDetail() {
                                   {backup.engine}
                                 </Badge>
                               ) : null}
-                              {backup.format === 'walg' ? (
+                              {isPitrCapableFormat(backup.format) ? (
                                 <Badge variant="secondary" className="text-xs">
                                   PITR
                                 </Badge>
