@@ -18,6 +18,7 @@ import {
 import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
+import { RetainedComposeContainers } from '@/components/deployments/RetainedComposeContainers'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -1412,6 +1413,14 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         {/* Deployment Pipeline — failed stages expose a "Debug with AI" sidebar
             (ADR-023), gated on the project's ai_debug_chat_enabled toggle */}
         <DeploymentStages project={project} deployment={deployment} />
+
+        <RetainedComposeContainers
+          projectId={deployment.project_id}
+          projectSlug={project.slug}
+          environmentId={deployment.environment_id}
+          deploymentId={deployment.id}
+          deploymentStatus={deployment.status}
+        />
 
         {/* Captured logs from previous containers (survive teardown) */}
         <DeploymentContainerLogs

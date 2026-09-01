@@ -1024,20 +1024,22 @@ impl DeploymentService {
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
 
-        let deployment_id = environment
-            .current_deployment_id
-            .ok_or_else(|| DeploymentError::NotFound("No active deployment found".to_string()))?;
-
-        // Verify the container belongs to this deployment and pick up its node placement.
+        // Resolve any still-live container in this environment, including a
+        // failed Compose candidate retained for debugging. Do not constrain
+        // this to `current_deployment_id`: failed candidates are deliberately
+        // never promoted, but their logs remain an authenticated project
+        // debugging surface until retry/delete cleanup.
         let container = deployment_containers::Entity::find()
-            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+            .inner_join(deployments::Entity)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .filter(deployments::Column::EnvironmentId.eq(environment.id))
             .filter(deployment_containers::Column::ContainerId.eq(&container_id))
             .filter(deployment_containers::Column::DeletedAt.is_null())
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| {
                 DeploymentError::NotFound(format!(
-                    "Container {} not found in deployment",
+                    "Container {} not found in environment",
                     container_id
                 ))
             })?;
@@ -7114,6 +7116,74 @@ mod tests {
             }
             _ => panic!("Expected NotFound error"),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retained_failed_compose_container_passes_log_ownership_lookup(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        use temps_entities::deployment_containers;
+
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+        let (project, environment, current_deployment) = setup_test_data(&db).await?;
+
+        let mut active_environment: environments::ActiveModel = environment.clone().into();
+        active_environment.current_deployment_id = Set(Some(current_deployment.id));
+        active_environment.update(db.as_ref()).await?;
+
+        let failed_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("failed-compose-candidate".to_string()),
+            state: Set("failed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+        deployment_containers::ActiveModel {
+            deployment_id: Set(failed_deployment.id),
+            container_id: Set("retained-failed-container".to_string()),
+            container_name: Set("temps-retained-app-1".to_string()),
+            container_port: Set(80),
+            image_name: Set(Some("nginx:alpine".to_string())),
+            status: Set(Some("retained:running".to_string())),
+            service_name: Set(Some("app".to_string())),
+            created_at: Set(Utc::now()),
+            deployed_at: Set(Utc::now()),
+            ready_at: Set(None),
+            deleted_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await?;
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+        let result = deployment_service
+            .get_container_logs_by_id(
+                project.id,
+                environment.id,
+                "retained-failed-container".to_string(),
+                ContainerLogParams {
+                    start_date: None,
+                    end_date: None,
+                    tail: Some("10".to_string()),
+                    timestamps: false,
+                    follow: false,
+                },
+            )
+            .await;
+
+        assert!(
+            !matches!(result, Err(DeploymentError::NotFound(_))),
+            "a live retained container must pass project/environment ownership lookup even when another deployment is current"
+        );
 
         Ok(())
     }

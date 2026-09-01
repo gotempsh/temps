@@ -2514,6 +2514,7 @@ impl WorkflowExecutionService {
                     .deployment_id(deployment.id)
                     .project_id(project.id)
                     .environment_id(environment.id)
+                    .db(self.db.clone())
                     .compose_executor(compose_executor)
                     .compose_path(compose_path)
                     .directory(directory)

@@ -42,6 +42,7 @@ interface ContainerHeaderBarProps {
   onTabChange: (tab: ContainerTab) => void
   onAction: (action: 'start' | 'stop' | 'restart') => void
   actionInFlight?: 'start' | 'stop' | 'restart' | null
+  actionsEnabled?: boolean
 }
 
 export function ContainerHeaderBar({
@@ -54,6 +55,7 @@ export function ContainerHeaderBar({
   onTabChange,
   onAction,
   actionInFlight,
+  actionsEnabled = true,
 }: ContainerHeaderBarProps) {
   const [statusFilter, setStatusFilter] = useState<
     'all' | 'running' | 'stopped'
@@ -178,56 +180,58 @@ export function ContainerHeaderBar({
             </div>
           </div>
 
-          <div className="flex items-center gap-2">
-            {isRunning ? (
-              <>
-                <Button
-                  type="button"
-                  variant="outline"
-                  size="sm"
-                  disabled={actionInFlight === 'restart'}
-                  onClick={() => onAction('restart')}
-                >
-                  {actionInFlight === 'restart' ? (
-                    <Loader2 className="mr-1.5 size-4 animate-spin" />
-                  ) : (
-                    <RotateCw className="mr-1.5 size-4" aria-hidden="true" />
-                  )}
-                  Restart
-                </Button>
-                <Button
-                  type="button"
-                  variant="destructive"
-                  size="sm"
-                  disabled={actionInFlight === 'stop'}
-                  onClick={() => onAction('stop')}
-                >
-                  {actionInFlight === 'stop' ? (
-                    <Loader2 className="mr-1.5 size-4 animate-spin" />
-                  ) : (
-                    <Square className="mr-1.5 size-4" aria-hidden="true" />
-                  )}
-                  Stop
-                </Button>
-              </>
-            ) : (
-              selectedContainer && (
-                <Button
-                  type="button"
-                  size="sm"
-                  disabled={actionInFlight === 'start'}
-                  onClick={() => onAction('start')}
-                >
-                  {actionInFlight === 'start' ? (
-                    <Loader2 className="mr-1.5 size-4 animate-spin" />
-                  ) : (
-                    <Play className="mr-1.5 size-4" aria-hidden="true" />
-                  )}
-                  Start
-                </Button>
-              )
-            )}
-          </div>
+          {actionsEnabled && (
+            <div className="flex items-center gap-2">
+              {isRunning ? (
+                <>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    disabled={actionInFlight === 'restart'}
+                    onClick={() => onAction('restart')}
+                  >
+                    {actionInFlight === 'restart' ? (
+                      <Loader2 className="mr-1.5 size-4 animate-spin" />
+                    ) : (
+                      <RotateCw className="mr-1.5 size-4" aria-hidden="true" />
+                    )}
+                    Restart
+                  </Button>
+                  <Button
+                    type="button"
+                    variant="destructive"
+                    size="sm"
+                    disabled={actionInFlight === 'stop'}
+                    onClick={() => onAction('stop')}
+                  >
+                    {actionInFlight === 'stop' ? (
+                      <Loader2 className="mr-1.5 size-4 animate-spin" />
+                    ) : (
+                      <Square className="mr-1.5 size-4" aria-hidden="true" />
+                    )}
+                    Stop
+                  </Button>
+                </>
+              ) : (
+                selectedContainer && (
+                  <Button
+                    type="button"
+                    size="sm"
+                    disabled={actionInFlight === 'start'}
+                    onClick={() => onAction('start')}
+                  >
+                    {actionInFlight === 'start' ? (
+                      <Loader2 className="mr-1.5 size-4 animate-spin" />
+                    ) : (
+                      <Play className="mr-1.5 size-4" aria-hidden="true" />
+                    )}
+                    Start
+                  </Button>
+                )
+              )}
+            </div>
+          )}
         </div>
 
         <nav

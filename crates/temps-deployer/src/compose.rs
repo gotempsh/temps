@@ -7,7 +7,7 @@
 //! After `compose up`, discovers running containers, applies Temps labels,
 //! and returns per-service results that get inserted into `deployment_containers`.
 
-use bollard::query_parameters::LogsOptions;
+use bollard::query_parameters::{LogsOptions, RemoveContainerOptions};
 use bollard::Docker;
 use futures::{StreamExt, TryStreamExt};
 use regex::Regex;
@@ -204,6 +204,49 @@ pub enum ComposeError {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+}
+
+/// A failed Compose startup together with every container Docker managed to
+/// create for the candidate stack.
+///
+/// Readiness failures are operationally different from preparation failures:
+/// the containers often contain the only useful diagnostics. Carrying them
+/// alongside the typed error lets the deployment layer register them for
+/// authenticated log access instead of immediately destroying the evidence.
+#[derive(Debug)]
+pub struct ComposeDeployFailure {
+    pub error: ComposeError,
+    pub containers: Vec<ComposeServiceResult>,
+    /// Ownership-verified containers that are unsafe to retain but can be
+    /// removed directly if `docker compose down` fails.
+    pub cleanup_containers: Vec<ComposeServiceResult>,
+    /// Why a partially-created stack could not be retained safely. The
+    /// primary deployment error remains in `error`; this secondary reason is
+    /// for operator diagnostics and forces the caller to tear the stack down.
+    pub retention_error: Option<ComposeError>,
+}
+
+impl std::fmt::Display for ComposeDeployFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.error.fmt(formatter)
+    }
+}
+
+impl std::error::Error for ComposeDeployFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+impl ComposeDeployFailure {
+    fn without_containers(error: ComposeError) -> Self {
+        Self {
+            error,
+            containers: Vec::new(),
+            cleanup_containers: Vec::new(),
+            retention_error: None,
+        }
+    }
 }
 
 /// Compose filenames Temps generates itself inside the stack directory.
@@ -1025,10 +1068,12 @@ impl ComposeExecutor {
         }
     }
 
-    /// Promote a successful candidate by removing every older generation.
-    /// This runs only after the replacement containers are healthy, so no live
-    /// container can still depend on the directories being removed.
-    async fn promote_secret_generation(
+    /// Keep one candidate's secret generation and remove every older one.
+    ///
+    /// Callers may use this either after the replacement containers become
+    /// healthy or after the previous stack has been stopped. In both cases no
+    /// live container may still depend on the generations being removed.
+    pub async fn prune_secret_generations(
         &self,
         project_name: &str,
         generation: Option<&str>,
@@ -1261,7 +1306,7 @@ impl ComposeExecutor {
         &self,
         prepared: PreparedComposeDeploy,
         request: &ComposeDeployRequest,
-    ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
+    ) -> Result<Vec<ComposeServiceResult>, Box<ComposeDeployFailure>> {
         let PreparedComposeDeploy {
             effective_dir,
             project_name,
@@ -1276,7 +1321,9 @@ impl ComposeExecutor {
         // this is the same network Temps-managed external services and
         // single-container app deployments join, so a compose service can
         // reach a Temps-managed database by name.
-        self.ensure_temps_network_exists().await?;
+        self.ensure_temps_network_exists()
+            .await
+            .map_err(|error| Box::new(ComposeDeployFailure::without_containers(error)))?;
 
         // 4. Run docker compose up. Images are already pulled (step 3) or built
         // (step 2), so `--pull never` would also work, but omitting `--pull`
@@ -1285,56 +1332,76 @@ impl ComposeExecutor {
         // If a user-provided `container_name` conflicts with an existing
         // container, let Compose report the conflict instead of deleting
         // containers outside this Temps project boundary.
-        self.compose_up(
-            &effective_dir,
-            &project_name,
-            &compose_file,
-            &redact_values,
-            &request.relaxed_capability_services,
-        )
-        .await?;
+        if let Err(error) = self
+            .compose_up(
+                &effective_dir,
+                &project_name,
+                &compose_file,
+                &redact_values,
+                &request.relaxed_capability_services,
+            )
+            .await
+        {
+            return Err(Box::new(
+                self.failure_with_discovered_containers(
+                    &effective_dir,
+                    &project_name,
+                    &compose_file,
+                    request,
+                    error,
+                )
+                .await,
+            ));
+        }
 
         // 4b. `up -d` returns as soon as containers are created/started, not
         // once they're actually ready. Wait for every service to reach
         // `running` (and `healthy`, for services that define a healthcheck)
         // so a crash-looping or slow-starting service surfaces as a failed
         // deployment instead of a false "success".
-        self.wait_for_services_ready(
-            &effective_dir,
-            &project_name,
-            &compose_file,
-            &redact_values,
-            &request.relaxed_capability_services,
-            COMPOSE_READY_TIMEOUT,
-        )
-        .await?;
+        if let Err(error) = self
+            .wait_for_services_ready(
+                &effective_dir,
+                &project_name,
+                &compose_file,
+                &redact_values,
+                &request.relaxed_capability_services,
+                COMPOSE_READY_TIMEOUT,
+            )
+            .await
+        {
+            return Err(Box::new(
+                self.failure_with_discovered_containers(
+                    &effective_dir,
+                    &project_name,
+                    &compose_file,
+                    request,
+                    error,
+                )
+                .await,
+            ));
+        }
 
         // 5. Discover running containers
         let containers = self
             .discover_containers(&effective_dir, &project_name, &compose_file)
-            .await?;
+            .await
+            .map_err(|error| Box::new(ComposeDeployFailure::without_containers(error)))?;
 
-        // 5b. Apply Temps labels to each container
+        // 5b. Verify the ownership labels written by the generated override.
+        // Never register containers cleanup cannot prove belong to this stack.
         for container in &containers {
-            if let Err(e) = self
-                .apply_labels(
-                    &container.container_id,
-                    &request.labels,
-                    &container.service_name,
-                )
-                .await
-            {
-                warn!(
-                    container_id = %container.container_id,
-                    service = %container.service_name,
-                    error = %e,
-                    "Failed to apply Temps labels to container"
-                );
-            }
+            self.verify_labels(
+                &container.container_id,
+                &request.labels,
+                &container.service_name,
+            )
+            .await
+            .map_err(|error| Box::new(ComposeDeployFailure::without_containers(error)))?;
         }
 
         if let Err(error) = self
-            .promote_secret_generation(
+            .prune_secret_generations(
                 &project_name,
                 has_materialized_secrets.then_some(secret_generation.as_str()),
             )
@@ -1378,7 +1445,9 @@ impl ComposeExecutor {
         request: ComposeDeployRequest,
     ) -> Result<Vec<ComposeServiceResult>, ComposeError> {
         let prepared = self.prepare_and_pull(&request).await?;
-        self.deploy_prepared(prepared, &request).await
+        self.deploy_prepared(prepared, &request)
+            .await
+            .map_err(|failure| failure.error)
     }
 
     /// Tear down containers before a redeploy. Preserves volumes (database data,
@@ -4235,6 +4304,7 @@ impl ComposeExecutor {
         timeout: std::time::Duration,
     ) -> Result<(), ComposeError> {
         let start = std::time::Instant::now();
+        let mut observed_ready_once = false;
         loop {
             let entries = self
                 .compose_ps(project_dir, project_name, compose_file)
@@ -4255,8 +4325,18 @@ impl ComposeExecutor {
                     // a connection before calling the stack ready.
                     let unreachable = Self::unreachable_published_ports(&entries).await;
                     if unreachable.is_empty() {
-                        return Ok(());
+                        // Docker may briefly report a just-started container as
+                        // running before its health state is populated (or
+                        // before a short-lived process exits). Require one
+                        // stable poll interval before accepting readiness.
+                        if observed_ready_once {
+                            return Ok(());
+                        }
+                        observed_ready_once = true;
+                        tokio::time::sleep(COMPOSE_READY_POLL_INTERVAL).await;
+                        continue;
                     }
+                    observed_ready_once = false;
                     if start.elapsed() >= timeout {
                         let container_logs = self
                             .describe_unhealthy_containers(
@@ -4292,6 +4372,7 @@ impl ComposeExecutor {
                     });
                 }
                 ComposeReadiness::Pending(reasons) => {
+                    observed_ready_once = false;
                     if start.elapsed() >= timeout {
                         let container_logs = self
                             .describe_unhealthy_containers(
@@ -4452,6 +4533,95 @@ impl ComposeExecutor {
         Ok(results)
     }
 
+    /// Preserve the primary deployment error while best-effort discovering
+    /// the candidate containers it left behind. Discovery must never replace
+    /// the startup error: an empty list simply tells the caller that there is
+    /// no safe live diagnostic surface to retain.
+    async fn failure_with_discovered_containers(
+        &self,
+        project_dir: &Path,
+        project_name: &str,
+        compose_file: &str,
+        request: &ComposeDeployRequest,
+        error: ComposeError,
+    ) -> ComposeDeployFailure {
+        let containers = match self
+            .discover_containers(project_dir, project_name, compose_file)
+            .await
+        {
+            Ok(containers) => containers,
+            Err(discovery_error) => {
+                warn!(
+                    project = %project_name,
+                    error = %discovery_error,
+                    "Compose startup failed and candidate containers could not be discovered"
+                );
+                return ComposeDeployFailure {
+                    error,
+                    containers: Vec::new(),
+                    cleanup_containers: Vec::new(),
+                    retention_error: Some(discovery_error),
+                };
+            }
+        };
+
+        for container in &containers {
+            if let Err(retention_error) = self
+                .verify_labels(
+                    &container.container_id,
+                    &request.labels,
+                    &container.service_name,
+                )
+                .await
+            {
+                warn!(
+                    project = %project_name,
+                    container_id = %container.container_id,
+                    service = %container.service_name,
+                    error = %retention_error,
+                    "Failed to verify retained Compose container labels"
+                );
+                return ComposeDeployFailure {
+                    error,
+                    containers: Vec::new(),
+                    cleanup_containers: Vec::new(),
+                    retention_error: Some(retention_error),
+                };
+            }
+        }
+
+        // Only expose candidates for direct cleanup after ownership has been
+        // verified for the entire stack. Port safety is checked separately so
+        // an unsafe first container cannot short-circuit sibling verification.
+        for container in &containers {
+            if let Err(retention_error) = self
+                .verify_retention_port_bindings(&container.container_id, &container.service_name)
+                .await
+            {
+                warn!(
+                    project = %project_name,
+                    container_id = %container.container_id,
+                    service = %container.service_name,
+                    error = %retention_error,
+                    "Failed Compose container has a host port that is unsafe to retain"
+                );
+                return ComposeDeployFailure {
+                    error,
+                    containers: Vec::new(),
+                    cleanup_containers: containers.clone(),
+                    retention_error: Some(retention_error),
+                };
+            }
+        }
+
+        ComposeDeployFailure {
+            error,
+            containers,
+            cleanup_containers: Vec::new(),
+            retention_error: None,
+        }
+    }
+
     fn parse_publishers(&self, publishers: &[ComposePsPublisher]) -> Vec<ComposePortBinding> {
         publishers
             .iter()
@@ -4464,33 +4634,38 @@ impl ComposeExecutor {
             .collect()
     }
 
-    async fn apply_labels(
+    async fn verify_labels(
         &self,
         container_id: &str,
         base_labels: &HashMap<String, String>,
         service_name: &str,
     ) -> Result<(), ComposeError> {
-        // Bollard doesn't support updating labels on a running container directly.
-        // We need to use `docker container update` is also limited.
-        // Instead, we verify the container exists and log the labels.
-        // The labels were already set via compose labels or we use docker inspect
-        // to verify the container is running.
-        //
-        // For Temps integration, we rely on:
-        // 1. The compose project name (temps-{project_id}-{env_id}) for discovery
-        // 2. The container IDs stored in deployment_containers table
-        // 3. Container names for log aggregation
-        //
-        // The deployment pipeline inserts these containers into deployment_containers
-        // with the correct project_id, environment_id, deployment_id, and service_name.
-        // The proxy and monitoring systems use deployment_containers for lookup,
-        // not Docker labels.
-
         let inspect = self
             .docker
             .inspect_container(container_id, None)
             .await
             .map_err(|e| ComposeError::Docker(format!("inspect failed: {}", e)))?;
+
+        let actual_labels = inspect
+            .config
+            .as_ref()
+            .and_then(|config| config.labels.as_ref())
+            .ok_or_else(|| ComposeError::Docker(format!(
+                "container {container_id} for service '{service_name}' has no labels; refusing to register an unowned Compose container"
+            )))?;
+        for (key, expected) in base_labels {
+            let actual = actual_labels.get(key).map(String::as_str);
+            if actual != Some(expected.as_str()) {
+                return Err(ComposeError::Docker(format!(
+                    "container {container_id} for service '{service_name}' has ownership label '{key}'={actual:?}, expected '{expected}'"
+                )));
+            }
+        }
+        if actual_labels.get("sh.temps.service").map(String::as_str) != Some(service_name) {
+            return Err(ComposeError::Docker(format!(
+                "container {container_id} has a mismatched sh.temps.service ownership label for Compose service '{service_name}'"
+            )));
+        }
 
         let state = inspect
             .state
@@ -4508,6 +4683,122 @@ impl ComposeExecutor {
         );
 
         Ok(())
+    }
+
+    /// A retained failure must not bypass the Temps proxy through a Docker
+    /// host port. Inspect Docker's configured bindings (not `compose ps`,
+    /// which can omit stopped-container publishers) and admit loopback only.
+    async fn verify_retention_port_bindings(
+        &self,
+        container_id: &str,
+        service_name: &str,
+    ) -> Result<(), ComposeError> {
+        let inspect = self
+            .docker
+            .inspect_container(container_id, None)
+            .await
+            .map_err(|error| {
+                ComposeError::Docker(format!(
+                    "failed to inspect port bindings for retained container {container_id}: {error}"
+                ))
+            })?;
+        let Some(port_bindings) = inspect
+            .host_config
+            .and_then(|host_config| host_config.port_bindings)
+        else {
+            return Ok(());
+        };
+
+        for (container_port, bindings) in port_bindings {
+            for binding in bindings.into_iter().flatten() {
+                let host_ip = binding.host_ip.unwrap_or_default();
+                let loopback = host_ip
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|address| address.is_loopback());
+                if !loopback {
+                    return Err(ComposeError::Docker(format!(
+                        "service '{service_name}' publishes container port {container_port} on host address '{}'; failed stacks may be retained only when every host binding is loopback",
+                        if host_ip.is_empty() { "all interfaces" } else { &host_ip }
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Force-remove a set of candidate containers after re-verifying their
+    /// exact Temps ownership labels. Used as the fail-closed fallback for a
+    /// failed stack that is unsafe to retain (for example, it publishes a
+    /// host port on all interfaces). Every candidate is attempted so one
+    /// Docker error cannot leave a sibling publicly reachable.
+    pub async fn remove_verified_containers(
+        &self,
+        containers: &[ComposeServiceResult],
+        expected_labels: &HashMap<String, String>,
+    ) -> Result<(), ComposeError> {
+        let mut failures = Vec::new();
+        for container in containers {
+            match self
+                .docker
+                .inspect_container(&container.container_id, None)
+                .await
+            {
+                Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => continue,
+                Err(error) => {
+                    failures.push(format!(
+                        "inspect {} (service '{}'): {error}",
+                        container.container_id, container.service_name
+                    ));
+                    continue;
+                }
+                Ok(_) => {}
+            }
+
+            if let Err(error) = self
+                .verify_labels(
+                    &container.container_id,
+                    expected_labels,
+                    &container.service_name,
+                )
+                .await
+            {
+                failures.push(error.to_string());
+                continue;
+            }
+
+            match self
+                .docker
+                .remove_container(
+                    &container.container_id,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+            {
+                Ok(())
+                | Err(bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                }) => {}
+                Err(error) => failures.push(format!(
+                    "remove {} (service '{}'): {error}",
+                    container.container_id, container.service_name
+                )),
+            }
+        }
+
+        if failures.is_empty() {
+            Ok(())
+        } else {
+            Err(ComposeError::Docker(format!(
+                "failed to remove {} ownership-verified Compose candidate container(s): {}",
+                failures.len(),
+                failures.join("; ")
+            )))
+        }
     }
 
     /// Generate a docker-compose.temps-override.yml that adds env_file to every
@@ -4776,7 +5067,7 @@ impl ComposeExecutor {
         labels: &HashMap<String, String>,
     ) -> String {
         // Reuse the same service parsing logic
-        let services = self.parse_service_names(compose_content);
+        let services = self.parse_service_names_yaml(compose_content);
 
         if services.is_empty() || labels.is_empty() {
             return String::new();
@@ -6447,6 +6738,382 @@ services:
         assert_eq!(sandboxed_host.pids_limit, Some(512));
     }
 
+    #[tokio::test]
+    async fn failed_compose_startup_returns_containers_without_removing_them() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let compose_available = tokio::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success());
+        if !compose_available
+            || executor
+                .docker
+                .inspect_image("alpine:latest")
+                .await
+                .is_err()
+        {
+            println!("Docker Compose or alpine:latest is unavailable; skipping runtime test");
+            return;
+        }
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let project_name = format!(
+            "temps-failed-retention-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let compose = r#"
+services:
+  worker:
+    image: alpine:latest
+    command: ["sh", "-c", "echo retained-compose-diagnostic; sleep 30"]
+    healthcheck:
+      test: ["CMD", "false"]
+      interval: 1s
+      timeout: 1s
+      retries: 1
+"#;
+        let request = ComposeDeployRequest {
+            project_name: project_name.clone(),
+            compose_content: compose.to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: None,
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::from([
+                ("sh.temps.managed".to_string(), "true".to_string()),
+                ("sh.temps.project_id".to_string(), "42".to_string()),
+                ("sh.temps.environment".to_string(), "7".to_string()),
+            ]),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: Vec::new(),
+        };
+        executor
+            .write_compose_files(project_dir.path(), &request, "failed-test")
+            .await
+            .unwrap();
+        let prepared = PreparedComposeDeploy {
+            effective_dir: project_dir.path().to_path_buf(),
+            project_name: project_name.clone(),
+            compose_file: "docker-compose.yml".to_string(),
+            redact_values: Vec::new(),
+            secret_generation: "failed-test".to_string(),
+            has_materialized_secrets: false,
+        };
+
+        let failure = executor
+            .deploy_prepared(prepared, &request)
+            .await
+            .expect_err("unhealthy service must fail readiness");
+
+        assert!(
+            matches!(
+                &failure.error,
+                ComposeError::CommandFailed { .. } | ComposeError::ServicesNotReady { .. }
+            ),
+            "unexpected startup failure: {}",
+            failure.error
+        );
+        assert_eq!(failure.containers.len(), 1);
+        assert!(failure.cleanup_containers.is_empty());
+        assert!(failure.retention_error.is_none());
+        assert_eq!(failure.containers[0].service_name, "worker");
+        assert_eq!(failure.containers[0].status, "running");
+        let retained_id = failure.containers[0].container_id.clone();
+        let inspect = executor
+            .docker
+            .inspect_container(&retained_id, None)
+            .await
+            .expect("failed candidate must still exist for log inspection");
+        let labels = inspect
+            .config
+            .and_then(|config| config.labels)
+            .unwrap_or_default();
+        assert_eq!(
+            labels.get("sh.temps.managed").map(String::as_str),
+            Some("true")
+        );
+        let logs = executor.container_log_tail(&retained_id).await;
+        assert!(
+            logs.contains("retained-compose-diagnostic"),
+            "logs were: {logs}"
+        );
+
+        executor
+            .teardown_at(
+                &project_name,
+                Some(project_dir.path()),
+                Some("docker-compose.yml"),
+                &HashMap::new(),
+                true,
+            )
+            .await
+            .expect("runtime test must clean up its retained stack");
+    }
+
+    #[tokio::test]
+    async fn quickly_exiting_compose_service_never_reports_ready() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let compose_available = tokio::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success());
+        if !compose_available
+            || executor
+                .docker
+                .inspect_image("alpine:latest")
+                .await
+                .is_err()
+        {
+            println!("Docker Compose or alpine:latest is unavailable; skipping runtime test");
+            return;
+        }
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let project_name = format!(
+            "temps-quick-exit-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let compose = r#"
+services:
+  worker:
+    image: alpine:latest
+    command: ["sh", "-c", "echo quick-exit-diagnostic; exit 17"]
+"#;
+        let request = ComposeDeployRequest {
+            project_name: project_name.clone(),
+            compose_content: compose.to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: None,
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::from([
+                ("sh.temps.managed".to_string(), "true".to_string()),
+                ("sh.temps.project_id".to_string(), "42".to_string()),
+                ("sh.temps.environment".to_string(), "7".to_string()),
+            ]),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: Vec::new(),
+        };
+        executor
+            .write_compose_files(project_dir.path(), &request, "quick-exit")
+            .await
+            .unwrap();
+        let prepared = PreparedComposeDeploy {
+            effective_dir: project_dir.path().to_path_buf(),
+            project_name: project_name.clone(),
+            compose_file: "docker-compose.yml".to_string(),
+            redact_values: Vec::new(),
+            secret_generation: "quick-exit".to_string(),
+            has_materialized_secrets: false,
+        };
+
+        let failure = executor
+            .deploy_prepared(prepared, &request)
+            .await
+            .expect_err("a quickly exiting service must never be reported ready");
+        assert!(matches!(
+            failure.error,
+            ComposeError::ServicesNotReady { .. }
+        ));
+        assert_eq!(failure.containers.len(), 1);
+        assert_eq!(failure.containers[0].status, "exited");
+        let logs = executor
+            .container_log_tail(&failure.containers[0].container_id)
+            .await;
+        assert!(logs.contains("quick-exit-diagnostic"), "logs were: {logs}");
+
+        executor
+            .teardown_at(
+                &project_name,
+                Some(project_dir.path()),
+                Some("docker-compose.yml"),
+                &HashMap::new(),
+                true,
+            )
+            .await
+            .expect("runtime test must clean up its retained stack");
+    }
+
+    #[tokio::test]
+    async fn failed_compose_with_public_host_binding_is_not_retainable() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let compose_available = tokio::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success());
+        if !compose_available
+            || executor
+                .docker
+                .inspect_image("alpine:latest")
+                .await
+                .is_err()
+        {
+            println!("Docker Compose or alpine:latest is unavailable; skipping runtime test");
+            return;
+        }
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let project_name = format!(
+            "temps-failed-public-port-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let compose = r#"
+services:
+  worker:
+    image: alpine:latest
+    command: ["sh", "-c", "sleep 30"]
+    ports:
+      - "0.0.0.0::8080"
+    healthcheck:
+      test: ["CMD", "false"]
+      interval: 1s
+      timeout: 1s
+      retries: 1
+"#;
+        let request = ComposeDeployRequest {
+            project_name: project_name.clone(),
+            compose_content: compose.to_string(),
+            env_content: None,
+            work_dir: project_dir.path().to_path_buf(),
+            compose_path: None,
+            environment_vars: HashMap::new(),
+            secrets: HashMap::new(),
+            secret_compose_services: HashMap::new(),
+            build_args: HashMap::new(),
+            labels: HashMap::from([
+                ("sh.temps.managed".to_string(), "true".to_string()),
+                ("sh.temps.project_id".to_string(), "42".to_string()),
+                ("sh.temps.environment".to_string(), "7".to_string()),
+            ]),
+            repo_dir: None,
+            compose_override: None,
+            relaxed_capability_services: Vec::new(),
+            unsandboxed_services: Vec::new(),
+        };
+        executor
+            .write_compose_files(project_dir.path(), &request, "failed-public-port")
+            .await
+            .unwrap();
+        let prepared = PreparedComposeDeploy {
+            effective_dir: project_dir.path().to_path_buf(),
+            project_name: project_name.clone(),
+            compose_file: "docker-compose.yml".to_string(),
+            redact_values: Vec::new(),
+            secret_generation: "failed-public-port".to_string(),
+            has_materialized_secrets: false,
+        };
+
+        let failure = executor
+            .deploy_prepared(prepared, &request)
+            .await
+            .expect_err("unhealthy service must fail readiness");
+        assert!(failure.containers.is_empty());
+        assert_eq!(failure.cleanup_containers.len(), 1);
+        let unsafe_container_id = failure.cleanup_containers[0].container_id.clone();
+        let retention_error = failure
+            .retention_error
+            .expect("public host binding must block retention")
+            .to_string();
+        assert!(retention_error.contains("0.0.0.0"));
+        assert!(retention_error.contains("loopback"));
+
+        executor
+            .remove_verified_containers(&failure.cleanup_containers, &request.labels)
+            .await
+            .expect("ownership-verified direct cleanup must remove the unsafe container");
+        let simulated_teardown_failure = executor
+            .teardown_at(
+                &project_name,
+                Some(project_dir.path()),
+                Some("missing-compose.yml"),
+                &HashMap::new(),
+                true,
+            )
+            .await;
+        assert!(simulated_teardown_failure.is_err());
+        assert!(matches!(
+            executor
+                .docker
+                .inspect_container(&unsafe_container_id, None)
+                .await,
+            Err(bollard::errors::Error::DockerResponseServerError {
+                status_code: 404,
+                ..
+            })
+        ));
+
+        executor
+            .teardown_at(
+                &project_name,
+                Some(project_dir.path()),
+                Some("docker-compose.yml"),
+                &HashMap::new(),
+                true,
+            )
+            .await
+            .expect("runtime test must clean up the unsafe failed stack");
+    }
+
+    #[test]
+    fn labels_override_supports_inline_service_mappings() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let compose = r#"services: {web: {image: nginx:alpine}, worker: {image: alpine}}"#;
+        let labels = HashMap::from([
+            ("sh.temps.managed".to_string(), "true".to_string()),
+            ("sh.temps.project_id".to_string(), "42".to_string()),
+        ]);
+
+        let rendered = executor.generate_labels_override(compose, &labels);
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+        let services = parsed
+            .get("services")
+            .and_then(serde_yaml::Value::as_mapping)
+            .unwrap();
+
+        for service in ["web", "worker"] {
+            let service_config = services
+                .get(serde_yaml::Value::String(service.to_string()))
+                .and_then(serde_yaml::Value::as_mapping)
+                .unwrap();
+            let generated_labels = service_config
+                .get(serde_yaml::Value::String("labels".to_string()))
+                .and_then(serde_yaml::Value::as_mapping)
+                .unwrap();
+            assert_eq!(
+                generated_labels.get(serde_yaml::Value::String("sh.temps.managed".to_string())),
+                Some(&serde_yaml::Value::String("true".to_string()))
+            );
+            assert_eq!(
+                generated_labels.get(serde_yaml::Value::String("sh.temps.service".to_string())),
+                Some(&serde_yaml::Value::String(service.to_string()))
+            );
+        }
+    }
+
     #[test]
     fn test_security_override_is_empty_when_every_service_is_unsandboxed() {
         let Some(executor) = test_executor() else {
@@ -7126,7 +7793,7 @@ services:
     }
 
     #[tokio::test]
-    async fn test_promoting_secret_generation_removes_only_obsolete_plaintext() {
+    async fn test_pruning_secret_generations_removes_only_obsolete_plaintext() {
         let Some(docker) = Docker::connect_with_defaults().ok() else {
             return;
         };
@@ -7147,7 +7814,7 @@ services:
         }
 
         executor
-            .promote_secret_generation("temps-1-2", Some("current"))
+            .prune_secret_generations("temps-1-2", Some("current"))
             .await
             .unwrap();
         assert!(!executor.secret_generation_dir("temps-1-2", "old").exists());
