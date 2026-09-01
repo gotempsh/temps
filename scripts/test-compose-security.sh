@@ -595,21 +595,27 @@ fi
 # Slow/incomplete requests must be bounded before HTTP parsing and Basic auth.
 # Saturate one reachable source and prove a separate loopback administrator can
 # still authenticate while the attack is active.
-admin_ingress_network="$(docker inspect temps-admin-ingress | jq -r '
-  .[0].NetworkSettings.Networks | keys[]
-  | select(endswith("_temps-ingress-network"))
-')"
-if [[ -z "$admin_ingress_network" ]]; then
-  echo "could not determine the dedicated admin ingress network" >&2
-  exit 1
-fi
+#
+# The probe must reach admin-ingress the same way any real client does: through
+# its loopback-published host port. temps-ingress-network disables inter-
+# container communication on its bridge (com.docker.network.bridge.enable_icc:
+# "false", by design -- see the network's compose comment), so a probe
+# attached directly to that bridge network has its connections silently
+# dropped before nginx ever sees them, which would make this assertion pass
+# for the wrong reason (no requests arrived) rather than because nginx
+# enforced the limit. --network host bypasses that bridge entirely and hits
+# the same published address the admin_authenticated checks above already use.
 docker run --detach --rm --name "$admin_saturation_probe_name" \
-  --network "$admin_ingress_network" alpine:3.22 sleep 300 >/dev/null
-docker exec --detach "$admin_saturation_probe_name" sh -ec '
+  --network host alpine:3.22 sleep 300 >/dev/null
+admin_binding_host="${admin_binding%:*}"
+admin_binding_port="${admin_binding##*:}"
+docker exec --detach \
+  --env ADMIN_HOST="$admin_binding_host" --env ADMIN_PORT="$admin_binding_port" \
+  "$admin_saturation_probe_name" sh -ec '
   index=0
   while [ "$index" -lt 64 ]; do
     { printf "GET /slow HTTP/1.1\r\nHost: temps"; sleep 30; } \
-      | nc -w 35 temps-admin-ingress 9001 >/dev/null 2>&1 &
+      | nc -w 35 "$ADMIN_HOST" "$ADMIN_PORT" >/dev/null 2>&1 &
     index=$((index + 1))
   done
   wait
@@ -625,8 +631,6 @@ for _ in {1..40}; do
 done
 if [[ "$admin_connection_limit_enforced" != "true" ]]; then
   echo "admin ingress did not enforce its pre-authentication connection ceiling" >&2
-  echo "--- resolved address of temps-admin-ingress from the probe ---" >&2
-  docker exec "$admin_saturation_probe_name" getent hosts temps-admin-ingress >&2 || true
   echo "--- established connections on temps-admin-ingress ---" >&2
   docker exec temps-admin-ingress sh -ec 'netstat -ant 2>/dev/null || cat /proc/net/tcp' >&2 || true
   echo "--- full nginx error log ---" >&2
