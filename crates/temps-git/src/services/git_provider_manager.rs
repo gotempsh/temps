@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::git_provider::{
     AuthMethod, GitProviderError, GitProviderFactory, GitProviderService, GitProviderType,
@@ -21,6 +21,7 @@ use temps_entities::{git_provider_connections, git_providers, projects, reposito
 
 // OAuth scope constants
 const GITLAB_OAUTH_SCOPES: &str = "api read_api read_repository";
+const MAX_DOCKERFILES_TO_SCAN: usize = 16;
 // Create JWT token for authentication
 use octocrab::models::{AppId, InstallationId, InstallationToken};
 use octocrab::params::apps::CreateInstallationAccessToken;
@@ -3310,7 +3311,16 @@ impl GitProviderManager {
             .await?;
 
         // Detect presets in root and subdirectories
-        let presets = self.detect_presets_in_directories(&files).await;
+        let mut presets = self.detect_presets_in_directories(&files).await;
+        self.enrich_dockerfile_exposed_ports(
+            &mut presets,
+            connection_id,
+            &provider_service,
+            &repository.owner,
+            &repository.name,
+            &target_branch,
+        )
+        .await;
 
         // Cache presets in repositories.preset as HashMap<branch, preset_data>
         let calculated_at = chrono::Utc::now();
@@ -3620,6 +3630,74 @@ impl GitProviderManager {
                 }
             })
             .collect()
+    }
+
+    /// Read a bounded number of detected Dockerfiles and attach their final
+    /// stage's primary `EXPOSE` port to preset metadata. Detection remains
+    /// best-effort: a provider read failure must not hide an otherwise valid
+    /// preset or prevent project creation.
+    async fn enrich_dockerfile_exposed_ports(
+        &self,
+        presets: &mut [ProjectPresetDomain],
+        connection_id: i32,
+        provider_service: &Arc<dyn GitProviderService>,
+        owner: &str,
+        repository_name: &str,
+        target_branch: &str,
+    ) {
+        let dockerfiles: Vec<(usize, String)> = presets
+            .iter()
+            .enumerate()
+            .filter(|(_, preset)| preset.preset == "dockerfile")
+            .take(MAX_DOCKERFILES_TO_SCAN)
+            .map(|(index, preset)| {
+                let path = if preset.path == "./" || preset.path.is_empty() {
+                    "Dockerfile".to_string()
+                } else {
+                    format!("{}/Dockerfile", preset.path.trim_end_matches('/'))
+                };
+                (index, path)
+            })
+            .collect();
+
+        for (preset_index, dockerfile_path) in dockerfiles {
+            let file = self
+                .execute_with_refresh(connection_id, |access_token| {
+                    let provider_service = provider_service.clone();
+                    let owner = owner.to_string();
+                    let repository_name = repository_name.to_string();
+                    let target_branch = target_branch.to_string();
+                    let dockerfile_path = dockerfile_path.clone();
+                    async move {
+                        provider_service
+                            .get_file_content(
+                                &access_token,
+                                &owner,
+                                &repository_name,
+                                &dockerfile_path,
+                                Some(&target_branch),
+                            )
+                            .await
+                    }
+                })
+                .await;
+
+            match file {
+                Ok(file) => {
+                    let content = decode_file_content(&file.content, &file.encoding);
+                    presets[preset_index].exposed_port =
+                        temps_presets::detect_primary_exposed_port(&content);
+                }
+                Err(error) => warn!(
+                    owner,
+                    repository = repository_name,
+                    branch = target_branch,
+                    dockerfile = dockerfile_path,
+                    error = %error,
+                    "Could not inspect Dockerfile EXPOSE metadata during preset detection"
+                ),
+            }
+        }
     }
 
     /// Update access token for a connection (for when tokens expire or are rotated)
@@ -6340,6 +6418,140 @@ services:
         assert!(message.contains("could not be rendered"), "{message}");
         validate_token.assert_async().await;
         file_content.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn connected_preset_detection_uses_selected_branch_and_preserves_read_failures() {
+        use crate::services::git_provider::{AuthMethod, GitProviderService};
+        use crate::services::github_provider::GitHubProvider;
+        use base64::Engine;
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let mut server = mockito::Server::new_async().await;
+        let validate_token = server
+            .mock("GET", "/rate_limit")
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"resources":{"core":{"remaining":4999}}}"#)
+            .expect(3)
+            .create_async()
+            .await;
+        let tree = server
+            .mock(
+                "GET",
+                "/repos/example-owner/example-repository/git/trees/release-port",
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "recursive".to_string(),
+                "1".to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tree":[{"path":"Dockerfile","type":"blob"},{"path":"apps/api/Dockerfile","type":"blob"}]}"#,
+            )
+            .create_async()
+            .await;
+        let missing_nested_dockerfile = server
+            .mock(
+                "GET",
+                "/repos/example-owner/example-repository/contents/apps/api/Dockerfile",
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "ref".to_string(),
+                "release-port".to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"simulated missing file"}"#)
+            .create_async()
+            .await;
+        let dockerfile = server
+            .mock(
+                "GET",
+                "/repos/example-owner/example-repository/contents/Dockerfile",
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "ref".to_string(),
+                "release-port".to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "path": "Dockerfile",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode("FROM alpine\nEXPOSE 4321\n"),
+                    "encoding": "base64"
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key should be valid"),
+        );
+        let mut connection = connection_fixture(11, Some(5));
+        connection.access_token = Some(
+            encryption_service
+                .encrypt_string("test-access-token")
+                .expect("test access token should encrypt"),
+        );
+        let repository = repository_fixture(connection.id);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[repository.clone()]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection]])
+                .append_query_results([[repository]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+        let provider: Arc<dyn GitProviderService> = Arc::new(GitHubProvider::new(
+            Some(server.url()),
+            AuthMethod::PersonalAccessToken {
+                token: "unused-constructor-token".to_string(),
+            },
+        ));
+        manager.providers_cache.write().await.insert(7, provider);
+
+        let result = manager
+            .calculate_repository_preset_live(42, Some("release-port".to_string()))
+            .await
+            .expect("connected preset detection should succeed");
+
+        assert_eq!(result.presets.len(), 2);
+        let root = result
+            .presets
+            .iter()
+            .find(|preset| preset.path == "./")
+            .expect("root Dockerfile preset should remain available");
+        let nested = result
+            .presets
+            .iter()
+            .find(|preset| preset.path == "apps/api")
+            .expect("unreadable nested Dockerfile preset should remain available");
+        assert_eq!(root.exposed_port, Some(4321));
+        assert_eq!(nested.exposed_port, None);
+        validate_token.assert_async().await;
+        tree.assert_async().await;
+        dockerfile.assert_async().await;
+        missing_nested_dockerfile.assert_async().await;
     }
 
     // Helper function to create a test ConfigService

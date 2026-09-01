@@ -248,6 +248,7 @@ mod tests {
             default_backup_provisioned: false,
             ai_data_access: false,
             container_name: None,
+            created_by_user_id: None,
         }
     }
 

@@ -156,8 +156,8 @@ struct MfaSetupCandidate {
 }
 
 fn generate_mfa_setup_candidate(email: &str) -> Result<MfaSetupCandidate, UserServiceError> {
-    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
     use argon2::Argon2;
+    use argon2::PasswordHasher;
 
     let secret: Vec<u8> = (0..20).map(|_| rand::rng().random::<u8>()).collect();
     let secret_key = base32::encode(base32::Alphabet::Rfc4648 { padding: true }, &secret);
@@ -173,9 +173,8 @@ fn generate_mfa_setup_candidate(email: &str) -> Result<MfaSetupCandidate, UserSe
     let hashed_recovery_codes = recovery_codes
         .iter()
         .map(|code| {
-            let salt = SaltString::generate(&mut OsRng);
             argon2
-                .hash_password(code.as_bytes(), &salt)
+                .hash_password(code.as_bytes())
                 .map(|hash| hash.to_string())
                 .map_err(|error| {
                     UserServiceError::Mfa(format!("Failed to hash MFA recovery code: {}", error))
@@ -623,12 +622,11 @@ impl UserService {
             crate::auth_service::validate_password_complexity(&pwd)
                 .map_err(|e| UserServiceError::Validation(e.to_string()))?;
             debug!("Hashing password with Argon2 for user: {}", username);
-            use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+            use argon2::PasswordHasher;
 
-            let salt = SaltString::generate(&mut OsRng);
             let argon2 = argon2::Argon2::default();
             let hash = argon2
-                .hash_password(pwd.as_bytes(), &salt)
+                .hash_password(pwd.as_bytes())
                 .map_err(|e| {
                     error!(
                         "Failed to hash password with Argon2 for user {}: {}",
@@ -892,7 +890,7 @@ impl UserService {
                 return Err(UserServiceError::InvalidCurrentPassword { user_id });
             }
             use argon2::PasswordVerifier;
-            let parsed = argon2::password_hash::PasswordHash::new(hash)
+            let parsed = argon2::PasswordHash::new(hash)
                 .map_err(|_| UserServiceError::InvalidCurrentPassword { user_id })?;
             if argon2::Argon2::default()
                 .verify_password(provided.as_bytes(), &parsed)
@@ -1034,8 +1032,7 @@ impl UserService {
             let hashed_codes_clone = hashed_codes.clone();
 
             // First check if the code matches any recovery code using Argon2id
-            use argon2::password_hash::{PasswordHash, PasswordVerifier};
-            use argon2::Argon2;
+            use argon2::{Argon2, PasswordHash, PasswordVerifier};
 
             let argon2 = Argon2::default();
             for hashed_code in hashed_codes {
@@ -1130,7 +1127,7 @@ impl UserService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use argon2::password_hash::{rand_core::OsRng, PasswordHasher, SaltString};
+    use argon2::PasswordHasher;
     use sea_orm::{DatabaseBackend, DbErr, MockDatabase, MockExecResult};
 
     fn user(mfa_enabled: bool, recovery_codes: Option<String>) -> temps_entities::users::Model {
@@ -1581,7 +1578,7 @@ mod tests {
     async fn recovery_code_is_consumed_under_an_exclusive_row_lock() {
         let recovery_code = "RECOVERY-CODE";
         let hash = argon2::Argon2::default()
-            .hash_password(recovery_code.as_bytes(), &SaltString::generate(&mut OsRng))
+            .hash_password(recovery_code.as_bytes())
             .expect("test recovery code hashes")
             .to_string();
         let original = user(

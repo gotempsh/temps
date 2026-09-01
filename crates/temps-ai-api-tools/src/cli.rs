@@ -96,11 +96,10 @@ pub(crate) fn resolve<'a>(
         {
             Some(op) => resolve_operation(op, &tokens[2..]),
             None => CliAction::Terminal(format!(
-                "Unknown operation '{op_name}' in section '{}'. Run `{} --help` to list it.{}{}",
-                sec.slug,
+                "Unknown operation '{op_name}' in section '{}'.{}\n\n{}",
                 sec.slug,
                 mutation_redirect(op_name),
-                suggest_operations(&secs, op_name),
+                render_section_help(sec),
             )),
         };
     }
@@ -542,6 +541,42 @@ fn first_line(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use utoipa::openapi::{
+        path::{OperationBuilder, PathItem, PathsBuilder},
+        OpenApiBuilder,
+    };
+
+    fn analytics_discovery_index() -> ReadOnlyApiIndex {
+        let visitor_sessions = OperationBuilder::new()
+            .operation_id(Some("get_analytics_visitor_sessions"))
+            .summary(Some("Get all sessions for a specific visitor"))
+            .tag("Analytics")
+            .build();
+        let page_detail = OperationBuilder::new()
+            .operation_id(Some("get_page_path_detail"))
+            .summary(Some("Get detailed analytics for a specific page path"))
+            .tag("Analytics")
+            .build();
+        let paths = PathsBuilder::new()
+            .path(
+                "/analytics/visitors/{visitor_id}/sessions",
+                PathItem::new(utoipa::openapi::path::HttpMethod::Get, visitor_sessions),
+            )
+            .path(
+                "/analytics/page-path-detail",
+                PathItem::new(utoipa::openapi::path::HttpMethod::Get, page_detail),
+            )
+            .build();
+        let openapi = OpenApiBuilder::new()
+            .info(utoipa::openapi::Info::new("Test API", "1.0.0"))
+            .paths(paths)
+            .build();
+
+        ReadOnlyApiIndex::from_openapi_allowlist(
+            &openapi,
+            &["get_analytics_visitor_sessions", "get_page_path_detail"],
+        )
+    }
 
     #[test]
     fn tokenize_respects_quotes() {
@@ -711,5 +746,62 @@ mod tests {
             "Static-bundles"
         );
         assert_eq!(path_section("/"), "General");
+    }
+
+    #[test]
+    fn unknown_analytics_operation_surfaces_page_level_country_operation() {
+        let index = analytics_discovery_index();
+
+        let result = resolve(&index, "analytics get_analytics --path /managed", &|_| true);
+        let CliAction::Terminal(message) = result else {
+            panic!("unknown analytics operation unexpectedly resolved");
+        };
+
+        assert!(message.contains("Unknown operation 'get_analytics'"));
+        assert!(
+            message.contains("get_page_path_detail"),
+            "page-level analytics operation missing from recovery help: {message}"
+        );
+        assert!(
+            message.contains("Get detailed analytics for a specific page path"),
+            "page-detail summary missing from recovery help: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_operation_recovery_only_lists_permitted_operations() {
+        let index = analytics_discovery_index();
+
+        let result = resolve(&index, "analytics get_analytics --path /managed", &|op| {
+            op.operation_id != "get_analytics_visitor_sessions"
+        });
+        let CliAction::Terminal(message) = result else {
+            panic!("unknown analytics operation unexpectedly resolved");
+        };
+
+        assert!(message.contains("get_page_path_detail"));
+        assert!(
+            !message.contains("get_analytics_visitor_sessions"),
+            "recovery help exposed an operation rejected by the permission filter: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_mutation_preserves_write_tool_redirect_and_section_help() {
+        let index = analytics_discovery_index();
+
+        let result = resolve(&index, "analytics delete_analytics", &|_| true);
+        let CliAction::Terminal(message) = result else {
+            panic!("unknown analytics mutation unexpectedly resolved");
+        };
+
+        assert!(
+            message.contains("temps_write"),
+            "redirect missing: {message}"
+        );
+        assert!(
+            message.contains("get_page_path_detail"),
+            "section recovery help missing: {message}"
+        );
     }
 }

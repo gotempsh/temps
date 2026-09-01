@@ -4,7 +4,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
   isLikelySecretProjectEnvironmentVariable,
-  isTempsManagedProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
 } from './project-environment-variables'
 
@@ -72,45 +71,17 @@ describe('projectEnvironmentVariablesSchema', () => {
     'SENTRY_DSN',
     'NEXT_PUBLIC_SENTRY_DSN',
     'OTEL_EXPORTER_OTLP_ENDPOINT',
-    'OTEL_EXPORTER_OTLP_TOKEN',
-  ])('rejects platform-managed variable %s', (key) => {
-    const result = projectEnvironmentVariablesSchema.safeParse([
-      { key, value: 'user-value', isSecret: false },
-    ])
-
-    expect(result.success).toBe(false)
-    if (result.success) return
-    expect(result.error.issues).toContainEqual(
-      expect.objectContaining({
-        message: 'Temps provides this variable automatically at deployment',
-        path: [0, 'key'],
-      })
-    )
-  })
-})
-
-describe('isTempsManagedProjectEnvironmentVariable', () => {
-  test.each([
-    'SENTRY_DSN',
-    'SENTRY_TUNNEL',
-    'NEXT_PUBLIC_SENTRY_DSN',
-    'VITE_SENTRY_DSN',
-    'TEMPS_API_TOKEN',
-    'PORT',
-    'TEMPS_ASSET_PREFIX',
-    'NEXT_PUBLIC_TEMPS_ASSET_PREFIX',
-    'TEMPS_NODE_NAME',
-    'OTEL_EXPORTER_OTLP_ENDPOINT',
-    'OTEL_EXPORTER_OTLP_HEADERS',
-    'OTEL_EXPORTER_OTLP_TOKEN',
-  ])('recognizes %s as platform-managed', (key) => {
-    expect(isTempsManagedProjectEnvironmentVariable(key)).toBe(true)
-  })
-
-  test.each(['SENTRY_DSN_BACKUP', 'OTEL_RESOURCE_ATTRIBUTES', 'API_TOKEN'])(
-    'keeps user-owned variable %s configurable',
+    'SENTRY_RELEASE',
+    'OTEL_SERVICE_VERSION',
+    'HOST',
+  ])(
+    'leaves backend-owned policy decisions to the managed catalog for %s',
     (key) => {
-      expect(isTempsManagedProjectEnvironmentVariable(key)).toBe(false)
+      const result = projectEnvironmentVariablesSchema.safeParse([
+        { key, value: 'user-value', isSecret: false },
+      ])
+
+      expect(result.success).toBe(true)
     }
   )
 })

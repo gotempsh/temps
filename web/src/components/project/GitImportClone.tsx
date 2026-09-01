@@ -7,10 +7,8 @@ import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   listConnectionsOptions,
   getRepositoryBranchesOptions,
-  getRepositoryPresetLiveOptions,
   createProjectMutation,
   getPublicBranchesOptions,
-  detectPublicPresetsOptions,
   listProjectTemplatesOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -374,50 +372,6 @@ export function GitImportClone({
   // Use the appropriate branches based on whether it's a public repo
   const branches = useGitUrl ? publicBranches : authenticatedBranches
 
-  // Query for presets from authenticated connection
-  const {
-    data: authenticatedPresetData,
-    refetch: refetchAuthenticatedPresetData,
-  } = useQuery({
-    ...getRepositoryPresetLiveOptions({
-      path: {
-        repository_id: selectedRepository?.id || 0,
-      },
-    }),
-    enabled: !useGitUrl && !!selectedRepository && !!selectedRepository?.id,
-  })
-
-  // Query for presets from public repository
-  const { data: publicPresetData, refetch: refetchPublicPresetData } = useQuery(
-    {
-      ...detectPublicPresetsOptions({
-        path: {
-          provider: parsedPublicRepo?.provider || 'github',
-          owner: parsedPublicRepo?.owner || '',
-          repo: parsedPublicRepo?.repo || '',
-        },
-        query: {
-          branch: selectedRepository?.default_branch,
-          base_url: parsedPublicRepo?.instanceUrl,
-        },
-      }),
-      enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
-    }
-  )
-
-  // Transform public preset data to match ProjectPresetResponse format (camelCase)
-  const presetData = useGitUrl
-    ? publicPresetData?.presets?.map((p) => ({
-        preset: p.preset,
-        presetLabel: p.preset_label,
-        exposedPort: p.exposed_port,
-        iconUrl: p.icon_url,
-        projectType: p.project_type,
-        path: p.path,
-        composeFiles: (p as any).compose_files as string[] | undefined,
-      }))
-    : authenticatedPresetData?.presets
-
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
     meta: {
@@ -648,12 +602,6 @@ export function GitImportClone({
                     baseUrl: parsedPublicRepo.instanceUrl,
                   }
                 : null
-            }
-            presetData={presetData}
-            onRefreshPresets={() =>
-              useGitUrl
-                ? refetchPublicPresetData()
-                : refetchAuthenticatedPresetData()
             }
             branches={branches?.branches}
             mode="wizard"

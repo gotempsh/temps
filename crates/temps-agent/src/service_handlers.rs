@@ -7,7 +7,7 @@
 //! (PostgreSQL, Redis, MongoDB, S3) on any node in the cluster.
 
 use axum::{
-    extract::{Path, State},
+    extract::{Extension, Path, State},
     http::StatusCode,
     response::IntoResponse,
     Json,
@@ -19,7 +19,17 @@ use bollard::query_parameters::{
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::handlers::{AgentResponse, AgentState};
+use crate::exec_timeout::{
+    completed_exec_exit_code, exec_start_was_rejected, monitor_exec_until_stopped,
+    resolve_container_id, resolve_exec_container_id, run_exec_with_deadline, ExecCleanupGuard,
+    ExecCompletionError, ExecDeadlineOutcome,
+};
+use crate::handlers::{
+    captured_error_response, captured_ok_response, container_identity_error_status,
+    try_acquire_attached_exec_permits, try_acquire_exec_lifecycle_permits, AgentResourceLimits,
+    AgentResponse, AgentState, ExecAdmissionError,
+};
+use crate::output_buffer::{BoundedTailBuffer, MAX_CAPTURED_STREAM_BYTES};
 use crate::{
     ServiceBackupRequest, ServiceBackupResponse, ServiceCreateRequest, ServiceCreateResponse,
     ServiceExecRequest, ServiceExecResponse, ServiceRestoreRequest, ServiceStatus,
@@ -28,6 +38,156 @@ use temps_providers::remote_service_client::{
     RemoteHealthProbeRequest, RemoteHealthProbeResponse, RemoteRuntimeEnvRequest,
     RemoteRuntimeEnvResponse,
 };
+
+const SERVICE_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+const SERVICE_DATA_OPERATION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(2 * 60 * 60);
+const DATA_OPERATION_STDERR_CAPTURE_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Copy)]
+struct ExecCaptureLimits {
+    stdout: usize,
+    stderr: usize,
+}
+
+const SERVICE_EXEC_CAPTURE_LIMITS: ExecCaptureLimits = ExecCaptureLimits {
+    stdout: MAX_CAPTURED_STREAM_BYTES,
+    stderr: MAX_CAPTURED_STREAM_BYTES,
+};
+const DATA_OPERATION_CAPTURE_LIMITS: ExecCaptureLimits = ExecCaptureLimits {
+    stdout: 0,
+    stderr: DATA_OPERATION_STDERR_CAPTURE_BYTES,
+};
+const POSTGRES_DUMP_SCRIPT: &str =
+    "pg_dumpall --clean --if-exists --no-acl --no-owner -U postgres | gzip > /tmp/backup.sql.gz && echo 'dump_complete'";
+
+fn postgres_dump_command() -> Vec<String> {
+    vec![
+        "bash".to_string(),
+        "-o".to_string(),
+        "pipefail".to_string(),
+        "-c".to_string(),
+        POSTGRES_DUMP_SCRIPT.to_string(),
+    ]
+}
+
+struct CapturedExecOutput {
+    exit_code: i64,
+    stdout: String,
+    stderr: String,
+    received_stdout_bytes: usize,
+    received_stderr_bytes: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum CaptureExecError {
+    #[error("Failed to start Docker exec '{exec_id}': {source}")]
+    Start {
+        exec_id: String,
+        source: bollard::errors::Error,
+    },
+    #[error("Docker exec '{exec_id}' unexpectedly started detached")]
+    UnexpectedDetached { exec_id: String },
+    #[error("Failed while reading output from Docker exec '{exec_id}': {source}")]
+    Stream {
+        exec_id: String,
+        source: bollard::errors::Error,
+    },
+    #[error("Failed to inspect completed Docker exec '{exec_id}': {source}")]
+    Inspect {
+        exec_id: String,
+        source: bollard::errors::Error,
+    },
+    #[error("Docker exec completion could not be confirmed: {source}")]
+    Completion {
+        #[from]
+        source: ExecCompletionError,
+    },
+}
+
+async fn capture_exec_output(
+    docker: &bollard::Docker,
+    exec_id: &str,
+    limits: ExecCaptureLimits,
+) -> Result<CapturedExecOutput, CaptureExecError> {
+    use bollard::exec::{StartExecOptions, StartExecResults};
+    use futures::StreamExt;
+
+    let mut output = match docker
+        .start_exec(exec_id, None::<StartExecOptions>)
+        .await
+        .map_err(|source| CaptureExecError::Start {
+            exec_id: exec_id.to_string(),
+            source,
+        })? {
+        StartExecResults::Attached { output, .. } => output,
+        StartExecResults::Detached => {
+            return Err(CaptureExecError::UnexpectedDetached {
+                exec_id: exec_id.to_string(),
+            });
+        }
+    };
+
+    let mut stdout = BoundedTailBuffer::new(limits.stdout);
+    let mut stderr = BoundedTailBuffer::new(limits.stderr);
+    let mut received_stdout_bytes = 0usize;
+    let mut received_stderr_bytes = 0usize;
+    while let Some(chunk) = output.next().await {
+        match chunk.map_err(|source| CaptureExecError::Stream {
+            exec_id: exec_id.to_string(),
+            source,
+        })? {
+            bollard::container::LogOutput::StdOut { message } => {
+                received_stdout_bytes = received_stdout_bytes.saturating_add(message.len());
+                stdout.push(message);
+            }
+            bollard::container::LogOutput::StdErr { message } => {
+                received_stderr_bytes = received_stderr_bytes.saturating_add(message.len());
+                stderr.push(message);
+            }
+            _ => {}
+        }
+    }
+
+    let inspect =
+        docker
+            .inspect_exec(exec_id)
+            .await
+            .map_err(|source| CaptureExecError::Inspect {
+                exec_id: exec_id.to_string(),
+                source,
+            })?;
+    let exit_code = completed_exec_exit_code(&inspect, exec_id)?;
+
+    Ok(CapturedExecOutput {
+        exit_code,
+        stdout: stdout.into_string(),
+        stderr: stderr.into_string(),
+        received_stdout_bytes,
+        received_stderr_bytes,
+    })
+}
+
+fn exec_failure_message(
+    operation: &str,
+    container_name: &str,
+    output: &CapturedExecOutput,
+) -> Option<String> {
+    if output.exit_code == 0 {
+        return None;
+    }
+
+    let stderr = output.stderr.trim();
+    let context = if stderr.is_empty() {
+        String::new()
+    } else {
+        format!(": {stderr}")
+    };
+    Some(format!(
+        "{operation} command in '{container_name}' exited with status {}{context}",
+        output.exit_code
+    ))
+}
 
 fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
     (
@@ -695,17 +855,23 @@ pub async fn service_status(
     responses(
         (status = 200, description = "Command executed", body = AgentResponse<ServiceExecResponse>),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Service container not found"),
+        (status = 409, description = "Container identity changed before exec start"),
+        (status = 429, description = "Exec or capture capacity exhausted"),
+        (status = 504, description = "Exec deadline exceeded"),
         (status = 500, description = "Exec failed")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn service_exec(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Json(request): Json<ServiceExecRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
         container = %request.container_name,
-        command = ?request.command,
+        command_argc = request.command.len(),
+        detached = request.detach,
         "Executing command in service container"
     );
 
@@ -715,6 +881,19 @@ pub async fn service_exec(
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Docker client not available".to_string(),
+            )
+            .into_response();
+        }
+    };
+    let cleanup_container_id = match resolve_container_id(docker, &request.container_name).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                container_identity_error_status(&error),
+                format!(
+                    "Failed to resolve service container '{}' before exec: {error}",
+                    request.container_name
+                ),
             )
             .into_response();
         }
@@ -731,6 +910,76 @@ pub async fn service_exec(
 
     let cmd_refs: Vec<&str> = request.command.iter().map(|s| &s[..]).collect();
 
+    let (operation_permit, container_permit, capture_permit) = if request.detach {
+        match try_acquire_exec_lifecycle_permits(&limits, &cleanup_container_id) {
+            Ok(permits) => (permits.operation, permits.container, None),
+            Err(ExecAdmissionError::OperationsExhausted) => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Cannot execute detached command in '{}': all exec operation slots are busy",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+            Err(ExecAdmissionError::ContainerOwned) => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Cannot execute detached command in '{}': another operation already owns that container",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+            Err(ExecAdmissionError::CapturesExhausted) => {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Detached command in '{}' unexpectedly required output capture capacity",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+        }
+    } else {
+        match try_acquire_attached_exec_permits(&limits, &cleanup_container_id) {
+            Ok(permits) => (permits.operation, permits.container, Some(permits.capture)),
+            Err(ExecAdmissionError::OperationsExhausted) => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Cannot execute command in '{}': all exec operation slots are busy",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+            Err(ExecAdmissionError::CapturesExhausted) => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Cannot execute command in '{}': all output capture slots are busy",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+            Err(ExecAdmissionError::ContainerOwned) => {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!(
+                        "Cannot execute command in '{}': another operation already owns that container",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            }
+        }
+    };
+
     let exec_config = CreateExecOptions {
         cmd: Some(cmd_refs),
         env: if env_refs.is_empty() {
@@ -744,10 +993,7 @@ pub async fn service_exec(
         ..Default::default()
     };
 
-    let exec_create = match docker
-        .create_exec(&request.container_name, exec_config)
-        .await
-    {
+    let exec_create = match docker.create_exec(&cleanup_container_id, exec_config).await {
         Ok(r) => r,
         Err(e) => {
             return error_response(
@@ -761,9 +1007,36 @@ pub async fn service_exec(
         }
     };
 
+    let exec_container_id = match resolve_exec_container_id(docker, &exec_create.id).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to prepare command cleanup: {error}"),
+            )
+            .into_response();
+        }
+    };
+    if exec_container_id != cleanup_container_id {
+        return error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Service container '{}' changed from '{}' to '{}' before exec start",
+                request.container_name, cleanup_container_id, exec_container_id
+            ),
+        )
+        .into_response();
+    }
+
     if request.detach {
-        // Start detached — don't wait for output
-        if let Err(e) = docker
+        let mut cleanup_guard = ExecCleanupGuard::new_without_capture(
+            docker.clone(),
+            exec_create.id.clone(),
+            cleanup_container_id.clone(),
+            Some(operation_permit),
+            container_permit,
+        );
+        let start_result = docker
             .start_exec(
                 &exec_create.id,
                 Some(StartExecOptions {
@@ -771,14 +1044,31 @@ pub async fn service_exec(
                     ..Default::default()
                 }),
             )
-            .await
-        {
+            .await;
+        if let Err(error) = start_result {
+            let cleanup_scheduled = !exec_start_was_rejected(&error);
+            if !cleanup_scheduled {
+                cleanup_guard.disarm();
+            }
+            let cleanup_note = if cleanup_scheduled {
+                "its container restart was scheduled because Docker did not definitively reject the workload"
+            } else {
+                "Docker definitively rejected the workload before start; its container was not restarted"
+            };
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to start exec (detached): {}", e),
+                format!("Failed to start detached exec: {error}; {cleanup_note}"),
             )
             .into_response();
         }
+
+        monitor_exec_until_stopped(
+            docker.clone(),
+            exec_create.id.clone(),
+            cleanup_container_id,
+            "detached service exec",
+            cleanup_guard,
+        );
 
         return ok_response(ServiceExecResponse {
             exit_code: 0,
@@ -788,59 +1078,111 @@ pub async fn service_exec(
         .into_response();
     }
 
-    // Start attached — collect output
-    let output = match docker
-        .start_exec(&exec_create.id, None::<StartExecOptions>)
-        .await
-    {
-        Ok(bollard::exec::StartExecResults::Attached { mut output, .. }) => {
-            use futures::StreamExt;
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-            while let Some(chunk) = output.next().await {
-                match chunk {
-                    Ok(bollard::container::LogOutput::StdOut { message }) => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(bollard::container::LogOutput::StdErr { message }) => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        stderr.push_str(&format!("Stream error: {}\n", e));
-                    }
-                }
-            }
-            (stdout, stderr)
-        }
-        Ok(bollard::exec::StartExecResults::Detached) => (String::new(), String::new()),
-        Err(e) => {
+    let capture_permit = match capture_permit {
+        Some(permit) => permit,
+        None => {
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to start exec: {}", e),
+                format!(
+                    "Missing output capture permit for attached command in '{}'",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+    };
+    let mut cleanup_guard = ExecCleanupGuard::new(
+        docker.clone(),
+        exec_create.id.clone(),
+        cleanup_container_id.clone(),
+        capture_permit,
+        operation_permit,
+        container_permit,
+    );
+
+    let (output, response_permit) = match run_exec_with_deadline(
+        docker,
+        &exec_create.id,
+        &cleanup_container_id,
+        SERVICE_EXEC_TIMEOUT,
+        capture_exec_output(docker, &exec_create.id, SERVICE_EXEC_CAPTURE_LIMITS),
+    )
+    .await
+    {
+        ExecDeadlineOutcome::Completed(Ok(output)) => {
+            let Some(response_permit) = cleanup_guard.disarm_and_take_capture() else {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Command in '{}' completed without response capture ownership",
+                        request.container_name
+                    ),
+                )
+                .into_response();
+            };
+            (output, response_permit)
+        }
+        ExecDeadlineOutcome::Completed(Err(error)) => {
+            let cleanup_scheduled = !matches!(
+                &error,
+                CaptureExecError::Start { source, .. } if exec_start_was_rejected(source)
+            );
+            if !cleanup_scheduled {
+                cleanup_guard.disarm();
+            }
+            let cleanup_note = if cleanup_scheduled {
+                "its container restart was scheduled to stop any ambiguous command workload"
+            } else {
+                "Docker definitively rejected the command before it started; its container was not restarted"
+            };
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to execute command in '{}': {error}; {cleanup_note}",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        ExecDeadlineOutcome::ContainerRestarted => {
+            cleanup_guard.disarm();
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "Command in '{}' exceeded the 5-minute worker deadline; its container was restarted to stop the complete command workload",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        ExecDeadlineOutcome::TerminationFailed(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Command in '{}' exceeded the 5-minute worker deadline, but the worker could not restart its container to stop the complete workload: {error}",
+                    request.container_name
+                ),
             )
             .into_response();
         }
     };
 
-    // Get exit code
-    let exit_code = match docker.inspect_exec(&exec_create.id).await {
-        Ok(info) => info.exit_code.unwrap_or(-1),
-        Err(_) => -1,
-    };
-
     tracing::info!(
         container = %request.container_name,
-        exit_code = exit_code,
+        exit_code = output.exit_code,
+        received_stdout_bytes = output.received_stdout_bytes,
+        received_stderr_bytes = output.received_stderr_bytes,
         "Exec completed"
     );
 
-    ok_response(ServiceExecResponse {
-        exit_code,
-        stdout: output.0,
-        stderr: output.1,
-    })
-    .into_response()
+    captured_ok_response(
+        ServiceExecResponse {
+            exit_code: output.exit_code,
+            stdout: output.stdout,
+            stderr: output.stderr,
+        },
+        response_permit,
+    )
 }
 
 /// Provision a project's logical database, bucket, or Redis allocation on
@@ -1046,12 +1388,17 @@ pub async fn list_services(State(state): State<Arc<AgentState>>) -> impl IntoRes
     responses(
         (status = 200, description = "Backup completed", body = AgentResponse<ServiceBackupResponse>),
         (status = 400, description = "Unsupported service type"),
+        (status = 404, description = "Service container not found"),
+        (status = 409, description = "Container identity changed before backup start"),
+        (status = 429, description = "Exec or capture capacity exhausted"),
+        (status = 504, description = "Backup deadline exceeded"),
         (status = 500, description = "Backup failed")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn backup_service(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Json(request): Json<ServiceBackupRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
@@ -1067,6 +1414,19 @@ pub async fn backup_service(
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Docker client not available".to_string(),
+            )
+            .into_response();
+        }
+    };
+    let cleanup_container_id = match resolve_container_id(docker, &request.container_name).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                container_identity_error_status(&error),
+                format!(
+                    "Failed to resolve service container '{}' before backup: {error}",
+                    request.container_name
+                ),
             )
             .into_response();
         }
@@ -1098,12 +1458,7 @@ pub async fn backup_service(
             // pg_dumpall dumps the entire cluster (all databases, roles, tablespaces).
             // Output is plain SQL (custom format is not supported by pg_dumpall), so the
             // restore path must use `psql -f` rather than `pg_restore`.
-            let cmd = vec![
-                "bash".to_string(),
-                "-c".to_string(),
-                "pg_dumpall --clean --if-exists --no-acl --no-owner -U postgres | gzip > /tmp/backup.sql.gz && echo 'dump_complete'"
-                    .to_string(),
-            ];
+            let cmd = postgres_dump_command();
             (cmd, Some("postgres"))
         }
         ("redis", _) => {
@@ -1136,9 +1491,45 @@ pub async fn backup_service(
         }
     };
 
-    // Execute the backup command inside the container
-    use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-    use futures::StreamExt;
+    let permits = match try_acquire_attached_exec_permits(&limits, &cleanup_container_id) {
+        Ok(permits) => permits,
+        Err(ExecAdmissionError::OperationsExhausted) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot back up '{}': all exec operation slots are busy",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        Err(ExecAdmissionError::CapturesExhausted) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot back up '{}': all output capture slots are busy",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        Err(ExecAdmissionError::ContainerOwned) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot back up '{}': another operation already owns that container",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+    };
+    let capture_permit = permits.capture;
+    let operation_permit = permits.operation;
+    let container_permit = permits.container;
+
+    // Execute the backup command inside the container.
+    use bollard::exec::CreateExecOptions;
 
     let env_strings: Vec<String> = s3_env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
     let env_refs: Vec<&str> = env_strings.iter().map(|s| &s[..]).collect();
@@ -1157,10 +1548,7 @@ pub async fn backup_service(
         ..Default::default()
     };
 
-    let exec_create = match docker
-        .create_exec(&request.container_name, exec_config)
-        .await
-    {
+    let exec_create = match docker.create_exec(&cleanup_container_id, exec_config).await {
         Ok(r) => r,
         Err(e) => {
             return error_response(
@@ -1170,72 +1558,133 @@ pub async fn backup_service(
             .into_response();
         }
     };
-
-    let start_opts = StartExecOptions {
-        ..Default::default()
+    let exec_container_id = match resolve_exec_container_id(docker, &exec_create.id).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to prepare backup cleanup: {error}"),
+            )
+            .into_response();
+        }
     };
+    if exec_container_id != cleanup_container_id {
+        return error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Service container '{}' changed from '{}' to '{}' before backup start",
+                request.container_name, cleanup_container_id, exec_container_id
+            ),
+        )
+        .into_response();
+    }
+    let mut cleanup_guard = ExecCleanupGuard::new(
+        docker.clone(),
+        exec_create.id.clone(),
+        cleanup_container_id.clone(),
+        capture_permit,
+        operation_permit,
+        container_permit,
+    );
 
-    match docker.start_exec(&exec_create.id, Some(start_opts)).await {
-        Ok(StartExecResults::Attached { mut output, .. }) => {
-            let mut stdout = String::new();
-            let mut stderr = String::new();
-
-            while let Some(chunk) = output.next().await {
-                match chunk {
-                    Ok(bollard::container::LogOutput::StdOut { message }) => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(bollard::container::LogOutput::StdErr { message }) => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        return error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Error reading backup output: {}", e),
-                        )
-                        .into_response();
-                    }
-                }
-            }
-
-            if stderr.contains("error") || stderr.contains("FATAL") {
-                tracing::error!(
-                    container = %request.container_name,
-                    "Backup failed: {}", stderr
-                );
+    let (output, response_permit) = match run_exec_with_deadline(
+        docker,
+        &exec_create.id,
+        &cleanup_container_id,
+        SERVICE_DATA_OPERATION_TIMEOUT,
+        capture_exec_output(docker, &exec_create.id, DATA_OPERATION_CAPTURE_LIMITS),
+    )
+    .await
+    {
+        ExecDeadlineOutcome::Completed(Ok(output)) => {
+            let Some(response_permit) = cleanup_guard.disarm_and_take_capture() else {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Backup failed: {}", stderr),
+                    format!(
+                        "Backup in '{}' completed without response capture ownership",
+                        request.container_name
+                    ),
                 )
                 .into_response();
-            }
-
-            tracing::info!(
-                container = %request.container_name,
-                stdout = %stdout,
-                "Backup completed successfully"
-            );
-
-            ok_response(ServiceBackupResponse {
-                s3_location: request.s3_path.clone(),
-                size_bytes: 0,
-                compression_type: "gzip".to_string(),
-                checksum: None,
-            })
-            .into_response()
+            };
+            (output, response_permit)
         }
-        Ok(StartExecResults::Detached) => error_response(
+        ExecDeadlineOutcome::Completed(Err(error)) => {
+            let cleanup_scheduled = !matches!(
+                &error,
+                CaptureExecError::Start { source, .. } if exec_start_was_rejected(source)
+            );
+            if !cleanup_scheduled {
+                cleanup_guard.disarm();
+            }
+            let cleanup_note = if cleanup_scheduled {
+                "its container restart was scheduled to stop any ambiguous backup workload"
+            } else {
+                "Docker definitively rejected the backup before it started; its container was not restarted"
+            };
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to run backup command in '{}': {error}; {cleanup_note}",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        ExecDeadlineOutcome::ContainerRestarted => {
+            cleanup_guard.disarm();
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "Backup command in '{}' exceeded the 2-hour worker deadline; its container was restarted to stop the complete backup workload",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        ExecDeadlineOutcome::TerminationFailed(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Backup command in '{}' exceeded the 2-hour worker deadline, but the worker could not restart its container to stop the complete workload: {error}",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+    };
+
+    if let Some(message) = exec_failure_message("Backup", &request.container_name, &output) {
+        tracing::error!(
+            container = %request.container_name,
+            exit_code = output.exit_code,
+            received_stdout_bytes = output.received_stdout_bytes,
+            received_stderr_bytes = output.received_stderr_bytes,
+            "Backup command failed"
+        );
+        return captured_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Backup exec unexpectedly detached".to_string(),
-        )
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to start backup exec: {}", e),
-        )
-        .into_response(),
+            message,
+            response_permit,
+        );
     }
+
+    tracing::info!(
+        container = %request.container_name,
+        received_stdout_bytes = output.received_stdout_bytes,
+        received_stderr_bytes = output.received_stderr_bytes,
+        "Backup completed successfully"
+    );
+
+    captured_ok_response(
+        ServiceBackupResponse {
+            s3_location: request.s3_path.clone(),
+            size_bytes: 0,
+            compression_type: "gzip".to_string(),
+            checksum: None,
+        },
+        response_permit,
+    )
 }
 
 /// Restore a service from S3.
@@ -1249,12 +1698,17 @@ pub async fn backup_service(
     responses(
         (status = 200, description = "Restore completed"),
         (status = 400, description = "Unsupported service type"),
+        (status = 404, description = "Service container not found"),
+        (status = 409, description = "Container identity changed before restore start"),
+        (status = 429, description = "Exec or capture capacity exhausted"),
+        (status = 504, description = "Restore deadline exceeded"),
         (status = 500, description = "Restore failed")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn restore_service(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Json(request): Json<ServiceRestoreRequest>,
 ) -> impl IntoResponse {
     tracing::info!(
@@ -1270,6 +1724,19 @@ pub async fn restore_service(
             return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Docker client not available".to_string(),
+            )
+            .into_response();
+        }
+    };
+    let cleanup_container_id = match resolve_container_id(docker, &request.container_name).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                container_identity_error_status(&error),
+                format!(
+                    "Failed to resolve service container '{}' before restore: {error}",
+                    request.container_name
+                ),
             )
             .into_response();
         }
@@ -1315,8 +1782,44 @@ pub async fn restore_service(
         }
     };
 
-    use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
-    use futures::StreamExt;
+    let permits = match try_acquire_attached_exec_permits(&limits, &cleanup_container_id) {
+        Ok(permits) => permits,
+        Err(ExecAdmissionError::OperationsExhausted) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot restore '{}': all exec operation slots are busy",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        Err(ExecAdmissionError::CapturesExhausted) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot restore '{}': all output capture slots are busy",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        Err(ExecAdmissionError::ContainerOwned) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot restore '{}': another operation already owns that container",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+    };
+    let capture_permit = permits.capture;
+    let operation_permit = permits.operation;
+    let container_permit = permits.container;
+
+    use bollard::exec::CreateExecOptions;
 
     let env_strings: Vec<String> = s3_env.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
     let env_refs: Vec<&str> = env_strings.iter().map(|s| &s[..]).collect();
@@ -1335,10 +1838,7 @@ pub async fn restore_service(
         ..Default::default()
     };
 
-    let exec_create = match docker
-        .create_exec(&request.container_name, exec_config)
-        .await
-    {
+    let exec_create = match docker.create_exec(&cleanup_container_id, exec_config).await {
         Ok(r) => r,
         Err(e) => {
             return error_response(
@@ -1348,61 +1848,131 @@ pub async fn restore_service(
             .into_response();
         }
     };
-
-    let start_opts = StartExecOptions {
-        ..Default::default()
+    let exec_container_id = match resolve_exec_container_id(docker, &exec_create.id).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to prepare restore cleanup: {error}"),
+            )
+            .into_response();
+        }
     };
+    if exec_container_id != cleanup_container_id {
+        return error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Service container '{}' changed from '{}' to '{}' before restore start",
+                request.container_name, cleanup_container_id, exec_container_id
+            ),
+        )
+        .into_response();
+    }
+    let mut cleanup_guard = ExecCleanupGuard::new(
+        docker.clone(),
+        exec_create.id.clone(),
+        cleanup_container_id.clone(),
+        capture_permit,
+        operation_permit,
+        container_permit,
+    );
 
-    match docker.start_exec(&exec_create.id, Some(start_opts)).await {
-        Ok(StartExecResults::Attached { mut output, .. }) => {
-            let mut stderr = String::new();
-
-            while let Some(chunk) = output.next().await {
-                match chunk {
-                    Ok(bollard::container::LogOutput::StdErr { message }) => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        return error_response(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Error reading restore output: {}", e),
-                        )
-                        .into_response();
-                    }
-                }
-            }
-
-            if stderr.contains("error") || stderr.contains("FATAL") {
+    let (output, response_permit) = match run_exec_with_deadline(
+        docker,
+        &exec_create.id,
+        &cleanup_container_id,
+        SERVICE_DATA_OPERATION_TIMEOUT,
+        capture_exec_output(docker, &exec_create.id, DATA_OPERATION_CAPTURE_LIMITS),
+    )
+    .await
+    {
+        ExecDeadlineOutcome::Completed(Ok(output)) => {
+            let Some(response_permit) = cleanup_guard.disarm_and_take_capture() else {
                 return error_response(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Restore failed: {}", stderr),
+                    format!(
+                        "Restore in '{}' completed without response capture ownership",
+                        request.container_name
+                    ),
                 )
                 .into_response();
-            }
-
-            tracing::info!(
-                container = %request.container_name,
-                "Restore completed successfully"
-            );
-
-            ok_response(serde_json::json!({
-                "status": "restored",
-                "container_name": request.container_name,
-            }))
-            .into_response()
+            };
+            (output, response_permit)
         }
-        Ok(StartExecResults::Detached) => error_response(
+        ExecDeadlineOutcome::Completed(Err(error)) => {
+            let cleanup_scheduled = !matches!(
+                &error,
+                CaptureExecError::Start { source, .. } if exec_start_was_rejected(source)
+            );
+            if !cleanup_scheduled {
+                cleanup_guard.disarm();
+            }
+            let cleanup_note = if cleanup_scheduled {
+                "its container restart was scheduled to stop any ambiguous restore workload"
+            } else {
+                "Docker definitively rejected the restore before it started; its container was not restarted"
+            };
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to run restore command in '{}': {error}; {cleanup_note}",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        ExecDeadlineOutcome::ContainerRestarted => {
+            cleanup_guard.disarm();
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!(
+                    "Restore command in '{}' exceeded the 2-hour worker deadline; its container was restarted to stop the complete restore workload",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+        ExecDeadlineOutcome::TerminationFailed(error) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Restore command in '{}' exceeded the 2-hour worker deadline, but the worker could not restart its container to stop the complete workload: {error}",
+                    request.container_name
+                ),
+            )
+            .into_response();
+        }
+    };
+
+    if let Some(message) = exec_failure_message("Restore", &request.container_name, &output) {
+        tracing::error!(
+            container = %request.container_name,
+            exit_code = output.exit_code,
+            received_stdout_bytes = output.received_stdout_bytes,
+            received_stderr_bytes = output.received_stderr_bytes,
+            "Restore command failed"
+        );
+        return captured_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Restore exec unexpectedly detached".to_string(),
-        )
-        .into_response(),
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to start restore exec: {}", e),
-        )
-        .into_response(),
+            message,
+            response_permit,
+        );
     }
+
+    tracing::info!(
+        container = %request.container_name,
+        received_stdout_bytes = output.received_stdout_bytes,
+        received_stderr_bytes = output.received_stderr_bytes,
+        "Restore completed successfully"
+    );
+
+    captured_ok_response(
+        serde_json::json!({
+            "status": "restored",
+            "container_name": request.container_name,
+        }),
+        response_permit,
+    )
 }
 
 /// Build S3 environment variables for backup commands (WAL-G, etc.)
@@ -1666,5 +2236,55 @@ mod overlay_ip_tests {
 
         assert!(names.contains("mongodb-orders_data"));
         assert!(names.contains("temps-mongodb-orders_data"));
+    }
+
+    #[test]
+    fn nonzero_exec_exit_includes_bounded_stderr_context() {
+        let output = CapturedExecOutput {
+            exit_code: 17,
+            stdout: String::new(),
+            // Model a diagnostic split across Docker frames before capture.
+            stderr: ["FA", "TAL: upload failed"].concat(),
+            received_stdout_bytes: 0,
+            received_stderr_bytes: 20,
+        };
+
+        let message = exec_failure_message("Backup", "postgres-orders", &output)
+            .expect("a nonzero exit must fail regardless of frame boundaries");
+        assert!(message.contains("postgres-orders"));
+        assert!(message.contains("status 17"));
+        assert!(message.contains("FATAL: upload failed"));
+    }
+
+    #[test]
+    fn zero_exec_exit_is_success_even_when_stderr_contains_error_word() {
+        let output = CapturedExecOutput {
+            exit_code: 0,
+            stdout: String::new(),
+            stderr: "non-fatal error counter: 0".to_string(),
+            received_stdout_bytes: 0,
+            received_stderr_bytes: 26,
+        };
+
+        assert!(exec_failure_message("Restore", "redis-cache", &output).is_none());
+    }
+
+    #[test]
+    fn data_operations_discard_stdout_and_keep_small_stderr_tail() {
+        assert_eq!(DATA_OPERATION_CAPTURE_LIMITS.stdout, 0);
+        assert_eq!(
+            DATA_OPERATION_CAPTURE_LIMITS.stderr,
+            DATA_OPERATION_STDERR_CAPTURE_BYTES
+        );
+    }
+
+    #[test]
+    fn postgres_dump_pipeline_enables_pipefail() {
+        let command = postgres_dump_command();
+
+        assert_eq!(&command[..4], ["bash", "-o", "pipefail", "-c"]);
+        assert!(command[4].contains("pg_dumpall"));
+        assert!(command[4].contains("| gzip"));
+        assert!(command[4].contains("&& echo 'dump_complete'"));
     }
 }

@@ -9,57 +9,6 @@ const LIKELY_SECRET_KEY =
   /(?:^|_)(?:SECRET|PASSWORD|PASSWD|TOKEN|API_KEY|PRIVATE_KEY|ACCESS_KEY|DATABASE_URL|POSTGRES_URL|MYSQL_URL|MONGODB_URL|MONGODB_URI|REDIS_URL|AMQP_URL|CONNECTION_STRING|DSN|WEBHOOK_URL)(?:_|$)/i
 
 /**
- * Variables written after user configuration is resolved by the deployment
- * planner. Letting users configure these during project creation is misleading:
- * the generated value wins at deploy time. OTEL_EXPORTER_OTLP_TOKEN is kept in
- * this list as a legacy alias used by an older bundled template; Temps now
- * injects the standard OTEL_EXPORTER_OTLP_HEADERS value instead.
- *
- * This is only a conservative client-side validation guard. The inventory
- * shown to users comes from the backend managed-environment-variables endpoint,
- * whose canonical catalog lives in
- * `temps-deployments/src/services/managed_environment_variables.rs`.
- */
-export const TEMPS_MANAGED_PROJECT_ENVIRONMENT_VARIABLES = [
-  'SENTRY_DSN',
-  'SENTRY_TUNNEL',
-  'NEXT_PUBLIC_SENTRY_DSN',
-  'NUXT_PUBLIC_SENTRY_DSN',
-  'VITE_SENTRY_DSN',
-  'PUBLIC_SENTRY_DSN',
-  'REACT_APP_SENTRY_DSN',
-  'NEXT_PUBLIC_SENTRY_TUNNEL',
-  'NUXT_PUBLIC_SENTRY_TUNNEL',
-  'VITE_SENTRY_TUNNEL',
-  'PUBLIC_SENTRY_TUNNEL',
-  'REACT_APP_SENTRY_TUNNEL',
-  'SENTRY_RELEASE',
-  'TEMPS_API_URL',
-  'TEMPS_API_TOKEN',
-  'CRON_SECRET',
-  'PORT',
-  'TEMPS_ASSET_PREFIX',
-  'NEXT_PUBLIC_TEMPS_ASSET_PREFIX',
-  'TEMPS_NODE_NAME',
-  'TEMPS_NODE_ID',
-  'TEMPS_REPLICA',
-  'OTEL_EXPORTER_OTLP_ENDPOINT',
-  'OTEL_EXPORTER_OTLP_PROTOCOL',
-  'OTEL_EXPORTER_OTLP_HEADERS',
-  'OTEL_EXPORTER_OTLP_TOKEN',
-  'OTEL_SERVICE_NAME',
-  'OTEL_SERVICE_VERSION',
-] as const
-
-const TEMPS_MANAGED_PROJECT_ENVIRONMENT_VARIABLE_SET = new Set<string>(
-  TEMPS_MANAGED_PROJECT_ENVIRONMENT_VARIABLES
-)
-
-export function isTempsManagedProjectEnvironmentVariable(key: string): boolean {
-  return TEMPS_MANAGED_PROJECT_ENVIRONMENT_VARIABLE_SET.has(key.trim())
-}
-
-/**
  * Picks a safe initial value for the explicit "Encrypt as secret" control.
  * This intentionally avoids broad matches such as `AUTH`, which would mark
  * public values like `NEXTAUTH_URL` as write-only.
@@ -89,13 +38,6 @@ export const projectEnvironmentVariablesSchema = z
         message: 'A secret needs a value — it cannot be filled in later',
         path: ['value'],
       })
-      .refine(
-        (variable) => !isTempsManagedProjectEnvironmentVariable(variable.key),
-        {
-          message: 'Temps provides this variable automatically at deployment',
-          path: ['key'],
-        }
-      )
   )
   .superRefine((variables, context) => {
     const firstIndexByKey = new Map<string, number>()

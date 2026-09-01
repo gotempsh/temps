@@ -2586,9 +2586,8 @@ async fn feature_flag_table_count(db: &DatabaseConnection) -> anyhow::Result<i32
     Ok(row.try_get("", "n")?)
 }
 
-/// Existing installations must gain both the project opt-in column and the
-/// provider-key model catalog with its ownership constraint after a normal
-/// forward migration.
+/// A normal forward migration must include the latest security-relevant
+/// ownership and AI catalog schema.
 #[tokio::test]
 async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()> {
     if external_db_configured() {
@@ -2636,7 +2635,12 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
                 (SELECT COUNT(*)::int FROM information_schema.columns \
                   WHERE table_schema = 'public' AND table_name = 'ai_gateway_config' \
                     AND column_name IN ('summary_provider_id', 'summary_model', \
-                                        'summary_thinking_level')) AS summary_columns"
+                                        'summary_thinking_level')) AS summary_columns, \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'public' AND table_name = 'external_services' \
+                    AND column_name = 'created_by_user_id') AS service_creator_column, \
+                EXISTS (SELECT 1 FROM pg_constraint \
+                  WHERE conname = 'fk_external_services_created_by_user') AS service_creator_fk"
                 .to_string(),
         ))
         .await?
@@ -2645,6 +2649,36 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
     assert!(schema.try_get::<bool>("", "model_table")?);
     assert!(schema.try_get::<bool>("", "model_key_fk")?);
     assert_eq!(schema.try_get::<i32>("", "summary_columns")?, 3);
+    assert!(schema.try_get::<bool>("", "service_creator_column")?);
+    assert!(schema.try_get::<bool>("", "service_creator_fk")?);
+
+    // The creator-ownership migration is the latest migration. Exercise its
+    // reversal and re-application so upgrades retain an emergency rollback.
+    Migrator::down(&db, Some(1)).await?;
+    let creator_column_after_down = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+               WHERE table_schema = 'public' AND table_name = 'external_services' \
+                 AND column_name = 'created_by_user_id') AS present"
+                .to_string(),
+        ))
+        .await?
+        .expect("creator column rollback query");
+    assert!(!creator_column_after_down.try_get::<bool>("", "present")?);
+
+    Migrator::up(&db, Some(1)).await?;
+    let creator_column_after_reapply = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+               WHERE table_schema = 'public' AND table_name = 'external_services' \
+                 AND column_name = 'created_by_user_id') AS present"
+                .to_string(),
+        ))
+        .await?
+        .expect("creator column reapply query");
+    assert!(creator_column_after_reapply.try_get::<bool>("", "present")?);
 
     Ok(())
 }

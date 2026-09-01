@@ -25,8 +25,7 @@ use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use argon2::password_hash::PasswordHash;
-use argon2::{Argon2, PasswordVerifier};
+use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use dashmap::DashMap;
 use moka::future::Cache;
 use parking_lot::Mutex;

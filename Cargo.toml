@@ -199,12 +199,12 @@ reqwest = { version = "0.12.15", features = ["json", "stream", "multipart", "rus
 utoipa = { version = "5.4.0", features = ["axum_extras", "debug"] }
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum", "vendored"], default-features = false }
 schemars = { version = "1.2", features = ["preserve_order"] }
-jsonschema = { version = "0.51.0", default-features = false }
+jsonschema = { version = "0.52.0", default-features = false }
 
 # ============================================================================
 # Cryptography & Security
 # ============================================================================
-argon2 = "0.5"
+argon2 = "0.6"
 aes-gcm = "0.11.0"
 hkdf = "0.13"
 totp-rs = "6.0.0"

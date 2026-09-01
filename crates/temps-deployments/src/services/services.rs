@@ -7,6 +7,7 @@ use sea_orm::{
     PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use temps_entities::{
@@ -94,6 +95,27 @@ pub enum DeploymentError {
     #[error("Invalid bundle path '{path}': {reason}")]
     InvalidBundlePath { path: String, reason: String },
 
+    #[error(
+        "Cannot resolve the build artifact for deployment {deployment_id} in project {project_id}: source deployment {source_deployment_id} was not found"
+    )]
+    AssetOriginNotFound {
+        project_id: i32,
+        deployment_id: i32,
+        source_deployment_id: i32,
+    },
+
+    #[error(
+        "Cannot resolve the build artifact for deployment {deployment_id} in project {project_id}: deployment reuse metadata contains a cycle at deployment {source_deployment_id}"
+    )]
+    AssetOriginCycle {
+        project_id: i32,
+        deployment_id: i32,
+        source_deployment_id: i32,
+    },
+
+    #[error(transparent)]
+    EnvironmentResolution(#[from] super::env_resolver::DeploymentEnvResolutionError),
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -151,12 +173,12 @@ struct DeploymentAssetOrigin {
 /// Resolve the immutable build artifact behind a deployment. Promotion and
 /// rollback rows may already reference an earlier source, so propagating the
 /// immediate row would lose assets after the second hop.
-fn canonical_deployment_asset_origin(
+fn complete_deployment_asset_origin(
     deployment_id: i32,
     environment_id: i32,
     slug: &str,
     context: Option<&serde_json::Value>,
-) -> DeploymentAssetOrigin {
+) -> Option<DeploymentAssetOrigin> {
     let source_deployment_id = context
         .and_then(|value| value.get("source_deployment_id"))
         .and_then(serde_json::Value::as_i64)
@@ -170,26 +192,76 @@ fn canonical_deployment_asset_origin(
         .and_then(serde_json::Value::as_str);
 
     match (source_deployment_id, source_environment_id, source_slug) {
-        (Some(deployment_id), Some(environment_id), Some(slug)) => DeploymentAssetOrigin {
+        (Some(deployment_id), Some(environment_id), Some(slug)) => Some(DeploymentAssetOrigin {
             deployment_id,
             environment_id,
             slug: slug.to_string(),
-        },
-        _ => DeploymentAssetOrigin {
+        }),
+        (None, None, None) => Some(DeploymentAssetOrigin {
             deployment_id,
             environment_id,
             slug: slug.to_string(),
-        },
+        }),
+        _ => None,
     }
 }
 
-fn deployment_asset_origin(deployment: &deployments::Model) -> DeploymentAssetOrigin {
-    canonical_deployment_asset_origin(
-        deployment.id,
-        deployment.environment_id,
-        &deployment.slug,
-        deployment.context_vars.as_ref(),
-    )
+fn source_deployment_id(context: Option<&serde_json::Value>) -> Option<i32> {
+    context
+        .and_then(|value| value.get("source_deployment_id"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+/// Resolve both the current complete reuse metadata and the partial metadata
+/// written by Temps before source slugs were persisted. Legacy rows are walked
+/// back to the immutable build deployment so a second promotion/rollback does
+/// not perpetuate an intermediate, asset-less deployment.
+async fn deployment_asset_origin(
+    db: &temps_database::DbConnection,
+    deployment: &deployments::Model,
+) -> Result<DeploymentAssetOrigin, DeploymentError> {
+    let root_deployment_id = deployment.id;
+    let project_id = deployment.project_id;
+    let mut current = deployment.clone();
+    let mut visited = HashSet::from([current.id]);
+
+    loop {
+        if let Some(origin) = complete_deployment_asset_origin(
+            current.id,
+            current.environment_id,
+            &current.slug,
+            current.context_vars.as_ref(),
+        ) {
+            return Ok(origin);
+        }
+
+        let Some(source_id) = source_deployment_id(current.context_vars.as_ref()) else {
+            return Ok(DeploymentAssetOrigin {
+                deployment_id: current.id,
+                environment_id: current.environment_id,
+                slug: current.slug,
+            });
+        };
+
+        if !visited.insert(source_id) {
+            return Err(DeploymentError::AssetOriginCycle {
+                project_id,
+                deployment_id: root_deployment_id,
+                source_deployment_id: source_id,
+            });
+        }
+
+        current = deployments::Entity::find_by_id(source_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(db)
+            .await?
+            .ok_or(DeploymentError::AssetOriginNotFound {
+                project_id,
+                deployment_id: root_deployment_id,
+                source_deployment_id: source_id,
+            })?;
+    }
 }
 
 #[derive(Clone)]
@@ -2052,7 +2124,8 @@ impl DeploymentService {
 
         let rollback_slug = format!("{}-{}", project.slug, deployment_number);
 
-        let rollback_asset_origin = deployment_asset_origin(&target_deployment);
+        let rollback_asset_origin =
+            deployment_asset_origin(self.db.as_ref(), &target_deployment).await?;
         let rollback_metadata = DeploymentMetadata {
             is_rollback: true,
             rolled_back_from_id: Some(deployment_id),
@@ -2346,13 +2419,7 @@ impl DeploymentService {
             let resolved_env = if let Some(resolver) = self.env_resolver.get() {
                 let mut resolved = resolver
                     .resolve(&project, &environment, &rollback_deployment)
-                    .await
-                    .map_err(|e| {
-                        DeploymentError::Other(format!(
-                            "Failed to resolve environment variables for rollback in environment {}: {}",
-                            environment_id, e
-                        ))
-                    })?;
+                    .await?;
                 crate::services::env_resolver::apply_deployment_owned_variables(
                     &mut resolved,
                     project.preset,
@@ -2757,7 +2824,7 @@ impl DeploymentService {
             )
         });
 
-        let promotion_asset_origin = deployment_asset_origin(&source);
+        let promotion_asset_origin = deployment_asset_origin(self.db.as_ref(), &source).await?;
         let new_deployment = deployments::ActiveModel {
             id: sea_orm::NotSet,
             project_id: Set(project_id),
@@ -3022,13 +3089,7 @@ impl DeploymentService {
             let resolved_env = if let Some(resolver) = self.env_resolver.get() {
                 let mut resolved = resolver
                     .resolve(&project, &target_env, &promoted_deployment)
-                    .await
-                    .map_err(|e| {
-                        DeploymentError::Other(format!(
-                            "Failed to resolve environment variables for promotion to environment {}: {}",
-                            target_environment_id, e
-                        ))
-                    })?;
+                    .await?;
                 crate::services::env_resolver::apply_deployment_owned_variables(
                     &mut resolved,
                     project.preset,
@@ -5005,19 +5066,16 @@ mod tests {
     }
 
     #[test]
-    fn deployment_asset_origin_stays_canonical_across_reuse_hops() {
+    fn complete_asset_origin_stays_canonical_across_reuse_hops() {
         let first_reuse_context = serde_json::json!({
             "source_deployment_id": 10,
             "source_environment_id": 20,
             "source_deployment_slug": "original-build",
         });
 
-        let origin = canonical_deployment_asset_origin(
-            30,
-            40,
-            "first-promotion",
-            Some(&first_reuse_context),
-        );
+        let origin =
+            complete_deployment_asset_origin(30, 40, "first-promotion", Some(&first_reuse_context))
+                .expect("complete reuse metadata should resolve without a database lookup");
         assert_eq!(
             origin,
             DeploymentAssetOrigin {
@@ -5033,13 +5091,13 @@ mod tests {
             "source_deployment_slug": origin.slug.clone(),
         });
         assert_eq!(
-            canonical_deployment_asset_origin(
+            complete_deployment_asset_origin(
                 50,
                 60,
                 "second-promotion",
                 Some(&second_reuse_context),
             ),
-            origin
+            Some(origin)
         );
     }
     use temps_database::test_utils::TestDatabase;
@@ -5178,6 +5236,70 @@ mod tests {
         let deployment = deployment.insert(db.as_ref()).await?;
 
         Ok((project, environment, deployment))
+    }
+
+    #[tokio::test]
+    async fn legacy_asset_origin_walks_partial_reuse_metadata_to_original_build() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc().clone();
+        let (project, environment, original) = setup_test_data(&db)
+            .await
+            .expect("create deployment fixtures");
+
+        let first_reuse = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("legacy-promotion".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            context_vars: Set(Some(serde_json::json!({
+                "trigger": "promotion",
+                "source_deployment_id": original.id,
+                "source_environment_id": original.environment_id,
+            }))),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert legacy promotion");
+
+        let second_reuse = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("legacy-rollback".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            context_vars: Set(Some(serde_json::json!({
+                "trigger": "rollback",
+                "source_deployment_id": first_reuse.id,
+            }))),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert legacy rollback");
+
+        let origin = deployment_asset_origin(db.as_ref(), &second_reuse)
+            .await
+            .expect("legacy reuse metadata should resolve");
+
+        assert_eq!(origin.deployment_id, original.id);
+        assert_eq!(origin.environment_id, original.environment_id);
+        assert_eq!(origin.slug, original.slug);
     }
 
     #[tokio::test]

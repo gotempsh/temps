@@ -10,6 +10,12 @@ use clap::Args;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+const MAX_AGENT_WORKER_THREADS: usize = 8;
+
+fn agent_worker_threads(available_parallelism: usize) -> usize {
+    available_parallelism.clamp(1, MAX_AGENT_WORKER_THREADS)
+}
+
 /// Resolve the agent data directory (`TEMPS_DATA_DIR` env var, or
 /// `~/.temps`, or `./` as a last resort). Used for the saved agent
 /// config and the per-node DNS resolver snapshot (`<dir>/dns/zone.json`).
@@ -54,7 +60,15 @@ pub struct AgentCommand {
 
 impl AgentCommand {
     pub fn execute(self) -> anyhow::Result<()> {
+        let available_parallelism = std::thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(1);
+        let worker_threads = agent_worker_threads(available_parallelism);
         let rt = tokio::runtime::Builder::new_multi_thread()
+            // The agent is predominantly network and Docker-socket I/O. Tokio's
+            // default of one worker per logical CPU needlessly multiplies
+            // thread stacks and allocator arenas on large worker hosts.
+            .worker_threads(worker_threads)
             .enable_all()
             .build()?;
 
@@ -109,7 +123,12 @@ impl AgentCommand {
             let deployer: Arc<dyn temps_deployer::ContainerDeployer> = docker_runtime.clone();
             let builder: Arc<dyn temps_deployer::ImageBuilder> = docker_runtime;
 
-            tracing::info!("Starting temps agent (node_id={})...", config.node_id);
+            tracing::info!(
+                node_id = config.node_id,
+                worker_threads,
+                available_parallelism,
+                "Starting temps agent"
+            );
 
             // Nightly Docker image + build-cache prune. Worker nodes build
             // and pull images locally but never run the console's plugin
@@ -376,4 +395,26 @@ async fn read_bridge_ip_from_kernel(iface: &str) -> Option<std::net::IpAddr> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_runtime_uses_available_threads_on_small_hosts() {
+        assert_eq!(agent_worker_threads(1), 1);
+        assert_eq!(agent_worker_threads(4), 4);
+    }
+
+    #[test]
+    fn agent_runtime_caps_threads_on_large_hosts() {
+        assert_eq!(agent_worker_threads(16), MAX_AGENT_WORKER_THREADS);
+        assert_eq!(agent_worker_threads(128), MAX_AGENT_WORKER_THREADS);
+    }
+
+    #[test]
+    fn agent_runtime_never_builds_with_zero_workers() {
+        assert_eq!(agent_worker_threads(0), 1);
+    }
 }

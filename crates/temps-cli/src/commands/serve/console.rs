@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Argon2, PasswordHasher};
 use axum::body::Body;
 use axum::extract::Request;
@@ -478,9 +477,8 @@ async fn create_initial_admin_user(
 
     // Hash the password using Argon2
     let argon2 = Argon2::default();
-    let salt = SaltString::generate(&mut OsRng);
     let password_hash = argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|error| InitialAdminBootstrapError::HashPassword {
             email: email_lower.clone(),
             reason: error.to_string(),
@@ -4138,6 +4136,41 @@ mod ai_tool_allowlist_tests {
         };
         let catalog = caller.run_cli("projects --help", &scope).await;
         assert!(catalog.contains("get_projects"), "catalog: {catalog}");
+    }
+
+    /// Reproduces the page-country chat failure against the real analytics
+    /// OpenAPI document and the production AI read allowlist. This catches a
+    /// renamed/removed handler, missing allowlist entry, or parameter drift in
+    /// addition to the virtual CLI's unknown-operation recovery behavior.
+    #[tokio::test]
+    async fn page_country_analytics_recovers_through_real_api_contract() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller};
+
+        let openapi = temps_analytics::handler::AnalyticsApiDoc::openapi();
+        let caller =
+            InternalApiCaller::new_allowlisted(axum::Router::new(), &openapi, ai_read_allowlist());
+        let scope = ApiCallScope {
+            auth: admin_auth(),
+            project_ids: vec![1],
+        };
+
+        let recovery = caller
+            .run_cli("analytics get_analytics --path /managed", &scope)
+            .await;
+        assert!(
+            recovery.contains("get_page_path_detail"),
+            "page-level aggregate missing from recovery help: {recovery}"
+        );
+
+        let help = caller
+            .run_cli("analytics get_page_path_detail --help", &scope)
+            .await;
+        for flag in ["--page_path", "--start_date", "--end_date"] {
+            assert!(
+                help.contains(flag),
+                "real page-detail contract is missing `{flag}`: {help}"
+            );
+        }
     }
 
     #[test]

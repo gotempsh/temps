@@ -43,12 +43,13 @@ import type {
   IngestErrorSummary,
   PipelineHistoryResponse,
 } from '@/api/client/types.gen'
+import { formatChartTick, formatChartTooltipLabel } from '@/lib/chart-tooltip'
 import {
-  formatChartTick,
-  formatChartTooltipLabel,
-  TOOLTIP_CONTENT_STYLE,
-  TOOLTIP_LABEL_STYLE,
-} from '@/lib/chart-tooltip'
+  ThresholdLineChart,
+  type ThresholdLineSeries,
+} from '@/components/charts/threshold-line-chart'
+import { seriesLineColor } from '@/components/charts/chart-colors'
+import type { MetricTone } from '@/components/charts/metric-sparkline'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
 import {
@@ -61,15 +62,6 @@ import {
 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { Link } from 'react-router'
-import {
-  CartesianGrid,
-  Line,
-  LineChart,
-  ResponsiveContainer,
-  Tooltip,
-  XAxis,
-  YAxis,
-} from 'recharts'
 
 // ---------------------------------------------------------------------------
 // Trend chart
@@ -92,7 +84,13 @@ type TrendSeriesDef = {
   /** Metric name as published by the sampler (`OTEL_PIPELINE_METRIC_NAMES`). */
   metric: string
   label: string
-  color: string
+  /**
+   * Semantic tone from the shared chart palette: neutral = volume in,
+   * good = success, warn = warning, poor = loss. Omit to cycle the theme's
+   * breakdown palette (matches ThresholdLineChart's own fallback), for
+   * series that don't carry good/bad meaning (e.g. "Archived (S3)").
+   */
+  tone?: MetricTone
 }
 
 type TrendPanelDef = {
@@ -101,39 +99,33 @@ type TrendPanelDef = {
   series: TrendSeriesDef[]
 }
 
-// Colours mirror the existing convention on this page and in ProxyMetrics:
-// blue = volume in, green = success, amber = warning, red = loss.
 const TREND_PANELS: TrendPanelDef[] = [
   {
     title: 'Traces (spans)',
     description: 'Spans received, stored and dropped per sample',
     series: [
-      { metric: 'otel.spans_received', label: 'Received', color: '#2563eb' },
-      { metric: 'otel.spans_stored', label: 'Stored', color: '#16a34a' },
-      { metric: 'otel.spans_dropped', label: 'Dropped', color: '#dc2626' },
+      { metric: 'otel.spans_received', label: 'Received', tone: 'neutral' },
+      { metric: 'otel.spans_stored', label: 'Stored', tone: 'good' },
+      { metric: 'otel.spans_dropped', label: 'Dropped', tone: 'poor' },
     ],
   },
   {
     title: 'Metrics',
     description: 'Metric points received, stored and dropped per sample',
     series: [
-      { metric: 'otel.metrics_received', label: 'Received', color: '#2563eb' },
-      { metric: 'otel.metrics_stored', label: 'Stored', color: '#16a34a' },
-      { metric: 'otel.metrics_dropped', label: 'Dropped', color: '#dc2626' },
+      { metric: 'otel.metrics_received', label: 'Received', tone: 'neutral' },
+      { metric: 'otel.metrics_stored', label: 'Stored', tone: 'good' },
+      { metric: 'otel.metrics_dropped', label: 'Dropped', tone: 'poor' },
     ],
   },
   {
     title: 'Logs',
     description: 'Log records received, persisted to DB and S3, and dropped',
     series: [
-      { metric: 'otel.logs_received', label: 'Received', color: '#2563eb' },
-      { metric: 'otel.logs_stored_db', label: 'Stored (DB)', color: '#16a34a' },
-      {
-        metric: 'otel.logs_stored_s3',
-        label: 'Archived (S3)',
-        color: '#7c3aed',
-      },
-      { metric: 'otel.logs_dropped', label: 'Dropped', color: '#dc2626' },
+      { metric: 'otel.logs_received', label: 'Received', tone: 'neutral' },
+      { metric: 'otel.logs_stored_db', label: 'Stored (DB)', tone: 'good' },
+      { metric: 'otel.logs_stored_s3', label: 'Archived (S3)' },
+      { metric: 'otel.logs_dropped', label: 'Dropped', tone: 'poor' },
     ],
   },
   {
@@ -143,46 +135,96 @@ const TREND_PANELS: TrendPanelDef[] = [
       {
         metric: 'otel.rate_limited_requests',
         label: 'Rate limited',
-        color: '#d97706',
+        tone: 'warn',
       },
-      {
-        metric: 'otel.quota_exceeded_requests',
-        label: 'Quota exceeded',
-        color: '#7c3aed',
-      },
-      {
-        metric: 'otel.ingest_errors',
-        label: 'Ingest errors',
-        color: '#dc2626',
-      },
+      { metric: 'otel.quota_exceeded_requests', label: 'Quota exceeded' },
+      { metric: 'otel.ingest_errors', label: 'Ingest errors', tone: 'poor' },
     ],
   },
 ]
 
-/** A recharts row: epoch-ms timestamp plus one key per metric in the panel. */
-type TrendRow = { ts: number } & Record<string, number>
+/**
+ * A chart row: epoch-ms timestamp, its pre-formatted axis/tooltip label
+ * (ThresholdLineChart reads a categorical `label` x-axis, same as
+ * MetricsExplorer), plus one numeric key per series slot in the panel.
+ */
+type TrendRow = { ts: number; label: string } & Record<string, number | string>
 
 /**
- * Pivot the API's series-of-points into recharts' row-per-timestamp shape.
+ * Maps each panel series to an index-based chart key (`s0`, `s1`, …), NOT
+ * the raw `otel.spans_received`-style metric name — ChartContainer turns
+ * `dataKey` into a CSS custom-property name (`--color-s0`), and the literal
+ * `.` in a metric name silently truncates that declaration (the browser
+ * drops everything from the dot onward), leaving the line strokeless. Same
+ * landmine `buildBreakdownData` (metric-format.ts) documents and avoids.
+ */
+function seriesSlotKeys(series: TrendSeriesDef[]): Map<string, string> {
+  return new Map(series.map((s, i) => [s.metric, `s${i}`]))
+}
+
+/**
+ * Pivot the API's series-of-points into ThresholdLineChart's row-per-point shape.
  *
- * Every series shares the same server-derived bucket grid, so timestamps align
- * and a missing sample simply leaves that key absent for the row (recharts
- * renders a gap rather than a false zero).
+ * ThresholdLineChart's x-axis is categorical (one equal-width slot per row),
+ * so the row set must cover every *expected* bucket in the window — not just
+ * the ones the API returned — or a real gap (e.g. the server was down and
+ * the sampler wrote nothing) would vanish instead of taking its proportional
+ * share of the axis, visually compressing the surrounding samples together.
+ * `start_time`/`end_time`/`step_seconds` (server-clamped, so this is at most
+ * a few hundred rows even for the 7-day preset) pre-seed one slot per step;
+ * a bucket the API has no data for then stays `undefined`, which the chart
+ * renders as a break in the line via `connectNulls`, instead of a false
+ * zero.
+ *
+ * The grid must align to the SAME boundaries the backend's `time_bucket()`
+ * produces, not to the raw (unaligned) `start_time` — the query window is
+ * `now - range`, an arbitrary instant, while `time_bucket()` snaps to its
+ * own fixed origin independent of that window. Seeding from `start_time`
+ * directly would put every synthetic slot off by however far `start_time`
+ * sits from the nearest real boundary, so real points would land on new
+ * intermediate timestamps instead of merging into their pre-seeded slot —
+ * doubling the categories and corrupting the spacing this was meant to fix.
+ * Anchoring on one real point's timestamp (any series — they all share the
+ * same step) and walking by exact multiples of `stepMs` from there keeps
+ * every synthetic slot on the real grid.
  */
 function buildTrendRows(
   history: PipelineHistoryResponse | undefined,
-  metrics: string[]
+  slotKeys: Map<string, string>,
+  labelFormatter: (ts: number) => string
 ): TrendRow[] {
   if (!history) return []
   const byTs = new Map<number, TrendRow>()
 
+  const stepMs = history.step_seconds * 1000
+  const startMs = new Date(history.start_time).getTime()
+  const endMs = new Date(history.end_time).getTime()
+  const anchorMs = history.series
+    .flatMap((s) => s.points)
+    .map((p) => new Date(p.time).getTime())
+    .find((ts) => !Number.isNaN(ts))
+
+  if (
+    stepMs > 0 &&
+    anchorMs !== undefined &&
+    Number.isFinite(startMs) &&
+    Number.isFinite(endMs)
+  ) {
+    const firstGridTs =
+      anchorMs + Math.ceil((startMs - anchorMs) / stepMs) * stepMs
+    for (let ts = firstGridTs; ts <= endMs; ts += stepMs) {
+      byTs.set(ts, { ts, label: labelFormatter(ts) })
+    }
+  }
+
   for (const series of history.series) {
-    if (!metrics.includes(series.name)) continue
+    const slotKey = slotKeys.get(series.name)
+    if (!slotKey) continue
     for (const point of series.points) {
       const ts = new Date(point.time).getTime()
       if (Number.isNaN(ts)) continue
-      const row = byTs.get(ts) ?? ({ ts } as TrendRow)
-      row[series.name] = point.value
+      const row = byTs.get(ts) ?? { ts, label: labelFormatter(ts) }
+      row[slotKey] = point.value
       byTs.set(ts, row)
     }
   }
@@ -190,8 +232,14 @@ function buildTrendRows(
   return [...byTs.values()].sort((a, b) => a.ts - b.ts)
 }
 
-function hasAnyTrendData(rows: TrendRow[], metrics: string[]): boolean {
-  return rows.some((row) => metrics.some((m) => (row[m] ?? 0) > 0))
+function hasAnyTrendData(
+  rows: TrendRow[],
+  slotKeys: Map<string, string>
+): boolean {
+  const keys = [...slotKeys.values()]
+  return rows.some((row) =>
+    keys.some((k) => ((row[k] as number | undefined) ?? 0) > 0)
+  )
 }
 
 function TrendPanel({
@@ -205,15 +253,27 @@ function TrendPanel({
   isLoading: boolean
   showDate: boolean
 }) {
-  const metrics = useMemo(
-    () => panel.series.map((s) => s.metric),
-    [panel.series]
-  )
+  const slotKeys = useMemo(() => seriesSlotKeys(panel.series), [panel.series])
+  const labelFormatter = showDate ? formatChartTooltipLabel : formatChartTick
   const rows = useMemo(
-    () => buildTrendRows(history, metrics),
-    [history, metrics]
+    () => buildTrendRows(history, slotKeys, labelFormatter),
+    [history, slotKeys, labelFormatter]
   )
-  const isFlat = !isLoading && !hasAnyTrendData(rows, metrics)
+  // Only overlay the flat-line message once ThresholdLineChart actually has
+  // enough points to draw a line (its own `maxValidCount < 2` empty state
+  // takes over below that) — otherwise the two placeholders would stack.
+  const isFlat =
+    !isLoading && rows.length >= 2 && !hasAnyTrendData(rows, slotKeys)
+
+  const series: ThresholdLineSeries[] = useMemo(
+    () =>
+      panel.series.map((s) => ({
+        dataKey: slotKeys.get(s.metric) as string,
+        label: s.label,
+        tone: s.tone,
+      })),
+    [panel.series, slotKeys]
+  )
 
   return (
     <div className="rounded-lg border bg-card p-4">
@@ -225,48 +285,18 @@ function TrendPanel({
       {isLoading ? (
         <Skeleton className="mt-3 h-[180px] w-full" />
       ) : (
-        <div className="relative mt-3 h-[180px] w-full">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart
-              data={rows}
-              margin={{ top: 4, right: 8, bottom: 0, left: -18 }}
-            >
-              <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" />
-              <XAxis
-                dataKey="ts"
-                type="number"
-                domain={['dataMin', 'dataMax']}
-                scale="time"
-                tickFormatter={
-                  showDate ? formatChartTooltipLabel : formatChartTick
-                }
-                tick={{ fontSize: 10, fill: 'var(--muted-foreground)' }}
-                minTickGap={28}
-              />
-              <YAxis
-                allowDecimals={false}
-                tick={{ fontSize: 10, fill: 'var(--muted-foreground)' }}
-                width={44}
-              />
-              <Tooltip
-                contentStyle={TOOLTIP_CONTENT_STYLE}
-                labelStyle={TOOLTIP_LABEL_STYLE}
-                labelFormatter={(l) => formatChartTooltipLabel(Number(l))}
-              />
-              {panel.series.map((s) => (
-                <Line
-                  key={s.metric}
-                  type="monotone"
-                  dataKey={s.metric}
-                  name={s.label}
-                  stroke={s.color}
-                  strokeWidth={1.75}
-                  dot={false}
-                  isAnimationActive={false}
-                />
-              ))}
-            </LineChart>
-          </ResponsiveContainer>
+        <div className="relative mt-3">
+          <ThresholdLineChart
+            data={rows}
+            xKey="label"
+            series={series}
+            height={180}
+            // Pipeline counts are always integers — recharts' default tick
+            // step otherwise picks non-round values (e.g. "93.988...") since
+            // ThresholdLineChart doesn't set `allowDecimals={false}`.
+            yTickFormatter={(v) => Math.round(v).toLocaleString()}
+            tooltipValueFormatter={(v) => v.toLocaleString()}
+          />
 
           {isFlat && (
             <div className="pointer-events-none absolute inset-0 flex items-center justify-center">
@@ -279,14 +309,14 @@ function TrendPanel({
       )}
 
       <div className="mt-2 flex flex-wrap gap-x-3 gap-y-1">
-        {panel.series.map((s) => (
+        {panel.series.map((s, i) => (
           <span
             key={s.metric}
             className="inline-flex items-center gap-1 text-xs text-muted-foreground"
           >
             <span
               className="inline-block h-2 w-2 rounded-full"
-              style={{ backgroundColor: s.color }}
+              style={{ backgroundColor: seriesLineColor(s.tone, i) }}
             />
             {s.label}
           </span>

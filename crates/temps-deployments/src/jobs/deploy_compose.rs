@@ -673,33 +673,9 @@ impl WorkflowTask for DeployComposeJob {
             }
         }
 
-        // Tear down previous containers (preserve volumes for data persistence)
-        if let Some(ref log_id) = self.log_id {
-            let _ = self
-                .log_service
-                .log_info(
-                    log_id,
-                    "Stopping previous compose stack (preserving volumes)",
-                )
-                .await;
-        }
-        if let Err(e) = self
-            .compose_executor
-            .teardown_at(
-                &project_name,
-                repo_path.as_deref(),
-                Some(compose_file_name),
-                &self.environment_vars,
-            )
-            .await
-        {
-            debug!(
-                project = %project_name,
-                error = %e,
-                "Previous compose stack teardown failed (may not exist)"
-            );
-        }
-
+        // Build the deploy request here so it is available to prepare_and_pull
+        // BEFORE teardown. This is required for pull latency to fall outside the
+        // downtime window (see below).
         let request = ComposeDeployRequest {
             project_name: project_name.clone(),
             compose_content,
@@ -717,8 +693,78 @@ impl WorkflowTask for DeployComposeJob {
             unsandboxed_services: self.unsandboxed_services.clone(),
         };
 
-        // Deploy
-        let services = match self.compose_executor.deploy(request).await {
+        // Prepare compose files, build (if needed), and pull images BEFORE
+        // tearing down the old stack. This keeps image-fetch latency — which
+        // can span minutes on large images or slow registries — outside the
+        // downtime window: the old containers keep serving traffic while the
+        // new images are fetched. If this step fails (bad image reference,
+        // registry unreachable, build error), we return early WITHOUT calling
+        // teardown_at, so the still-working old stack continues to run.
+        // Rejecting after teardown would cause downtime for what is an
+        // image/build configuration problem — the same logic already applied
+        // above for security-policy validation.
+        if let Some(ref log_id) = self.log_id {
+            let _ = self
+                .log_service
+                .log_info(
+                    log_id,
+                    "Pulling images (old stack remains live during fetch)",
+                )
+                .await;
+        }
+        let prepared = match self.compose_executor.prepare_and_pull(&request).await {
+            Ok(p) => p,
+            Err(e) => {
+                let error_msg = format!("Compose prepare/pull failed: {}", e);
+                tracing::error!(error = %error_msg, "Docker Compose prepare_and_pull failed");
+                if let Some(ref log_id) = self.log_id {
+                    let _ = self.log_service.log_error(log_id, &error_msg).await;
+                }
+                return Err(WorkflowError::JobExecutionFailed(error_msg));
+            }
+        };
+
+        // Tear down previous containers (preserve volumes for data persistence).
+        // Images are already local at this point, so the actual downtime window
+        // is now only: old-container-stop → new-container-healthy (no pull).
+        if let Some(ref log_id) = self.log_id {
+            let _ = self
+                .log_service
+                .log_info(
+                    log_id,
+                    "Stopping previous compose stack (preserving volumes)",
+                )
+                .await;
+        }
+        if let Err(e) = self
+            .compose_executor
+            .teardown_at(
+                &project_name,
+                repo_path.as_deref(),
+                Some(compose_file_name),
+                &self.environment_vars,
+                // Secrets must NOT be deleted here: prepare_and_pull() just
+                // materialized them and deploy_prepared() is about to bind-mount
+                // them into the new containers. Deleting them now would cause
+                // the new containers to start with missing or empty secrets.
+                false,
+            )
+            .await
+        {
+            debug!(
+                project = %project_name,
+                error = %e,
+                "Previous compose stack teardown failed (may not exist)"
+            );
+        }
+
+        // Deploy (network + up + wait + discover + label). Images are already
+        // local from prepare_and_pull so this is the live downtime window.
+        let services = match self
+            .compose_executor
+            .deploy_prepared(prepared, &request)
+            .await
+        {
             Ok(s) => s,
             Err(e) => {
                 let cleanup_error = self
@@ -728,6 +774,10 @@ impl WorkflowTask for DeployComposeJob {
                         repo_path.as_deref(),
                         Some(compose_file_name),
                         &self.environment_vars,
+                        // Deploy attempt is over; remove secrets so plaintext
+                        // credentials are not left on disk for a stack that
+                        // is no longer running.
+                        true,
                     )
                     .await
                     .err();
@@ -780,6 +830,10 @@ impl WorkflowTask for DeployComposeJob {
                     repo_path.as_deref(),
                     Some(compose_file_name),
                     &self.environment_vars,
+                    // Deploy attempt is over; remove secrets so plaintext
+                    // credentials are not left on disk for a stack that
+                    // is no longer running.
+                    true,
                 )
                 .await;
             let error_msg = "No containers found after docker compose up".to_string();
@@ -940,6 +994,10 @@ impl WorkflowTask for DeployComposeJob {
                         cleanup_repo_path.as_deref(),
                         Some(compose_file_name),
                         &self.environment_vars,
+                        // Deploy attempt is aborted; remove secrets so plaintext
+                        // credentials are not left on disk for a stack that
+                        // is no longer running.
+                        true,
                     )
                     .await
                     .map_err(|error| WorkflowError::JobExecutionFailed(format!(

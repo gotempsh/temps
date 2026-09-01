@@ -1763,13 +1763,25 @@ async function serviceEnablePgStatStatementsAction(
 
 // ── services metrics ────────────────────────────────────────────────────────
 
-/** Parse and validate a required numeric `--id`, warning and returning
- *  `undefined` (rather than throwing) so callers can early-return cleanly. */
-function parseServiceId(raw: string): number | undefined {
+/** Parse a required numeric ID (service ID or alert rule ID), returning
+ *  `undefined` for anything that isn't a positive integer. */
+export function parsePositiveIntId(raw: string): number | undefined {
   const id = parseInt(raw, 10)
-  if (isNaN(id)) {
-    warning('Invalid service ID — --id must be a numeric service ID')
-    return undefined
+  return isNaN(id) || id <= 0 ? undefined : id
+}
+
+function parseServiceId(raw: string): number | undefined {
+  const id = parsePositiveIntId(raw)
+  if (id === undefined) {
+    warning('Invalid service ID — --id must be a positive numeric service ID')
+  }
+  return id
+}
+
+function parseRuleId(raw: string): number | undefined {
+  const id = parsePositiveIntId(raw)
+  if (id === undefined) {
+    warning('Invalid --rule-id — must be a positive numeric alert rule ID')
   }
   return id
 }
@@ -2057,6 +2069,17 @@ interface ServiceMetricsAlertRulesCreateOptions {
 }
 
 const VALID_COMPARATORS = new Set(['>', '<', '>=', '<='])
+const VALID_SEVERITIES = new Set(['warning', 'critical'])
+
+/** Alert-rule comparator allowlist — matches the backend's accepted operators. */
+export function isValidComparator(value: string): boolean {
+  return VALID_COMPARATORS.has(value)
+}
+
+/** Alert-rule severity allowlist — matches the backend's accepted values. */
+export function isValidSeverity(value: string): boolean {
+  return VALID_SEVERITIES.has(value)
+}
 
 async function serviceMetricsAlertRulesCreateAction(
   options: ServiceMetricsAlertRulesCreateOptions,
@@ -2067,7 +2090,7 @@ async function serviceMetricsAlertRulesCreateAction(
   const id = parseServiceId(options.id)
   if (id === undefined) return
 
-  if (!VALID_COMPARATORS.has(options.comparator)) {
+  if (!isValidComparator(options.comparator)) {
     warning(`Invalid --comparator "${options.comparator}" — must be one of >, <, >=, <=`)
     return
   }
@@ -2085,7 +2108,7 @@ async function serviceMetricsAlertRulesCreateAction(
   }
 
   const severity = options.severity ?? 'warning'
-  if (severity !== 'warning' && severity !== 'critical') {
+  if (!isValidSeverity(severity)) {
     warning('Invalid --severity — must be "warning" or "critical"')
     return
   }
@@ -2141,18 +2164,15 @@ async function serviceMetricsAlertRulesUpdateAction(
   const id = parseServiceId(options.id)
   if (id === undefined) return
 
-  const ruleId = parseInt(options.ruleId, 10)
-  if (isNaN(ruleId)) {
-    warning('Invalid --rule-id — must be a numeric alert rule ID')
-    return
-  }
+  const ruleId = parseRuleId(options.ruleId)
+  if (ruleId === undefined) return
 
-  if (options.comparator !== undefined && !VALID_COMPARATORS.has(options.comparator)) {
+  if (options.comparator !== undefined && !isValidComparator(options.comparator)) {
     warning(`Invalid --comparator "${options.comparator}" — must be one of >, <, >=, <=`)
     return
   }
 
-  if (options.severity !== undefined && options.severity !== 'warning' && options.severity !== 'critical') {
+  if (options.severity !== undefined && !isValidSeverity(options.severity)) {
     warning('Invalid --severity — must be "warning" or "critical"')
     return
   }
@@ -2223,11 +2243,8 @@ async function serviceMetricsAlertRulesRemoveAction(
   const id = parseServiceId(options.id)
   if (id === undefined) return
 
-  const ruleId = parseInt(options.ruleId, 10)
-  if (isNaN(ruleId)) {
-    warning('Invalid --rule-id — must be a numeric alert rule ID')
-    return
-  }
+  const ruleId = parseRuleId(options.ruleId)
+  if (ruleId === undefined) return
 
   if (!options.yes) {
     const confirmed = await promptConfirm({

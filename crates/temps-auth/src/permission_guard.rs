@@ -1299,6 +1299,7 @@ mod tests {
             // with the instance-wide FlagsWrite the default role carries.
             "temps-flags",
             "temps-projects",
+            "temps-providers",
             "temps-proxy",
             "temps-status-page",
         ];

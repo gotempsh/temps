@@ -253,6 +253,12 @@ pub struct CreateProjectRequest {
     pub environment_variables: Option<Vec<CreateProjectEnvVar>>,
     pub automatic_deploy: bool,
     pub storage_service_ids: Vec<i32>,
+    /// Services whose authorization relied on their one-time creator claim.
+    /// Internal only: handlers populate this after access checks.
+    #[serde(default)]
+    pub storage_service_claim_ids: Vec<i32>,
+    #[serde(default)]
+    pub storage_service_claim_user_id: Option<i32>,
     pub is_public_repo: Option<bool>,
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
@@ -322,10 +328,10 @@ pub enum ProjectError {
         reason: String,
     },
 
-    #[error("Failed to link storage service {service_id} to project {project_id}: {reason}")]
-    StorageLinkFailed {
+    #[error("Failed to link storage services {service_ids:?} to project {project_id}: {reason}")]
+    StorageLinksFailed {
         project_id: i32,
-        service_id: i32,
+        service_ids: Vec<i32>,
         reason: String,
     },
 

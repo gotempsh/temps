@@ -10,7 +10,7 @@ use axum::{
     body::Body,
     extract::{
         ws::{Message, WebSocket, WebSocketUpgrade},
-        Path, Query, State,
+        Extension, Path, Query, State,
     },
     http::{header, StatusCode},
     response::{IntoResponse, Response},
@@ -20,12 +20,230 @@ use bollard::exec::StartExecResults;
 use bollard::query_parameters::LogsOptions;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use temps_deployer::{ContainerDeployer, DeployRequest, ImageBuilder};
 use tokio::io::AsyncWriteExt;
 use utoipa::{OpenApi, ToSchema};
 
+use crate::exec_timeout::{
+    completed_exec_exit_code, exec_start_was_rejected, monitor_exec_until_stopped,
+    resolve_container_id, resolve_exec_container_id, run_exec_with_deadline,
+    ContainerIdentityError, ExecCleanupGuard, ExecCompletionError, ExecDeadlineOutcome,
+};
+use crate::output_buffer::{
+    json_response_with_capture_permit, BoundedTailBuffer, MAX_CAPTURED_STREAM_BYTES,
+};
 use crate::NodeHealthReport;
+
+pub(crate) const MAX_CONCURRENT_OUTPUT_CAPTURES: usize = 4;
+pub(crate) const MAX_CONCURRENT_EXEC_OPERATIONS: usize = 4;
+pub(crate) const MAX_CONCURRENT_IMAGE_IMPORTS: usize = 1;
+const MAX_IMAGE_IMPORT_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+const IMAGE_IMPORT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+const CONTAINER_LOG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+pub(crate) struct AttachedExecPermits {
+    pub(crate) operation: tokio::sync::OwnedSemaphorePermit,
+    pub(crate) capture: tokio::sync::OwnedSemaphorePermit,
+    pub(crate) container: tokio::sync::OwnedSemaphorePermit,
+}
+
+pub(crate) struct ExecLifecyclePermits {
+    pub(crate) operation: tokio::sync::OwnedSemaphorePermit,
+    pub(crate) container: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum ExecAdmissionError {
+    OperationsExhausted,
+    CapturesExhausted,
+    ContainerOwned,
+}
+
+#[derive(Default)]
+struct ContainerOperationRegistry {
+    slots: parking_lot::Mutex<HashMap<String, Weak<tokio::sync::Semaphore>>>,
+}
+
+impl ContainerOperationRegistry {
+    fn try_acquire(
+        &self,
+        container_id: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, ExecAdmissionError> {
+        let slot = {
+            let mut slots = self.slots.lock();
+            slots.retain(|_, slot| slot.strong_count() > 0);
+            if let Some(slot) = slots.get(container_id).and_then(Weak::upgrade) {
+                slot
+            } else {
+                let slot = Arc::new(tokio::sync::Semaphore::new(1));
+                slots.insert(container_id.to_string(), Arc::downgrade(&slot));
+                slot
+            }
+        };
+        slot.try_acquire_owned()
+            .map_err(|_| ExecAdmissionError::ContainerOwned)
+    }
+}
+
+/// Per-agent limits live in router extensions rather than public `AgentState`
+/// fields. This keeps synchronization internals out of the crate's public
+/// state construction API.
+pub struct AgentResourceLimits {
+    output_capture_slots: Arc<tokio::sync::Semaphore>,
+    exec_operation_slots: Arc<tokio::sync::Semaphore>,
+    image_import_slots: Arc<tokio::sync::Semaphore>,
+    container_operations: ContainerOperationRegistry,
+}
+
+impl AgentResourceLimits {
+    pub fn new() -> Self {
+        Self {
+            output_capture_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_OUTPUT_CAPTURES,
+            )),
+            exec_operation_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_CONCURRENT_EXEC_OPERATIONS,
+            )),
+            image_import_slots: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_IMAGE_IMPORTS)),
+            container_operations: ContainerOperationRegistry::default(),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_capacities(operations: usize, captures: usize, imports: usize) -> Self {
+        Self {
+            output_capture_slots: Arc::new(tokio::sync::Semaphore::new(captures)),
+            exec_operation_slots: Arc::new(tokio::sync::Semaphore::new(operations)),
+            image_import_slots: Arc::new(tokio::sync::Semaphore::new(imports)),
+            container_operations: ContainerOperationRegistry::default(),
+        }
+    }
+}
+
+impl Default for AgentResourceLimits {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Reserve lifecycle capacity before memory capacity and before any Docker
+/// exec allocation. This keeps cleanup outages from consuming log-capture
+/// slots or accumulating unstarted Docker exec metadata.
+pub(crate) fn try_acquire_attached_exec_permits(
+    limits: &AgentResourceLimits,
+    container_id: &str,
+) -> Result<AttachedExecPermits, ExecAdmissionError> {
+    let operation = limits
+        .exec_operation_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ExecAdmissionError::OperationsExhausted)?;
+    let container = limits.container_operations.try_acquire(container_id)?;
+    let capture = limits
+        .output_capture_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ExecAdmissionError::CapturesExhausted)?;
+    Ok(AttachedExecPermits {
+        operation,
+        capture,
+        container,
+    })
+}
+
+pub(crate) fn try_acquire_exec_lifecycle_permits(
+    limits: &AgentResourceLimits,
+    container_id: &str,
+) -> Result<ExecLifecyclePermits, ExecAdmissionError> {
+    let operation = limits
+        .exec_operation_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ExecAdmissionError::OperationsExhausted)?;
+    let container = limits.container_operations.try_acquire(container_id)?;
+    Ok(ExecLifecyclePermits {
+        operation,
+        container,
+    })
+}
+
+#[cfg(test)]
+mod exec_admission_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn exhausted_operation_capacity_rejects_before_capture_or_docker_allocation() {
+        let limits = AgentResourceLimits::with_capacities(0, 1, 1);
+        let docker_allocations = AtomicUsize::new(0);
+
+        let admission = try_acquire_attached_exec_permits(&limits, "container-a");
+        if admission.is_ok() {
+            docker_allocations.fetch_add(1, Ordering::SeqCst);
+        }
+
+        assert!(matches!(
+            admission,
+            Err(ExecAdmissionError::OperationsExhausted)
+        ));
+        assert_eq!(limits.output_capture_slots.available_permits(), 1);
+        assert_eq!(docker_allocations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn capture_rejection_returns_the_reserved_operation_slot() {
+        let limits = AgentResourceLimits::with_capacities(1, 0, 1);
+
+        let admission = try_acquire_attached_exec_permits(&limits, "container-a");
+
+        assert!(matches!(
+            admission,
+            Err(ExecAdmissionError::CapturesExhausted)
+        ));
+        assert_eq!(limits.exec_operation_slots.available_permits(), 1);
+        assert!(limits
+            .container_operations
+            .try_acquire("container-a")
+            .is_ok());
+    }
+
+    #[test]
+    fn same_container_is_single_flight_while_other_containers_can_run() {
+        let limits = AgentResourceLimits::with_capacities(3, 3, 1);
+        let first = try_acquire_attached_exec_permits(&limits, "container-a")
+            .expect("first container operation is admitted");
+
+        assert!(matches!(
+            try_acquire_attached_exec_permits(&limits, "container-a"),
+            Err(ExecAdmissionError::ContainerOwned)
+        ));
+        assert!(try_acquire_attached_exec_permits(&limits, "container-b").is_ok());
+
+        drop(first);
+        assert!(try_acquire_attached_exec_permits(&limits, "container-a").is_ok());
+    }
+
+    #[test]
+    fn detached_exec_reserves_operation_and_container_lifecycle_capacity() {
+        let limits = AgentResourceLimits::with_capacities(1, 1, 1);
+        let detached = try_acquire_exec_lifecycle_permits(&limits, "container-a")
+            .expect("first detached operation is admitted");
+
+        assert_eq!(limits.exec_operation_slots.available_permits(), 0);
+        assert!(matches!(
+            try_acquire_exec_lifecycle_permits(&limits, "container-a"),
+            Err(ExecAdmissionError::OperationsExhausted)
+        ));
+        assert_eq!(limits.output_capture_slots.available_permits(), 1);
+
+        drop(detached);
+        assert!(try_acquire_exec_lifecycle_permits(&limits, "container-a").is_ok());
+    }
+}
 
 /// Shared state for all agent handlers.
 pub struct AgentState {
@@ -88,6 +306,52 @@ fn error_response(status: StatusCode, message: String) -> impl IntoResponse {
             error: Some(message),
         }),
     )
+}
+
+pub(crate) fn captured_ok_response<T: Serialize>(
+    data: T,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    json_response_with_capture_permit(
+        StatusCode::OK,
+        AgentResponse {
+            success: true,
+            data: Some(data),
+            error: None,
+        },
+        permit,
+    )
+}
+
+pub(crate) fn captured_error_response(
+    status: StatusCode,
+    message: String,
+    permit: tokio::sync::OwnedSemaphorePermit,
+) -> Response {
+    json_response_with_capture_permit(
+        status,
+        AgentResponse::<()> {
+            success: false,
+            data: None,
+            error: Some(message),
+        },
+        permit,
+    )
+}
+
+pub(crate) fn container_identity_error_status(error: &ContainerIdentityError) -> StatusCode {
+    match error {
+        ContainerIdentityError::Inspect {
+            source:
+                bollard::errors::Error::DockerResponseServerError {
+                    status_code: 404, ..
+                },
+            ..
+        } => StatusCode::NOT_FOUND,
+        ContainerIdentityError::Inspect { .. }
+        | ContainerIdentityError::MissingId { .. }
+        | ContainerIdentityError::InvalidId { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+    }
 }
 
 fn remove_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
@@ -409,26 +673,48 @@ mod remove_tests {
     responses(
         (status = 200, description = "Container logs", body = AgentResponse<String>),
         (status = 401, description = "Unauthorized"),
+        (status = 429, description = "Output capture capacity exhausted"),
+        (status = 504, description = "Log capture timed out"),
         (status = 500, description = "Failed to get logs")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn get_container_logs(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Path(container_id): Path<String>,
 ) -> impl IntoResponse {
+    let capture_permit = match limits.output_capture_slots.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot capture logs for container {container_id}: all output capture slots are busy"
+                ),
+            )
+            .into_response();
+        }
+    };
+
     tracing::debug!(container_id = %container_id, "Fetching container logs");
-    match state
-        .container_deployer
-        .get_container_logs(&container_id)
-        .await
+    match tokio::time::timeout(
+        CONTAINER_LOG_TIMEOUT,
+        state.container_deployer.get_container_logs(&container_id),
+    )
+    .await
     {
-        Ok(logs) => AgentResponse::ok(logs).into_response(),
-        Err(e) => {
-            tracing::error!(container_id = %container_id, "Failed to get logs: {}", e);
+        Err(_) => error_response(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("Timed out capturing logs for container {container_id} after 60 seconds"),
+        )
+        .into_response(),
+        Ok(Ok(logs)) => captured_ok_response(logs, capture_permit),
+        Ok(Err(error)) => {
+            tracing::error!(container_id = %container_id, reason = %error, "Failed to get container logs");
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Failed to get logs for container {}: {}", container_id, e),
+                format!("Failed to get logs for container {container_id}: {error}"),
             )
             .into_response()
         }
@@ -485,6 +771,32 @@ pub struct AgentExecResponse {
     pub stderr: String,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum ContainerExecCaptureError {
+    #[error("Failed to start Docker exec '{exec_id}': {source}")]
+    Start {
+        exec_id: String,
+        source: bollard::errors::Error,
+    },
+    #[error("Docker exec '{exec_id}' unexpectedly started detached")]
+    UnexpectedDetached { exec_id: String },
+    #[error("Failed while reading output from Docker exec '{exec_id}': {source}")]
+    Stream {
+        exec_id: String,
+        source: bollard::errors::Error,
+    },
+    #[error("Failed to inspect completed Docker exec '{exec_id}': {source}")]
+    Inspect {
+        exec_id: String,
+        source: bollard::errors::Error,
+    },
+    #[error("Docker exec completion could not be confirmed: {source}")]
+    Completion {
+        #[from]
+        source: ExecCompletionError,
+    },
+}
+
 /// Run a one-shot command inside a container on this worker.
 ///
 /// Container exec is timeout-bounded (default 30s, max 300s) so a hung
@@ -503,6 +815,10 @@ pub struct AgentExecResponse {
         (status = 200, description = "Exec result", body = AgentResponse<AgentExecResponse>),
         (status = 400, description = "Invalid command"),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container not found"),
+        (status = 409, description = "Container identity changed before exec start"),
+        (status = 429, description = "Exec or capture capacity exhausted"),
+        (status = 503, description = "Docker unavailable"),
         (status = 500, description = "Exec failed"),
         (status = 504, description = "Exec timed out")
     ),
@@ -510,6 +826,7 @@ pub struct AgentExecResponse {
 )]
 pub async fn exec_container(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Path(container_id): Path<String>,
     Json(request): Json<AgentExecRequest>,
 ) -> impl IntoResponse {
@@ -525,6 +842,50 @@ pub async fn exec_container(
         )
         .into_response();
     };
+
+    let cleanup_container_id = match resolve_container_id(&docker, &container_id).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                container_identity_error_status(&error),
+                format!("Failed to resolve container '{container_id}' before exec: {error}"),
+            )
+            .into_response();
+        }
+    };
+
+    let permits = match try_acquire_attached_exec_permits(&limits, &cleanup_container_id) {
+        Ok(permits) => permits,
+        Err(ExecAdmissionError::OperationsExhausted) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot execute command in container {container_id}: all exec operation slots are busy"
+                ),
+            )
+            .into_response();
+        }
+        Err(ExecAdmissionError::CapturesExhausted) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot execute command in container {container_id}: all output capture slots are busy"
+                ),
+            )
+            .into_response();
+        }
+        Err(ExecAdmissionError::ContainerOwned) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot execute command in container {container_id}: another operation already owns that container"
+                ),
+            )
+            .into_response();
+        }
+    };
+    let capture_permit = permits.capture;
+    let operation_permit = permits.operation;
 
     let timeout_secs = std::cmp::min(request.timeout_seconds.unwrap_or(30), 300);
 
@@ -542,7 +903,7 @@ pub async fn exec_container(
         ..Default::default()
     };
 
-    let exec = match docker.create_exec(&container_id, exec_config).await {
+    let exec = match docker.create_exec(&cleanup_container_id, exec_config).await {
         Ok(e) => e,
         Err(bollard::errors::Error::DockerResponseServerError {
             status_code: 404, ..
@@ -562,65 +923,165 @@ pub async fn exec_container(
             .into_response();
         }
     };
+    let exec_container_id = match resolve_exec_container_id(&docker, &exec.id).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            tracing::error!(container_id = %container_id, exec_id = %exec.id, reason = %error, "Failed to pin exec container identity");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to prepare command cleanup: {error}"),
+            )
+            .into_response();
+        }
+    };
+    if exec_container_id != cleanup_container_id {
+        return error_response(
+            StatusCode::CONFLICT,
+            format!(
+                "Container '{container_id}' changed from '{cleanup_container_id}' to '{exec_container_id}' before exec start"
+            ),
+        )
+        .into_response();
+    }
+    let mut cleanup_guard = ExecCleanupGuard::new(
+        docker.clone(),
+        exec.id.clone(),
+        cleanup_container_id.clone(),
+        capture_permit,
+        operation_permit,
+        permits.container,
+    );
 
     let start_config = bollard::exec::StartExecOptions {
         detach: false,
         ..Default::default()
     };
 
-    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
-        let output = docker.start_exec(&exec.id, Some(start_config)).await?;
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        if let bollard::exec::StartExecResults::Attached { mut output, .. } = output {
-            while let Some(Ok(msg)) = output.next().await {
-                match msg {
+    let result = run_exec_with_deadline(
+        &docker,
+        &exec.id,
+        &cleanup_container_id,
+        std::time::Duration::from_secs(timeout_secs),
+        async {
+            let output = docker
+                .start_exec(&exec.id, Some(start_config))
+                .await
+                .map_err(|source| ContainerExecCaptureError::Start {
+                    exec_id: exec.id.clone(),
+                    source,
+                })?;
+            let mut stdout = BoundedTailBuffer::new(MAX_CAPTURED_STREAM_BYTES);
+            let mut stderr = BoundedTailBuffer::new(MAX_CAPTURED_STREAM_BYTES);
+            let mut output = match output {
+                bollard::exec::StartExecResults::Attached { output, .. } => output,
+                bollard::exec::StartExecResults::Detached => {
+                    return Err(ContainerExecCaptureError::UnexpectedDetached {
+                        exec_id: exec.id.clone(),
+                    });
+                }
+            };
+            while let Some(message) = output.next().await {
+                match message.map_err(|source| ContainerExecCaptureError::Stream {
+                    exec_id: exec.id.clone(),
+                    source,
+                })? {
                     bollard::container::LogOutput::StdOut { message } => {
-                        stdout.push_str(&String::from_utf8_lossy(&message));
+                        stdout.push(message);
                     }
                     bollard::container::LogOutput::StdErr { message } => {
-                        stderr.push_str(&String::from_utf8_lossy(&message));
+                        stderr.push(message);
                     }
                     _ => {}
                 }
             }
-        }
-        Ok::<_, bollard::errors::Error>((stdout, stderr))
-    })
+
+            let inspect = docker.inspect_exec(&exec.id).await.map_err(|source| {
+                ContainerExecCaptureError::Inspect {
+                    exec_id: exec.id.clone(),
+                    source,
+                }
+            })?;
+            let exit_code = completed_exec_exit_code(&inspect, &exec.id)?;
+            Ok::<_, ContainerExecCaptureError>((
+                exit_code,
+                stdout.into_string(),
+                stderr.into_string(),
+            ))
+        },
+    )
     .await;
 
     match result {
-        Ok(Ok((stdout, stderr))) => {
-            let exit_code = docker
-                .inspect_exec(&exec.id)
-                .await
-                .ok()
-                .and_then(|i| i.exit_code);
+        ExecDeadlineOutcome::Completed(Ok((exit_code, stdout, stderr))) => {
+            let Some(capture_permit) = cleanup_guard.disarm_and_take_capture() else {
+                return error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!(
+                        "Exec in container {container_id} completed without response capture ownership"
+                    ),
+                )
+                .into_response();
+            };
             tracing::info!(
                 container_id = %container_id,
-                exit_code = ?exit_code,
+                exit_code,
                 "Exec completed"
             );
-            AgentResponse::ok(AgentExecResponse {
-                exit_code,
-                stdout,
-                stderr,
-            })
-            .into_response()
+            captured_ok_response(
+                AgentExecResponse {
+                    exit_code: Some(exit_code),
+                    stdout,
+                    stderr,
+                },
+                capture_permit,
+            )
         }
-        Ok(Err(e)) => {
-            tracing::error!(container_id = %container_id, "Exec error: {}", e);
+        ExecDeadlineOutcome::Completed(Err(e)) => {
+            let cleanup_scheduled = !matches!(
+                &e,
+                ContainerExecCaptureError::Start { source, .. }
+                    if exec_start_was_rejected(source)
+            );
+            if !cleanup_scheduled {
+                cleanup_guard.disarm();
+            }
+            let cleanup_note = if cleanup_scheduled {
+                format!(
+                    "container {container_id} restart was scheduled to stop any ambiguous command workload"
+                )
+            } else {
+                "Docker definitively rejected the command before it started; the container was not restarted".to_string()
+            };
+            tracing::error!(container_id = %container_id, cleanup_scheduled, "Exec error: {}", e);
             error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("Exec error: {}", e),
+                format!("Exec error: {e}; {cleanup_note}"),
             )
             .into_response()
         }
-        Err(_) => {
-            tracing::warn!(container_id = %container_id, timeout_secs, "Exec timed out");
+        ExecDeadlineOutcome::ContainerRestarted => {
+            cleanup_guard.disarm();
+            tracing::warn!(container_id = %container_id, timeout_secs, "Exec timed out; containing container was restarted to stop the complete workload");
             error_response(
                 StatusCode::GATEWAY_TIMEOUT,
-                format!("Command timed out after {}s", timeout_secs),
+                format!(
+                    "Command timed out after {timeout_secs}s; container {container_id} was restarted to stop the complete command workload"
+                ),
+            )
+            .into_response()
+        }
+        ExecDeadlineOutcome::TerminationFailed(error) => {
+            tracing::error!(
+                container_id = %container_id,
+                timeout_secs,
+                reason = %error,
+                "Exec timed out and its container could not be restarted"
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Command timed out after {timeout_secs}s, but the worker could not restart its container to stop the complete workload: {error}"
+                ),
             )
             .into_response()
         }
@@ -641,6 +1102,7 @@ pub async fn exec_container(
 /// against a remote container. No protocol translation in the middle.
 pub async fn terminal_container(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     Path(container_id): Path<String>,
     ws: WebSocketUpgrade,
 ) -> Response {
@@ -652,8 +1114,36 @@ pub async fn terminal_container(
         .into_response();
     };
 
-    ws.on_upgrade(move |socket| handle_terminal_session(socket, docker, container_id))
-        .into_response()
+    let canonical_container_id = match resolve_container_id(&docker, &container_id).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            return error_response(
+                container_identity_error_status(&error),
+                format!("Failed to resolve terminal container '{container_id}': {error}"),
+            )
+            .into_response();
+        }
+    };
+    let container_permit = match limits
+        .container_operations
+        .try_acquire(&canonical_container_id)
+    {
+        Ok(permit) => permit,
+        Err(_) => {
+            return error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                format!(
+                    "Cannot open terminal for container {container_id}: another operation already owns that container"
+                ),
+            )
+            .into_response();
+        }
+    };
+
+    ws.on_upgrade(move |socket| {
+        handle_terminal_session(socket, docker, canonical_container_id, container_permit)
+    })
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -664,7 +1154,12 @@ struct TerminalControl {
     data: Option<String>,
 }
 
-async fn handle_terminal_session(socket: WebSocket, docker: bollard::Docker, container_id: String) {
+async fn handle_terminal_session(
+    socket: WebSocket,
+    docker: bollard::Docker,
+    container_id: String,
+    container_permit: tokio::sync::OwnedSemaphorePermit,
+) {
     tracing::debug!(container_id = %container_id, "Agent terminal session started");
 
     // Try bash, fall back to sh — same shape as the CP-local terminal so
@@ -690,6 +1185,24 @@ async fn handle_terminal_session(socket: WebSocket, docker: bollard::Docker, con
         }
     };
     let exec_id = exec.id.clone();
+    let exec_container_id = match resolve_exec_container_id(&docker, &exec_id).await {
+        Ok(container_id) => container_id,
+        Err(error) => {
+            tracing::error!(reason = %error, container_id = %container_id, exec_id = %exec_id, "Failed to pin terminal exec container identity");
+            return;
+        }
+    };
+    if exec_container_id != container_id {
+        tracing::error!(container_id = %container_id, exec_container_id = %exec_container_id, exec_id = %exec_id, "Terminal container identity changed before exec start");
+        return;
+    }
+    let mut cleanup_guard = ExecCleanupGuard::new_without_capture(
+        docker.clone(),
+        exec_id.clone(),
+        container_id.clone(),
+        None,
+        container_permit,
+    );
 
     let start_config = bollard::exec::StartExecOptions {
         detach: false,
@@ -703,11 +1216,15 @@ async fn handle_terminal_session(socket: WebSocket, docker: bollard::Docker, con
     {
         Ok(StartExecResults::Attached { output, input }) => (output, input),
         Ok(StartExecResults::Detached) => {
-            tracing::error!("Exec started in detached mode unexpectedly");
+            tracing::error!(container_id = %container_id, exec_id = %exec_id, "Terminal exec started detached unexpectedly; scheduling containing-container restart");
             return;
         }
-        Err(e) => {
-            tracing::error!(error = %e, container_id = %container_id, "Failed to start exec for terminal");
+        Err(error) => {
+            let cleanup_scheduled = !exec_start_was_rejected(&error);
+            if !cleanup_scheduled {
+                cleanup_guard.disarm();
+            }
+            tracing::error!(reason = %error, container_id = %container_id, exec_id = %exec_id, cleanup_scheduled, "Failed to start exec for terminal");
             return;
         }
     };
@@ -798,8 +1315,16 @@ async fn handle_terminal_session(socket: WebSocket, docker: bollard::Docker, con
         }
     }
 
+    let _ = docker_input.shutdown().await;
     output_task.abort();
-    tracing::info!(container_id = %container_id, "Agent terminal session ended");
+    monitor_exec_until_stopped(
+        docker,
+        exec_id,
+        container_id.clone(),
+        "terminal exec",
+        cleanup_guard,
+    );
+    tracing::info!(container_id = %container_id, "Agent terminal session ended; lifecycle ownership retained until Docker confirms exec completion");
 }
 
 /// Query parameters for the streaming logs endpoint. Mirrors the control
@@ -1100,6 +1625,48 @@ pub async fn image_exists(
     }
 }
 
+fn image_upload_stream(
+    body: Body,
+    received_bytes: Arc<AtomicU64>,
+    max_bytes: u64,
+) -> temps_deployer::ImageImportStream {
+    Box::pin(body.into_data_stream().map(move |result| {
+        match result {
+            Ok(chunk) => {
+                let chunk_bytes = u64::try_from(chunk.len()).unwrap_or(u64::MAX);
+                let previous = received_bytes.fetch_add(chunk_bytes, Ordering::Relaxed);
+                let total = previous.saturating_add(chunk_bytes);
+                if total > max_bytes {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::FileTooLarge,
+                        format!(
+                            "Image upload exceeded the {max_bytes}-byte worker limit after receiving {total} bytes"
+                        ),
+                    ));
+                }
+                Ok(chunk)
+            }
+            Err(error) => Err(std::io::Error::other(format!(
+                "Failed to read image upload body: {error}"
+            ))),
+        }
+    }))
+}
+
+fn spawn_permit_owned_task<T, F>(
+    permit: tokio::sync::OwnedSemaphorePermit,
+    future: F,
+) -> tokio::task::JoinHandle<T>
+where
+    T: Send + 'static,
+    F: Future<Output = T> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let _permit = permit;
+        future.await
+    })
+}
+
 /// Import a Docker image from a tar archive streamed in the request body.
 ///
 /// The control plane calls this to transfer locally-built images to worker nodes.
@@ -1113,12 +1680,16 @@ pub async fn image_exists(
         (status = 200, description = "Image imported successfully", body = AgentResponse<String>),
         (status = 400, description = "Missing x-image-tag header"),
         (status = 401, description = "Unauthorized"),
+        (status = 413, description = "Image exceeds the worker import limit"),
+        (status = 503, description = "Image import capacity unavailable"),
+        (status = 504, description = "Image import deadline exceeded"),
         (status = 500, description = "Import failed")
     ),
     security(("bearer_auth" = []))
 )]
 pub async fn import_image(
     State(state): State<Arc<AgentState>>,
+    Extension(limits): Extension<Arc<AgentResourceLimits>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> impl IntoResponse {
@@ -1135,64 +1706,124 @@ pub async fn import_image(
 
     tracing::info!(image = %tag, "Receiving image tar from control plane");
 
-    // Stream the body to a temp file
-    let tmp_dir = std::env::temp_dir();
-    let tmp_path = tmp_dir.join(format!("temps-image-import-{}.tar", uuid::Uuid::new_v4()));
-
-    let write_result = async {
-        use http_body_util::BodyExt;
-
-        let mut file = tokio::fs::File::create(&tmp_path).await?;
-        let mut total_bytes: u64 = 0;
-
-        let mut body = body;
-        while let Some(frame) = BodyExt::frame(&mut body).await {
-            let frame =
-                frame.map_err(|e| std::io::Error::other(format!("Body read error: {}", e)))?;
-            if let Ok(data) = frame.into_data() {
-                tokio::io::AsyncWriteExt::write_all(&mut file, &data).await?;
-                total_bytes += data.len() as u64;
+    if let Some(content_length) = headers.get(header::CONTENT_LENGTH) {
+        let content_length: u64 = match content_length
+            .to_str()
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+        {
+            Some(length) => length,
+            None => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "Invalid Content-Length header for image import".to_string(),
+                )
+                .into_response();
             }
+        };
+        if content_length > MAX_IMAGE_IMPORT_BYTES {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "Image import is {content_length} bytes; worker limit is {MAX_IMAGE_IMPORT_BYTES} bytes"
+                ),
+            )
+            .into_response();
         }
-        tokio::io::AsyncWriteExt::flush(&mut file).await?;
-
-        tracing::info!(
-            image = %tag,
-            size_mb = format!("{:.1}", total_bytes as f64 / 1_048_576.0),
-            "Image tar received, loading into Docker"
-        );
-        Ok::<_, std::io::Error>(())
-    }
-    .await;
-
-    if let Err(e) = write_result {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to write image tar: {}", e),
-        )
-        .into_response();
     }
 
-    // Import the image via the image builder (docker load)
-    let result = state
-        .image_builder
-        .import_image(tmp_path.clone(), &tag)
-        .await;
+    let deadline = tokio::time::Instant::now() + IMAGE_IMPORT_TIMEOUT;
+    let import_permit =
+        match tokio::time::timeout_at(deadline, limits.image_import_slots.clone().acquire_owned())
+            .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => {
+                return error_response(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("Image import capacity is unavailable: {error}"),
+                )
+                .into_response();
+            }
+            Err(_) => {
+                return error_response(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    format!("Image import '{tag}' waited 30 minutes for worker capacity"),
+                )
+                .into_response();
+            }
+        };
 
-    // Clean up temp file
-    let _ = tokio::fs::remove_file(&tmp_path).await;
+    // Forward request chunks directly to Docker. Backpressure propagates from
+    // the daemon to the request body, keeping memory bounded without a full
+    // temporary archive whose page cache is charged to this service's cgroup.
+    let received_bytes = Arc::new(AtomicU64::new(0));
+    let image_stream = image_upload_stream(body, received_bytes.clone(), MAX_IMAGE_IMPORT_BYTES);
+
+    let image_builder = state.image_builder.clone();
+    let import_tag = tag.clone();
+    let mut import_task = spawn_permit_owned_task(import_permit, async move {
+        image_builder
+            .import_image_stream(image_stream, &import_tag)
+            .await
+    });
+    let result = match tokio::time::timeout_at(deadline, &mut import_task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Image import task for '{tag}' failed: {error}"),
+            )
+            .into_response();
+        }
+        Err(_) => {
+            tracing::warn!(image = %tag, "Image import request exceeded its deadline; Docker import continues to own the worker slot until it ends");
+            return error_response(
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("Image import '{tag}' exceeded the 30-minute worker deadline"),
+            )
+            .into_response();
+        }
+    };
+    let total_bytes = received_bytes.load(Ordering::Relaxed);
 
     match result {
         Ok(image_id) => {
-            tracing::info!(image = %tag, image_id = %image_id, "Image imported successfully");
+            tracing::info!(
+                image = %tag,
+                image_id = %image_id,
+                size_mb = format!("{:.1}", total_bytes as f64 / 1_048_576.0),
+                "Streamed image imported successfully"
+            );
             AgentResponse::ok(image_id).into_response()
         }
-        Err(e) => error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to import image '{}': {}", tag, e),
-        )
-        .into_response(),
+        Err(error) => {
+            if total_bytes > MAX_IMAGE_IMPORT_BYTES {
+                tracing::warn!(
+                    image = %tag,
+                    received_bytes = total_bytes,
+                    "Rejected oversized streamed image import"
+                );
+                return error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    format!("Image import exceeded the {MAX_IMAGE_IMPORT_BYTES}-byte worker limit"),
+                )
+                .into_response();
+            }
+            tracing::error!(
+                image = %tag,
+                received_bytes = total_bytes,
+                reason = %error,
+                "Streamed image import failed"
+            );
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "Failed to import image '{tag}' after receiving {total_bytes} bytes: {error}"
+                ),
+            )
+            .into_response()
+        }
     }
 }
 
@@ -1249,5 +1880,138 @@ async fn collect_system_metrics(state: &AgentState) -> NodeHealthReport {
         // Empty means "not discovered yet" — the control plane treats a blank
         // platform as unknown rather than as a claim about this node.
         platform: crate::server::read_platform(&state.platform).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod image_import_tests {
+    use super::*;
+    use bytes::Bytes;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test]
+    async fn image_upload_stream_is_lazy_and_backpressure_aware() {
+        const CHUNK_BYTES: usize = 1024 * 1024;
+        const TOTAL_CHUNKS: usize = 100;
+
+        let source_polls = Arc::new(AtomicUsize::new(0));
+        let source_counter = source_polls.clone();
+        let source = futures::stream::unfold(0usize, move |index| {
+            let source_counter = source_counter.clone();
+            async move {
+                if index == TOTAL_CHUNKS {
+                    return None;
+                }
+                source_counter.fetch_add(1, Ordering::Relaxed);
+                Some((
+                    Ok::<_, std::io::Error>(Bytes::from(vec![0; CHUNK_BYTES])),
+                    index + 1,
+                ))
+            }
+        });
+
+        let received_bytes = Arc::new(AtomicU64::new(0));
+        let mut upload = image_upload_stream(
+            Body::from_stream(source),
+            received_bytes.clone(),
+            (CHUNK_BYTES * TOTAL_CHUNKS) as u64,
+        );
+
+        assert_eq!(source_polls.load(Ordering::Relaxed), 0);
+        let first = upload
+            .next()
+            .await
+            .expect("stream should produce its first chunk")
+            .expect("first chunk should be readable");
+
+        assert_eq!(first.len(), CHUNK_BYTES);
+        assert_eq!(received_bytes.load(Ordering::Relaxed), CHUNK_BYTES as u64);
+        assert!(
+            source_polls.load(Ordering::Relaxed) < TOTAL_CHUNKS,
+            "reading one chunk must not eagerly materialize the 100 MiB upload"
+        );
+    }
+
+    #[tokio::test]
+    async fn image_upload_stream_rejects_bytes_past_limit() {
+        let received_bytes = Arc::new(AtomicU64::new(0));
+        let mut upload = image_upload_stream(
+            Body::from(Bytes::from_static(b"12345")),
+            received_bytes.clone(),
+            4,
+        );
+
+        let error = upload
+            .next()
+            .await
+            .expect("body should yield one result")
+            .expect_err("five bytes must exceed a four-byte limit");
+        assert!(error.to_string().contains("4-byte worker limit"));
+        assert_eq!(received_bytes.load(Ordering::Relaxed), 5);
+    }
+
+    #[tokio::test]
+    async fn dropped_import_waiter_does_not_release_import_capacity() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("test semaphore remains open");
+        let finish = Arc::new(tokio::sync::Notify::new());
+        let task_finish = finish.clone();
+        let task = spawn_permit_owned_task(permit, async move {
+            task_finish.notified().await;
+        });
+
+        drop(task);
+        assert!(slots.clone().try_acquire_owned().is_err());
+
+        finish.notify_one();
+        let released = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            slots.clone().acquire_owned(),
+        )
+        .await
+        .expect("owned import task releases capacity after completion")
+        .expect("test semaphore remains open");
+        drop(released);
+    }
+}
+
+#[cfg(test)]
+mod openapi_response_tests {
+    use super::*;
+
+    #[test]
+    fn resource_limit_and_lifecycle_statuses_are_documented() {
+        let spec = serde_json::to_value(AgentApiDoc::openapi())
+            .expect("agent OpenAPI document serializes");
+        for pointer in [
+            "/paths/~1agent~1containers~1{id}~1logs/get/responses/429",
+            "/paths/~1agent~1containers~1{id}~1logs/get/responses/504",
+            "/paths/~1agent~1containers~1{id}~1exec/post/responses/404",
+            "/paths/~1agent~1containers~1{id}~1exec/post/responses/409",
+            "/paths/~1agent~1containers~1{id}~1exec/post/responses/429",
+            "/paths/~1agent~1containers~1{id}~1exec/post/responses/503",
+            "/paths/~1agent~1containers~1{id}~1exec/post/responses/504",
+            "/paths/~1agent~1images~1import/post/responses/413",
+            "/paths/~1agent~1images~1import/post/responses/503",
+            "/paths/~1agent~1images~1import/post/responses/504",
+            "/paths/~1agent~1services~1exec/post/responses/404",
+            "/paths/~1agent~1services~1exec/post/responses/409",
+            "/paths/~1agent~1services~1exec/post/responses/429",
+            "/paths/~1agent~1services~1exec/post/responses/504",
+            "/paths/~1agent~1services~1backup/post/responses/404",
+            "/paths/~1agent~1services~1backup/post/responses/409",
+            "/paths/~1agent~1services~1backup/post/responses/429",
+            "/paths/~1agent~1services~1backup/post/responses/504",
+            "/paths/~1agent~1services~1restore/post/responses/404",
+            "/paths/~1agent~1services~1restore/post/responses/409",
+            "/paths/~1agent~1services~1restore/post/responses/429",
+            "/paths/~1agent~1services~1restore/post/responses/504",
+        ] {
+            assert!(spec.pointer(pointer).is_some(), "missing OpenAPI {pointer}");
+        }
     }
 }
