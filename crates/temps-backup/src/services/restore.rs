@@ -403,15 +403,17 @@ impl RestoreService {
         let mut resolved_location = backup_location.clone();
         let mut location_was_resolved = false;
         if resolved_location.is_empty() {
-            let origin = backup_row
-                .as_ref()
-                .and_then(|b| serde_json::from_str::<serde_json::Value>(&b.metadata).ok())
-                .and_then(|v| {
-                    v.get("service_name")
-                        .and_then(|s| s.as_str())
-                        .map(String::from)
-                });
-            if let Some(origin) = origin {
+            let origin_and_uuid = backup_row.as_ref().and_then(|b| {
+                serde_json::from_str::<serde_json::Value>(&b.metadata)
+                    .ok()
+                    .and_then(|v| {
+                        v.get("service_name")
+                            .and_then(|s| s.as_str())
+                            .map(String::from)
+                    })
+                    .map(|origin| (origin, b.backup_id.clone()))
+            });
+            if let Some((origin, backup_uuid)) = origin_and_uuid {
                 if let Ok(s3_source) = temps_entities::s3_sources::Entity::find_by_id(s3_source_id)
                     .one(self.db.as_ref())
                     .await
@@ -443,6 +445,7 @@ impl RestoreService {
                             &s3_source,
                             &target.service_type,
                             &origin,
+                            &backup_uuid,
                         )
                         .await
                         {
@@ -1664,8 +1667,14 @@ async fn run_restore_inner(
         let engine = target_service.service_type.clone();
 
         if let Some(origin) = origin_service_name {
-            let resolved =
-                resolve_backup_location_from_s3(&s3_client, &s3_source, &engine, &origin).await;
+            let resolved = resolve_backup_location_from_s3(
+                &s3_client,
+                &s3_source,
+                &engine,
+                &origin,
+                &backup_model.backup_id,
+            )
+            .await;
             match resolved {
                 Ok(Some(loc)) => {
                     info!(
@@ -2551,6 +2560,7 @@ async fn resolve_backup_location_from_s3(
     s3_source: &temps_entities::s3_sources::Model,
     engine: &str,
     origin_service_name: &str,
+    backup_uuid: &str,
 ) -> Result<Option<String>, anyhow::Error> {
     let bucket = &s3_source.bucket_name;
     // Mirror the path convention backup_external_service writes to:
@@ -2590,8 +2600,18 @@ async fn resolve_backup_location_from_s3(
         )));
     }
 
-    // 2) pg_dump / rdb / mongodump — pick the newest matching object under
-    //    the service prefix.
+    // 2) pg_dump / rdb / mongodump / mariadb — every non-WAL-G engine writes
+    //    its artifact under `<service_prefix>.../<backup_uuid>/<filename>`
+    //    (see `v2_common::build_external_service_s3_key`, where `backup_uuid`
+    //    is `backups.backup_id`). Scanning the whole service prefix and
+    //    picking the newest matching extension is NOT safe here: a service
+    //    can carry backups from more than one engine/format (e.g. a MariaDB
+    //    physical base and a later logical dump), and "newest of any format"
+    //    can silently return a different backup than the one the caller
+    //    selected. Require the object's key to contain this exact backup's
+    //    own uuid path segment, so the resolver can only ever return the
+    //    artifact that this specific backup wrote.
+    let uuid_segment = format!("/{}/", backup_uuid);
     let mut best: Option<(String, aws_sdk_s3::primitives::DateTime)> = None;
     let mut continuation: Option<String> = None;
     loop {
@@ -2609,6 +2629,9 @@ async fn resolve_backup_location_from_s3(
                 None => continue,
             };
             if key.contains("/walg/") {
+                continue;
+            }
+            if !key.contains(&uuid_segment) {
                 continue;
             }
             if !(key.ends_with(".sql.gz")
@@ -3485,16 +3508,30 @@ mod tests {
         }
     }
 
-    /// REGRESSION (Greptile finding on PR #878): a legacy MariaDB *physical*
-    /// backup row with an empty `s3_location` was undiscoverable, because the
-    /// extension allowlist in `resolve_backup_location_from_s3` did not include
-    /// `.mbstream.gz`. That made the backup permanently unrestorable through
-    /// the repair path — a data-safety bug, not a cosmetic one.
+    /// REGRESSION (Greptile findings on PR #878, two rounds):
+    ///
+    /// 1. A legacy MariaDB *physical* backup row with an empty `s3_location`
+    ///    was undiscoverable, because the extension allowlist in
+    ///    `resolve_backup_location_from_s3` did not include `.mbstream.gz`.
+    ///    That made the backup permanently unrestorable through the repair
+    ///    path — a data-safety bug, not a cosmetic one.
+    /// 2. After (1) was fixed, the resolver still picked the *newest matching
+    ///    object of any format* under the service prefix — so a service with
+    ///    both a physical base and a later logical dump would silently
+    ///    substitute the dump for a physical backup row, restoring the wrong
+    ///    snapshot and format. The fix scopes every non-WAL-G lookup to the
+    ///    calling backup's own `<backup_uuid>/` path segment (`backups.backup_id`,
+    ///    the same uuid every engine already writes its artifact under —
+    ///    see `v2_common::build_external_service_s3_key`), so the resolver can
+    ///    only ever return that specific backup's own object.
     ///
     /// This seeds the exact key shape a physical base occupies in a real
-    /// bucket and asserts the resolver now finds it. It also seeds a logical
+    /// bucket and asserts the resolver now finds it; seeds a logical
     /// `dump.sql.gz` under a *different* service prefix and asserts that one
-    /// still resolves, so the fix is additive rather than a swap.
+    /// still resolves (the extension fix is additive, not a swap); and seeds
+    /// a physical base and a NEWER logical dump under the SAME service
+    /// prefix with different backup uuids, asserting each backup's own uuid
+    /// resolves to its own artifact rather than the newer one winning.
     #[cfg(feature = "docker-tests")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups() {
@@ -3520,13 +3557,13 @@ mod tests {
 
         let physical_service = "orders-physical";
         let logical_service = "orders-logical";
+        let physical_uuid = uuid::Uuid::new_v4().to_string();
+        let logical_uuid = uuid::Uuid::new_v4().to_string();
         let physical_key = format!(
-            "external_services/mariadb/{physical_service}/2026/01/01/{}/base.mbstream.gz",
-            uuid::Uuid::new_v4()
+            "external_services/mariadb/{physical_service}/2026/01/01/{physical_uuid}/base.mbstream.gz"
         );
         let logical_key = format!(
-            "external_services/mariadb/{logical_service}/2026/01/01/{}/dump.sql.gz",
-            uuid::Uuid::new_v4()
+            "external_services/mariadb/{logical_service}/2026/01/01/{logical_uuid}/dump.sql.gz"
         );
         // Engines always write a `metadata.json` companion next to the
         // artifact; seeding it proves the resolver picks the artifact and not
@@ -3551,10 +3588,15 @@ mod tests {
         }
 
         // ---- Act + Assert: physical base is now discoverable --------------
-        let physical =
-            resolve_backup_location_from_s3(&s3_client, &s3_source, "mariadb", physical_service)
-                .await
-                .expect("listing a reachable bucket must not error");
+        let physical = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            physical_service,
+            &physical_uuid,
+        )
+        .await
+        .expect("listing a reachable bucket must not error");
         eprintln!("resolved physical location = {physical:?}");
         let physical = physical.expect(
             "a .mbstream.gz physical base must be discoverable; before the \
@@ -3567,10 +3609,15 @@ mod tests {
         assert_eq!(physical, physical_key, "resolver must return the exact key");
 
         // ---- Assert: the logical-dump path did not regress ----------------
-        let logical =
-            resolve_backup_location_from_s3(&s3_client, &s3_source, "mariadb", logical_service)
-                .await
-                .expect("listing a reachable bucket must not error");
+        let logical = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            logical_service,
+            &logical_uuid,
+        )
+        .await
+        .expect("listing a reachable bucket must not error");
         eprintln!("resolved logical location = {logical:?}");
         let logical = logical.expect("a .sql.gz logical dump must stay discoverable");
         assert_eq!(
@@ -3579,13 +3626,90 @@ mod tests {
         );
 
         // ---- Assert: an unknown service still resolves to None ------------
-        let missing =
-            resolve_backup_location_from_s3(&s3_client, &s3_source, "mariadb", "no-such-service")
-                .await
-                .expect("listing an empty prefix must not error");
+        let missing = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            "no-such-service",
+            &physical_uuid,
+        )
+        .await
+        .expect("listing an empty prefix must not error");
         assert!(
             missing.is_none(),
             "an empty service prefix must resolve to None, got {missing:?}"
+        );
+
+        // ---- REGRESSION (round 2): same service, two backups of different
+        //      formats and different ages — the resolver must not let the
+        //      newer one win when a specific backup's own uuid is given. ---
+        let shared_service = "orders-mixed-formats";
+        let older_physical_uuid = uuid::Uuid::new_v4().to_string();
+        let newer_logical_uuid = uuid::Uuid::new_v4().to_string();
+        let older_physical_key = format!(
+            "external_services/mariadb/{shared_service}/2026/01/01/{older_physical_uuid}/base.mbstream.gz"
+        );
+        let newer_logical_key = format!(
+            "external_services/mariadb/{shared_service}/2026/01/02/{newer_logical_uuid}/dump.sql.gz"
+        );
+        // Seed the OLDER physical object first, then the NEWER logical
+        // object second, so a naive "pick whatever S3 reports as most
+        // recently modified" implementation would pick the logical one.
+        if let Err(e) = s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(&older_physical_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"seed"))
+            .send()
+            .await
+        {
+            eprintln!("Could not seed object {older_physical_key}, skipping: {e}");
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        if let Err(e) = s3_client
+            .put_object()
+            .bucket(bucket)
+            .key(&newer_logical_key)
+            .body(aws_sdk_s3::primitives::ByteStream::from_static(b"seed"))
+            .send()
+            .await
+        {
+            eprintln!("Could not seed object {newer_logical_key}, skipping: {e}");
+            return;
+        }
+
+        let resolved_for_older = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            shared_service,
+            &older_physical_uuid,
+        )
+        .await
+        .expect("listing a reachable bucket must not error")
+        .expect("the older physical backup's own artifact must still be discoverable by its uuid");
+        eprintln!("resolved (older physical uuid) = {resolved_for_older}");
+        assert_eq!(
+            resolved_for_older, older_physical_key,
+            "SECURITY/DATA-SAFETY: resolving the OLDER physical backup's own uuid must return \
+             its own artifact, not the newer logical dump under the same service prefix — \
+             substituting artifacts here means restoring the wrong snapshot in the wrong format"
+        );
+
+        let resolved_for_newer = resolve_backup_location_from_s3(
+            &s3_client,
+            &s3_source,
+            "mariadb",
+            shared_service,
+            &newer_logical_uuid,
+        )
+        .await
+        .expect("listing a reachable bucket must not error")
+        .expect("the newer logical backup's own artifact must be discoverable by its uuid");
+        assert_eq!(
+            resolved_for_newer, newer_logical_key,
+            "resolving the newer logical backup's own uuid must return its own artifact"
         );
     }
 }
