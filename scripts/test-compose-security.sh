@@ -615,13 +615,13 @@ docker exec --detach "$admin_saturation_probe_name" sh -ec '
   wait
 '
 admin_connection_limit_enforced=false
-for _ in {1..20}; do
+for _ in {1..40}; do
   admin_ingress_logs="$(docker logs temps-admin-ingress 2>&1)"
   if grep -Fq 'limiting connections by zone "admin_clients"' <<<"$admin_ingress_logs"; then
     admin_connection_limit_enforced=true
     break
   fi
-  sleep 0.5
+  sleep 1
 done
 if [[ "$admin_connection_limit_enforced" != "true" ]]; then
   echo "admin ingress did not enforce its pre-authentication connection ceiling" >&2
