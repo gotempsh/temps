@@ -64,6 +64,74 @@ pub enum FlushOutcome {
     },
 }
 
+/// Why Cloud-primary projects are being handed back to local span storage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloudFallbackReason {
+    /// `DELETE /cloud` — the operator disconnected the instance.
+    Disconnected,
+    /// The Cloud telemetry feature switch was turned off.
+    TelemetryDisabled,
+}
+
+/// The instance's Cloud-primary write-mode owner, called when the link goes
+/// away (ADR-041 §7c).
+///
+/// # Why this is a trait on the link rather than a call in `temps-cloud`
+///
+/// The write mode, its ledger and the durable outbox all live in `temps-otel`,
+/// which depends on this crate and not the other way round. The link is the one
+/// object both sides already hold, so it is where the "the link is going away"
+/// event can be delivered without inverting that dependency or making this
+/// crate know what a project is.
+///
+/// The implementation is registered at startup and is absent on an instance
+/// that never wires Cloud-primary writes, in which case a disconnect has
+/// nothing to undo.
+#[async_trait::async_trait]
+pub trait CloudTelemetryFallback: Send + Sync {
+    /// Hand every Cloud-primary project back to local span storage, and spill
+    /// whatever is still queued into the local store rather than dropping it.
+    ///
+    /// Must be idempotent: it is called on disconnect and again, at most once,
+    /// by the outbox worker after a feature-switch change.
+    ///
+    /// Returns how many projects' declared write mode was actually rewritten.
+    /// The disconnect path reports that number back to the operator when the
+    /// Cloud-side revoke afterwards fails: the flip is deliberately not undone
+    /// (local storage is always safe), but a failed disconnect that silently
+    /// changed several projects' settings is exactly the kind of thing a
+    /// self-hosted operator has nobody to ask about.
+    async fn revert_to_local(&self, reason: CloudFallbackReason) -> usize;
+}
+
+/// What a Cloud-primary outbox shipment did (ADR-041 §3).
+///
+/// Deliberately a separate type from [`FlushOutcome`] even though the variants
+/// rhyme. The two paths settle differently — `flush` owns its queue and this
+/// one does not — and collapsing them would let a caller ack an outbox row on
+/// an outcome that only ever meant "the spool kept it".
+#[derive(Debug, Clone, PartialEq)]
+pub enum OutboxShipOutcome {
+    /// Nothing was offered.
+    Idle,
+    /// Not linked, or telemetry export is switched off. The rows stay pending;
+    /// the write-mode fallback (ADR-041 §7) is what resolves this, not a retry.
+    NotLinked,
+    Shipped {
+        spans: usize,
+        /// Cloud accepted the batch but the tenant is degraded — over quota and
+        /// sampling, most importantly. Under Cloud-primary writes this is not
+        /// informational: sampling would be sampling away the only copy, so the
+        /// caller must act on it (ADR-041 §7b).
+        warning: Option<temps_cloud_protocol::Unavailable>,
+    },
+    /// Transient failure. Retry on the backoff curve.
+    Retained { spans: usize, reason: String },
+    /// Refused for a reason retrying cannot fix. The rows are still kept —
+    /// never infer from a 4xx that a customer's telemetry is disposable.
+    Blocked { spans: usize, reason: String },
+}
+
 struct IncomingBatch {
     generation: u64,
     spans: Vec<SpanRecord>,
@@ -100,6 +168,24 @@ pub struct CloudLink {
     backups_enabled: AtomicBool,
     notifications_enabled: AtomicBool,
     encryption: Option<Arc<temps_core::EncryptionService>>,
+    /// ADR-041 §7c. Set once at startup by whoever owns the write mode.
+    telemetry_fallback: RwLock<Option<Arc<dyn CloudTelemetryFallback>>>,
+    /// How many projects the most recent fallback handed back to local span
+    /// storage.
+    ///
+    /// Read by the disconnect path when the Cloud-side revoke afterwards fails,
+    /// so the error can name the settings change that already happened instead
+    /// of leaving the operator to discover it in project settings later.
+    telemetry_reverted_projects: AtomicUsize,
+    /// Raised when telemetry export is switched off, so the outbox worker can
+    /// run the (async) fallback that [`CloudLink::set_feature_switches`] cannot
+    /// run itself.
+    ///
+    /// Correctness does not depend on how quickly this is observed: the ingest
+    /// path checks `telemetry_enabled()` directly, so local span writes have
+    /// already resumed by the time this flag is read. What the fallback adds is
+    /// the ledger entry and the spill of anything still queued.
+    telemetry_fallback_pending: AtomicBool,
 }
 
 impl CloudLink {
@@ -185,7 +271,55 @@ impl CloudLink {
             backups_enabled: AtomicBool::new(false),
             notifications_enabled: AtomicBool::new(false),
             encryption,
+            telemetry_fallback: RwLock::new(None),
+            telemetry_reverted_projects: AtomicUsize::new(0),
+            telemetry_fallback_pending: AtomicBool::new(false),
         }
+    }
+
+    /// Register the owner of Cloud-primary write modes (ADR-041 §7c).
+    pub fn set_telemetry_fallback(&self, fallback: Arc<dyn CloudTelemetryFallback>) {
+        *self
+            .telemetry_fallback
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(fallback);
+    }
+
+    fn telemetry_fallback(&self) -> Option<Arc<dyn CloudTelemetryFallback>> {
+        self.telemetry_fallback
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Run the fallback queued by a feature-switch change, if any.
+    ///
+    /// Called by the outbox worker on each cycle. Clears the flag *before*
+    /// running so a concurrent switch-off queues another run rather than being
+    /// swallowed by this one.
+    pub async fn run_pending_telemetry_fallback(&self) {
+        if !self
+            .telemetry_fallback_pending
+            .swap(false, Ordering::AcqRel)
+        {
+            return;
+        }
+        if let Some(fallback) = self.telemetry_fallback() {
+            let reverted = fallback
+                .revert_to_local(CloudFallbackReason::TelemetryDisabled)
+                .await;
+            self.telemetry_reverted_projects
+                .store(reverted, Ordering::Release);
+        }
+    }
+
+    /// Projects the most recent fallback handed back to local span storage.
+    ///
+    /// Zero until one has run. Only meaningful immediately after
+    /// [`Self::revoke`] or [`Self::run_pending_telemetry_fallback`]; it is a
+    /// last-outcome record for the error path, not a running total.
+    pub fn telemetry_projects_reverted(&self) -> usize {
+        self.telemetry_reverted_projects.load(Ordering::Acquire)
     }
 
     fn save_state(&self, state: &EnrollmentState) -> Result<(), crate::state::StateError> {
@@ -269,6 +403,17 @@ impl CloudLink {
             .store(switches.notifications, Ordering::Release);
         if switches.telemetry {
             return Ok(());
+        }
+
+        if telemetry_was_enabled {
+            // ADR-041 §7c: Cloud-primary projects must go back to local span
+            // storage. Local writes have *already* resumed — the ingest path
+            // reads `telemetry_enabled()` directly and this store happened
+            // above, before any lock was taken — so what is queued here is the
+            // ledger entry and the spill of anything still in the outbox, both
+            // of which need async work this synchronous method cannot do.
+            self.telemetry_fallback_pending
+                .store(true, Ordering::Release);
         }
 
         if telemetry_was_enabled {
@@ -609,6 +754,57 @@ impl CloudLink {
     /// remove the local credential after this succeeds, or after the backend
     /// confirms that the credential is already invalid.
     pub async fn revoke(&self) -> Result<(), CloudError> {
+        // ADR-041 §7c: before the credential goes away, hand every Cloud-primary
+        // project back to local span storage and spill whatever is still queued
+        // into the local store. This runs *first*, and unconditionally, because
+        // it is the only point in the disconnect path that is both async and
+        // still has a usable link — after this method the token is gone and the
+        // outbox has nowhere to ship.
+        //
+        // Running it even when the revoke below then fails is deliberate: the
+        // instance is left storing spans locally, which is always safe, and the
+        // recovery path reopens `cloud` intervals automatically once Cloud is
+        // accepting again (§7b). The opposite ordering would leave a window in
+        // which the credential is gone and projects still believe they are
+        // Cloud-primary.
+        //
+        // What is *not* acceptable is doing it quietly. When the revoke then
+        // fails, the request the operator made returns an error while several of
+        // their projects' write mode has already been permanently rewritten, so
+        // the count is both recorded (for callers that can surface it) and
+        // logged at ERROR here, naming what changed and how to put it back.
+        let reverted = match self.telemetry_fallback() {
+            Some(fallback) => {
+                let reverted = fallback
+                    .revert_to_local(CloudFallbackReason::Disconnected)
+                    .await;
+                self.telemetry_reverted_projects
+                    .store(reverted, Ordering::Release);
+                reverted
+            }
+            None => 0,
+        };
+
+        let outcome = self.revoke_credential().await;
+        if let Err(error) = &outcome {
+            if reverted > 0 {
+                tracing::error!(
+                    projects = reverted,
+                    %error,
+                    "Temps Cloud could not be told to revoke this instance's credential, but \
+                     {reverted} project(s) had already been switched back to storing spans on \
+                     this instance. Nothing is lost — their spans are on this machine — but that \
+                     change was kept. If you did not mean to disconnect, set those projects back \
+                     to Cloud-primary in their project settings once the link is healthy again."
+                );
+            }
+        }
+        outcome
+    }
+
+    /// The Cloud-side half of [`Self::revoke`], split out so the telemetry
+    /// fallback's outcome is still in scope when this fails.
+    async fn revoke_credential(&self) -> Result<(), CloudError> {
         if let Some(error) = self.unreadable_cloud_error() {
             return Err(error);
         }
@@ -916,6 +1112,125 @@ impl CloudLink {
                 .fetch_sub(batch.spans.len(), Ordering::Relaxed);
             if batch.generation == current_generation && self.linked.load(Ordering::Acquire) {
                 spool.push(batch.spans);
+            }
+        }
+    }
+
+    /// Ship one already-durable batch straight to `POST /v1/telemetry`
+    /// (ADR-041 §3).
+    ///
+    /// This is the Cloud-**primary** path and is deliberately *not*
+    /// [`CloudLink::flush`]:
+    ///
+    /// - It never touches the in-memory [`Spool`] or the `pending_submission`
+    ///   field in the encrypted state file. The durable record is the outbox
+    ///   row, which already survives a restart; rewriting the whole state file
+    ///   per batch on top of that would be a second, weaker copy and a
+    ///   per-batch whole-file rewrite of a credential store.
+    /// - It takes the batch as an argument rather than draining a queue, so the
+    ///   caller owns claim/ack and the row is only settled after Cloud has
+    ///   acknowledged it.
+    ///
+    /// Holds the same `flush_lock` as [`CloudLink::flush`] so the mirror path
+    /// and the primary path never have two submissions in flight at once —
+    /// ADR-041 §3b is explicit that sequential drain must be proven sufficient
+    /// before any concurrency is added, because whether `/v1/telemetry`'s
+    /// idempotency and metering tolerate concurrent submissions from one
+    /// instance is an open question on the Cloud side.
+    ///
+    /// Subscribes to telemetry revocations before starting I/O, exactly as
+    /// `flush` does, so switching export off drops the in-flight request rather
+    /// than letting it complete after consent was withdrawn.
+    pub async fn ship_outbox_batch(
+        &self,
+        submission_id: Uuid,
+        spans: Vec<SpanRecord>,
+    ) -> OutboxShipOutcome {
+        if spans.is_empty() {
+            return OutboxShipOutcome::Idle;
+        }
+        let _flush = self.flush_lock.lock().await;
+        let mut telemetry_revocations = self.telemetry_revocations.subscribe();
+
+        if !self.telemetry_enabled.load(Ordering::Acquire) {
+            return OutboxShipOutcome::NotLinked;
+        }
+        let (base_url, token) = match self.linked_credential() {
+            Ok(credential) => credential,
+            Err(error) => {
+                return match error {
+                    CloudError::NotEnrolled => OutboxShipOutcome::NotLinked,
+                    other => OutboxShipOutcome::Blocked {
+                        spans: spans.len(),
+                        reason: other.to_string(),
+                    },
+                }
+            }
+        };
+        let generation = self.generation.load(Ordering::SeqCst);
+        let count = spans.len();
+
+        let backend = match self.parse_backend(&base_url) {
+            Ok(backend) => backend,
+            Err(error) => {
+                return OutboxShipOutcome::Blocked {
+                    spans: count,
+                    reason: error.to_string(),
+                }
+            }
+        };
+        let client = match CloudClient::new(backend) {
+            Ok(client) => client,
+            Err(error) => {
+                return OutboxShipOutcome::Blocked {
+                    spans: count,
+                    reason: error.to_string(),
+                }
+            }
+        };
+
+        let result = tokio::select! {
+            biased;
+            changed = telemetry_revocations.changed() => {
+                let _ = changed;
+                return OutboxShipOutcome::NotLinked;
+            }
+            result = client.ship(&token, submission_id, spans) => result,
+        };
+
+        if !self.telemetry_enabled.load(Ordering::Acquire)
+            || self.generation.load(Ordering::SeqCst) != generation
+        {
+            // Consent was withdrawn, or the link changed origin, while the
+            // request was in flight. The caller must keep the rows rather than
+            // acking them against a link that no longer exists.
+            return OutboxShipOutcome::NotLinked;
+        }
+
+        match result {
+            Ok(ack) => {
+                self.credential_rejected.store(false, Ordering::SeqCst);
+                OutboxShipOutcome::Shipped {
+                    spans: count,
+                    warning: ack.warning,
+                }
+            }
+            Err(error) => {
+                if matches!(error, CloudError::CredentialRejected) {
+                    self.credential_rejected.store(true, Ordering::SeqCst);
+                }
+                let reason = error.to_string();
+                if error.is_retryable() {
+                    OutboxShipOutcome::Retained {
+                        spans: count,
+                        reason,
+                    }
+                } else {
+                    OutboxShipOutcome::Blocked {
+                        spans: count,
+                        reason,
+                    }
+                }
             }
         }
     }

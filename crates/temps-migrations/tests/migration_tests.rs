@@ -33,6 +33,30 @@ fn postgres_ready_wait_for() -> WaitFor {
 /// contention. Matches the budget used by `temps_database::test_utils`.
 const CONTAINER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The migration whose reversibility `test_api_traffic_ai_and_model_catalog_migrations`
+/// exercises.
+const MIGRATION_EXTERNAL_SERVICE_CREATOR: &str = "m20260830_000001_add_external_service_creator";
+
+/// How many `Migrator::down` steps reach `name`, inclusive.
+///
+/// A reversibility test that hardcodes `Some(1)` is only correct until the next
+/// migration is appended, and then it fails by rolling back something unrelated
+/// — which looks like the migration under test is broken. Deriving the count
+/// from the registered list keeps the assertion about the migration it names.
+fn steps_back_to(name: &str) -> u32 {
+    let migrations = Migrator::migrations();
+    let position = migrations
+        .iter()
+        .position(|migration| migration.name() == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "migration `{name}` is not registered in `Migrator`; update this test's constant \
+                 if it was renamed"
+            )
+        });
+    (migrations.len() - position) as u32
+}
+
 async fn env_var_preview_default(db: &DatabaseConnection) -> anyhow::Result<String> {
     let row = db
         .query_one(sea_orm::Statement::from_string(
@@ -2652,9 +2676,16 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
     assert!(schema.try_get::<bool>("", "service_creator_column")?);
     assert!(schema.try_get::<bool>("", "service_creator_fk")?);
 
-    // The creator-ownership migration is the latest migration. Exercise its
-    // reversal and re-application so upgrades retain an emergency rollback.
-    Migrator::down(&db, Some(1)).await?;
+    // Exercise the creator-ownership migration's reversal and re-application so
+    // upgrades retain an emergency rollback.
+    //
+    // How far down to go is *derived* rather than hardcoded to 1. It used to
+    // assume this was the newest migration, which silently stopped being true
+    // the moment anything was appended after it — and then failed by rolling
+    // back an unrelated migration and asserting about a column that migration
+    // never touched, which reads as "the creator migration is broken".
+    let steps = steps_back_to(MIGRATION_EXTERNAL_SERVICE_CREATOR);
+    Migrator::down(&db, Some(steps)).await?;
     let creator_column_after_down = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -2667,7 +2698,7 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
         .expect("creator column rollback query");
     assert!(!creator_column_after_down.try_get::<bool>("", "present")?);
 
-    Migrator::up(&db, Some(1)).await?;
+    Migrator::up(&db, Some(steps)).await?;
     let creator_column_after_reapply = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,

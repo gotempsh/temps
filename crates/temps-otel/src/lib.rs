@@ -128,4 +128,21 @@ pub struct OtelAppState {
     /// backfill running" is worse than one that always can.
     pub cloud_backfill_progress:
         std::sync::Arc<crate::services::cloud_backfill_progress::CloudBackfillProgressService>,
+    /// Per-project telemetry write mode, its §1 gate and its interval ledger
+    /// (ADR-041).
+    ///
+    /// Required rather than optional, for the same reason
+    /// `cloud_backfill_progress` is: the write-mode control renders in every
+    /// project's settings, including on an instance that has never linked Cloud
+    /// — where it must onboard rather than disappear. An endpoint that
+    /// sometimes cannot answer "where do this project's spans go" would make
+    /// that impossible.
+    pub telemetry_write_modes: std::sync::Arc<crate::services::TelemetryWriteModeService>,
+    /// The Cloud link, read only for the §1 gate's prerequisites (linked,
+    /// telemetry switch on, credential accepted) and for rendering them.
+    ///
+    /// `None` on a build that wires no Cloud integration at all, which resolves
+    /// to "not linked" — the safe answer, and the one that produces an
+    /// onboarding state rather than an error.
+    pub cloud_link: Option<std::sync::Arc<temps_cloud_client::CloudLink>>,
 }

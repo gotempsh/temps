@@ -32,6 +32,10 @@ oif = "oif"
 Oif = "Oif"
 # Expected last four characters of "properly" in a masking regression test.
 erly = "erly"
+# The "mis-" prefix in "mis-routes"/"mis-routing" (ADR-041's ledger docs),
+# hyphenated for readability. typos tokenizes on the hyphen and mistakes the
+# fragment "mis" for "miss"/"mist".
+mis = "mis"
 
 [default.extend-identifiers]
 # W3C traceparent spec example span-id used in test fixtures

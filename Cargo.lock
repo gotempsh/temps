@@ -10991,6 +10991,7 @@ dependencies = [
 name = "temps-cloud-client"
 version = "0.1.0-beta.56"
 dependencies = [
+ "async-trait",
  "axum",
  "base64 0.23.1",
  "chrono",
@@ -10998,12 +10999,14 @@ dependencies = [
  "futures",
  "hmac 0.13.0",
  "reqwest 0.12.28",
+ "sea-orm",
  "serde",
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "temps-cloud-protocol",
  "temps-core",
+ "temps-entities",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

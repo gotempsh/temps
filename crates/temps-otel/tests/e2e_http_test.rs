@@ -322,6 +322,13 @@ async fn setup_e2e_as_full(
         cloud_backfill_progress: Arc::new(temps_otel::services::CloudBackfillProgressService::new(
             db.clone(),
         )),
+        // ADR-041: no Cloud link in these tests, so every project resolves to
+        // `local` and the span-read path is the local store — which is exactly
+        // the deployment shape these tests are asserting.
+        telemetry_write_modes: Arc::new(temps_otel::services::TelemetryWriteModeService::new(
+            db.clone(),
+        )),
+        cloud_link: None,
     };
 
     // Create auth middleware that injects AuthContext into request extensions.

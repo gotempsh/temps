@@ -270,6 +270,48 @@ impl AuditOperation for FacetBackfillRetriedAudit {
     }
 }
 
+// ── Cloud telemetry write-mode audit events (ADR-041 §1) ────────────
+
+/// Audit event for changing where a project's spans are written.
+///
+/// Both the previous and the new value of *both* settings are recorded, not
+/// just what changed. This is the one setting whose effect is "this project's
+/// spans stop being stored on this machine", and reconstructing that from a
+/// diff of two audit rows written minutes apart is exactly the reconstruction
+/// an operator should not have to do after an incident.
+#[derive(Debug, Clone, Serialize)]
+pub struct CloudTelemetryWriteModeChangedAudit {
+    pub context: AuditContext,
+    pub project_id: i32,
+    pub previous_write_mode: String,
+    pub write_mode: String,
+    pub previous_fidelity: String,
+    pub fidelity: String,
+}
+
+impl AuditOperation for CloudTelemetryWriteModeChangedAudit {
+    fn operation_type(&self) -> String {
+        "OTEL_CLOUD_TELEMETRY_WRITE_MODE_CHANGED".to_string()
+    }
+
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+
+    fn serialize(&self) -> Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation: {}", e))
+    }
+}
+
 // ── Metric alert rule audit events ──────────────────────────────────
 
 /// Audit event for creating a metric alert rule.

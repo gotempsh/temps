@@ -25,14 +25,23 @@
 
 pub mod flusher;
 pub mod link;
+pub mod outbox;
+pub mod outbox_worker;
 pub mod query;
 pub mod spool;
 pub mod state;
 pub mod status;
 
-pub use link::{CloudLink, FlushOutcome};
+pub use link::{
+    CloudFallbackReason, CloudLink, CloudTelemetryFallback, FlushOutcome, OutboxShipOutcome,
+};
+pub use outbox::{
+    ClaimedSpan, DeadLetterSummary, EnqueueOutcome, OutboxStats, SpanOutbox, SpanOutboxError,
+    DEAD_LETTER_PAYLOAD_RETENTION, OUTBOX_BATCH_SIZE, OUTBOX_MAX_ATTEMPTS,
+};
+pub use outbox_worker::{DrainObserver, DrainOutcome, OutboxCapSource};
 pub use state::EnrollmentState;
-pub use status::{LinkStatus, MirrorHealth};
+pub use status::{LinkStatus, MirrorHealth, TelemetryDurability};
 
 /// Operator-controlled export gates. Linking an account never enables data
 /// export; persisted settings must be applied explicitly after startup.

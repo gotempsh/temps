@@ -221,6 +221,50 @@ pub struct CloudSettings {
     pub backups_enabled: bool,
     /// Explicit consent to send notifications through managed providers.
     pub notifications_enabled: bool,
+
+    /// ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
+    /// backs Cloud-primary telemetry writes.
+    ///
+    /// An operator setting on the singleton `settings` row rather than an
+    /// environment variable, per CLAUDE.md, so it can be raised at runtime by
+    /// the operator watching a queue fill up — which is exactly when they need
+    /// to change it and exactly when restarting the binary is the worst
+    /// available option.
+    ///
+    /// Expressed in **bytes and not rows**: the reference deployment is
+    /// 3 vCPU / 4 GB, and a row count says nothing about disk on a table whose
+    /// rows are serialized spans of wildly varying size. When the queue reaches
+    /// this size the instance stops accepting new spans for Cloud-primary
+    /// projects and records a gap window with a start, an end and a count —
+    /// see [`DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES`] for how the default is
+    /// sized and what it buys.
+    #[serde(default = "default_cloud_telemetry_outbox_max_bytes")]
+    #[schema(minimum = 1048576, example = 536870912)]
+    pub telemetry_outbox_max_bytes: u64,
+}
+
+/// Default durable-outbox ceiling: 512 MiB.
+///
+/// Sized so that a completely full queue is a small fraction of the reference
+/// deployment's disk and cannot fill it, while still buying a long outage. At
+/// the `Queryable` projection's typical few-hundred bytes per span, 512 MiB is
+/// on the order of a million spans — roughly a day at 12 spans/second, or about
+/// eight hours at the 35 spans/second the Phase B1 load test sustains.
+///
+/// Deliberately generous rather than minimal: the cost of an over-large cap is
+/// disk an operator can see and change, and the cost of an under-sized one is
+/// telemetry that no longer exists.
+pub const DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Smallest accepted ceiling: 1 MiB.
+///
+/// A cap below one batch's worth of spans would make the queue drop
+/// continuously while reporting itself as merely "full", so the settings write
+/// path refuses it rather than accepting a value that cannot work.
+pub const MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES: u64 = 1024 * 1024;
+
+fn default_cloud_telemetry_outbox_max_bytes() -> u64 {
+    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES
 }
 
 impl Default for CloudSettings {
@@ -230,7 +274,23 @@ impl Default for CloudSettings {
             telemetry_enabled: false,
             backups_enabled: false,
             notifications_enabled: false,
+            telemetry_outbox_max_bytes: DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
         }
+    }
+}
+
+impl CloudSettings {
+    /// The effective outbox ceiling, clamped to something that can actually
+    /// work.
+    ///
+    /// A settings row written by an older build has no value at all (serde
+    /// supplies the default); a row written by hand could carry `0`, which
+    /// would mean "drop every span and record a permanent gap". Both resolve to
+    /// a usable number here rather than at each of the several call sites that
+    /// would otherwise have to remember.
+    pub fn effective_outbox_max_bytes(&self) -> u64 {
+        self.telemetry_outbox_max_bytes
+            .max(MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES)
     }
 }
 

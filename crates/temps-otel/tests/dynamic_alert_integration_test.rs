@@ -706,6 +706,13 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         cloud_backfill_progress: Arc::new(temps_otel::services::CloudBackfillProgressService::new(
             ctx.db.clone(),
         )),
+        // ADR-041: no Cloud link here, so every project resolves to `local` and
+        // span reads go to the local store — the deployment shape this test is
+        // asserting.
+        telemetry_write_modes: Arc::new(temps_otel::services::TelemetryWriteModeService::new(
+            ctx.db.clone(),
+        )),
+        cloud_link: None,
     };
 
     let attacker_auth = AuthContext::new_session(attacker_user, Role::Admin);

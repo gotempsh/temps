@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+import { CloudTelemetryWriteStatusCard } from '@/components/observe/CloudTelemetryWriteStatusCard'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -585,6 +586,12 @@ export function OtelPipelineStatusPage() {
           every {sampleIntervalSeconds}&nbsp;s and can trigger alarms.
         </p>
       </div>
+
+      {/* Where spans are written, and whether the local span store is still
+          needed. Sits above the throughput charts because "these spans are not
+          stored on this instance at all" changes how every number below is
+          read. */}
+      <CloudTelemetryWriteStatusCard />
 
       {/* Trend over time — the cumulative counters below can't distinguish a
           past incident that recovered from an ongoing bleed. */}

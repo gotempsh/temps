@@ -15,9 +15,14 @@ import {
   error as errorOutput,
 } from '../../ui/output.js'
 import { startSpinner, succeedSpinner, failSpinner, updateSpinner, withSpinner } from '../../ui/spinner.js'
+import { promptConfirm } from '../../ui/prompts.js'
 import { getCloudUrl, cloudFetch, isCloudAuthenticated } from '../../lib/cloud-client.js'
 import { registerCloudVpsCommands } from './vps.js'
 import { registerCloudBillingCommands } from './billing.js'
+import {
+  registerCloudTelemetryCommands,
+  type CloudTelemetryWriteStatus,
+} from './telemetry.js'
 import { requireAuth } from '../../config/store.js'
 import { client, getErrorMessage, setupClient } from '../../lib/api-client.js'
 import {
@@ -270,14 +275,72 @@ async function connectInstance(options: { code: string }): Promise<void> {
   if (result) info(`Connected. ${result.status_message}`)
 }
 
-async function disconnectCurrentInstance(): Promise<void> {
+async function disconnectCurrentInstance(options: {
+  force?: boolean
+  yes?: boolean
+}): Promise<void> {
   await requireAuth()
   await setupClient()
+
+  // ADR-041 §7c: a disconnect has two separate consequences, and an operator
+  // who is told only one of them will be surprised by the other. Both are
+  // stated before anything is revoked.
+  const telemetry = await cloudTelemetryWriteSummary()
+  if (!options.force && !options.yes) {
+    const consequences = [
+      'Disconnect this instance from Temps Cloud?',
+      telemetry.cloudPrimaryProjects > 0
+        ? `  • ${telemetry.cloudPrimaryProjects} project(s) currently write their spans to Cloud. ` +
+          'They will go back to being stored on this instance, and anything still ' +
+          'queued will be written here rather than dropped.'
+        : null,
+      '  • Telemetry already in Temps Cloud stays there, but this instance can no ' +
+        'longer read it. That window becomes unreadable from here.',
+    ]
+      .filter((line): line is string => line !== null)
+      .join('\n')
+
+    const confirmed = await promptConfirm({
+      message: consequences,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Still connected. No change made.')
+      return
+    }
+  }
+
   await withSpinner('Disconnecting this instance...', async () => {
     const { error } = await disconnectInstance({ client })
     if (error) throw new Error(getErrorMessage(error))
   })
   info('Instance disconnected from Temps Cloud')
+  if (telemetry.cloudPrimaryProjects > 0) {
+    info(
+      'Cloud-primary projects were returned to local span storage. Check ' +
+        '"temps cloud telemetry status" to confirm nothing is still queued.',
+    )
+  }
+}
+
+/**
+ * How many projects a disconnect would move back to local storage.
+ *
+ * Best-effort: an instance that cannot answer must still be disconnectable, so
+ * a failure here degrades to "we don't know" and the generic half of the
+ * warning is shown on its own.
+ */
+async function cloudTelemetryWriteSummary(): Promise<{
+  cloudPrimaryProjects: number
+}> {
+  try {
+    const { data } = await client.get<CloudTelemetryWriteStatus>({
+      url: 'otel/cloud-telemetry/status',
+    })
+    return { cloudPrimaryProjects: data?.cloud_primary_projects ?? 0 }
+  } catch {
+    return { cloudPrimaryProjects: 0 }
+  }
 }
 
 export function registerCloudCommands(program: Command): void {
@@ -315,8 +378,11 @@ export function registerCloudCommands(program: Command): void {
   cloud
     .command('disconnect')
     .description('Disconnect this self-hosted instance from Temps Cloud')
+    .option('-f, --force', 'Skip confirmation')
+    .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
     .action(disconnectCurrentInstance)
 
   registerCloudVpsCommands(cloud)
   registerCloudBillingCommands(cloud)
+  registerCloudTelemetryCommands(cloud)
 }

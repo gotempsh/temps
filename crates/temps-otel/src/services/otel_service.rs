@@ -57,6 +57,17 @@ pub struct OtelService {
     /// more, which is why this is an `Option` with a `Metered` fallback rather
     /// than a required dependency that would fail startup.
     cloud_policy_cache: Option<Arc<CloudPolicyCache>>,
+    /// ADR-041 §3: the durable queue Cloud-primary spans are written to instead
+    /// of local storage.
+    ///
+    /// `None` means no project can be Cloud-primary on this instance, however
+    /// its rows are configured — the partition in [`Self::ingest_spans`]
+    /// requires one, so an unwired outbox degrades to today's local-first
+    /// behaviour rather than to dropping spans.
+    span_outbox: Option<Arc<temps_cloud_client::SpanOutbox>>,
+    /// ADR-041 §7b: consulted per batch so a quota event resumes local writes
+    /// immediately rather than up to one policy TTL later.
+    write_mode_service: Option<Arc<crate::services::TelemetryWriteModeService>>,
     stats: PipelineStatsAtomic,
 }
 
@@ -298,6 +309,8 @@ impl OtelService {
             ingest_permit_limit: max_concurrent_ingest_requests,
             cloud_link: None,
             cloud_policy_cache: None,
+            span_outbox: None,
+            write_mode_service: None,
             stats: PipelineStatsAtomic::default(),
         }
     }
@@ -325,6 +338,35 @@ impl OtelService {
     /// unchanged behaviour for up to one TTL.
     pub fn cloud_policy_cache(&self) -> Option<&Arc<CloudPolicyCache>> {
         self.cloud_policy_cache.as_ref()
+    }
+
+    /// Attach the durable outbox that backs Cloud-primary span writes
+    /// (ADR-041 §3).
+    ///
+    /// Without it no project can be Cloud-primary regardless of what its row
+    /// says, because the partition in [`Self::ingest_spans`] requires an outbox
+    /// to enqueue into. That is the correct degradation: a deployment that has
+    /// not wired the queue keeps storing spans locally rather than discovering
+    /// at runtime that it has nowhere to put them.
+    pub fn with_span_outbox(mut self, outbox: Arc<temps_cloud_client::SpanOutbox>) -> Self {
+        self.span_outbox = Some(outbox);
+        self
+    }
+
+    /// Attach the write-mode service, whose suspension flag the ingest path
+    /// consults per batch (ADR-041 §7b).
+    pub fn with_write_mode_service(
+        mut self,
+        service: Arc<crate::services::TelemetryWriteModeService>,
+    ) -> Self {
+        self.write_mode_service = Some(service);
+        self
+    }
+
+    /// The durable outbox, when one is wired. Exposed for the status surfaces
+    /// and the disconnect drain.
+    pub fn span_outbox(&self) -> Option<&Arc<temps_cloud_client::SpanOutbox>> {
+        self.span_outbox.as_ref()
     }
 
     /// Acquire an ingest slot without queueing more work in memory.
@@ -518,6 +560,27 @@ impl OtelService {
     ///
     /// Sampling is the client SDK's responsibility (head-based).
     /// The server stores everything it receives.
+    ///
+    /// # ADR-041 §2: the batch is partitioned by write mode
+    ///
+    /// - Spans whose project is `Local` → `store_spans` exactly as before, then
+    ///   `link.record(..)` after the local write succeeds. Ordering unchanged,
+    ///   retry behaviour unchanged, `Metered` projection byte identical.
+    /// - Spans whose project is Cloud-primary → enqueued to the durable outbox.
+    ///   **No local span write happens for these.** That is the entire point of
+    ///   the ADR.
+    ///
+    /// A batch that mixes projects is normal and is not a special case.
+    ///
+    /// **Ingestion never blocks on Cloud.** The enqueue is a local durable
+    /// write; the shipping is a background worker. A Cloud outage cannot add
+    /// latency to an OTLP request, cannot consume an ingest permit, and cannot
+    /// produce a 5xx to the customer's exporter.
+    ///
+    /// **What a 2xx means changes for Cloud-primary projects**, and this is
+    /// documented rather than discovered: it means "committed to this
+    /// instance's durable telemetry outbox", not "committed to local storage".
+    /// Strictly weaker than before, strictly stronger than fire-and-forget.
     pub async fn ingest_spans(&self, spans: Vec<SpanRecord>) -> Result<u64, OtelError> {
         let count = spans.len() as u64;
         self.stats
@@ -528,25 +591,153 @@ impl OtelService {
             return Ok(0);
         }
 
-        let mirror = match self.cloud_link.as_ref() {
-            Some(link) if link.is_linked() && link.telemetry_enabled() => {
-                // One lookup per *distinct* project in the batch, served from a
-                // TTL cache — never one per span. Unresolved projects fall back
-                // to `Metered`, so a lookup problem can only narrow egress.
-                let policies = self.resolve_cloud_policies(&spans).await;
-                let metered = CloudTelemetryPolicy::metered();
-                Some(
-                    spans
-                        .iter()
-                        .filter_map(|span| {
-                            let policy = policies.get(&span.project_id).unwrap_or(&metered);
-                            cloud_span(link, span, policy)
-                        })
-                        .collect::<Vec<_>>(),
-                )
-            }
-            _ => None,
+        // ── Deployment shape A: no Cloud link ─────────────────────────────
+        //
+        // Nothing below this line runs for the ~default install. No policy
+        // lookup, no partition, no outbox, no new query on the ingest path —
+        // the same two statements this method has always executed.
+        let Some(link) = self.cloud_link.as_ref() else {
+            return self.store_spans_locally(spans, None).await;
         };
+        if !link.is_linked() || !link.telemetry_enabled() {
+            return self.store_spans_locally(spans, None).await;
+        }
+
+        // One lookup per *distinct* project in the batch, served from a TTL
+        // cache — never one per span. Unresolved projects fall back to
+        // `Metered` + `Local`, so a lookup problem can only narrow egress and
+        // can only ever store *more*.
+        let policies = self.resolve_cloud_policies(&spans).await;
+        let metered = CloudTelemetryPolicy::metered();
+
+        // Cloud-primary writes are suspended process-wide while Cloud is
+        // refusing for a reason only the operator can fix (ADR-041 §7b). One
+        // relaxed atomic load, evaluated per batch rather than cached with the
+        // policy, so a quota event resumes local writes on the very next batch
+        // instead of up to one TTL later.
+        let cloud_writes_available = self
+            .write_mode_service
+            .as_ref()
+            .is_none_or(|service| !service.suspension().is_suspended())
+            && self.span_outbox.is_some();
+
+        let mut local_spans: Vec<SpanRecord> = Vec::with_capacity(spans.len());
+        let mut cloud_by_project: std::collections::HashMap<
+            i32,
+            Vec<temps_cloud_protocol::SpanRecord>,
+        > = std::collections::HashMap::new();
+
+        for span in &spans {
+            let policy = policies.get(&span.project_id).unwrap_or(&metered);
+            let cloud_primary = cloud_writes_available && policy.is_cloud_primary();
+            if !cloud_primary {
+                local_spans.push(span.clone());
+                continue;
+            }
+            match cloud_span(link, span, policy) {
+                Some(projected) => cloud_by_project
+                    .entry(span.project_id)
+                    .or_default()
+                    .push(projected),
+                None => {
+                    // The projection refused — telemetry export was switched
+                    // off between the policy read and here, or the link lost
+                    // its credential. A Cloud-primary span with nowhere to go
+                    // is stored locally rather than dropped: there is never a
+                    // state in which the instance stores spans nowhere.
+                    local_spans.push(span.clone());
+                }
+            }
+        }
+
+        // The mirror projection for `Local` projects, unchanged from before.
+        let mirror: Vec<temps_cloud_protocol::SpanRecord> = local_spans
+            .iter()
+            .filter_map(|span| {
+                let policy = policies.get(&span.project_id).unwrap_or(&metered);
+                cloud_span(link, span, policy)
+            })
+            .collect();
+
+        // Enqueue first, so a Cloud-primary project's spans are durable before
+        // the request is acknowledged. This is a local Postgres write and does
+        // not touch the network.
+        let mut queued = 0u64;
+        if !cloud_by_project.is_empty() {
+            let Some(outbox) = self.span_outbox.as_ref() else {
+                // Unreachable: `cloud_writes_available` already required one.
+                // Kept as a branch rather than an `expect` because losing a
+                // customer's spans to a panic on the ingest path is the worst
+                // possible way to be wrong about that.
+                return self.store_spans_locally(spans, Some((link, mirror))).await;
+            };
+            for (project_id, projected) in &cloud_by_project {
+                match outbox.enqueue(*project_id, projected).await {
+                    Ok(outcome) => {
+                        queued += outcome.accepted as u64;
+                        if outcome.refused_any() {
+                            // Refused at the byte cap. Already recorded as a
+                            // gap window with a start and an end; counted here
+                            // so the pipeline's dropped total stays honest.
+                            self.stats
+                                .spans_dropped
+                                .fetch_add(outcome.refused as u64, Ordering::Relaxed);
+                            warn!(
+                                project_id,
+                                refused = outcome.refused,
+                                refused_bytes = outcome.refused_bytes,
+                                "Telemetry outbox is at its byte cap; these spans were not \
+                                 captured and are recorded as a gap window"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let error: OtelError = error.into();
+                        self.stats.spans_dropped.fetch_add(count, Ordering::Relaxed);
+                        self.stats.ingest_errors.fetch_add(1, Ordering::Relaxed);
+                        error!(
+                            project_id,
+                            spans = projected.len(),
+                            error = %error,
+                            "Failed to enqueue Cloud-primary spans; answering the exporter with \
+                             an error so its retry can still save them"
+                        );
+                        self.record_ingest_failure("spans", &error).await;
+                        return Err(error);
+                    }
+                }
+            }
+        }
+
+        if local_spans.is_empty() {
+            // Every project in this batch is Cloud-primary. No local span write
+            // at all — the property the whole ADR exists to deliver.
+            self.stats.spans_stored.fetch_add(queued, Ordering::Relaxed);
+            return Ok(queued);
+        }
+
+        let stored = self
+            .store_spans_locally(local_spans, Some((link, mirror)))
+            .await?;
+        Ok(stored + queued)
+    }
+
+    /// The pre-ADR-041 write path, unchanged: store locally with a bounded
+    /// retry, then offer the mirror projection once the local write succeeded.
+    ///
+    /// Extracted verbatim so deployment shape A (no Cloud link) executes
+    /// exactly the same statements in exactly the same order as before, and so
+    /// that fact is checkable by reading one function rather than diffing a
+    /// branch.
+    async fn store_spans_locally(
+        &self,
+        spans: Vec<SpanRecord>,
+        mirror: Option<(
+            &Arc<temps_cloud_client::CloudLink>,
+            Vec<temps_cloud_protocol::SpanRecord>,
+        )>,
+    ) -> Result<u64, OtelError> {
+        let count = spans.len() as u64;
 
         // Retry on transient storage failures — see `store_with_retry`. Two
         // failed ClickHouse writes used to mean 1,024 permanently lost spans
@@ -560,7 +751,7 @@ impl OtelService {
         match result {
             Ok(stored) => {
                 self.stats.spans_stored.fetch_add(stored, Ordering::Relaxed);
-                if let (Some(link), Some(mirror)) = (&self.cloud_link, mirror) {
+                if let Some((link, mirror)) = mirror {
                     link.record(mirror);
                 }
                 Ok(stored)

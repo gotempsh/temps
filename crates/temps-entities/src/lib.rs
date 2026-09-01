@@ -34,8 +34,10 @@ pub mod challenge_sessions;
 pub mod cli_login_sessions;
 pub mod cloud_backup_mirror_cursors;
 pub mod cloud_backup_mirror_states;
+pub mod cloud_span_outbox;
 pub mod cloud_telemetry_backfills;
 pub mod cloud_telemetry_fidelity;
+pub mod cloud_telemetry_write_mode;
 pub mod cron_executions;
 pub mod crons;
 pub mod custom_routes;
@@ -92,6 +94,7 @@ pub mod postgres_major_upgrades;
 pub mod preset;
 pub mod project_custom_domains;
 pub mod project_services;
+pub mod project_telemetry_write_intervals;
 pub mod projects;
 pub mod proxy_logs;
 pub mod renewal_attempts;
@@ -133,6 +136,7 @@ pub mod session_replay_events;
 pub mod session_replay_ingest_batches;
 pub mod session_replay_sessions;
 pub mod settings;
+pub mod telemetry_gap_windows;
 pub mod visitor;
 
 // Error tracking entities

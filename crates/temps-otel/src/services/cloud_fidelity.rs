@@ -19,14 +19,26 @@
 //! resolves one entry per *distinct project in the batch* and reuses it for
 //! [`CLOUD_POLICY_CACHE_TTL`].
 //!
-//! # Why every failure resolves to `Metered`
+//! # Why every failure resolves to `Metered` *and* `Local`
 //!
 //! A missing project row, a database error, or an unwired cache all yield
-//! [`CloudTelemetryPolicy::metered`]. Failing towards *less* egress is the only
-//! safe direction: the worst case is that a project which opted in keeps
-//! mirroring the pre-ADR-040 projection for up to one TTL, which is a
-//! recoverable gap. The opposite failure — shipping real span names because a
-//! lookup errored — cannot be undone once the bytes have left.
+//! [`CloudTelemetryPolicy::metered`], which is `Metered` fidelity **and**
+//! `Local` writes (ADR-041 §1). Both halves fail in the safe direction, and
+//! they are different directions:
+//!
+//! - Failing to `Metered` means *less egress*. The worst case is that a project
+//!   which opted in keeps mirroring the pre-ADR-040 projection for up to one
+//!   TTL, which is a recoverable gap. The opposite failure — shipping real span
+//!   names because a lookup errored — cannot be undone once the bytes have
+//!   left.
+//! - Failing to `Local` means *more storage*. The worst case is that a
+//!   Cloud-primary project writes some spans locally that it did not need to,
+//!   which costs disk. The opposite failure — treating an unresolvable project
+//!   as Cloud-primary — would silently stop storing its spans anywhere on this
+//!   instance, and that is unrecoverable once the window has passed.
+//!
+//! An unresolvable project therefore always ends up in the state that stores
+//! more and sends less, never the reverse.
 //!
 //! # Why one caller does *not* get that collapse
 //!
@@ -43,6 +55,7 @@ use std::time::{Duration, Instant};
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter, QuerySelect};
 use temps_core::DBDateTime;
 use temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity;
+use temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 use temps_entities::projects;
 use tracing::warn;
 
@@ -90,6 +103,17 @@ pub struct CloudTelemetryPolicy {
     /// `Arc` so a cache hit clones a pointer rather than the key set on the
     /// ingest path.
     pub attribute_allowlist: Arc<BTreeSet<String>>,
+    /// ADR-041 §1: whether this project's spans are written to local storage at
+    /// all.
+    ///
+    /// Carried on the same lookup, behind the same TTL, and with the **same
+    /// fail-safe direction** as `fidelity`: a project that cannot be resolved
+    /// is [`CloudTelemetryWriteMode::Local`], so a lookup failure can only ever
+    /// be safer. The opposite default would mean a database blip silently
+    /// stopped storing a project's spans, which is unrecoverable once the
+    /// window has passed — whereas failing to `Local` merely writes spans to a
+    /// store that already exists.
+    pub write_mode: CloudTelemetryWriteMode,
 }
 
 impl Default for CloudTelemetryPolicy {
@@ -99,11 +123,13 @@ impl Default for CloudTelemetryPolicy {
 }
 
 impl CloudTelemetryPolicy {
-    /// The default and the fallback: today's pre-ADR-040 projection.
+    /// The default and the fallback: today's pre-ADR-040 projection, written to
+    /// local storage exactly as it always was.
     pub fn metered() -> Self {
         Self {
             fidelity: CloudTelemetryFidelity::Metered,
             attribute_allowlist: Arc::new(BTreeSet::new()),
+            write_mode: CloudTelemetryWriteMode::Local,
         }
     }
 
@@ -115,7 +141,32 @@ impl CloudTelemetryPolicy {
         Self {
             fidelity: CloudTelemetryFidelity::Queryable,
             attribute_allowlist: Arc::new(allowlist.into_iter().collect()),
+            write_mode: CloudTelemetryWriteMode::Local,
         }
+    }
+
+    /// The same policy with Cloud-primary writes.
+    ///
+    /// Only meaningful at `Queryable` fidelity — the §1 gate makes the
+    /// `Metered` combination unreachable through every write path — so this is
+    /// a builder on top of [`Self::queryable`] rather than a free constructor
+    /// that could produce the forbidden pair.
+    pub fn cloud_primary(mut self) -> Self {
+        self.write_mode = CloudTelemetryWriteMode::Cloud;
+        self
+    }
+
+    /// Whether spans for this project skip local storage entirely.
+    ///
+    /// Defence in depth against the one state that must be unreachable: even if
+    /// a row somehow carried `cloud` at `metered` fidelity — a hand-written
+    /// `UPDATE` against a database whose CHECK constraint was dropped, a
+    /// restored dump from a build that predates the constraint — the ingest
+    /// path treats it as `Local` and stores the spans, rather than discarding
+    /// them locally and shipping unreadable placeholders. Failing towards *more
+    /// storage* is the only safe direction here.
+    pub fn is_cloud_primary(&self) -> bool {
+        self.write_mode.is_cloud_primary() && self.fidelity.is_queryable()
     }
 
     /// Whether `key` may be mirrored.
@@ -136,6 +187,7 @@ impl CloudTelemetryPolicy {
                     .cloned()
                     .collect(),
             ),
+            write_mode: row.cloud_telemetry_write_mode,
         }
     }
 }
@@ -147,6 +199,7 @@ struct ProjectPolicyRow {
     id: i32,
     cloud_telemetry_fidelity: CloudTelemetryFidelity,
     cloud_telemetry_attribute_allowlist: Vec<String>,
+    cloud_telemetry_write_mode: CloudTelemetryWriteMode,
     /// Read, but only acted on by [`CloudPolicyCache::resolve_project`]: a
     /// soft-deleted project is "gone" to an operator naming it on a command
     /// line, while the ingest path has no reason to care — spans still arriving
@@ -287,6 +340,7 @@ impl CloudPolicyCache {
             .column(projects::Column::Id)
             .column(projects::Column::CloudTelemetryFidelity)
             .column(projects::Column::CloudTelemetryAttributeAllowlist)
+            .column(projects::Column::CloudTelemetryWriteMode)
             .column(projects::Column::DeletedAt)
             .filter(projects::Column::Id.is_in(project_ids.iter().copied()))
             .into_model::<ProjectPolicyRow>()
@@ -351,6 +405,15 @@ mod tests {
         fidelity: CloudTelemetryFidelity,
         allowlist: &[&str],
     ) -> BTreeMap<String, Value> {
+        row_with_mode(id, fidelity, allowlist, CloudTelemetryWriteMode::Local)
+    }
+
+    fn row_with_mode(
+        id: i32,
+        fidelity: CloudTelemetryFidelity,
+        allowlist: &[&str],
+        write_mode: CloudTelemetryWriteMode,
+    ) -> BTreeMap<String, Value> {
         let mut row = BTreeMap::new();
         row.insert("id".to_string(), Value::Int(Some(id)));
         row.insert(
@@ -368,6 +431,10 @@ mod tests {
                         .collect(),
                 )),
             ),
+        );
+        row.insert(
+            "cloud_telemetry_write_mode".to_string(),
+            Value::String(Some(Box::new(write_mode.to_string()))),
         );
         row.insert("deleted_at".to_string(), Value::ChronoDateTimeUtc(None));
         row
@@ -403,10 +470,99 @@ mod tests {
     }
 
     #[test]
-    fn the_default_policy_is_metered_with_no_attributes() {
+    fn the_default_policy_is_metered_with_no_attributes_and_local_writes() {
         let policy = CloudTelemetryPolicy::default();
         assert_eq!(policy.fidelity, CloudTelemetryFidelity::Metered);
         assert!(policy.attribute_allowlist.is_empty());
+        assert_eq!(policy.write_mode, CloudTelemetryWriteMode::Local);
+        assert!(!policy.is_cloud_primary());
+    }
+
+    // ── ADR-041 §1: the write mode fails safe in its own direction ───────
+
+    #[tokio::test]
+    async fn a_cloud_primary_project_resolves_with_its_write_mode() {
+        let cache = cache_with(vec![vec![row_with_mode(
+            7,
+            CloudTelemetryFidelity::Queryable,
+            &["http.route"],
+            CloudTelemetryWriteMode::Cloud,
+        )]]);
+
+        let policy = cache.policy_for(7).await;
+        assert_eq!(policy.write_mode, CloudTelemetryWriteMode::Cloud);
+        assert!(policy.is_cloud_primary());
+    }
+
+    #[tokio::test]
+    async fn an_unresolvable_project_writes_locally_rather_than_nowhere() {
+        // The fail-safe direction that matters most. Reading this as
+        // Cloud-primary would mean a database blip silently stopped storing a
+        // project's spans anywhere on this instance.
+        let cache = cache_with(vec![vec![]]);
+        assert!(!cache.policy_for(404).await.is_cloud_primary());
+
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_errors(vec![DbErr::Custom("connection reset".into())])
+            .into_connection();
+        let cache = CloudPolicyCache::new(Arc::new(db));
+        let policy = cache.policy_for(7).await;
+        assert_eq!(
+            policy.write_mode,
+            CloudTelemetryWriteMode::Local,
+            "a failed lookup must never stop a project's spans being stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_primary_at_metered_fidelity_is_treated_as_local() {
+        // Structurally unreachable through every write path — the service gate
+        // and a database CHECK both forbid it. This asserts the third line of
+        // defence: if a row somehow carries the pair anyway (a restored dump
+        // from a build predating the constraint, a manual UPDATE), the ingest
+        // path stores the spans rather than discarding them locally and
+        // shipping unreadable placeholders.
+        let cache = cache_with(vec![vec![row_with_mode(
+            7,
+            CloudTelemetryFidelity::Metered,
+            &[],
+            CloudTelemetryWriteMode::Cloud,
+        )]]);
+
+        let policy = cache.policy_for(7).await;
+        assert_eq!(policy.write_mode, CloudTelemetryWriteMode::Cloud);
+        assert!(
+            !policy.is_cloud_primary(),
+            "a metered project must never bypass local storage"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_write_mode_shares_the_fidelity_ttl_and_invalidation() {
+        // One lookup carries both, so an operator flipping the write mode sees
+        // it take effect on the same terms as a fidelity change — no restart,
+        // no second cache to reason about.
+        let cache = cache_with(vec![
+            vec![row_with_mode(
+                7,
+                CloudTelemetryFidelity::Queryable,
+                &[],
+                CloudTelemetryWriteMode::Cloud,
+            )],
+            vec![row_with_mode(
+                7,
+                CloudTelemetryFidelity::Queryable,
+                &[],
+                CloudTelemetryWriteMode::Local,
+            )],
+        ]);
+
+        assert!(cache.policy_for(7).await.is_cloud_primary());
+        cache.invalidate(7);
+        assert!(
+            !cache.policy_for(7).await.is_cloud_primary(),
+            "reverting to local must take effect without a restart"
+        );
     }
 
     #[test]

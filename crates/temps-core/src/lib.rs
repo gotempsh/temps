@@ -112,7 +112,8 @@ pub use app_settings::{
     MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
-    TenantResourceCeilings,
+    TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+    MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
 };
 pub use async_trait;
 pub use chrono;

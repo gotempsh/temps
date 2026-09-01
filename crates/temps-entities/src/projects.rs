@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
 use super::cloud_telemetry_fidelity::CloudTelemetryFidelity;
+use super::cloud_telemetry_write_mode::CloudTelemetryWriteMode;
 use super::deployment_config::DeploymentConfig;
 use super::preset::{Preset, PresetConfig};
 use super::source_type::SourceType;
@@ -170,6 +171,20 @@ pub struct Model {
     /// quietly widen egress later.
     #[sea_orm(default_value = "{}")]
     pub cloud_telemetry_attribute_allowlist: Vec<String>,
+    /// ADR-041 §1: whether this project's spans are stored on this instance at
+    /// all, or written straight to Temps Cloud through the durable outbox.
+    ///
+    /// `local` (the default for every existing and new project) is exactly
+    /// today's behaviour. `cloud` is a per-project opt-in that is only
+    /// reachable when `cloud_telemetry_fidelity` is `queryable`, the instance
+    /// is linked, and the Cloud telemetry switch is on — a Cloud-primary
+    /// project at `metered` fidelity would store nothing readable anywhere.
+    ///
+    /// This is the operator's *declared intent*. The effective destination can
+    /// temporarily differ (quota exhaustion, disconnect, queue overflow); that
+    /// history lives in `project_telemetry_write_intervals`, never here.
+    #[sea_orm(default_value = "local")]
+    pub cloud_telemetry_write_mode: CloudTelemetryWriteMode,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

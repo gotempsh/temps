@@ -26,6 +26,22 @@
 > intentionally described here only at the contract level the OSS client
 > depends on; the private repo carries its own ADR with the implementation.
 
+> **Amendment (2026-09-01, second).** After Phase A shipped, the product owner
+> pivoted the *write* model: when an instance is linked to Temps Cloud with
+> telemetry enabled, spans for opted-in projects should be written directly to
+> Cloud and not stored locally at all, so that a local span store — ClickHouse
+> or the TimescaleDB `otel_spans` hypertable — stops being needed. The
+> motivation is the instance's resource footprint, not retention. That change
+> is specified in **ADR-041 (Cloud-Primary Telemetry Writes)**, which amends
+> this ADR rather than replacing it. What changes here: the local-first premise
+> in the Context section below, the retention-floor form of the `auto` routing
+> policy in §3, and the scope of Phase B. What does **not** change: the fidelity
+> tiers and backfill in §1 (Phase A, shipped, and now a hard prerequisite for
+> Cloud-primary writes), the storage-reuse design in §2, the no-silent-fallback
+> contract and the badge in §3, the Cloud-side read contract in §4, and the
+> signal-by-signal scope in §5. Inline notes below mark the specific paragraphs
+> ADR-041 supersedes; the original text is left intact rather than rewritten.
+
 ---
 
 ## Context
@@ -43,6 +59,15 @@ around lines 432–455). There is no backfill, no replay, and no read.
 
 That ordering is deliberate and must not change: local is primary, Cloud is an
 optional mirror, and a Cloud problem can never become a local problem.
+
+> **Amended by ADR-041.** This remains the behaviour for projects in the
+> default `Local` write mode, which is every project unless an operator
+> explicitly opts in. ADR-041 adds an opt-in per-project Cloud-primary write
+> mode in which no local span write happens at all and the span write is
+> instead durably queued for Cloud. A Cloud problem still cannot become a local
+> problem — ingest never blocks and never fails on Cloud availability — but for
+> a Cloud-primary project a long enough Cloud outage does become a bounded,
+> visible gap in that project's traces. See ADR-041 §2, §3 and §7.
 
 ### The finding that shapes this entire ADR
 
@@ -428,6 +453,14 @@ maps to `Problem` in its own handler module, exactly as the rule requires.
 ```
 ?source=local | cloud | auto      (default: auto)
 ```
+
+> **Narrowed by ADR-041.** The retention-floor comparison below assumes local
+> always holds at least a recent window of the data. That assumption does not
+> hold for a project in ADR-041's Cloud-primary write mode, which has no local
+> copy of post-cutover data at all. For those projects `auto` resolves against
+> an exact per-project write-mode interval ledger instead of a retention-floor
+> estimate (ADR-041 §1 and §8), which also retires Open Question 2 below for
+> them. For `Local`-mode projects the policy below is unchanged.
 
 **`auto`.** Serve from local unless *all* of the following hold, in which case
 serve from Cloud: the requested window starts before the local retention floor
@@ -903,6 +936,16 @@ ID decision, the consent copy, and the deletion path from Open Question 1.
 
 ### Phase B — The read path, end to end (the deliverable)
 
+> **Superseded by ADR-041 Phases B1/B2.** The read-path work below is still
+> required and its shape is unchanged, but ADR-041 re-scopes this phase: the
+> durable-transport work (B1) must land and be load-tested before any project
+> can be set Cloud-primary, and the routing work (B2) additionally covers the
+> write-mode switch, the interval ledger, and installing the routing decorator
+> at the plugin's `register_service` call site rather than only in the query
+> handlers — otherwise the health, cross-project, `TraceReader` and
+> observability span readers silently return nothing. See ADR-041's
+> Implementation Notes.
+
 **Status:** the Cloud-pointed client half of this phase (the `temps-cloud-client`
 bullet below) is done — built, security-reviewed and remediated as the spike
 referenced in the amendment. The routing/decorator/badge-wiring half is not yet
@@ -1027,6 +1070,8 @@ that domain. Until then the Errors page renders `this_instance`, which is true.
 - `crates/temps-cloud-protocol/src/lib.rs` — `Capability`, `Unavailable`,
   forward-compatible `#[serde(other)] Unknown` negotiation
 - `web/src/components/global/TelemetrySourceBadge.tsx` — the fixed UI contract
+- ADR-041 — cloud-primary telemetry writes; amends this ADR's local-first write
+  premise, narrows §3's `auto` policy, and re-scopes Phase B
 - ADR-027 — cross-project trace linking (why clear-text trace IDs matter)
 - ADR-017 — split proxy/console process model, the general pattern this design's
   Cloud-side counterpart follows (implementation details in the private repo)

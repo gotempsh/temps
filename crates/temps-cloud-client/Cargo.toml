@@ -11,7 +11,16 @@ description = "Optional client that links a self-hosted Temps instance to a mana
 [dependencies]
 temps-cloud-protocol = { path = "../temps-cloud-protocol" }
 temps-core = { path = "../temps-core" }
+# ADR-041 §3a: the Cloud-primary write path's durable outbox is a Postgres
+# table, deliberately reusing the proven `events_ch_outbox` pattern rather than
+# inventing a file queue. Postgres is unconditionally present on every
+# deployment shape, so this adds no new runtime dependency — only a compile-time
+# one on the entity definitions and the ORM the rest of the workspace already
+# uses.
+temps-entities = { path = "../temps-entities" }
+sea-orm = { workspace = true }
 
+async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
 # Points a stock ClickHouse client at Temps Cloud's HTTP-interface read proxy

@@ -15,6 +15,7 @@ import { ProjectSecuritySettings } from './settings/ProjectSecuritySettings'
 import { McpServersSettings } from './settings/McpServersSettings'
 import { SecretsSettings } from './settings/SecretsSettings'
 import { SkillsSettings } from './settings/SkillsSettings'
+import { TelemetrySettings } from './settings/TelemetrySettings'
 import { WebhooksSettings } from './settings/WebhooksSettings'
 import { CreateWebhookPage } from './settings/webhooks/CreateWebhookPage'
 import { EditWebhookPage } from './settings/webhooks/EditWebhookPage'
@@ -87,6 +88,10 @@ export function ProjectSettings({ project, refetch }: ProjectSettingsProps) {
         <Route
           path="deployment-tokens"
           element={<DeploymentTokensSettings project={project} />}
+        />
+        <Route
+          path="telemetry"
+          element={<TelemetrySettings project={project} />}
         />
         <Route path="*" element={<Navigate to="." replace />} />
       </Routes>

@@ -5,6 +5,8 @@
 
 pub mod audit;
 pub mod cloud_backfill_handler;
+/// Per-project telemetry write mode and the instance aggregate (ADR-041 §9).
+pub mod cloud_telemetry_handler;
 pub mod dashboard_handler;
 pub mod facet_handler;
 pub mod ingest_handler;
@@ -55,6 +57,9 @@ pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 ///   GET /otel/ingest-errors
 ///   GET /otel/pipeline-history
 ///   GET /otel/cloud-telemetry/backfill/{project_id}
+///   GET /otel/cloud-telemetry/status
+///   GET   /otel/cloud-telemetry/projects/{project_id}
+///   PATCH /otel/cloud-telemetry/projects/{project_id}
 pub fn configure_routes() -> Router<OtelAppState> {
     // OTLP ingest endpoints are split into their own sub-router so
     // `DefaultBodyLimit` applies only to them, not to the query/dashboard
@@ -118,6 +123,23 @@ pub fn configure_routes() -> Router<OtelAppState> {
         .route(
             "/otel/cloud-telemetry/backfill/{project_id}",
             get(cloud_backfill_handler::get_cloud_backfill_status),
+        )
+        // ADR-041 §9: the per-project write-mode control and the instance
+        // aggregate. Both answer on an unlinked instance — the control must
+        // onboard rather than disappear, which is impossible if the endpoint
+        // 404s when Cloud is not set up.
+        //
+        // The static `/status` path is registered before the parameterised
+        // `/projects/{project_id}` for readability only; matchit prefers static
+        // segments regardless.
+        .route(
+            "/otel/cloud-telemetry/status",
+            get(cloud_telemetry_handler::get_cloud_telemetry_status),
+        )
+        .route(
+            "/otel/cloud-telemetry/projects/{project_id}",
+            get(cloud_telemetry_handler::get_project_cloud_telemetry)
+                .patch(cloud_telemetry_handler::update_project_cloud_telemetry),
         )
         .route(
             "/otel/has-traces/{project_id}",

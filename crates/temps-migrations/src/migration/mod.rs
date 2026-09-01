@@ -216,6 +216,9 @@ mod m20260830_000001_add_managed_by_cloud_to_s3_sources;
 mod m20260901_000001_add_cloud_telemetry_fidelity;
 mod m20260901_000002_create_cloud_telemetry_backfills;
 mod m20260901_000003_constrain_cloud_telemetry_fidelity;
+mod m20260901_000004_create_cloud_span_outbox;
+mod m20260901_000005_add_cloud_telemetry_write_mode;
+mod m20260901_000006_create_telemetry_write_ledger;
 
 pub struct Migrator;
 
@@ -466,6 +469,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260901_000001_add_cloud_telemetry_fidelity::Migration),
             Box::new(m20260901_000002_create_cloud_telemetry_backfills::Migration),
             Box::new(m20260901_000003_constrain_cloud_telemetry_fidelity::Migration),
+            Box::new(m20260901_000004_create_cloud_span_outbox::Migration),
+            Box::new(m20260901_000005_add_cloud_telemetry_write_mode::Migration),
+            Box::new(m20260901_000006_create_telemetry_write_ledger::Migration),
         ]
     }
 }
