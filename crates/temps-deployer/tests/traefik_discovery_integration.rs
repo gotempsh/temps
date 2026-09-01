@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use bollard::query_parameters::InspectContainerOptions;
 use bollard::Docker;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
@@ -280,7 +281,7 @@ async fn stopping_a_container_removes_its_discovered_route() {
     };
     let container_id = container.id().to_string();
 
-    let svc = service(docker, db.clone(), &network);
+    let svc = service(docker.clone(), db.clone(), &network);
     svc.reconcile().await.expect("initial reconcile");
     assert_eq!(rows_for(db.as_ref(), &network).await.len(), 1);
 
@@ -308,9 +309,36 @@ async fn stopping_a_container_removes_its_discovered_route() {
     // Reconciliation path: after actually stopping the container, a full pass
     // must agree (and must not resurrect the row).
     container.stop().await.ok();
+    // `stop()` returns once the daemon has processed the request, but Docker's
+    // own `list_containers(status=running)` filter (what `reconcile()` uses to
+    // find candidates) can lag a beat behind that under CI load. Poll the
+    // container's real state instead of racing it, so this test verifies
+    // reconcile's behavior against a genuinely-stopped container rather than
+    // one that is still transitioning.
+    wait_until_not_running(&docker, &container_id).await;
     let outcome = svc.reconcile().await.expect("reconcile after stop");
     assert_eq!(outcome.routes_upserted, 0, "outcome: {outcome:?}");
     assert!(rows_for(db.as_ref(), &network).await.is_empty());
+}
+
+/// Poll Docker until `container_id` is no longer reported as running, or give
+/// up after 10s. Used to close the race between `stop()` returning and the
+/// daemon's container-list filters reflecting the new state.
+async fn wait_until_not_running(docker: &Docker, container_id: &str) {
+    for _ in 0..100 {
+        let running = docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await
+            .ok()
+            .and_then(|resp| resp.state)
+            .and_then(|state| state.running)
+            .unwrap_or(false);
+        if !running {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    eprintln!("⚠️  container {container_id} still reported running after 10s");
 }
 
 /// A Temps-deployed container must never be adopted through its labels, even
