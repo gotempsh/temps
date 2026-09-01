@@ -447,12 +447,10 @@ impl AuthService {
         }
 
         // Hash the password
-        use argon2::password_hash::{rand_core::OsRng, SaltString};
         let argon2 = argon2::Argon2::default();
-        let salt = SaltString::generate(&mut OsRng);
 
         let password_hash = argon2
-            .hash_password(request.password.as_bytes(), &salt)
+            .hash_password(request.password.as_bytes())
             .map_err(|_| UserAuthError::PasswordHashError)?
             .to_string();
 
@@ -526,11 +524,10 @@ impl AuthService {
         let password_valid = if password_hash.starts_with("$argon2") {
             // Argon2 hash (only supported format)
             debug!("Verifying Argon2 password for user {}", user.id);
-            let parsed_hash =
-                argon2::password_hash::PasswordHash::new(password_hash).map_err(|e| {
-                    error!("Failed to parse Argon2 hash for user {}: {}", user.id, e);
-                    UserAuthError::InvalidCredentials
-                })?;
+            let parsed_hash = argon2::PasswordHash::new(password_hash).map_err(|e| {
+                error!("Failed to parse Argon2 hash for user {}: {}", user.id, e);
+                UserAuthError::InvalidCredentials
+            })?;
 
             let argon2 = argon2::Argon2::default();
             argon2
@@ -715,9 +712,8 @@ impl AuthService {
 
                     if user.must_change_password {
                         if let Some(current_hash) = user.password_hash.as_deref() {
-                            let parsed_hash =
-                                argon2::password_hash::PasswordHash::new(current_hash)
-                                    .map_err(|_| UserAuthError::PasswordHashError)?;
+                            let parsed_hash = argon2::PasswordHash::new(current_hash)
+                                .map_err(|_| UserAuthError::PasswordHashError)?;
                             if argon2::Argon2::default()
                                 .verify_password(request.new_password.as_bytes(), &parsed_hash)
                                 .is_ok()
@@ -728,12 +724,10 @@ impl AuthService {
                     }
 
                     // Hash new password
-                    use argon2::password_hash::{rand_core::OsRng, SaltString};
                     let argon2 = argon2::Argon2::default();
-                    let salt = SaltString::generate(&mut OsRng);
 
                     let password_hash = argon2
-                        .hash_password(request.new_password.as_bytes(), &salt)
+                        .hash_password(request.new_password.as_bytes())
                         .map_err(|_| UserAuthError::PasswordHashError)?
                         .to_string();
 
@@ -781,7 +775,7 @@ impl AuthService {
                     }
 
                     if let Some(current_hash) = user.password_hash.as_deref() {
-                        let parsed_hash = argon2::password_hash::PasswordHash::new(current_hash)
+                        let parsed_hash = argon2::PasswordHash::new(current_hash)
                             .map_err(|_| UserAuthError::PasswordHashError)?;
                         if argon2::Argon2::default()
                             .verify_password(request.new_password.as_bytes(), &parsed_hash)
@@ -791,10 +785,8 @@ impl AuthService {
                         }
                     }
 
-                    use argon2::password_hash::{rand_core::OsRng, SaltString};
-                    let salt = SaltString::generate(&mut OsRng);
                     let password_hash = argon2::Argon2::default()
-                        .hash_password(request.new_password.as_bytes(), &salt)
+                        .hash_password(request.new_password.as_bytes())
                         .map_err(|_| UserAuthError::PasswordHashError)?
                         .to_string();
 
@@ -876,7 +868,7 @@ impl AuthService {
             return Err(AuthError::InvalidCurrentPassword);
         }
         use argon2::PasswordVerifier;
-        let parsed = argon2::password_hash::PasswordHash::new(stored_hash)
+        let parsed = argon2::PasswordHash::new(stored_hash)
             .map_err(|_| AuthError::InvalidCurrentPassword)?;
         if argon2::Argon2::default()
             .verify_password(current_password.as_bytes(), &parsed)
@@ -922,12 +914,10 @@ impl AuthService {
 
         // 6. Hash + persist. We also bump updated_at; downstream watchers
         // (audit consumers, cache invalidators) key off this.
-        use argon2::password_hash::{rand_core::OsRng, SaltString};
         let argon2 = argon2::Argon2::default();
-        let salt = SaltString::generate(&mut OsRng);
         use argon2::PasswordHasher;
         let new_hash = argon2
-            .hash_password(new_password.as_bytes(), &salt)
+            .hash_password(new_password.as_bytes())
             .map_err(|e| AuthError::EncryptionError(format!("password hash failed: {}", e)))?
             .to_string();
 
@@ -1287,11 +1277,9 @@ mod tests {
         email: &str,
         password: &str,
     ) -> users::Model {
-        use argon2::password_hash::{rand_core::OsRng, SaltString};
         let argon2 = argon2::Argon2::default();
-        let salt = SaltString::generate(&mut OsRng);
         let password_hash = argon2
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .unwrap()
             .to_string();
 
@@ -1314,11 +1302,9 @@ mod tests {
         password: &str,
         mfa_enabled: bool,
     ) -> users::Model {
-        use argon2::password_hash::{rand_core::OsRng, SaltString};
         let argon2 = argon2::Argon2::default();
-        let salt = SaltString::generate(&mut OsRng);
         let password_hash = argon2
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .unwrap()
             .to_string();
 
@@ -2795,11 +2781,8 @@ mod tests {
 
         let password = "Password123!";
         let argon2 = argon2::Argon2::default();
-        let salt = argon2::password_hash::SaltString::generate(
-            &mut argon2::password_hash::rand_core::OsRng,
-        );
         let password_hash = argon2
-            .hash_password(password.as_bytes(), &salt)
+            .hash_password(password.as_bytes())
             .unwrap()
             .to_string();
 

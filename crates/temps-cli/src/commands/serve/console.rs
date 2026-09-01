@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Argon2, PasswordHasher};
 use axum::body::Body;
 use axum::extract::Request;
@@ -477,9 +476,8 @@ async fn create_initial_admin_user(
 
     // Hash the password using Argon2
     let argon2 = Argon2::default();
-    let salt = SaltString::generate(&mut OsRng);
     let password_hash = argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|error| InitialAdminBootstrapError::HashPassword {
             email: email_lower.clone(),
             reason: error.to_string(),
