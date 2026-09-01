@@ -3,6 +3,7 @@
 
 import { getSettings, updateSettings } from '@/api/client'
 import type {
+  AppSettings,
   AppSettingsResponse,
   LetsEncryptSettings,
   ScreenshotSettings,
@@ -162,7 +163,6 @@ export interface PlatformSettings extends AppSettingsResponse {
   disk_space_alert: DiskSpaceAlertSettings
   ai_config: AiConfigSettings
   insecure_tls: boolean
-  attack_mode?: boolean
   build_limits: BuildLimitsSettings
   /** Enabled, running services included in the metrics scrape cycle. */
   monitored_services_count: number | null
@@ -213,7 +213,27 @@ export async function updatePlatformSettings(
 
   validateSettings(updated)
 
-  const body: any = {
+  const body = buildPlatformSettingsUpdateBody(updated)
+  const result = await updateSettings({ body })
+  if (result.error) {
+    // The generated client resolves (rather than throws) on non-2xx
+    // responses, so a failed save must be surfaced explicitly here —
+    // otherwise the caller sees a resolved promise and reports "saved"
+    // for a change that was actually rejected (e.g. a validation error).
+    const detail =
+      (result.error as { detail?: string })?.detail || 'Failed to save settings'
+    throw new Error(detail)
+  }
+
+  // The PUT endpoint returns only an ack message, so we hand back our
+  // merged view. Callers that need the absolute server state should refetch.
+  return updated
+}
+
+export function buildPlatformSettingsUpdateBody(
+  updated: PlatformSettings
+): AppSettings {
+  return {
     dns_provider: updated.dns_provider,
     external_url: updated.external_url,
     internal_url: updated.internal_url,
@@ -227,10 +247,16 @@ export async function updatePlatformSettings(
     screenshots: updated.screenshots,
     security_headers: updated.security_headers,
     rate_limiting: updated.rate_limiting,
+    // The settings endpoint replaces the full AppSettings document. Omitting
+    // this field makes serde restore DockerRegistrySettings::default(), so a
+    // successful save immediately clears the registry configuration.
+    docker_registry: updated.docker_registry,
     disk_space_alert: updated.disk_space_alert,
-    agent_sandbox: updated.agent_sandbox,
+    // The response replaces encrypted provider credentials with masked status
+    // fields. The server restores those omitted secrets from storage on PUT.
+    agent_sandbox:
+      updated.agent_sandbox as unknown as AppSettings['agent_sandbox'],
     ai_config: updated.ai_config,
-    attack_mode: updated.attack_mode,
     build_limits: updated.build_limits,
     ai_chat_limits: updated.ai_chat_limits,
     request_timeouts: updated.request_timeouts,
@@ -253,20 +279,6 @@ export async function updatePlatformSettings(
     // every unrelated settings save.
     mcp_server: updated.mcp_server,
   }
-  const result = await updateSettings({ body })
-  if (result.error) {
-    // The generated client resolves (rather than throws) on non-2xx
-    // responses, so a failed save must be surfaced explicitly here —
-    // otherwise the caller sees a resolved promise and reports "saved"
-    // for a change that was actually rejected (e.g. a validation error).
-    const detail =
-      (result.error as { detail?: string })?.detail || 'Failed to save settings'
-    throw new Error(detail)
-  }
-
-  // The PATCH endpoint returns only an ack message, so we hand back our
-  // merged view. Callers that need the absolute server state should refetch.
-  return updated
 }
 
 /**
