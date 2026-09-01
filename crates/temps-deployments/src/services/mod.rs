@@ -67,3 +67,6 @@ pub use failure_report_service::*;
 
 pub mod traefik_discovery_service;
 pub use traefik_discovery_service::*;
+
+pub mod cert_validator;
+pub use cert_validator::*;

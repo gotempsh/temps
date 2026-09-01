@@ -9617,6 +9617,70 @@ export type ImportStatusResponse = {
     warnings: Array<string>;
 };
 
+/**
+ * Request body for Path B: import from Traefik's `acme.json`.
+ *
+ * `Debug` is hand-written: `acme_json` contains Traefik's private keys and
+ * must never appear in logs. Only the host list, renewal method, dry-run flag,
+ * and byte length are logged.
+ */
+export type ImportTraefikAcmeJsonRequest = {
+    /**
+     * Required when `renewal_method` is `"dns-01"` and no auto-manage zone
+     * covers the host.
+     */
+    acknowledge_manual_dns_renewal?: boolean;
+    /**
+     * `true` → full parse and validation, no writes. The identical per-host
+     * verdicts are returned, giving the operator a preview before committing.
+     */
+    dry_run?: boolean;
+    /**
+     * Hosts to import. Only hosts that appear in the document's certificates
+     * (by X.509 SAN, not JSON `domain.main`) are accepted.
+     */
+    hosts: Array<string>;
+    /**
+     * `"http-01"` or `"dns-01"`. Stored as `verification_method` so the
+     * renewal scheduler knows how to renew.
+     */
+    renewal_method: string;
+};
+
+/**
+ * Response body for the Path B import endpoint.
+ */
+export type ImportTraefikAcmeJsonResponse = {
+    dry_run: boolean;
+    failed: number;
+    succeeded: number;
+    total_requested: number;
+    verdicts: Array<ImportedHostVerdict>;
+};
+
+/**
+ * Per-host result from a Path B import.
+ */
+export type ImportedHostVerdict = {
+    /**
+     * Human-readable failure reason when `success` is `false`.
+     */
+    error?: string | null;
+    host: string;
+    /**
+     * ISO 8601 expiry of the imported certificate.
+     */
+    not_after?: string | null;
+    /**
+     * DNS SANs carried in the imported certificate.
+     */
+    sans: Array<string>;
+    /**
+     * Whether the cert was written (or would be written on `dry_run: false`).
+     */
+    success: boolean;
+};
+
 export type IncidentBucket = {
     active_incidents: number;
     avg_resolution_time_minutes?: number | null;
@@ -15020,6 +15084,22 @@ export type RepositorySyncStartedResponse = {
     syncing: boolean;
 };
 
+/**
+ * Request body for Path A: operator-triggered ACME issuance.
+ */
+export type RequestDiscoveredRouteCertRequest = {
+    /**
+     * Must be `true` when `challenge_type` is `"dns-01"` and no verified
+     * `auto_manage` zone covers this host. Lets the operator confirm they
+     * know renewal will require manual DNS updates.
+     */
+    acknowledge_manual_dns_renewal?: boolean;
+    /**
+     * `"http-01"` or `"dns-01"`. Required — no silent default.
+     */
+    challenge_type: string;
+};
+
 export type RequestRow = {
     client_ip?: string | null;
     country?: string | null;
@@ -19134,6 +19214,7 @@ export type TraefikDiscoveredRouteResponse = {
     target_host_port?: number | null;
     target_port: number;
     tls: boolean;
+    tls_certificate?: null | TraefikRouteTlsBlock;
     updated_at: string;
 };
 
@@ -19243,6 +19324,63 @@ export type TraefikReconciliationResponse = {
      * route and must never re-derive one from labels they control).
      */
     skipped_temps_managed: number;
+};
+
+/**
+ * TLS state for a single discovered route (ADR-041 §3/§4).
+ *
+ * Absent when no `traefik_route_certificates` row exists for this host.
+ * Never `null` on a host where `cert_authorized = true`.
+ */
+export type TraefikRouteTlsBlock = {
+    authorized_at: string;
+    /**
+     * Container ID that was authorized. Used for drift comparison.
+     */
+    authorized_container_id?: string | null;
+    authorized_container_name?: string | null;
+    /**
+     * The operator has explicitly authorized TLS for this host.
+     */
+    cert_authorized: boolean;
+    /**
+     * `true` when the currently-serving container differs from the one
+     * that was authorized. Requires operator acknowledgment.
+     */
+    container_drift: boolean;
+    /**
+     * When drift was first detected.
+     */
+    container_drift_detected_at: string;
+    /**
+     * Name of the container that currently holds the host (for the drift UI).
+     */
+    current_container_name?: string | null;
+    /**
+     * Days until expiry.
+     */
+    days_remaining?: number | null;
+    imported_at: string;
+    /**
+     * ISO 8601 expiry time of the current certificate, if one exists.
+     */
+    not_after?: string | null;
+    /**
+     * `"http-01"` or `"dns-01"`.
+     */
+    renewal_method?: string | null;
+    /**
+     * `true` when the proxy is currently loading a cert for this host.
+     */
+    serving: boolean;
+    /**
+     * `"acme"` or `"imported"`.
+     */
+    source?: string | null;
+    /**
+     * Certificate status as reported by the `domains` row, e.g. `"active"`.
+     */
+    status?: string | null;
 };
 
 export type TrafficAggregationRequest = {
@@ -53690,6 +53828,100 @@ export type ListTraefikDiscoveredRoutesResponses = {
 
 export type ListTraefikDiscoveredRoutesResponse = ListTraefikDiscoveredRoutesResponses[keyof ListTraefikDiscoveredRoutesResponses];
 
+export type DeauthorizeDiscoveredRouteCertData = {
+    body?: never;
+    path: {
+        /**
+         * Hostname of the discovered route
+         */
+        host: string;
+    };
+    query?: never;
+    url: '/traefik-discovery/routes/{host}/certificate';
+};
+
+export type DeauthorizeDiscoveredRouteCertErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No authorization record for that host
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type DeauthorizeDiscoveredRouteCertResponses = {
+    /**
+     * TLS authorization cleared
+     */
+    204: void;
+};
+
+export type DeauthorizeDiscoveredRouteCertResponse = DeauthorizeDiscoveredRouteCertResponses[keyof DeauthorizeDiscoveredRouteCertResponses];
+
+export type RequestDiscoveredRouteCertData = {
+    body: RequestDiscoveredRouteCertRequest;
+    path: {
+        /**
+         * Hostname of the discovered route
+         */
+        host: string;
+    };
+    query?: never;
+    url: '/traefik-discovery/routes/{host}/certificate';
+};
+
+export type RequestDiscoveredRouteCertErrors = {
+    /**
+     * Validation error (e.g. unsupported challenge_type)
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * No discovered route for that host
+     */
+    404: unknown;
+    /**
+     * Host owned by another resource, or verification_method conflict
+     */
+    409: unknown;
+    /**
+     * Certificate validation failed
+     */
+    422: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+    /**
+     * TLS provisioner error (ACME upstream failure)
+     */
+    502: unknown;
+};
+
+export type RequestDiscoveredRouteCertResponses = {
+    /**
+     * TLS authorization created and ACME challenge initiated
+     */
+    201: unknown;
+};
+
 export type SetTraefikDiscoveredRouteEnabledData = {
     body: UpdateTraefikRouteEnabledRequest;
     path: {
@@ -53764,6 +53996,45 @@ export type GetTraefikDiscoveryStatusResponses = {
 };
 
 export type GetTraefikDiscoveryStatusResponse = GetTraefikDiscoveryStatusResponses[keyof GetTraefikDiscoveryStatusResponses];
+
+export type ImportTraefikAcmeJsonData = {
+    body: ImportTraefikAcmeJsonRequest;
+    path?: never;
+    query?: never;
+    url: '/traefik-discovery/tls/import';
+};
+
+export type ImportTraefikAcmeJsonErrors = {
+    /**
+     * Validation error (malformed JSON, unsupported renewal_method)
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Request body exceeds the 1 MiB limit
+     */
+    413: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ImportTraefikAcmeJsonResponses = {
+    /**
+     * Import results (per-host verdicts)
+     */
+    200: ImportTraefikAcmeJsonResponse;
+};
+
+export type ImportTraefikAcmeJsonResponse2 = ImportTraefikAcmeJsonResponses[keyof ImportTraefikAcmeJsonResponses];
 
 export type GetCurrentUserData = {
     body?: never;

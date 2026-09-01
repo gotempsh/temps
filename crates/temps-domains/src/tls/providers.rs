@@ -443,10 +443,18 @@ impl LetsEncryptProvider {
         }
     }
 
+    /// Finalize the ACME order, generate the CSR, and return the certificate.
+    ///
+    /// `challenge_type` is the actual challenge method that validated this
+    /// order (`http-01` or `dns-01`). It is recorded as `verification_method`
+    /// on the returned `Certificate` so `save_certificate` — and the renewal
+    /// scheduler — see the real value instead of the former placeholder `"acme"`
+    /// (ADR-041 §7a step b).
     async fn generate_certificate_from_order(
         &self,
         domain: &str,
         order: &mut Order,
+        challenge_type: &str,
     ) -> Result<Certificate, ProviderError> {
         // Generate CSR
         // For wildcard domains, include both wildcard and base domain
@@ -485,7 +493,10 @@ impl LetsEncryptProvider {
             expiration_time,
             last_renewed: Some(Utc::now()),
             is_wildcard: domain.starts_with("*."),
-            verification_method: "acme".to_string(),
+            // ADR-041 §7a step (b): record the real challenge type, not "acme".
+            // The renewal scheduler dispatches on this value; "acme" was silently
+            // never renewed because it matched no arm.
+            verification_method: challenge_type.to_string(),
             status: CertificateStatus::Active,
         })
     }
@@ -809,11 +820,17 @@ impl CertificateProvider for LetsEncryptProvider {
         // 0.8.5: `NewOrder` fields are private — use the constructor.
         let mut order = acme_account.new_order(&NewOrder::new(&identifiers)).await?;
 
+        // Canonical challenge-type string for stamping on the certificate (ADR-041 §7a b).
+        let challenge_type_str = match challenge {
+            ChallengeType::Http01 => "http-01",
+            ChallengeType::Dns01 => "dns-01",
+        };
+
         // Check if order is already ready (renewal case)
         if order.state().status == OrderStatus::Ready {
             info!("Order is already ready, generating certificate");
             let cert = self
-                .generate_certificate_from_order(domain, &mut order)
+                .generate_certificate_from_order(domain, &mut order, challenge_type_str)
                 .await?;
             return Ok(ProvisioningResult::Certificate(cert));
         }
@@ -844,7 +861,7 @@ impl CertificateProvider for LetsEncryptProvider {
                 authz_count
             );
             let cert = self
-                .generate_certificate_from_order(domain, &mut order)
+                .generate_certificate_from_order(domain, &mut order, challenge_type_str)
                 .await?;
             return Ok(ProvisioningResult::Certificate(cert));
         }
@@ -943,8 +960,12 @@ impl CertificateProvider for LetsEncryptProvider {
         // Wait for validation
         self.wait_for_order_ready(&mut order).await?;
 
-        // Generate certificate
-        self.generate_certificate_from_order(domain, &mut order)
+        // Generate certificate, stamping the real challenge type (ADR-041 §7a b).
+        let challenge_type_str = match challenge_data.challenge_type {
+            ChallengeType::Http01 => "http-01",
+            ChallengeType::Dns01 => "dns-01",
+        };
+        self.generate_certificate_from_order(domain, &mut order, challenge_type_str)
             .await
     }
 

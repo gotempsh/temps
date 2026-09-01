@@ -60,6 +60,7 @@ import {
   Users,
   UsersRound,
   Wand2,
+  Waypoints,
 } from 'lucide-react'
 
 import { ProjectResponse } from '@/api/client'
@@ -209,6 +210,11 @@ const settingsGroups: SettingsGroupDef[] = [
         url: '/settings/nodes',
         icon: Network,
         featureKey: 'multi-node-worker-join',
+      },
+      {
+        title: 'Traefik Discovery',
+        url: '/settings/traefik-discovery',
+        icon: Waypoints,
       },
       {
         title: 'Plugins',

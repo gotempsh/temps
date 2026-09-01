@@ -214,6 +214,42 @@ pub struct TraefikDiscoveredRouteToggledAudit {
     pub enabled: bool,
 }
 
+/// Operator authorized Temps to issue an ACME certificate for a discovered
+/// Traefik route (Path A of ADR-041).
+#[derive(Debug, Clone, Serialize)]
+pub struct TraefikDiscoveredRouteCertRequestedAudit {
+    pub context: AuditContext,
+    /// The hostname being authorized.
+    pub host: String,
+    /// Container that was serving the host at authorization time.
+    pub container_id: String,
+    pub container_name: String,
+    /// "http-01" or "dns-01".
+    pub renewal_method: String,
+    /// DNS zone supplied for DNS-01 challenges, absent for HTTP-01.
+    pub dns01_zone: Option<String>,
+}
+
+/// Operator imported an existing certificate from a Traefik `acme.json` file
+/// for a discovered route (Path B of ADR-041).
+#[derive(Debug, Clone, Serialize)]
+pub struct TraefikDiscoveredRouteCertImportedAudit {
+    pub context: AuditContext,
+    /// Hosts successfully imported in this call.
+    pub imported_hosts: Vec<String>,
+    /// Hosts that were present in the acme.json but failed validation.
+    pub failed_hosts: Vec<String>,
+    /// Total number of entries parsed from the document.
+    pub entries_parsed: usize,
+}
+
+/// Operator removed TLS authorization from a discovered Traefik route.
+#[derive(Debug, Clone, Serialize)]
+pub struct TraefikDiscoveredRouteCertDeauthorizedAudit {
+    pub context: AuditContext,
+    pub host: String,
+}
+
 // ── AuditOperation implementations ──────────────────────────────────────────
 
 macro_rules! impl_audit_operation {
@@ -274,4 +310,16 @@ impl_audit_operation!(NodeArchitectureChangedAudit, "NODE_ARCHITECTURE_CHANGED")
 impl_audit_operation!(
     TraefikDiscoveredRouteToggledAudit,
     "TRAEFIK_DISCOVERED_ROUTE_TOGGLED"
+);
+impl_audit_operation!(
+    TraefikDiscoveredRouteCertRequestedAudit,
+    "TRAEFIK_DISCOVERED_ROUTE_CERT_REQUESTED"
+);
+impl_audit_operation!(
+    TraefikDiscoveredRouteCertImportedAudit,
+    "TRAEFIK_DISCOVERED_ROUTE_CERT_IMPORTED"
+);
+impl_audit_operation!(
+    TraefikDiscoveredRouteCertDeauthorizedAudit,
+    "TRAEFIK_DISCOVERED_ROUTE_CERT_DEAUTHORIZED"
 );

@@ -20499,6 +20499,108 @@
         ],
         "type": "object"
       },
+      "ImportTraefikAcmeJsonRequest": {
+        "description": "Request body for Path B: import from Traefik's `acme.json`.\n\n`Debug` is hand-written: `acme_json` contains Traefik's private keys and\nmust never appear in logs. Only the host list, renewal method, dry-run flag,\nand byte length are logged.",
+        "properties": {
+          "acknowledge_manual_dns_renewal": {
+            "description": "Required when `renewal_method` is `\"dns-01\"` and no auto-manage zone\ncovers the host.",
+            "type": "boolean"
+          },
+          "dry_run": {
+            "description": "`true` → full parse and validation, no writes. The identical per-host\nverdicts are returned, giving the operator a preview before committing.",
+            "type": "boolean"
+          },
+          "hosts": {
+            "description": "Hosts to import. Only hosts that appear in the document's certificates\n(by X.509 SAN, not JSON `domain.main`) are accepted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "renewal_method": {
+            "description": "`\"http-01\"` or `\"dns-01\"`. Stored as `verification_method` so the\nrenewal scheduler knows how to renew.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "hosts",
+          "renewal_method"
+        ],
+        "type": "object"
+      },
+      "ImportTraefikAcmeJsonResponse": {
+        "description": "Response body for the Path B import endpoint.",
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "failed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "succeeded": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_requested": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "verdicts": {
+            "items": {
+              "$ref": "#/components/schemas/ImportedHostVerdict"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dry_run",
+          "total_requested",
+          "succeeded",
+          "failed",
+          "verdicts"
+        ],
+        "type": "object"
+      },
+      "ImportedHostVerdict": {
+        "description": "Per-host result from a Path B import.",
+        "properties": {
+          "error": {
+            "description": "Human-readable failure reason when `success` is `false`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "type": "string"
+          },
+          "not_after": {
+            "description": "ISO 8601 expiry of the imported certificate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sans": {
+            "description": "DNS SANs carried in the imported certificate.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "success": {
+            "description": "Whether the cert was written (or would be written on `dry_run: false`).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "host",
+          "success",
+          "sans"
+        ],
+        "type": "object"
+      },
       "IncidentBucket": {
         "properties": {
           "active_incidents": {
@@ -32644,6 +32746,23 @@
         ],
         "type": "object"
       },
+      "RequestDiscoveredRouteCertRequest": {
+        "description": "Request body for Path A: operator-triggered ACME issuance.",
+        "properties": {
+          "acknowledge_manual_dns_renewal": {
+            "description": "Must be `true` when `challenge_type` is `\"dns-01\"` and no verified\n`auto_manage` zone covers this host. Lets the operator confirm they\nknow renewal will require manual DNS updates.",
+            "type": "boolean"
+          },
+          "challenge_type": {
+            "description": "`\"http-01\"` or `\"dns-01\"`. Required — no silent default.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "challenge_type"
+        ],
+        "type": "object"
+      },
       "RequestRow": {
         "properties": {
           "client_ip": {
@@ -41535,6 +41654,17 @@
           "tls": {
             "type": "boolean"
           },
+          "tls_certificate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TraefikRouteTlsBlock",
+                "description": "TLS authorization state for this host (ADR-041). Present only when a\n`traefik_route_certificates` row exists. `null` means no operator has\never authorized TLS for this host — the container label's `tls` field\n(above) records what the label says, but this is what has been acted on."
+              }
+            ]
+          },
           "updated_at": {
             "example": "2026-01-01T00:00:00Z",
             "format": "date-time",
@@ -41745,6 +41875,104 @@
           "routes_removed",
           "conflicts",
           "completed_at"
+        ],
+        "type": "object"
+      },
+      "TraefikRouteTlsBlock": {
+        "description": "TLS state for a single discovered route (ADR-041 §3/§4).\n\nAbsent when no `traefik_route_certificates` row exists for this host.\nNever `null` on a host where `cert_authorized = true`.",
+        "properties": {
+          "authorized_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "authorized_container_id": {
+            "description": "Container ID that was authorized. Used for drift comparison.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authorized_container_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cert_authorized": {
+            "description": "The operator has explicitly authorized TLS for this host.",
+            "type": "boolean"
+          },
+          "container_drift": {
+            "description": "`true` when the currently-serving container differs from the one\nthat was authorized. Requires operator acknowledgment.",
+            "type": "boolean"
+          },
+          "container_drift_detected_at": {
+            "description": "When drift was first detected.",
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "current_container_name": {
+            "description": "Name of the container that currently holds the host (for the drift UI).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "days_remaining": {
+            "description": "Days until expiry.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "imported_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_after": {
+            "description": "ISO 8601 expiry time of the current certificate, if one exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "renewal_method": {
+            "description": "`\"http-01\"` or `\"dns-01\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serving": {
+            "description": "`true` when the proxy is currently loading a cert for this host.",
+            "type": "boolean"
+          },
+          "source": {
+            "description": "`\"acme\"` or `\"imported\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Certificate status as reported by the `domains` row, e.g. `\"active\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "cert_authorized",
+          "serving",
+          "container_drift",
+          "container_drift_detected_at",
+          "authorized_at",
+          "imported_at"
         ],
         "type": "object"
       },
@@ -98666,6 +98894,112 @@
         ]
       }
     },
+    "/traefik-discovery/routes/{host}/certificate": {
+      "delete": {
+        "description": "Clears `cert_authorized` so Temps stops attempting renewal. Does **not**\ndelete the `domains` row or the certificate — deleting live key material as\na side effect of deauthorization is the kind of surprise this codebase\navoids. Use `DELETE /domains/{host}` to remove the certificate itself.",
+        "operationId": "deauthorize_discovered_route_cert",
+        "parameters": [
+          {
+            "description": "Hostname of the discovered route",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "TLS authorization cleared"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No authorization record for that host"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove TLS authorization for a discovered route.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      },
+      "post": {
+        "description": "The operator explicitly authorizes issuance; `cert_eligible` stays `false`\nso the container's own labels can never trigger this. Both `SettingsWrite`\nand `DomainsCreate` are required: `SettingsWrite` is Admin/PlatformAdmin\nonly, so any caller reaching this endpoint is already an administrator.\n\nThe authorization is recorded against the container identity currently\nserving the host (§2a). Container drift after authorization fires a Critical\nalarm but does not auto-clear `cert_authorized` — auto-clearing would not\nremove the certificate and would be a DoS primitive (ADR-041 §2a).",
+        "operationId": "request_discovered_route_cert",
+        "parameters": [
+          {
+            "description": "Hostname of the discovered route",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestDiscoveredRouteCertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "TLS authorization created and ACME challenge initiated"
+          },
+          "400": {
+            "description": "Validation error (e.g. unsupported challenge_type)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "No discovered route for that host"
+          },
+          "409": {
+            "description": "Host owned by another resource, or verification_method conflict"
+          },
+          "422": {
+            "description": "Certificate validation failed"
+          },
+          "500": {
+            "description": "Internal server error"
+          },
+          "502": {
+            "description": "TLS provisioner error (ACME upstream failure)"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Request Temps to issue an ACME certificate for a discovered route (Path A).",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
     "/traefik-discovery/routes/{host}/enabled": {
       "patch": {
         "description": "This is a plain column update: the `traefik_discovered_routes` row-level\ntrigger fires `notify_route_table_change()` on an `enabled` change, so the\nexisting `route_table_changes` LISTEN/NOTIFY path reloads this node's route\ntable *and* every other control plane node's. No manual reload here.",
@@ -98759,6 +99093,58 @@
           }
         ],
         "summary": "Whether Traefik label discovery is active on this instance, and how to turn\nit on when it is not.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/tls/import": {
+      "post": {
+        "description": "Upload the raw contents of Traefik's `acme.json` and a list of hosts to\nimport. Each host is independently validated (8-step chain from ADR-041 §5)\nand a per-host verdict is returned. `dry_run: true` runs all validation\nwithout writing anything, so the operator can preview before committing.\n\nThe request body is capped at 1 MiB. Do **not** add a decompression layer\nto this route — the 1 MiB cap's security properties depend on the absence\nof decompression here (ADR-041 §4).",
+        "operationId": "import_traefik_acme_json",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportTraefikAcmeJsonRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportTraefikAcmeJsonResponse"
+                }
+              }
+            },
+            "description": "Import results (per-host verdicts)"
+          },
+          "400": {
+            "description": "Validation error (malformed JSON, unsupported renewal_method)"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "413": {
+            "description": "Request body exceeds the 1 MiB limit"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Import certificates from a Traefik `acme.json` document (Path B).",
         "tags": [
           "Traefik Discovery"
         ]

@@ -31,6 +31,7 @@
 
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
     PaginatorTrait, QueryFilter, QueryOrder,
@@ -40,7 +41,11 @@ use temps_core::UtcDateTime;
 use temps_deployer::traefik_discovery::{
     ConflictReason, ReconcileOutcome, TraefikDiscoveryHandle, ENABLED_ENV, NETWORK_ENV,
 };
+use temps_entities::domains;
+use temps_entities::environment_domains;
+use temps_entities::project_custom_domains;
 use temps_entities::traefik_discovered_routes as discovered;
+use temps_entities::traefik_route_certificates as certs;
 use thiserror::Error;
 use utoipa::ToSchema;
 
@@ -48,6 +53,60 @@ use utoipa::ToSchema;
 const DEFAULT_PAGE_SIZE: u64 = 20;
 /// Hard cap on page size, per the project-wide pagination convention.
 const MAX_PAGE_SIZE: u64 = 100;
+
+/// Error returned by the TLS provisioner trait when it cannot issue or save
+/// a certificate for a discovered host.
+#[derive(Debug, Error)]
+pub enum TlsProvisionerError {
+    #[error("Certificate operation for host '{host}' failed: {reason}")]
+    Failed { host: String, reason: String },
+
+    #[error(
+        "Host '{host}' already has a domains row with verification_method='{stored}', \
+             but the request declared '{declared}'. Declare the stored method or remove \
+             the domain with DELETE /domains/{host} first."
+    )]
+    VerificationMethodConflict {
+        host: String,
+        stored: String,
+        declared: String,
+    },
+}
+
+/// Adapter boundary for ACME issuance and certificate persistence.
+///
+/// Implemented in the main binary (which can depend on both `temps-deployments`
+/// and `temps-domains`). Keeping the trait here avoids adding a `temps-domains`
+/// dependency to `temps-deployments` — and prevents the circular dependency that
+/// would follow.
+///
+/// Both methods are called **after** the eight-step import validation chain and
+/// the host-ownership check have passed; they must not duplicate those checks.
+#[async_trait]
+pub trait DiscoveredHostTlsProvisioner: Send + Sync {
+    /// Ensure a `domains` row exists for `host` with `challenge_type` set, then
+    /// call `request_challenge` to kick off ACME issuance (Path A).
+    ///
+    /// Returns `Err(TlsProvisionerError::VerificationMethodConflict)` when a
+    /// `domains` row already exists with a **different** `verification_method`
+    /// so the service can surface the 409 with both values named.
+    async fn request_acme_cert(
+        &self,
+        host: &str,
+        challenge_type: &str,
+    ) -> Result<(), TlsProvisionerError>;
+
+    /// Persist a validated certificate + key into the `domains` table via
+    /// `CertificateRepository::save_certificate` (Path B). Returns the
+    /// `domains.id` of the upserted row.
+    async fn save_imported_cert(
+        &self,
+        host: &str,
+        certificate_pem: &str,
+        key_pem: &str,
+        renewal_method: &str,
+    ) -> Result<i32, TlsProvisionerError>;
+}
 
 #[derive(Debug, Error)]
 pub enum TraefikDiscoveryAdminError {
@@ -63,6 +122,39 @@ pub enum TraefikDiscoveryAdminError {
         #[source]
         source: DbErr,
     },
+
+    /// The host is already owned by a Temps-managed resource (custom domain,
+    /// environment domain, custom route, console hostname, or an existing
+    /// `domains` row not belonging to this authorization record).
+    /// The `owner` field names the conflicting resource.
+    #[error(
+        "Host '{host}' is already owned by '{owner}' and cannot be authorized \
+             for TLS here. Remove the conflicting resource first."
+    )]
+    HostOwned { host: String, owner: String },
+
+    /// `verification_method` in the existing `domains` row differs from the
+    /// declared `challenge_type`. Both values are surfaced in the error so the
+    /// operator can make an informed decision.
+    #[error(
+        "Host '{host}' already has verification_method='{stored}' but this \
+             request declared '{declared}'. Either declare the stored method or \
+             remove the domain with DELETE /domains/{host} first."
+    )]
+    VerificationMethodConflict {
+        host: String,
+        stored: String,
+        declared: String,
+    },
+
+    /// The certificate material (from Path B import) failed the validation chain.
+    #[error("Certificate validation failed for host '{host}': {reason}")]
+    CertificateValidation { host: String, reason: String },
+
+    /// The injected TLS provisioner returned an error (e.g. ACME order failed,
+    /// encryption failed, DB write failed).
+    #[error("TLS provisioner error for host '{host}': {reason}")]
+    Upstream { host: String, reason: String },
 }
 
 impl TraefikDiscoveryAdminError {
@@ -233,10 +325,19 @@ pub struct TraefikDiscoveredRouteResponse {
     pub created_at: UtcDateTime,
     #[schema(value_type = String, format = "date-time", example = "2026-01-01T00:00:00Z")]
     pub updated_at: UtcDateTime,
+    /// TLS authorization state for this host (ADR-041). Present only when a
+    /// `traefik_route_certificates` row exists. `null` means no operator has
+    /// ever authorized TLS for this host — the container label's `tls` field
+    /// (above) records what the label says, but this is what has been acted on.
+    pub tls_certificate: Option<TraefikRouteTlsBlock>,
 }
 
 impl TraefikDiscoveredRouteResponse {
-    fn from_model(model: discovered::Model, contested_by: Vec<String>) -> Self {
+    fn from_model(
+        model: discovered::Model,
+        contested_by: Vec<String>,
+        cert: Option<&certs::Model>,
+    ) -> Self {
         let inactive_reason = if model.enabled {
             None
         } else {
@@ -245,6 +346,9 @@ impl TraefikDiscoveredRouteResponse {
                 model.host
             ))
         };
+        let tls_certificate = cert.map(|c| {
+            TraefikRouteTlsBlock::from_cert_row(c, Some(model.target_container_name.as_str()))
+        });
         Self {
             id: model.id,
             host: model.host,
@@ -262,6 +366,7 @@ impl TraefikDiscoveredRouteResponse {
             last_seen_at: model.last_seen_at,
             created_at: model.created_at,
             updated_at: model.updated_at,
+            tls_certificate,
         }
     }
 }
@@ -291,6 +396,157 @@ pub struct UpdateTraefikRouteEnabledRequest {
     pub enabled: bool,
 }
 
+// ── TLS-related DTOs ────────────────────────────────────────────────────────
+
+/// TLS state for a single discovered route (ADR-041 §3/§4).
+///
+/// Absent when no `traefik_route_certificates` row exists for this host.
+/// Never `null` on a host where `cert_authorized = true`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct TraefikRouteTlsBlock {
+    /// The operator has explicitly authorized TLS for this host.
+    pub cert_authorized: bool,
+    /// `"acme"` or `"imported"`.
+    pub source: Option<String>,
+    /// `"http-01"` or `"dns-01"`.
+    pub renewal_method: Option<String>,
+    /// Certificate status as reported by the `domains` row, e.g. `"active"`.
+    pub status: Option<String>,
+    /// ISO 8601 expiry time of the current certificate, if one exists.
+    pub not_after: Option<String>,
+    /// Days until expiry.
+    pub days_remaining: Option<i64>,
+    /// `true` when the proxy is currently loading a cert for this host.
+    pub serving: bool,
+    /// Container ID that was authorized. Used for drift comparison.
+    pub authorized_container_id: Option<String>,
+    pub authorized_container_name: Option<String>,
+    /// `true` when the currently-serving container differs from the one
+    /// that was authorized. Requires operator acknowledgment.
+    pub container_drift: bool,
+    /// Name of the container that currently holds the host (for the drift UI).
+    pub current_container_name: Option<String>,
+    /// When drift was first detected.
+    #[schema(value_type = String, format = "date-time", example = "2026-01-01T00:00:00Z")]
+    pub container_drift_detected_at: Option<UtcDateTime>,
+    #[schema(value_type = String, format = "date-time", example = "2026-01-01T00:00:00Z")]
+    pub authorized_at: Option<UtcDateTime>,
+    #[schema(value_type = String, format = "date-time", example = "2026-01-01T00:00:00Z")]
+    pub imported_at: Option<UtcDateTime>,
+}
+
+impl TraefikRouteTlsBlock {
+    /// Build from a `traefik_route_certificates` row and the current container
+    /// name from `traefik_discovered_routes` (for drift display).
+    pub fn from_cert_row(row: &certs::Model, current_container_name: Option<&str>) -> Self {
+        // Use `container_drift_detected_at.is_some()` as the single source of
+        // truth for drift. The reconciler (`check_certificate_drift_for`) sets
+        // this field when it detects a mismatch by container ID; computing drift
+        // by container name here would produce a different result on
+        // `--force-recreate` (same name, different ID) and confuse operators
+        // investigating an alarm.
+        let container_drift = row.cert_authorized && row.container_drift_detected_at.is_some();
+        Self {
+            cert_authorized: row.cert_authorized,
+            source: Some(row.source.clone()),
+            renewal_method: Some(row.renewal_method.clone()),
+            status: None, // filled in by service when domains row is loaded
+            not_after: None,
+            days_remaining: None,
+            serving: false,
+            authorized_container_id: Some(row.authorized_container_id.clone()),
+            authorized_container_name: Some(row.authorized_container_name.clone()),
+            container_drift,
+            current_container_name: current_container_name.map(str::to_string),
+            container_drift_detected_at: row.container_drift_detected_at,
+            authorized_at: row.authorized_at,
+            imported_at: row.imported_at,
+        }
+    }
+}
+
+/// Request body for Path A: operator-triggered ACME issuance.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct RequestDiscoveredRouteCertRequest {
+    /// `"http-01"` or `"dns-01"`. Required — no silent default.
+    pub challenge_type: String,
+    /// Must be `true` when `challenge_type` is `"dns-01"` and no verified
+    /// `auto_manage` zone covers this host. Lets the operator confirm they
+    /// know renewal will require manual DNS updates.
+    #[serde(default)]
+    pub acknowledge_manual_dns_renewal: bool,
+}
+
+/// Request body for Path B: import from Traefik's `acme.json`.
+///
+/// `Debug` is hand-written: `acme_json` contains Traefik's private keys and
+/// must never appear in logs. Only the host list, renewal method, dry-run flag,
+/// and byte length are logged.
+#[derive(Clone, Deserialize, ToSchema)]
+pub struct ImportTraefikAcmeJsonRequest {
+    /// Raw contents of the Traefik `acme.json` file (uploaded by the CLI or
+    /// pasted in the console). **Never** a server-side file path.
+    /// Redacted in `Debug` output — the field holds private key material.
+    #[serde(skip_serializing)]
+    pub acme_json: String,
+    /// Hosts to import. Only hosts that appear in the document's certificates
+    /// (by X.509 SAN, not JSON `domain.main`) are accepted.
+    pub hosts: Vec<String>,
+    /// `"http-01"` or `"dns-01"`. Stored as `verification_method` so the
+    /// renewal scheduler knows how to renew.
+    pub renewal_method: String,
+    /// Required when `renewal_method` is `"dns-01"` and no auto-manage zone
+    /// covers the host.
+    #[serde(default)]
+    pub acknowledge_manual_dns_renewal: bool,
+    /// `true` → full parse and validation, no writes. The identical per-host
+    /// verdicts are returned, giving the operator a preview before committing.
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+impl std::fmt::Debug for ImportTraefikAcmeJsonRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ImportTraefikAcmeJsonRequest")
+            .field("hosts", &self.hosts)
+            .field("renewal_method", &self.renewal_method)
+            .field(
+                "acknowledge_manual_dns_renewal",
+                &self.acknowledge_manual_dns_renewal,
+            )
+            .field("dry_run", &self.dry_run)
+            .field(
+                "acme_json",
+                &format!("<redacted, {} bytes>", self.acme_json.len()),
+            )
+            .finish()
+    }
+}
+
+/// Per-host result from a Path B import.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportedHostVerdict {
+    pub host: String,
+    /// Whether the cert was written (or would be written on `dry_run: false`).
+    pub success: bool,
+    /// Human-readable failure reason when `success` is `false`.
+    pub error: Option<String>,
+    /// ISO 8601 expiry of the imported certificate.
+    pub not_after: Option<String>,
+    /// DNS SANs carried in the imported certificate.
+    pub sans: Vec<String>,
+}
+
+/// Response body for the Path B import endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct ImportTraefikAcmeJsonResponse {
+    pub dry_run: bool,
+    pub total_requested: usize,
+    pub succeeded: usize,
+    pub failed: usize,
+    pub verdicts: Vec<ImportedHostVerdict>,
+}
+
 // ── Service ─────────────────────────────────────────────────────────────────
 
 /// Operator-facing view of Traefik label discovery.
@@ -300,11 +556,105 @@ pub struct TraefikDiscoveryAdminService {
     /// watcher isn't running, so a disabled instance still reports what it
     /// *would* do.
     handle: Arc<TraefikDiscoveryHandle>,
+    /// Optional: TLS provisioner injected by the main binary.
+    /// When `None`, TLS write operations (Path A / Path B) return
+    /// `TraefikDiscoveryAdminError::Upstream` with a clear message.
+    provisioner: Option<Arc<dyn DiscoveredHostTlsProvisioner>>,
 }
 
 impl TraefikDiscoveryAdminService {
     pub fn new(db: Arc<DatabaseConnection>, handle: Arc<TraefikDiscoveryHandle>) -> Self {
-        Self { db, handle }
+        Self {
+            db,
+            handle,
+            provisioner: None,
+        }
+    }
+
+    pub fn with_provisioner(mut self, provisioner: Arc<dyn DiscoveredHostTlsProvisioner>) -> Self {
+        self.provisioner = Some(provisioner);
+        self
+    }
+
+    /// Verify that `host` is not already claimed by a Temps-managed resource
+    /// before writing a TLS authorization record. Called by both Path A and Path B.
+    ///
+    /// Checks, in order:
+    /// 1. `environment_domains` — auto-generated `<env>.<project>.temps.local` and
+    ///    custom environment subdomains.
+    /// 2. `project_custom_domains` — operator-added custom domains.
+    /// 3. `domains` — if a row exists for this host and it is NOT already linked
+    ///    to the current `traefik_route_certificates` row (via `certificate_id`),
+    ///    another resource owns it.
+    ///
+    /// The check is always evaluated fresh from the database — never from a
+    /// stale in-memory set — so a domain added or removed between reconcile
+    /// passes is still caught.
+    async fn check_host_ownership(
+        &self,
+        host: &str,
+        existing_cert_row: Option<&certs::Model>,
+    ) -> Result<(), TraefikDiscoveryAdminError> {
+        // 1. environment_domains
+        let env_domain_count = environment_domains::Entity::find()
+            .filter(environment_domains::Column::Domain.eq(host))
+            .count(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                TraefikDiscoveryAdminError::database(
+                    "checking environment domains for host ownership",
+                    e,
+                )
+            })?;
+        if env_domain_count > 0 {
+            return Err(TraefikDiscoveryAdminError::HostOwned {
+                host: host.to_string(),
+                owner: "an environment subdomain".to_string(),
+            });
+        }
+
+        // 2. project_custom_domains
+        let custom_domain_count = project_custom_domains::Entity::find()
+            .filter(project_custom_domains::Column::Domain.eq(host))
+            .count(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                TraefikDiscoveryAdminError::database(
+                    "checking custom domains for host ownership",
+                    e,
+                )
+            })?;
+        if custom_domain_count > 0 {
+            return Err(TraefikDiscoveryAdminError::HostOwned {
+                host: host.to_string(),
+                owner: "a project custom domain".to_string(),
+            });
+        }
+
+        // 3. domains — a row for this host owned by a different certificate.
+        let domain_row = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(host))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                TraefikDiscoveryAdminError::database("checking domains table for host ownership", e)
+            })?;
+
+        if let Some(domain) = domain_row {
+            // If the existing cert row already points to this domain, we own it.
+            let owned_by_us = existing_cert_row
+                .and_then(|cert| cert.certificate_id)
+                .map(|cert_id| cert_id == domain.id)
+                .unwrap_or(false);
+            if !owned_by_us {
+                return Err(TraefikDiscoveryAdminError::HostOwned {
+                    host: host.to_string(),
+                    owner: format!("a domains row (id={}, status={})", domain.id, domain.status),
+                });
+            }
+        }
+
+        Ok(())
     }
 
     /// Capability + status. Never fails on "discovery is off" — that is a
@@ -380,11 +730,28 @@ impl TraefikDiscoveryAdminService {
             })
             .unwrap_or_default();
 
+        // Bulk-fetch cert rows for this page's hosts in one query.
+        let hosts_on_page: Vec<String> = models.iter().map(|m| m.host.clone()).collect();
+        let cert_rows: Vec<certs::Model> = if hosts_on_page.is_empty() {
+            vec![]
+        } else {
+            certs::Entity::find()
+                .filter(certs::Column::Host.is_in(hosts_on_page))
+                .all(self.db.as_ref())
+                .await
+                .map_err(|e| {
+                    TraefikDiscoveryAdminError::database("loading cert rows for route list", e)
+                })?
+        };
+        let certs_by_host: std::collections::HashMap<&str, &certs::Model> =
+            cert_rows.iter().map(|c| (c.host.as_str(), c)).collect();
+
         let routes = models
             .into_iter()
             .map(|model| {
                 let contested_by = contenders_for_host(&conflicts, &model.host);
-                TraefikDiscoveredRouteResponse::from_model(model, contested_by)
+                let cert = certs_by_host.get(model.host.as_str()).copied();
+                TraefikDiscoveredRouteResponse::from_model(model, contested_by, cert)
             })
             .collect();
 
@@ -437,6 +804,7 @@ impl TraefikDiscoveryAdminService {
             return Ok(TraefikDiscoveredRouteResponse::from_model(
                 model,
                 contested_by,
+                None,
             ));
         }
 
@@ -463,7 +831,407 @@ impl TraefikDiscoveryAdminService {
         Ok(TraefikDiscoveredRouteResponse::from_model(
             updated,
             contested_by,
+            None,
         ))
+    }
+
+    // ── TLS authorization service methods (ADR-041) ──────────────────────────
+
+    /// Path A: authorize ACME issuance for a discovered host.
+    ///
+    /// Validates the host is a live discovered route, checks host ownership,
+    /// persists the authorization record, then delegates to the injected
+    /// `DiscoveredHostTlsProvisioner` to create/update the `domains` row and
+    /// kick off the ACME challenge.
+    pub async fn authorize_acme_cert(
+        &self,
+        host: &str,
+        request: &RequestDiscoveredRouteCertRequest,
+        user_id: i32,
+    ) -> Result<certs::Model, TraefikDiscoveryAdminError> {
+        use sea_orm::IntoActiveModel;
+
+        let host = host.trim().to_ascii_lowercase();
+        if host.is_empty() {
+            return Err(TraefikDiscoveryAdminError::Validation {
+                host: host.clone(),
+                message: "host must not be empty".to_string(),
+            });
+        }
+        if !matches!(request.challenge_type.as_str(), "http-01" | "dns-01") {
+            return Err(TraefikDiscoveryAdminError::Validation {
+                host: host.clone(),
+                message: format!(
+                    "challenge_type must be 'http-01' or 'dns-01', got '{}'",
+                    request.challenge_type
+                ),
+            });
+        }
+
+        // Step 3: host must be an enabled discovered route on the current network.
+        let network = self.handle.config().network.clone();
+        let route = discovered::Entity::find()
+            .filter(discovered::Column::Host.eq(host.clone()))
+            .filter(discovered::Column::Enabled.eq(true))
+            .filter(discovered::Column::Network.eq(network.clone()))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                TraefikDiscoveryAdminError::database(
+                    "looking up discovered route for TLS authorization",
+                    e,
+                )
+            })?
+            .ok_or_else(|| TraefikDiscoveryAdminError::NotFound { host: host.clone() })?;
+
+        // Step 4: look up any existing cert row — needed both for the ownership
+        // check below and for the upsert in Step 5.
+        let existing = certs::Entity::find()
+            .filter(certs::Column::Host.eq(host.clone()))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                TraefikDiscoveryAdminError::database("looking up cert authorization record", e)
+            })?;
+
+        // Step 4b: host ownership check — verify the host is not already claimed
+        // by an environment subdomain, a project custom domain, or a `domains`
+        // row that a different cert record (or no cert record) owns. Evaluated
+        // fresh from the DB, never from a stale reconcile-time set.
+        self.check_host_ownership(&host, existing.as_ref()).await?;
+
+        // Step 5: delegate to provisioner BEFORE writing the authorization record
+        // so a provisioner failure doesn't leave a permanently-authorized row
+        // with no certificate behind it.
+        if let Some(prov) = &self.provisioner {
+            prov.request_acme_cert(&host, &request.challenge_type)
+                .await
+                .map_err(|e| match e {
+                    TlsProvisionerError::VerificationMethodConflict {
+                        stored, declared, ..
+                    } => TraefikDiscoveryAdminError::VerificationMethodConflict {
+                        host: host.clone(),
+                        stored,
+                        declared,
+                    },
+                    TlsProvisionerError::Failed { reason, .. } => {
+                        TraefikDiscoveryAdminError::Upstream {
+                            host: host.clone(),
+                            reason,
+                        }
+                    }
+                })?;
+        }
+
+        // Step 6: persist or update the authorization record now that the
+        // provisioner has confirmed success.
+        let now = chrono::Utc::now();
+        let cert_row = if let Some(existing) = existing {
+            let mut active = existing.into_active_model();
+            active.cert_authorized = Set(true);
+            active.authorized_at = Set(Some(now));
+            active.authorized_by_user_id = Set(Some(user_id));
+            active.authorized_network = Set(network.clone());
+            active.authorized_container_id = Set(route.target_container_id.clone());
+            active.authorized_container_name = Set(route.target_container_name.clone());
+            active.renewal_method = Set(request.challenge_type.clone());
+            active.source = Set("acme".to_string());
+            // Clear any existing drift state when re-authorizing.
+            active.container_drift_detected_at = Set(None);
+            active.last_drift_alarmed_container_id = Set(None);
+            active.update(self.db.as_ref()).await.map_err(|e| {
+                TraefikDiscoveryAdminError::database("updating cert authorization record", e)
+            })?
+        } else {
+            certs::ActiveModel {
+                host: Set(host.clone()),
+                cert_authorized: Set(true),
+                authorized_at: Set(Some(now)),
+                authorized_by_user_id: Set(Some(user_id)),
+                authorized_network: Set(network.clone()),
+                authorized_container_id: Set(route.target_container_id.clone()),
+                authorized_container_name: Set(route.target_container_name.clone()),
+                container_drift_detected_at: Set(None),
+                last_drift_alarmed_container_id: Set(None),
+                renewal_method: Set(request.challenge_type.clone()),
+                source: Set("acme".to_string()),
+                certificate_id: Set(None),
+                imported_at: Set(None),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                TraefikDiscoveryAdminError::database("inserting cert authorization record", e)
+            })?
+        };
+
+        Ok(cert_row)
+    }
+
+    /// DELETE path: clear `cert_authorized` on the authorization record.
+    ///
+    /// Does NOT delete the `domains` row or the certificate — deleting live
+    /// key material as a side effect of deauthorization would be a surprise.
+    /// The existing domain-deletion endpoint is the way to do that.
+    pub async fn deauthorize_cert(&self, host: &str) -> Result<(), TraefikDiscoveryAdminError> {
+        use sea_orm::IntoActiveModel;
+
+        let host = host.trim().to_ascii_lowercase();
+        let row = certs::Entity::find()
+            .filter(certs::Column::Host.eq(host.clone()))
+            .one(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                TraefikDiscoveryAdminError::database("looking up cert authorization record", e)
+            })?
+            .ok_or_else(|| TraefikDiscoveryAdminError::NotFound { host: host.clone() })?;
+
+        let mut active = row.into_active_model();
+        active.cert_authorized = Set(false);
+        active
+            .update(self.db.as_ref())
+            .await
+            .map_err(|e| TraefikDiscoveryAdminError::database("deauthorizing cert", e))?;
+
+        Ok(())
+    }
+
+    /// Path B: import certificates from a Traefik `acme.json` document.
+    ///
+    /// Runs the full 8-step validation chain (via `cert_validator`) for each
+    /// requested host, then writes authorization records and certificate
+    /// material (unless `dry_run` is true).
+    pub async fn import_acme_json(
+        &self,
+        request: &ImportTraefikAcmeJsonRequest,
+        user_id: i32,
+    ) -> Result<ImportTraefikAcmeJsonResponse, TraefikDiscoveryAdminError> {
+        use crate::services::cert_validator::{
+            find_entries_for_host, parse_acme_json, validate_cert_entry, RawCertEntry,
+        };
+        use sea_orm::IntoActiveModel;
+
+        if !matches!(request.renewal_method.as_str(), "http-01" | "dns-01") {
+            return Err(TraefikDiscoveryAdminError::Validation {
+                host: String::new(),
+                message: format!(
+                    "renewal_method must be 'http-01' or 'dns-01', got '{}'",
+                    request.renewal_method
+                ),
+            });
+        }
+
+        // Parse the acme.json document once.
+        let entries = parse_acme_json(&request.acme_json).map_err(|e| {
+            TraefikDiscoveryAdminError::Validation {
+                host: String::new(),
+                message: format!("Failed to parse acme.json: {e}"),
+            }
+        })?;
+
+        let network = self.handle.config().network.clone();
+        let now = chrono::Utc::now();
+
+        let mut verdicts: Vec<ImportedHostVerdict> = Vec::with_capacity(request.hosts.len());
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
+
+        for host in &request.hosts {
+            let host_normalized = host.trim().to_ascii_lowercase();
+
+            // Step 1: host must be an enabled discovered route on the current network.
+            let route = match discovered::Entity::find()
+                .filter(discovered::Column::Host.eq(host_normalized.clone()))
+                .filter(discovered::Column::Enabled.eq(true))
+                .filter(discovered::Column::Network.eq(network.clone()))
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| {
+                    TraefikDiscoveryAdminError::database("looking up discovered route", e)
+                })? {
+                Some(r) => r,
+                None => {
+                    failed += 1;
+                    verdicts.push(ImportedHostVerdict {
+                        host: host_normalized.clone(),
+                        success: false,
+                        error: Some(format!(
+                            "No enabled discovered route for '{host_normalized}' on network '{network}'"
+                        )),
+                        not_after: None,
+                        sans: vec![],
+                    });
+                    continue;
+                }
+            };
+
+            // Find matching entries in the parsed document by X.509 SAN.
+            let matching = find_entries_for_host(&entries, &host_normalized);
+            if matching.is_empty() {
+                failed += 1;
+                verdicts.push(ImportedHostVerdict {
+                    host: host_normalized.clone(),
+                    success: false,
+                    error: Some(format!(
+                        "No certificate in acme.json covers '{host_normalized}' (checked X.509 SANs)"
+                    )),
+                    not_after: None,
+                    sans: vec![],
+                });
+                continue;
+            }
+
+            // Use the first matching entry (there should usually be exactly one).
+            let acme_entry = matching[0];
+            let raw = RawCertEntry {
+                host: host_normalized.clone(),
+                certificate_pem: acme_entry.certificate_pem.clone(),
+                key_pem: acme_entry.key_pem.clone(),
+            };
+
+            // Steps 2–6, 8: run the full validation chain.
+            let validated = match validate_cert_entry(&raw) {
+                Ok(v) => v,
+                Err(e) => {
+                    failed += 1;
+                    verdicts.push(ImportedHostVerdict {
+                        host: host_normalized.clone(),
+                        success: false,
+                        error: Some(e.to_string()),
+                        not_after: None,
+                        sans: vec![],
+                    });
+                    continue;
+                }
+            };
+
+            let not_after_str = validated.not_after.to_rfc3339();
+            let sans = validated.sans.clone();
+
+            // Fetch the existing cert authorization record for this host now,
+            // before any write.  We need it both for the ownership check and to
+            // decide whether to INSERT or UPDATE below.
+            let existing_cert = certs::Entity::find()
+                .filter(certs::Column::Host.eq(host_normalized.clone()))
+                .one(self.db.as_ref())
+                .await
+                .map_err(|e| {
+                    TraefikDiscoveryAdminError::database("looking up cert authorization record", e)
+                })?;
+
+            // Check host ownership: reject hosts that belong to another resource
+            // (environment subdomain, custom domain, or a different cert row in
+            // the `domains` table) before writing anything.
+            if let Err(e) = self
+                .check_host_ownership(&host_normalized, existing_cert.as_ref())
+                .await
+            {
+                failed += 1;
+                verdicts.push(ImportedHostVerdict {
+                    host: host_normalized.clone(),
+                    success: false,
+                    error: Some(e.to_string()),
+                    not_after: Some(not_after_str),
+                    sans,
+                });
+                continue;
+            }
+
+            if !request.dry_run {
+                // Write: delegate to provisioner, then upsert authorization record.
+                let certificate_id = if let Some(prov) = &self.provisioner {
+                    match prov
+                        .save_imported_cert(
+                            &host_normalized,
+                            &validated.certificate_pem,
+                            &validated.key_pem,
+                            &request.renewal_method,
+                        )
+                        .await
+                    {
+                        Ok(id) => Some(id),
+                        Err(e) => {
+                            failed += 1;
+                            verdicts.push(ImportedHostVerdict {
+                                host: host_normalized.clone(),
+                                success: false,
+                                error: Some(format!("Provisioner error: {e}")),
+                                not_after: Some(not_after_str),
+                                sans,
+                            });
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(existing) = existing_cert {
+                    let mut active = existing.into_active_model();
+                    active.cert_authorized = Set(true);
+                    active.authorized_at = Set(Some(now));
+                    active.authorized_by_user_id = Set(Some(user_id));
+                    active.authorized_network = Set(network.clone());
+                    active.authorized_container_id = Set(route.target_container_id.clone());
+                    active.authorized_container_name = Set(route.target_container_name.clone());
+                    active.renewal_method = Set(request.renewal_method.clone());
+                    active.source = Set("imported".to_string());
+                    active.certificate_id = Set(certificate_id);
+                    active.imported_at = Set(Some(now));
+                    active.container_drift_detected_at = Set(None);
+                    active.last_drift_alarmed_container_id = Set(None);
+                    active.update(self.db.as_ref()).await.map_err(|e| {
+                        TraefikDiscoveryAdminError::database(
+                            "updating cert authorization record",
+                            e,
+                        )
+                    })?;
+                } else {
+                    certs::ActiveModel {
+                        host: Set(host_normalized.clone()),
+                        cert_authorized: Set(true),
+                        authorized_at: Set(Some(now)),
+                        authorized_by_user_id: Set(Some(user_id)),
+                        authorized_network: Set(network.clone()),
+                        authorized_container_id: Set(route.target_container_id.clone()),
+                        authorized_container_name: Set(route.target_container_name.clone()),
+                        container_drift_detected_at: Set(None),
+                        last_drift_alarmed_container_id: Set(None),
+                        renewal_method: Set(request.renewal_method.clone()),
+                        source: Set("imported".to_string()),
+                        certificate_id: Set(certificate_id),
+                        imported_at: Set(Some(now)),
+                        ..Default::default()
+                    }
+                    .insert(self.db.as_ref())
+                    .await
+                    .map_err(|e| {
+                        TraefikDiscoveryAdminError::database(
+                            "inserting cert authorization record",
+                            e,
+                        )
+                    })?;
+                }
+            }
+
+            succeeded += 1;
+            verdicts.push(ImportedHostVerdict {
+                host: host_normalized.clone(),
+                success: true,
+                error: None,
+                not_after: Some(not_after_str),
+                sans,
+            });
+        }
+
+        Ok(ImportTraefikAcmeJsonResponse {
+            dry_run: request.dry_run,
+            total_requested: request.hosts.len(),
+            succeeded,
+            failed,
+            verdicts,
+        })
     }
 
     /// Container names that lost a collision for `host` in the last pass.
@@ -617,6 +1385,8 @@ mod tests {
                 route_model("app.example.com", true),
                 route_model("suppressed.example.com", false),
             ]])
+            // Cert rows lookup: no certs authorized for these hosts.
+            .append_query_results([Vec::<certs::Model>::new()])
             .into_connection();
         let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
 

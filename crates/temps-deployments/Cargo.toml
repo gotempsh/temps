@@ -75,6 +75,11 @@ regex = { workspace = true }
 # ClientConfig presenting the CP's cluster-CA-signed identity.
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
+# ADR-041 §5: X.509 leaf parsing for certificate import validation.
+x509-parser = "0.18.0"
+# ADR-041 §5: rustls key types for CryptoProvider-based sign/verify.
+rustls-pki-types = "1.12.0"
+base64 = "0.23"
 
 [dev-dependencies]
 testcontainers = { workspace = true }
@@ -83,6 +88,13 @@ mockall = "0.15"
 tower = { workspace = true }
 env_logger = "0.11"
 serial_test = "4.0"
+# ADR-041 tests: generate self-signed certs for cert_validator unit tests.
+rcgen = { version = "0.14.8", features = ["x509-parser"] }
+# Key re-encoding for SEC1 (EC) and PKCS#1 (RSA) coverage (ADR-041 verification table).
+# All three crates are already vendored as transitive dependencies; adding them here
+# only exposes their encoding APIs to the test binary, without new network downloads.
+p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+rsa = { version = "0.9", features = ["pem"] }
 
 [features]
 default = []

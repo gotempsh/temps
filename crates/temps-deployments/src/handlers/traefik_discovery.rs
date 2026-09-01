@@ -18,10 +18,11 @@
 
 use std::sync::Arc;
 
+use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::{
     extract::{Path, Query, State},
-    routing::{get, patch},
+    routing::{get, patch, post},
     Extension, Json, Router,
 };
 use serde::Deserialize;
@@ -31,11 +32,16 @@ use temps_core::{AuditContext, RequestMetadata};
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
-use super::audit::TraefikDiscoveredRouteToggledAudit;
+use super::audit::{
+    TraefikDiscoveredRouteCertDeauthorizedAudit, TraefikDiscoveredRouteCertImportedAudit,
+    TraefikDiscoveredRouteCertRequestedAudit, TraefikDiscoveredRouteToggledAudit,
+};
 use crate::services::traefik_discovery_service::{
-    TraefikDiscoveredRouteListResponse, TraefikDiscoveredRouteResponse, TraefikDiscoveryAdminError,
-    TraefikDiscoveryAdminService, TraefikDiscoveryConflictResponse, TraefikDiscoverySetupResponse,
-    TraefikDiscoveryStatusResponse, TraefikReconciliationResponse,
+    ImportTraefikAcmeJsonRequest, ImportTraefikAcmeJsonResponse, ImportedHostVerdict,
+    RequestDiscoveredRouteCertRequest, TraefikDiscoveredRouteListResponse,
+    TraefikDiscoveredRouteResponse, TraefikDiscoveryAdminError, TraefikDiscoveryAdminService,
+    TraefikDiscoveryConflictResponse, TraefikDiscoverySetupResponse,
+    TraefikDiscoveryStatusResponse, TraefikReconciliationResponse, TraefikRouteTlsBlock,
     UpdateTraefikRouteEnabledRequest,
 };
 
@@ -59,6 +65,26 @@ impl From<TraefikDiscoveryAdminError> for Problem {
                     .with_title("Validation Error")
                     .with_detail(error.to_string())
             }
+            TraefikDiscoveryAdminError::HostOwned { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Host Already Owned")
+                    .with_detail(error.to_string())
+            }
+            TraefikDiscoveryAdminError::VerificationMethodConflict { .. } => {
+                problemdetails::new(StatusCode::CONFLICT)
+                    .with_title("Verification Method Conflict")
+                    .with_detail(error.to_string())
+            }
+            TraefikDiscoveryAdminError::CertificateValidation { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Certificate Validation Failed")
+                    .with_detail(error.to_string())
+            }
+            TraefikDiscoveryAdminError::Upstream { .. } => {
+                problemdetails::new(StatusCode::BAD_GATEWAY)
+                    .with_title("TLS Provisioner Error")
+                    .with_detail(error.to_string())
+            }
             TraefikDiscoveryAdminError::Database { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
@@ -76,12 +102,19 @@ pub struct ListDiscoveredRoutesQuery {
     pub page_size: Option<u64>,
 }
 
+/// 1 MiB body cap on the Path B import endpoint — matches the cap stated in
+/// ADR-041 §4 and the pattern used in `temps-error-tracking`.
+const IMPORT_BODY_LIMIT: usize = 1024 * 1024;
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
         get_traefik_discovery_status,
         list_traefik_discovered_routes,
         set_traefik_discovered_route_enabled,
+        request_discovered_route_cert,
+        deauthorize_discovered_route_cert,
+        import_traefik_acme_json,
     ),
     components(schemas(
         TraefikDiscoveryStatusResponse,
@@ -92,12 +125,18 @@ pub struct ListDiscoveredRoutesQuery {
         TraefikDiscoveredRouteListResponse,
         UpdateTraefikRouteEnabledRequest,
         ListDiscoveredRoutesQuery,
+        TraefikRouteTlsBlock,
+        RequestDiscoveredRouteCertRequest,
+        ImportTraefikAcmeJsonRequest,
+        ImportTraefikAcmeJsonResponse,
+        ImportedHostVerdict,
     )),
     info(
         title = "Traefik Discovery API",
         description = "Operator API for live Traefik-label route discovery: whether it is \
         enabled on this instance, which containers it adopted, why a labelled container is \
-        not being routed, and a per-route kill switch.",
+        not being routed, a per-route kill switch, and TLS certificate management for \
+        discovered routes (ADR-041).",
         version = "1.0.0"
     )
 )]
@@ -117,6 +156,22 @@ pub fn configure_routes() -> Router<Arc<TraefikDiscoveryAppState>> {
         .route(
             "/traefik-discovery/routes/{host}/enabled",
             patch(set_traefik_discovered_route_enabled),
+        )
+        .route(
+            "/traefik-discovery/routes/{host}/certificate",
+            // POST body is a small JSON object (challenge_type + one bool).
+            // 8 KiB is generous; it prevents unbounded request bodies that
+            // cannot affect the application (ADR-041 §4).
+            post(request_discovered_route_cert)
+                .layer(DefaultBodyLimit::max(8 * 1024))
+                .delete(deauthorize_discovered_route_cert),
+        )
+        // 1 MiB body limit applied as a route-level layer (ADR-041 §4).
+        // Never add a RequestDecompressionLayer to this router — the 1 MiB cap's
+        // security properties depend on the absence of decompression here.
+        .route(
+            "/traefik-discovery/tls/import",
+            post(import_traefik_acme_json).layer(DefaultBodyLimit::max(IMPORT_BODY_LIMIT)),
         )
 }
 
@@ -253,6 +308,222 @@ async fn set_traefik_discovered_route_enabled(
     }
 
     Ok(Json(route))
+}
+
+// ── ADR-041 TLS handlers ─────────────────────────────────────────────────────
+
+/// Request Temps to issue an ACME certificate for a discovered route (Path A).
+///
+/// The operator explicitly authorizes issuance; `cert_eligible` stays `false`
+/// so the container's own labels can never trigger this. Both `SettingsWrite`
+/// and `DomainsCreate` are required: `SettingsWrite` is Admin/PlatformAdmin
+/// only, so any caller reaching this endpoint is already an administrator.
+///
+/// The authorization is recorded against the container identity currently
+/// serving the host (§2a). Container drift after authorization fires a Critical
+/// alarm but does not auto-clear `cert_authorized` — auto-clearing would not
+/// remove the certificate and would be a DoS primitive (ADR-041 §2a).
+#[utoipa::path(
+    tag = "Traefik Discovery",
+    post,
+    path = "/traefik-discovery/routes/{host}/certificate",
+    params(
+        ("host" = String, Path, description = "Hostname of the discovered route")
+    ),
+    request_body = RequestDiscoveredRouteCertRequest,
+    responses(
+        (status = 201, description = "TLS authorization created and ACME challenge initiated"),
+        (status = 400, description = "Validation error (e.g. unsupported challenge_type)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "No discovered route for that host"),
+        (status = 409, description = "Host owned by another resource, or verification_method conflict"),
+        (status = 422, description = "Certificate validation failed"),
+        (status = 502, description = "TLS provisioner error (ACME upstream failure)"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn request_discovered_route_cert(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<TraefikDiscoveryAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(host): Path<String>,
+    Json(request): Json<RequestDiscoveredRouteCertRequest>,
+) -> Result<impl axum::response::IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, DomainsCreate);
+
+    let user_id = auth.user_id();
+    let cert_row = app_state
+        .traefik_discovery_service
+        .authorize_acme_cert(&host, &request, user_id)
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to authorize ACME cert for discovered route '{}': {}",
+                host, e
+            );
+            Problem::from(e)
+        })?;
+
+    let audit = TraefikDiscoveredRouteCertRequestedAudit {
+        context: AuditContext {
+            user_id,
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        host: cert_row.host.clone(),
+        container_id: cert_row.authorized_container_id.clone(),
+        container_name: cert_row.authorized_container_name.clone(),
+        renewal_method: cert_row.renewal_method.clone(),
+        dns01_zone: None,
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for ACME cert request on '{}': {}",
+            cert_row.host, e
+        );
+    }
+
+    Ok(StatusCode::CREATED)
+}
+
+/// Remove TLS authorization for a discovered route.
+///
+/// Clears `cert_authorized` so Temps stops attempting renewal. Does **not**
+/// delete the `domains` row or the certificate — deleting live key material as
+/// a side effect of deauthorization is the kind of surprise this codebase
+/// avoids. Use `DELETE /domains/{host}` to remove the certificate itself.
+#[utoipa::path(
+    tag = "Traefik Discovery",
+    delete,
+    path = "/traefik-discovery/routes/{host}/certificate",
+    params(
+        ("host" = String, Path, description = "Hostname of the discovered route")
+    ),
+    responses(
+        (status = 204, description = "TLS authorization cleared"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 404, description = "No authorization record for that host"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn deauthorize_discovered_route_cert(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<TraefikDiscoveryAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Path(host): Path<String>,
+) -> Result<impl axum::response::IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, DomainsCreate);
+
+    app_state
+        .traefik_discovery_service
+        .deauthorize_cert(&host)
+        .await
+        .map_err(|e| {
+            error!(
+                "Failed to deauthorize cert for discovered route '{}': {}",
+                host, e
+            );
+            Problem::from(e)
+        })?;
+
+    let audit = TraefikDiscoveredRouteCertDeauthorizedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        host: host.clone(),
+    };
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for cert deauthorization on '{}': {}",
+            host, e
+        );
+    }
+
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Import certificates from a Traefik `acme.json` document (Path B).
+///
+/// Upload the raw contents of Traefik's `acme.json` and a list of hosts to
+/// import. Each host is independently validated (8-step chain from ADR-041 §5)
+/// and a per-host verdict is returned. `dry_run: true` runs all validation
+/// without writing anything, so the operator can preview before committing.
+///
+/// The request body is capped at 1 MiB. Do **not** add a decompression layer
+/// to this route — the 1 MiB cap's security properties depend on the absence
+/// of decompression here (ADR-041 §4).
+#[utoipa::path(
+    tag = "Traefik Discovery",
+    post,
+    path = "/traefik-discovery/tls/import",
+    request_body = ImportTraefikAcmeJsonRequest,
+    responses(
+        (status = 200, description = "Import results (per-host verdicts)", body = ImportTraefikAcmeJsonResponse),
+        (status = 400, description = "Validation error (malformed JSON, unsupported renewal_method)"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 413, description = "Request body exceeds the 1 MiB limit"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn import_traefik_acme_json(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<TraefikDiscoveryAppState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(request): Json<ImportTraefikAcmeJsonRequest>,
+) -> Result<Json<ImportTraefikAcmeJsonResponse>, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, DomainsCreate);
+
+    let user_id = auth.user_id();
+    let response = app_state
+        .traefik_discovery_service
+        .import_acme_json(&request, user_id)
+        .await
+        .map_err(|e| {
+            error!("Failed to import acme.json: {}", e);
+            Problem::from(e)
+        })?;
+
+    let imported_hosts: Vec<String> = response
+        .verdicts
+        .iter()
+        .filter(|v| v.success)
+        .map(|v| v.host.clone())
+        .collect();
+    let failed_hosts: Vec<String> = response
+        .verdicts
+        .iter()
+        .filter(|v| !v.success)
+        .map(|v| v.host.clone())
+        .collect();
+
+    if !request.dry_run {
+        let audit = TraefikDiscoveredRouteCertImportedAudit {
+            context: AuditContext {
+                user_id,
+                ip_address: Some(metadata.ip_address.clone()),
+                user_agent: metadata.user_agent.clone(),
+            },
+            imported_hosts,
+            failed_hosts,
+            entries_parsed: response.total_requested,
+        };
+        if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+            error!("Failed to create audit log for acme.json import: {}", e);
+        }
+    }
+
+    Ok(Json(response))
 }
 
 #[cfg(test)]
@@ -426,6 +697,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![count_row(1)]])
             .append_query_results([vec![route_model("app.example.com", true)]])
+            // Cert rows lookup: no cert authorized for this host.
+            .append_query_results([Vec::<temps_entities::traefik_route_certificates::Model>::new()])
             .into_connection();
 
         let response = list_traefik_discovered_routes(
@@ -543,6 +816,8 @@ mod tests {
             "/traefik-discovery/status",
             "/traefik-discovery/routes",
             "/traefik-discovery/routes/{host}/enabled",
+            "/traefik-discovery/routes/{host}/certificate",
+            "/traefik-discovery/tls/import",
         ] {
             assert!(
                 paths.contains_key(expected),
@@ -550,6 +825,170 @@ mod tests {
                 paths.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn cert_endpoints_declare_host_path_parameter() {
+        let spec = TraefikDiscoveryApiDoc::openapi();
+        let item = spec
+            .paths
+            .paths
+            .get("/traefik-discovery/routes/{host}/certificate")
+            .expect("certificate path must exist");
+
+        for op in [item.post.as_ref(), item.delete.as_ref()] {
+            let op = op.expect("POST and DELETE must both exist");
+            let params = op
+                .parameters
+                .as_ref()
+                .expect("cert operations must declare path parameters");
+            assert!(
+                params.iter().any(|p| p.name == "host"),
+                "`host` path parameter must be declared on cert operation"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn request_cert_rejects_caller_without_settings_write() {
+        let state = state_with(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+
+        let result = request_discovered_route_cert(
+            user_auth(Role::User),
+            State(state),
+            request_metadata(),
+            Path("app.example.com".to_string()),
+            Json(RequestDiscoveredRouteCertRequest {
+                challenge_type: "http-01".to_string(),
+                acknowledge_manual_dns_renewal: false,
+            }),
+        )
+        .await;
+
+        match result {
+            Err(prob) => assert_eq!(prob.status_code, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("a plain User must not authorize TLS"),
+        }
+    }
+
+    #[tokio::test]
+    async fn deauthorize_cert_rejects_caller_without_settings_write() {
+        let state = state_with(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+
+        let result = deauthorize_discovered_route_cert(
+            user_auth(Role::User),
+            State(state),
+            request_metadata(),
+            Path("app.example.com".to_string()),
+        )
+        .await;
+
+        match result {
+            Err(prob) => assert_eq!(prob.status_code, StatusCode::FORBIDDEN),
+            Ok(_) => panic!("a plain User must not deauthorize TLS"),
+        }
+    }
+
+    #[tokio::test]
+    async fn import_acme_json_rejects_caller_without_settings_write() {
+        let state = state_with(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+
+        let err = import_traefik_acme_json(
+            user_auth(Role::User),
+            State(state),
+            request_metadata(),
+            Json(ImportTraefikAcmeJsonRequest {
+                acme_json: "{}".to_string(),
+                hosts: vec![],
+                renewal_method: "http-01".to_string(),
+                acknowledge_manual_dns_renewal: false,
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect_err("a plain User must not import acme.json");
+
+        assert_eq!(err.status_code, StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn import_acme_json_dry_run_empty_hosts_returns_empty_verdicts() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let state = state_with(db);
+
+        let response = import_traefik_acme_json(
+            user_auth(Role::Admin),
+            State(state),
+            request_metadata(),
+            Json(ImportTraefikAcmeJsonRequest {
+                acme_json: r#"{"r1": {"Certificates": []}}"#.to_string(),
+                hosts: vec![],
+                renewal_method: "http-01".to_string(),
+                acknowledge_manual_dns_renewal: false,
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect("empty import must succeed");
+
+        let Json(result) = response;
+        assert!(result.dry_run);
+        assert_eq!(result.total_requested, 0);
+        assert_eq!(result.succeeded, 0);
+        assert_eq!(result.failed, 0);
+        assert!(result.verdicts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn import_acme_json_rejects_invalid_renewal_method() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let state = state_with(db);
+
+        let err = import_traefik_acme_json(
+            user_auth(Role::Admin),
+            State(state),
+            request_metadata(),
+            Json(ImportTraefikAcmeJsonRequest {
+                acme_json: "{}".to_string(),
+                hosts: vec!["app.example.com".to_string()],
+                renewal_method: "manual".to_string(), // invalid
+                acknowledge_manual_dns_renewal: false,
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect_err("invalid renewal_method must be rejected");
+
+        assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn import_acme_json_returns_per_host_failure_for_unknown_host() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // Route lookup for "app.example.com" returns empty.
+            .append_query_results([Vec::<discovered::Model>::new()])
+            .into_connection();
+        let state = state_with(db);
+
+        let response = import_traefik_acme_json(
+            user_auth(Role::Admin),
+            State(state),
+            request_metadata(),
+            Json(ImportTraefikAcmeJsonRequest {
+                acme_json: r#"{"r1": {"Certificates": []}}"#.to_string(),
+                hosts: vec!["app.example.com".to_string()],
+                renewal_method: "http-01".to_string(),
+                acknowledge_manual_dns_renewal: false,
+                dry_run: true,
+            }),
+        )
+        .await
+        .expect("import must not fail for a missing host — it returns a per-host verdict");
+
+        let Json(result) = response;
+        assert_eq!(result.failed, 1);
+        assert_eq!(result.succeeded, 0);
+        assert!(!result.verdicts[0].success);
     }
 
     #[test]

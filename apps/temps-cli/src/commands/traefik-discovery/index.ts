@@ -13,6 +13,7 @@ import type {
   TraefikDiscoveredRouteResponse,
   TraefikDiscoveryConflictResponse,
 } from '../../api/types.gen.js'
+import { registerTraefikDiscoveryTlsCommands } from './tls.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import {
@@ -113,6 +114,9 @@ export function registerTraefikDiscoveryCommands(program: Command): void {
     )
     .option('--json', 'Output in JSON format')
     .action((host: string, options: { json?: boolean }) => setEnabledAction(host, false, options))
+
+  // ADR-041: TLS management subcommands.
+  registerTraefikDiscoveryTlsCommands(discovery)
 }
 
 // ============================================================================

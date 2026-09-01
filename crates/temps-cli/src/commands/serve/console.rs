@@ -37,6 +37,7 @@ use temps_core::templates::TemplateService;
 use temps_core::{CookieCrypto, EncryptionService};
 use temps_database::DbConnection;
 use temps_deployer::plugin::DeployerPlugin;
+use temps_deployer::traefik_discovery::DriftAlarmSink;
 use temps_deployments::DeploymentsPlugin;
 use temps_dns::DnsPlugin;
 use temps_domains::DomainsPlugin;
@@ -2800,6 +2801,62 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         tracing::warn!(
             "ConfigService or AlarmService not available - disk space monitoring disabled."
         );
+    }
+
+    // ADR-041 §2a: wire the alarm service into the Traefik discovery watcher so
+    // certificate-drift events are visible in the alarm panel, not just in logs.
+    // This must run after MonitoringPlugin (step 9.8) has registered AlarmService.
+    // We bridge via `DriftAlarmSink` to avoid a dependency cycle
+    // (temps-monitoring depends on temps-deployer).
+    if let Some(alarm_service) = service_context.get_service::<AlarmService>() {
+        struct AlarmServiceDriftSink(Arc<AlarmService>);
+        #[async_trait::async_trait]
+        impl DriftAlarmSink for AlarmServiceDriftSink {
+            async fn notify_container_drift(
+                &self,
+                host: String,
+                authorized_container: String,
+                current_container: String,
+            ) {
+                use temps_monitoring::alarm_service::{AlarmSeverity, AlarmType, FireAlarmRequest};
+                let detail = format!(
+                    "Host '{host}' is now served by container '{current}' but TLS was \
+                     authorized for container '{authorized}'. The certificate is still \
+                     valid but may be delivered to the wrong container if the new one is \
+                     not legitimate. Deauthorize and re-authorize once the correct \
+                     container is confirmed.",
+                    host = host,
+                    current = current_container,
+                    authorized = authorized_container,
+                );
+                let metadata = serde_json::json!({
+                    "host": host,
+                    "authorized_container": authorized_container,
+                    "current_container": current_container,
+                });
+                let request = FireAlarmRequest {
+                    project_id: None,
+                    environment_id: None,
+                    deployment_id: None,
+                    container_id: None,
+                    service_id: None,
+                    alarm_type: AlarmType::TraefikContainerDrift,
+                    severity: AlarmSeverity::Critical,
+                    title: format!("Certificate drift: {host}"),
+                    message: detail,
+                    metadata: Some(metadata),
+                };
+                if let Err(e) = self.0.fire_alarm(request).await {
+                    tracing::error!(
+                        host = %host,
+                        error = %e,
+                        "Failed to fire TraefikContainerDrift alarm; drift is still \
+                         recorded in the database"
+                    );
+                }
+            }
+        }
+        traefik_discovery.inject_alarm_sink(Arc::new(AlarmServiceDriftSink(alarm_service)));
     }
 
     // Start alarm service, outage detection, and container health monitoring.

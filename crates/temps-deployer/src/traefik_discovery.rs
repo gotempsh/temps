@@ -61,16 +61,39 @@ use chrono::{DateTime, Utc};
 use futures_util::StreamExt;
 use sea_orm::sea_query::OnConflict;
 use sea_orm::{
-    ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait,
-    QueryFilter, Statement,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr,
+    EntityTrait, IntoActiveModel, QueryFilter, Statement,
 };
 use temps_core::route_table::RouteTableRefresher;
 use temps_core::{AppSettings, PublicHostnameStrategy};
 use temps_entities::traefik_discovered_routes as discovered;
+use temps_entities::traefik_route_certificates as route_certs;
+// No direct dependency on temps-monitoring here: that crate depends on
+// temps-deployer itself, which would create a cycle.  Instead we define a
+// narrow trait that the alarm service adapter (wired in console.rs) implements.
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
 use crate::traefik_labels::{self, ResolvedRouter};
+
+/// Narrow trait for firing a Critical alarm when certificate drift is detected.
+///
+/// This is the seam between `temps-deployer` and `temps-monitoring`.
+/// `temps-monitoring` depends on `temps-deployer`, so we cannot depend on it
+/// directly (cycle).  `console.rs` bridges the gap by creating an adapter that
+/// wraps the concrete `AlarmService` and injects it via
+/// [`TraefikDiscoveryService::inject_alarm_sink`].
+#[async_trait::async_trait]
+pub trait DriftAlarmSink: Send + Sync {
+    /// Fire a Critical alarm for the given drift event.
+    /// Errors are logged by the implementation; callers do not need to handle them.
+    async fn notify_container_drift(
+        &self,
+        host: String,
+        authorized_container: String,
+        current_container: String,
+    );
+}
 
 /// Environment variable that opts an installation into label discovery.
 pub const ENABLED_ENV: &str = "TEMPS_TRAEFIK_DISCOVERY_ENABLED";
@@ -233,7 +256,7 @@ impl ReconcileOutcome {
 
 /// A route candidate derived from one container's labels.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct RouteCandidate {
+pub(crate) struct RouteCandidate {
     host: String,
     router_name: String,
     container_id: String,
@@ -299,6 +322,112 @@ pub struct TraefikDiscoveryService {
     /// `None` means "not primed yet": fall back to querying, because an empty
     /// set and an unknown set must not be confused.
     tracked_containers: std::sync::RwLock<Option<HashSet<String>>>,
+    /// ADR-041 §2a: alarm sink injected after construction (via
+    /// [`Self::inject_alarm_sink`]) so the watcher fires a Critical alarm
+    /// when certificate drift is detected — not just a log line.
+    ///
+    /// `OnceLock` is used because the service is constructed before the plugin
+    /// system (which registers `AlarmService`) has run. The first reconcile
+    /// pass starts later; by that point the sink is always set.
+    alarm_sink: std::sync::OnceLock<Arc<dyn DriftAlarmSink>>,
+}
+
+/// ADR-041 §2a: Free function core of drift detection. Separated from
+/// `TraefikDiscoveryService` so unit tests can exercise it via `MockDatabase`
+/// without needing a live Docker daemon.
+///
+/// Rules:
+/// - Only checks hosts on `network`.
+/// - Drift when a `cert_authorized = true` row's `authorized_container_id`
+///   differs from the current candidate's `container_id`.
+/// - When a certified host has *no* current candidate (container left the
+///   network entirely), that is also drift.
+/// - `cert_authorized` is NEVER cleared: auto-clearing would not remove the
+///   certificate and would be a DoS primitive (ADR-041 §2a).
+/// - `last_drift_alarmed_container_id` deduplicates: the alarm fires at most
+///   once per unique current container so a steady-state drift is not noisy.
+pub(crate) async fn check_certificate_drift_for(
+    db: &DatabaseConnection,
+    network: &str,
+    candidates: &HashMap<String, RouteCandidate>,
+    alarm_sink: Option<&dyn DriftAlarmSink>,
+) -> Result<(), TraefikDiscoveryError> {
+    let cert_rows = route_certs::Entity::find()
+        .filter(route_certs::Column::CertAuthorized.eq(true))
+        .filter(route_certs::Column::AuthorizedNetwork.eq(network.to_string()))
+        .all(db)
+        .await
+        .map_err(|source| TraefikDiscoveryError::Database {
+            network: network.to_string(),
+            operation: "load cert rows for drift check".to_string(),
+            source,
+        })?;
+
+    if cert_rows.is_empty() {
+        return Ok(());
+    }
+
+    let now = Utc::now();
+
+    for cert in cert_rows {
+        let current_container_id = candidates.get(&cert.host).map(|c| c.container_id.as_str());
+
+        let is_drift = match current_container_id {
+            Some(cid) => cid != cert.authorized_container_id.as_str(),
+            None => true,
+        };
+
+        if !is_drift {
+            continue;
+        }
+
+        // Deduplicate: only alarm for a given current container ID once.
+        let already_alarmed = cert
+            .last_drift_alarmed_container_id
+            .as_deref()
+            .is_some_and(|id| Some(id) == current_container_id);
+        if already_alarmed {
+            continue;
+        }
+
+        let current_container_name = candidates
+            .get(&cert.host)
+            .map(|c| c.container_name.as_str())
+            .unwrap_or("<none — container left network>");
+
+        warn!(
+            host = %cert.host,
+            authorized_container = %cert.authorized_container_name,
+            current_container = %current_container_name,
+            "Certificate drift detected: the container serving this host is no \
+             longer the one that was authorized for TLS. Operator review required."
+        );
+
+        // ADR-041 §2a: a warn! line is not unmissable. Fire a Critical alarm so
+        // the operator is paged regardless of whether they are tailing logs.
+        if let Some(sink) = alarm_sink {
+            sink.notify_container_drift(
+                cert.host.clone(),
+                cert.authorized_container_name.clone(),
+                current_container_name.to_string(),
+            )
+            .await;
+        }
+
+        let mut active = cert.into_active_model();
+        active.container_drift_detected_at = Set(Some(now));
+        active.last_drift_alarmed_container_id = Set(current_container_id.map(str::to_string));
+        active
+            .update(db)
+            .await
+            .map_err(|source| TraefikDiscoveryError::Database {
+                network: network.to_string(),
+                operation: "recording certificate drift".to_string(),
+                source,
+            })?;
+    }
+
+    Ok(())
 }
 
 impl TraefikDiscoveryService {
@@ -315,7 +444,16 @@ impl TraefikDiscoveryService {
             refresher,
             last_outcome: std::sync::RwLock::new(None),
             tracked_containers: std::sync::RwLock::new(None),
+            alarm_sink: std::sync::OnceLock::new(),
         }
+    }
+
+    /// ADR-041 §2a: inject the alarm sink so certificate-drift events reach the
+    /// operator via the alarm system, not just as log lines. Called from
+    /// `console.rs` after the plugin system has registered `AlarmService`.
+    pub fn inject_alarm_sink(&self, sink: Arc<dyn DriftAlarmSink>) {
+        // Ignore if already set (e.g. in tests that call inject twice).
+        let _ = self.alarm_sink.set(sink);
     }
 
     pub fn config(&self) -> &TraefikDiscoveryConfig {
@@ -548,6 +686,18 @@ impl TraefikDiscoveryService {
                 .collect(),
         );
 
+        // ADR-041 §2a: Check certificate drift for every host with cert_authorized=true
+        // on this network. When the current container differs from the authorized one,
+        // record `container_drift_detected_at`. This is a best-effort pass; drift
+        // detection failures are logged but do not fail the reconciliation.
+        if let Err(e) = self.check_certificate_drift(&candidates).await {
+            error!(
+                network = %self.config.network,
+                error = %e,
+                "Certificate drift check failed; will retry on the next reconciliation pass"
+            );
+        }
+
         let outcome = ReconcileOutcome {
             network: self.config.network.clone(),
             containers_scanned,
@@ -581,6 +731,22 @@ impl TraefikDiscoveryService {
             *guard = Some(outcome.clone());
         }
         Ok(outcome)
+    }
+
+    /// ADR-041 §2a: Compare `traefik_route_certificates` rows against the
+    /// current candidate set and record drift when the running container no
+    /// longer matches the one that was authorized.
+    async fn check_certificate_drift(
+        &self,
+        candidates: &HashMap<String, RouteCandidate>,
+    ) -> Result<(), TraefikDiscoveryError> {
+        check_certificate_drift_for(
+            self.db.as_ref(),
+            &self.config.network,
+            candidates,
+            self.alarm_sink.get().map(|a| a.as_ref()),
+        )
+        .await
     }
 
     /// Incrementally handle a single container event.
@@ -1167,6 +1333,15 @@ impl TraefikDiscoveryHandle {
     /// hasn't completed its first pass yet.
     pub fn last_outcome(&self) -> Option<ReconcileOutcome> {
         self.service.as_ref().and_then(|s| s.last_outcome())
+    }
+
+    /// ADR-041 §2a: wire the alarm sink into the underlying watcher so
+    /// certificate-drift events reach the operator via the alarm system.
+    /// No-op when the watcher isn't running in this process.
+    pub fn inject_alarm_sink(&self, sink: Arc<dyn DriftAlarmSink>) {
+        if let Some(svc) = &self.service {
+            svc.inject_alarm_sink(sink);
+        }
     }
 }
 
@@ -1778,5 +1953,153 @@ mod tests {
             ..Default::default()
         };
         assert!(ContainerView::from_summary(summary, "temps").is_none());
+    }
+
+    // ── ADR-041 §2a: Container drift detection tests ─────────────────────────
+    //
+    // These tests exercise `check_certificate_drift_for` (the extracted free
+    // function) directly with a `MockDatabase` so no live Docker daemon is
+    // needed. The three cases below correspond to the three findings from the
+    // security review: initial drift alarm, deduplication, and re-alarm.
+
+    fn cert_row(
+        host: &str,
+        authorized_container_id: &str,
+        last_drift_alarmed: Option<&str>,
+    ) -> route_certs::Model {
+        let now = Utc::now();
+        route_certs::Model {
+            id: 1,
+            host: host.to_string(),
+            cert_authorized: true,
+            authorized_at: Some(now),
+            authorized_by_user_id: Some(1),
+            authorized_network: "temps".to_string(),
+            authorized_container_id: authorized_container_id.to_string(),
+            authorized_container_name: "authorized-container".to_string(),
+            container_drift_detected_at: None,
+            last_drift_alarmed_container_id: last_drift_alarmed.map(str::to_string),
+            renewal_method: "http-01".to_string(),
+            source: "acme".to_string(),
+            certificate_id: None,
+            imported_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    fn candidate(host: &str, container_id: &str) -> (String, RouteCandidate) {
+        (
+            host.to_string(),
+            RouteCandidate {
+                host: host.to_string(),
+                router_name: "app".to_string(),
+                container_id: container_id.to_string(),
+                container_name: format!("container-{container_id}"),
+                port: 80,
+                host_port: None,
+                tls: false,
+            },
+        )
+    }
+
+    /// First detection: the container serving the host changed.
+    /// `cert_authorized` must remain `true`; `container_drift_detected_at` and
+    /// `last_drift_alarmed_container_id` must be updated.
+    #[tokio::test]
+    async fn drift_sets_detected_at_on_first_container_change() {
+        let row = cert_row("drift.example.com", "old-id", None);
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            // SELECT: returns one cert_authorized row with old container ID
+            .append_query_results([vec![row.clone()]])
+            // UPDATE ... RETURNING * (Postgres returns the updated row as a query result)
+            .append_query_results([vec![row]])
+            .into_connection();
+
+        let candidates = HashMap::from([candidate("drift.example.com", "new-id")]);
+
+        check_certificate_drift_for(&db, "temps", &candidates, None)
+            .await
+            .expect("drift detection must not fail");
+
+        let log = db.into_transaction_log();
+        // SELECT + UPDATE
+        assert_eq!(log.len(), 2, "expected SELECT + UPDATE, got {log:?}");
+
+        // The UPDATE must NOT touch cert_authorized in the SET clause — clearing it
+        // would be a DoS primitive. Note: RETURNING lists all columns (including
+        // cert_authorized), so we check only the SET portion of the SQL.
+        let update_stmts = log[1].statements();
+        assert!(
+            !update_stmts.is_empty(),
+            "UPDATE transaction must have statements"
+        );
+        for stmt in update_stmts {
+            // Extract just the SET ... WHERE portion to avoid false positives from RETURNING.
+            let set_portion = stmt.sql.split("WHERE").next().unwrap_or(&stmt.sql);
+            assert!(
+                !set_portion.contains("cert_authorized"),
+                "cert_authorized must never appear in the SET clause of a drift update: {}",
+                stmt.sql
+            );
+        }
+    }
+
+    /// Deduplication: the same drifting container fires the alarm at most once.
+    /// When `last_drift_alarmed_container_id` already equals the current container
+    /// ID, the UPDATE must be suppressed.
+    #[tokio::test]
+    async fn drift_deduplication_suppresses_repeat_alarm_for_same_container() {
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            // SELECT: cert already alarmed for "new-id"
+            .append_query_results([vec![cert_row(
+                "drift.example.com",
+                "old-id",
+                Some("new-id"),
+            )]])
+            // No UPDATE expected — dedup must fire
+            .into_connection();
+
+        let candidates = HashMap::from([candidate("drift.example.com", "new-id")]);
+
+        check_certificate_drift_for(&db, "temps", &candidates, None)
+            .await
+            .expect("drift detection must not fail");
+
+        let log = db.into_transaction_log();
+        // Only the SELECT; no UPDATE.
+        assert_eq!(
+            log.len(),
+            1,
+            "expected only SELECT (dedup suppressed UPDATE), got {log:?}"
+        );
+    }
+
+    /// Re-alarm: when a *third* container takes over (different from the one
+    /// already recorded in `last_drift_alarmed_container_id`), the alarm must
+    /// fire again. This proves the dedup is per-container-ID, not permanent.
+    #[tokio::test]
+    async fn drift_re_alarms_when_yet_another_container_takes_over() {
+        let row = cert_row("drift.example.com", "original-id", Some("second-id"));
+        let db = sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+            // SELECT: previously alarmed for "second-id"; now "third-id" is serving
+            .append_query_results([vec![row.clone()]])
+            // UPDATE ... RETURNING * (Postgres returns the updated row as a query result)
+            .append_query_results([vec![row]])
+            .into_connection();
+
+        let candidates = HashMap::from([candidate("drift.example.com", "third-id")]);
+
+        check_certificate_drift_for(&db, "temps", &candidates, None)
+            .await
+            .expect("drift detection must not fail");
+
+        let log = db.into_transaction_log();
+        // SELECT + UPDATE (new container triggers a fresh alarm)
+        assert_eq!(
+            log.len(),
+            2,
+            "expected SELECT + UPDATE for third container, got {log:?}"
+        );
     }
 }

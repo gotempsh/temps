@@ -76,6 +76,12 @@ pub enum AlarmType {
     /// A worker/agent node's CPU/memory/disk usage crossed the configured
     /// threshold.
     NodeResourcePressure,
+    /// A Traefik-discovered route that was certificate-authorized is now being
+    /// served by a different container than the one the authorization was
+    /// granted against. This is a HIGH-severity security event: a takeover
+    /// that previously moved plaintext HTTP traffic now moves HTTPS traffic
+    /// terminated with a real, publicly-trusted certificate (ADR-041 §2a).
+    TraefikContainerDrift,
 }
 
 impl AlarmType {
@@ -105,6 +111,7 @@ impl AlarmType {
             Self::DiskSpaceLow => "disk_space_low",
             Self::NodeOffline => "node_offline",
             Self::NodeResourcePressure => "node_resource_pressure",
+            Self::TraefikContainerDrift => "traefik_container_drift",
         }
     }
 
@@ -134,6 +141,7 @@ impl AlarmType {
             "disk_space_low" => Some(Self::DiskSpaceLow),
             "node_offline" => Some(Self::NodeOffline),
             "node_resource_pressure" => Some(Self::NodeResourcePressure),
+            "traefik_container_drift" => Some(Self::TraefikContainerDrift),
             _ => None,
         }
     }
@@ -1346,6 +1354,7 @@ mod tests {
             AlarmType::DiskSpaceLow,
             AlarmType::NodeOffline,
             AlarmType::NodeResourcePressure,
+            AlarmType::TraefikContainerDrift,
         ];
 
         for t in &types {

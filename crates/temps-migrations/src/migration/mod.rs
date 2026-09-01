@@ -209,6 +209,8 @@ mod m20260828_000001_alarms_nullable_project;
 mod m20260828_000002_add_alarms_silenced_until;
 mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
 mod m20260830_000001_create_traefik_discovered_routes;
+mod m20260831_000001_create_traefik_route_certificates;
+mod m20260831_000002_backfill_acme_verification_method;
 
 pub struct Migrator;
 
@@ -452,6 +454,11 @@ impl MigratorTrait for Migrator {
             Box::new(m20260828_000002_add_alarms_silenced_until::Migration),
             Box::new(m20260829_000001_allow_duplicate_ready_snapshot_digests::Migration),
             Box::new(m20260830_000001_create_traefik_discovered_routes::Migration),
+            // ADR-041: durable per-host TLS authorization records for discovered routes.
+            Box::new(m20260831_000001_create_traefik_route_certificates::Migration),
+            // ADR-041 §7a step (b): backfill "acme"/"http" → "http-01" so the renewal
+            // scheduler can dispatch them; "manual" is intentionally left untouched.
+            Box::new(m20260831_000002_backfill_acme_verification_method::Migration),
         ]
     }
 }
