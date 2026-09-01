@@ -625,6 +625,12 @@ for _ in {1..40}; do
 done
 if [[ "$admin_connection_limit_enforced" != "true" ]]; then
   echo "admin ingress did not enforce its pre-authentication connection ceiling" >&2
+  echo "--- resolved address of temps-admin-ingress from the probe ---" >&2
+  docker exec "$admin_saturation_probe_name" getent hosts temps-admin-ingress >&2 || true
+  echo "--- established connections on temps-admin-ingress ---" >&2
+  docker exec temps-admin-ingress sh -ec 'netstat -ant 2>/dev/null || cat /proc/net/tcp' >&2 || true
+  echo "--- full nginx error log ---" >&2
+  printf '%s\n' "$admin_ingress_logs" >&2
   exit 1
 fi
 if ! curl --fail --silent --user "temps:${admin_ingress_password}" \
