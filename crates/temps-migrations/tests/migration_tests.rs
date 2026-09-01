@@ -2890,9 +2890,20 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
     assert!(schema.try_get::<bool>("", "service_creator_column")?);
     assert!(schema.try_get::<bool>("", "service_creator_fk")?);
 
-    // The creator-ownership migration is the latest migration. Exercise its
-    // reversal and re-application so upgrades retain an emergency rollback.
-    Migrator::down(&db, Some(1)).await?;
+    // Exercise the creator-ownership migration's reversal and re-application
+    // so upgrades retain an emergency rollback. Targeted by name rather than
+    // assuming it is the last registered migration — hardcoding `Some(1)`
+    // here broke the moment a later migration was registered after it, for a
+    // reason that had nothing to do with whatever added that later one.
+    let target = "m20260830_000001_add_external_service_creator";
+    let all_migrations = Migrator::migrations();
+    let target_position = all_migrations
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    let steps_from_target_to_head = (all_migrations.len() - target_position) as u32;
+
+    Migrator::down(&db, Some(steps_from_target_to_head)).await?;
     let creator_column_after_down = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -2905,7 +2916,7 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
         .expect("creator column rollback query");
     assert!(!creator_column_after_down.try_get::<bool>("", "present")?);
 
-    Migrator::up(&db, Some(1)).await?;
+    Migrator::up(&db, Some(steps_from_target_to_head)).await?;
     let creator_column_after_reapply = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
