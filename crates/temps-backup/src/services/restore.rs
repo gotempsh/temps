@@ -2615,7 +2615,8 @@ async fn resolve_backup_location_from_s3(
                 || key.ends_with(".pgdump.gz")
                 || key.ends_with(".rdb.gz")
                 || key.ends_with(".bson.gz")
-                || key.ends_with(".archive"))
+                || key.ends_with(".archive")
+                || key.ends_with(".mbstream.gz"))
             {
                 continue;
             }
@@ -3323,5 +3324,268 @@ mod tests {
         // in a stable way across minor versions, so we check behavior via
         // construction success.
         let _client = build_s3_client(&creds);
+    }
+
+    // ---- Backup-location repair against a REAL MinIO (docker-tests) ------
+    //
+    // `resolve_backup_location_from_s3` is the repair path for `backups` rows
+    // whose `s3_location` was never populated. It is private, so it can only be
+    // exercised from in-crate tests — and it is pure S3 listing, so mocking the
+    // S3 client would only test the mock. These tests boot a real MinIO,
+    // seed real objects at the real key shapes the engines write, and call the
+    // real function.
+
+    #[cfg(feature = "docker-tests")]
+    const LOCATION_TEST_MINIO_ACCESS_KEY: &str = "minioadmin";
+    #[cfg(feature = "docker-tests")]
+    const LOCATION_TEST_MINIO_SECRET_KEY: &str = "minioadmin";
+
+    /// RAII reaper for the MinIO container booted by the location-resolution
+    /// tests. Mirrors `tests/mariadb_pitr_e2e.rs::ContainerGuard`; requires a
+    /// multi-thread test runtime because it drives Docker from `Drop`.
+    #[cfg(feature = "docker-tests")]
+    struct MinioGuard {
+        docker: Docker,
+        id: String,
+    }
+
+    #[cfg(feature = "docker-tests")]
+    impl Drop for MinioGuard {
+        fn drop(&mut self) {
+            let docker = self.docker.clone();
+            let id = self.id.clone();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    tokio::task::block_in_place(|| {
+                        handle.block_on(async {
+                            let _ = docker
+                                .remove_container(
+                                    &id,
+                                    Some(bollard::query_parameters::RemoveContainerOptions {
+                                        force: true,
+                                        v: true,
+                                        ..Default::default()
+                                    }),
+                                )
+                                .await;
+                            eprintln!("Reaped MinIO container {id}");
+                        });
+                    });
+                }
+            }));
+        }
+    }
+
+    /// Boot a MinIO container for the location-resolution tests, returning
+    /// `(host_port, guard)`. Returns `None` (graceful skip) whenever Docker is
+    /// unreachable or the image cannot be pulled — never panics on missing
+    /// infrastructure.
+    #[cfg(feature = "docker-tests")]
+    async fn boot_location_test_minio() -> Option<(u16, MinioGuard)> {
+        use futures::StreamExt;
+        use std::collections::HashMap;
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("Docker unavailable (connect failed), skipping: {e}");
+                return None;
+            }
+        };
+        if let Err(e) = docker.ping().await {
+            eprintln!("Docker socket unreachable (ping failed), skipping: {e}");
+            return None;
+        }
+
+        let mut stream = docker.create_image(
+            Some(bollard::query_parameters::CreateImageOptions {
+                from_image: Some("minio/minio".to_string()),
+                tag: Some("latest".to_string()),
+                ..Default::default()
+            }),
+            None,
+            None,
+        );
+        while let Some(item) = stream.next().await {
+            if let Err(e) = item {
+                eprintln!("Could not pull MinIO image, skipping: {e}");
+                return None;
+            }
+        }
+
+        let port = {
+            use std::net::TcpListener;
+            (9400..9600).find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok())?
+        };
+        let name = format!("temps-test-restore-loc-minio-{}", uuid::Uuid::new_v4());
+
+        let config = bollard::models::ContainerCreateBody {
+            image: Some("minio/minio:latest".to_string()),
+            cmd: Some(vec!["server".to_string(), "/data".to_string()]),
+            env: Some(vec![
+                format!("MINIO_ROOT_USER={LOCATION_TEST_MINIO_ACCESS_KEY}"),
+                format!("MINIO_ROOT_PASSWORD={LOCATION_TEST_MINIO_SECRET_KEY}"),
+            ]),
+            host_config: Some(bollard::models::HostConfig {
+                port_bindings: Some(HashMap::from([(
+                    "9000/tcp".to_string(),
+                    Some(vec![bollard::models::PortBinding {
+                        host_ip: Some("127.0.0.1".to_string()),
+                        host_port: Some(port.to_string()),
+                    }]),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let created = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&name)
+                        .build(),
+                ),
+                config,
+            )
+            .await
+            .ok()?;
+        let guard = MinioGuard {
+            docker: docker.clone(),
+            id: created.id.clone(),
+        };
+        docker
+            .start_container(
+                &created.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .ok()?;
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        Some((port, guard))
+    }
+
+    /// An `s3_sources::Model` pointing at the local MinIO with an empty
+    /// `bucket_path`, matching the row shape `run_pitr_flow` inserts.
+    #[cfg(feature = "docker-tests")]
+    fn location_test_s3_source(port: u16, bucket: &str) -> temps_entities::s3_sources::Model {
+        temps_entities::s3_sources::Model {
+            id: 1,
+            name: "loc-test-s3".to_string(),
+            bucket_name: bucket.to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: Some(format!("http://127.0.0.1:{port}")),
+            bucket_path: String::new(),
+            access_key_id: LOCATION_TEST_MINIO_ACCESS_KEY.to_string(),
+            secret_key: LOCATION_TEST_MINIO_SECRET_KEY.to_string(),
+            force_path_style: Some(true),
+            is_default: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    /// REGRESSION (Greptile finding on PR #878): a legacy MariaDB *physical*
+    /// backup row with an empty `s3_location` was undiscoverable, because the
+    /// extension allowlist in `resolve_backup_location_from_s3` did not include
+    /// `.mbstream.gz`. That made the backup permanently unrestorable through
+    /// the repair path — a data-safety bug, not a cosmetic one.
+    ///
+    /// This seeds the exact key shape a physical base occupies in a real
+    /// bucket and asserts the resolver now finds it. It also seeds a logical
+    /// `dump.sql.gz` under a *different* service prefix and asserts that one
+    /// still resolves, so the fix is additive rather than a swap.
+    #[cfg(feature = "docker-tests")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn resolve_backup_location_from_s3_finds_mariadb_physical_and_logical_backups() {
+        // ---- Arrange: real MinIO + real objects at real key shapes --------
+        let Some((port, _minio_guard)) = boot_location_test_minio().await else {
+            return;
+        };
+        let bucket = "restore-location-test";
+        let s3_source = location_test_s3_source(port, bucket);
+        let s3_client = build_s3_client(&S3Credentials {
+            access_key_id: LOCATION_TEST_MINIO_ACCESS_KEY.to_string(),
+            secret_key: LOCATION_TEST_MINIO_SECRET_KEY.to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: s3_source.endpoint.clone(),
+            bucket_name: bucket.to_string(),
+            bucket_path: String::new(),
+            force_path_style: true,
+        });
+        if let Err(e) = s3_client.create_bucket().bucket(bucket).send().await {
+            eprintln!("Could not create MinIO bucket, skipping: {e}");
+            return;
+        }
+
+        let physical_service = "orders-physical";
+        let logical_service = "orders-logical";
+        let physical_key = format!(
+            "external_services/mariadb/{physical_service}/2026/01/01/{}/base.mbstream.gz",
+            uuid::Uuid::new_v4()
+        );
+        let logical_key = format!(
+            "external_services/mariadb/{logical_service}/2026/01/01/{}/dump.sql.gz",
+            uuid::Uuid::new_v4()
+        );
+        // Engines always write a `metadata.json` companion next to the
+        // artifact; seeding it proves the resolver picks the artifact and not
+        // its sidecar.
+        for key in [
+            physical_key.clone(),
+            logical_key.clone(),
+            physical_key.replace("base.mbstream.gz", "metadata.json"),
+            logical_key.replace("dump.sql.gz", "metadata.json"),
+        ] {
+            if let Err(e) = s3_client
+                .put_object()
+                .bucket(bucket)
+                .key(&key)
+                .body(aws_sdk_s3::primitives::ByteStream::from_static(b"seed"))
+                .send()
+                .await
+            {
+                eprintln!("Could not seed object {key}, skipping: {e}");
+                return;
+            }
+        }
+
+        // ---- Act + Assert: physical base is now discoverable --------------
+        let physical =
+            resolve_backup_location_from_s3(&s3_client, &s3_source, "mariadb", physical_service)
+                .await
+                .expect("listing a reachable bucket must not error");
+        eprintln!("resolved physical location = {physical:?}");
+        let physical = physical.expect(
+            "a .mbstream.gz physical base must be discoverable; before the \
+             extension-allowlist fix this returned None and the backup was unrestorable",
+        );
+        assert!(
+            physical.ends_with("base.mbstream.gz"),
+            "resolver must return the physical base artifact, got {physical}"
+        );
+        assert_eq!(physical, physical_key, "resolver must return the exact key");
+
+        // ---- Assert: the logical-dump path did not regress ----------------
+        let logical =
+            resolve_backup_location_from_s3(&s3_client, &s3_source, "mariadb", logical_service)
+                .await
+                .expect("listing a reachable bucket must not error");
+        eprintln!("resolved logical location = {logical:?}");
+        let logical = logical.expect("a .sql.gz logical dump must stay discoverable");
+        assert_eq!(
+            logical, logical_key,
+            "resolver must return the logical dump artifact unchanged"
+        );
+
+        // ---- Assert: an unknown service still resolves to None ------------
+        let missing =
+            resolve_backup_location_from_s3(&s3_client, &s3_source, "mariadb", "no-such-service")
+                .await
+                .expect("listing an empty prefix must not error");
+        assert!(
+            missing.is_none(),
+            "an empty service prefix must resolve to None, got {missing:?}"
+        );
     }
 }

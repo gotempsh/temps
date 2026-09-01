@@ -774,6 +774,896 @@ async fn run_pitr_flow(
     Ok(())
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared setup for the additional end-to-end flows below.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Everything the extra E2E flows need: a live Docker daemon, a migrated
+/// Postgres test DB, a MinIO with `BUCKET` created, and a running MariaDB
+/// source container with binary logging on.
+///
+/// The `_*_guard` fields are RAII container reapers — they must be held for the
+/// lifetime of the test, and `_test_db` must outlive `pool` (dropping the
+/// `TestDatabase` tears down its schema).
+struct E2eEnv {
+    docker: Docker,
+    _test_db: temps_database::test_utils::TestDatabase,
+    pool: Arc<temps_database::DbConnection>,
+    minio_port: u16,
+    _minio_guard: ContainerGuard,
+    s3_client: aws_sdk_s3::Client,
+    service_name: String,
+    container_name: String,
+    mariadb_port: u16,
+    _mariadb_guard: ContainerGuard,
+}
+
+/// Boot the whole fixture. Returns `None` (graceful skip) whenever any piece of
+/// infrastructure is unavailable — never panics on missing infrastructure, only
+/// on real assertion failures once a flow is running.
+async fn setup_e2e_env(name_prefix: &str) -> Option<E2eEnv> {
+    init_tracing();
+
+    let docker = connect_docker().await?;
+
+    let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+        Ok(db) => db,
+        Err(e) => {
+            eprintln!("Test database unavailable, skipping: {e}");
+            return None;
+        }
+    };
+    let pool = test_db.connection_arc();
+
+    let (minio_port, minio_guard) = boot_minio(&docker).await?;
+    let s3_client = build_s3_client(minio_port)?;
+    if let Err(e) = s3_client.create_bucket().bucket(BUCKET).send().await {
+        eprintln!("Could not create MinIO bucket, skipping: {e}");
+        return None;
+    }
+
+    let service_name = format!("{name_prefix}{}", uuid::Uuid::new_v4().simple());
+    let (container_name, mariadb_port, mariadb_guard) =
+        boot_mariadb_source(&docker, &service_name).await?;
+    eprintln!("Booted MariaDB source container {container_name} on host port {mariadb_port}");
+
+    Some(E2eEnv {
+        docker,
+        _test_db: test_db,
+        pool,
+        minio_port,
+        _minio_guard: minio_guard,
+        s3_client,
+        service_name,
+        container_name,
+        mariadb_port,
+        _mariadb_guard: mariadb_guard,
+    })
+}
+
+/// Insert the encrypted `external_services` + `s3_sources` + `users` rows the
+/// engines read, mirroring what the production executor persists before it
+/// invokes an engine. Returns `(service_model, s3_source_model, user_id)`.
+async fn seed_service_rows(
+    pool: &temps_database::DbConnection,
+    encryption: &EncryptionService,
+    service_name: &str,
+    mariadb_port: u16,
+    minio_port: u16,
+) -> anyhow::Result<(
+    temps_entities::external_services::Model,
+    temps_entities::s3_sources::Model,
+    i32,
+)> {
+    let config_plaintext = mariadb_params(service_name, mariadb_port).to_string();
+    let config_encrypted = encryption.encrypt_string(&config_plaintext)?;
+
+    let service_model = temps_entities::external_services::ActiveModel {
+        name: Set(service_name.to_string()),
+        service_type: Set("mariadb".to_string()),
+        version: Set(None),
+        status: Set("running".to_string()),
+        config: Set(Some(config_encrypted)),
+        topology: Set("standalone".to_string()),
+        ..Default::default()
+    }
+    .insert(pool)
+    .await?;
+
+    let s3_source_model = temps_entities::s3_sources::ActiveModel {
+        name: Set("pitr-s3".to_string()),
+        bucket_name: Set(BUCKET.to_string()),
+        region: Set("us-east-1".to_string()),
+        endpoint: Set(Some(format!("http://127.0.0.1:{minio_port}"))),
+        bucket_path: Set(String::new()),
+        access_key_id: Set(encryption.encrypt_string(MINIO_ACCESS_KEY)?),
+        secret_key: Set(encryption.encrypt_string(MINIO_SECRET_KEY)?),
+        force_path_style: Set(Some(true)),
+        is_default: Set(true),
+        ..Default::default()
+    }
+    .insert(pool)
+    .await?;
+
+    let user = temps_entities::users::ActiveModel {
+        name: Set("pitr-test-user".to_string()),
+        email: Set(format!(
+            "pitr-{}@example.test",
+            uuid::Uuid::new_v4().simple()
+        )),
+        email_verified: Set(true),
+        mfa_enabled: Set(false),
+        ..Default::default()
+    }
+    .insert(pool)
+    .await?;
+
+    Ok((service_model, s3_source_model, user.id))
+}
+
+/// Insert the parent `backups` row an engine expects (its public UUID becomes
+/// the artifact directory), run `engine`, then mark the row completed with the
+/// produced location — the same contract `run_pitr_flow` exercises.
+async fn run_engine_backup<E: BackupEngine>(
+    pool_arc: &Arc<temps_database::DbConnection>,
+    engine: &E,
+    engine_key: &str,
+    backup_name: &str,
+    service_id: i32,
+    s3_source_id: i32,
+    user_id: i32,
+) -> anyhow::Result<(String, temps_entities::backups::Model)> {
+    let pool: &temps_database::DbConnection = pool_arc.as_ref();
+    let parent_backup = temps_entities::backups::ActiveModel {
+        name: Set(backup_name.to_string()),
+        backup_id: Set(uuid::Uuid::new_v4().to_string()),
+        backup_type: Set("full".to_string()),
+        state: Set("running".to_string()),
+        started_at: Set(chrono::Utc::now()),
+        s3_source_id: Set(s3_source_id),
+        s3_location: Set(String::new()),
+        metadata: Set("{}".to_string()),
+        compression_type: Set("gzip".to_string()),
+        created_by: Set(user_id),
+        tags: Set("[]".to_string()),
+        ..Default::default()
+    }
+    .insert(pool)
+    .await?;
+
+    let ctx = BackupContext {
+        backup_id: parent_backup.id,
+        engine_key: engine_key.to_string(),
+        params: serde_json::json!({ "service_id": service_id, "s3_source_id": s3_source_id }),
+        cancel: CancellationToken::new(),
+        db: Arc::clone(pool_arc),
+    };
+    let outcome = engine
+        .run(&ctx)
+        .await
+        .map_err(|e| anyhow::anyhow!("{engine_key} engine ({backup_name}): {e}"))?;
+
+    let mut completed = parent_backup.into_active_model();
+    completed.state = Set("completed".to_string());
+    completed.finished_at = Set(Some(chrono::Utc::now()));
+    completed.size_bytes = Set(outcome.size_bytes);
+    completed.s3_location = Set(outcome.location.clone());
+    let backup_model = completed.update(pool).await?;
+
+    eprintln!(
+        "Backup '{backup_name}' ({engine_key}) landed at key: {}",
+        outcome.location
+    );
+    Ok((outcome.location, backup_model))
+}
+
+/// S3 key of one archived binlog segment (empty bucket_path). Mirrors the
+/// provider's `MariaDbService::binlog_object_key`, which is `pub(crate)`.
+fn binlog_segment_key(service_name: &str, file: &str) -> String {
+    format!("external_services/mariadb/{service_name}/binlog/{file}.gz")
+}
+
+/// S3 key of the binlog manifest (empty bucket_path).
+fn binlog_manifest_key(service_name: &str) -> String {
+    format!("external_services/mariadb/{service_name}/binlog/manifest.json")
+}
+
+/// Read and parse the binlog manifest straight out of S3.
+async fn fetch_binlog_manifest(
+    s3_client: &aws_sdk_s3::Client,
+    service_name: &str,
+) -> anyhow::Result<temps_providers::externalsvc::mariadb::BinlogManifest> {
+    let obj = s3_client
+        .get_object()
+        .bucket(BUCKET)
+        .key(binlog_manifest_key(service_name))
+        .send()
+        .await
+        .map_err(|e| anyhow::anyhow!("get binlog manifest: {e}"))?;
+    let bytes = obj.body.collect().await?.into_bytes();
+    eprintln!("DIAG binlog manifest = {}", String::from_utf8_lossy(&bytes));
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+/// Mirror of the provider's `pub(crate)` `MariaDbService::binlog_is_strictly_older`
+/// ordering rule: same basename, same zero-padded suffix width, lexicographically
+/// smaller. Anything it cannot order with certainty answers `false` (= keep).
+///
+/// Deliberately re-stated here rather than approximated with a plain string
+/// compare — the assertion is only meaningful if it predicts what the
+/// production predicate does.
+fn expect_strictly_older(candidate: &str, anchor: &str) -> bool {
+    fn split(file: &str) -> Option<(&str, &str)> {
+        let (base, suffix) = file.rsplit_once('.')?;
+        if base.is_empty() || suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        Some((base, suffix))
+    }
+    match (split(candidate), split(anchor)) {
+        (Some((cb, cs)), Some((ab, asuf))) => cb == ab && cs.len() == asuf.len() && cs < asuf,
+        _ => false,
+    }
+}
+
+/// Whether an object exists in the test bucket.
+async fn object_exists(s3_client: &aws_sdk_s3::Client, key: &str) -> bool {
+    s3_client
+        .head_object()
+        .bucket(BUCKET)
+        .key(key)
+        .send()
+        .await
+        .is_ok()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E2E #2 — binary-log retention pruning.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Drives the REAL binlog retention pruner (`MariaDbService::prune_stale_binlogs`)
+/// against real archived segments in real object storage.
+///
+/// `prune_stale_binlogs` DELETES recovery data, so its safety invariants are
+/// only meaningfully proven against real S3 objects and a real manifest:
+///
+///  * pruning against the OLDEST retained base's anchor never touches that
+///    base's own segment or anything after it (it may drop segments that
+///    predate every retained base — those are genuinely unreachable);
+///  * pruning against a LATER base's anchor (the realistic case: the first base
+///    has aged out, so base #2 is now the oldest retained) deletes exactly the
+///    segments strictly older than that anchor, and nothing else;
+///  * the deleted objects are really gone and the retained ones really remain;
+///  * the rewritten manifest drops only the deleted entries and NEVER rewinds
+///    `last_shipped_file` (rewinding it would re-ship every segment);
+///  * a repeat prune with the same anchor is a no-op, not a double-delete.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mariadb_pitr_full_chain_e2e_binlog_retention_prune() {
+    tokio::time::timeout(E2E_TIMEOUT, mariadb_binlog_retention_prune_inner())
+        .await
+        .expect("MariaDB binlog retention E2E timed out")
+}
+
+async fn mariadb_binlog_retention_prune_inner() {
+    let Some(env) = setup_e2e_env("prune").await else {
+        return;
+    };
+    run_binlog_retention_flow(&env)
+        .await
+        .expect("binlog retention end-to-end flow");
+}
+
+async fn run_binlog_retention_flow(env: &E2eEnv) -> anyhow::Result<()> {
+    let pool: &temps_database::DbConnection = env.pool.as_ref();
+    let service_name = env.service_name.as_str();
+    eprintln!(
+        "Running binlog-retention flow against source container {}",
+        env.container_name
+    );
+    let encryption = Arc::new(EncryptionService::new(MASTER_KEY_HEX)?);
+
+    let (service_model, s3_source_model, user_id) = seed_service_rows(
+        pool,
+        &encryption,
+        service_name,
+        env.mariadb_port,
+        env.minio_port,
+    )
+    .await?;
+
+    // Seed a user database so the physical base has something to copy.
+    let src = mysql_pool(env.mariadb_port).await?;
+    sqlx::query("CREATE DATABASE IF NOT EXISTS appdb")
+        .execute(&src)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS appdb.events (id INT PRIMARY KEY AUTO_INCREMENT, batch CHAR(1) NOT NULL, note VARCHAR(64))",
+    )
+    .execute(&src)
+    .await?;
+    for i in 0..5 {
+        sqlx::query("INSERT INTO appdb.events (batch, note) VALUES ('A', ?)")
+            .bind(format!("a{i}"))
+            .execute(&src)
+            .await?;
+    }
+
+    let engine = temps_backup::engines::mariadb_physical::MariadbPhysicalEngine::new(
+        temps_backup::engines::mariadb_physical::MariadbPhysicalDeps {
+            db: Arc::clone(&env.pool),
+            encryption_service: Arc::clone(&encryption),
+            docker: env.docker.clone(),
+        },
+    );
+
+    // ── Base #1: the first retained base backup ─────────────────────────────
+    let (base1_location, _base1_backup) = run_engine_backup(
+        &env.pool,
+        &engine,
+        "mariadb_physical",
+        "retention-base-1",
+        service_model.id,
+        s3_source_model.id,
+        user_id,
+    )
+    .await?;
+    assert!(
+        base1_location.ends_with("base.mbstream.gz"),
+        "base #1 must be a physical base, got {base1_location}"
+    );
+
+    let mariadb_svc = MariaDbService::new(service_name.to_string(), Arc::new(env.docker.clone()));
+    let mariadb_config = parse_mariadb_config(service_name, env.mariadb_port);
+
+    // ── Ship several segments: each round FLUSHes (rotating the active
+    //    segment closed) and uploads everything newly closed. Real writes in
+    //    between so the segments carry real events. ────────────────────────
+    let mut shipped_total = 0usize;
+    for round in 0..3 {
+        for i in 0..3 {
+            sqlx::query("INSERT INTO appdb.events (batch, note) VALUES ('B', ?)")
+                .bind(format!("pre{round}-{i}"))
+                .execute(&src)
+                .await?;
+        }
+        let n = mariadb_svc
+            .archive_binlogs(&env.s3_client, &s3_source_model, &mariadb_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("archive_binlogs pre-round {round}: {e}"))?;
+        shipped_total += n;
+        eprintln!("archive_binlogs pre-round {round} shipped {n} segment(s)");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    // ── Base #2, later in the timeline: its anchor is a LATER segment ───────
+    let (base2_location, _base2_backup) = run_engine_backup(
+        &env.pool,
+        &engine,
+        "mariadb_physical",
+        "retention-base-2",
+        service_model.id,
+        s3_source_model.id,
+        user_id,
+    )
+    .await?;
+    assert!(
+        base2_location.ends_with("base.mbstream.gz"),
+        "base #2 must be a physical base, got {base2_location}"
+    );
+
+    // ── Ship more segments AFTER base #2 so the prune has both a "delete"
+    //    side and a "keep" side to prove. ─────────────────────────────────
+    for round in 0..2 {
+        for i in 0..3 {
+            sqlx::query("INSERT INTO appdb.events (batch, note) VALUES ('C', ?)")
+                .bind(format!("post{round}-{i}"))
+                .execute(&src)
+                .await?;
+        }
+        let n = mariadb_svc
+            .archive_binlogs(&env.s3_client, &s3_source_model, &mariadb_config)
+            .await
+            .map_err(|e| anyhow::anyhow!("archive_binlogs post-round {round}: {e}"))?;
+        shipped_total += n;
+        eprintln!("archive_binlogs post-round {round} shipped {n} segment(s)");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    src.close().await;
+    eprintln!("Total binlog segments shipped: {shipped_total}");
+
+    // ── Anchors ─────────────────────────────────────────────────────────────
+    let anchor1 = mariadb_svc
+        .base_binlog_anchor(&env.s3_client, BUCKET, &base1_location)
+        .await
+        .map_err(|e| anyhow::anyhow!("base_binlog_anchor(base #1): {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("base #1 must expose a PITR binlog anchor; got None (pitr disabled?)")
+        })?;
+    let anchor2 = mariadb_svc
+        .base_binlog_anchor(&env.s3_client, BUCKET, &base2_location)
+        .await
+        .map_err(|e| anyhow::anyhow!("base_binlog_anchor(base #2): {e}"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!("base #2 must expose a PITR binlog anchor; got None (pitr disabled?)")
+        })?;
+    eprintln!("DIAG anchors: base#1={anchor1} base#2={anchor2}");
+    assert!(
+        expect_strictly_older(&anchor1, &anchor2),
+        "the FLUSH rotations between the two bases must advance the anchor \
+         (base#1={anchor1}, base#2={anchor2}); without that this test proves nothing"
+    );
+
+    let before = fetch_binlog_manifest(&env.s3_client, service_name).await?;
+    assert!(
+        before.shipped_files.len() >= 3,
+        "need at least 3 shipped segments to prove partial pruning, got {:?}",
+        before.shipped_files
+    );
+    let last_shipped_before = before.last_shipped_file.clone();
+    assert!(
+        last_shipped_before.is_some(),
+        "manifest must record a high-water mark after shipping"
+    );
+
+    // ── Invariant 1: pruning against the OLDEST retained base's anchor keeps
+    //    that base's OWN segment and everything after it, and drops only what
+    //    predates it.
+    //
+    //    Note: this is NOT necessarily a no-op. `mariadb-backup` runs a FLUSH
+    //    of its own, so base #1's anchor is typically the segment *after* the
+    //    one the server started on — that earlier segment predates every
+    //    retained base and is genuinely unreachable, so deleting it is correct.
+    //    The invariant that matters is the boundary, not the count. ─────────
+    let expected_stale1: Vec<String> = before
+        .shipped_files
+        .iter()
+        .filter(|f| expect_strictly_older(f, &anchor1))
+        .cloned()
+        .collect();
+    let expected_kept1: Vec<String> = before
+        .shipped_files
+        .iter()
+        .filter(|f| !expect_strictly_older(f, &anchor1))
+        .cloned()
+        .collect();
+    eprintln!("DIAG prune anchor={anchor1} stale={expected_stale1:?} kept={expected_kept1:?}");
+    assert!(
+        expected_kept1.contains(&anchor1),
+        "base #1's own anchor segment ({anchor1}) must never be prunable against its own \
+         anchor — PITR replay starts there; manifest was {:?}",
+        before.shipped_files
+    );
+
+    let deleted1 = mariadb_svc
+        .prune_stale_binlogs(&env.s3_client, &s3_source_model, &anchor1)
+        .await
+        .map_err(|e| anyhow::anyhow!("prune_stale_binlogs(anchor of oldest base): {e}"))?;
+    assert_eq!(
+        deleted1,
+        expected_stale1.len(),
+        "pruning against the oldest retained base's anchor ({anchor1}) must delete exactly \
+         the segments that predate it (expected {expected_stale1:?})"
+    );
+    for file in &expected_stale1 {
+        assert!(
+            !object_exists(&env.s3_client, &binlog_segment_key(service_name, file)).await,
+            "segment {file} predates the oldest retained base and must be gone"
+        );
+    }
+    for file in &expected_kept1 {
+        assert!(
+            object_exists(&env.s3_client, &binlog_segment_key(service_name, file)).await,
+            "segment {file} is still reachable from base #1 and must survive"
+        );
+    }
+
+    let after1 = fetch_binlog_manifest(&env.s3_client, service_name).await?;
+    assert_eq!(
+        after1.shipped_files, expected_kept1,
+        "manifest must list exactly the segments still reachable from base #1"
+    );
+    assert_eq!(
+        after1.last_shipped_file, last_shipped_before,
+        "prune must NEVER rewind last_shipped_file — rewinding it re-ships every segment"
+    );
+
+    // ── Invariant 2: once base #1 ages out, base #2 becomes the oldest
+    //    retained base and its (later) anchor prunes strictly more —
+    //    but still nothing at-or-after itself. ──────────────────────────────
+    let expected_stale: Vec<String> = after1
+        .shipped_files
+        .iter()
+        .filter(|f| expect_strictly_older(f, &anchor2))
+        .cloned()
+        .collect();
+    let expected_kept: Vec<String> = after1
+        .shipped_files
+        .iter()
+        .filter(|f| !expect_strictly_older(f, &anchor2))
+        .cloned()
+        .collect();
+    eprintln!("DIAG prune anchor={anchor2} stale={expected_stale:?} kept={expected_kept:?}");
+    assert!(
+        !expected_stale.is_empty(),
+        "expected at least one prunable segment older than {anchor2}, manifest was {:?}",
+        after1.shipped_files
+    );
+    assert!(
+        !expected_kept.is_empty(),
+        "expected at least one retained segment at-or-after {anchor2}, manifest was {:?}",
+        after1.shipped_files
+    );
+    assert!(
+        expected_kept.contains(&anchor2),
+        "base #2's own anchor segment ({anchor2}) must survive a prune against its own anchor"
+    );
+
+    let deleted = mariadb_svc
+        .prune_stale_binlogs(&env.s3_client, &s3_source_model, &anchor2)
+        .await
+        .map_err(|e| anyhow::anyhow!("prune_stale_binlogs(anchor of new oldest base): {e}"))?;
+    assert_eq!(
+        deleted,
+        expected_stale.len(),
+        "prune must delete exactly the segments strictly older than {anchor2} \
+         (expected {expected_stale:?})"
+    );
+
+    // Objects really gone / really kept.
+    for file in &expected_stale {
+        assert!(
+            !object_exists(&env.s3_client, &binlog_segment_key(service_name, file)).await,
+            "pruned segment {file} must no longer exist in S3"
+        );
+    }
+    for file in &expected_kept {
+        assert!(
+            object_exists(&env.s3_client, &binlog_segment_key(service_name, file)).await,
+            "retained segment {file} must still exist in S3"
+        );
+    }
+
+    // Manifest rewritten to match, high-water mark untouched.
+    let after = fetch_binlog_manifest(&env.s3_client, service_name).await?;
+    assert_eq!(
+        after.shipped_files, expected_kept,
+        "manifest must list exactly the retained segments, in ship order"
+    );
+    assert_eq!(
+        after.last_shipped_file, last_shipped_before,
+        "prune must NEVER rewind last_shipped_file — rewinding it re-ships every segment"
+    );
+
+    // ── Invariant 3: repeat prune with the same anchor is a no-op ───────────
+    let deleted_again = mariadb_svc
+        .prune_stale_binlogs(&env.s3_client, &s3_source_model, &anchor2)
+        .await
+        .map_err(|e| anyhow::anyhow!("prune_stale_binlogs(repeat): {e}"))?;
+    assert_eq!(
+        deleted_again, 0,
+        "a repeat prune against the same anchor must be idempotent"
+    );
+    let after_repeat = fetch_binlog_manifest(&env.s3_client, service_name).await?;
+    assert_eq!(
+        after_repeat, after,
+        "an idempotent prune must leave the manifest byte-identical"
+    );
+    for file in &expected_kept {
+        assert!(
+            object_exists(&env.s3_client, &binlog_segment_key(service_name, file)).await,
+            "retained segment {file} must survive a repeat prune"
+        );
+    }
+
+    // ── Invariant 4: fail closed on an unorderable/unsafe anchor ────────────
+    let err = mariadb_svc
+        .prune_stale_binlogs(&env.s3_client, &s3_source_model, "../../etc/passwd")
+        .await
+        .expect_err("an unsafe anchor must be rejected, not acted on");
+    eprintln!("DIAG unsafe-anchor rejection: {err}");
+    for file in &expected_kept {
+        assert!(
+            object_exists(&env.s3_client, &binlog_segment_key(service_name, file)).await,
+            "retained segment {file} must survive a rejected prune"
+        );
+    }
+
+    Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// E2E #3 — logical (`mariadb_dump`) backup + restore-to-new-service.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Root/app credentials for the RESTORE TARGET. They are deliberately different
+/// from the origin's (`ROOT_PASSWORD`) — that is exactly the state
+/// `credential_propagation_gates` produces for a `mariadb_dump` restore, which
+/// returns `(false, false)` and therefore does NOT merge the origin's
+/// credentials into the config handed to the provider.
+const RESTORED_ROOT_PASSWORD: &str = "target-root-pw-9876";
+const RESTORED_APP_USER: &str = "appuser";
+const RESTORED_APP_PASSWORD: &str = "target-app-pw-9876";
+
+/// `ServiceConfig.parameters` for the restore target. Mirrors `mariadb_params`
+/// but with the target's OWN credentials and a non-root app user (the MariaDB
+/// entrypoint refuses `MARIADB_USER=root`).
+fn restored_mariadb_params(service_name: &str) -> serde_json::Value {
+    serde_json::json!({
+        "host": "localhost",
+        "database": "appdb",
+        "username": RESTORED_APP_USER,
+        "password": RESTORED_APP_PASSWORD,
+        "root_password": RESTORED_ROOT_PASSWORD,
+        "docker_image": "mariadb:lts",
+        "container_name": format!("mariadb-{service_name}"),
+    })
+}
+
+/// Full logical-dump round trip: REAL `MariadbDumpEngine` -> real `dump.sql.gz`
+/// in real object storage -> REAL `restore_to_new_service` into a real new
+/// container.
+///
+/// Two things nothing else covers end-to-end:
+///
+///  1. The dump engine's output is actually restorable — no e2e test exercised
+///     `mariadb_dump` at all before this one.
+///  2. The M-2 credential fix. `credential_propagation_gates` returns
+///     `(false, false)` for `mariadb_dump` because the dump excludes the
+///     `mysql` schema, so the restored server must keep the TARGET's own
+///     credentials. Only a unit test asserted the boolean today; this proves
+///     the restored container really authenticates with the target's password
+///     and really REJECTS the origin's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mariadb_pitr_full_chain_e2e_logical_dump_restore_keeps_target_credentials() {
+    tokio::time::timeout(E2E_TIMEOUT, mariadb_logical_dump_restore_inner())
+        .await
+        .expect("MariaDB logical dump restore E2E timed out")
+}
+
+async fn mariadb_logical_dump_restore_inner() {
+    let Some(env) = setup_e2e_env("dump").await else {
+        return;
+    };
+    run_logical_dump_restore_flow(&env)
+        .await
+        .expect("logical dump restore end-to-end flow");
+}
+
+async fn run_logical_dump_restore_flow(env: &E2eEnv) -> anyhow::Result<()> {
+    let pool: &temps_database::DbConnection = env.pool.as_ref();
+    let service_name = env.service_name.as_str();
+    eprintln!(
+        "Running logical-dump flow against source container {}",
+        env.container_name
+    );
+    let encryption = Arc::new(EncryptionService::new(MASTER_KEY_HEX)?);
+
+    let (service_model, s3_source_model, user_id) = seed_service_rows(
+        pool,
+        &encryption,
+        service_name,
+        env.mariadb_port,
+        env.minio_port,
+    )
+    .await?;
+
+    // ── Seed real user data on the origin ───────────────────────────────────
+    let src = mysql_pool(env.mariadb_port).await?;
+    sqlx::query("CREATE DATABASE IF NOT EXISTS appdb")
+        .execute(&src)
+        .await?;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS appdb.events (id INT PRIMARY KEY AUTO_INCREMENT, batch CHAR(1) NOT NULL, note VARCHAR(64))",
+    )
+    .execute(&src)
+    .await?;
+    for i in 0..7 {
+        sqlx::query("INSERT INTO appdb.events (batch, note) VALUES ('A', ?)")
+            .bind(format!("a{i}"))
+            .execute(&src)
+            .await?;
+    }
+    let seeded: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM appdb.events")
+        .fetch_one(&src)
+        .await?;
+    assert_eq!(seeded, 7, "origin rows seeded");
+    src.close().await;
+
+    // ── REAL logical dump engine ────────────────────────────────────────────
+    let engine = temps_backup::engines::mariadb_dump::MariadbDumpEngine::new(
+        temps_backup::engines::mariadb_dump::MariadbDumpDeps {
+            db: Arc::clone(&env.pool),
+            encryption_service: Arc::clone(&encryption),
+            docker: env.docker.clone(),
+        },
+    );
+    let (dump_location, backup_model) = run_engine_backup(
+        &env.pool,
+        &engine,
+        "mariadb_dump",
+        "logical-dump",
+        service_model.id,
+        s3_source_model.id,
+        user_id,
+    )
+    .await?;
+    assert!(
+        dump_location.ends_with("dump.sql.gz"),
+        "engine should produce a logical dump, got {dump_location}"
+    );
+    assert!(
+        env.s3_client
+            .head_object()
+            .bucket(BUCKET)
+            .key(&dump_location)
+            .send()
+            .await
+            .is_ok(),
+        "dump object must exist in MinIO at {dump_location}"
+    );
+    // This is the exact predicate `credential_propagation_gates` keys off to
+    // decide (false, false) for MariaDB — assert it on the REAL produced key.
+    assert!(
+        !MariaDbService::is_physical_base_location(&dump_location),
+        "a logical dump must not classify as a physical base ({dump_location}); \
+         if it did, the restore would merge the ORIGIN's credentials"
+    );
+
+    // ── REAL restore into a new service with the TARGET's own credentials ───
+    let decrypted_s3_source = {
+        let mut m = s3_source_model.clone();
+        m.access_key_id = encryption.decrypt_string(&s3_source_model.access_key_id)?;
+        m.secret_key = encryption.decrypt_string(&s3_source_model.secret_key)?;
+        m
+    };
+    let s3_credentials = S3Credentials {
+        access_key_id: MINIO_ACCESS_KEY.to_string(),
+        secret_key: MINIO_SECRET_KEY.to_string(),
+        region: "us-east-1".to_string(),
+        endpoint: decrypted_s3_source.endpoint.clone(),
+        bucket_name: BUCKET.to_string(),
+        bucket_path: String::new(),
+        force_path_style: true,
+    };
+
+    let restored_name = format!("{service_name}-dumprestore");
+    let source_config = ServiceConfig {
+        name: restored_name.clone(),
+        service_type: ServiceType::Mariadb,
+        version: None,
+        // No origin-credential merge: this is what the (false, false) gate
+        // hands the provider for a `mariadb_dump` restore.
+        parameters: restored_mariadb_params(&restored_name),
+    };
+
+    let mariadb_svc = MariaDbService::new(service_name.to_string(), Arc::new(env.docker.clone()));
+    let restore_ctx = RestoreContext {
+        s3_client: &env.s3_client,
+        s3_credentials: &s3_credentials,
+        s3_source: &decrypted_s3_source,
+        backup: &backup_model,
+        backup_location: &dump_location,
+        source_service: &service_model,
+        source_config,
+        pool,
+    };
+
+    // Register the container for reaping BEFORE the restore runs: the provider
+    // creates it partway through, and a mid-restore failure must not leak it.
+    let restored_container = format!("mariadb-{restored_name}");
+    let _restored_guard = ContainerGuard {
+        docker: env.docker.clone(),
+        id: restored_container.clone(),
+        label: restored_container.clone(),
+    };
+    let restored_volume = format!("mariadb_data_{restored_name}");
+
+    let result = mariadb_svc
+        .restore_to_new_service(restore_ctx, restored_name.clone(), serde_json::Value::Null)
+        .await
+        .map_err(|e| anyhow::anyhow!("restore_to_new_service: {e}"))?;
+    eprintln!("Restore produced new service: {}", result.connection_info);
+
+    let restored_port: u16 = result
+        .parameters
+        .get("port")
+        .and_then(|p| p.parse().ok())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "restored service has no port param: {:?}",
+                result.parameters
+            )
+        })?;
+    eprintln!("Restored MariaDB on host port {restored_port}");
+
+    // ── Assert: the target's OWN root password works ────────────────────────
+    let restored = {
+        let conn = format!("mysql://root:{RESTORED_ROOT_PASSWORD}@127.0.0.1:{restored_port}/");
+        let mut pool = None;
+        for attempt in 0..30 {
+            match MySqlPoolOptions::new()
+                .max_connections(1)
+                .acquire_timeout(Duration::from_secs(3))
+                .connect(&conn)
+                .await
+            {
+                Ok(p) => {
+                    pool = Some(p);
+                    break;
+                }
+                Err(_) if attempt < 29 => tokio::time::sleep(Duration::from_millis(750)).await,
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "restored MariaDB rejected the TARGET's own root password — the \
+                         logical-dump restore must not overwrite the target's credentials: {e}"
+                    ))
+                }
+            }
+        }
+        pool.ok_or_else(|| {
+            anyhow::anyhow!(
+                "restored MariaDB never accepted the TARGET's own root password; the \
+                 logical-dump restore must leave mysql.user untouched"
+            )
+        })?
+    };
+
+    // ── Assert: the data really round-tripped ───────────────────────────────
+    let restored_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM appdb.events")
+        .fetch_one(&restored)
+        .await?;
+    let batch_a: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM appdb.events WHERE batch='A'")
+        .fetch_one(&restored)
+        .await?;
+    eprintln!(
+        "Restored logical-dump row counts - total={restored_rows} A={batch_a} (expected 7/7)"
+    );
+    assert_eq!(restored_rows, 7, "all dumped rows must be restored");
+    assert_eq!(batch_a, 7, "restored rows must carry their original values");
+    restored.close().await;
+
+    // ── The key assertion: the ORIGIN's root password must NOT work ─────────
+    // `mariadb_dump` excludes the `mysql` schema, so nothing in the dump can
+    // replace the target's `mysql.user`. If this ever succeeds, the restore
+    // propagated origin credentials it had no business propagating.
+    let origin_conn = format!("mysql://root:{ROOT_PASSWORD}@127.0.0.1:{restored_port}/");
+    let origin_auth = MySqlPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(Duration::from_secs(5))
+        .connect(&origin_conn)
+        .await;
+    match origin_auth {
+        Ok(p) => {
+            p.close().await;
+            panic!(
+                "SECURITY: the restored service accepted the ORIGIN's root password. A \
+                 mariadb_dump restore must never propagate the origin's credentials \
+                 (credential_propagation_gates returns (false, false) for this format)."
+            );
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            eprintln!("Origin password correctly rejected by restored service: {msg}");
+            assert!(
+                msg.contains("1045") || msg.to_lowercase().contains("access denied"),
+                "expected an authentication failure (1045 / access denied) when using the \
+                 origin's password, got a different error: {msg}"
+            );
+        }
+    }
+
+    // Best-effort: remove the restored data volume so it doesn't leak.
+    let _ = env
+        .docker
+        .remove_volume(
+            &restored_volume,
+            Some(bollard::query_parameters::RemoveVolumeOptions { force: true }),
+        )
+        .await;
+
+    Ok(())
+}
+
 /// Build the provider-side `MariaDbConfig` indirectly: the provider parses a
 /// `ServiceConfig` internally, so we hand `archive_binlogs` a config by
 /// round-tripping through the same parameters. The provider's `archive_binlogs`
