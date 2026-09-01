@@ -256,6 +256,39 @@ mod tests {
     }
 
     #[test]
+    fn test_detect_presets_from_file_tree_bare_dockerfile_in_docker_dir_roots_at_repo_root() {
+        // Mirrors a real repository (JupyterLab) that ships a
+        // `docker/Dockerfile` whose COPY instructions reach back to files at
+        // the repository root. Unlike `apps/api/Dockerfile` above (which has
+        // its own go.mod and stays its own root), `docker/` has no manifest
+        // of its own, so it must be surfaced as a root-level build option
+        // rather than becoming its own project root/build context.
+        let files = vec![
+            "pyproject.toml".to_string(),
+            "docker/Dockerfile".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 2);
+        assert!(presets.iter().all(|p| p.path == "./"), "{presets:?}");
+
+        let dockerfile = presets
+            .iter()
+            .find(|p| p.slug == "dockerfile")
+            .expect("dockerfile preset should still be detected");
+        assert_eq!(
+            dockerfile.dockerfile_path.as_deref(),
+            Some("docker/Dockerfile")
+        );
+
+        let python = presets
+            .iter()
+            .find(|p| p.slug == "python")
+            .expect("root pyproject.toml should still be detected");
+        assert_eq!(python.dockerfile_path, None);
+    }
+
+    #[test]
     fn test_detect_presets_from_file_tree_skips_node_modules() {
         let files = vec![
             "next.config.js".to_string(),

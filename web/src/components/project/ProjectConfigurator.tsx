@@ -863,6 +863,7 @@ export function ProjectConfigurator({
           projectType: preset.project_type,
           path: preset.path,
           composeFiles: preset.compose_files,
+          dockerfilePath: preset.dockerfile_path,
         })),
       }
     }
@@ -1005,6 +1006,13 @@ export function ProjectConfigurator({
       return {
         value: `${presetName}::${normalizedPath}`,
         rootDir: presetPath, // Keep original path for rootDirectory field
+        // Carries the rolled-up Dockerfile path (see onSelectPreset) so the
+        // very first auto-selected preset pre-fills it too, not just
+        // subsequent manual selections.
+        dockerfilePath:
+          presetName === 'dockerfile'
+            ? firstPreset.dockerfilePath || undefined
+            : undefined,
       }
     }
     // Fallback: use 'custom' as default
@@ -1038,6 +1046,12 @@ export function ProjectConfigurator({
       shouldValidate: true,
       shouldDirty: true,
     })
+    if (defaultPresetValue.dockerfilePath) {
+      form.setValue('dockerfilePath', defaultPresetValue.dockerfilePath, {
+        shouldValidate: true,
+        shouldDirty: true,
+      })
+    }
   }, [defaultPresetValue, form])
 
   // Auto-set default branch (select first branch by default)
@@ -1459,7 +1473,7 @@ export function ProjectConfigurator({
                       field.onChange('custom')
                       form.setValue('rootDirectory', './')
                     } else {
-                      const [_presetName, presetPath] = value.split('::')
+                      const [presetName, presetPath] = value.split('::')
                       // Store the full preset key (preset::path) to distinguish between same preset at different paths
                       field.onChange(value)
 
@@ -1485,6 +1499,25 @@ export function ProjectConfigurator({
                         form.setValue('rootDirectory', `./${cleanPath}`)
                       } else {
                         form.setValue('rootDirectory', './')
+                      }
+
+                      // Pre-fill the Dockerfile path from the detected
+                      // candidate. Covers the rolled-up case — a Dockerfile
+                      // that actually lives in a subdirectory (e.g.
+                      // `docker/Dockerfile`) but is presented at the
+                      // repository root so the build context stays there —
+                      // and resets to the plain default otherwise, so a
+                      // stale value from a previous selection never lingers.
+                      if (presetName === 'dockerfile') {
+                        const matchedCandidate = presetData?.presets?.find(
+                          (p: ProjectPresetResponse) =>
+                            p.preset === presetName &&
+                            normalizePath(p.path) === normalizePath(presetPath)
+                        )
+                        form.setValue(
+                          'dockerfilePath',
+                          matchedCandidate?.dockerfilePath || 'Dockerfile'
+                        )
                       }
                     }
                   }}

@@ -48,6 +48,7 @@ import { Skeleton } from '@/components/ui/skeleton'
 import { Checkbox } from '@/components/ui/checkbox'
 import { KbdBadge } from '@/components/ui/kbd-badge'
 import { ImportEnvDialog } from '@/components/ui/import-env-dialog'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { Switch } from '@/components/ui/switch'
 import { Label } from '@/components/ui/label'
 import {
@@ -1104,6 +1105,11 @@ export function EnvironmentVariablesSettings({
 }: EnvironmentVariablesSettingsProps) {
   const [isAddDialogOpen, setIsAddDialogOpen] = useState(false)
   const [isImportDialogOpen, setIsImportDialogOpen] = useState(false)
+
+  useKeyboardShortcut({
+    key: 'n',
+    callback: () => setIsAddDialogOpen(true),
+  })
   const [selectedVariables, setSelectedVariables] = useState<Set<number>>(
     new Set()
   )
@@ -1412,35 +1418,6 @@ export function EnvironmentVariablesSettings({
       errorTitle: 'Failed to delete environment variable',
     },
   })
-
-  // Keyboard shortcut to add new variable (N key)
-  // IMPORTANT: This useEffect must be called BEFORE any early returns to follow React's Rules of Hooks
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      // Check if the key is 'N' and no input/textarea is focused
-      if (
-        e.key === 'n' &&
-        !e.metaKey &&
-        !e.ctrlKey &&
-        !e.shiftKey &&
-        !e.altKey
-      ) {
-        const target = e.target as HTMLElement
-        // Only trigger if not typing in an input/textarea
-        if (
-          target.tagName !== 'INPUT' &&
-          target.tagName !== 'TEXTAREA' &&
-          !target.isContentEditable
-        ) {
-          e.preventDefault()
-          setIsAddDialogOpen(true)
-        }
-      }
-    }
-
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [])
 
   const handleSelectVariable = (id: number) => {
     setSelectedVariables((prev) => {

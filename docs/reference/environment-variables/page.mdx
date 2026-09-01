@@ -33,7 +33,45 @@ These environment variables configure the Temps server itself:
 | `TEMPS_DATA_DIR`        | `--data-dir`        | `~/.temps`       | Data directory for keys and configuration            |
 | `TEMPS_LOG_LEVEL`       | `--log-level`       | `info`           | Log level: `trace`, `debug`, `info`, `warn`, `error` |
 | `TEMPS_CONSOLE_ADDRESS` | `--console-address` | (optional)       | Console listener (public ingest + admin if no split) |
+| `TEMPS_EXECUTION_ENV`   | (none)              | `host`           | Control-plane network context: `host` or `docker`    |
+| `TEMPS_NETWORK_NAME`    | (none)              | `temps-app-network` | Docker network for managed workloads; Compose sets `temps-docker-workloads` |
 | `TEMPS_DOCKER_EXTRA_NETWORKS` | (none)          | (empty)          | Comma-separated Docker networks app containers must join before startup |
+
+`TEMPS_EXECUTION_ENV=docker` makes Temps reach managed containers through
+their stable Docker network names and internal target ports. Host execution
+uses `127.0.0.1` and published host ports. The legacy `DEPLOYMENT_MODE` variable
+remains supported when `TEMPS_EXECUTION_ENV` is unset; migrate it to the
+canonical variable. Unknown values fail startup, and `kubernetes` is reserved
+but intentionally unsupported until its runtime adapter ships.
+
+In the Compose package, Temps joins both its private control-plane network and
+the explicitly named `TEMPS_NETWORK_NAME` workload network. Managed workloads
+join only the latter, so Docker DNS and internal ports work without granting
+applications network access to the control-plane PostgreSQL or ClickHouse
+services. The Compose package pins its private dependencies and Temps listener
+binds to configurable static control-network addresses rather than DNS-derived
+addresses. Host access is published separately on `127.0.0.1`. Compose splits
+public ingest (`9000`) from admin/UI (`9001`) with physically separate proxy
+containers; only the public proxy joins the workload network. The admin proxy
+passes through a separate Basic-auth secret before reaching Temps' own
+authentication.
+
+The Compose file also reads these `.env` values. If the subnet overlaps an
+existing route, change the subnet and all three addresses together:
+
+| Variable | Compose default | Description |
+| --- | --- | --- |
+| `TEMPS_CONTROL_SUBNET` | `198.18.255.0/24` | Private control-plane bridge subnet |
+| `TEMPS_CONTROL_INTERNAL_IP` | `198.18.255.10` | Temps listener address on the private network |
+| `TEMPS_POSTGRES_INTERNAL_IP` | `198.18.255.11` | PostgreSQL address used by Temps |
+| `TEMPS_CLICKHOUSE_INTERNAL_IP` | `198.18.255.12` | ClickHouse address used by Temps |
+| `TEMPS_WORKLOAD_SUBNET` | `198.20.255.0/24` | Shared managed-workload bridge subnet |
+| `TEMPS_PUBLIC_INGRESS_IP` | `198.20.255.10` | Public proxy address reachable by managed workloads |
+| `TEMPS_INGRESS_SUBNET` | `198.19.255.0/24` | Dedicated loopback-admin proxy bridge subnet |
+| `TEMPS_ADMIN_INGRESS_IP` | `198.19.255.10` | Admin proxy address on its dedicated bridge |
+| `TEMPS_INGRESS_GATEWAY_IP` | `198.19.255.1` | Dedicated admin bridge gateway |
+| `TEMPS_ADMIN_PASSWORD_FILE` | `./secrets/admin_password` | Initial Temps administrator password secret |
+| `TEMPS_ADMIN_INGRESS_PASSWORD_FILE` | `./secrets/admin_ingress_password` | Independent single-line Basic-auth secret (16–72 non-blank printable ASCII bytes) for loopback admin ingress (username `temps`) |
 
 ### Admin Listener (optional)
 

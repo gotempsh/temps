@@ -9,7 +9,6 @@
 //! - Git provider (GitHub) with token
 //! - Domain with SSL certificate provisioning
 
-use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Argon2, PasswordHasher};
 use clap::Args;
 use colored::Colorize;
@@ -349,9 +348,8 @@ async fn create_admin_user(
 
     // Hash password with Argon2
     let argon2 = Argon2::default();
-    let salt = SaltString::generate(&mut OsRng);
     let password_hash = argon2
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map_err(|e| anyhow::anyhow!("Password hashing failed: {}", e))?
         .to_string();
 

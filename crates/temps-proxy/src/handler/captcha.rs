@@ -238,8 +238,13 @@ mod tests {
         let mut nonce = 0u64;
         let mut solution_found = false;
 
-        while nonce < 5_000_000 {
-            // Limit attempts to avoid infinite loop in tests (20 bits needs ~1M average)
+        // 20 bits needs ~1M attempts on average (geometric distribution with
+        // p = 2^-20). A 5M cap left a ~0.85% chance of a false-failure on any
+        // given run purely from an unlucky random challenge -- exactly what
+        // caused this test to flake in CI. 20M attempts pushes the odds of a
+        // spurious failure down to ~2e-9 while leaving the (much faster)
+        // typical run unaffected.
+        while nonce < 20_000_000 {
             let hash = compute_hash(&challenge, &nonce.to_string());
 
             if has_leading_zero_bits(&hash, difficulty) {
@@ -258,7 +263,7 @@ mod tests {
 
         assert!(
             solution_found,
-            "Failed to find solution within 5,000,000 attempts"
+            "Failed to find solution within 20,000,000 attempts"
         );
     }
 

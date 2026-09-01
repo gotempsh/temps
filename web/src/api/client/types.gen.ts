@@ -1008,6 +1008,51 @@ export type AllocEntry = {
     underlay_address: string;
 };
 
+/**
+ * An analytics ingest key as returned by the admin API.
+ *
+ * `public_key` is present in full on every response — see the module docs.
+ */
+export type AnalyticsIngestKey = {
+    /**
+     * Exact origins (`scheme://host[:port]`) permitted to use this key from a
+     * browser. `None` or `[]` means any origin. This is a browser-enforced
+     * convenience control, not authentication — a non-browser client ignores
+     * `Origin` entirely.
+     */
+    allowed_origins?: Array<string> | null;
+    created_at: string;
+    created_by_user_id?: number | null;
+    /**
+     * `None` means the key is scoped to the whole project. An
+     * environment-scoped key additionally attributes ingested data to that
+     * environment's current deployment, when it has one.
+     */
+    environment_id?: number | null;
+    event_count: number;
+    id: number;
+    is_active: boolean;
+    last_used_at?: string | null;
+    /**
+     * Operator-facing label.
+     */
+    name: string;
+    project_id: number;
+    /**
+     * The ingest key itself, `pa_` + 64 hex characters.
+     *
+     * **Not a secret.** It is designed to ship in client-side JavaScript and
+     * is returned unmasked so operators can copy it. See the module docs.
+     */
+    public_key: string;
+    /**
+     * `None` or `<= 0` means unlimited.
+     */
+    rate_limit_per_minute?: number | null;
+    revoked_at?: string | null;
+    updated_at: string;
+};
+
 export type AnalyticsSessionEventsResponse = {
     events: Array<SessionEvent>;
     session_id: string;
@@ -1528,7 +1573,7 @@ export type AppSettingsResponse = {
     /**
      * Managed control-plane destination and explicit export consent flags.
      */
-    cloud?: CloudSettings;
+    cloud: CloudSettings;
     /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
      * needed — `enabled` is a plain bool with no sensitive content. Passed
@@ -2618,6 +2663,59 @@ export type CloudAiCapability = {
     setup_path: string;
 };
 
+export type CloudBackfillStatusResponse = {
+    /**
+     * Whether a backfill would be accepted right now. False means the project
+     * is still at `metered` fidelity.
+     */
+    backfill_available: boolean;
+    /**
+     * The exact command an operator should run. Always present, in every
+     * state, so the capability is discoverable from the Console even though
+     * the Console deliberately cannot trigger it.
+     */
+    command: string;
+    completed_at?: string | null;
+    /**
+     * Current per-project egress fidelity. A `metered` project cannot be
+     * backfilled at all — the CLI refuses — so the client must be able to
+     * render "not set up" rather than "not started".
+     */
+    fidelity: CloudTelemetryFidelity;
+    /**
+     * Reason the last run stopped, when `status` is `failed`. Verbatim, but
+     * length-bounded: it originates as raw driver/server text and is readable
+     * by every project member with `OtelRead`, not only whoever ran the
+     * command.
+     */
+    last_error?: string | null;
+    /**
+     * `spans_processed / spans_total`, clamped to 0–100. `None` when the total
+     * is unknown or zero — an empty window is not "0% done".
+     */
+    percent_complete?: number | null;
+    project_id: number;
+    /**
+     * Where to go to raise fidelity, when `backfill_available` is false.
+     */
+    setup_path?: string | null;
+    spans_processed: number;
+    spans_total: number;
+    started_at?: string | null;
+    /**
+     * `not_started` when no backfill has ever run for this project.
+     */
+    status: CloudTelemetryBackfillStatus;
+    /**
+     * Bumped on every progress write. A `running` status whose `updated_at` is
+     * far in the past is a stalled run, and the client should say so instead
+     * of showing a spinner forever.
+     */
+    updated_at?: string | null;
+    window_from?: string | null;
+    window_to?: string | null;
+};
+
 export type CloudCapability = {
     configured: boolean;
     reason?: string | null;
@@ -2655,6 +2753,25 @@ export type CloudSettings = {
      * Explicit consent to mirror locally stored telemetry.
      */
     telemetry_enabled?: boolean;
+    /**
+     * ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
+     * backs Cloud-primary telemetry writes.
+     *
+     * An operator setting on the singleton `settings` row rather than an
+     * environment variable, per CLAUDE.md, so it can be raised at runtime by
+     * the operator watching a queue fill up — which is exactly when they need
+     * to change it and exactly when restarting the binary is the worst
+     * available option.
+     *
+     * Expressed in **bytes and not rows**: the reference deployment is
+     * 3 vCPU / 4 GB, and a row count says nothing about disk on a table whose
+     * rows are serialized spans of wildly varying size. When the queue reaches
+     * this size the instance stops accepting new spans for Cloud-primary
+     * projects and records a gap window with a start, an end and a count —
+     * see [`DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES`] for how the default is
+     * sized and what it buys.
+     */
+    telemetry_outbox_max_bytes?: number;
 };
 
 export type CloudStatus = {
@@ -2669,6 +2786,74 @@ export type CloudStatus = {
     status: string;
     status_message: string;
     telemetry_enabled: boolean;
+};
+
+/**
+ * Lifecycle of the most recent backfill run for a project.
+ */
+export type CloudTelemetryBackfillStatus = 'not_started' | 'running' | 'completed' | 'failed';
+
+/**
+ * Per-project fidelity tier for the optional Temps Cloud telemetry mirror.
+ */
+export type CloudTelemetryFidelity = 'metered' | 'queryable';
+
+/**
+ * Per-project destination for span writes.
+ */
+export type CloudTelemetryWriteMode = 'local' | 'cloud';
+
+/**
+ * Instance-wide aggregate for the Cloud settings page.
+ */
+export type CloudTelemetryWriteStatusResponse = {
+    /**
+     * Whether the console should offer decommission guidance. True only when
+     * `local_span_store_required` is false — the ADR is explicit that the
+     * advice must not appear before then.
+     */
+    can_decommission_local_span_store: boolean;
+    cloud_primary_projects: number;
+    /**
+     * Whether Cloud-primary writes can be used at all on this instance.
+     */
+    configured: boolean;
+    /**
+     * Rows that exhausted their retries. Never swept automatically; an
+     * operator has to see them.
+     */
+    dead_lettered_rows: number;
+    gap_windows: Array<TelemetryGapWindowResponse>;
+    local_history_until?: string | null;
+    local_mode_projects: number;
+    local_span_store_reason?: string | null;
+    /**
+     * The derived decommission signal. `true` means the operator gets **zero**
+     * resource win from removing their local span store, whatever the write
+     * modes say.
+     */
+    local_span_store_required: boolean;
+    /**
+     * Age of the oldest unshipped span, in seconds. `None` when the queue is
+     * empty — different from zero, and it must not render as zero.
+     */
+    oldest_unshipped_age_secs?: number | null;
+    queue_bytes: number;
+    /**
+     * Spans queued for Cloud across all projects.
+     */
+    queue_depth: number;
+    /**
+     * The operator-set ceiling, so the depth above is readable against
+     * something rather than being a number with no scale.
+     */
+    queue_max_bytes: number;
+    reason?: string | null;
+    setup_path?: string | null;
+    /**
+     * Set while Cloud-primary writes are falling back to local storage.
+     */
+    write_suspension?: string | null;
 };
 
 /**
@@ -3810,6 +3995,32 @@ export type CreateAlertRuleRequest = {
      * Trigger type: new_issue, regression, frequency, new_user, user_count, status_change
      */
     trigger_type: string;
+};
+
+/**
+ * Request body for minting a new ingest key.
+ */
+export type CreateAnalyticsIngestKeyRequest = {
+    /**
+     * Exact origins permitted to use this key from a browser. Omit or send an
+     * empty array to allow any origin.
+     */
+    allowed_origins?: Array<string> | null;
+    /**
+     * Scope the key to a single environment. Recommended: it lets Temps
+     * attribute ingested data to that environment's current deployment.
+     * Omit for a project-wide key.
+     */
+    environment_id?: number | null;
+    /**
+     * Operator-facing label. Defaults to "Default ingest key".
+     */
+    name?: string | null;
+    /**
+     * Requests per minute for this key. Omit for the 600/min default; send a
+     * non-positive value for unlimited.
+     */
+    rate_limit_per_minute?: number | null;
 };
 
 export type CreateApiKeyRequest = {
@@ -6544,6 +6755,14 @@ export type DropPresetCandidate = {
     composePath?: string | null;
     confidence: string;
     directory: string;
+    /**
+     * Repository-root-relative path to the Dockerfile, when it does not
+     * live directly under `{directory}/Dockerfile` (e.g. `docker/Dockerfile`
+     * rolled up to a `directory` of `"."`). `None` for a Dockerfile located
+     * directly at `{directory}/Dockerfile` and for every non-Dockerfile
+     * preset.
+     */
+    dockerfilePath?: string | null;
     isStatic: boolean;
     label: string;
     preset: string;
@@ -7595,6 +7814,14 @@ export type EventMetricsPayload = {
      * Cumulative Layout Shift (score)
      */
     cls?: number | null;
+    /**
+     * The tracked site's own domain, computed client-side by the SDK's
+     * `resolveDomain()` and sent as a sibling of `event_data` (not nested
+     * inside it). Used on the keyed ingest path (ADR-040 §3) to attribute
+     * self-referrals/channels correctly: there, `Host` names the Temps
+     * server rather than the customer's site, so it can't be used for that.
+     */
+    domain?: string | null;
     event_data: unknown;
     event_name: string;
     /**
@@ -7624,11 +7851,23 @@ export type EventMetricsPayload = {
     screen_height?: number | null;
     screen_width?: number | null;
     /**
+     * Client-generated session id fallback (see `visitor_id`).
+     */
+    session_id?: string | null;
+    /**
      * Time to First Byte (milliseconds)
      */
     ttfb?: number | null;
     viewport_height?: number | null;
     viewport_width?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     * Accepts the SDK's `visitorId` key too, since the shared SDK helper that
+     * generates this value sends camelCase for every ingest endpoint.
+     */
+    visitor_id?: string | null;
 };
 
 /**
@@ -8097,6 +8336,33 @@ export type ExternalServiceSummary = {
  * stamping it on each row keeps the status fields unambiguous.
  */
 export type FacetBackendKind = 'clickhouse' | 'timescaledb';
+
+/**
+ * Whether a facet registered now would actually cover anything
+ * (Feature Discoverability: "not built" and "not set up" need different UI).
+ */
+export type FacetCapability = {
+    /**
+     * False when the facet would populate for no project at all.
+     */
+    configured: boolean;
+    /**
+     * Why, when `configured` is false. Always populated in that case.
+     */
+    reason?: string | null;
+    /**
+     * Where the operator goes to change it.
+     */
+    setup_path?: string | null;
+    /**
+     * Projects whose spans this facet will **not** cover, because they are
+     * Cloud-primary and store no spans on this instance. Non-empty alongside
+     * `configured: true` is a real and useful state: the facet works for the
+     * other projects, and the operator must be told which ones it misses
+     * rather than discovering it from an empty filter.
+     */
+    uncovered_project_ids: Array<number>;
+};
 
 /**
  * Public representation of a registered span attribute facet.
@@ -11054,8 +11320,8 @@ export type MintEnrollmentTokenRequest = {
 
 export type MintEnrollmentTokenResponse = {
     /**
-     * SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
-     * worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+     * SHA-256 fingerprint of the cluster CA. Token issuance initializes the
+     * CA when needed, so every newly minted token carries a trust pin.
      */
     ca_fingerprint?: string | null;
     expires_at: string;
@@ -11309,9 +11575,10 @@ export type MultiNodeSettings = {
      */
     private_address?: string | null;
     /**
-     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`
-     * (default), the control plane ignores join-time CSRs and nodes keep
-     * serving plaintext HTTP — zero behavior change. When `true`, the CP signs
+     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). New installations
+     * default to `true`. Existing serialized settings that predate this field
+     * deserialize it as `false`, providing an explicit migration window rather
+     * than unexpectedly disconnecting legacy workers. When `true`, the CP signs
      * node CSRs, nodes serve mutual TLS, and every CP→agent call uses the
      * cluster client cert. Observe-then-enforce: flip this on only once all
      * workers have re-enrolled with certs.
@@ -11328,10 +11595,6 @@ export type MultiNodeSettingsMasked = {
      * verify it out of band; the CA private key is never exposed).
      */
     cluster_ca_fingerprint?: string | null;
-    /**
-     * Effective cluster-wide container address pool. `None` only when the
-     * singleton network configuration could not be read.
-     */
     cluster_network?: null | ClusterNetworkSettings;
     has_join_token: boolean;
     /**
@@ -11423,6 +11686,16 @@ export type NetworkConfiguration = {
  */
 export type NetworkMode = 'bridge' | 'host' | 'none' | {
     custom: string;
+};
+
+/**
+ * Cluster-wide pool which every node must use. This is intentionally sent
+ * alongside the local allocation so operators and agents can detect stale or
+ * independently configured nodes before routes are changed.
+ */
+export type NetworkPoolEntry = {
+    compute_pool_cidr: string;
+    subnet_prefix_len: number;
 };
 
 /**
@@ -12737,6 +13010,7 @@ export type PeerListResponse = {
      * and newer version skew degrades to the safe default of `false`.
      */
     cluster_dns_enabled: boolean;
+    network: NetworkPoolEntry;
     /**
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
@@ -13313,6 +13587,13 @@ export type PresetInfo = {
      */
     compose_files?: Array<string> | null;
     /**
+     * Repository-root-relative path to the Dockerfile, when it does not
+     * live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+     * rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+     * directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+     */
+    dockerfile_path?: string | null;
+    /**
      * Default exposed port for this preset
      */
     exposed_port?: number | null;
@@ -13523,6 +13804,68 @@ export type ProjectAccessResponse = {
 };
 
 /**
+ * A project's Cloud telemetry configuration, in every state.
+ */
+export type ProjectCloudTelemetryResponse = {
+    attribute_allowlist: Array<string>;
+    /**
+     * Whether `write_mode = cloud` could be set right now.
+     *
+     * `false` is the normal state on an unlinked instance and must render as
+     * onboarding, not as an error.
+     */
+    cloud_write_mode_available: boolean;
+    /**
+     * Spans this instance accepted for this project and gave up on delivering.
+     *
+     * The instance-wide card only shows a count; this route is already scoped
+     * to one project, so it can say *why* without exposing another tenant's
+     * failures.
+     */
+    dead_lettered_spans: number;
+    effective_reason?: null | TelemetryWriteIntervalReason;
+    effective_reason_message?: string | null;
+    /**
+     * Where this project's spans are going right now, which differs from
+     * `write_mode` during a quota or credential fallback.
+     */
+    effective_write_mode: CloudTelemetryWriteMode;
+    fidelity: CloudTelemetryFidelity;
+    /**
+     * Gap windows in the last 30 days.
+     */
+    gap_windows: Array<TelemetryGapWindowResponse>;
+    /**
+     * The write-mode ledger, newest first.
+     */
+    intervals: Array<TelemetryWriteIntervalResponse>;
+    last_dead_letter_at?: string | null;
+    /**
+     * The reason the most recent give-up gave, if there is one.
+     *
+     * Delivery metadata only — this instance's own bounded error string. It is
+     * never the span payload, and this field must not become a place one
+     * appears.
+     */
+    last_dead_letter_error?: string | null;
+    project_id: number;
+    /**
+     * Spans queued for Cloud for this project and not yet acknowledged.
+     */
+    queued_spans: number;
+    /**
+     * The single most relevant missing prerequisite, when
+     * `cloud_write_mode_available` is false.
+     */
+    reason?: string | null;
+    setup_path?: string | null;
+    /**
+     * The operator's declared intent.
+     */
+    write_mode: CloudTelemetryWriteMode;
+};
+
+/**
  * Project-level configuration
  */
 export type ProjectConfiguration = {
@@ -13670,6 +14013,13 @@ export type ProjectPresetResponse = {
      * Compose file paths found in the repository (only for docker-compose preset)
      */
     composeFiles?: Array<string> | null;
+    /**
+     * Repository-root-relative path to the Dockerfile, when it does not
+     * live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+     * rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+     * directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+     */
+    dockerfilePath?: string | null;
     /**
      * Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
      */
@@ -14923,6 +15273,10 @@ export type RegisterNodeResponse = {
     cert_pem?: string | null;
     id: number;
     message: string;
+    /**
+     * Whether this node must serve mTLS and reject plaintext agent traffic.
+     */
+    mtls_required: boolean;
     name: string;
     status: string;
 };
@@ -15687,6 +16041,25 @@ export type RootfsVmEntry = {
     sandbox_name: string;
 };
 
+export type RotateClusterCaRequest = {
+    /**
+     * Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
+     */
+    confirmation: string;
+    /**
+     * Fingerprint observed through a trusted operator channel immediately
+     * before rotation. The request fails if the active root changed.
+     */
+    expected_fingerprint: string;
+};
+
+export type RotateClusterCaResponse = {
+    message: string;
+    new_fingerprint: string;
+    previous_fingerprint: string;
+    revoked_enrollment_tokens: number;
+};
+
 export type RouteRefreshResponse = {
     /**
      * Human-readable message
@@ -15811,7 +16184,9 @@ export type S3SourceResponse = {
     id: number;
     is_default: boolean;
     /**
-     * True when this source was auto-provisioned by a Temps Cloud link rather than entered by an operator. Managed sources cannot be edited or deleted from this API; disconnect Temps Cloud to remove one.
+     * True when this source was auto-provisioned by a Temps Cloud link
+     * rather than entered by an operator. Managed sources cannot be edited
+     * or deleted from this API; disconnect Temps Cloud to remove one.
      */
     managed_by_cloud: boolean;
     name: string;
@@ -17192,6 +17567,13 @@ export type SessionReplayInitRequest = {
     userAgent?: string | null;
     viewportHeight?: number | null;
     viewportWidth?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     * The SDK already sends this today via `getSessionMetadata()`.
+     */
+    visitorId?: string | null;
 };
 
 export type SessionReplayInitResponse = {
@@ -18096,6 +18478,10 @@ export type SpeedMetricsPayload = {
      */
     screenWidth?: number | null;
     /**
+     * Client-generated session id fallback (see `visitor_id`).
+     */
+    sessionId?: string | null;
+    /**
      * Time to First Byte (milliseconds)
      */
     ttfb?: number | null;
@@ -18107,6 +18493,12 @@ export type SpeedMetricsPayload = {
      * Viewport width in pixels
      */
     viewportWidth?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     */
+    visitorId?: string | null;
 };
 
 /**
@@ -18705,6 +19097,39 @@ export type TeamResponse = {
  * alteration blocking a downgrade.
  */
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
+
+/**
+ * A gap window as the client renders it.
+ */
+export type TelemetryGapWindowResponse = {
+    dropped_bytes: number;
+    dropped_spans: number;
+    ended_at: string;
+    /**
+     * The sentence shown to the operator. Sent by the server so the client
+     * never has to map an enum to prose and never renders a bare enum name.
+     */
+    message: string;
+    project_id: number;
+    reason: TelemetryWriteIntervalReason;
+    started_at: string;
+};
+
+/**
+ * Why an interval opened.
+ */
+export type TelemetryWriteIntervalReason = 'operator' | 'cloud_disconnected' | 'quota_exhausted' | 'credential_rejected' | 'queue_overflow_spill' | 'cloud_recovered';
+
+/**
+ * One entry of the write-mode ledger.
+ */
+export type TelemetryWriteIntervalResponse = {
+    effective_from: string;
+    effective_to?: string | null;
+    message: string;
+    mode: CloudTelemetryWriteMode;
+    reason: TelemetryWriteIntervalReason;
+};
 
 /**
  * Response type for a single template
@@ -19564,6 +19989,30 @@ export type UpdateAlertRuleRequest = {
     trigger_type?: string | null;
 };
 
+/**
+ * Request body for a partial update.
+ *
+ * `allowed_origins` and `rate_limit_per_minute` use the three-state
+ * double-`Option` encoding: field absent = leave unchanged, explicit `null` =
+ * clear, value = set. Plain `Option<Option<T>>` alone cannot express this
+ * because serde collapses an explicit JSON `null` into the outer `None`.
+ */
+export type UpdateAnalyticsIngestKeyRequest = {
+    /**
+     * Absent = unchanged, `null` = clear (any origin allowed), array = replace.
+     */
+    allowed_origins?: Array<string> | null;
+    /**
+     * New operator-facing label. Absent leaves it unchanged. The column is
+     * `NOT NULL`, so there is no "clear" state — send a new label instead.
+     */
+    name?: string | null;
+    /**
+     * Absent = unchanged, `null` = clear (unlimited), value = replace.
+     */
+    rate_limit_per_minute?: number | null;
+};
+
 export type UpdateApiKeyRequest = {
     expires_at?: string | null;
     is_active?: boolean | null;
@@ -20253,6 +20702,19 @@ export type UpdatePreferencesRequest = {
 };
 
 /**
+ * Body for changing a project's Cloud telemetry settings.
+ *
+ * Both fields are optional and independent: an operator raising fidelity and
+ * one flipping the write mode are two different acts, and forcing a client to
+ * send both would make each one able to clobber the other.
+ */
+export type UpdateProjectCloudTelemetryRequest = {
+    attribute_allowlist?: Array<string> | null;
+    fidelity?: null | CloudTelemetryFidelity;
+    write_mode?: null | CloudTelemetryWriteMode;
+};
+
+/**
  * Request to update a project secret. The `value` field is optional — omit it
  * to rotate only the environment scoping / preview flag without touching the
  * ciphertext.
@@ -20532,6 +20994,16 @@ export type UpdateSpeedMetricsPayload = {
      * Interaction to Next Paint (milliseconds)
      */
     inp?: number | null;
+    /**
+     * Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+     */
+    sessionId?: string | null;
+    /**
+     * Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+     * Required to identify the right row on the keyed path, where there is
+     * no Temps-issued cookie to fall back on.
+     */
+    visitorId?: string | null;
 };
 
 /**
@@ -21602,7 +22074,9 @@ export type S3SourceResponseWritable = {
     id: number;
     is_default: boolean;
     /**
-     * True when this source was auto-provisioned by a Temps Cloud link rather than entered by an operator. Managed sources cannot be edited or deleted from this API; disconnect Temps Cloud to remove one.
+     * True when this source was auto-provisioned by a Temps Cloud link
+     * rather than entered by an operator. Managed sources cannot be edited
+     * or deleted from this API; disconnect Temps Cloud to remove one.
      */
     managed_by_cloud: boolean;
     name: string;
@@ -21853,8 +22327,19 @@ export type UploadReleaseFileResponse = UploadReleaseFileResponses[keyof UploadR
 
 export type RecordEventMetricsData = {
     body: EventMetricsPayload;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/event';
 };
 
@@ -21926,8 +22411,19 @@ export type IngestTunneledEnvelopeResponse = IngestTunneledEnvelopeResponses[key
 
 export type AddSessionReplayEventsData = {
     body: SessionReplayEventsRequest;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used to flush the final replay batch on page unload). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/session-replay/events';
 };
 
@@ -21959,8 +22455,19 @@ export type AddSessionReplayEventsResponse = AddSessionReplayEventsResponses[key
 
 export type InitSessionReplayData = {
     body: SessionReplayInitRequest;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/session-replay/init';
 };
 
@@ -21988,8 +22495,19 @@ export type InitSessionReplayResponse = InitSessionReplayResponses[keyof InitSes
 
 export type RecordSpeedMetricsData = {
     body: SpeedMetricsPayload;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/speed';
 };
 
@@ -22021,8 +22539,19 @@ export type RecordSpeedMetricsResponse = RecordSpeedMetricsResponses[keyof Recor
 
 export type UpdateSpeedMetricsData = {
     body: UpdateSpeedMetricsPayload;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers. This endpoint is called via `navigator.sendBeacon` on page unload, so the query form is the only one available there. Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/speed/update';
 };
 
@@ -31455,6 +31984,14 @@ export type ListServiceProjectsData = {
 
 export type ListServiceProjectsErrors = {
     /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to view this service
+     */
+    403: unknown;
+    /**
      * Service not found
      */
     404: unknown;
@@ -31487,9 +32024,21 @@ export type LinkServiceToProjectData = {
 
 export type LinkServiceToProjectErrors = {
     /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to link this service
+     */
+    403: unknown;
+    /**
      * Service or project not found
      */
     404: unknown;
+    /**
+     * Project already has a database of this type
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -31522,6 +32071,14 @@ export type UnlinkServiceFromProjectData = {
 };
 
 export type UnlinkServiceFromProjectErrors = {
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to unlink this service
+     */
+    403: unknown;
     /**
      * Service link not found
      */
@@ -37735,6 +38292,165 @@ export type UpdateAlertResponses = {
 
 export type UpdateAlertResponse = UpdateAlertResponses[keyof UpdateAlertResponses];
 
+export type GetCloudBackfillStatusData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/backfill/{project_id}';
+};
+
+export type GetCloudBackfillStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCloudBackfillStatusError = GetCloudBackfillStatusErrors[keyof GetCloudBackfillStatusErrors];
+
+export type GetCloudBackfillStatusResponses = {
+    /**
+     * Backfill status
+     */
+    200: CloudBackfillStatusResponse;
+};
+
+export type GetCloudBackfillStatusResponse = GetCloudBackfillStatusResponses[keyof GetCloudBackfillStatusResponses];
+
+export type GetProjectCloudTelemetryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/projects/{project_id}';
+};
+
+export type GetProjectCloudTelemetryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectCloudTelemetryError = GetProjectCloudTelemetryErrors[keyof GetProjectCloudTelemetryErrors];
+
+export type GetProjectCloudTelemetryResponses = {
+    /**
+     * Project Cloud telemetry settings
+     */
+    200: ProjectCloudTelemetryResponse;
+};
+
+export type GetProjectCloudTelemetryResponse = GetProjectCloudTelemetryResponses[keyof GetProjectCloudTelemetryResponses];
+
+export type UpdateProjectCloudTelemetryData = {
+    body: UpdateProjectCloudTelemetryRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/projects/{project_id}';
+};
+
+export type UpdateProjectCloudTelemetryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * A prerequisite is missing
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateProjectCloudTelemetryError = UpdateProjectCloudTelemetryErrors[keyof UpdateProjectCloudTelemetryErrors];
+
+export type UpdateProjectCloudTelemetryResponses = {
+    /**
+     * Updated settings
+     */
+    200: ProjectCloudTelemetryResponse;
+};
+
+export type UpdateProjectCloudTelemetryResponse = UpdateProjectCloudTelemetryResponses[keyof UpdateProjectCloudTelemetryResponses];
+
+export type GetCloudTelemetryStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/cloud-telemetry/status';
+};
+
+export type GetCloudTelemetryStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCloudTelemetryStatusError = GetCloudTelemetryStatusErrors[keyof GetCloudTelemetryStatusErrors];
+
+export type GetCloudTelemetryStatusResponses = {
+    /**
+     * Instance Cloud telemetry write status
+     */
+    200: CloudTelemetryWriteStatusResponse;
+};
+
+export type GetCloudTelemetryStatusResponse = GetCloudTelemetryStatusResponses[keyof GetCloudTelemetryStatusResponses];
+
 export type ListDashboardsData = {
     body?: never;
     path?: never;
@@ -42009,6 +42725,226 @@ export type SilenceAlarmResponses = {
      */
     200: unknown;
 };
+
+export type ListAnalyticsIngestKeysData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys';
+};
+
+export type ListAnalyticsIngestKeysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListAnalyticsIngestKeysResponses = {
+    /**
+     * Ingest keys, active and revoked, newest first
+     */
+    200: Array<AnalyticsIngestKey>;
+};
+
+export type ListAnalyticsIngestKeysResponse = ListAnalyticsIngestKeysResponses[keyof ListAnalyticsIngestKeysResponses];
+
+export type CreateAnalyticsIngestKeyData = {
+    body: CreateAnalyticsIngestKeyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys';
+};
+
+export type CreateAnalyticsIngestKeyErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key created
+     */
+    201: AnalyticsIngestKey;
+};
+
+export type CreateAnalyticsIngestKeyResponse = CreateAnalyticsIngestKeyResponses[keyof CreateAnalyticsIngestKeyResponses];
+
+export type UpdateAnalyticsIngestKeyData = {
+    body: UpdateAnalyticsIngestKeyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}';
+};
+
+export type UpdateAnalyticsIngestKeyErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key updated
+     */
+    200: AnalyticsIngestKey;
+};
+
+export type UpdateAnalyticsIngestKeyResponse = UpdateAnalyticsIngestKeyResponses[keyof UpdateAnalyticsIngestKeyResponses];
+
+export type RevokeAnalyticsIngestKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}/revoke';
+};
+
+export type RevokeAnalyticsIngestKeyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevokeAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key revoked
+     */
+    204: void;
+};
+
+export type RevokeAnalyticsIngestKeyResponse = RevokeAnalyticsIngestKeyResponses[keyof RevokeAnalyticsIngestKeyResponses];
+
+export type RotateAnalyticsIngestKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}/rotate';
+};
+
+export type RotateAnalyticsIngestKeyErrors = {
+    /**
+     * The key is revoked and cannot be rotated
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RotateAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key rotated
+     */
+    200: AnalyticsIngestKey;
+};
+
+export type RotateAnalyticsIngestKeyResponse = RotateAnalyticsIngestKeyResponses[keyof RotateAnalyticsIngestKeyResponses];
 
 export type GetApiCallersData = {
     body?: never;
@@ -52126,6 +53062,49 @@ export type SaveAiProviderCredentialResponses = {
 };
 
 export type SaveAiProviderCredentialResponse = SaveAiProviderCredentialResponses[keyof SaveAiProviderCredentialResponses];
+
+export type RotateClusterCaData = {
+    body: RotateClusterCaRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-ca/rotate';
+};
+
+export type RotateClusterCaErrors = {
+    /**
+     * Invalid confirmation or CA state
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Expected fingerprint is stale
+     */
+    409: unknown;
+    /**
+     * Fresh MFA verification required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RotateClusterCaResponses = {
+    /**
+     * Cluster CA rotated
+     */
+    200: RotateClusterCaResponse;
+};
+
+export type RotateClusterCaResponse2 = RotateClusterCaResponses[keyof RotateClusterCaResponses];
 
 export type GetDiskStatusData = {
     body?: never;

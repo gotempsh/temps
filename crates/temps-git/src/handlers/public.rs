@@ -109,6 +109,12 @@ pub struct PresetInfo {
     /// Compose file paths found in the repository (only for docker-compose preset)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_files: Option<Vec<String>>,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+    /// rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+    /// directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dockerfile_path: Option<String>,
 }
 
 /// Response for preset detection
@@ -627,6 +633,7 @@ pub async fn detect_public_presets(
                     icon_url: p.icon_url,
                     project_type: p.project_type,
                     compose_files: p.compose_files,
+                    dockerfile_path: p.dockerfile_path,
                 })
                 .collect();
             return Ok(Json(PublicPresetResponse {
@@ -664,6 +671,7 @@ pub async fn detect_public_presets(
             icon_url: p.icon_url,
             project_type: p.project_type,
             compose_files: p.compose_files,
+            dockerfile_path: p.dockerfile_path,
         })
         .collect();
 
@@ -685,6 +693,7 @@ pub async fn detect_public_presets(
             icon_url: p.icon_url,
             project_type: p.project_type,
             compose_files: p.compose_files,
+            dockerfile_path: p.dockerfile_path,
         })
         .collect();
 
@@ -1456,6 +1465,7 @@ mod tests {
             icon_url: Some("https://example.com/nextjs.svg".to_string()),
             project_type: "frontend".to_string(),
             compose_files: None,
+            dockerfile_path: None,
         }];
 
         // Set cache
@@ -1542,12 +1552,38 @@ mod tests {
             icon_url: Some("https://example.com/nextjs.svg".to_string()),
             project_type: "frontend".to_string(),
             compose_files: None,
+            dockerfile_path: None,
         };
 
         let json = serde_json::to_string(&preset).unwrap();
         assert!(json.contains("\"preset\":\"nextjs\""));
         assert!(json.contains("\"exposed_port\":3000"));
         assert!(json.contains("\"path\":\"apps/web\""));
+        // `dockerfile_path: None` must be omitted entirely, not serialized as null.
+        assert!(!json.contains("dockerfile_path"));
+    }
+
+    #[test]
+    fn test_preset_info_serialization_with_dockerfile_path() {
+        let preset = PresetInfo {
+            path: "./".to_string(),
+            preset: "dockerfile".to_string(),
+            preset_label: "Dockerfile".to_string(),
+            exposed_port: None,
+            icon_url: None,
+            project_type: "backend".to_string(),
+            compose_files: None,
+            dockerfile_path: Some("docker/Dockerfile".to_string()),
+        };
+
+        let json = serde_json::to_string(&preset).unwrap();
+        assert!(json.contains("\"dockerfile_path\":\"docker/Dockerfile\""));
+
+        let round_tripped: PresetInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round_tripped.dockerfile_path,
+            Some("docker/Dockerfile".to_string())
+        );
     }
 
     #[test]
@@ -1563,6 +1599,7 @@ mod tests {
                     icon_url: None,
                     project_type: "backend".to_string(),
                     compose_files: None,
+                    dockerfile_path: None,
                 },
                 PresetInfo {
                     path: "frontend".to_string(),
@@ -1572,6 +1609,7 @@ mod tests {
                     icon_url: None,
                     project_type: "frontend".to_string(),
                     compose_files: None,
+                    dockerfile_path: None,
                 },
             ],
         };

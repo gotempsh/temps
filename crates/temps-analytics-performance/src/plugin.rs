@@ -53,6 +53,10 @@ impl TempsPlugin for PerformancePlugin {
             route_table,
             ip_address_service,
             project_access_checker,
+            ingest_key_service: context
+                .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
+            ingest_rate_limiter: context
+                .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
         }));
 
         Some(PluginRoutes::new(routes))
@@ -64,13 +68,18 @@ impl TempsPlugin for PerformancePlugin {
         let ip_address_service = context.require_service::<temps_geo::IpAddressService>();
 
         // Public ingest routes resolve project/environment/deployment from the
-        // route table (by Host header), never from a caller-supplied
-        // project_id, so there is no project scope to check here.
+        // route table (by Host header) or from an ADR-040 ingest key, never
+        // from a caller-supplied project_id, so there is no project scope to
+        // check here.
         let routes = configure_public_routes().with_state(Arc::new(AppState {
             performance_service,
             route_table,
             ip_address_service,
             project_access_checker: None,
+            ingest_key_service: context
+                .require_service::<temps_analytics::AnalyticsIngestKeyService>(),
+            ingest_rate_limiter: context
+                .require_service::<temps_analytics::AnalyticsIngestRateLimiter>(),
         }));
 
         Some(PluginRoutes::new(routes))

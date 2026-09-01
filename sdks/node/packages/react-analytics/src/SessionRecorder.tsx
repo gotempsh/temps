@@ -9,6 +9,11 @@ export const SESSION_RECORDER_ENDPOINT = "session-replay";
 
 interface SessionRecorderProps {
   basePath: string;  // Required, no default
+  /**
+   * Analytics ingest key (`pa_…`). Required only when Temps does not serve or
+   * proxy the app. See `AnalyticsClientOptions.ingestKey`.
+   */
+  ingestKey?: string;
   domain?: string;
   enabled?: boolean;
   excludedPaths?: string[];
@@ -102,6 +107,7 @@ export function SessionRecorder(props: SessionRecorderProps): null {
 
     const recorder = new CoreSessionRecorder({
       basePath: props.basePath,
+      ingestKey: props.ingestKey,
       domain: props.domain,
       enabled: true,
       excludedPaths: props.excludedPaths,

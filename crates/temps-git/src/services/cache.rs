@@ -301,6 +301,11 @@ pub struct CachedPresetInfo {
     pub icon_url: Option<String>,
     pub project_type: String,
     pub compose_files: Option<Vec<String>>,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{path}/Dockerfile`. See
+    /// [`temps_presets::DetectedPreset::dockerfile_path`] for the full
+    /// explanation.
+    pub dockerfile_path: Option<String>,
 }
 
 /// Aggregated cache manager for all Git provider caches

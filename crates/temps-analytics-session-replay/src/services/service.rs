@@ -347,6 +347,17 @@ pub struct SessionReplayWithEvents {
     pub events: Vec<SessionEvent>,
 }
 
+/// Translate `visitor.environment_id`'s legacy `0` sentinel into `None`.
+///
+/// `visitor.environment_id` is `NOT NULL` with no foreign key, so the analytics
+/// ingest path encodes "no environment" there as a magic `0`
+/// (`events_service.rs`). `session_replay_sessions.environment_id` *does* have
+/// a foreign key, so copying the sentinel across would FK-violate. Making that
+/// column nullable is only half the fix; this is the other half.
+fn environment_id_from_visitor(visitor_environment_id: i32) -> Option<i32> {
+    (visitor_environment_id != 0).then_some(visitor_environment_id)
+}
+
 pub struct SessionReplayService {
     db: Arc<DatabaseConnection>,
 }
@@ -368,9 +379,15 @@ impl SessionReplayService {
     ) -> Result<String, SessionReplayError> {
         info!("Initializing session: {} with metadata", session_id);
 
-        // Look up visitor by visitor_id GUID
+        // Look up visitor by visitor_id GUID, scoped to this project.
+        // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
+        // visitor_id string can legitimately belong to different projects —
+        // so an unscoped lookup would bind (and let a caller mutate) another
+        // project's visitor row for any client-supplied visitor_id on the
+        // keyed ingest path (ADR-040 §3).
         let visitor = visitor::Entity::find()
             .filter(visitor::Column::VisitorId.eq(&metadata.visitor_id))
+            .filter(visitor::Column::ProjectId.eq(project_id))
             .one(self.db.as_ref())
             .await?;
 
@@ -412,8 +429,11 @@ impl SessionReplayService {
             session_replay_id: Set(session_id.to_string()),
             visitor_id: Set(visitor_id_int),
             project_id: Set(project_id),
-            environment_id: Set(environment_id.unwrap_or(0)),
-            deployment_id: Set(deployment_id.unwrap_or(0)),
+            // NULL, never a `0` sentinel: there is no `environments.id = 0`
+            // or `deployments.id = 0`, so `unwrap_or(0)` FK-violated on every
+            // host that resolved to a project without a live deployment.
+            environment_id: Set(environment_id),
+            deployment_id: Set(deployment_id),
             created_at: Set(created_at),
             user_agent: Set(Some(metadata.user_agent)),
             browser: Set(browser_info.browser),
@@ -642,7 +662,7 @@ impl SessionReplayService {
     pub async fn store_packed_session_replay(
         &self,
         packed_data: PackedEvents,
-        deployment_id: i32,
+        deployment_id: Option<i32>,
     ) -> Result<String, SessionReplayError> {
         info!(
             "Storing packed session replay for session: {}",
@@ -666,7 +686,7 @@ impl SessionReplayService {
 
         let visitor_id_int = visitor.id;
         let project_id = visitor.project_id;
-        let environment_id = visitor.environment_id;
+        let environment_id = environment_id_from_visitor(visitor.environment_id);
 
         // Unpack the events
         let unpacked = self.unpack_events(&packed_data)?;
@@ -756,7 +776,7 @@ impl SessionReplayService {
         visitor_id: i32,
         packed_data: String,
         metadata: Option<SessionMetadata>,
-        deployment_id: i32,
+        deployment_id: Option<i32>,
     ) -> Result<String, SessionReplayError> {
         info!(
             "Store or update session replay for session: {}, visitor: {}",
@@ -778,7 +798,7 @@ impl SessionReplayService {
                 .ok_or_else(|| SessionReplayError::VisitorNotFound(visitor_id.to_string()))?;
 
             let project_id = visitor.project_id;
-            let environment_id = visitor.environment_id;
+            let environment_id = environment_id_from_visitor(visitor.environment_id);
 
             // Parse user agent if available
             let browser_info = if let Some(meta) = metadata.as_ref() {
@@ -1783,8 +1803,8 @@ mod tests {
             session_replay_id: session_replay_id.to_string(),
             visitor_id: 1,
             project_id,
-            environment_id: 1,
-            deployment_id: 1,
+            environment_id: Some(1),
+            deployment_id: Some(1),
             created_at: None,
             user_agent: None,
             browser: None,
@@ -1857,6 +1877,139 @@ mod tests {
             matches!(result.unwrap_err(), SessionReplayError::SessionNotFound(ref s) if s == "does-not-exist"),
             "Expected SessionNotFound"
         );
+    }
+
+    fn make_visitor_model(environment_id: i32) -> visitor::Model {
+        let now = chrono::Utc::now();
+        visitor::Model {
+            id: 5,
+            visitor_id: "visitor-abc".to_string(),
+            project_id: 7,
+            environment_id,
+            first_seen: now,
+            last_seen: now,
+            user_agent: None,
+            ip_address_id: None,
+            is_crawler: false,
+            crawler_name: None,
+            custom_data: None,
+            has_activity: true,
+            first_referrer: None,
+            first_referrer_hostname: None,
+            first_channel: None,
+            first_utm_source: None,
+            first_utm_medium: None,
+            first_utm_campaign: None,
+        }
+    }
+
+    fn make_session_metadata() -> SessionMetadata {
+        SessionMetadata {
+            visitor_id: "visitor-abc".to_string(),
+            user_agent: "Mozilla/5.0".to_string(),
+            language: "en-US".to_string(),
+            timezone: "UTC".to_string(),
+            screen: Screen {
+                width: 1920,
+                height: 1080,
+                color_depth: 24,
+            },
+            viewport: Viewport {
+                width: 1280,
+                height: 720,
+            },
+            timestamp: "2026-08-31T00:00:00Z".to_string(),
+            url: "https://app.example.com/".to_string(),
+        }
+    }
+
+    /// Regression test for the live FK-violation fixed alongside ADR-040:
+    /// `initialize_session` used to write `environment_id.unwrap_or(0)` /
+    /// `deployment_id.unwrap_or(0)`. There is no `environments.id = 0` or
+    /// `deployments.id = 0`, so `/api/_temps/session-replay/init` 500'd for
+    /// every host that resolved to a project without a live deployment. The
+    /// insert must bind NULL.
+    #[tokio::test]
+    async fn initialize_session_writes_null_scope_not_zero_sentinel() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                // 1. visitor lookup
+                .append_query_results(vec![vec![make_visitor_model(3)]])
+                // 2. existing-session lookup (none)
+                .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
+                // 3. the insert
+                .append_query_results(vec![vec![make_session_model(1, "session-abc", 7)]])
+                .into_connection(),
+        );
+        let service = SessionReplayService::new(db.clone());
+
+        let result = service
+            .initialize_session("session-abc", make_session_metadata(), 7, None, None)
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "a project without a deployment must still open a replay session: {:?}",
+            result.err()
+        );
+
+        drop(service);
+        let log = match Arc::try_unwrap(db) {
+            Ok(conn) => conn.into_transaction_log(),
+            Err(_) => panic!("service still holds a connection handle"),
+        };
+        let insert = format!("{:?}", log.get(2).expect("an INSERT must have been issued"));
+        assert!(
+            insert.contains("INSERT INTO") && insert.contains("session_replay_sessions"),
+            "expected an insert into session_replay_sessions, got: {insert}"
+        );
+        assert!(
+            !insert.contains("Int(Some(0))"),
+            "the `0` sentinel must never reach an FK column: {insert}"
+        );
+        assert!(
+            insert.contains("Int(None)"),
+            "environment_id/deployment_id must be bound as NULL: {insert}"
+        );
+    }
+
+    #[tokio::test]
+    async fn initialize_session_preserves_concrete_scope() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![make_visitor_model(3)]])
+                .append_query_results(vec![vec![] as Vec<session_replay_sessions::Model>])
+                .append_query_results(vec![vec![make_session_model(1, "session-abc", 7)]])
+                .into_connection(),
+        );
+        let service = SessionReplayService::new(db.clone());
+
+        let result = service
+            .initialize_session("session-abc", make_session_metadata(), 7, Some(3), Some(11))
+            .await;
+
+        assert!(result.is_ok());
+
+        drop(service);
+        let log = match Arc::try_unwrap(db) {
+            Ok(conn) => conn.into_transaction_log(),
+            Err(_) => panic!("service still holds a connection handle"),
+        };
+        let insert = format!("{:?}", log.get(2).expect("an INSERT must have been issued"));
+        assert!(
+            insert.contains("Int(Some(3))") && insert.contains("Int(Some(11))"),
+            "a fully resolved route must keep its attribution: {insert}"
+        );
+    }
+
+    /// `visitor.environment_id` is `NOT NULL` with no FK, so the analytics
+    /// ingest path still encodes "no environment" there as a magic `0`. That
+    /// sentinel must not be copied into `session_replay_sessions`, whose
+    /// `environment_id` *does* have an FK.
+    #[test]
+    fn environment_id_from_visitor_maps_zero_sentinel_to_none() {
+        assert_eq!(environment_id_from_visitor(0), None);
+        assert_eq!(environment_id_from_visitor(3), Some(3));
     }
 
     /// Build the wire payload the browser SDK sends: zlib-compressed JSON,

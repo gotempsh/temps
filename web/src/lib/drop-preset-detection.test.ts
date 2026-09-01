@@ -22,6 +22,34 @@ describe('prepareAndInspectDrop', () => {
     ).toEqual({ composePath: 'compose.yaml' })
   })
 
+  test('threads a rolled-up Dockerfile path through to preset_config', () => {
+    expect(
+      presetConfigForDropCandidate({
+        confidence: 'high',
+        directory: '.',
+        dockerfilePath: 'docker/Dockerfile',
+        isStatic: false,
+        label: 'Dockerfile',
+        preset: 'dockerfile',
+        reason: 'Dockerfile found in docker/',
+      })
+    ).toEqual({ dockerfilePath: 'docker/Dockerfile' })
+  })
+
+  test('leaves preset_config unset for a Dockerfile directly at its directory', () => {
+    expect(
+      presetConfigForDropCandidate({
+        confidence: 'high',
+        directory: '.',
+        dockerfilePath: null,
+        isStatic: false,
+        label: 'Dockerfile',
+        preset: 'dockerfile',
+        reason: 'Dockerfile found',
+      })
+    ).toBeUndefined()
+  })
+
   test('packages selected files and returns the detected preset', async () => {
     let inspectedArchive: File | undefined
     const result = await prepareAndInspectDrop(

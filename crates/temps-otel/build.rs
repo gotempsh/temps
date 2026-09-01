@@ -3,8 +3,16 @@
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proto_root = "proto";
+    let mut config = prost_build::Config::new();
 
-    prost_build::Config::new().btree_map(["."]).compile_protos(
+    // Ubuntu 22.04's protoc requires this flag for the `optional` fields in
+    // the OpenTelemetry metrics schema. Newer protoc releases accept them
+    // without it, which previously hid this release-build-only failure.
+    config
+        .btree_map(["."])
+        .protoc_arg("--experimental_allow_proto3_optional");
+
+    config.compile_protos(
         &[
             "proto/opentelemetry/proto/common/v1/common.proto",
             "proto/opentelemetry/proto/resource/v1/resource.proto",

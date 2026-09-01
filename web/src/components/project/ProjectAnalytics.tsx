@@ -2,12 +2,16 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import {
+  createAnalyticsIngestKeyMutation,
   getEnvironmentsOptions,
   getEventsCountOptions,
   getHourlyVisitsOptions,
   hasAnalyticsEventsOptions,
+  listAnalyticsIngestKeysOptions,
+  revokeAnalyticsIngestKeyMutation,
+  rotateAnalyticsIngestKeyMutation,
 } from '@/api/client/@tanstack/react-query.gen'
-import { ProjectResponse } from '@/api/client/types.gen'
+import { AnalyticsIngestKey, ProjectResponse } from '@/api/client/types.gen'
 import {
   AiAgentsChart,
   AnalyticsMetrics,
@@ -79,13 +83,29 @@ import {
 import VisitorAnalytics from '@/components/visitors/VisitorAnalytics'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from '@/components/ui/alert-dialog'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Skeleton } from '@/components/ui/skeleton'
+import { useSettings } from '@/hooks/useSettings'
 import { cn } from '@/lib/utils'
 import type { ChartDateRange } from '@/lib/chart-range-selection'
 import { CreateFunnel } from '@/pages/CreateFunnel'
 import { EditFunnel } from '@/pages/EditFunnel'
 import RequestLogs from '@/pages/RequestLogs'
-import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { format } from 'date-fns'
+import { toast } from 'sonner'
 import {
   getDateRangeFromFilter,
   QUICK_FILTERS,
@@ -95,11 +115,13 @@ import {
 import {
   ArrowLeft,
   ArrowRight,
+  Ban,
   Calendar as CalendarIcon,
   Check,
   FileCode,
   Globe,
   Info,
+  KeyRound,
   Loader2,
   RefreshCw,
   RotateCcw,
@@ -1947,6 +1969,315 @@ function FunnelAnalytics({ project }: ProjectAnalyticsProps) {
   return <FunnelManagement project={project} />
 }
 
+/**
+ * ADR-040: apps Temps neither serves nor proxies have no `Host` route-table
+ * entry to resolve a project from, so ingest needs a project-scoped key
+ * instead. `basePath` in the snippets below must be an absolute URL (not the
+ * `/api/_temps`-relative default) since the request leaves the app's own
+ * origin entirely.
+ */
+function analyticsIngestBaseUrl(
+  externalUrl: string | null | undefined
+): string {
+  return `${externalUrl || window.location.origin}/api/_temps`
+}
+
+function IngestKeySetup({ project }: ProjectAnalyticsProps) {
+  const queryClient = useQueryClient()
+  const { data: settings } = useSettings()
+  const baseUrl = analyticsIngestBaseUrl(settings?.external_url)
+
+  const keysQueryKey = listAnalyticsIngestKeysOptions({
+    path: { project_id: project.id },
+  }).queryKey
+
+  const {
+    data: keys,
+    isLoading: isLoadingKeys,
+    isError: isErrorKeys,
+    refetch: refetchKeys,
+  } = useQuery({
+    ...listAnalyticsIngestKeysOptions({ path: { project_id: project.id } }),
+  })
+
+  const invalidateKeys = () =>
+    queryClient.invalidateQueries({ queryKey: keysQueryKey })
+
+  const createKey = useMutation({
+    ...createAnalyticsIngestKeyMutation(),
+    meta: { errorTitle: 'Failed to create analytics ingest key' },
+    onSuccess: invalidateKeys,
+  })
+
+  const rotateKey = useMutation({
+    ...rotateAnalyticsIngestKeyMutation(),
+    meta: { errorTitle: 'Failed to rotate analytics ingest key' },
+    onSuccess: () => {
+      toast.success(
+        'Ingest key rotated — the previous value stopped working immediately.'
+      )
+      invalidateKeys()
+    },
+  })
+
+  const revokeKey = useMutation({
+    ...revokeAnalyticsIngestKeyMutation(),
+    meta: { errorTitle: 'Failed to revoke analytics ingest key' },
+    onSuccess: () => {
+      toast.success('Ingest key revoked')
+      invalidateKeys()
+    },
+  })
+
+  const activeKeys = React.useMemo(
+    () => (keys ?? []).filter((k: AnalyticsIngestKey) => k.is_active),
+    [keys]
+  )
+  const revokedKeys = React.useMemo(
+    () => (keys ?? []).filter((k: AnalyticsIngestKey) => !k.is_active),
+    [keys]
+  )
+  const primaryKey = activeKeys[0]
+  const keySnippetValue = primaryKey?.public_key ?? 'pa_YOUR_INGEST_KEY'
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader>
+          <div className="flex items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <KeyRound className="h-4 w-4 text-muted-foreground" />
+              <CardTitle className="text-base">Analytics ingest key</CardTitle>
+            </div>
+            {/* Always mounted (never conditionally rendered) so the dialog's
+                open state can't be torn down mid-interaction by an unrelated
+                `keys` refetch flipping `primaryKey` — only the trigger's
+                visibility depends on there being a key to rotate. */}
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={rotateKey.isPending}
+                  className={primaryKey ? undefined : 'hidden'}
+                >
+                  <RotateCcw className="h-4 w-4 mr-2" />
+                  Rotate
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Rotate this ingest key?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    The current value stops working immediately. Update it
+                    everywhere it&apos;s used — your app&apos;s code, env
+                    vars, or CDN script tag — before rotating, or analytics
+                    will stop flowing until you do.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
+                    disabled={rotateKey.isPending}
+                    onClick={() =>
+                      primaryKey &&
+                      rotateKey.mutate({
+                        path: {
+                          project_id: project.id,
+                          key_id: primaryKey.id,
+                        },
+                      })
+                    }
+                  >
+                    {rotateKey.isPending ? 'Rotating…' : 'Rotate key'}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
+          </div>
+          <CardDescription>
+            Not a secret — it&apos;s designed to be embedded in client-side
+            JavaScript. It only grants analytics ingest for this project,
+            nothing else.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          {isLoadingKeys ? (
+            <Skeleton className="h-10 w-full" />
+          ) : isErrorKeys ? (
+            <Alert variant="destructive">
+              <AlertDescription className="flex items-center justify-between gap-2">
+                <span>Failed to load analytics ingest keys.</span>
+                <Button size="sm" variant="outline" onClick={() => refetchKeys()}>
+                  Retry
+                </Button>
+              </AlertDescription>
+            </Alert>
+          ) : primaryKey ? (
+            <div className="space-y-1.5">
+              <div className="flex gap-2">
+                <Input
+                  value={primaryKey.public_key}
+                  readOnly
+                  className="font-mono text-sm"
+                />
+                <CopyButton value={primaryKey.public_key} />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {primaryKey.event_count.toLocaleString()} event
+                {primaryKey.event_count === 1 ? '' : 's'} ingested · Last used:{' '}
+                {primaryKey.last_used_at
+                  ? new Date(primaryKey.last_used_at).toLocaleString()
+                  : 'never'}
+              </p>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              <Alert>
+                <AlertDescription>
+                  {createKey.isError
+                    ? 'Failed to create an ingest key. Try again.'
+                    : "No ingest key yet — create one to let this app send analytics without being deployed by Temps."}
+                </AlertDescription>
+              </Alert>
+              <Button
+                size="sm"
+                disabled={createKey.isPending}
+                onClick={() =>
+                  createKey.mutate({
+                    path: { project_id: project.id },
+                    body: {},
+                  })
+                }
+              >
+                <KeyRound className="h-4 w-4 mr-2" />
+                {createKey.isPending ? 'Creating…' : 'Create ingest key'}
+              </Button>
+            </div>
+          )}
+
+          {/* Always mounted for the same reason as the Rotate dialog above —
+              only the trigger's visibility depends on `primaryKey`. */}
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className={
+                  primaryKey ? 'text-muted-foreground' : 'hidden'
+                }
+                disabled={revokeKey.isPending}
+              >
+                <Ban className="h-4 w-4 mr-2" />
+                Revoke key
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Revoke this ingest key?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  Analytics from apps using this key stop being recorded
+                  immediately. The key stays listed here, marked revoked, so
+                  you can still tell which key ingested past data.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  disabled={revokeKey.isPending}
+                  onClick={() =>
+                    primaryKey &&
+                    revokeKey.mutate({
+                      path: {
+                        project_id: project.id,
+                        key_id: primaryKey.id,
+                      },
+                    })
+                  }
+                >
+                  {revokeKey.isPending ? 'Revoking…' : 'Revoke key'}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
+        </CardContent>
+      </Card>
+
+      {revokedKeys.length > 0 && (
+        <details className="rounded-lg border bg-card p-4 text-sm">
+          <summary className="cursor-pointer font-medium text-muted-foreground">
+            {revokedKeys.length} revoked key
+            {revokedKeys.length === 1 ? '' : 's'}
+          </summary>
+          <div className="mt-3 space-y-2">
+            {revokedKeys.map((k: AnalyticsIngestKey) => (
+              <div
+                key={k.id}
+                className="flex items-center justify-between gap-2 text-xs"
+              >
+                <span className="font-mono truncate">{k.public_key}</span>
+                <Badge variant="outline" className="shrink-0">
+                  Revoked
+                </Badge>
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+
+      <div className="space-y-3">
+        <h3 className="text-sm font-medium">Add it to your app</h3>
+        <Tabs defaultValue="react">
+          <TabsList>
+            <TabsTrigger value="react">React</TabsTrigger>
+            <TabsTrigger value="script">Any website (script tag)</TabsTrigger>
+          </TabsList>
+          <TabsContent value="react" className="space-y-3 pt-3">
+            <CodeBlock
+              language="bash"
+              code="npm install @temps-sdk/react-analytics"
+              showCopy
+            />
+            <CodeBlock
+              language="tsx"
+              code={`import { TempsAnalyticsProvider } from '@temps-sdk/react-analytics';
+
+<TempsAnalyticsProvider
+  basePath="${baseUrl}"
+  ingestKey="${keySnippetValue}"
+>
+  {children}
+</TempsAnalyticsProvider>`}
+              showCopy
+            />
+          </TabsContent>
+          <TabsContent value="script" className="space-y-3 pt-3">
+            <CodeBlock
+              language="text"
+              code={`<script
+  defer
+  data-base-path="${baseUrl}"
+  data-ingest-key="${keySnippetValue}"
+  src="https://cdn.jsdelivr.net/npm/@temps-sdk/analytics-browser@latest/dist/temps.min.js">
+</script>`}
+              showCopy
+            />
+          </TabsContent>
+        </Tabs>
+        <p className="text-xs text-muted-foreground">
+          Works for any host — Vercel, Netlify, GitHub Pages, a static bucket,
+          or anywhere else this app doesn&apos;t run on Temps. Manage this key
+          anytime with{' '}
+          <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+            bunx @temps-sdk/cli analytics keys list
+          </code>
+          .
+        </p>
+      </div>
+    </div>
+  )
+}
+
 // Analytics Setup Component
 function AnalyticsSetup({ project }: ProjectAnalyticsProps) {
   const [selectedFramework, setSelectedFramework] = React.useState('nextjs-app')
@@ -2164,10 +2495,19 @@ export default function App() {
   );
 }`,
     },
+    {
+      id: 'external',
+      name: 'Not hosted on Temps',
+      category: 'Other',
+      icon: () => <Globe className="h-5 w-5" />,
+      description: 'Vercel, Netlify, static hosting, or anywhere else',
+      setupCode: '',
+    },
   ]
 
   const selectedFrameworkData =
     frameworks.find((f) => f.id === selectedFramework) || frameworks[0]
+  const isExternal = selectedFramework === 'external'
 
   // Generate AI prompt for coding agents based on the selected framework
   const getAnalyticsAiPrompt = () => {
@@ -2386,124 +2726,132 @@ After implementation:
                 )}
               </div>
             </div>
-            <CopyButton
-              value={getAnalyticsAiPrompt()}
-              className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
-            >
-              Copy AI prompt
-            </CopyButton>
+            {!isExternal && (
+              <CopyButton
+                value={getAnalyticsAiPrompt()}
+                className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium"
+              >
+                Copy AI prompt
+              </CopyButton>
+            )}
           </div>
 
-          <div className="rounded-lg border border-primary/30 bg-primary/5 p-4">
-            <div className="flex items-start gap-3">
-              <Terminal className="mt-0.5 size-4 shrink-0 text-primary" />
-              <div className="min-w-0 space-y-2">
-                <div>
-                  <p className="text-sm font-medium">
-                    Using an AI coding CLI? Run the Temps skill.
-                  </p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    Works with Claude Code, OpenCode, Codex, and any CLI that
-                    supports skills. The{' '}
-                    <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-                      add-react-analytics
-                    </code>{' '}
-                    skill auto-detects your framework and wires the provider,
-                    env vars, and proxy route for you.
-                  </p>
+          {isExternal ? (
+            <IngestKeySetup project={project} />
+          ) : (
+            <>
+              <div className="rounded-lg border border-primary/30 bg-primary/5 p-4">
+                <div className="flex items-start gap-3">
+                  <Terminal className="mt-0.5 size-4 shrink-0 text-primary" />
+                  <div className="min-w-0 space-y-2">
+                    <div>
+                      <p className="text-sm font-medium">
+                        Using an AI coding CLI? Run the Temps skill.
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        Works with Claude Code, OpenCode, Codex, and any CLI
+                        that supports skills. The{' '}
+                        <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                          add-react-analytics
+                        </code>{' '}
+                        skill auto-detects your framework and wires the
+                        provider, env vars, and proxy route for you.
+                      </p>
+                    </div>
+                    <div className="space-y-1.5">
+                      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                        1. Install the skill (one-time)
+                      </p>
+                      <CodeBlock
+                        language="bash"
+                        code={`npx skills add https://github.com/gotempsh/temps --skill add-react-analytics`}
+                        showCopy
+                      />
+                    </div>
+                    <div className="space-y-1.5">
+                      <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                        2. Invoke it in your CLI
+                      </p>
+                      <CodeBlock
+                        language="bash"
+                        code={`/add-react-analytics`}
+                        showCopy
+                      />
+                    </div>
+                  </div>
                 </div>
-                <div className="space-y-1.5">
-                  <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                    1. Install the skill (one-time)
-                  </p>
+              </div>
+
+              {selectedFrameworkData.packageName && (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2">
+                    <Terminal className="size-4 text-muted-foreground" />
+                    <h3 className="text-sm font-medium">1. Install the SDK</h3>
+                  </div>
+                  <div className="flex gap-1 rounded-lg border border-border bg-muted p-1 w-fit">
+                    {['npm', 'yarn', 'pnpm', 'bun'].map((pm) => {
+                      const isSelected = selectedPackageManager === pm
+                      return (
+                        <button
+                          key={pm}
+                          type="button"
+                          onClick={() => setSelectedPackageManager(pm)}
+                          className={cn(
+                            'rounded-md px-3 py-1 text-xs font-medium transition-colors',
+                            isSelected
+                              ? 'bg-background text-foreground shadow-sm'
+                              : 'text-muted-foreground hover:text-foreground'
+                          )}
+                          aria-pressed={isSelected}
+                        >
+                          {pm}
+                        </button>
+                      )
+                    })}
+                  </div>
                   <CodeBlock
                     language="bash"
-                    code={`npx skills add https://github.com/gotempsh/temps --skill add-react-analytics`}
+                    code={getInstallCommand(selectedFrameworkData.packageName)}
                     showCopy
                   />
                 </div>
-                <div className="space-y-1.5">
-                  <p className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
-                    2. Invoke it in your CLI
-                  </p>
+              )}
+
+              <div className="space-y-3">
+                <div className="flex items-center gap-2">
+                  <FileCode className="size-4 text-muted-foreground" />
+                  <h3 className="text-sm font-medium">
+                    {selectedFrameworkData.packageName ? '2' : '1'}. Wrap your
+                    app with the provider
+                  </h3>
+                </div>
+                <CodeBlock
+                  language={
+                    selectedFrameworkData.id.includes('next')
+                      ? 'typescript'
+                      : 'javascript'
+                  }
+                  code={selectedFrameworkData.setupCode}
+                  showCopy
+                />
+              </div>
+
+              {selectedFrameworkData.envExample && (
+                <div className="space-y-3">
+                  <div className="flex items-center gap-2">
+                    <FileCode className="size-4 text-muted-foreground" />
+                    <h3 className="text-sm font-medium">
+                      3. Environment variables
+                    </h3>
+                  </div>
                   <CodeBlock
                     language="bash"
-                    code={`/add-react-analytics`}
+                    code={selectedFrameworkData.envExample}
                     showCopy
                   />
                 </div>
-              </div>
-            </div>
-          </div>
-
-          {selectedFrameworkData.packageName && (
-            <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <Terminal className="size-4 text-muted-foreground" />
-                <h3 className="text-sm font-medium">1. Install the SDK</h3>
-              </div>
-              <div className="flex gap-1 rounded-lg border border-border bg-muted p-1 w-fit">
-                {['npm', 'yarn', 'pnpm', 'bun'].map((pm) => {
-                  const isSelected = selectedPackageManager === pm
-                  return (
-                    <button
-                      key={pm}
-                      type="button"
-                      onClick={() => setSelectedPackageManager(pm)}
-                      className={cn(
-                        'rounded-md px-3 py-1 text-xs font-medium transition-colors',
-                        isSelected
-                          ? 'bg-background text-foreground shadow-sm'
-                          : 'text-muted-foreground hover:text-foreground'
-                      )}
-                      aria-pressed={isSelected}
-                    >
-                      {pm}
-                    </button>
-                  )
-                })}
-              </div>
-              <CodeBlock
-                language="bash"
-                code={getInstallCommand(selectedFrameworkData.packageName)}
-                showCopy
-              />
-            </div>
-          )}
-
-          <div className="space-y-3">
-            <div className="flex items-center gap-2">
-              <FileCode className="size-4 text-muted-foreground" />
-              <h3 className="text-sm font-medium">
-                {selectedFrameworkData.packageName ? '2' : '1'}. Wrap your app
-                with the provider
-              </h3>
-            </div>
-            <CodeBlock
-              language={
-                selectedFrameworkData.id.includes('next')
-                  ? 'typescript'
-                  : 'javascript'
-              }
-              code={selectedFrameworkData.setupCode}
-              showCopy
-            />
-          </div>
-
-          {selectedFrameworkData.envExample && (
-            <div className="space-y-3">
-              <div className="flex items-center gap-2">
-                <FileCode className="size-4 text-muted-foreground" />
-                <h3 className="text-sm font-medium">
-                  3. Environment variables
-                </h3>
-              </div>
-              <CodeBlock
-                language="bash"
-                code={selectedFrameworkData.envExample}
-                showCopy
-              />
-            </div>
+              )}
+            </>
           )}
 
           <div className="flex items-center justify-between gap-3 pt-2">

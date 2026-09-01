@@ -21,6 +21,10 @@ use utoipa::{openapi::OpenApi, OpenApi as OpenApiTrait};
 
 use crate::api_traffic::ApiTrafficService;
 use crate::handler::{configure_routes, AnalyticsApiDoc, AppState};
+use crate::ingest_keys::{
+    configure_ingest_key_routes, AnalyticsIngestKeyApiDoc, AnalyticsIngestKeyService,
+    AnalyticsIngestKeysAppState, AnalyticsIngestRateLimiter,
+};
 use crate::{Analytics, AnalyticsService};
 
 /// Analytics Plugin for web analytics and visitor tracking
@@ -71,6 +75,14 @@ impl TempsPlugin for AnalyticsPlugin {
             let analytics_trait: Arc<dyn Analytics> = analytics_service;
             context.register_service(analytics_trait);
 
+            // ADR-040 ingest keys. Registered as shared singletons because the
+            // three analytics ingest crates must observe the *same* resolution
+            // cache and the same rate-limit windows as the admin CRUD surface
+            // — a second instance would keep serving a key that this one just
+            // revoked.
+            context.register_service(Arc::new(AnalyticsIngestKeyService::new(db.clone())));
+            context.register_service(Arc::new(AnalyticsIngestRateLimiter::new()));
+
             tracing::debug!("Analytics plugin services registered successfully");
             Ok(())
         })
@@ -89,8 +101,24 @@ impl TempsPlugin for AnalyticsPlugin {
             api_traffic_service,
         });
 
+        // ADR-040 ingest-key admin CRUD. Its own state so the key service and
+        // audit logger are held directly rather than reached through the
+        // analytics service.
+        let ingest_keys_state = Arc::new(AnalyticsIngestKeysAppState {
+            ingest_key_service: context.require_service::<AnalyticsIngestKeyService>(),
+            // The very same limiter the public ingest handlers resolve, not a
+            // second one: revoking a key must release the bucket that ingest
+            // has been filling, and a private instance here would release
+            // nothing.
+            rate_limiter: context.require_service::<AnalyticsIngestRateLimiter>(),
+            audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            project_access_checker: context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+        });
+
         // Configure routes with the state
-        let routes = configure_routes().with_state(app_state);
+        let routes = configure_routes()
+            .with_state(app_state)
+            .merge(configure_ingest_key_routes().with_state(ingest_keys_state));
 
         Some(PluginRoutes::new(routes))
     }
@@ -114,12 +142,58 @@ impl TempsPlugin for AnalyticsPlugin {
                     "analytics: no storage-neutral API traffic source registered; falling back to TimescaleDB"
                 );
             }
+
+            // ADR-040: a deployment transition updates
+            // `environments.current_deployment_id` without touching
+            // `analytics_ingest_keys` at all, so the ingest-key resolve
+            // cache's targeted invalidation (on rotate/revoke/update) never
+            // fires for it. An environment-scoped key would otherwise keep
+            // attributing events to the previous deployment for up to
+            // `RESOLVE_CACHE_TTL` after every deploy. `Job::RouteTableUpdated`
+            // — the same in-process signal the route table itself reloads
+            // on — fires exactly when that column changes, so subscribing
+            // here closes the window immediately instead of waiting it out.
+            let job_queue = context.require_service::<dyn temps_core::JobQueue>();
+            let ingest_key_service = context.require_service::<AnalyticsIngestKeyService>();
+            let mut job_receiver = job_queue.subscribe();
+            tokio::spawn(async move {
+                loop {
+                    match job_receiver.recv().await {
+                        Ok(temps_core::Job::RouteTableUpdated(_)) => {
+                            ingest_key_service.invalidate_all_cached_scopes();
+                        }
+                        Ok(_) => {}
+                        Err(temps_core::QueueError::ChannelClosed) => {
+                            // The queue is gone — the process is shutting down.
+                            tracing::warn!(
+                                "analytics: ingest-key cache invalidation subscriber stopping, queue channel closed"
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            // Broadcast receiver lagged: a RouteTableUpdated may
+                            // have been missed. Invalidate defensively — the next
+                            // resolve simply re-reads the current deployment id,
+                            // which is always correct regardless of how many
+                            // updates were dropped.
+                            tracing::warn!(
+                                "analytics: ingest-key cache invalidation subscriber lagged ({}); invalidating defensively",
+                                e
+                            );
+                            ingest_key_service.invalidate_all_cached_scopes();
+                        }
+                    }
+                }
+            });
+
             Ok(())
         })
     }
 
     fn openapi_schema(&self) -> Option<OpenApi> {
-        Some(AnalyticsApiDoc::openapi())
+        let mut doc = AnalyticsApiDoc::openapi();
+        doc.merge(AnalyticsIngestKeyApiDoc::openapi());
+        Some(doc)
     }
 }
 

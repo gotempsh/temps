@@ -32,8 +32,9 @@ oif = "oif"
 Oif = "Oif"
 # Expected last four characters of "properly" in a masking regression test.
 erly = "erly"
-# The "mis-" prefix in "mis-routes"/"mis-routing" (ADR-041's ledger docs),
-# hyphenated for readability. typos tokenizes on the hyphen and mistakes the
+# The "mis-" prefix in hyphenated words like "mis-routes"/"mis-routing"
+# (ADR-041's ledger docs) and "mis-attribute"/"mis-attributed" (ADR-040 docs
+# and ingest-key handlers). typos tokenizes on the hyphen and mistakes the
 # fragment "mis" for "miss"/"mist".
 mis = "mis"
 

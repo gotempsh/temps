@@ -1,0 +1,15 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+FROM alpine:3.22
+
+RUN apk update \
+    && apk upgrade --no-cache \
+    && apk add --no-cache apache2-utils nginx nginx-mod-stream \
+    && rm -rf /var/cache/apk/*
+
+COPY scripts/docker-ingress-entrypoint.sh /usr/local/bin/docker-ingress-entrypoint
+RUN chmod 0555 /usr/local/bin/docker-ingress-entrypoint
+
+USER 65534:65534
+ENTRYPOINT ["/usr/local/bin/docker-ingress-entrypoint"]

@@ -30,6 +30,9 @@ clickhouse = { version = "0.15", features = ["uuid", "chrono"] }
 # Web framework
 axum = { workspace = true }
 utoipa = { workspace = true }
+# CORS on the public ingest routes (ADR-040): the browser blocks a
+# cross-origin POST before it leaves the page without it.
+tower-http = { workspace = true }
 
 # Database
 sea-orm = { workspace = true }
@@ -60,6 +63,8 @@ woothee = { workspace = true }
 tokio = { workspace = true }
 testcontainers = { workspace = true, features = ["http_wait_plain"] }
 temps-migrations = { path = "../temps-migrations" }
+# `RouteInfo`/`BackendType` for `insert_route_for_test` in the ingest tests.
+temps-routes = { path = "../temps-routes" }
 tower = { version = "0.5", features = ["util"] }
 tracing-subscriber = { workspace = true }
 uuid = { version = "1", features = ["v4"] }

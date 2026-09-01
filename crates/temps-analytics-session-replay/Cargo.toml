@@ -17,9 +17,15 @@ temps-database = { path = "../temps-database" }
 temps-entities = { path = "../temps-entities" }
 temps-auth = { path = "../temps-auth" }
 temps-routes = { path = "../temps-routes" }
+# ADR-040 analytics ingest keys. Downward-only: temps-analytics depends on
+# neither temps-routes nor this crate, so there is no cycle.
+temps-analytics = { path = "../temps-analytics" }
 # Web framework
 axum = { workspace = true }
 utoipa = { workspace = true }
+# CORS on the public ingest routes (ADR-040): the browser blocks a
+# cross-origin POST before it leaves the page without it.
+tower-http = { workspace = true }
 
 # Database
 sea-orm = { workspace = true }
@@ -51,3 +57,5 @@ chrono = { workspace = true }
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
 axum-test = "21.0.0"
+# Schema-backed ingest tests (ADR-040 keyed ingest + no-key regression).
+tower = { version = "0.5", features = ["util"] }
