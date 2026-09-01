@@ -23,8 +23,42 @@ use std::sync::Arc;
 use sea_orm::{ActiveValue::Set, ColumnTrait, EntityTrait, QueryFilter};
 use temps_database::test_utils::TestDatabase;
 use temps_deployer::traefik_discovery::{TraefikDiscoveryConfig, TraefikDiscoveryHandle};
+use temps_deployments::services::traefik_discovery_service::{
+    DiscoveredHostTlsProvisioner, TlsProvisionerError,
+};
 use temps_deployments::services::TraefikDiscoveryAdminService;
 use temps_entities::traefik_discovered_routes as discovered;
+
+/// A `DiscoveredHostTlsProvisioner` that always succeeds — integration tests
+/// that exercise `set_route_enabled` and `list_routes` never touch TLS paths,
+/// so this is the right stub for them.
+struct NoopProvisioner;
+
+#[async_trait::async_trait]
+impl DiscoveredHostTlsProvisioner for NoopProvisioner {
+    async fn request_acme_cert(
+        &self,
+        _host: &str,
+        _challenge_type: &str,
+    ) -> Result<(), TlsProvisionerError> {
+        Ok(())
+    }
+
+    async fn save_imported_cert(
+        &self,
+        _host: &str,
+        _certificate_pem: &str,
+        _key_pem: &str,
+        _renewal_method: &str,
+        _not_after: chrono::DateTime<chrono::Utc>,
+    ) -> Result<i32, TlsProvisionerError> {
+        Ok(1)
+    }
+}
+
+fn noop_provisioner() -> Arc<dyn DiscoveredHostTlsProvisioner> {
+    Arc::new(NoopProvisioner)
+}
 
 /// Boot a real Postgres with the full Temps schema, or `None` so the caller
 /// can skip.
@@ -81,7 +115,8 @@ async fn set_route_enabled_persists_and_is_visible_to_a_later_read() {
     let db = test_db.connection_arc();
     let seeded = seed_route(db.as_ref(), "app.example.com", "whoami", true).await;
 
-    let service = TraefikDiscoveryAdminService::new(db.clone(), disabled_handle());
+    let service =
+        TraefikDiscoveryAdminService::new(db.clone(), disabled_handle(), noop_provisioner());
 
     // Suppress it.
     let updated = service
@@ -134,7 +169,8 @@ async fn list_and_status_reflect_the_rows_in_the_database() {
     seed_route(db.as_ref(), "one.example.com", "one", true).await;
     seed_route(db.as_ref(), "two.example.com", "two", false).await;
 
-    let service = TraefikDiscoveryAdminService::new(db.clone(), disabled_handle());
+    let service =
+        TraefikDiscoveryAdminService::new(db.clone(), disabled_handle(), noop_provisioner());
 
     let list = service
         .list_routes(None, None)

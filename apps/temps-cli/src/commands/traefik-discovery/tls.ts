@@ -15,49 +15,55 @@
 //!   Deauthorize (stop renewal, do not delete cert):
 //!     temps traefik-discovery tls revoke <host>
 //!
-//! These endpoints are not yet in the generated SDK (openapi.json is regenerated
-//! against a running server after each release). We call the shared `client`
-//! generic methods directly — the same pattern used in otel-forward/index.ts.
+//! These endpoints are implemented in crates/temps-deployments and are fully
+//! documented in the generated SDK — see requestDiscoveredRouteCert,
+//! deauthorizeDiscoveredRouteCert, and importTraefikAcmeJson below.
 
 import { readFileSync } from 'node:fs'
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import {
+  requestDiscoveredRouteCert,
+  deauthorizeDiscoveredRouteCert,
+  importTraefikAcmeJson,
+} from '../../api/sdk.gen.js'
+import type { ImportTraefikAcmeJsonResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { newline, header, icons, json, colors, keyValue, success, warning, error as printError } from '../../ui/output.js'
 
-// ── Hand-written request/response shapes ─────────────────────────────────────
-// These mirror the Rust structs in traefik_discovery_service.rs exactly.
-// When openapi.json is next regenerated (after `bun run spec:update`), replace
-// these with imports from ../../api/types.gen.js.
+// ── Pure helpers (unit tested) ────────────────────────────────────────────────
 
-interface RequestDiscoveredRouteCertRequest {
-  challenge_type: 'http-01' | 'dns-01'
-  acknowledge_manual_dns_renewal: boolean
+/** The only ACME/renewal method values the server accepts (ADR-041). */
+export const VALID_ACME_METHODS = ['http-01', 'dns-01'] as const
+export type AcmeMethod = (typeof VALID_ACME_METHODS)[number]
+
+export function isValidChallengeType(value: string): value is AcmeMethod {
+  return (VALID_ACME_METHODS as readonly string[]).includes(value)
 }
 
-interface ImportTraefikAcmeJsonRequest {
-  acme_json: string
-  hosts: string[]
-  renewal_method: 'http-01' | 'dns-01'
-  acknowledge_manual_dns_renewal: boolean
-  dry_run: boolean
+export function isValidRenewalMethod(value: string): value is AcmeMethod {
+  return (VALID_ACME_METHODS as readonly string[]).includes(value)
 }
 
-interface ImportedHostVerdict {
-  host: string
-  success: boolean
-  error?: string
-  not_after?: string
-  sans: string[]
-}
+export type ReadAcmeJsonResult =
+  | { ok: true; contents: string }
+  | { ok: false; message: string }
 
-interface ImportTraefikAcmeJsonResponse {
-  dry_run: boolean
-  total_requested: number
-  succeeded: number
-  failed: number
-  verdicts: ImportedHostVerdict[]
+/**
+ * Read the acme.json file for the Path B import. Only reads bytes and never
+ * parses/validates JSON here — the 8-step X.509 chain validation happens
+ * server-side (ADR-041 §5) so the client can't diverge from it. Failures are
+ * translated into a message an operator can act on instead of a raw
+ * ENOENT/EISDIR stack.
+ */
+export function readAcmeJsonFile(file: string): ReadAcmeJsonResult {
+  try {
+    return { ok: true, contents: readFileSync(file, 'utf-8') }
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e)
+    return { ok: false, message: `Failed to read '${file}': ${msg}` }
+  }
 }
 
 // ── Commander registration ────────────────────────────────────────────────────
@@ -140,20 +146,19 @@ async function requestCertAction(
   await setupClient()
 
   const challengeType = options.challengeType ?? 'http-01'
-  if (challengeType !== 'http-01' && challengeType !== 'dns-01') {
+  if (!isValidChallengeType(challengeType)) {
     printError(`Invalid --challenge-type '${challengeType}'. Must be 'http-01' or 'dns-01'.`)
     process.exit(1)
   }
 
-  const body: RequestDiscoveredRouteCertRequest = {
-    challenge_type: challengeType as 'http-01' | 'dns-01',
-    acknowledge_manual_dns_renewal: options.acknowledgeManualDnsRenewal ?? false,
-  }
-
   await withSpinner(`Requesting ${challengeType} certificate for ${host}...`, async () => {
-    const { error } = await client.post({
-      url: `/traefik-discovery/routes/${encodeURIComponent(host)}/certificate`,
-      body,
+    const { error } = await requestDiscoveredRouteCert({
+      client,
+      path: { host },
+      body: {
+        challenge_type: challengeType,
+        acknowledge_manual_dns_renewal: options.acknowledgeManualDnsRenewal ?? false,
+      },
     })
     if (error) {
       throw new Error(getErrorMessage(error))
@@ -191,8 +196,9 @@ async function revokeCertAction(
   await setupClient()
 
   await withSpinner(`Removing TLS authorization for ${host}...`, async () => {
-    const { error } = await client.delete({
-      url: `/traefik-discovery/routes/${encodeURIComponent(host)}/certificate`,
+    const { error } = await deauthorizeDiscoveredRouteCert({
+      client,
+      path: { host },
     })
     if (error) {
       throw new Error(getErrorMessage(error))
@@ -230,41 +236,37 @@ async function importAcmeJsonAction(
   await setupClient()
 
   const renewalMethod = options.renewalMethod ?? 'http-01'
-  if (renewalMethod !== 'http-01' && renewalMethod !== 'dns-01') {
+  if (!isValidRenewalMethod(renewalMethod)) {
     printError(`Invalid --renewal-method '${renewalMethod}'. Must be 'http-01' or 'dns-01'.`)
     process.exit(1)
   }
 
-  let acmeJson: string
-  try {
-    acmeJson = readFileSync(acmeJsonFile, 'utf-8')
-  } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e)
-    printError(`Failed to read '${acmeJsonFile}': ${msg}`)
+  const read = readAcmeJsonFile(acmeJsonFile)
+  if (!read.ok) {
+    printError(read.message)
     process.exit(1)
   }
-
-  const body: ImportTraefikAcmeJsonRequest = {
-    acme_json: acmeJson,
-    hosts: options.hosts,
-    renewal_method: renewalMethod as 'http-01' | 'dns-01',
-    acknowledge_manual_dns_renewal: options.acknowledgeManualDnsRenewal ?? false,
-    dry_run: options.dryRun ?? false,
-  }
+  const acmeJson = read.contents
 
   const label = options.dryRun
     ? `Validating ${options.hosts.length} host(s) from ${acmeJsonFile} (dry run)...`
     : `Importing ${options.hosts.length} host(s) from ${acmeJsonFile}...`
 
   const result = await withSpinner<ImportTraefikAcmeJsonResponse>(label, async () => {
-    const { data, error } = await client.post({
-      url: '/traefik-discovery/tls/import',
-      body,
+    const { data, error } = await importTraefikAcmeJson({
+      client,
+      body: {
+        acme_json: acmeJson,
+        hosts: options.hosts,
+        renewal_method: renewalMethod,
+        acknowledge_manual_dns_renewal: options.acknowledgeManualDnsRenewal ?? false,
+        dry_run: options.dryRun ?? false,
+      },
     })
     if (error || !data) {
       throw new Error(getErrorMessage(error))
     }
-    return data as ImportTraefikAcmeJsonResponse
+    return data
   })
 
   if (options.json) {

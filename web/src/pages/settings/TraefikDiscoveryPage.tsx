@@ -81,15 +81,21 @@ function formatRelative(iso: string): string {
  * Render the TLS status badge for a discovered route.
  *
  * - No `tls` label → plain dash.
- * - `tls` label, no cert row yet → amber "HTTPS – no cert" warning.
+ * - `tls` label, no cert row yet → amber "HTTPS – no cert" warning with both
+ *   ADR-041 remedies surfaced as copyable CLI commands (Path A: request
+ *   issuance, Path B: import an existing cert) — a route this far along
+ *   already has an operator looking right at it, so the fix belongs here,
+ *   not just in a doc.
  * - Cert row exists, drift detected → red "Drift" critical badge.
  * - Cert row exists, authorized, no drift → green "Authorized" badge.
  * - Cert row exists, not yet authorized → yellow "Pending" badge.
  */
 function TlsStatusCell({
+  host,
   tls,
   cert,
 }: {
+  host: string
   tls: boolean
   cert?: TraefikRouteTlsBlock | null
 }) {
@@ -97,13 +103,40 @@ function TlsStatusCell({
     return <span className="text-xs text-muted-foreground">—</span>
   }
   if (!cert) {
+    const requestCommand = `bunx @temps-sdk/cli traefik-discovery tls request ${host} --challenge-type http-01`
+    const importCommand = `bunx @temps-sdk/cli traefik-discovery tls import acme.json --hosts ${host}`
     return (
-      <span className="flex flex-col gap-0.5">
+      <span className="flex max-w-[280px] flex-col gap-1">
         <Badge variant="outline" className="w-fit border-amber-500 text-xs text-amber-600 dark:text-amber-400">
           TLS
         </Badge>
         <span className="text-xs text-amber-600 dark:text-amber-400">
           HTTPS will fail — no cert authorized
+        </span>
+        <span className="flex items-start justify-between gap-1 rounded-md bg-muted px-1.5 py-1">
+          <code className="overflow-x-auto whitespace-nowrap font-mono text-[11px] leading-relaxed">
+            {requestCommand}
+          </code>
+          <CopyButton
+            value={requestCommand}
+            minimal
+            label="Copy the request-certificate command"
+            className="shrink-0 rounded p-0.5"
+          />
+        </span>
+        <span className="text-xs text-muted-foreground">
+          Already have a cert from Traefik?{' '}
+          <span className="inline-flex items-center gap-1">
+            <code className="rounded bg-muted px-1 py-0.5 font-mono text-[11px]">
+              {importCommand}
+            </code>
+            <CopyButton
+              value={importCommand}
+              minimal
+              label="Copy the import-certificate command"
+              className="shrink-0 rounded p-0.5"
+            />
+          </span>
         </span>
       </span>
     )
@@ -477,7 +510,7 @@ function RouteRow({
           )}
       </TableCell>
       <TableCell className="hidden md:table-cell">
-        <TlsStatusCell tls={route.tls} cert={route.tls_certificate} />
+        <TlsStatusCell host={route.host} tls={route.tls} cert={route.tls_certificate} />
       </TableCell>
       <TableCell>
         {route.active ? (

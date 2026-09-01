@@ -614,12 +614,20 @@ impl TempsPlugin for DeploymentsPlugin {
                     ),
                 )
             });
+        // ADR-041 §8: the TLS provisioner bridges temps-deployments to
+        // temps-domains without introducing a direct crate dependency.
+        // It is registered by the serve wiring layer (console.rs) after all
+        // plugins have initialized, following the same pattern as
+        // AlarmServiceDriftSink. `require_service` fails loudly at startup if
+        // the provisioner was not registered, per CLAUDE.md's dependency rule.
+        let provisioner = context.require_service::<dyn crate::services::traefik_discovery_service::DiscoveredHostTlsProvisioner>();
         let traefik_discovery_state =
             Arc::new(handlers::traefik_discovery::TraefikDiscoveryAppState {
                 traefik_discovery_service: Arc::new(
                     crate::services::TraefikDiscoveryAdminService::new(
                         context.require_service::<sea_orm::DatabaseConnection>(),
                         traefik_discovery_handle,
+                        provisioner,
                     ),
                 ),
                 audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
@@ -746,6 +754,8 @@ mod tests {
             "/traefik-discovery/status",
             "/traefik-discovery/routes",
             "/traefik-discovery/routes/{host}/enabled",
+            "/traefik-discovery/routes/{host}/certificate",
+            "/traefik-discovery/tls/import",
         ] {
             assert!(
                 paths.contains_key(expected),

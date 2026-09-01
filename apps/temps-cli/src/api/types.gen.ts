@@ -9631,6 +9631,12 @@ export type ImportTraefikAcmeJsonRequest = {
      */
     acknowledge_manual_dns_renewal?: boolean;
     /**
+     * Raw contents of the Traefik `acme.json` file (uploaded by the CLI or
+     * pasted in the console). **Never** a server-side file path.
+     * Redacted in `Debug` output — the field holds private key material.
+     */
+    acme_json: string;
+    /**
      * `true` → full parse and validation, no writes. The identical per-host
      * verdicts are returned, giving the operator a preview before committing.
      */
@@ -31545,6 +31551,14 @@ export type ListServiceProjectsData = {
 
 export type ListServiceProjectsErrors = {
     /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to view this service
+     */
+    403: unknown;
+    /**
      * Service not found
      */
     404: unknown;
@@ -31577,9 +31591,21 @@ export type LinkServiceToProjectData = {
 
 export type LinkServiceToProjectErrors = {
     /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to link this service
+     */
+    403: unknown;
+    /**
      * Service or project not found
      */
     404: unknown;
+    /**
+     * Project already has a database of this type
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -31612,6 +31638,14 @@ export type UnlinkServiceFromProjectData = {
 };
 
 export type UnlinkServiceFromProjectErrors = {
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to unlink this service
+     */
+    403: unknown;
     /**
      * Service link not found
      */
@@ -53808,16 +53842,18 @@ export type ListTraefikDiscoveredRoutesErrors = {
     /**
      * Unauthorized
      */
-    401: unknown;
+    401: ProblemDetails;
     /**
      * Insufficient permissions
      */
-    403: unknown;
+    403: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type ListTraefikDiscoveredRoutesError = ListTraefikDiscoveredRoutesErrors[keyof ListTraefikDiscoveredRoutesErrors];
 
 export type ListTraefikDiscoveredRoutesResponses = {
     /**
@@ -53844,20 +53880,22 @@ export type DeauthorizeDiscoveredRouteCertErrors = {
     /**
      * Unauthorized
      */
-    401: unknown;
+    401: ProblemDetails;
     /**
      * Insufficient permissions
      */
-    403: unknown;
+    403: ProblemDetails;
     /**
      * No authorization record for that host
      */
-    404: unknown;
+    404: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type DeauthorizeDiscoveredRouteCertError = DeauthorizeDiscoveredRouteCertErrors[keyof DeauthorizeDiscoveredRouteCertErrors];
 
 export type DeauthorizeDiscoveredRouteCertResponses = {
     /**
@@ -53884,36 +53922,38 @@ export type RequestDiscoveredRouteCertErrors = {
     /**
      * Validation error (e.g. unsupported challenge_type)
      */
-    400: unknown;
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
-    401: unknown;
+    401: ProblemDetails;
     /**
      * Insufficient permissions
      */
-    403: unknown;
+    403: ProblemDetails;
     /**
      * No discovered route for that host
      */
-    404: unknown;
+    404: ProblemDetails;
     /**
      * Host owned by another resource, or verification_method conflict
      */
-    409: unknown;
+    409: ProblemDetails;
     /**
      * Certificate validation failed
      */
-    422: unknown;
+    422: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
     /**
      * TLS provisioner error (ACME upstream failure)
      */
-    502: unknown;
+    502: ProblemDetails;
 };
+
+export type RequestDiscoveredRouteCertError = RequestDiscoveredRouteCertErrors[keyof RequestDiscoveredRouteCertErrors];
 
 export type RequestDiscoveredRouteCertResponses = {
     /**
@@ -53938,24 +53978,26 @@ export type SetTraefikDiscoveredRouteEnabledErrors = {
     /**
      * Validation error
      */
-    400: unknown;
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
-    401: unknown;
+    401: ProblemDetails;
     /**
      * Insufficient permissions
      */
-    403: unknown;
+    403: ProblemDetails;
     /**
      * No discovered route for that host
      */
-    404: unknown;
+    404: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type SetTraefikDiscoveredRouteEnabledError = SetTraefikDiscoveredRouteEnabledErrors[keyof SetTraefikDiscoveredRouteEnabledErrors];
 
 export type SetTraefikDiscoveredRouteEnabledResponses = {
     /**
@@ -53977,16 +54019,18 @@ export type GetTraefikDiscoveryStatusErrors = {
     /**
      * Unauthorized
      */
-    401: unknown;
+    401: ProblemDetails;
     /**
      * Insufficient permissions
      */
-    403: unknown;
+    403: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type GetTraefikDiscoveryStatusError = GetTraefikDiscoveryStatusErrors[keyof GetTraefikDiscoveryStatusErrors];
 
 export type GetTraefikDiscoveryStatusResponses = {
     /**
@@ -54008,24 +54052,26 @@ export type ImportTraefikAcmeJsonErrors = {
     /**
      * Validation error (malformed JSON, unsupported renewal_method)
      */
-    400: unknown;
+    400: ProblemDetails;
     /**
      * Unauthorized
      */
-    401: unknown;
+    401: ProblemDetails;
     /**
      * Insufficient permissions
      */
-    403: unknown;
+    403: ProblemDetails;
     /**
      * Request body exceeds the 1 MiB limit
      */
-    413: unknown;
+    413: ProblemDetails;
     /**
      * Internal server error
      */
-    500: unknown;
+    500: ProblemDetails;
 };
+
+export type ImportTraefikAcmeJsonError = ImportTraefikAcmeJsonErrors[keyof ImportTraefikAcmeJsonErrors];
 
 export type ImportTraefikAcmeJsonResponses = {
     /**

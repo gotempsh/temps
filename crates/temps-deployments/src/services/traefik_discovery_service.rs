@@ -99,12 +99,17 @@ pub trait DiscoveredHostTlsProvisioner: Send + Sync {
     /// Persist a validated certificate + key into the `domains` table via
     /// `CertificateRepository::save_certificate` (Path B). Returns the
     /// `domains.id` of the upserted row.
+    ///
+    /// `not_after` is the leaf certificate's expiry timestamp, already parsed
+    /// by `validate_cert_entry`; the adapter writes it to `domains.expiration_time`
+    /// without re-parsing the PEM.
     async fn save_imported_cert(
         &self,
         host: &str,
         certificate_pem: &str,
         key_pem: &str,
         renewal_method: &str,
+        not_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<i32, TlsProvisionerError>;
 }
 
@@ -162,6 +167,18 @@ impl TraefikDiscoveryAdminError {
         Self::Database {
             operation: operation.to_string(),
             source,
+        }
+    }
+}
+
+impl From<DbErr> for TraefikDiscoveryAdminError {
+    fn from(error: DbErr) -> Self {
+        match error {
+            DbErr::RecordNotFound(msg) => TraefikDiscoveryAdminError::NotFound { host: msg },
+            other => TraefikDiscoveryAdminError::Database {
+                operation: "database operation".to_string(),
+                source: other,
+            },
         }
     }
 }
@@ -487,7 +504,6 @@ pub struct ImportTraefikAcmeJsonRequest {
     /// Raw contents of the Traefik `acme.json` file (uploaded by the CLI or
     /// pasted in the console). **Never** a server-side file path.
     /// Redacted in `Debug` output — the field holds private key material.
-    #[serde(skip_serializing)]
     pub acme_json: String,
     /// Hosts to import. Only hosts that appear in the document's certificates
     /// (by X.509 SAN, not JSON `domain.main`) are accepted.
@@ -556,24 +572,24 @@ pub struct TraefikDiscoveryAdminService {
     /// watcher isn't running, so a disabled instance still reports what it
     /// *would* do.
     handle: Arc<TraefikDiscoveryHandle>,
-    /// Optional: TLS provisioner injected by the main binary.
-    /// When `None`, TLS write operations (Path A / Path B) return
-    /// `TraefikDiscoveryAdminError::Upstream` with a clear message.
-    provisioner: Option<Arc<dyn DiscoveredHostTlsProvisioner>>,
+    /// TLS provisioner — bridges to `DomainService`/`CertificateRepository`
+    /// in `temps-domains` without introducing a direct crate dependency.
+    /// Required: plugin registration fails loudly at startup if one is not
+    /// wired (CLAUDE.md: "Use `Arc<T>` and fail at startup if missing").
+    provisioner: Arc<dyn DiscoveredHostTlsProvisioner>,
 }
 
 impl TraefikDiscoveryAdminService {
-    pub fn new(db: Arc<DatabaseConnection>, handle: Arc<TraefikDiscoveryHandle>) -> Self {
+    pub fn new(
+        db: Arc<DatabaseConnection>,
+        handle: Arc<TraefikDiscoveryHandle>,
+        provisioner: Arc<dyn DiscoveredHostTlsProvisioner>,
+    ) -> Self {
         Self {
             db,
             handle,
-            provisioner: None,
+            provisioner,
         }
-    }
-
-    pub fn with_provisioner(mut self, provisioner: Arc<dyn DiscoveredHostTlsProvisioner>) -> Self {
-        self.provisioner = Some(provisioner);
-        self
     }
 
     /// Verify that `host` is not already claimed by a Temps-managed resource
@@ -903,25 +919,24 @@ impl TraefikDiscoveryAdminService {
         // Step 5: delegate to provisioner BEFORE writing the authorization record
         // so a provisioner failure doesn't leave a permanently-authorized row
         // with no certificate behind it.
-        if let Some(prov) = &self.provisioner {
-            prov.request_acme_cert(&host, &request.challenge_type)
-                .await
-                .map_err(|e| match e {
-                    TlsProvisionerError::VerificationMethodConflict {
-                        stored, declared, ..
-                    } => TraefikDiscoveryAdminError::VerificationMethodConflict {
+        self.provisioner
+            .request_acme_cert(&host, &request.challenge_type)
+            .await
+            .map_err(|e| match e {
+                TlsProvisionerError::VerificationMethodConflict {
+                    stored, declared, ..
+                } => TraefikDiscoveryAdminError::VerificationMethodConflict {
+                    host: host.clone(),
+                    stored,
+                    declared,
+                },
+                TlsProvisionerError::Failed { reason, .. } => {
+                    TraefikDiscoveryAdminError::Upstream {
                         host: host.clone(),
-                        stored,
-                        declared,
-                    },
-                    TlsProvisionerError::Failed { reason, .. } => {
-                        TraefikDiscoveryAdminError::Upstream {
-                            host: host.clone(),
-                            reason,
-                        }
+                        reason,
                     }
-                })?;
-        }
+                }
+            })?;
 
         // Step 6: persist or update the authorization record now that the
         // provisioner has confirmed success.
@@ -1018,6 +1033,19 @@ impl TraefikDiscoveryAdminService {
                 message: format!(
                     "renewal_method must be 'http-01' or 'dns-01', got '{}'",
                     request.renewal_method
+                ),
+            });
+        }
+
+        // Cap the number of hosts per request (matches MAX_ACME_JSON_ENTRIES on the
+        // parsed-document side) to prevent unbounded DB + provisioner fan-out.
+        const MAX_IMPORT_HOSTS: usize = 256;
+        if request.hosts.len() > MAX_IMPORT_HOSTS {
+            return Err(TraefikDiscoveryAdminError::Validation {
+                host: String::new(),
+                message: format!(
+                    "hosts list exceeds the {} entry limit; split into smaller batches",
+                    MAX_IMPORT_HOSTS
                 ),
             });
         }
@@ -1140,31 +1168,29 @@ impl TraefikDiscoveryAdminService {
 
             if !request.dry_run {
                 // Write: delegate to provisioner, then upsert authorization record.
-                let certificate_id = if let Some(prov) = &self.provisioner {
-                    match prov
-                        .save_imported_cert(
-                            &host_normalized,
-                            &validated.certificate_pem,
-                            &validated.key_pem,
-                            &request.renewal_method,
-                        )
-                        .await
-                    {
-                        Ok(id) => Some(id),
-                        Err(e) => {
-                            failed += 1;
-                            verdicts.push(ImportedHostVerdict {
-                                host: host_normalized.clone(),
-                                success: false,
-                                error: Some(format!("Provisioner error: {e}")),
-                                not_after: Some(not_after_str),
-                                sans,
-                            });
-                            continue;
-                        }
+                let certificate_id = match self
+                    .provisioner
+                    .save_imported_cert(
+                        &host_normalized,
+                        &validated.certificate_pem,
+                        &validated.key_pem,
+                        &request.renewal_method,
+                        validated.not_after,
+                    )
+                    .await
+                {
+                    Ok(id) => Some(id),
+                    Err(e) => {
+                        failed += 1;
+                        verdicts.push(ImportedHostVerdict {
+                            host: host_normalized.clone(),
+                            success: false,
+                            error: Some(format!("Provisioner error: {e}")),
+                            not_after: Some(not_after_str),
+                            sans,
+                        });
+                        continue;
                     }
-                } else {
-                    None
                 };
 
                 if let Some(existing) = existing_cert {
@@ -1268,6 +1294,75 @@ mod tests {
     use sea_orm::{DatabaseBackend, MockDatabase, MockExecResult};
     use temps_deployer::traefik_discovery::{HostConflict, TraefikDiscoveryConfig};
 
+    // ── Test helpers ─────────────────────────────────────────────────────────
+
+    /// A `DiscoveredHostTlsProvisioner` that always succeeds — used by tests
+    /// that exercise paths unrelated to TLS provisioning (status, list, toggle).
+    struct NoopProvisioner;
+
+    #[async_trait::async_trait]
+    impl DiscoveredHostTlsProvisioner for NoopProvisioner {
+        async fn request_acme_cert(
+            &self,
+            _host: &str,
+            _challenge_type: &str,
+        ) -> Result<(), TlsProvisionerError> {
+            Ok(())
+        }
+
+        async fn save_imported_cert(
+            &self,
+            _host: &str,
+            _certificate_pem: &str,
+            _key_pem: &str,
+            _renewal_method: &str,
+            _not_after: chrono::DateTime<chrono::Utc>,
+        ) -> Result<i32, TlsProvisionerError> {
+            Ok(1)
+        }
+    }
+
+    /// A `DiscoveredHostTlsProvisioner` that always fails with a generic error —
+    /// used to test that provisioner failures surface as `Upstream` errors and
+    /// never fabricate a successful response.
+    struct FailingProvisioner;
+
+    #[async_trait::async_trait]
+    impl DiscoveredHostTlsProvisioner for FailingProvisioner {
+        async fn request_acme_cert(
+            &self,
+            host: &str,
+            _challenge_type: &str,
+        ) -> Result<(), TlsProvisionerError> {
+            Err(TlsProvisionerError::Failed {
+                host: host.to_string(),
+                reason: "mock provisioner always fails".to_string(),
+            })
+        }
+
+        async fn save_imported_cert(
+            &self,
+            host: &str,
+            _certificate_pem: &str,
+            _key_pem: &str,
+            _renewal_method: &str,
+            _not_after: chrono::DateTime<chrono::Utc>,
+        ) -> Result<i32, TlsProvisionerError> {
+            Err(TlsProvisionerError::Failed {
+                host: host.to_string(),
+                reason: "mock provisioner always fails".to_string(),
+            })
+        }
+    }
+
+    fn noop_provisioner() -> Arc<dyn DiscoveredHostTlsProvisioner> {
+        Arc::new(NoopProvisioner)
+    }
+
+    fn failing_provisioner() -> Arc<dyn DiscoveredHostTlsProvisioner> {
+        Arc::new(FailingProvisioner)
+    }
+
     fn route_model(host: &str, enabled: bool) -> discovered::Model {
         let now = Utc::now();
         discovered::Model {
@@ -1307,7 +1402,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![count_row(0)], vec![count_row(0)]])
             .into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
 
         let status = service.status().await.expect("status must not fail");
 
@@ -1345,7 +1441,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![count_row(4)], vec![count_row(3)]])
             .into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
 
         let status = service.status().await.expect("status must not fail");
 
@@ -1361,7 +1458,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_errors([DbErr::Custom("connection reset".to_string())])
             .into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
 
         let err = service
             .status()
@@ -1388,7 +1486,8 @@ mod tests {
             // Cert rows lookup: no certs authorized for these hosts.
             .append_query_results([Vec::<certs::Model>::new()])
             .into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
 
         let list = service
             .list_routes(None, None)
@@ -1425,7 +1524,8 @@ mod tests {
             .append_query_results([vec![count_row(0)]])
             .append_query_results([Vec::<discovered::Model>::new()])
             .into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
 
         let list = service
             .list_routes(Some(0), Some(5_000))
@@ -1505,7 +1605,7 @@ mod tests {
             .append_query_results([vec![count_row(0)]])
             .append_query_results([Vec::<discovered::Model>::new()])
             .into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), handle);
+        let service = TraefikDiscoveryAdminService::new(Arc::new(db), handle, noop_provisioner());
         let list = service.list_routes(None, None).await.expect("listing");
         assert!(
             list.conflicts.is_empty(),
@@ -1524,7 +1624,8 @@ mod tests {
                 rows_affected: 1,
             }])
             .into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
 
         let route = service
             .set_route_enabled("APP.example.com ", false)
@@ -1544,7 +1645,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([vec![route_model("app.example.com", true)]])
             .into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
 
         let route = service
             .set_route_enabled("app.example.com", true)
@@ -1559,7 +1661,8 @@ mod tests {
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             .append_query_results([Vec::<discovered::Model>::new()])
             .into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
 
         let err = service
             .set_route_enabled("nope.example.com", false)
@@ -1576,7 +1679,8 @@ mod tests {
     #[tokio::test]
     async fn set_route_enabled_rejects_a_blank_host() {
         let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
-        let service = TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle());
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
 
         let err = service
             .set_route_enabled("   ", true)
@@ -1586,6 +1690,242 @@ mod tests {
         assert!(
             matches!(err, TraefikDiscoveryAdminError::Validation { .. }),
             "expected Validation, got {err:?}"
+        );
+    }
+
+    // ── authorize_acme_cert ───────────────────────────────────────────────────
+
+    fn cert_model(host: &str) -> certs::Model {
+        let now = Utc::now();
+        certs::Model {
+            id: 1,
+            host: host.to_string(),
+            cert_authorized: false,
+            authorized_at: None,
+            authorized_by_user_id: None,
+            authorized_network: "temps".to_string(),
+            authorized_container_id: "abc123".to_string(),
+            authorized_container_name: "whoami".to_string(),
+            container_drift_detected_at: None,
+            last_drift_alarmed_container_id: None,
+            renewal_method: "http-01".to_string(),
+            source: "acme".to_string(),
+            certificate_id: None,
+            imported_at: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    #[tokio::test]
+    async fn authorize_acme_cert_fails_for_unknown_host() {
+        // No enabled route exists for the host → NotFound.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // discovered route lookup returns empty
+            .append_query_results([Vec::<discovered::Model>::new()])
+            .into_connection();
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
+
+        let req = RequestDiscoveredRouteCertRequest {
+            challenge_type: "http-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+        };
+        let err = service
+            .authorize_acme_cert("missing.example.com", &req, 1)
+            .await
+            .expect_err("an unknown host must return an error, never fabricate success");
+
+        assert!(
+            matches!(&err, TraefikDiscoveryAdminError::NotFound { host } if host == "missing.example.com"),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_acme_cert_with_failing_provisioner_returns_upstream_error() {
+        // The host exists as an enabled route, but the provisioner fails.
+        // The service must propagate the error and NOT write an authorization row.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // discovered route lookup
+            .append_query_results([vec![route_model("app.example.com", true)]])
+            // existing cert row lookup (none)
+            .append_query_results([Vec::<certs::Model>::new()])
+            // ownership checks (env_domains, project_custom_domains, domains)
+            .append_query_results([vec![count_row(0)]])
+            .append_query_results([vec![count_row(0)]])
+            .append_query_results([Vec::<temps_entities::domains::Model>::new()])
+            .into_connection();
+        let service = TraefikDiscoveryAdminService::new(
+            Arc::new(db),
+            disabled_handle(),
+            failing_provisioner(),
+        );
+
+        let req = RequestDiscoveredRouteCertRequest {
+            challenge_type: "http-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+        };
+        let err = service
+            .authorize_acme_cert("app.example.com", &req, 1)
+            .await
+            .expect_err("a provisioner failure must surface as Err, never Ok");
+
+        assert!(
+            matches!(&err, TraefikDiscoveryAdminError::Upstream { .. }),
+            "expected Upstream error from failing provisioner, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_acme_cert_rejects_unknown_challenge_type() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
+
+        let req = RequestDiscoveredRouteCertRequest {
+            challenge_type: "tls-alpn-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+        };
+        let err = service
+            .authorize_acme_cert("app.example.com", &req, 1)
+            .await
+            .expect_err("unsupported challenge_type must be rejected");
+
+        assert!(
+            matches!(err, TraefikDiscoveryAdminError::Validation { .. }),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    // ── deauthorize_cert ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn deauthorize_cert_fails_when_no_authorization_record_exists() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<certs::Model>::new()])
+            .into_connection();
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
+
+        let err = service
+            .deauthorize_cert("app.example.com")
+            .await
+            .expect_err("deauthorizing a host with no record must fail, not silently succeed");
+
+        assert!(
+            matches!(&err, TraefikDiscoveryAdminError::NotFound { host } if host == "app.example.com"),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deauthorize_cert_clears_cert_authorized_flag() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // cert row lookup
+            .append_query_results([vec![cert_model("app.example.com")]])
+            // UPDATE returning the updated row
+            .append_query_results([vec![{
+                let mut m = cert_model("app.example.com");
+                m.cert_authorized = false;
+                m
+            }]])
+            .into_connection();
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
+
+        service
+            .deauthorize_cert("app.example.com")
+            .await
+            .expect("deauthorization must succeed when a record exists");
+    }
+
+    // ── import_acme_json ─────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn import_acme_json_rejects_unknown_renewal_method() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
+
+        let req = ImportTraefikAcmeJsonRequest {
+            acme_json: "{}".to_string(),
+            hosts: vec!["app.example.com".to_string()],
+            renewal_method: "tls-alpn-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+            dry_run: false,
+        };
+        let err = service
+            .import_acme_json(&req, 1)
+            .await
+            .expect_err("unsupported renewal_method must be rejected");
+
+        assert!(
+            matches!(err, TraefikDiscoveryAdminError::Validation { .. }),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_acme_json_rejects_hosts_list_exceeding_cap() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
+
+        let hosts: Vec<String> = (0..=256).map(|i| format!("host{i}.example.com")).collect();
+        let req = ImportTraefikAcmeJsonRequest {
+            acme_json: "{}".to_string(),
+            hosts,
+            renewal_method: "http-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+            dry_run: false,
+        };
+        let err = service
+            .import_acme_json(&req, 1)
+            .await
+            .expect_err("hosts list exceeding 256 entries must be rejected");
+
+        assert!(
+            matches!(err, TraefikDiscoveryAdminError::Validation { .. }),
+            "expected Validation error for oversized hosts list, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn import_acme_json_returns_not_found_verdict_for_host_with_no_route() {
+        // The host list has an entry that has no discovered route → the per-host
+        // verdict must record failure without aborting the whole import.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // discovered route lookup for the one host: no row
+            .append_query_results([Vec::<discovered::Model>::new()])
+            .into_connection();
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
+
+        let req = ImportTraefikAcmeJsonRequest {
+            acme_json: "{\"le\":{\"Certificates\":[]}}".to_string(),
+            hosts: vec!["missing.example.com".to_string()],
+            renewal_method: "http-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+            dry_run: false,
+        };
+        let resp = service
+            .import_acme_json(&req, 1)
+            .await
+            .expect("import must return Ok even when individual hosts fail");
+
+        assert_eq!(resp.total_requested, 1);
+        assert_eq!(resp.succeeded, 0);
+        assert_eq!(resp.failed, 1);
+        let verdict = &resp.verdicts[0];
+        assert!(!verdict.success);
+        assert!(
+            verdict
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("missing.example.com")),
+            "verdict must name the missing host, got {:?}",
+            verdict.error
         );
     }
 }

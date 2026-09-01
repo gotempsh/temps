@@ -330,6 +330,16 @@ pub struct TraefikDiscoveryService {
     /// system (which registers `AlarmService`) has run. The first reconcile
     /// pass starts later; by that point the sink is always set.
     alarm_sink: std::sync::OnceLock<Arc<dyn DriftAlarmSink>>,
+    /// Short-lived cache for the reserved-host set so that `handle_container_event`
+    /// (called on every Docker event, including events for containers on
+    /// unrelated networks) does not execute 5 full-table scans per event.
+    ///
+    /// The cache is written at the start of each `reconcile()` pass and on the
+    /// first `handle_container_event` call in a new interval. Stale for at most
+    /// `RESERVED_HOSTS_CACHE_TTL`, which is bounded by the reconcile interval
+    /// (default 30 s). Per the hot-loop rule (CLAUDE.md "Background loops must
+    /// be O(changes), not O(total)"), event-driven paths must be O(changes).
+    reserved_hosts_cache: std::sync::RwLock<Option<(Arc<ReservedHosts>, std::time::Instant)>>,
 }
 
 /// ADR-041 §2a: Free function core of drift detection. Separated from
@@ -445,6 +455,7 @@ impl TraefikDiscoveryService {
             last_outcome: std::sync::RwLock::new(None),
             tracked_containers: std::sync::RwLock::new(None),
             alarm_sink: std::sync::OnceLock::new(),
+            reserved_hosts_cache: std::sync::RwLock::new(None),
         }
     }
 
@@ -569,6 +580,12 @@ impl TraefikDiscoveryService {
     /// routes, and converge the `traefik_discovered_routes` rows for this
     /// network onto that set.
     pub async fn reconcile(&self) -> Result<ReconcileOutcome, TraefikDiscoveryError> {
+        // Invalidate the reserved-host cache so this reconcile sees current DB
+        // state, not a stale cache left over from incremental event handling.
+        // The cache is refreshed when `reserved_hosts()` is called below, and
+        // subsequent `handle_container_event` calls within the TTL window reuse it.
+        self.invalidate_reserved_hosts_cache();
+
         // Rows this node adopted under a *previous* discovery configuration
         // (a different `TEMPS_TRAEFIK_DISCOVERY_NETWORK`) are nobody's job to
         // clean up otherwise: the reconciler only ever diffs its own network,
@@ -818,6 +835,25 @@ impl TraefikDiscoveryService {
 
                 let reserved = self.reserved_hosts().await?;
                 let mut changed = false;
+
+                // Batch-fetch all discovered rows for this candidate set in a
+                // single query to avoid an N+1 round trip per host.
+                let candidate_hosts: Vec<String> =
+                    candidates.iter().map(|c| c.host.clone()).collect();
+                let existing_rows: std::collections::HashMap<String, discovered::Model> =
+                    if candidate_hosts.is_empty() {
+                        std::collections::HashMap::new()
+                    } else {
+                        discovered::Entity::find()
+                            .filter(discovered::Column::Host.is_in(candidate_hosts))
+                            .all(self.db.as_ref())
+                            .await
+                            .map_err(|e| self.db_err("batch look up discovered routes by host", e))?
+                            .into_iter()
+                            .map(|row| (row.host.clone(), row))
+                            .collect()
+                    };
+
                 for candidate in &candidates {
                     if reserved.is_reserved(&candidate.host) {
                         warn!(
@@ -830,12 +866,7 @@ impl TraefikDiscoveryService {
                     }
                     // Never steal a host another container already holds; the
                     // full reconciliation owns tie-breaking.
-                    if let Some(row) = discovered::Entity::find()
-                        .filter(discovered::Column::Host.eq(candidate.host.clone()))
-                        .one(self.db.as_ref())
-                        .await
-                        .map_err(|e| self.db_err("look up discovered route by host", e))?
-                    {
+                    if let Some(row) = existing_rows.get(&candidate.host) {
                         if row.target_container_id != candidate.container_id {
                             warn!(
                                 host = %candidate.host,
@@ -845,7 +876,7 @@ impl TraefikDiscoveryService {
                             );
                             continue;
                         }
-                        if candidate.matches_row(&row, &self.config.network) {
+                        if candidate.matches_row(row, &self.config.network) {
                             self.touch_last_seen(std::slice::from_ref(&candidate.host))
                                 .await?;
                             continue;
@@ -1171,6 +1202,20 @@ impl TraefikDiscoveryService {
             custom_routes, environment_domains, environments, project_custom_domains, settings,
         };
 
+        // Cache TTL: 30 s matches the default reconcile interval. Container
+        // events during a burst reuse the cached set so the full-table scan does
+        // not run O(events); the reconcile pass invalidates it explicitly via
+        // `invalidate_reserved_hosts_cache` so correctness is not traded away.
+        const RESERVED_HOSTS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
+        if let Ok(guard) = self.reserved_hosts_cache.read() {
+            if let Some((cached, primed_at)) = guard.as_ref() {
+                if primed_at.elapsed() < RESERVED_HOSTS_CACHE_TTL {
+                    return Ok((**cached).clone());
+                }
+            }
+        }
+
         let mut reserved = ReservedHosts::default();
 
         for row in environment_domains::Entity::find()
@@ -1223,7 +1268,22 @@ impl TraefikDiscoveryService {
             );
         }
 
+        // Write to cache so subsequent event-path calls within the TTL window
+        // skip the five full-table scans.
+        if let Ok(mut guard) = self.reserved_hosts_cache.write() {
+            *guard = Some((Arc::new(reserved.clone()), std::time::Instant::now()));
+        }
+
         Ok(reserved)
+    }
+
+    /// Invalidate the reserved-host cache so the next call to `reserved_hosts()`
+    /// performs a fresh database read. Called at the start of each reconcile pass
+    /// so the full-reconcile path always sees current state.
+    fn invalidate_reserved_hosts_cache(&self) {
+        if let Ok(mut guard) = self.reserved_hosts_cache.write() {
+            *guard = None;
+        }
     }
 
     async fn trigger_route_reload(&self) {

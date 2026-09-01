@@ -666,7 +666,12 @@ pub fn parse_acme_json(raw: &str) -> Result<Vec<AcmeCertEntry>, AcmeJsonParseErr
                         field: "certificate".to_string(),
                         reason: e.to_string(),
                     })?;
-            let certificate_pem = String::from_utf8(certificate_pem).unwrap_or_default();
+            let certificate_pem = String::from_utf8(certificate_pem).map_err(|e| {
+                AcmeJsonParseError::InvalidJson(format!(
+                    "certificate PEM is not valid UTF-8: {}",
+                    e
+                ))
+            })?;
 
             // Get "key" field (base64-encoded PEM).
             let key_b64 = cert_obj
@@ -682,7 +687,9 @@ pub fn parse_acme_json(raw: &str) -> Result<Vec<AcmeCertEntry>, AcmeJsonParseErr
                         field: "key".to_string(),
                         reason: e.to_string(),
                     })?;
-            let key_pem = String::from_utf8(key_pem).unwrap_or_default();
+            let key_pem = String::from_utf8(key_pem).map_err(|e| {
+                AcmeJsonParseError::InvalidJson(format!("key PEM is not valid UTF-8: {}", e))
+            })?;
 
             entries.push(AcmeCertEntry {
                 main_domain,
@@ -701,8 +708,8 @@ pub fn parse_acme_json(raw: &str) -> Result<Vec<AcmeCertEntry>, AcmeJsonParseErr
 /// Matches against the X.509 SANs in the actual certificate, not the JSON's
 /// `domain.main`/`sans` fields (which are informational only).
 ///
-/// Returns `None` if no entry's certificate covers the host — the JSON claims
-/// are ignored; only the leaf's SANs are authoritative.
+/// Returns an empty `Vec` if no entry's certificate covers the host — the
+/// JSON claims are ignored; only the leaf's SANs are authoritative.
 pub fn find_entries_for_host<'a>(
     entries: &'a [AcmeCertEntry],
     host: &str,

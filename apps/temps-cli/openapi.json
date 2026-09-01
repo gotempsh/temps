@@ -20506,6 +20506,10 @@
             "description": "Required when `renewal_method` is `\"dns-01\"` and no auto-manage zone\ncovers the host.",
             "type": "boolean"
           },
+          "acme_json": {
+            "description": "Raw contents of the Traefik `acme.json` file (uploaded by the CLI or\npasted in the console). **Never** a server-side file path.\nRedacted in `Debug` output — the field holds private key material.",
+            "type": "string"
+          },
           "dry_run": {
             "description": "`true` → full parse and validation, no writes. The identical per-host\nverdicts are returned, giving the operator a preview before committing.",
             "type": "boolean"
@@ -20523,6 +20527,7 @@
           }
         },
         "required": [
+          "acme_json",
           "hosts",
           "renewal_method"
         ],
@@ -63243,6 +63248,12 @@
             },
             "description": "List of linked projects"
           },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to view this service"
+          },
           "404": {
             "description": "Service not found"
           },
@@ -63290,8 +63301,17 @@
             },
             "description": "Service linked to project successfully"
           },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to link this service"
+          },
           "404": {
             "description": "Service or project not found"
+          },
+          "409": {
+            "description": "Project already has a database of this type"
           },
           "500": {
             "description": "Internal server error"
@@ -63331,6 +63351,12 @@
         "responses": {
           "204": {
             "description": "Service unlinked from project successfully"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to unlink this service"
           },
           "404": {
             "description": "Service link not found"
@@ -98874,12 +98900,33 @@
             "description": "Discovered routes and unresolved host conflicts"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Unauthorized"
           },
           "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Insufficient permissions"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Internal server error"
           }
         },
@@ -98914,15 +98961,43 @@
             "description": "TLS authorization cleared"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Unauthorized"
           },
           "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Insufficient permissions"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "No authorization record for that host"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Internal server error"
           }
         },
@@ -98965,27 +99040,83 @@
             "description": "TLS authorization created and ACME challenge initiated"
           },
           "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Validation error (e.g. unsupported challenge_type)"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Unauthorized"
           },
           "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Insufficient permissions"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "No discovered route for that host"
           },
           "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Host owned by another resource, or verification_method conflict"
           },
           "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Certificate validation failed"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Internal server error"
           },
           "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "TLS provisioner error (ACME upstream failure)"
           }
         },
@@ -99037,18 +99168,53 @@
             "description": "Updated discovered route"
           },
           "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Validation error"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Unauthorized"
           },
           "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Insufficient permissions"
           },
           "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "No discovered route for that host"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Internal server error"
           }
         },
@@ -99078,12 +99244,33 @@
             "description": "Discovery status. `configured: false` means it is not turned on here — the `setup` block says exactly how to turn it on"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Unauthorized"
           },
           "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Insufficient permissions"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Internal server error"
           }
         },
@@ -99124,18 +99311,53 @@
             "description": "Import results (per-host verdicts)"
           },
           "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Validation error (malformed JSON, unsupported renewal_method)"
           },
           "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Unauthorized"
           },
           "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Insufficient permissions"
           },
           "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Request body exceeds the 1 MiB limit"
           },
           "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
             "description": "Internal server error"
           }
         },

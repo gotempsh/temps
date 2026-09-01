@@ -27,7 +27,7 @@ use axum::{
 };
 use serde::Deserialize;
 use temps_auth::{permission_guard, RequireAuth};
-use temps_core::problemdetails::{self, Problem};
+use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::{AuditContext, RequestMetadata};
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
@@ -183,9 +183,9 @@ pub fn configure_routes() -> Router<Arc<TraefikDiscoveryAppState>> {
     path = "/traefik-discovery/status",
     responses(
         (status = 200, description = "Discovery status. `configured: false` means it is not turned on here — the `setup` block says exactly how to turn it on", body = TraefikDiscoveryStatusResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 500, description = "Internal server error")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -219,9 +219,9 @@ async fn get_traefik_discovery_status(
     ),
     responses(
         (status = 200, description = "Discovered routes and unresolved host conflicts", body = TraefikDiscoveredRouteListResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 500, description = "Internal server error")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -260,11 +260,11 @@ async fn list_traefik_discovered_routes(
     request_body = UpdateTraefikRouteEnabledRequest,
     responses(
         (status = 200, description = "Updated discovered route", body = TraefikDiscoveredRouteResponse),
-        (status = 400, description = "Validation error"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "No discovered route for that host"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Validation error", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "No discovered route for that host", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -333,14 +333,14 @@ async fn set_traefik_discovered_route_enabled(
     request_body = RequestDiscoveredRouteCertRequest,
     responses(
         (status = 201, description = "TLS authorization created and ACME challenge initiated"),
-        (status = 400, description = "Validation error (e.g. unsupported challenge_type)"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "No discovered route for that host"),
-        (status = 409, description = "Host owned by another resource, or verification_method conflict"),
-        (status = 422, description = "Certificate validation failed"),
-        (status = 502, description = "TLS provisioner error (ACME upstream failure)"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Validation error (e.g. unsupported challenge_type)", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "No discovered route for that host", body = ProblemDetails),
+        (status = 409, description = "Host owned by another resource, or verification_method conflict", body = ProblemDetails),
+        (status = 422, description = "Certificate validation failed", body = ProblemDetails),
+        (status = 502, description = "TLS provisioner error (ACME upstream failure)", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -404,10 +404,10 @@ async fn request_discovered_route_cert(
     ),
     responses(
         (status = 204, description = "TLS authorization cleared"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 404, description = "No authorization record for that host"),
-        (status = 500, description = "Internal server error")
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "No authorization record for that host", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -419,6 +419,12 @@ async fn deauthorize_discovered_route_cert(
 ) -> Result<impl axum::response::IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
     permission_guard!(auth, DomainsCreate);
+
+    // Normalize here so the audit record matches the actual host key used by
+    // the service. The service trims and lowercases before querying, so the
+    // raw path segment would otherwise diverge from the stored host on
+    // mixed-case input (e.g. "App.Example.COM" vs "app.example.com").
+    let host = host.trim().to_ascii_lowercase();
 
     app_state
         .traefik_discovery_service
@@ -467,11 +473,11 @@ async fn deauthorize_discovered_route_cert(
     request_body = ImportTraefikAcmeJsonRequest,
     responses(
         (status = 200, description = "Import results (per-host verdicts)", body = ImportTraefikAcmeJsonResponse),
-        (status = 400, description = "Validation error (malformed JSON, unsupported renewal_method)"),
-        (status = 401, description = "Unauthorized"),
-        (status = 403, description = "Insufficient permissions"),
-        (status = 413, description = "Request body exceeds the 1 MiB limit"),
-        (status = 500, description = "Internal server error")
+        (status = 400, description = "Validation error (malformed JSON, unsupported renewal_method)", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 413, description = "Request body exceeds the 1 MiB limit", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
 )]
@@ -631,6 +637,38 @@ mod tests {
         )
     }
 
+    /// A `DiscoveredHostTlsProvisioner` that always succeeds — used by handler
+    /// tests that exercise paths unrelated to TLS provisioning.
+    struct NoopProvisioner;
+
+    #[async_trait::async_trait]
+    impl crate::services::traefik_discovery_service::DiscoveredHostTlsProvisioner for NoopProvisioner {
+        async fn request_acme_cert(
+            &self,
+            _host: &str,
+            _challenge_type: &str,
+        ) -> Result<(), crate::services::traefik_discovery_service::TlsProvisionerError> {
+            Ok(())
+        }
+
+        async fn save_imported_cert(
+            &self,
+            _host: &str,
+            _certificate_pem: &str,
+            _key_pem: &str,
+            _renewal_method: &str,
+            _not_after: chrono::DateTime<chrono::Utc>,
+        ) -> Result<i32, crate::services::traefik_discovery_service::TlsProvisionerError> {
+            Ok(1)
+        }
+    }
+
+    fn noop_provisioner(
+    ) -> std::sync::Arc<dyn crate::services::traefik_discovery_service::DiscoveredHostTlsProvisioner>
+    {
+        std::sync::Arc::new(NoopProvisioner)
+    }
+
     fn state_with_handle(
         db: sea_orm::DatabaseConnection,
         handle: TraefikDiscoveryHandle,
@@ -639,6 +677,7 @@ mod tests {
             traefik_discovery_service: Arc::new(TraefikDiscoveryAdminService::new(
                 Arc::new(db),
                 Arc::new(handle),
+                noop_provisioner(),
             )),
             audit_service: Arc::new(NoopAuditLogger),
         })

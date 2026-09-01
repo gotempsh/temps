@@ -2857,6 +2857,144 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         traefik_discovery.inject_alarm_sink(Arc::new(AlarmServiceDriftSink(alarm_service)));
     }
 
+    // ADR-041 §8: wire the TLS provisioner for Traefik label discovery.
+    //
+    // `temps-deployments` cannot depend on `temps-domains` directly (that would
+    // introduce a dependency cycle), so the trait `DiscoveredHostTlsProvisioner`
+    // is declared in `temps-deployments` and implemented here — in the serve
+    // wiring layer that already depends on both crates — following the same
+    // adapter pattern used above for `AlarmServiceDriftSink`.
+    //
+    // Both DomainService and CertificateRepository are registered by
+    // DomainsPlugin::register_services, which has already run by this point
+    // (all plugins run register_services before initialize_plugins returns).
+    // If DomainsPlugin is absent the require_service below will panic at
+    // startup with a clear error, which is the correct behaviour for a missing
+    // required dependency (CLAUDE.md: "Use `Arc<T>` and fail at startup if missing").
+    {
+        use temps_deployments::services::traefik_discovery_service::{
+            DiscoveredHostTlsProvisioner, TlsProvisionerError,
+        };
+        use temps_domains::tls::models::{Certificate, CertificateStatus};
+        use temps_domains::tls::repository::CertificateRepository;
+        use temps_domains::DomainService;
+
+        struct TraefikTlsProvisioner {
+            domain_service: Arc<DomainService>,
+            cert_repo: Arc<dyn CertificateRepository>,
+            config_service: Arc<temps_config::ConfigService>,
+        }
+
+        impl TraefikTlsProvisioner {
+            /// Read `letsencrypt.email` from settings — mirrors TlsService::get_acme_email.
+            async fn get_acme_email(&self) -> String {
+                if let Ok(settings) = self.config_service.get_settings().await {
+                    if let Some(email) = settings.letsencrypt.email {
+                        let email = email.trim().to_string();
+                        if !email.is_empty() {
+                            return email;
+                        }
+                    }
+                }
+                String::new()
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl DiscoveredHostTlsProvisioner for TraefikTlsProvisioner {
+            async fn request_acme_cert(
+                &self,
+                host: &str,
+                challenge_type: &str,
+            ) -> Result<(), TlsProvisionerError> {
+                let email = self.get_acme_email().await;
+
+                // Check whether a domains row already exists for this host.
+                let existing = self.cert_repo.find_certificate(host).await.map_err(|e| {
+                    TlsProvisionerError::Failed {
+                        host: host.to_string(),
+                        reason: e.to_string(),
+                    }
+                })?;
+
+                match existing {
+                    None => {
+                        // No row yet — create one with the declared challenge type.
+                        self.domain_service
+                            .create_domain(host, challenge_type)
+                            .await
+                            .map_err(|e| TlsProvisionerError::Failed {
+                                host: host.to_string(),
+                                reason: e.to_string(),
+                            })?;
+                    }
+                    Some(cert) if cert.verification_method == challenge_type => {
+                        // Row exists with a matching method — reuse it as-is.
+                    }
+                    Some(cert) => {
+                        // Row exists but the stored method differs — 409.
+                        return Err(TlsProvisionerError::VerificationMethodConflict {
+                            host: host.to_string(),
+                            stored: cert.verification_method,
+                            declared: challenge_type.to_string(),
+                        });
+                    }
+                }
+
+                // Initiate the ACME challenge order.
+                self.domain_service
+                    .request_challenge(host, &email)
+                    .await
+                    .map_err(|e| TlsProvisionerError::Failed {
+                        host: host.to_string(),
+                        reason: e.to_string(),
+                    })?;
+
+                Ok(())
+            }
+
+            async fn save_imported_cert(
+                &self,
+                host: &str,
+                certificate_pem: &str,
+                key_pem: &str,
+                renewal_method: &str,
+                not_after: chrono::DateTime<chrono::Utc>,
+            ) -> Result<i32, TlsProvisionerError> {
+                let cert = Certificate {
+                    id: 0,
+                    domain: host.to_string(),
+                    certificate_pem: certificate_pem.to_string(),
+                    private_key_pem: key_pem.to_string(),
+                    expiration_time: not_after,
+                    last_renewed: Some(chrono::Utc::now()),
+                    is_wildcard: false,
+                    verification_method: renewal_method.to_string(),
+                    status: CertificateStatus::Active,
+                };
+                let saved = self.cert_repo.save_certificate(cert).await.map_err(|e| {
+                    TlsProvisionerError::Failed {
+                        host: host.to_string(),
+                        reason: e.to_string(),
+                    }
+                })?;
+                Ok(saved.id)
+            }
+        }
+
+        let domain_service = service_context.require_service::<DomainService>();
+        let cert_repo = service_context.require_service::<dyn CertificateRepository>();
+        let config_service_for_provisioner =
+            service_context.require_service::<temps_config::ConfigService>();
+        let provisioner: Arc<dyn DiscoveredHostTlsProvisioner> = Arc::new(TraefikTlsProvisioner {
+            domain_service,
+            cert_repo,
+            config_service: config_service_for_provisioner,
+        });
+        service_context.register_service(provisioner);
+        debug!("Traefik TLS provisioner (ADR-041 §8) registered");
+    }
+
     // Start alarm service, outage detection, and container health monitoring.
     // AlarmService is already constructed and registered by MonitoringPlugin
     // (step 9.8 above). We retrieve the same Arc here so the background loops
