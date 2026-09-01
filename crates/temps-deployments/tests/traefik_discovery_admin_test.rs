@@ -54,6 +54,10 @@ impl DiscoveredHostTlsProvisioner for NoopProvisioner {
     ) -> Result<i32, TlsProvisionerError> {
         Ok(1)
     }
+
+    async fn dns_zone_is_auto_managed(&self, _host: &str) -> Result<bool, TlsProvisionerError> {
+        Ok(true)
+    }
 }
 
 fn noop_provisioner() -> Arc<dyn DiscoveredHostTlsProvisioner> {

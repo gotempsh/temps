@@ -661,6 +661,13 @@ mod tests {
         ) -> Result<i32, crate::services::traefik_discovery_service::TlsProvisionerError> {
             Ok(1)
         }
+
+        async fn dns_zone_is_auto_managed(
+            &self,
+            _host: &str,
+        ) -> Result<bool, crate::services::traefik_discovery_service::TlsProvisionerError> {
+            Ok(true)
+        }
     }
 
     fn noop_provisioner(

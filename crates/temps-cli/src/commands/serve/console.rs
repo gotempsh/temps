@@ -2883,6 +2883,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
             domain_service: Arc<DomainService>,
             cert_repo: Arc<dyn CertificateRepository>,
             config_service: Arc<temps_config::ConfigService>,
+            dns_provider_service: Arc<temps_dns::services::DnsProviderService>,
         }
 
         impl TraefikTlsProvisioner {
@@ -2917,7 +2918,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     }
                 })?;
 
-                match existing {
+                let created_domain_this_call = match existing {
                     None => {
                         // No row yet — create one with the declared challenge type.
                         self.domain_service
@@ -2927,9 +2928,11 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                                 host: host.to_string(),
                                 reason: e.to_string(),
                             })?;
+                        true
                     }
                     Some(cert) if cert.verification_method == challenge_type => {
                         // Row exists with a matching method — reuse it as-is.
+                        false
                     }
                     Some(cert) => {
                         // Row exists but the stored method differs — 409.
@@ -2939,16 +2942,33 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                             declared: challenge_type.to_string(),
                         });
                     }
-                }
+                };
 
-                // Initiate the ACME challenge order.
-                self.domain_service
-                    .request_challenge(host, &email)
-                    .await
-                    .map_err(|e| TlsProvisionerError::Failed {
+                // Initiate the ACME challenge order. If we just created the
+                // domain row above and this fails, roll it back — otherwise the
+                // domain is left authorized-but-uncertificated with no matching
+                // `traefik_route_certificates` row (the caller only writes that
+                // after this call succeeds), and every retry is then rejected by
+                // the host-ownership check as "owned by a domains row" with no
+                // way to clear it short of manual intervention. A pre-existing
+                // domain row we merely reused is left untouched: it may already
+                // be serving a certificate that a failed re-challenge must not
+                // destroy.
+                if let Err(e) = self.domain_service.request_challenge(host, &email).await {
+                    if created_domain_this_call {
+                        if let Err(cleanup_err) = self.domain_service.delete_domain(host).await {
+                            tracing::error!(
+                                "Failed to roll back domain {host} after a failed ACME challenge \
+                                 request ({e}); the domain row is now orphaned and must be \
+                                 removed manually before retrying: {cleanup_err}"
+                            );
+                        }
+                    }
+                    return Err(TlsProvisionerError::Failed {
                         host: host.to_string(),
                         reason: e.to_string(),
-                    })?;
+                    });
+                }
 
                 Ok(())
             }
@@ -2980,16 +3000,33 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 })?;
                 Ok(saved.id)
             }
+
+            async fn dns_zone_is_auto_managed(
+                &self,
+                host: &str,
+            ) -> Result<bool, TlsProvisionerError> {
+                self.dns_provider_service
+                    .find_provider_for_domain(host)
+                    .await
+                    .map(|found| found.is_some())
+                    .map_err(|e| TlsProvisionerError::Failed {
+                        host: host.to_string(),
+                        reason: e.to_string(),
+                    })
+            }
         }
 
         let domain_service = service_context.require_service::<DomainService>();
         let cert_repo = service_context.require_service::<dyn CertificateRepository>();
         let config_service_for_provisioner =
             service_context.require_service::<temps_config::ConfigService>();
+        let dns_provider_service_for_provisioner =
+            service_context.require_service::<temps_dns::services::DnsProviderService>();
         let provisioner: Arc<dyn DiscoveredHostTlsProvisioner> = Arc::new(TraefikTlsProvisioner {
             domain_service,
             cert_repo,
             config_service: config_service_for_provisioner,
+            dns_provider_service: dns_provider_service_for_provisioner,
         });
         service_context.register_service(provisioner);
         debug!("Traefik TLS provisioner (ADR-041 §8) registered");

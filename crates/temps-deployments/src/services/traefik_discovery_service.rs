@@ -111,6 +111,18 @@ pub trait DiscoveredHostTlsProvisioner: Send + Sync {
         renewal_method: &str,
         not_after: chrono::DateTime<chrono::Utc>,
     ) -> Result<i32, TlsProvisionerError>;
+
+    /// Whether a verified, `auto_manage`-enabled DNS zone covers `host` — i.e.
+    /// Temps can auto-publish the `_acme-challenge` TXT record on future
+    /// dns-01 renewals without operator intervention.
+    ///
+    /// Consulted before accepting a dns-01 `request_acme_cert`/
+    /// `save_imported_cert` call that did not set
+    /// `acknowledge_manual_dns_renewal`: without a covering zone, every future
+    /// renewal needs a human to publish a TXT record by hand, and the operator
+    /// must consent to that up front rather than discover it when a
+    /// certificate silently fails to renew.
+    async fn dns_zone_is_auto_managed(&self, host: &str) -> Result<bool, TlsProvisionerError>;
 }
 
 #[derive(Debug, Error)]
@@ -883,6 +895,26 @@ impl TraefikDiscoveryAdminService {
                 ),
             });
         }
+        if request.challenge_type == "dns-01" && !request.acknowledge_manual_dns_renewal {
+            let auto_managed = self
+                .provisioner
+                .dns_zone_is_auto_managed(&host)
+                .await
+                .map_err(|e| TraefikDiscoveryAdminError::Upstream {
+                    host: host.clone(),
+                    reason: e.to_string(),
+                })?;
+            if !auto_managed {
+                return Err(TraefikDiscoveryAdminError::Validation {
+                    host: host.clone(),
+                    message: "challenge_type is 'dns-01' but no verified, auto-managed DNS zone \
+                              covers this host, so every renewal will require manually \
+                              publishing a TXT record. Set acknowledge_manual_dns_renewal=true \
+                              to confirm, or add a managed DNS provider zone covering this host."
+                        .to_string(),
+                });
+            }
+        }
 
         // Step 3: host must be an enabled discovered route on the current network.
         let network = self.handle.config().network.clone();
@@ -1093,6 +1125,52 @@ impl TraefikDiscoveryAdminService {
                     continue;
                 }
             };
+
+            // dns-01 without acknowledgment requires a verified, auto-managed
+            // DNS zone covering this host — otherwise every future renewal
+            // needs a human to publish a TXT record by hand. Checked per-host
+            // (unlike the request-level renewal_method shape check above)
+            // because zone coverage varies host by host within one batch.
+            // Checked before parsing this host's certificate entry: consent is
+            // a property of the request, not of the certificate, so there is
+            // nothing to gain by paying the parse cost first.
+            if request.renewal_method == "dns-01" && !request.acknowledge_manual_dns_renewal {
+                let auto_managed = match self
+                    .provisioner
+                    .dns_zone_is_auto_managed(&host_normalized)
+                    .await
+                {
+                    Ok(covered) => covered,
+                    Err(e) => {
+                        failed += 1;
+                        verdicts.push(ImportedHostVerdict {
+                            host: host_normalized.clone(),
+                            success: false,
+                            error: Some(format!("Provisioner error: {e}")),
+                            not_after: None,
+                            sans: vec![],
+                        });
+                        continue;
+                    }
+                };
+                if !auto_managed {
+                    failed += 1;
+                    verdicts.push(ImportedHostVerdict {
+                        host: host_normalized.clone(),
+                        success: false,
+                        error: Some(
+                            "renewal_method is 'dns-01' but no verified, auto-managed DNS zone \
+                             covers this host, so every renewal will require manually \
+                             publishing a TXT record. Set acknowledge_manual_dns_renewal=true to \
+                             confirm, or add a managed DNS provider zone covering this host."
+                                .to_string(),
+                        ),
+                        not_after: None,
+                        sans: vec![],
+                    });
+                    continue;
+                }
+            }
 
             // Find matching entries in the parsed document by X.509 SAN.
             let matching = find_entries_for_host(&entries, &host_normalized);
@@ -1320,6 +1398,10 @@ mod tests {
         ) -> Result<i32, TlsProvisionerError> {
             Ok(1)
         }
+
+        async fn dns_zone_is_auto_managed(&self, _host: &str) -> Result<bool, TlsProvisionerError> {
+            Ok(true)
+        }
     }
 
     /// A `DiscoveredHostTlsProvisioner` that always fails with a generic error —
@@ -1353,6 +1435,13 @@ mod tests {
                 reason: "mock provisioner always fails".to_string(),
             })
         }
+
+        async fn dns_zone_is_auto_managed(&self, host: &str) -> Result<bool, TlsProvisionerError> {
+            Err(TlsProvisionerError::Failed {
+                host: host.to_string(),
+                reason: "mock provisioner always fails".to_string(),
+            })
+        }
     }
 
     fn noop_provisioner() -> Arc<dyn DiscoveredHostTlsProvisioner> {
@@ -1361,6 +1450,42 @@ mod tests {
 
     fn failing_provisioner() -> Arc<dyn DiscoveredHostTlsProvisioner> {
         Arc::new(FailingProvisioner)
+    }
+
+    /// A `DiscoveredHostTlsProvisioner` that reports no verified auto-managed
+    /// DNS zone covers any host — used to exercise the dns-01 consent gate.
+    /// Its other methods panic: a test relying on them would mean the gate
+    /// failed to short-circuit before reaching them.
+    struct DnsZoneUnmanagedProvisioner;
+
+    #[async_trait::async_trait]
+    impl DiscoveredHostTlsProvisioner for DnsZoneUnmanagedProvisioner {
+        async fn request_acme_cert(
+            &self,
+            _host: &str,
+            _challenge_type: &str,
+        ) -> Result<(), TlsProvisionerError> {
+            unreachable!("the dns-01 consent gate must reject before calling request_acme_cert")
+        }
+
+        async fn save_imported_cert(
+            &self,
+            _host: &str,
+            _certificate_pem: &str,
+            _key_pem: &str,
+            _renewal_method: &str,
+            _not_after: chrono::DateTime<chrono::Utc>,
+        ) -> Result<i32, TlsProvisionerError> {
+            unreachable!("the dns-01 consent gate must reject before calling save_imported_cert")
+        }
+
+        async fn dns_zone_is_auto_managed(&self, _host: &str) -> Result<bool, TlsProvisionerError> {
+            Ok(false)
+        }
+    }
+
+    fn dns_zone_unmanaged_provisioner() -> Arc<dyn DiscoveredHostTlsProvisioner> {
+        Arc::new(DnsZoneUnmanagedProvisioner)
     }
 
     fn route_model(host: &str, enabled: bool) -> discovered::Model {
@@ -1798,6 +1923,68 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn authorize_acme_cert_rejects_dns01_without_acknowledgment_when_zone_unmanaged() {
+        // No verified auto-managed DNS zone covers the host, and the caller
+        // did not acknowledge manual renewal — this must be rejected before
+        // any route lookup or provisioner call, since a request that would
+        // silently strand the operator with unrenewable DNS-01 certificates
+        // is not a case any DB state can rescue.
+        let db = MockDatabase::new(DatabaseBackend::Postgres).into_connection();
+        let service = TraefikDiscoveryAdminService::new(
+            Arc::new(db),
+            disabled_handle(),
+            dns_zone_unmanaged_provisioner(),
+        );
+
+        let req = RequestDiscoveredRouteCertRequest {
+            challenge_type: "dns-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+        };
+        let err = service
+            .authorize_acme_cert("app.example.com", &req, 1)
+            .await
+            .expect_err(
+                "dns-01 without acknowledgment and without a managed zone must be rejected",
+            );
+
+        assert!(
+            matches!(err, TraefikDiscoveryAdminError::Validation { .. }),
+            "expected Validation, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_acme_cert_allows_dns01_with_explicit_acknowledgment() {
+        // Same unmanaged-zone provisioner as above, but the caller explicitly
+        // acknowledged manual renewal — the consent gate must be skipped
+        // entirely, letting the request proceed to the normal route lookup.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([Vec::<discovered::Model>::new()])
+            .into_connection();
+        let service = TraefikDiscoveryAdminService::new(
+            Arc::new(db),
+            disabled_handle(),
+            dns_zone_unmanaged_provisioner(),
+        );
+
+        let req = RequestDiscoveredRouteCertRequest {
+            challenge_type: "dns-01".to_string(),
+            acknowledge_manual_dns_renewal: true,
+        };
+        let err = service
+            .authorize_acme_cert("app.example.com", &req, 1)
+            .await
+            .expect_err(
+                "no discovered route was seeded, so this must still fail — just not on consent",
+            );
+
+        assert!(
+            matches!(err, TraefikDiscoveryAdminError::NotFound { .. }),
+            "expected the consent gate to be skipped and NotFound to surface instead, got {err:?}"
+        );
+    }
+
     // ── deauthorize_cert ─────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -1925,6 +2112,48 @@ mod tests {
                 .as_deref()
                 .is_some_and(|e| e.contains("missing.example.com")),
             "verdict must name the missing host, got {:?}",
+            verdict.error
+        );
+    }
+
+    #[tokio::test]
+    async fn import_acme_json_rejects_dns01_without_acknowledgment_when_zone_unmanaged() {
+        // The route exists, but no verified auto-managed DNS zone covers the
+        // host and the caller did not acknowledge manual renewal — the
+        // per-host verdict must record failure without ever parsing the
+        // host's certificate entry from acme.json.
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results([vec![route_model("app.example.com", true)]])
+            .into_connection();
+        let service = TraefikDiscoveryAdminService::new(
+            Arc::new(db),
+            disabled_handle(),
+            dns_zone_unmanaged_provisioner(),
+        );
+
+        let req = ImportTraefikAcmeJsonRequest {
+            acme_json: "{\"le\":{\"Certificates\":[]}}".to_string(),
+            hosts: vec!["app.example.com".to_string()],
+            renewal_method: "dns-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+            dry_run: false,
+        };
+        let resp = service
+            .import_acme_json(&req, 1)
+            .await
+            .expect("import must return Ok even when individual hosts fail");
+
+        assert_eq!(resp.total_requested, 1);
+        assert_eq!(resp.succeeded, 0);
+        assert_eq!(resp.failed, 1);
+        let verdict = &resp.verdicts[0];
+        assert!(!verdict.success);
+        assert!(
+            verdict
+                .error
+                .as_deref()
+                .is_some_and(|e| e.contains("acknowledge_manual_dns_renewal")),
+            "verdict must explain the missing acknowledgment, got {:?}",
             verdict.error
         );
     }
