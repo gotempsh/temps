@@ -319,6 +319,9 @@ async fn setup_e2e_as_full(
         otel_relay_tx: None,
         project_access_checker: None,
         facet_service,
+        cloud_backfill_progress: Arc::new(temps_otel::services::CloudBackfillProgressService::new(
+            db.clone(),
+        )),
     };
 
     // Create auth middleware that injects AuthContext into request extensions.

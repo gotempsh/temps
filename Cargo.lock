@@ -10896,6 +10896,7 @@ dependencies = [
  "temps-backup",
  "temps-blob",
  "temps-cloud",
+ "temps-cloud-client",
  "temps-config",
  "temps-core",
  "temps-database",

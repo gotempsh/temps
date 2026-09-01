@@ -45,6 +45,9 @@ fn spans(n: usize) -> Vec<SpanRecord> {
             ts_millis: i as i64,
             duration_ms: 1.0,
             attributes: Default::default(),
+            // ADR-040's queryable-fidelity fields stay absent: the transport
+            // is fidelity-agnostic.
+            ..Default::default()
         })
         .collect()
 }

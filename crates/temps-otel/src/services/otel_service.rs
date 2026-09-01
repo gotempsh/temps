@@ -20,8 +20,10 @@ use crate::error::OtelError;
 use crate::ingest::auth::{IngestAuth, OtelAuthService, ProjectAuth};
 use crate::ingest::quota_cache::{QuotaCache, QUOTA_CACHE_TTL};
 use crate::ingest::rate_limit::RateLimiter;
+use crate::services::cloud_fidelity::{CloudPolicyCache, CloudTelemetryPolicy};
 use crate::storage::OtelStorage;
 use crate::types::*;
+use temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 
 /// Core OTel service that orchestrates ingest and storage.
 pub struct OtelService {
@@ -47,6 +49,14 @@ pub struct OtelService {
     /// `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS`).
     ingest_permit_limit: usize,
     cloud_link: Option<Arc<temps_cloud_client::CloudLink>>,
+    /// Resolves each project's Temps Cloud egress consent (ADR-040 §1).
+    ///
+    /// `None` means the fidelity columns are not reachable from here, and every
+    /// mirrored span uses [`CloudTelemetryPolicy::metered`] — i.e. exactly the
+    /// pre-ADR-040 projection. Absent must always mean *less* egress, never
+    /// more, which is why this is an `Option` with a `Metered` fallback rather
+    /// than a required dependency that would fail startup.
+    cloud_policy_cache: Option<Arc<CloudPolicyCache>>,
     stats: PipelineStatsAtomic,
 }
 
@@ -68,26 +78,80 @@ const SERVICE_INGEST_MAX_REQUESTS: u32 = 600;
 /// Sliding window for the service ingest limiter.
 const SERVICE_INGEST_WINDOW: Duration = Duration::from_secs(60);
 
-fn cloud_span(
+/// Project one locally-stored span into the record this instance is willing to
+/// mirror to Temps Cloud, at the fidelity the owning project consented to
+/// (ADR-040 §1).
+///
+/// Returns `None` when the record cannot be built — a link that is not
+/// enrolled, or telemetry export switched off — in which case the span is
+/// simply not mirrored. Local storage is authoritative and unaffected either
+/// way.
+pub(crate) fn cloud_span(
     link: &temps_cloud_client::CloudLink,
     span: &SpanRecord,
+    policy: &CloudTelemetryPolicy,
 ) -> Option<temps_cloud_protocol::SpanRecord> {
-    Some(temps_cloud_protocol::SpanRecord {
-        trace_id: link
-            .pseudonymize_telemetry_id("trace", &span.trace_id)
-            .ok()?,
-        span_id: link.pseudonymize_telemetry_id("span", &span.span_id).ok()?,
-        // Span names are application-controlled too. Instrumentation may put
-        // raw URLs, SQL, email addresses or identifiers here, so the safe
-        // continuous projection uses a neutral operation label.
-        name: "span".to_string(),
-        ts_millis: span.start_time.timestamp_millis(),
-        duration_ms: span.duration_ms,
-        // Default-deny at the OSS boundary. Arbitrary span attributes
-        // routinely contain headers, SQL, user identifiers and other
-        // application data.
-        attributes: Default::default(),
-    })
+    match policy.fidelity {
+        // ── Metered: the default, and byte-identical to the pre-ADR-040
+        //    projection. Every field added for `Queryable` is left at its
+        //    empty value and is `skip_serializing_if`-elided, so the bytes on
+        //    the wire are exactly what older instances shipped and an older
+        //    gateway sees no new keys. `the_metered_projection_serializes_to_
+        //    exactly_the_pre_adr_040_bytes` pins this against a literal.
+        CloudTelemetryFidelity::Metered => Some(temps_cloud_protocol::SpanRecord {
+            trace_id: link
+                .pseudonymize_telemetry_id("trace", &span.trace_id)
+                .ok()?,
+            span_id: link.pseudonymize_telemetry_id("span", &span.span_id).ok()?,
+            // Span names are application-controlled too. Instrumentation may put
+            // raw URLs, SQL, email addresses or identifiers here, so the safe
+            // continuous projection uses a neutral operation label.
+            name: "span".to_string(),
+            ts_millis: span.start_time.timestamp_millis(),
+            duration_ms: span.duration_ms,
+            // Default-deny at the OSS boundary. Arbitrary span attributes
+            // routinely contain headers, SQL, user identifiers and other
+            // application data.
+            attributes: Default::default(),
+            ..Default::default()
+        }),
+
+        // ── Queryable: the project opted in, so ship what makes a span
+        //    renderable and correlatable. Trace and span identifiers go in the
+        //    clear deliberately (ADR-040 §1): a pseudonymised id would render
+        //    a tree but match nothing in the user's own logs, which is a defect
+        //    rather than a privacy win. The project itself is still referenced
+        //    only by a pseudonym.
+        CloudTelemetryFidelity::Queryable => Some(temps_cloud_protocol::SpanRecord {
+            trace_id: span.trace_id.clone(),
+            span_id: span.span_id.clone(),
+            name: span.name.clone(),
+            ts_millis: span.start_time.timestamp_millis(),
+            duration_ms: span.duration_ms,
+            // Default-deny survives the opt-in: only exact-match allowlisted
+            // keys are copied, and everything else is dropped here, before the
+            // batch exists. An empty allowlist ships nothing.
+            attributes: span
+                .attributes
+                .iter()
+                .filter(|(key, _)| policy.allows_attribute(key))
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+            // Pseudonymous scoping key: Cloud can group by project without
+            // learning its name, and nobody observing the payload can tie it to
+            // a local project. It is not a secret *from Cloud* — see
+            // `SpanRecord::project_ref`, which documents why the key holder can
+            // invert a small-integer input.
+            project_ref: link
+                .pseudonymize_telemetry_id("project", &span.project_id.to_string())
+                .ok()?,
+            service_name: Some(span.resource.service_name.clone()),
+            span_kind: Some(span.kind.to_string()),
+            status_code: Some(span.status_code.to_string()),
+            parent_span_id: span.parent_span_id.clone(),
+            environment: span.resource.deployment_environment.clone(),
+        }),
+    }
 }
 
 /// Total attempts (first try + retries) for a single ingest storage write.
@@ -233,6 +297,7 @@ impl OtelService {
             ingest_semaphore: Arc::new(Semaphore::new(max_concurrent_ingest_requests)),
             ingest_permit_limit: max_concurrent_ingest_requests,
             cloud_link: None,
+            cloud_policy_cache: None,
             stats: PipelineStatsAtomic::default(),
         }
     }
@@ -242,6 +307,24 @@ impl OtelService {
     pub fn with_cloud_link(mut self, cloud_link: Arc<temps_cloud_client::CloudLink>) -> Self {
         self.cloud_link = Some(cloud_link);
         self
+    }
+
+    /// Attach the per-project Cloud telemetry fidelity resolver (ADR-040 §1).
+    ///
+    /// Without it every mirrored span keeps the `Metered` projection, so a
+    /// deployment that never wires this cannot accidentally widen egress.
+    pub fn with_cloud_policy_cache(mut self, cache: Arc<CloudPolicyCache>) -> Self {
+        self.cloud_policy_cache = Some(cache);
+        self
+    }
+
+    /// The per-project Cloud fidelity resolver, when one is wired.
+    ///
+    /// Exposed so the settings path can invalidate a project's cached decision
+    /// the moment an operator changes it, rather than leaving them staring at
+    /// unchanged behaviour for up to one TTL.
+    pub fn cloud_policy_cache(&self) -> Option<&Arc<CloudPolicyCache>> {
+        self.cloud_policy_cache.as_ref()
     }
 
     /// Acquire an ingest slot without queueing more work in memory.
@@ -415,6 +498,22 @@ impl OtelService {
         }
     }
 
+    /// Resolve the Cloud egress policy for every distinct project in a batch.
+    ///
+    /// Returns an empty map when no resolver is wired, which callers read as
+    /// "everything is `Metered`" — the pre-ADR-040 behaviour.
+    async fn resolve_cloud_policies(
+        &self,
+        spans: &[SpanRecord],
+    ) -> std::collections::HashMap<i32, CloudTelemetryPolicy> {
+        let Some(cache) = self.cloud_policy_cache.as_ref() else {
+            return std::collections::HashMap::new();
+        };
+        cache
+            .policies_for(spans.iter().map(|span| span.project_id))
+            .await
+    }
+
     /// Ingest trace spans — stores all received spans.
     ///
     /// Sampling is the client SDK's responsibility (head-based).
@@ -429,14 +528,25 @@ impl OtelService {
             return Ok(0);
         }
 
-        let mirror = self.cloud_link.as_ref().and_then(|link| {
-            (link.is_linked() && link.telemetry_enabled()).then(|| {
-                spans
-                    .iter()
-                    .filter_map(|span| cloud_span(link, span))
-                    .collect::<Vec<_>>()
-            })
-        });
+        let mirror = match self.cloud_link.as_ref() {
+            Some(link) if link.is_linked() && link.telemetry_enabled() => {
+                // One lookup per *distinct* project in the batch, served from a
+                // TTL cache — never one per span. Unresolved projects fall back
+                // to `Metered`, so a lookup problem can only narrow egress.
+                let policies = self.resolve_cloud_policies(&spans).await;
+                let metered = CloudTelemetryPolicy::metered();
+                Some(
+                    spans
+                        .iter()
+                        .filter_map(|span| {
+                            let policy = policies.get(&span.project_id).unwrap_or(&metered);
+                            cloud_span(link, span, policy)
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            }
+            _ => None,
+        };
 
         // Retry on transient storage failures — see `store_with_retry`. Two
         // failed ClickHouse writes used to mean 1,024 permanently lost spans
@@ -874,7 +984,7 @@ mod tests {
         spans[0].name = "SELECT * FROM users WHERE email='secret@example.com'".into();
 
         let (_directory, link) = linked_cloud();
-        let mirrored = cloud_span(&link, &spans[0]).unwrap();
+        let mirrored = cloud_span(&link, &spans[0], &CloudTelemetryPolicy::metered()).unwrap();
 
         assert!(mirrored.attributes.is_empty());
         assert_ne!(mirrored.trace_id, spans[0].trace_id);
@@ -885,6 +995,255 @@ mod tests {
         let serialized = serde_json::to_string(&mirrored).unwrap();
         assert!(!serialized.contains("secret@example.com"));
         assert!(!serialized.contains("must-not-leave"));
+    }
+
+    // ── ADR-040 §1 fidelity invariants ──────────────────────────────────
+    //
+    // These are the contract, not coverage. The first pins that opting *out*
+    // (the default) changed nothing on the wire; the second pins that opting
+    // *in* still ships no attributes unless a key was explicitly listed.
+
+    /// A span carrying every field `Metered` must strip: an application-
+    /// controlled name, an attribute, a real parent, an environment, a service
+    /// name and an error status.
+    ///
+    /// Identifiers and timestamp are fixed, not decoded from a fixture, so the
+    /// expected wire bytes below can be written out literally.
+    fn metered_fixture_span(trace_id: &str, span_id: &str) -> SpanRecord {
+        let start_time = chrono::DateTime::from_timestamp_millis(1_700_000_000_000)
+            .expect("fixed timestamp is in range");
+        SpanRecord {
+            project_id: 7,
+            deployment_id: None,
+            resource: ResourceInfo {
+                service_name: "checkout".to_string(),
+                service_version: Some("1.4.2".to_string()),
+                deployment_environment: Some("production".to_string()),
+                attributes: Default::default(),
+            },
+            trace_id: trace_id.to_string(),
+            span_id: span_id.to_string(),
+            parent_span_id: Some("00f067aa0ba902b6".to_string()),
+            name: "SELECT * FROM users WHERE email='secret@example.com'".to_string(),
+            kind: SpanKind::Server,
+            start_time,
+            end_time: start_time + chrono::Duration::milliseconds(13),
+            duration_ms: 12.5,
+            status_code: SpanStatusCode::Error,
+            status_message: "boom".to_string(),
+            attributes: [
+                ("db.statement".to_string(), "must-not-leave".to_string()),
+                ("http.route".to_string(), "/orders".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_metered_projection_serializes_to_exactly_the_pre_adr_040_bytes() {
+        // ADR-040 makes `Metered` the default for every existing and future
+        // project. If this ever diverges, an upgrade silently changes what
+        // leaves every linked instance that never opted in.
+        //
+        // The expectation is a literal, hand-written string rather than a
+        // re-implementation of the old projection: a parallel implementation
+        // edited in the same commit as `cloud_span` would agree with the bug,
+        // and a `serde_json::Value` comparison would additionally depend on
+        // `serde_json`'s `preserve_order` feature happening to be enabled
+        // somewhere in the dependency tree. `temps-cloud-protocol`'s
+        // `a_metered_record_serializes_without_any_queryable_keys` pins the
+        // same property one layer down, the same way.
+        //
+        // The two 64-hex values are HMAC-SHA256(<the fixture's instance token>,
+        // "trace"|"span" || 0x00 || <id>), i.e. what `pseudonymize_telemetry_id`
+        // produces for `linked_cloud()`'s fixed token. Changing that token
+        // changes these literals, deliberately: pseudonymisation is part of the
+        // contract being pinned.
+        let cases: [(SpanRecord, &str); 2] = [
+            (
+                metered_fixture_span("4bf92f3577b34da6a3ce929d0e0e4736", "00f067aa0ba902b7"),
+                r#"{"trace_id":"4c80dab45fa7b33603dcdba132044a7186f0cbab5778a8f26f4cc7117728c328","span_id":"0da6b04cd7e98c634420df49c63d54dec287504a63c73683d95640a25131d045","name":"span","ts_millis":1700000000000,"duration_ms":12.5,"attributes":{}}"#,
+            ),
+            (
+                metered_fixture_span("0af7651916cd43dd8448eb211c80319c", "b7ad6b7169203331"),
+                r#"{"trace_id":"f420acecc6b61aebb78f23b3332bb8d5a29703d7d300573fa2d4fcd2094db6f7","span_id":"7c3889741fdf60683a82e0216f810edd6473a66dae781e9cdc0a27d50020699a","name":"span","ts_millis":1700000000000,"duration_ms":12.5,"attributes":{}}"#,
+            ),
+        ];
+
+        let (_directory, link) = linked_cloud();
+
+        for (span, expected_json) in &cases {
+            let actual = cloud_span(&link, span, &CloudTelemetryPolicy::metered())
+                .expect("the metered projection must build for a linked instance");
+
+            assert_eq!(
+                serde_json::to_string(&actual).expect("record must serialize"),
+                *expected_json,
+                "the metered projection must be byte-identical to the pre-ADR-040 one"
+            );
+
+            // ...and field-by-field, so a serde attribute change cannot make
+            // the byte comparison pass for the wrong reason.
+            assert_ne!(actual.trace_id, span.trace_id);
+            assert_ne!(actual.span_id, span.span_id);
+            assert_eq!(actual.name, "span");
+            assert_eq!(actual.ts_millis, 1_700_000_000_000);
+            assert_eq!(actual.duration_ms, 12.5);
+            assert!(actual.attributes.is_empty());
+            assert_eq!(actual.project_ref, "");
+            assert_eq!(actual.service_name, None);
+            assert_eq!(actual.span_kind, None);
+            assert_eq!(actual.status_code, None);
+            assert_eq!(actual.parent_span_id, None);
+            assert_eq!(actual.environment, None);
+        }
+    }
+
+    #[test]
+    fn queryable_fidelity_with_an_empty_allowlist_ships_no_attributes_at_all() {
+        // The safe default the whole opt-in leans on: raising fidelity makes a
+        // span renderable, it does NOT open the attribute map. An operator has
+        // to list each key by hand.
+        let (_, encoded) = test_support::build_sample_trace_tree();
+        let mut spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
+        spans[0].attributes.insert(
+            "http.request.header.authorization".into(),
+            "Bearer must-not-leave".into(),
+        );
+        spans[0]
+            .attributes
+            .insert("db.statement".into(), "SELECT secret@example.com".into());
+        spans[0]
+            .attributes
+            .insert("http.route".into(), "/orders".into());
+
+        let (_directory, link) = linked_cloud();
+        let mirrored = cloud_span(
+            &link,
+            &spans[0],
+            &CloudTelemetryPolicy::queryable(std::iter::empty()),
+        )
+        .expect("the queryable projection must build for a linked instance");
+
+        assert!(
+            mirrored.attributes.is_empty(),
+            "an empty allowlist must ship zero attributes even at queryable fidelity"
+        );
+        let serialized = serde_json::to_string(&mirrored).expect("record must serialize");
+        assert!(!serialized.contains("must-not-leave"));
+        assert!(!serialized.contains("secret@example.com"));
+        assert!(!serialized.contains("/orders"));
+        // The rest of the queryable projection is still present — this is a
+        // narrowing of attributes only, not a fallback to `Metered`.
+        assert_eq!(mirrored.trace_id, spans[0].trace_id);
+        assert_eq!(mirrored.name, spans[0].name);
+    }
+
+    #[test]
+    fn queryable_fidelity_copies_only_exact_allowlisted_attribute_keys() {
+        let (_, encoded) = test_support::build_sample_trace_tree();
+        let mut spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
+        spans[0]
+            .attributes
+            .insert("http.route".into(), "/orders".into());
+        spans[0]
+            .attributes
+            .insert("http.route.template".into(), "must-not-leave".into());
+        spans[0]
+            .attributes
+            .insert("db.statement".into(), "must-not-leave".into());
+
+        let (_directory, link) = linked_cloud();
+        let policy = CloudTelemetryPolicy::queryable(["http.route".to_string()]);
+        let mirrored = cloud_span(&link, &spans[0], &policy)
+            .expect("the queryable projection must build for a linked instance");
+
+        assert_eq!(mirrored.attributes.len(), 1);
+        assert_eq!(
+            mirrored.attributes.get("http.route").map(String::as_str),
+            Some("/orders")
+        );
+        let serialized = serde_json::to_string(&mirrored).expect("record must serialize");
+        assert!(
+            !serialized.contains("must-not-leave"),
+            "a near-miss key must not be treated as a prefix match: {serialized}"
+        );
+    }
+
+    #[test]
+    fn queryable_fidelity_emits_the_renderable_fields_and_a_pseudonymous_project_ref() {
+        let (_, encoded) = test_support::build_sample_trace_tree();
+        let mut spans = decode::decode_traces_request(&encoded, 7, None).unwrap();
+        spans[0].parent_span_id = Some("00f067aa0ba902b6".into());
+        spans[0].resource.service_name = "checkout".into();
+        spans[0].resource.deployment_environment = Some("production".into());
+
+        let (_directory, link) = linked_cloud();
+        let mirrored = cloud_span(
+            &link,
+            &spans[0],
+            &CloudTelemetryPolicy::queryable(std::iter::empty()),
+        )
+        .expect("the queryable projection must build for a linked instance");
+
+        // Real identifiers, deliberately (ADR-040 §1): a pseudonym would match
+        // nothing in the user's own logs.
+        assert_eq!(mirrored.trace_id, spans[0].trace_id);
+        assert_eq!(mirrored.span_id, spans[0].span_id);
+        assert_eq!(mirrored.name, spans[0].name);
+        assert_eq!(mirrored.parent_span_id, Some("00f067aa0ba902b6".into()));
+        assert_eq!(mirrored.service_name, Some("checkout".into()));
+        assert_eq!(mirrored.environment, Some("production".into()));
+        assert_eq!(mirrored.span_kind, Some(spans[0].kind.to_string()));
+        assert_eq!(mirrored.status_code, Some(spans[0].status_code.to_string()));
+
+        // The project, by contrast, is referenced only by an HMAC pseudonym —
+        // stable so Cloud can scope by it, opaque so Cloud never learns the
+        // local project id or name.
+        assert_eq!(mirrored.project_ref.len(), 64);
+        assert!(mirrored.project_ref.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(mirrored.project_ref, "7");
+        assert_eq!(
+            mirrored.project_ref,
+            link.pseudonymize_telemetry_id("project", "7")
+                .expect("project pseudonym must derive"),
+            "project_ref must reuse the existing pseudonymisation helper"
+        );
+    }
+
+    #[test]
+    fn the_project_pseudonym_is_domain_separated_from_trace_and_span_ids() {
+        // Same input value, three domains: if they collided, a project_ref
+        // would be forgeable from a trace id and vice versa.
+        let (_directory, link) = linked_cloud();
+        let project = link.pseudonymize_telemetry_id("project", "7").unwrap();
+        let trace = link.pseudonymize_telemetry_id("trace", "7").unwrap();
+        let span = link.pseudonymize_telemetry_id("span", "7").unwrap();
+
+        assert_ne!(project, trace);
+        assert_ne!(project, span);
+        assert_ne!(trace, span);
+    }
+
+    #[tokio::test]
+    async fn a_service_without_a_policy_cache_mirrors_at_metered_fidelity() {
+        // The unwired case must be the *narrow* one. If this ever inverted,
+        // any deployment that skipped the wiring would start shipping real
+        // span names without anyone opting in.
+        let mock = MockOtelStorage::new();
+        let (svc, _) = make_service(mock);
+        let (_directory, link) = linked_cloud();
+        let svc = svc.with_cloud_link(link.clone());
+
+        let (_, encoded) = test_support::build_sample_trace_tree();
+        let mut spans = decode::decode_traces_request(&encoded, 1, None).unwrap();
+        spans[0].name = "SELECT * FROM users WHERE email='secret@example.com'".into();
+
+        assert!(svc.resolve_cloud_policies(&spans).await.is_empty());
+        svc.ingest_spans(spans).await.unwrap();
+        assert_eq!(link.spooled(), 4);
     }
 
     #[tokio::test]

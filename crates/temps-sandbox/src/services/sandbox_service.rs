@@ -3191,6 +3191,9 @@ mod storage_cleanup_tests {
             generic_webhook_token: None,
             cross_project_trace_sharing: false,
             image_retention_hours: None,
+            cloud_telemetry_fidelity:
+                temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
+            cloud_telemetry_attribute_allowlist: Vec::new(),
         }
     }
 

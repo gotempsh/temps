@@ -67,6 +67,17 @@ pub enum Capability {
     /// Instance may submit an operator-approved, locally redacted manifest for
     /// credit-backed managed inference. Source telemetry never moves implicitly.
     ManagedAiInference,
+    /// Instance may *read* previously mirrored telemetry back out of the
+    /// managed backend to serve console queries (ADR-040).
+    ///
+    /// Strictly narrower than [`Capability::TelemetryShipping`] and negotiated
+    /// separately: shipping is a write the instance chooses to make, reading is
+    /// a query surface the backend chooses to expose. A backend that accepts
+    /// telemetry but cannot serve it back declines this one, and the instance
+    /// then reports "not supported" rather than "unavailable" — a distinction
+    /// an operator debugging alone needs, because only one of those two is
+    /// worth retrying.
+    TelemetryQuery,
     /// A capability introduced by a newer peer. Older agents retain the
     /// connection and simply decline to negotiate the unknown feature.
     #[serde(other)]
@@ -196,6 +207,35 @@ mod tests {
                 .negotiate(&peer)
                 .unwrap(),
             vec![Capability::TelemetryShipping]
+        );
+    }
+
+    #[test]
+    fn telemetry_query_is_negotiated_independently_of_shipping() {
+        // ADR-040: an instance that ships telemetry to a backend which cannot
+        // serve it back must end up with shipping enabled and reading absent,
+        // not with reading assumed from shipping.
+        let ours = hello(&[Capability::TelemetryShipping, Capability::TelemetryQuery]);
+        let write_only_backend = hello(&[Capability::TelemetryShipping]);
+        assert_eq!(
+            ours.negotiate(&write_only_backend)
+                .expect("capability absence is never fatal"),
+            vec![Capability::TelemetryShipping]
+        );
+    }
+
+    #[test]
+    fn telemetry_query_survives_a_serde_round_trip_as_snake_case() {
+        // The wire name is part of the contract with the backend; a rename
+        // would silently read as `Unknown` on the peer.
+        assert_eq!(
+            serde_json::to_string(&Capability::TelemetryQuery).expect("capability must serialize"),
+            r#""telemetry_query""#
+        );
+        assert_eq!(
+            serde_json::from_str::<Capability>(r#""telemetry_query""#)
+                .expect("capability must parse"),
+            Capability::TelemetryQuery
         );
     }
 

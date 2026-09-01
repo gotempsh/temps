@@ -168,6 +168,7 @@ mod tests {
             ts_millis: i,
             duration_ms: 1.0,
             attributes: Default::default(),
+            ..Default::default()
         }
     }
 

@@ -62,7 +62,7 @@ pub enum Commands {
     ApiKey(ApiKeyCommand),
     /// Backup management commands
     Backup(BackupCommand),
-    /// One-shot data migration utilities (e.g. TimescaleDB → ClickHouse)
+    /// One-shot data migration utilities (TimescaleDB → ClickHouse, spans → Temps Cloud)
     Backfill(BackfillCommand),
     /// Manage platform services (KV, Blob)
     Services(ServicesCommand),

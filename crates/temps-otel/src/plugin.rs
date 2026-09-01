@@ -17,6 +17,7 @@ use utoipa::OpenApi as OpenApiTrait;
 
 use crate::anomaly::detector::{AnomalyDetector, AnomalyDetectorConfig};
 use crate::handlers;
+use crate::handlers::cloud_backfill_handler;
 use crate::handlers::dashboard_handler;
 use crate::handlers::facet_handler;
 use crate::handlers::ingest_handler;
@@ -331,6 +332,7 @@ fn pipeline_stat_deltas(
         query_handler::get_health,
         query_handler::get_quota,
         query_handler::has_traces,
+        cloud_backfill_handler::get_cloud_backfill_status,
         query_handler::get_pipeline_stats,
         query_handler::get_ingest_errors,
         query_handler::get_pipeline_history,
@@ -370,6 +372,9 @@ fn pipeline_stat_deltas(
             query_handler::HealthResponse,
             query_handler::QuotaResponse,
             query_handler::HasTracesResponse,
+            cloud_backfill_handler::CloudBackfillStatusResponse,
+            temps_entities::cloud_telemetry_backfills::CloudTelemetryBackfillStatus,
+            temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity,
             query_handler::PipelineStatsResponse,
         query_handler::IngestErrorsResponse,
         crate::types::IngestErrorSummary,
@@ -646,6 +651,25 @@ impl TempsPlugin for OtelPlugin {
                 Duration::from_secs(config.rate_limit_window_secs),
             ));
 
+            // Per-project Temps Cloud telemetry fidelity (ADR-040 §1). Reads
+            // `projects.cloud_telemetry_fidelity` /
+            // `projects.cloud_telemetry_attribute_allowlist` behind a short TTL
+            // so a fidelity change takes effect without restarting the binary.
+            // Registered as a service so the settings path can invalidate a
+            // project's entry the moment the operator changes it.
+            let cloud_policy_cache = Arc::new(crate::services::CloudPolicyCache::new(db.clone()));
+            context.register_service(cloud_policy_cache.clone());
+
+            // Shared progress record for `temps backfill cloud-telemetry`. The
+            // backfill itself runs out of process (ADR-040 §1), so this service
+            // is read-only here — it exists so the Console can see a run the
+            // CLI is driving instead of the operator having to watch a
+            // terminal they may not have open.
+            let cloud_backfill_progress = Arc::new(
+                crate::services::CloudBackfillProgressService::new(db.clone()),
+            );
+            context.register_service(cloud_backfill_progress.clone());
+
             // Create the main OTel service
             let otel_service = Arc::new(
                 OtelService::new(
@@ -654,7 +678,8 @@ impl TempsPlugin for OtelPlugin {
                     rate_limiter,
                     config.max_concurrent_ingest_requests,
                 )
-                .with_cloud_link(context.require_service::<temps_cloud_client::CloudLink>()),
+                .with_cloud_link(context.require_service::<temps_cloud_client::CloudLink>())
+                .with_cloud_policy_cache(cloud_policy_cache),
             );
             context.register_service(otel_service.clone());
             // Also expose the same service behind the storage-agnostic read
@@ -811,6 +836,7 @@ impl TempsPlugin for OtelPlugin {
                 cross_project_service: cross_project_service.clone(),
                 otel_relay_tx: Some(otel_relay_tx),
                 project_access_checker: None,
+                cloud_backfill_progress: cloud_backfill_progress.clone(),
             };
             context.register_service(Arc::new(app_state.clone()));
 

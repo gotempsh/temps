@@ -201,6 +201,9 @@ mod tests {
     }
 
     fn span() -> SpanRecord {
+        // A `Metered`-fidelity record: the ADR-040 fields stay at their
+        // defaults, which is what the flusher sees for a project that never
+        // opted in.
         SpanRecord {
             trace_id: "shutdown-trace".into(),
             span_id: "shutdown-span".into(),
@@ -208,6 +211,7 @@ mod tests {
             ts_millis: 1,
             duration_ms: 1.0,
             attributes: Default::default(),
+            ..Default::default()
         }
     }
 

@@ -703,6 +703,9 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
         otel_relay_tx: None,
         project_access_checker: None,
         facet_service,
+        cloud_backfill_progress: Arc::new(temps_otel::services::CloudBackfillProgressService::new(
+            ctx.db.clone(),
+        )),
     };
 
     let attacker_auth = AuthContext::new_session(attacker_user, Role::Admin);

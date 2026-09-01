@@ -4,6 +4,7 @@
 //! HTTP handlers for OTLP ingest and query endpoints.
 
 pub mod audit;
+pub mod cloud_backfill_handler;
 pub mod dashboard_handler;
 pub mod facet_handler;
 pub mod ingest_handler;
@@ -53,6 +54,7 @@ pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 ///   GET /otel/pipeline-stats
 ///   GET /otel/ingest-errors
 ///   GET /otel/pipeline-history
+///   GET /otel/cloud-telemetry/backfill/{project_id}
 pub fn configure_routes() -> Router<OtelAppState> {
     // OTLP ingest endpoints are split into their own sub-router so
     // `DefaultBodyLimit` applies only to them, not to the query/dashboard
@@ -111,6 +113,12 @@ pub fn configure_routes() -> Router<OtelAppState> {
         )
         .route("/otel/health/{project_id}", get(query_handler::get_health))
         .route("/otel/quota/{project_id}", get(query_handler::get_quota))
+        // ADR-040 §1: read-only status of the out-of-process Cloud telemetry
+        // backfill, so the Console can show a run the CLI is driving.
+        .route(
+            "/otel/cloud-telemetry/backfill/{project_id}",
+            get(cloud_backfill_handler::get_cloud_backfill_status),
+        )
         .route(
             "/otel/has-traces/{project_id}",
             get(query_handler::has_traces),

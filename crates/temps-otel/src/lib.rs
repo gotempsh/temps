@@ -119,4 +119,13 @@ pub struct OtelAppState {
     pub otel_relay_tx: Option<tokio::sync::mpsc::Sender<crate::relay::OtelRelayMessage>>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<std::sync::Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Read side of the out-of-process Cloud telemetry backfill's progress
+    /// record (ADR-040 §1).
+    ///
+    /// The backfill runs under `temps backfill cloud-telemetry`, not in this
+    /// process, so this is how the Console learns a run exists at all. Required
+    /// rather than optional: an endpoint that sometimes cannot answer "is a
+    /// backfill running" is worse than one that always can.
+    pub cloud_backfill_progress:
+        std::sync::Arc<crate::services::cloud_backfill_progress::CloudBackfillProgressService>,
 }

@@ -7,6 +7,7 @@ use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
 use serde::{Deserialize, Serialize};
 use temps_core::DBDateTime;
 
+use super::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 use super::deployment_config::DeploymentConfig;
 use super::preset::{Preset, PresetConfig};
 use super::source_type::SourceType;
@@ -145,6 +146,30 @@ pub struct Model {
     /// `AppSettings.image_retention.default_hours` (336 hours / 14 days
     /// out of the box).
     pub image_retention_hours: Option<i32>,
+    /// ADR-040 §1: how much of a span may leave this instance for Temps Cloud.
+    ///
+    /// `metered` (the default for every existing and new project) is exactly
+    /// today's behaviour — pseudonymised identifiers, constant span name, no
+    /// attributes. `queryable` is a per-project opt-in that ships real span
+    /// names, service names, trace/span identifiers and allowlisted attributes
+    /// so the data can be read back into the console.
+    ///
+    /// Not a secret and therefore not encrypted; it is a consent flag, and an
+    /// operator must be able to read it back verbatim to know what their
+    /// instance is doing.
+    #[sea_orm(default_value = "metered")]
+    pub cloud_telemetry_fidelity: CloudTelemetryFidelity,
+    /// ADR-040 §1: exact-match keys whose span attributes may be mirrored to
+    /// Temps Cloud at `queryable` fidelity.
+    ///
+    /// **Default-deny.** Empty (the default, even after opting into
+    /// `queryable`) means no attributes leave at all. Arbitrary span
+    /// attributes routinely carry headers, SQL and user identifiers, so this
+    /// closes that hazard by construction rather than by operator diligence.
+    /// Matching is exact — no prefixes, no globs — so a broad pattern cannot
+    /// quietly widen egress later.
+    #[sea_orm(default_value = "{}")]
+    pub cloud_telemetry_attribute_allowlist: Vec<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

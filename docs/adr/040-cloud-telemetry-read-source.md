@@ -225,7 +225,7 @@ Added fields:
 
 | Field | Type | Notes |
 |---|---|---|
-| `project_ref` | `String` | **Pseudonymous.** `pseudonymize_telemetry_id("project", project_id)`. Cloud gets a stable scoping key without learning project names or local IDs. The instance maps it back locally. |
+| `project_ref` | `String` | **Pseudonymous.** `pseudonymize_telemetry_id("project", project_id)`. A stable scoping key that does not disclose the project's *name*, and that no third party observing the payload can correlate to a local project. It is **not** a secret from Cloud itself: the HMAC key is the instance's own bearer token, which Cloud issued and receives on every request, and the input is a small integer — so the key holder can enumerate `HMAC(token, "project\0" \|\| i)` and invert every `project_ref` in the tenant. That is acceptable (Cloud is the tenant's own provider, not a third party) but must not be described as if Cloud were blinded. The trace/span pseudonyms below are different: their 128-bit random inputs are not enumerable. |
 | `service_name` | `Option<String>` | Operator-visible in the consent copy. Real value — a service name the user cannot filter on is not a Traces page. |
 | `name` | `String` | The real span name at `Queryable`, still `"span"` at `Metered`. |
 | `span_kind` | `Option<String>` | Low cardinality, enum-like. |
@@ -828,6 +828,43 @@ an error-tracking refactor.
    error bodies (which currently pass through close to verbatim) need further
    sanitization before this leaves spike status, and whether the per-tenant
    concurrency bound needs to vary by plan tier once reads are metered.
+9. **The fidelity/allowlist write path MUST invalidate the policy cache in the
+   same request.** Not a question — a binding requirement on the Phase B
+   endpoint that does not exist yet, recorded here so it cannot be forgotten
+   when it is built. `CloudPolicyCache::invalidate(project_id)` and
+   `invalidate_all()` (`crates/temps-otel/src/services/cloud_fidelity.rs`) are
+   implemented and registered as a service by `temps-otel`'s plugin
+   specifically so the settings path can call them, and today they have **zero
+   production callers** — Phase A ships no write path, so the only way to change
+   fidelity is a direct `UPDATE`. The moment a PATCH handler exists, omitting
+   the `invalidate` call means a fidelity *downgrade* keeps shipping `Queryable`
+   spans — real names, real trace IDs, allowlisted attributes — for up to
+   `CLOUD_POLICY_CACHE_TTL` after the operator believes they stopped it, with a
+   UI that already says `metered`. Upgrades are self-correcting and downgrades
+   are not, which is exactly the wrong asymmetry for a consent control. The same
+   applies to editing `cloud_telemetry_attribute_allowlist`: removing a key must
+   take effect on the next batch, not one TTL later. A test asserting that the
+   PATCH handler's effect is visible on the immediately following projection is
+   the acceptance criterion.
+10. **Lowering fidelity, or removing an allowlist key, MUST purge or re-project
+    what is already buffered.** Also a requirement rather than a question, and
+    the second half of the same hole. Invalidating the cache only governs spans
+    projected *after* the change; records already projected at `Queryable` sit
+    in `Spool` and, because the link persists its in-flight batch, in the
+    `pending_submission` file that survives a process restart
+    (`crates/temps-cloud-client/src/link.rs`). `Spool::clear` exists and is
+    wired to link-wide telemetry *revocation*, but there is no per-project
+    equivalent — so "I turned it off" today would still let queued spans ship
+    minutes later, and a restart does not stop them either. Phase B's write path
+    must, for the affected project: drop or re-project its buffered spool
+    records, and drop or re-project the persisted `pending_submission` if it
+    contains any of them. Re-projection (downgrading the buffered records to the
+    new fidelity) is preferable to dropping, since the metering/liveness signal
+    is not the part being retracted — but dropping is acceptable and shipping
+    them unchanged is not. Note this is bounded mitigation, not retraction:
+    anything already acknowledged by Cloud is subject to the deletion path in
+    Open Question 1, which is the only mechanism that can actually take data
+    back.
 
 ---
 
@@ -850,6 +887,11 @@ an error-tracking refactor.
 - `temps-cli` (Rust subcommand) — `temps backfill cloud-telemetry`, modelled on
   `crates/temps-analytics-events/src/services/ch_backfill.rs`. Cursor-based,
   resumable, `--dry-run` reporting rows and estimated metered bytes.
+  Audit-logged at start and at the terminal state
+  (`CLOUD_TELEMETRY_BACKFILL_STARTED` / `..._FINISHED`): the run is a paid,
+  one-way write, and the per-project progress row is `UNIQUE (project_id)`, so
+  without accumulating audit entries a second run erases the only record that
+  the first one happened.
 
 **Migration:** yes (two additive columns, both defaulted).
 **Breaking changes:** no. Every protocol addition is `#[serde(default)]`; default
@@ -913,6 +955,12 @@ built in the completed spike, or to a thin shared location both `temps-otel` and
 - A `Metered` project returns 409 with a `setup_path`, not 503 and not empty
   success.
 - A straddling window is clamped and reports `window_clamped_at`.
+- Lowering a project's fidelity through the write path is visible to the *next*
+  projection, with no TTL delay (Open Question 9 — the handler calls
+  `CloudPolicyCache::invalidate`).
+- Lowering a project's fidelity, or removing an allowlist key, leaves no
+  already-buffered `Queryable` record for that project in either the in-memory
+  spool or the persisted `pending_submission` (Open Question 10).
 
 **Migration:** none.
 **Breaking changes:** none (additive response field, additive query param).

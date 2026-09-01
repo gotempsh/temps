@@ -213,6 +213,9 @@ mod m20260828_000002_add_alarms_silenced_until;
 mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
 mod m20260830_000001_add_external_service_creator;
 mod m20260830_000001_add_managed_by_cloud_to_s3_sources;
+mod m20260901_000001_add_cloud_telemetry_fidelity;
+mod m20260901_000002_create_cloud_telemetry_backfills;
+mod m20260901_000003_constrain_cloud_telemetry_fidelity;
 
 pub struct Migrator;
 
@@ -460,6 +463,9 @@ impl MigratorTrait for Migrator {
             Box::new(m20260829_000001_allow_duplicate_ready_snapshot_digests::Migration),
             Box::new(m20260830_000001_add_external_service_creator::Migration),
             Box::new(m20260830_000001_add_managed_by_cloud_to_s3_sources::Migration),
+            Box::new(m20260901_000001_add_cloud_telemetry_fidelity::Migration),
+            Box::new(m20260901_000002_create_cloud_telemetry_backfills::Migration),
+            Box::new(m20260901_000003_constrain_cloud_telemetry_fidelity::Migration),
         ]
     }
 }

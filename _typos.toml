@@ -38,6 +38,12 @@ erly = "erly"
 # (crates/temps-proxy/src/proxy.rs `extract_traceparent_trace_id` tests).
 # Hex string contains "ba" which the spell-checker mistakes for "by"/"be".
 "00f067aa0ba902b7" = "00f067aa0ba902b7"
+# Synthetic parent-span-id fixture in the ADR-040 fidelity tests
+# (crates/temps-otel/src/services/otel_service.rs, crates/temps-cloud-protocol/src/messages.rs) —
+# one hex digit off the W3C example above, deliberately, so a span's own id
+# and its parent's id are never byte-identical in the assertions. Same "ba"
+# false positive.
+"00f067aa0ba902b6" = "00f067aa0ba902b6"
 "deadbeef" = "deadbeef"
 # git-cliff nightly-tag changelog entry (CHANGELOG.md) — the short commit
 # hash "ba96c0f7" isolates to "ba", mistaken for "by"/"be".

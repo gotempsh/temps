@@ -110,7 +110,28 @@ impl std::fmt::Debug for EnrollResponse {
 ///
 /// Deliberately flat and self-describing: the cloud must be able to accept a
 /// batch from an instance several versions behind without a translation table.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// # Two fidelity tiers on one struct (ADR-040 §1)
+///
+/// An instance decides, per project, how much of a span may leave it:
+///
+/// - **`Metered`** (the default, and what every instance shipped before
+///   ADR-040): pseudonymised `trace_id`/`span_id`, the constant `name`
+///   `"span"`, no attributes. Enough to meter and to prove liveness, and
+///   nothing else.
+/// - **`Queryable`** (opt-in, per project): the real span name, real trace and
+///   span IDs, and the fields below that make a span renderable in a console.
+///
+/// Every field added for `Queryable` is `#[serde(default)]` **and** skipped on
+/// serialization when empty. Both halves matter:
+///
+/// - `serde(default)` keeps a *newer gateway* able to read an *older
+///   instance's* batch, which is the crate's stated compatibility rule.
+/// - `skip_serializing_if` keeps a `Metered` record's bytes **identical** to
+///   what instances shipped before these fields existed, so raising the
+///   protocol version is not required and an older gateway sees no new keys.
+///   `temps-otel` has a test pinning that byte-for-byte equivalence.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpanRecord {
     pub trace_id: String,
     pub span_id: String,
@@ -123,6 +144,47 @@ pub struct SpanRecord {
     pub duration_ms: f64,
     #[serde(default)]
     pub attributes: std::collections::BTreeMap<String, String>,
+
+    // ── Queryable-fidelity fields (ADR-040 §1) ──────────────────────────
+    //
+    // Absent at `Metered` fidelity. Never populated unless the owning project
+    // opted in.
+    /// Pseudonymous, stable per-link scoping key for the owning project —
+    /// `pseudonymize_telemetry_id("project", project_id)`.
+    ///
+    /// A stable key the cloud can group and scope by without learning the
+    /// project's **name**, and which no third party observing the payload can
+    /// correlate back to a local project. It is deliberately *not* claimed to
+    /// hide the project id from the cloud itself: the HMAC key is the
+    /// instance's own bearer token, which the cloud issued and receives on
+    /// every request, and the pseudonymised input is a small integer — so the
+    /// key holder can enumerate `HMAC(token, "project\0" || i)` and invert
+    /// every `project_ref` in the tenant. (The trace and span pseudonyms are
+    /// different: their inputs are 128-bit random values, which are not
+    /// enumerable.)
+    ///
+    /// Empty at `Metered` fidelity, where nothing is queryable and so nothing
+    /// needs scoping.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub project_ref: String,
+    /// OTel `service.name` of the emitting service. A traces view the user
+    /// cannot filter by service is not a traces view.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+    /// OTel span kind (`SERVER`, `CLIENT`, …). Low cardinality, enum-like.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub span_kind: Option<String>,
+    /// OTel status: `OK` / `ERROR` / `UNSET`. Required for error counts and
+    /// the error filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_code: Option<String>,
+    /// Parent span id, required to render a trace as a tree rather than a
+    /// flat list. Real (not pseudonymised) whenever `span_id` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_span_id: Option<String>,
+    /// OTel `deployment.environment` of the emitting service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
 }
 
 /// A batch posted to the ingest endpoint.
@@ -703,6 +765,75 @@ mod tests {
         }"#;
         let span: SpanRecord = serde_json::from_str(json).unwrap();
         assert!(span.attributes.is_empty());
+    }
+
+    #[test]
+    fn queryable_fidelity_fields_default_when_absent() {
+        // ADR-040 §1: a gateway several versions ahead must still be able to
+        // read a batch from an instance that predates the fidelity tiers.
+        let json = r#"{
+            "trace_id":"t","span_id":"s","name":"span",
+            "ts_millis":1700000000000,"duration_ms":1.5
+        }"#;
+        let span: SpanRecord = serde_json::from_str(json).expect("legacy record must parse");
+        assert_eq!(span.project_ref, "");
+        assert_eq!(span.service_name, None);
+        assert_eq!(span.span_kind, None);
+        assert_eq!(span.status_code, None);
+        assert_eq!(span.parent_span_id, None);
+        assert_eq!(span.environment, None);
+    }
+
+    #[test]
+    fn a_metered_record_serializes_without_any_queryable_keys() {
+        // The hard compatibility invariant: at `Metered` fidelity the bytes on
+        // the wire are exactly what instances shipped before ADR-040, so no
+        // protocol version bump is needed and an older gateway sees no new
+        // keys. `temps-otel` pins the same property against its real
+        // projection; this pins it at the protocol layer.
+        let metered = SpanRecord {
+            trace_id: "a".repeat(64),
+            span_id: "b".repeat(64),
+            name: "span".into(),
+            ts_millis: 1_700_000_000_000,
+            duration_ms: 1.5,
+            attributes: Default::default(),
+            ..Default::default()
+        };
+
+        let json = serde_json::to_string(&metered).expect("record must serialize");
+        assert_eq!(
+            json,
+            format!(
+                r#"{{"trace_id":"{}","span_id":"{}","name":"span","ts_millis":1700000000000,"duration_ms":1.5,"attributes":{{}}}}"#,
+                "a".repeat(64),
+                "b".repeat(64)
+            )
+        );
+    }
+
+    #[test]
+    fn a_queryable_record_round_trips_every_added_field() {
+        let queryable = SpanRecord {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+            span_id: "00f067aa0ba902b7".into(),
+            name: "GET /orders".into(),
+            ts_millis: 1_700_000_000_000,
+            duration_ms: 12.5,
+            attributes: [("http.route".to_string(), "/orders".to_string())]
+                .into_iter()
+                .collect(),
+            project_ref: "c".repeat(64),
+            service_name: Some("checkout".into()),
+            span_kind: Some("SERVER".into()),
+            status_code: Some("ERROR".into()),
+            parent_span_id: Some("00f067aa0ba902b6".into()),
+            environment: Some("production".into()),
+        };
+
+        let encoded = serde_json::to_string(&queryable).expect("record must serialize");
+        let decoded: SpanRecord = serde_json::from_str(&encoded).expect("record must parse");
+        assert_eq!(decoded, queryable);
     }
 
     #[test]
