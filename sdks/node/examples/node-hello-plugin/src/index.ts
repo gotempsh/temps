@@ -38,8 +38,7 @@ const plugin: TempsPlugin = {
       .displayName("Hello TypeScript")
       .description("Example TypeScript plugin compiled to a standalone executable")
       .requiresDb(false)
-      .addNav("Hello", "hand", "/hello")
-      .addNav("Projects", "folder", "/projects")
+      .addNav("Hello TypeScript", "puzzle", "/hello")
       .event("deployment.succeeded")
       .event("deployment.failed")
       .build();

@@ -452,7 +452,12 @@ async function main(): Promise<void> {
   assertEqual(manifestMsg.manifest.version, "0.1.0", "Plugin version");
   assertEqual(manifestMsg.manifest.display_name, "Hello TypeScript", "Display name");
   assert(Array.isArray(manifestMsg.manifest.nav), "Nav entries is array");
-  assert(manifestMsg.manifest.nav.length >= 2, "Has at least 2 nav entries");
+  assertEqual(manifestMsg.manifest.nav.length, 1, "Has one plugin navigation entry");
+  assertEqual(
+    manifestMsg.manifest.nav[0]?.label,
+    "Hello TypeScript",
+    "Navigation names the plugin rather than an internal view",
+  );
   assertEqual(manifestMsg.manifest.requires_db, false, "Does not require DB");
   assertEqual(manifestMsg.manifest.requires_host_data_access, false, "Does not require host data");
   assertEqual(manifestMsg.manifest.health_path, "/health", "Health path");

@@ -30,8 +30,9 @@ chmod +x ~/.temps/plugins/temps-hello-typescript-plugin
 ```
 
 Open **Settings → Plugins** and select **Reload Plugins**, or restart Temps.
-The plugin contributes Hello and Projects navigation entries and mounts its API
-at `/api/x/hello-typescript`.
+The plugin contributes one **Hello TypeScript** navigation entry and mounts its
+API at `/api/x/hello-typescript`. Projects are displayed inside that plugin
+surface instead of appearing as a second, duplicate sidebar destination.
 
 ## Start your own plugin
 
