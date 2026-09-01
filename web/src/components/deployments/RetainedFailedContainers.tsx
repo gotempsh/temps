@@ -11,7 +11,7 @@ import {
   currentRetainedContainers,
   retainedContainerLogsPath,
   toggleRetainedContainerLogs,
-} from '@/lib/retained-compose-containers'
+} from '@/lib/retained-failed-containers'
 import { useQuery } from '@tanstack/react-query'
 import {
   AlertTriangle,
@@ -23,7 +23,7 @@ import {
 import { useState } from 'react'
 import { Link } from 'react-router'
 
-interface RetainedComposeContainersProps {
+interface RetainedFailedContainersProps {
   projectId: number
   projectSlug: string
   environmentId: number
@@ -32,17 +32,17 @@ interface RetainedComposeContainersProps {
 }
 
 /**
- * Failed Compose candidates stay alive until the next deploy/delete so their
+ * Failed deployment candidates stay alive until the next deploy/delete so their
  * runtime logs remain inspectable. They are deliberately never routed: only
  * successful finalization promotes deployment routes.
  */
-export function RetainedComposeContainers({
+export function RetainedFailedContainers({
   projectId,
   projectSlug,
   environmentId,
   deploymentId,
   deploymentStatus,
-}: RetainedComposeContainersProps) {
+}: RetainedFailedContainersProps) {
   const [expandedContainerId, setExpandedContainerId] = useState<string | null>(
     null
   )
@@ -82,7 +82,7 @@ export function RetainedComposeContainers({
         <div className="mb-2 flex items-center gap-2">
           <AlertTriangle className="h-4 w-4 text-amber-600 dark:text-amber-400" />
           <h3 className="text-sm font-semibold">
-            Failed Compose containers retained for debugging
+            Failed deployment containers retained for debugging
           </h3>
           <Badge variant="outline" className="ml-1">
             {retained.length}
@@ -90,8 +90,8 @@ export function RetainedComposeContainers({
         </div>
         <p className="mb-4 text-xs text-muted-foreground">
           These containers are not receiving public traffic. Inspect their live
-          logs before redeploying; the next deployment or project deletion
-          removes them automatically.
+          logs before redeploying; the next successful deployment or project
+          deletion removes them automatically.
         </p>
 
         <div className="flex flex-col gap-2">
@@ -112,7 +112,7 @@ export function RetainedComposeContainers({
                     </div>
                     {container.service_name && (
                       <div className="text-xs text-muted-foreground">
-                        Compose service: {container.service_name}
+                        Service: {container.service_name}
                       </div>
                     )}
                   </div>

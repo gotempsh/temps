@@ -18,7 +18,7 @@ import {
 import { DeploymentContainerLogs } from '@/components/deployments/DeploymentContainerLogs'
 import { DeploymentStages } from '@/components/deployments/DeploymentStages'
 import { RedeploymentModal } from '@/components/deployments/RedeploymentModal'
-import { RetainedComposeContainers } from '@/components/deployments/RetainedComposeContainers'
+import { RetainedFailedContainers } from '@/components/deployments/RetainedFailedContainers'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -1324,7 +1324,7 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
         {/* Failed Compose candidates are the primary debugging surface, so
             keep their live logs beside the concise failure summary instead
             of below the complete deployment pipeline. */}
-        <RetainedComposeContainers
+        <RetainedFailedContainers
           projectId={deployment.project_id}
           projectSlug={project.slug}
           environmentId={deployment.environment_id}

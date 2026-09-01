@@ -5,17 +5,34 @@ import type { Command } from 'commander'
 import { requireAuth, config, credentials } from '../config/store.js'
 import { setupClient, client, normalizeApiUrl } from '../lib/api-client.js'
 import { resolveProjectSlug } from '../config/resolve-project.js'
-import { getProjectBySlug, listContainers, getEnvironments } from '../api/sdk.gen.js'
+import { getProjectBySlug, listContainerHistory, listContainers, getEnvironments } from '../api/sdk.gen.js'
 import { colors, info, warning, newline } from '../ui/output.js'
 import { startSpinner, succeedSpinner, failSpinner } from '../ui/spinner.js'
 
-interface RuntimeLogsOptions {
+export interface RuntimeLogsOptions {
   project?: string
   environment: string
   container?: string
+  deployment?: string
   tail: string
   timestamps?: boolean
   follow?: boolean
+}
+
+export interface RuntimeLogContainer {
+  container_id: string
+  container_name: string
+}
+
+export function selectRuntimeLogContainer(
+  containers: RuntimeLogContainer[],
+  selector?: string
+): RuntimeLogContainer | undefined {
+  if (!selector) return containers[0]
+  return containers.find(container =>
+    container.container_id.startsWith(selector) ||
+    container.container_name.includes(selector)
+  )
 }
 
 export function registerRuntimeLogsCommand(program: Command): void {
@@ -26,13 +43,14 @@ export function registerRuntimeLogsCommand(program: Command): void {
     .option('-p, --project <project>', 'Project slug or ID')
     .option('-e, --environment <env>', 'Environment name', 'production')
     .option('-c, --container <id>', 'Container ID (partial match supported)')
+    .option('-d, --deployment <id>', 'Deployment ID, including failed retained containers')
     .option('-n, --tail <lines>', 'Number of lines to tail', '1000')
     .option('-t, --timestamps', 'Show timestamps')
     .option('-f, --follow', 'Follow log output (stream in real-time)')
     .action(runtimeLogs)
 }
 
-async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
+export async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
   const apiKey = await requireAuth()
   await setupClient()
 
@@ -84,45 +102,68 @@ async function runtimeLogs(options: RuntimeLogsOptions): Promise<void> {
   }
   succeedSpinner(`Found environment: ${environment.name}`)
 
-  // Get containers
+  // Current containers come from the runtime endpoint. A deployment-scoped
+  // lookup uses history because failed candidates are intentionally not made
+  // current/public, but remain live and ownership-scoped for diagnostics.
   startSpinner('Finding containers...')
-  const { data: containersResponse, error: containersError } = await listContainers({
-    client,
-    path: {
-      project_id: projectData.id,
-      environment_id: environment.id,
-    },
-  })
-
-  if (containersError || !containersResponse?.containers || containersResponse.containers.length === 0) {
-    failSpinner('No running containers found')
-    return
+  let containers: Array<{ container_id: string; container_name: string }> = []
+  if (options.deployment) {
+    const deploymentId = Number.parseInt(options.deployment, 10)
+    if (!Number.isInteger(deploymentId) || deploymentId <= 0) {
+      failSpinner(`Invalid deployment ID "${options.deployment}"`)
+      return
+    }
+    const { data, error } = await listContainerHistory({
+      client,
+      path: {
+        project_id: projectData.id,
+        environment_id: environment.id,
+      },
+      query: { deployment_id: deploymentId, limit: 100 },
+    })
+    if (error || !data) {
+      failSpinner(`Unable to fetch containers for deployment ${deploymentId}`)
+      return
+    }
+    containers = data.containers.filter(container => container.is_current)
+  } else {
+    const { data, error } = await listContainers({
+      client,
+      path: {
+        project_id: projectData.id,
+        environment_id: environment.id,
+      },
+    })
+    if (error || !data) {
+      failSpinner('Unable to fetch running containers')
+      return
+    }
+    containers = data.containers
   }
 
-  const containers = containersResponse.containers
+  if (containers.length === 0) {
+    failSpinner(
+      options.deployment
+        ? `No live retained containers found for deployment ${options.deployment}`
+        : 'No running containers found'
+    )
+    return
+  }
   succeedSpinner(`Found ${containers.length} container(s)`)
 
   // Select container
-  let selectedContainer = containers[0]
+  const selectedContainer = selectRuntimeLogContainer(containers, options.container)
   if (!selectedContainer) {
-    warning('No container available')
-    return
-  }
-
-  if (options.container) {
-    const match = containers.find(c =>
-      c.container_id.startsWith(options.container!) ||
-      c.container_name?.includes(options.container!)
-    )
-    if (!match) {
+    if (options.container) {
       warning(`Container "${options.container}" not found`)
       info('Available containers:')
       for (const c of containers) {
         console.log(`  - ${c.container_id.substring(0, 12)} (${c.container_name || 'unnamed'})`)
       }
-      return
+    } else {
+      warning('No container available')
     }
-    selectedContainer = match
+    return
   }
 
   newline()

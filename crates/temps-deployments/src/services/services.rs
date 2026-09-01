@@ -2414,7 +2414,8 @@ impl DeploymentService {
                 .port(exposed_port)
                 .configured_port(configured_port)
                 .log_id(deploy_log_id.clone())
-                .log_service(self.log_service.clone());
+                .log_service(self.log_service.clone())
+                .failed_container_retention(self.db.clone(), rollback_deployment_id);
 
             // Apply container log rotation settings from config
             if let Ok(settings) = self.config_service.get_settings().await {
@@ -3081,7 +3082,8 @@ impl DeploymentService {
                 .port(exposed_port)
                 .configured_port(configured_port)
                 .log_id(deploy_log_id.clone())
-                .log_service(self.log_service.clone());
+                .log_service(self.log_service.clone())
+                .failed_container_retention(self.db.clone(), promoted_id);
 
             // Apply container log rotation settings from config
             if let Ok(settings) = self.config_service.get_settings().await {

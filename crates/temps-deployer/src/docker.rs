@@ -2633,7 +2633,12 @@ impl ContainerDeployer for DockerRuntime {
             let container_port_key =
                 format!("{}/{}", port_mapping.container_port, port_mapping.protocol);
             let host_port_binding = bollard::models::PortBinding {
-                host_ip: Some(self.host_bind_address.clone()),
+                host_ip: Some(
+                    port_mapping
+                        .host_ip
+                        .clone()
+                        .unwrap_or_else(|| self.host_bind_address.clone()),
+                ),
                 // When host_port is 0, let Docker pick an available port
                 host_port: if port_mapping.host_port == 0 {
                     None
@@ -3036,6 +3041,7 @@ impl ContainerDeployer for DockerRuntime {
                                 host_port,
                                 container_port,
                                 protocol,
+                                host_ip: binding.host_ip.clone(),
                             });
                         }
                     }
@@ -5321,6 +5327,7 @@ CMD ["cat", "/hello.txt"]
             host_port: 8080,
             container_port: 80,
             protocol: Protocol::Tcp,
+            host_ip: None,
         };
 
         assert_eq!(port_mapping.host_port, 8080);

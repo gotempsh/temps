@@ -7,17 +7,21 @@
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use sea_orm::{sea_query::Expr, ColumnTrait, EntityTrait, QueryFilter, Set, TransactionTrait};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use temps_core::{
     JobResult, WorkflowCancellationProvider, WorkflowContext, WorkflowError, WorkflowTask,
 };
+use temps_database::DbConnection;
 use temps_deployer::{
     ContainerDeployer, ContainerLogConfig, ContainerStatus as DeployerContainerStatus,
     DeployRequest, ImageBuilder, PortMapping, Protocol, ResourceLimits, RestartPolicy,
 };
+use temps_entities::deployment_containers;
 use temps_logs::{LogLevel, LogService};
 use tokio::time::{sleep, Duration};
 
@@ -253,6 +257,39 @@ fn cross_node_unreachable_error(
     })
 }
 
+fn private_remote_bind_address(address: &str) -> Result<String, WorkflowError> {
+    let ip = address.parse::<std::net::IpAddr>().map_err(|error| {
+        WorkflowError::JobExecutionFailed(format!(
+            "Worker private address '{address}' is not a valid IP address: {error}"
+        ))
+    })?;
+    let is_private = match ip {
+        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
+        std::net::IpAddr::V6(ip) => {
+            ip.is_unique_local() || ip.is_loopback() || ip.is_unicast_link_local()
+        }
+    };
+    if !is_private {
+        return Err(WorkflowError::JobExecutionFailed(format!(
+            "Worker address '{address}' is public; refusing to publish an app container outside the Temps proxy"
+        )));
+    }
+    Ok(address.to_string())
+}
+
+fn confirms_private_port_binding(
+    ports: &[PortMapping],
+    container_port: u16,
+    host_port: u16,
+    expected_host_ip: &str,
+) -> bool {
+    ports.iter().any(|port| {
+        port.container_port == container_port
+            && port.host_port == host_port
+            && port.host_ip.as_deref() == Some(expected_host_ip)
+    })
+}
+
 /// Configuration for deployment job execution
 /// This is built from the entity's DeploymentConfig + runtime values
 #[derive(Debug, Clone)]
@@ -385,6 +422,17 @@ pub struct DeployImageJob {
     container_ids: Arc<Mutex<Vec<String>>>,
     /// Per-replica deployers: maps container_id → deployer for cleanup on correct node
     replica_deployers: Arc<Mutex<HashMap<String, Arc<dyn ContainerDeployer>>>>,
+    /// Candidate metadata is persisted on a failed readiness check so the
+    /// authenticated container-log endpoints can still resolve the container.
+    failed_candidates: Arc<Mutex<Vec<FailedContainerCandidate>>>,
+    /// Set only after retained-container rows commit successfully. Workflow
+    /// cleanup must leave those registered candidates alive for inspection.
+    retained_failure: Arc<AtomicBool>,
+    /// A remote agent that cannot prove private-only port binding must never
+    /// be retained, even if another replica was otherwise safe to keep.
+    retention_forbidden: Arc<AtomicBool>,
+    failed_container_db: Option<Arc<DbConnection>>,
+    deployment_id: Option<i32>,
     /// Background task handle for log streaming (aborted on cleanup)
     log_stream_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
     /// Optional: directly provided image tag (for external/pre-built images, bypasses BuildImageJob lookup)
@@ -397,6 +445,16 @@ pub struct DeployImageJob {
     config_service: Option<Arc<temps_config::ConfigService>>,
     /// Local image builder — used to `save_image()` before transferring to remote nodes
     image_builder: Option<Arc<dyn temps_deployer::ImageBuilder>>,
+}
+
+#[derive(Debug, Clone)]
+struct FailedContainerCandidate {
+    container_id: String,
+    container_name: String,
+    container_port: u16,
+    host_port: u16,
+    image_name: String,
+    node_id: Option<i32>,
 }
 
 impl std::fmt::Debug for DeployImageJob {
@@ -430,6 +488,11 @@ impl DeployImageJob {
             log_service: None,
             container_ids: Arc::new(Mutex::new(Vec::new())),
             replica_deployers: Arc::new(Mutex::new(HashMap::new())),
+            failed_candidates: Arc::new(Mutex::new(Vec::new())),
+            retained_failure: Arc::new(AtomicBool::new(false)),
+            retention_forbidden: Arc::new(AtomicBool::new(false)),
+            failed_container_db: None,
+            deployment_id: None,
             log_stream_task: Arc::new(Mutex::new(None)),
             external_image_tag: None,
             log_config: None,
@@ -437,6 +500,16 @@ impl DeployImageJob {
             config_service: None,
             image_builder: None,
         }
+    }
+
+    fn with_failed_container_retention(
+        mut self,
+        db: Arc<DbConnection>,
+        deployment_id: i32,
+    ) -> Self {
+        self.failed_container_db = Some(db);
+        self.deployment_id = Some(deployment_id);
+        self
     }
 
     pub fn with_log_config(mut self, log_config: ContainerLogConfig) -> Self {
@@ -979,9 +1052,10 @@ impl DeployImageJob {
         &self.target
     }
 
-    /// Remove all containers if they exist (called on timeout/failure/cancellation)
-    async fn cleanup_container(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
-        // First, abort the background log streaming task if running
+    async fn stop_background_log_stream(
+        &self,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
         let should_log = {
             let mut task_handle = self.log_stream_task.lock().unwrap();
             if let Some(handle) = task_handle.take() {
@@ -997,12 +1071,20 @@ impl DeployImageJob {
                 .await?;
         }
 
+        Ok(())
+    }
+
+    /// Remove all containers if they exist (called on timeout/failure/cancellation)
+    async fn cleanup_container(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
+        self.stop_background_log_stream(context).await?;
+
         // Then clean up all containers
         let container_ids = {
             let guard = self.container_ids.lock().unwrap();
             guard.clone()
         };
 
+        let mut cleanup_errors = Vec::new();
         if !container_ids.is_empty() {
             self.log(
                 context,
@@ -1023,24 +1105,163 @@ impl DeployImageJob {
                         .unwrap_or_else(|| self.container_deployer.clone())
                 };
 
-                if let Err(e) = deployer.remove_container(container_id).await {
-                    self.log(
-                        context,
-                        format!(
-                            "⚠️  Warning: Failed to remove container {}: {}",
-                            container_id, e
-                        ),
-                    )
-                    .await?;
-                } else {
-                    self.log(
-                        context,
-                        format!("✅ Container {} removed successfully", container_id),
-                    )
-                    .await?;
+                match deployer.remove_container(container_id).await {
+                    Ok(()) | Err(temps_deployer::DeployerError::ContainerNotFound(_)) => {
+                        self.log(context, format!("✅ Container {} is absent", container_id))
+                            .await?;
+                    }
+                    Err(error) => {
+                        cleanup_errors.push(format!("container {container_id}: {error}"));
+                        self.log(
+                            context,
+                            format!(
+                                "⚠️  Warning: Failed to remove container {}: {}",
+                                container_id, error
+                            ),
+                        )
+                        .await?;
+                    }
                 }
             }
         }
+
+        if !cleanup_errors.is_empty() {
+            return Err(WorkflowError::JobExecutionFailed(format!(
+                "Failed to remove {} deployment container(s): {}",
+                cleanup_errors.len(),
+                cleanup_errors.join("; ")
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Persist failed app candidates without promoting routes. This mirrors
+    /// failed Compose retention: only a successful MarkDeploymentCompleteJob
+    /// makes a container public, while the ordinary authenticated log endpoint
+    /// can resolve these rows for debugging.
+    async fn retain_failed_containers(
+        &self,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        if self.retention_forbidden.load(Ordering::Acquire) {
+            return self.cleanup_container(context).await;
+        }
+        let candidates = self.failed_candidates.lock().unwrap().clone();
+        if candidates.is_empty() {
+            return self.cleanup_container(context).await;
+        }
+
+        let (Some(db), Some(deployment_id)) =
+            (self.failed_container_db.as_ref(), self.deployment_id)
+        else {
+            // Jobs created by isolated tests or legacy callers do not have a
+            // durable ownership record, so keeping their containers would leak
+            // an inaccessible Docker resource.
+            return self.cleanup_container(context).await;
+        };
+
+        self.stop_background_log_stream(context).await?;
+        let transaction = db.begin().await.map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to begin retained app-container registration for deployment {deployment_id}: {error}"
+            ))
+        })?;
+        let now = chrono::Utc::now();
+
+        for candidate in &candidates {
+            deployment_containers::Entity::insert(deployment_containers::ActiveModel {
+                deployment_id: Set(deployment_id),
+                container_id: Set(candidate.container_id.clone()),
+                container_name: Set(candidate.container_name.clone()),
+                container_port: Set(i32::from(candidate.container_port)),
+                host_port: Set(Some(i32::from(candidate.host_port))),
+                image_name: Set(Some(candidate.image_name.clone())),
+                status: Set(Some("retained:failed-readiness".to_string())),
+                service_name: Set(Some(self.config.service_name.clone())),
+                created_at: Set(now),
+                deployed_at: Set(now),
+                ready_at: Set(None),
+                deleted_at: Set(None),
+                node_id: Set(candidate.node_id),
+                ..Default::default()
+            })
+            .exec_without_returning(&transaction)
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to register retained app container '{}' for deployment {deployment_id}: {error}",
+                    candidate.container_id
+                ))
+            })?;
+        }
+
+        transaction.commit().await.map_err(|error| {
+            WorkflowError::JobExecutionFailed(format!(
+                "Failed to commit {} retained app container record(s) for deployment {deployment_id}: {error}",
+                candidates.len()
+            ))
+        })?;
+        self.retained_failure.store(true, Ordering::Release);
+        // The ownership row is already committed. A transient stage-log write
+        // failure must not make the workflow tear down the now-discoverable
+        // candidate while leaving its database row live.
+        let _ = self
+            .log(
+            context,
+            format!(
+                "Retained {} failed app container(s) for authenticated log inspection. They are not routed publicly and the next successful deployment removes them.",
+                candidates.len()
+            ),
+        )
+        .await;
+        Ok(())
+    }
+
+    /// Cancellation is an explicit request to stop, not a failed deployment
+    /// to diagnose. Remove any candidate that raced with cancellation and
+    /// retire a registration that may already have committed.
+    async fn discard_failed_candidates(
+        &self,
+        context: &WorkflowContext,
+    ) -> Result<(), WorkflowError> {
+        self.retained_failure.store(false, Ordering::Release);
+        self.cleanup_container(context).await?;
+
+        let candidate_ids = self
+            .failed_candidates
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|candidate| candidate.container_id.clone())
+            .collect::<Vec<_>>();
+        let (Some(db), Some(deployment_id)) =
+            (self.failed_container_db.as_ref(), self.deployment_id)
+        else {
+            return Ok(());
+        };
+        if candidate_ids.is_empty() {
+            return Ok(());
+        }
+
+        deployment_containers::Entity::update_many()
+            .col_expr(
+                deployment_containers::Column::DeletedAt,
+                Expr::value(Some(chrono::Utc::now())),
+            )
+            .col_expr(
+                deployment_containers::Column::Status,
+                Expr::value(Some("cancelled".to_string())),
+            )
+            .filter(deployment_containers::Column::DeploymentId.eq(deployment_id))
+            .filter(deployment_containers::Column::ContainerId.is_in(candidate_ids))
+            .exec(db.as_ref())
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Cancelled deployment {deployment_id} removed its app containers but failed to retire their diagnostic rows: {error}"
+                ))
+            })?;
 
         Ok(())
     }
@@ -1355,11 +1576,6 @@ impl DeployImageJob {
                 .await
             {
                 Ok((container_id, host_port, container_port)) => {
-                    // Track the deployer for this container (used for cleanup)
-                    {
-                        let mut deployers = self.replica_deployers.lock().unwrap();
-                        deployers.insert(container_id.clone(), deployer);
-                    }
                     all_container_ids.push(container_id);
                     all_host_ports.push(host_port);
                     all_node_ids.push(assignment.node_id());
@@ -1374,17 +1590,14 @@ impl DeployImageJob {
                     )
                     .await?;
 
-                    // Clean up all successfully deployed containers before failing
                     self.log(
                         context,
                         format!(
-                            "🧹 Cleaning up {} successfully deployed container(s) due to failure",
+                            "Retaining {} created container(s) while the failed deployment is recorded",
                             all_container_ids.len()
                         ),
                     )
                     .await?;
-
-                    self.cleanup_container(context).await?;
 
                     deployment_error = Some(e);
                     break;
@@ -1535,10 +1748,15 @@ impl DeployImageJob {
         )
         .await?;
 
+        let host_ip = assignment
+            .private_address()
+            .map(private_remote_bind_address)
+            .transpose()?;
         let port_mappings = vec![PortMapping {
             host_port,
             container_port,
             protocol: Protocol::Tcp,
+            host_ip,
         }];
 
         // Convert k8s-style strings ("1000m", "512Mi", "2", "1Gi") into the
@@ -1681,6 +1899,48 @@ impl DeployImageJob {
             let mut container_ids = self.container_ids.lock().unwrap();
             container_ids.push(deploy_result.container_id.clone());
         }
+        {
+            let mut deployers = self.replica_deployers.lock().unwrap();
+            deployers.insert(deploy_result.container_id.clone(), deployer.clone());
+        }
+
+        // A rolling-upgrade cluster may still have an older agent that ignores
+        // PortMapping.host_ip. Inspect what Docker actually published before
+        // this container becomes eligible for retention; fail closed if the
+        // worker cannot prove a private-only bind.
+        if let Some(expected_host_ip) = assignment.private_address() {
+            let private_host_ip = private_remote_bind_address(expected_host_ip)?;
+            let binding_is_private = deployer
+                .get_container_info(&deploy_result.container_id)
+                .await
+                .map(|info| {
+                    confirms_private_port_binding(
+                        &info.ports,
+                        deploy_result.container_port,
+                        deploy_result.host_port,
+                        &private_host_ip,
+                    )
+                })
+                .unwrap_or(false);
+            if !binding_is_private {
+                self.retention_forbidden.store(true, Ordering::Release);
+                return Err(WorkflowError::JobExecutionFailed(format!(
+                    "Worker did not confirm that container {} is bound only to private address {}; refusing to retain or route it. Upgrade the Temps agent on this node.",
+                    deploy_result.container_id, private_host_ip
+                )));
+            }
+        }
+        {
+            let mut candidates = self.failed_candidates.lock().unwrap();
+            candidates.push(FailedContainerCandidate {
+                container_id: deploy_result.container_id.clone(),
+                container_name: deploy_result.container_name.clone(),
+                container_port: deploy_result.container_port,
+                host_port: deploy_result.host_port,
+                image_name: image_tag.to_string(),
+                node_id: assignment.node_id(),
+            });
+        }
 
         self.log(
             context,
@@ -1740,8 +2000,6 @@ impl DeployImageJob {
                 DeployerContainerStatus::Exited | DeployerContainerStatus::Dead => {
                     self.log(context, "❌ Container failed to start".to_string())
                         .await?;
-                    // Clean up failed container
-                    self.cleanup_container(context).await?;
                     return Err(WorkflowError::JobExecutionFailed(
                         "Container failed to start".to_string(),
                     ));
@@ -1750,8 +2008,6 @@ impl DeployImageJob {
                     if start_time.elapsed() > max_wait_time {
                         self.log(context, "⏱️  Container start timeout".to_string())
                             .await?;
-                        // Clean up timed-out container
-                        self.cleanup_container(context).await?;
                         return Err(WorkflowError::JobExecutionFailed(
                             "Container timeout - took too long to start".to_string(),
                         ));
@@ -1936,8 +2192,6 @@ impl DeployImageJob {
                         "Application readiness timeout - connectivity checks failed".to_string(),
                     )
                     .await?;
-                    // Clean up container on connectivity timeout
-                    self.cleanup_container(context).await?;
                     return Err(WorkflowError::JobExecutionFailed(
                         "Application timeout - connectivity checks did not pass in time"
                             .to_string(),
@@ -1953,8 +2207,6 @@ impl DeployImageJob {
                                 .to_string(),
                         )
                         .await?;
-                        // Clean up container on health check failure
-                        self.cleanup_container(context).await?;
                         return Err(WorkflowError::JobExecutionFailed(
                             "Application health check failed - server returned error status codes for 60 seconds".to_string(),
                         ));
@@ -1975,8 +2227,6 @@ impl DeployImageJob {
                                     .to_string(),
                             )
                             .await?;
-                            // Clean up crashed container
-                            self.cleanup_container(context).await?;
                             return Err(WorkflowError::JobExecutionFailed(
                                 "Container crashed during startup - check container logs for details"
                                     .to_string(),
@@ -2211,9 +2461,27 @@ impl WorkflowTask for DeployImageJob {
         }
 
         // Deploy the image (logs written in real-time)
-        let deployment_output = self
+        let deployment_output = match self
             .deploy_image(&image_output, &context, health_override)
-            .await?;
+            .await
+        {
+            Ok(output) => output,
+            Err(deploy_error) => {
+                if let Err(retention_error) = self.retain_failed_containers(&context).await {
+                    // A container without a committed ownership row would be
+                    // unreachable through the authenticated API. Tear it down
+                    // rather than leaking an untracked runtime candidate.
+                    let cleanup_error = self.cleanup_container(&context).await.err();
+                    return Err(WorkflowError::JobExecutionFailed(format!(
+                        "{deploy_error}; additionally failed to retain candidate containers for log inspection: {retention_error}; cleanup: {}",
+                        cleanup_error
+                            .map(|error| error.to_string())
+                            .unwrap_or_else(|| "completed".to_string())
+                    )));
+                }
+                return Err(deploy_error);
+            }
+        };
 
         // Set typed job outputs
         context.set_output(&self.job_id, "status", &deployment_output.status)?;
@@ -2312,6 +2580,14 @@ impl WorkflowTask for DeployImageJob {
                 .await
                 .ok();
 
+                if let Err(error) = self.discard_failed_candidates(&context).await {
+                    tracing::error!(
+                        deployment_id = context.deployment_id,
+                        error = %error,
+                        "Failed to fully discard app containers after deployment cancellation"
+                    );
+                }
+
                 Err(WorkflowError::BuildCancelled)
             }
         }
@@ -2340,6 +2616,9 @@ impl WorkflowTask for DeployImageJob {
     }
 
     async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
+        if self.retained_failure.load(Ordering::Acquire) {
+            return self.stop_background_log_stream(context).await;
+        }
         // Use the stored container_id (set immediately after container creation)
         // This ensures cleanup works even if deployment fails before setting outputs
         self.cleanup_container(context).await
@@ -2360,6 +2639,8 @@ pub struct DeployImageJobBuilder {
     encryption_service: Option<Arc<temps_core::EncryptionService>>,
     config_service: Option<Arc<temps_config::ConfigService>>,
     image_builder: Option<Arc<dyn temps_deployer::ImageBuilder>>,
+    failed_container_db: Option<Arc<DbConnection>>,
+    deployment_id: Option<i32>,
 }
 
 impl DeployImageJobBuilder {
@@ -2377,6 +2658,8 @@ impl DeployImageJobBuilder {
             encryption_service: None,
             config_service: None,
             image_builder: None,
+            failed_container_db: None,
+            deployment_id: None,
         }
     }
 
@@ -2562,6 +2845,14 @@ impl DeployImageJobBuilder {
         self
     }
 
+    /// Enable durable retention of failed app candidates for authenticated
+    /// runtime-log inspection.
+    pub fn failed_container_retention(mut self, db: Arc<DbConnection>, deployment_id: i32) -> Self {
+        self.failed_container_db = Some(db);
+        self.deployment_id = Some(deployment_id);
+        self
+    }
+
     pub fn build(
         self,
         container_deployer: Arc<dyn ContainerDeployer>,
@@ -2601,6 +2892,9 @@ impl DeployImageJobBuilder {
         if let Some(image_builder) = self.image_builder {
             job = job.with_image_builder(image_builder);
         }
+        if let (Some(db), Some(deployment_id)) = (self.failed_container_db, self.deployment_id) {
+            job = job.with_failed_container_retention(db, deployment_id);
+        }
 
         Ok(job)
     }
@@ -2616,6 +2910,19 @@ impl Default for DeployImageJobBuilder {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+
+    struct TestLogWriter;
+
+    #[async_trait]
+    impl temps_core::LogWriter for TestLogWriter {
+        async fn write_log(&self, _message: String) -> Result<(), WorkflowError> {
+            Ok(())
+        }
+
+        fn stage_id(&self) -> i32 {
+            1
+        }
+    }
 
     fn build_output_with_tags(tags: &[(&str, &str)]) -> BuildImageOutput {
         BuildImageOutput {
@@ -2701,6 +3008,55 @@ mod tests {
         assert!(message.contains("2 linked service(s)"), "{message}");
         assert!(message.contains("orders-db"), "{message}");
         assert!(message.contains("cache"), "{message}");
+    }
+
+    #[test]
+    fn remote_app_ports_only_bind_private_interfaces() {
+        for address in ["10.0.0.8", "172.20.0.5", "192.168.1.10", "fd00::5"] {
+            assert_eq!(
+                private_remote_bind_address(address).expect("private address should be accepted"),
+                address
+            );
+        }
+
+        let public = private_remote_bind_address("203.0.113.10")
+            .expect_err("public worker address must not expose an app port");
+        assert!(public.to_string().contains("outside the Temps proxy"));
+        assert!(private_remote_bind_address("worker.example.com").is_err());
+
+        let expected = PortMapping {
+            host_port: 18080,
+            container_port: 3000,
+            protocol: Protocol::Tcp,
+            host_ip: Some("10.0.0.8".to_string()),
+        };
+        assert!(confirms_private_port_binding(
+            std::slice::from_ref(&expected),
+            3000,
+            18080,
+            "10.0.0.8"
+        ));
+
+        let legacy_agent = PortMapping {
+            host_ip: None,
+            ..expected.clone()
+        };
+        assert!(!confirms_private_port_binding(
+            &[legacy_agent],
+            3000,
+            18080,
+            "10.0.0.8"
+        ));
+        let public_binding = PortMapping {
+            host_ip: Some("0.0.0.0".to_string()),
+            ..expected
+        };
+        assert!(!confirms_private_port_binding(
+            &[public_binding],
+            3000,
+            18080,
+            "10.0.0.8"
+        ));
     }
 
     /// Single-arch build: every node gets the one tag, whatever it reports.
@@ -3276,6 +3632,9 @@ mod tests {
 
         let mut env_vars = HashMap::new();
         env_vars.insert("ENV".to_string(), "production".to_string());
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres).into_connection(),
+        );
 
         let job = DeployImageJobBuilder::new()
             .job_id("test_deploy".to_string())
@@ -3285,6 +3644,7 @@ mod tests {
             .namespace("production".to_string())
             .replicas(3)
             .environment_variables(env_vars)
+            .failed_container_retention(db, 42)
             .build(container_deployer)
             .unwrap();
 
@@ -3292,8 +3652,81 @@ mod tests {
         assert_eq!(job.build_job_id, "build_image");
         assert_eq!(job.config.service_name, "myapp");
         assert_eq!(job.config.namespace, "production");
+        assert_eq!(job.deployment_id, Some(42));
+        assert!(job.failed_container_db.is_some());
         assert_eq!(job.config.replicas, 3);
         assert_eq!(job.depends_on(), vec!["build_image".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn failed_app_container_is_registered_without_becoming_ready() {
+        let db = Arc::new(
+            sea_orm::MockDatabase::new(sea_orm::DatabaseBackend::Postgres)
+                .append_exec_results([sea_orm::MockExecResult {
+                    last_insert_id: 1,
+                    rows_affected: 1,
+                }])
+                .into_connection(),
+        );
+        let deployer: Arc<dyn ContainerDeployer> = Arc::new(TrackingMockContainerDeployer::new());
+        let job = DeployImageJobBuilder::new()
+            .job_id("deploy".to_string())
+            .build_job_id("build".to_string())
+            .target(DeploymentTarget::Docker {
+                registry_url: "local".to_string(),
+                network: None,
+            })
+            .service_name("checkout".to_string())
+            .failed_container_retention(db.clone(), 42)
+            .build(deployer)
+            .expect("valid deploy job");
+        job.failed_candidates
+            .lock()
+            .expect("candidate lock")
+            .push(FailedContainerCandidate {
+                container_id: "failed-app-id".to_string(),
+                container_name: "checkout-production".to_string(),
+                container_port: 3000,
+                host_port: 18080,
+                image_name: "checkout:broken".to_string(),
+                node_id: Some(7),
+            });
+        let context = WorkflowContext::new("run-42".to_string(), 42, 2, 3, Arc::new(TestLogWriter));
+
+        job.retain_failed_containers(&context)
+            .await
+            .expect("failed candidate should remain available for logs");
+        assert!(job.retained_failure.load(Ordering::Acquire));
+
+        drop(job);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let transaction_log = db.into_transaction_log();
+        let rendered = transaction_log
+            .iter()
+            .flat_map(|transaction| transaction.statements())
+            .filter(|statement| {
+                statement
+                    .sql
+                    .contains("INSERT INTO \"deployment_containers\"")
+            })
+            .map(|statement| format!("{statement:?}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("failed-app-id"));
+        assert!(rendered.contains("checkout-production"));
+        assert!(rendered.contains("retained:failed-readiness"));
+        assert!(rendered.contains("checkout:broken"));
+        assert!(rendered.contains("18080"));
+        assert!(rendered.contains("3000"));
+        assert!(
+            rendered.contains("Some(7)"),
+            "node ownership missing: {rendered}"
+        );
+        assert!(
+            !rendered.contains("ready_at\", Some"),
+            "failed candidates must never be routable: {rendered}"
+        );
     }
 
     #[test]

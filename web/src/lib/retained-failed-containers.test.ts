@@ -7,9 +7,9 @@ import {
   currentRetainedContainers,
   retainedContainerLogsPath,
   toggleRetainedContainerLogs,
-} from './retained-compose-containers'
+} from './retained-failed-containers'
 
-describe('retained Compose container diagnostics', () => {
+describe('retained failed-container diagnostics', () => {
   test('shows only container rows that have not been replaced', () => {
     const containers = [
       { container_id: 'retained', is_current: true },

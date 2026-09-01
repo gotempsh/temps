@@ -584,6 +584,7 @@ Manage deployments
 - `resume` - Resume a paused deployment
 - `teardown` - Teardown a deployment and remove all resources
 - `logs` - Show deployment build logs
+- `container-logs` - Show live container logs, including retained failed deployments
 - `failure-report` - Preview or send a redacted deploy-failure trace
 
 ### `deployments list` (alias: `ls`)
@@ -685,6 +686,22 @@ Show deployment build logs
 | `-f, --follow` | Follow log output | - | No |
 | `-n, --lines <number>` | Number of lines to show | `100` | No |
 | `-d, --deployment <id>` | Specific deployment ID | - | No |
+
+### `deployments container-logs`
+
+Show live container logs, including retained failed deployments
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-e, --environment <env>` | Environment | `production` | No |
+| `-d, --deployment <id>` | Deployment ID | - | Yes |
+| `-c, --container <id>` | Container ID or name (partial match supported) | - | No |
+| `-n, --tail <lines>` | Number of lines to tail | `1000` | No |
+| `-t, --timestamps` | Show timestamps | - | No |
+| `-f, --follow` | Follow log output | - | No |
 
 ### `deployments failure-report`
 
@@ -1676,6 +1693,7 @@ View runtime container logs (use -f to follow in real-time)
 | `-p, --project <project>` | Project slug or ID | - | No |
 | `-e, --environment <env>` | Environment name | `production` | No |
 | `-c, --container <id>` | Container ID (partial match supported) | - | No |
+| `-d, --deployment <id>` | Deployment ID, including failed retained containers | - | No |
 | `-n, --tail <lines>` | Number of lines to tail | `1000` | No |
 | `-t, --timestamps` | Show timestamps | - | No |
 | `-f, --follow` | Follow log output (stream in real-time) | - | No |
@@ -5848,6 +5866,7 @@ View project analytics
 
 **Subcommands:**
 
+- `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 - `funnels` - Show funnel conversion metrics for all funnels
@@ -5862,6 +5881,89 @@ View project analytics
 - `api-path` - Show client IPs calling one path with latency and error analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+
+### `analytics keys`
+
+Manage analytics ingest keys (pa_...) for apps Temps does not deploy
+
+**Subcommands:**
+
+- `list` (`ls`) - List analytics ingest keys for a project
+- `create` (`add`) - Mint a new analytics ingest key
+- `update` - Update an ingest key's label, origin allowlist, or rate limit
+- `rotate` - Replace an ingest key value, keeping the same row and scope
+- `revoke` - Revoke (deactivate) an analytics ingest key
+
+#### `analytics keys list` (alias: `ls`)
+
+List analytics ingest keys for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys create` (alias: `add`)
+
+Mint a new analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Operator-facing label for the key | - | No |
+| `--environment-id <id>` | Scope the key to one environment (omit for a project-wide key) | - | No |
+| `--allowed-origins <origins...>` | Browser origins allowed to use this key (omit to allow any origin) | - | No |
+| `--rate-limit <n>` | Requests per minute (omit for the server default; 0 or less for unlimited) | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys update`
+
+Update an ingest key's label, origin allowlist, or rate limit
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-n, --name <name>` | New operator-facing label | - | No |
+| `--allowed-origins <origins...>` | Replace the origin allowlist with these origins | - | No |
+| `--clear-origins` | Clear the origin allowlist (allow any origin) | - | No |
+| `--rate-limit <n>` | New requests-per-minute limit | - | No |
+| `--clear-rate-limit` | Clear the rate limit (unlimited) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys rotate`
+
+Replace an ingest key value, keeping the same row and scope
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys revoke`
+
+Revoke (deactivate) an analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ### `analytics overview` (alias: `o`)
 
