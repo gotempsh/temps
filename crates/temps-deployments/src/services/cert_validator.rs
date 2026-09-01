@@ -810,6 +810,7 @@ mod tests {
         // A PRIVATE KEY block in the certificate field must be rejected.
         // This closes the hole where an unfiltered import writes plaintext
         // key material into the unencrypted domains.certificate column.
+        install_ring_for_tests();
         let entry = RawCertEntry {
             host: "app.example.com".to_string(),
             certificate_pem: concat!(
@@ -833,6 +834,7 @@ mod tests {
 
     #[test]
     fn cert_field_rejects_zero_certificate_blocks() {
+        install_ring_for_tests();
         let entry = RawCertEntry {
             host: "app.example.com".to_string(),
             certificate_pem: String::new(),
@@ -865,6 +867,7 @@ mod tests {
     #[test]
     fn key_field_rejects_zero_key_blocks() {
         // We need a valid leaf cert for this. Produce one with rcgen.
+        install_ring_for_tests();
         let (cert_pem, _key_pem) = generate_test_cert_and_key("app.example.com");
 
         let entry = RawCertEntry {
@@ -884,6 +887,7 @@ mod tests {
 
     #[test]
     fn key_field_rejects_two_key_blocks() {
+        install_ring_for_tests();
         let (cert_pem, key_pem) = generate_test_cert_and_key("app.example.com");
         let double_key = format!("{key_pem}\n{key_pem}");
 
@@ -906,6 +910,7 @@ mod tests {
     fn leaf_must_be_element_0_not_element_1() {
         // Chain where element 0 covers an attacker host and element 1 covers
         // the requested host. Must be rejected because the leaf is element 0.
+        install_ring_for_tests();
         let (attacker_cert, _) = generate_test_cert_and_key("attacker.evil.com");
         let (target_cert, _) = generate_test_cert_and_key("app.example.com");
 
@@ -933,6 +938,7 @@ mod tests {
     fn wildcard_san_only_coverage_is_rejected() {
         // A cert for *.example.com should be rejected when the requested host
         // is app.example.com — exact match is required.
+        install_ring_for_tests();
         let (cert_pem, key_pem) = generate_test_cert_and_key("*.example.com");
         let entry = RawCertEntry {
             host: "app.example.com".to_string(),
@@ -948,6 +954,7 @@ mod tests {
 
     #[test]
     fn mismatched_key_is_rejected() {
+        install_ring_for_tests();
         let (cert_pem, _) = generate_test_cert_and_key("app.example.com");
         let (_, wrong_key) = generate_test_cert_and_key("other.example.com");
 

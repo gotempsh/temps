@@ -2652,9 +2652,13 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
     assert!(schema.try_get::<bool>("", "service_creator_column")?);
     assert!(schema.try_get::<bool>("", "service_creator_fk")?);
 
-    // The creator-ownership migration is the latest migration. Exercise its
-    // reversal and re-application so upgrades retain an emergency rollback.
-    Migrator::down(&db, Some(1)).await?;
+    // The creator-ownership migration used to be the latest migration; three
+    // more (Traefik discovered-routes/certificates + the verification-method
+    // backfill) now follow it in the registry with the same date+sequence
+    // stamp resolved in `mod.rs`. Roll back all four to reach behind it, then
+    // reapply all four, so this still exercises the creator migration's own
+    // rollback safety net rather than silently checking nothing.
+    Migrator::down(&db, Some(4)).await?;
     let creator_column_after_down = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -2667,7 +2671,7 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
         .expect("creator column rollback query");
     assert!(!creator_column_after_down.try_get::<bool>("", "present")?);
 
-    Migrator::up(&db, Some(1)).await?;
+    Migrator::up(&db, Some(4)).await?;
     let creator_column_after_reapply = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
