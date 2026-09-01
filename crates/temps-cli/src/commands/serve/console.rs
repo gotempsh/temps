@@ -2956,11 +2956,25 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                 // destroy.
                 if let Err(e) = self.domain_service.request_challenge(host, &email).await {
                     if created_domain_this_call {
-                        if let Err(cleanup_err) = self.domain_service.delete_domain(host).await {
+                        // The row we're rolling back was inserted moments ago in
+                        // this same call, so the only realistic way `delete_domain`
+                        // fails here is a transient DB error (connection blip,
+                        // timeout) — not a real invariant violation. Retry a few
+                        // times before accepting the orphan, since a single
+                        // failed attempt would otherwise permanently block every
+                        // future retry at the host-ownership check.
+                        let cleanup_retry = temps_core::retry::RetryConfig::new(3)
+                            .with_base_delay(std::time::Duration::from_millis(200))
+                            .with_max_delay(std::time::Duration::from_secs(2));
+                        if let Err(cleanup_err) = cleanup_retry
+                            .retry(|| self.domain_service.delete_domain(host))
+                            .await
+                        {
                             tracing::error!(
                                 "Failed to roll back domain {host} after a failed ACME challenge \
-                                 request ({e}); the domain row is now orphaned and must be \
-                                 removed manually before retrying: {cleanup_err}"
+                                 request ({e}) even after retrying; the domain row is now \
+                                 orphaned and must be removed manually before retrying: \
+                                 {cleanup_err}"
                             );
                         }
                     }
