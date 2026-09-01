@@ -1,7 +1,7 @@
 {
   "name": "@temps-sdk/plugin",
-  "version": "0.0.1",
-  "description": "Node.js SDK for building Temps external plugins",
+  "version": "0.1.0",
+  "description": "TypeScript SDK for building standalone Temps plugins with Bun",
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -12,7 +12,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "README.md"
   ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
@@ -29,16 +30,27 @@
     "external-plugin"
   ],
   "license": "MIT",
+  "sideEffects": false,
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gotempsh/temps.git",
+    "directory": "sdks/node/packages/plugin-sdk"
+  },
+  "homepage": "https://temps.sh/docs/plugins",
+  "bugs": {
+    "url": "https://github.com/gotempsh/temps/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
   "devDependencies": {
     "@types/bun": "latest",
     "@types/node": "^22.0.0",
     "typescript": "^5.5.4",
     "vitest": "^4.1.0"
   },
-  "peerDependencies": {
-    "typescript": "^5"
-  },
   "engines": {
-    "node": ">=20"
+    "bun": ">=1.3.0"
   }
 }

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 /**
- * Example Temps plugin built with the Node.js SDK.
+ * Example Temps plugin built with the TypeScript/Bun SDK.
  *
  * Demonstrates:
  * - Defining a manifest with navigation entries
@@ -34,9 +34,9 @@ try {
 
 const plugin: TempsPlugin = {
   manifest() {
-    return createManifest("hello-node", "0.1.0")
-      .displayName("Hello Node")
-      .description("Example Node.js plugin demonstrating the SDK")
+    return createManifest("hello-typescript", "0.1.0")
+      .displayName("Hello TypeScript")
+      .description("Example TypeScript plugin compiled to a standalone executable")
       .requiresDb(false)
       .addNav("Hello", "hand", "/hello")
       .addNav("Projects", "folder", "/projects")
@@ -61,7 +61,6 @@ const plugin: TempsPlugin = {
             JSON.stringify({
               message: `Hello ${auth?.userEmail ?? "anonymous"}!`,
               plugin: ctx.pluginName,
-              dataDir: ctx.dataDir,
             })
           );
           break;
@@ -81,12 +80,13 @@ const plugin: TempsPlugin = {
               })
             );
           } catch (err) {
+            console.error(JSON.stringify({
+              level: "error",
+              message: "Could not list projects",
+              reason: err instanceof Error ? err.message : String(err),
+            }));
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({
-                error: err instanceof Error ? err.message : String(err),
-              })
-            );
+            res.end(JSON.stringify({ error: "Could not list projects" }));
           }
           break;
         }
@@ -106,12 +106,13 @@ const plugin: TempsPlugin = {
             res.writeHead(200, { "Content-Type": "application/json" });
             res.end(JSON.stringify({ deployments }));
           } catch (err) {
+            console.error(JSON.stringify({
+              level: "error",
+              message: "Could not list deployments",
+              reason: err instanceof Error ? err.message : String(err),
+            }));
             res.writeHead(500, { "Content-Type": "application/json" });
-            res.end(
-              JSON.stringify({
-                error: err instanceof Error ? err.message : String(err),
-              })
-            );
+            res.end(JSON.stringify({ error: "Could not list deployments" }));
           }
           break;
         }
@@ -123,19 +124,22 @@ const plugin: TempsPlugin = {
     };
   },
 
-  async onStart(ctx: PluginContext) {
-    console.error(`[hello-node] Plugin started! Data dir: ${ctx.dataDir}`);
+  async onStart(_ctx: PluginContext) {
+    console.error(JSON.stringify({ level: "info", message: "Example plugin started" }));
   },
 
   onEvent(_ctx: PluginContext, event: PluginEvent) {
-    console.error(
-      `[hello-node] Received event: ${event.event_type} (project: ${event.project_id})`
-    );
+    console.error(JSON.stringify({
+      level: "info",
+      message: "Example plugin received event",
+      event_type: event.event_type,
+      project_id: event.project_id,
+    }));
   },
 
   async onShutdown() {
-    console.error("[hello-node] Shutting down gracefully");
+    console.error(JSON.stringify({ level: "info", message: "Example plugin shutdown" }));
   },
 };
 
-runPlugin(plugin);
+await runPlugin(plugin);

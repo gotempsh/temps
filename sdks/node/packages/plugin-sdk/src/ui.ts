@@ -12,7 +12,7 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { join, extname } from "node:path";
+import { extname, resolve, sep } from "node:path";
 import type { IncomingMessage, ServerResponse } from "node:http";
 
 const MIME_TYPES: Record<string, string> = {
@@ -69,7 +69,8 @@ export function createUiHandler(
   const prefix = basePath.endsWith("/") ? basePath : basePath + "/";
   const prefixNoSlash = prefix.slice(0, -1);
 
-  const indexHtml = join(distDir, "index.html");
+  const distRoot = resolve(distDir);
+  const indexHtml = resolve(distRoot, "index.html");
   const hasIndex = existsSync(indexHtml);
 
   return (req: IncomingMessage, res: ServerResponse): boolean => {
@@ -86,10 +87,16 @@ export function createUiHandler(
       return false;
     }
 
-    const relativePath = pathname.slice(prefix.length) || "index.html";
-    const filePath = join(distDir, relativePath);
+    const relativePath = decodeAssetPath(pathname.slice(prefix.length) || "index.html");
+    if (relativePath === null) {
+      res.writeHead(400);
+      res.end("Bad Request");
+      return true;
+    }
 
-    if (!filePath.startsWith(distDir)) {
+    const filePath = resolve(distRoot, relativePath);
+
+    if (filePath !== distRoot && !filePath.startsWith(`${distRoot}${sep}`)) {
       res.writeHead(403);
       res.end("Forbidden");
       return true;
@@ -148,10 +155,15 @@ export function createEmbeddedUiHandler(
       return false;
     }
 
-    const relativePath = pathname.slice(prefix.length) || "index.html";
+    const relativePath = decodeAssetPath(pathname.slice(prefix.length) || "index.html");
+    if (relativePath === null) {
+      res.writeHead(400);
+      res.end("Bad Request");
+      return true;
+    }
 
     // Prevent traversal
-    if (relativePath.includes("..")) {
+    if (relativePath.startsWith("/") || relativePath.split(/[\\/]/).includes("..")) {
       res.writeHead(403);
       res.end("Forbidden");
       return true;
@@ -225,4 +237,12 @@ function serveEmbeddedFile(
 function hasFileExtension(path: string): boolean {
   const lastSegment = path.split("/").pop() ?? "";
   return lastSegment.includes(".");
+}
+
+function decodeAssetPath(path: string): string | null {
+  try {
+    return decodeURIComponent(path);
+  } catch {
+    return null;
+  }
 }

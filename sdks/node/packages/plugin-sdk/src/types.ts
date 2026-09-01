@@ -1,20 +1,23 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/**
- * Types for the Temps external plugin protocol.
- *
- * These types mirror the Rust definitions in:
- * - crates/temps-core/src/external_plugin/manifest.rs
- * - crates/temps-core/src/external_plugin/channel.rs
- * - crates/temps-plugin-sdk/src/protocol.rs
- */
+/** Canonical TypeScript representation of Temps external-plugin protocol v2. */
+
+import type { PluginContext } from "./context.js";
+import type { EmbeddedAssets } from "./ui.js";
+import type { IncomingMessage, ServerResponse } from "node:http";
+
+export const EXTERNAL_PLUGIN_PROTOCOL_VERSION = 2 as const;
+export const MAX_CALL_BODY_BYTES = 32 * 1024 * 1024;
+export const MAX_PLUGIN_REQUEST_BODY_BYTES = 32 * 1024 * 1024;
+export const MAX_PLUGIN_RESPONSE_BODY_BYTES = 32 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
-// Plugin Manifest
+// Manifest and startup handshake
 // ---------------------------------------------------------------------------
 
 export type NavSection = "platform" | "settings" | "project";
+export type PluginCapability = "api_read" | "api_write";
 
 export interface NavEntry {
   label: string;
@@ -43,43 +46,75 @@ export interface PluginManifest {
   nav: NavEntry[];
   ui?: UiManifest;
   requires_db: boolean;
+  requires_host_data_access: boolean;
   health_path: string;
+  hide_header: boolean;
+  public_paths: string[];
+  capabilities: PluginCapability[];
   events: string[];
 }
 
-// ---------------------------------------------------------------------------
-// Handshake Messages (stdout JSON lines)
-// ---------------------------------------------------------------------------
-
-export interface ManifestMessage {
-  type: "manifest";
-  name: string;
-  version: string;
-  display_name?: string;
-  description?: string;
-  nav: NavEntry[];
-  ui?: UiManifest;
-  requires_db: boolean;
-  health_path: string;
-  events: string[];
+export interface PluginHelloMessage {
+  type: "hello";
+  protocol_version: typeof EXTERNAL_PLUGIN_PROTOCOL_VERSION;
+  manifest: PluginManifest;
 }
 
-export interface ReadyMessage {
+export interface PluginReadyMessage {
   type: "ready";
-  ready: boolean;
+  ready: true;
   has_ui: boolean;
+  protocol_version: typeof EXTERNAL_PLUGIN_PROTOCOL_VERSION;
+  openapi?: Record<string, unknown>;
 }
 
-export type HandshakeMessage = ManifestMessage | ReadyMessage;
+export type HandshakeMessage = PluginHelloMessage | PluginReadyMessage;
+
+export interface PluginLaunchConfig {
+  protocol_version: number;
+  auth_secret: string;
+  database_url: string | null;
+  host_data_dir: string | null;
+}
+
+export interface PluginArgs {
+  socketPath: string;
+  dataDir: string;
+  hostApiUrl?: string;
+}
 
 // ---------------------------------------------------------------------------
-// Channel Protocol (WebSocket JSON frames)
+// Authenticated proxy context
+// ---------------------------------------------------------------------------
+
+export type PluginRole =
+  | "admin"
+  | "platform_admin"
+  | "user"
+  | "reader"
+  | "api_reader"
+  | "custom"
+  | "metrics_ingest";
+
+export interface TempsUserContext {
+  readonly userId: number;
+  readonly userEmail: string;
+  readonly role: PluginRole;
+  readonly permissions: ReadonlySet<string>;
+  readonly requestId: string;
+  isAdmin(): boolean;
+  hasPermission(permission: string): boolean;
+}
+
+// ---------------------------------------------------------------------------
+// Channel protocol
 // ---------------------------------------------------------------------------
 
 export type ChannelErrorCode =
   | "method_not_found"
   | "invalid_params"
   | "permission_denied"
+  | "unauthenticated"
   | "not_found"
   | "internal";
 
@@ -88,31 +123,6 @@ export interface ChannelError {
   message: string;
 }
 
-export interface ChannelRequest {
-  type: "request";
-  id: number;
-  method: string;
-  params: Record<string, unknown>;
-}
-
-export interface ChannelResponse {
-  type: "response";
-  id: number;
-  result?: unknown;
-  error?: ChannelError;
-}
-
-export interface ChannelEvent {
-  type: "event";
-  event: PluginEvent;
-}
-
-export type ChannelMessage = ChannelRequest | ChannelResponse | ChannelEvent;
-
-// ---------------------------------------------------------------------------
-// Plugin Events
-// ---------------------------------------------------------------------------
-
 export interface PluginEvent {
   id: string;
   event_type: string;
@@ -120,10 +130,6 @@ export interface PluginEvent {
   project_id?: number;
   data: Record<string, unknown>;
 }
-
-// ---------------------------------------------------------------------------
-// Platform Data DTOs (returned by TempsClient)
-// ---------------------------------------------------------------------------
 
 export interface ProjectInfo {
   id: number;
@@ -167,97 +173,122 @@ export interface DeploymentInfo {
   finished_at?: string;
 }
 
-// ---------------------------------------------------------------------------
-// Auth Context (extracted from proxy headers)
-// ---------------------------------------------------------------------------
+export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
 
-export interface TempsUserContext {
-  userId?: number;
-  userEmail?: string;
-  role: string;
-  requestId: string;
+export type PartContent =
+  | { kind: "text"; value: string }
+  | { kind: "binary"; value: string };
+
+export interface MultipartPart {
+  name: string;
+  filename?: string;
+  content_type?: string;
+  content: PartContent;
 }
 
-// ---------------------------------------------------------------------------
-// Plugin CLI Arguments
-// ---------------------------------------------------------------------------
+export type CallBody =
+  | { kind: "json"; body: string }
+  | { kind: "multipart"; body: MultipartPart[] };
 
-export interface PluginArgs {
-  socketPath: string;
-  databaseUrl?: string;
-  authSecret: string;
-  dataDir: string;
+export interface ApiCall {
+  method: HttpMethod;
+  path: string;
+  query?: string;
+  body?: CallBody;
+  actor: string;
 }
 
+export interface ApiCallResult {
+  status: number;
+  /** JSON text carried by the protocol's transparent JsonBody wrapper. */
+  body: string;
+}
+
+export interface PlatformCallMap {
+  get_project: {
+    params: { project_id: number };
+    result: ProjectInfo;
+  };
+  list_projects: {
+    params: Record<string, never>;
+    result: ProjectInfo[];
+  };
+  get_environment: {
+    params: { environment_id: number };
+    result: EnvironmentInfo;
+  };
+  list_environments: {
+    params: { project_id: number };
+    result: EnvironmentInfo[];
+  };
+  get_deployment: {
+    params: { deployment_id: number };
+    result: DeploymentInfo;
+  };
+  get_last_deployment: {
+    params: { project_id: number; environment_id?: number };
+    result: DeploymentInfo;
+  };
+  list_deployments: {
+    params: { project_id: number; environment_id?: number; limit?: number };
+    result: DeploymentInfo[];
+  };
+  api_call: {
+    params: ApiCall;
+    result: ApiCallResult;
+  };
+}
+
+export type PlatformMethod = keyof PlatformCallMap;
+export type PlatformCallRequest = {
+  [Method in PlatformMethod]: {
+    method: Method;
+    params: PlatformCallMap[Method]["params"];
+  };
+}[PlatformMethod];
+
+export type PlatformCallResponse = {
+  [Method in PlatformMethod]: {
+    method: Method;
+    result: PlatformCallMap[Method]["result"];
+  };
+}[PlatformMethod];
+
+export interface ChannelRequest {
+  type: "request";
+  id: number;
+  call: PlatformCallRequest;
+}
+
+export interface ChannelResponse {
+  type: "response";
+  id: number;
+  outcome: { ok: PlatformCallResponse } | { err: ChannelError };
+}
+
+export interface ChannelEvent {
+  type: "event";
+  event: PluginEvent;
+}
+
+export type ChannelMessage = ChannelRequest | ChannelResponse | ChannelEvent;
+
 // ---------------------------------------------------------------------------
-// Plugin Definition (user-facing interface)
+// User-facing plugin definition
 // ---------------------------------------------------------------------------
 
-import type { PluginContext } from "./context.js";
-import type { EmbeddedAssets } from "./ui.js";
-import type { IncomingMessage, ServerResponse } from "node:http";
-
-/**
- * Request handler function compatible with Node.js HTTP server.
- *
- * Plugins provide a `handler` that receives standard Node.js HTTP
- * request/response objects. This works with any framework:
- *
- * - Plain `http.createServer` callback
- * - Express `app` (Express apps are valid request handlers)
- * - Fastify with `fastify.server` after `await fastify.ready()`
- * - Koa with `app.callback()`
- * - Hono with `serve()` adapter
- */
 export type RequestHandler = (
   req: IncomingMessage,
   res: ServerResponse
 ) => void | Promise<void>;
 
 export interface TempsPlugin {
-  /** Plugin manifest describing capabilities, nav entries, and event subscriptions. */
   manifest(): PluginManifest;
-
-  /**
-   * Return a Node.js HTTP request handler for your plugin's routes.
-   *
-   * The handler receives requests already stripped of the `/x/{plugin_name}/` prefix.
-   * Auth context is available via `x-temps-*` headers on each request.
-   *
-   * @param ctx - Plugin context with access to platform client and data directory.
-   */
   handler(ctx: PluginContext): RequestHandler | Promise<RequestHandler>;
-
-  /**
-   * Optional: path to a directory containing compiled UI assets to serve
-   * under `/ui/`. If provided, the SDK will automatically serve these
-   * with proper caching headers and SPA fallback.
-   *
-   * For development mode with hot-reload.
-   */
   uiDistPath?(): string;
-
-  /**
-   * Optional: in-memory map of embedded UI assets (for compiled binaries).
-   *
-   * Use the `embed-assets.ts` script to generate this map at build time.
-   * This is the Node.js equivalent of Rust's `include_dir!` macro.
-   *
-   * Takes priority over `uiDistPath()` if both are provided.
-   */
   embeddedUiAssets?(): EmbeddedAssets;
-
-  /**
-   * Called after the platform channel is established. Use for initialization
-   * logic that needs access to platform data.
-   */
+  openapiSchema?(): Record<string, unknown>;
   onStart?(ctx: PluginContext): void | Promise<void>;
-
-  /** Called on graceful shutdown (SIGTERM). */
   onShutdown?(): void | Promise<void>;
-
-  /**
-   * Called when a subscribed platform event is received.
-   */
   onEvent?(ctx: PluginContext, event: PluginEvent): void | Promise<void>;
 }

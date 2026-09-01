@@ -1,6 +1,21 @@
-# temps-sdk
+# Temps TypeScript SDKs
 
-A modern analytics SDK for React applications with automatic pageview tracking and custom event support.
+TypeScript packages for building applications and standalone plugins on Temps.
+
+## Packages
+
+| Package | Purpose |
+| --- | --- |
+| [`@temps-sdk/plugin`](./packages/plugin-sdk) | Build TypeScript external plugins and compile them to standalone Bun executables. |
+| [`@temps-sdk/node-sdk`](./packages/node-sdk) | Typed server-side client for the Temps HTTP API and error tracking. |
+| [`@temps-sdk/react-analytics`](./packages/react-analytics) | React analytics, session recording, engagement, and performance tracking. |
+| [`@temps-sdk/kv`](./packages/kv) | Key-value storage client. |
+| [`@temps-sdk/blob`](./packages/blob) | Blob storage client. |
+
+For a complete external plugin with a React UI, see
+[`examples/node-hello-plugin`](./examples/node-hello-plugin).
+
+## React analytics
 
 ## Installation
 

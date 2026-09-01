@@ -85,3 +85,68 @@ export class ChannelTimeoutError extends PluginSdkError {
     this.timeoutMs = timeoutMs;
   }
 }
+
+export class ProtocolMismatchError extends PluginSdkError {
+  public readonly expectedMethod: string;
+  public readonly receivedMethod: string;
+
+  constructor(expectedMethod: string, receivedMethod: string) {
+    super(
+      `Platform channel replied with "${receivedMethod}" to a "${expectedMethod}" request; rebuild the plugin against this Temps version`
+    );
+    this.name = "ProtocolMismatchError";
+    this.expectedMethod = expectedMethod;
+    this.receivedMethod = receivedMethod;
+  }
+}
+
+export class ActorTokenRequiredError extends PluginSdkError {
+  constructor() {
+    super(
+      "This request has no platform actor token; declare an API capability and call the platform only for an authenticated caller"
+    );
+    this.name = "ActorTokenRequiredError";
+  }
+}
+
+export class CallBodyTooLargeError extends PluginSdkError {
+  public readonly actualBytes: number;
+  public readonly maximumBytes: number;
+
+  constructor(actualBytes: number, maximumBytes: number) {
+    super(
+      `Platform API call body is ${actualBytes} bytes, exceeding the ${maximumBytes}-byte channel limit`
+    );
+    this.name = "CallBodyTooLargeError";
+    this.actualBytes = actualBytes;
+    this.maximumBytes = maximumBytes;
+  }
+}
+
+export class RequestBodyTooLargeError extends PluginSdkError {
+  public readonly actualBytes: number;
+  public readonly maximumBytes: number;
+
+  constructor(actualBytes: number, maximumBytes: number) {
+    super(
+      `Plugin request body is ${actualBytes} bytes, exceeding the ${maximumBytes}-byte runtime limit`
+    );
+    this.name = "RequestBodyTooLargeError";
+    this.actualBytes = actualBytes;
+    this.maximumBytes = maximumBytes;
+  }
+}
+
+export class ResponseBodyTooLargeError extends PluginSdkError {
+  public readonly actualBytes: number;
+  public readonly maximumBytes: number;
+
+  constructor(actualBytes: number, maximumBytes: number) {
+    super(
+      `Plugin response body is ${actualBytes} bytes, exceeding the ${maximumBytes}-byte runtime limit`
+    );
+    this.name = "ResponseBodyTooLargeError";
+    this.actualBytes = actualBytes;
+    this.maximumBytes = maximumBytes;
+  }
+}

@@ -112,6 +112,27 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
     let uri = request.uri().clone();
     let path = uri.path();
 
+    // Classify exactly the path the plugin runtime will see. WHATWG URL
+    // parsing (used by Bun and browsers) normalizes literal and percent-
+    // encoded dot segments, and treats backslashes as path separators. If we
+    // checked `public_paths` or the reserved transport routes first, an
+    // attacker could make the Rust proxy authorize one raw path and then have
+    // the plugin handle a different normalized path with our trusted
+    // signature attached.
+    if let Err(error) = validate_user_facing_path(path) {
+        warn!(
+            plugin = %proxy.plugin_name,
+            method = %method,
+            path = %path,
+            reason = %error,
+            "Rejecting unsafe external plugin path"
+        );
+        return problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Plugin Path")
+            .with_detail("The requested plugin path contains an unsafe path segment.")
+            .into_response();
+    }
+
     // These endpoints accept assertions that only the platform may make.
     // They remain reachable over the plugin's private Unix socket for event
     // delivery and channel setup, but must never be exposed through the
@@ -179,6 +200,98 @@ async fn proxy_handler(State(proxy): State<PluginProxy>, request: Request) -> Re
                 .with_detail("The plugin could not complete the request.")
                 .into_response()
         }
+    }
+}
+
+/// A path form whose interpretation can differ between Rust's URI parser and
+/// the WHATWG URL parser used by the TypeScript plugin runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnsafePluginPath {
+    DotSegment { segment: usize },
+    Backslash { segment: usize },
+    InvalidPercentEncoding { segment: usize, offset: usize },
+}
+
+impl std::fmt::Display for UnsafePluginPath {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DotSegment { segment } => {
+                write!(formatter, "dot segment at path segment {segment}")
+            }
+            Self::Backslash { segment } => {
+                write!(formatter, "backslash at path segment {segment}")
+            }
+            Self::InvalidPercentEncoding { segment, offset } => write!(
+                formatter,
+                "invalid percent encoding at byte {offset} of path segment {segment}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for UnsafePluginPath {}
+
+/// Reject paths that can be normalized into a different route by a WHATWG
+/// parser after the proxy has made its authorization decision.
+///
+/// Percent decoding is deliberately scoped to path segments. Query strings
+/// are not part of `Uri::path()` and remain byte-for-byte intact when the
+/// original `path_and_query` is forwarded.
+fn validate_user_facing_path(path: &str) -> Result<(), UnsafePluginPath> {
+    for (segment_index, segment) in path.as_bytes().split(|byte| *byte == b'/').enumerate() {
+        let mut decoded = Vec::with_capacity(segment.len());
+        let mut offset = 0;
+
+        while offset < segment.len() {
+            let byte = match segment[offset] {
+                b'%' => {
+                    let Some(high) = segment.get(offset + 1).and_then(|byte| hex_value(*byte))
+                    else {
+                        return Err(UnsafePluginPath::InvalidPercentEncoding {
+                            segment: segment_index,
+                            offset,
+                        });
+                    };
+                    let Some(low) = segment.get(offset + 2).and_then(|byte| hex_value(*byte))
+                    else {
+                        return Err(UnsafePluginPath::InvalidPercentEncoding {
+                            segment: segment_index,
+                            offset,
+                        });
+                    };
+                    offset += 3;
+                    (high << 4) | low
+                }
+                byte => {
+                    offset += 1;
+                    byte
+                }
+            };
+
+            if byte == b'\\' {
+                return Err(UnsafePluginPath::Backslash {
+                    segment: segment_index,
+                });
+            }
+            decoded.push(byte);
+        }
+
+        if decoded == b"." || decoded == b".." {
+            return Err(UnsafePluginPath::DotSegment {
+                segment: segment_index,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -746,6 +859,88 @@ mod tests {
         assert!(proxy.is_public("/hooks/incoming"));
         assert!(proxy.is_public("/hooks/incoming/jobs"));
         assert!(!proxy.is_public("/hooks/incoming-admin"));
+    }
+
+    #[test]
+    fn unsafe_dot_segments_and_backslash_variants_are_rejected() {
+        for path in [
+            "/public/../private",
+            "/public/./private",
+            "/public/%2e%2e/private",
+            "/public/%2E%2E/private",
+            "/public/%2e./private",
+            "/public/%2E./private",
+            "/public/.%2e/private",
+            "/public/.%2E/private",
+            "/public\\..\\private",
+            "/public/%5c..%5cprivate",
+            "/public/%5Cprivate",
+        ] {
+            assert!(
+                validate_user_facing_path(path).is_err(),
+                "unsafe path should be rejected: {path}"
+            );
+        }
+
+        for path in [
+            "/",
+            "/hooks/incoming",
+            "/hooks/incoming/jobs",
+            "/files/report%20one",
+            "/files/%E2%9C%93",
+            "/_events-calendar",
+            "/_temps/channel-status",
+        ] {
+            assert_eq!(
+                validate_user_facing_path(path),
+                Ok(()),
+                "normal path should remain valid: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn path_validation_does_not_consume_or_rewrite_query_strings() {
+        let uri: hyper::Uri = "/hooks/incoming?return=%2E%2E%5Cadmin&token=a%2Fb"
+            .parse()
+            .expect("test URI should parse");
+
+        assert_eq!(validate_user_facing_path(uri.path()), Ok(()));
+        assert_eq!(uri.path(), "/hooks/incoming");
+        assert_eq!(
+            uri.path_and_query().map(|value| value.as_str()),
+            Some("/hooks/incoming?return=%2E%2E%5Cadmin&token=a%2Fb")
+        );
+    }
+
+    #[tokio::test]
+    async fn public_prefix_cannot_escape_into_private_or_reserved_routes() {
+        // The socket deliberately does not exist. BAD_REQUEST proves these
+        // requests were rejected before public-path classification, trusted
+        // header injection, or forwarding.
+        let proxy = test_proxy().with_public_paths(vec!["/public".into()]);
+
+        for uri in [
+            "/public/../private",
+            "/public/%2e%2e/private",
+            "/public/%2E%2E/private",
+            "/public/%2e./private",
+            "/public/.%2E/private",
+            "/public\\..\\private",
+            "/public/%5c..%5cprivate",
+            "/public/%2e%2e/_events",
+            "/public/%2E%2E/_temps/channel",
+            "/public\\..\\_events",
+            "/public/%5C..%5C_temps%5Cchannel",
+        ] {
+            let request = Request::builder()
+                .uri(uri)
+                .body(Body::empty())
+                .expect("unsafe-path request should build");
+            let response = proxy_handler(State(proxy.clone()), request).await;
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{uri}");
+        }
     }
 
     #[test]

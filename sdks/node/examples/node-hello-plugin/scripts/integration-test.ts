@@ -31,7 +31,7 @@ import { createHash } from "node:crypto";
 // Config
 // ---------------------------------------------------------------------------
 
-const BINARY = join(import.meta.dirname, "..", "dist", "hello-node");
+const BINARY = join(import.meta.dirname, "..", "dist", "temps-hello-typescript-plugin");
 const SOCKET_PATH = "/tmp/tp-test-node-plugin/hello-node.sock";
 const DATA_DIR = "/tmp/tp-test-node-plugin-data";
 const AUTH_SECRET = "test-auth-secret-12345";
@@ -100,7 +100,8 @@ async function httpRequest(
  */
 async function connectWebSocket(
   socketPath: string,
-  path: string
+  path: string,
+  authSecret?: string
 ): Promise<{
   send: (data: string) => void;
   close: () => void;
@@ -145,6 +146,9 @@ async function connectWebSocket(
       socket: {
         open(sock) {
           // Send HTTP upgrade request
+          const assertionHeader = authSecret
+            ? [`X-Temps-Auth-Signature: ${authSecret}`]
+            : [];
           const upgradeReq = [
             `GET ${path} HTTP/1.1`,
             "Host: localhost",
@@ -152,6 +156,7 @@ async function connectWebSocket(
             "Upgrade: websocket",
             "Sec-WebSocket-Version: 13",
             `Sec-WebSocket-Key: ${wsKey}`,
+            ...assertionHeader,
             "",
             "",
           ].join("\r\n");
@@ -353,9 +358,9 @@ async function main(): Promise<void> {
     cmd: [
       BINARY,
       "--socket-path", SOCKET_PATH,
-      "--auth-secret", AUTH_SECRET,
       "--data-dir", DATA_DIR,
     ],
+    stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -441,22 +446,38 @@ async function main(): Promise<void> {
   const manifestLine = await readLine();
   const manifestMsg = JSON.parse(manifestLine);
 
-  assertEqual(manifestMsg.type, "manifest", "Manifest message type");
-  assertEqual(manifestMsg.name, "hello-node", "Plugin name");
-  assertEqual(manifestMsg.version, "0.1.0", "Plugin version");
-  assertEqual(manifestMsg.display_name, "Hello Node", "Display name");
-  assert(Array.isArray(manifestMsg.nav), "Nav entries is array");
-  assert(manifestMsg.nav.length >= 2, "Has at least 2 nav entries");
-  assertEqual(manifestMsg.requires_db, false, "Does not require DB");
-  assertEqual(manifestMsg.health_path, "/health", "Health path");
+  assertEqual(manifestMsg.type, "hello", "Hello message type");
+  assertEqual(manifestMsg.protocol_version, 2, "Hello protocol version");
+  assertEqual(manifestMsg.manifest.name, "hello-typescript", "Plugin name");
+  assertEqual(manifestMsg.manifest.version, "0.1.0", "Plugin version");
+  assertEqual(manifestMsg.manifest.display_name, "Hello TypeScript", "Display name");
+  assert(Array.isArray(manifestMsg.manifest.nav), "Nav entries is array");
+  assert(manifestMsg.manifest.nav.length >= 2, "Has at least 2 nav entries");
+  assertEqual(manifestMsg.manifest.requires_db, false, "Does not require DB");
+  assertEqual(manifestMsg.manifest.requires_host_data_access, false, "Does not require host data");
+  assertEqual(manifestMsg.manifest.health_path, "/health", "Health path");
   assert(
-    manifestMsg.events.includes("deployment.succeeded"),
+    manifestMsg.manifest.events.includes("deployment.succeeded"),
     "Subscribes to deployment.succeeded"
   );
   assert(
-    manifestMsg.events.includes("deployment.failed"),
+    manifestMsg.manifest.events.includes("deployment.failed"),
     "Subscribes to deployment.failed"
   );
+
+  const childStdin = child.stdin;
+  if (!childStdin || typeof childStdin === "number") {
+    throw new Error("Plugin stdin pipe is unavailable");
+  }
+  childStdin.write(
+    JSON.stringify({
+      protocol_version: 2,
+      auth_secret: AUTH_SECRET,
+      database_url: null,
+      host_data_dir: null,
+    }) + "\n"
+  );
+  await childStdin.flush();
 
   // -----------------------------------------------------------------------
   // 3. Read handshake phase 2: ready
@@ -469,6 +490,7 @@ async function main(): Promise<void> {
   assertEqual(readyMsg.type, "ready", "Ready message type");
   assertEqual(readyMsg.ready, true, "Plugin is ready");
   assertEqual(readyMsg.has_ui, true, "Plugin has UI");
+  assertEqual(readyMsg.protocol_version, 2, "Ready protocol version");
 
   // Wait a moment for the Unix socket to be ready
   await sleep(500);
@@ -482,14 +504,22 @@ async function main(): Promise<void> {
   assertEqual(healthRes.status, 200, "Health returns 200");
   const healthBody = JSON.parse(healthRes.body);
   assertEqual(healthBody.status, "ok", "Health status is ok");
-  assertEqual(healthBody.plugin, "hello-node", "Health returns plugin name");
+  assertEqual(healthBody.plugin, "hello-typescript", "Health returns plugin name");
 
   // -----------------------------------------------------------------------
   // 5. WebSocket channel connection
   // -----------------------------------------------------------------------
   console.log("\n5. WebSocket channel connection...");
 
-  const ws = await connectWebSocket(SOCKET_PATH, "/_temps/channel");
+  let unsignedChannelRejected = false;
+  try {
+    await connectWebSocket(SOCKET_PATH, "/_temps/channel");
+  } catch {
+    unsignedChannelRejected = true;
+  }
+  assert(unsignedChannelRejected, "Unsigned WebSocket channel is rejected");
+
+  const ws = await connectWebSocket(SOCKET_PATH, "/_temps/channel", AUTH_SECRET);
   assert(ws.connected, "WebSocket connected");
 
   // Wait for the plugin to finish initializing after channel connects
@@ -500,23 +530,54 @@ async function main(): Promise<void> {
   // -----------------------------------------------------------------------
   console.log("\n6. API requests with auth headers...");
 
+  const platformHeaders = {
+    "x-temps-auth-signature": AUTH_SECRET,
+    "x-temps-user-id": "42",
+    "x-temps-user-email": "developer@example.com",
+    "x-temps-user-role": "admin",
+    "x-temps-user-permissions": "projects:read,deployments:read",
+    "x-temps-request-id": "req-001",
+  };
+
+  const unsignedHello = await httpRequest(SOCKET_PATH, "/hello");
+  assertEqual(unsignedHello.status, 401, "Unsigned plugin route is rejected");
+
   const helloRes = await httpRequest(SOCKET_PATH, "/hello", {
-    headers: {
-      "x-temps-user-id": "42",
-      "x-temps-user-email": "test@example.com",
-      "x-temps-user-role": "admin",
-      "x-temps-request-id": "req-001",
-    },
+    headers: platformHeaders,
   });
   assertEqual(helloRes.status, 200, "Hello returns 200");
   const helloBody = JSON.parse(helloRes.body);
-  assertEqual(helloBody.message, "Hello test@example.com!", "Hello includes user email");
-  assertEqual(helloBody.plugin, "hello-node", "Hello includes plugin name");
-  assert(helloBody.dataDir.includes("tp-test-node-plugin-data"), "Hello includes data dir");
+  assertEqual(helloBody.message, "Hello developer@example.com!", "Hello includes verified user email");
+  assertEqual(helloBody.plugin, "hello-typescript", "Hello includes plugin name");
+  assertEqual(helloBody.dataDir, undefined, "Hello does not disclose the host data path");
 
   // Test 404 for unknown route
-  const notFoundRes = await httpRequest(SOCKET_PATH, "/unknown-route");
+  const notFoundRes = await httpRequest(SOCKET_PATH, "/unknown-route", {
+    headers: platformHeaders,
+  });
   assertEqual(notFoundRes.status, 404, "Unknown route returns 404");
+
+  let typedChannelRequest = false;
+  ws.onMessage((data) => {
+    const message = JSON.parse(data);
+    if (message.type !== "request" || message.call?.method !== "list_projects") return;
+    typedChannelRequest = message.call.params !== undefined;
+    ws.send(
+      JSON.stringify({
+        type: "response",
+        id: message.id,
+        outcome: {
+          ok: { method: "list_projects", result: [] },
+        },
+      })
+    );
+  });
+  const projectsRes = await httpRequest(SOCKET_PATH, "/projects", {
+    headers: platformHeaders,
+  });
+  assertEqual(projectsRes.status, 200, "Projects route returns 200");
+  assertEqual(JSON.parse(projectsRes.body).projects.length, 0, "Typed channel response is returned");
+  assert(typedChannelRequest, "Plugin sends protocol-v2 typed channel calls");
 
   // -----------------------------------------------------------------------
   // 7. Embedded UI asset serving
@@ -524,12 +585,12 @@ async function main(): Promise<void> {
   console.log("\n7. Embedded UI serving...");
 
   // /ui should redirect to /ui/
-  const uiRedirectRes = await httpRequest(SOCKET_PATH, "/ui");
+  const uiRedirectRes = await httpRequest(SOCKET_PATH, "/ui", { headers: platformHeaders });
   assertEqual(uiRedirectRes.status, 302, "GET /ui redirects");
   assertEqual(uiRedirectRes.headers.get("location"), "/ui/", "Redirects to /ui/");
 
   // /ui/ should serve index.html
-  const uiIndexRes = await httpRequest(SOCKET_PATH, "/ui/");
+  const uiIndexRes = await httpRequest(SOCKET_PATH, "/ui/", { headers: platformHeaders });
   assertEqual(uiIndexRes.status, 200, "GET /ui/ returns 200");
   assert(
     uiIndexRes.headers.get("content-type")?.includes("text/html") ?? false,
@@ -547,7 +608,7 @@ async function main(): Promise<void> {
   // Find the actual JS filename from the HTML
   const jsMatch = uiIndexRes.body.match(/assets\/(index-[a-zA-Z0-9]+\.js)/);
   if (jsMatch) {
-    const jsRes = await httpRequest(SOCKET_PATH, `/ui/assets/${jsMatch[1]}`);
+    const jsRes = await httpRequest(SOCKET_PATH, `/ui/assets/${jsMatch[1]}`, { headers: platformHeaders });
     assertEqual(jsRes.status, 200, `JS asset ${jsMatch[1]} returns 200`);
     assert(
       jsRes.headers.get("content-type")?.includes("javascript") ?? false,
@@ -565,12 +626,12 @@ async function main(): Promise<void> {
   }
 
   // SPA fallback: non-existent path without extension should serve index.html
-  const spaRes = await httpRequest(SOCKET_PATH, "/ui/some/nested/route");
+  const spaRes = await httpRequest(SOCKET_PATH, "/ui/some/nested/route", { headers: platformHeaders });
   assertEqual(spaRes.status, 200, "SPA fallback returns 200");
   assert(spaRes.body.includes("<!DOCTYPE html>"), "SPA fallback serves index.html");
 
   // Non-existent asset file should 404
-  const missing404 = await httpRequest(SOCKET_PATH, "/ui/assets/nonexistent.js");
+  const missing404 = await httpRequest(SOCKET_PATH, "/ui/assets/nonexistent.js", { headers: platformHeaders });
   assertEqual(missing404.status, 404, "Missing asset returns 404");
 
   // -----------------------------------------------------------------------
@@ -580,7 +641,7 @@ async function main(): Promise<void> {
 
   const eventRes = await httpRequest(SOCKET_PATH, "/_events", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...platformHeaders, "Content-Type": "application/json" },
     body: JSON.stringify({
       id: "evt-001",
       event_type: "deployment.succeeded",
@@ -590,13 +651,18 @@ async function main(): Promise<void> {
     }),
   });
   assertEqual(eventRes.status, 200, "Event delivery returns 200");
-  const eventBody = JSON.parse(eventRes.body);
-  assertEqual(eventBody.ok, true, "Event delivery returns ok");
+
+  const unsignedEvent = await httpRequest(SOCKET_PATH, "/_events", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  assertEqual(unsignedEvent.status, 401, "Unsigned event delivery is rejected");
 
   // Bad event payload
   const badEventRes = await httpRequest(SOCKET_PATH, "/_events", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { ...platformHeaders, "Content-Type": "application/json" },
     body: "not json",
   });
   assertEqual(badEventRes.status, 400, "Bad event returns 400");
@@ -621,7 +687,7 @@ async function main(): Promise<void> {
   assert(exitCode !== -1, "Plugin exited within 5 seconds");
   // Check stderr for shutdown message
   await sleep(200); // Let stderr reader finish
-  const hasShutdownLog = stderrLines.some((l) => l.includes("Shutting down"));
+  const hasShutdownLog = stderrLines.some((l) => l.includes("Shutting down plugin"));
   assert(hasShutdownLog, "Shutdown message logged to stderr");
 
   // Socket should be cleaned up

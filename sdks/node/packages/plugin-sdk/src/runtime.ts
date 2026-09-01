@@ -1,479 +1,618 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/**
- * Plugin runtime -- handles the full lifecycle of a Temps external plugin.
- *
- * Mirrors: crates/temps-plugin-sdk/src/runtime.rs
- *
- * Built for Bun -- compiled to a single binary via `bun build --compile`.
- *
- * Lifecycle:
- * 1. Parse CLI arguments (--socket-path, --auth-secret, --data-dir, etc.)
- * 2. Emit manifest to stdout (handshake phase 1)
- * 3. Start Bun.serve on Unix domain socket
- * 4. Emit ready to stdout (handshake phase 2)
- * 5. Accept WebSocket connection from host on /_temps/channel
- * 6. Create PluginContext with TempsClient
- * 7. Call plugin.onStart()
- * 8. Serve plugin routes, health, events, and embedded UI
- * 9. Handle SIGTERM for graceful shutdown
- */
-
-import { existsSync, mkdirSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, unlinkSync } from "node:fs";
+import type { IncomingMessage, ServerResponse } from "node:http";
 import { dirname } from "node:path";
-import type { TempsPlugin, PluginArgs, PluginEvent } from "./types.js";
+import {
+  attachVerifiedCaller,
+  type AuthenticatedCaller,
+  verifyProxyHeaders,
+} from "./auth.js";
 import { TempsClient, type WsLike } from "./client.js";
 import { PluginContext } from "./context.js";
-import { emitManifest, emitReady, PLUGIN_CHANNEL_PATH, extractAuthContext } from "./protocol.js";
-import { createEmbeddedUiHandler, type EmbeddedAssets } from "./ui.js";
-import { ArgsError, InitializationError } from "./errors.js";
+import {
+  ArgsError,
+  InitializationError,
+  RequestBodyTooLargeError,
+  ResponseBodyTooLargeError,
+} from "./errors.js";
+import {
+  emitHello,
+  emitReady,
+  PLUGIN_CHANNEL_PATH,
+  PLUGIN_EVENTS_PATH,
+  readLaunchConfig,
+} from "./protocol.js";
+import {
+  MAX_PLUGIN_REQUEST_BODY_BYTES,
+  MAX_PLUGIN_RESPONSE_BODY_BYTES,
+  type PluginArgs,
+  type PluginEvent,
+  type RequestHandler,
+  type TempsPlugin,
+} from "./types.js";
+import { createEmbeddedUiHandler, createUiHandler } from "./ui.js";
 
-/**
- * Run a Temps plugin. This is the main entry point.
- *
- * @example
- * ```ts
- * import { runPlugin, createManifest } from "@temps-sdk/plugin";
- *
- * runPlugin({
- *   manifest: () => createManifest("my-plugin", "0.1.0")
- *     .displayName("My Plugin")
- *     .addNav("Dashboard", "layout-dashboard", "/dashboard")
- *     .build(),
- *
- *   handler: (ctx) => async (req, res) => {
- *     res.writeHead(200, { "Content-Type": "application/json" });
- *     res.end(JSON.stringify({ hello: "world" }));
- *   },
- * });
- * ```
- */
+const CHANNEL_TIMEOUT_MS = 30_000;
+
+/** Run a TypeScript Temps plugin under Bun or as a Bun-compiled executable. */
 export async function runPlugin(plugin: TempsPlugin): Promise<void> {
-  // 1. Parse CLI arguments
-  const args = parseArgs(process.argv.slice(2));
-
-  // Ensure data directory exists
-  mkdirSync(args.dataDir, { recursive: true });
-
+  const args = parsePluginArgs(process.argv.slice(2));
   const manifest = plugin.manifest();
+  validateManifest(manifest.name, manifest.health_path);
 
-  // 2. Emit manifest (handshake phase 1)
-  emitManifest(manifest);
+  // Stage 1: identify the protocol and requested privileges before receiving secrets.
+  emitHello(manifest);
+  const launch = await readLaunchConfig(manifest);
 
-  // Ensure socket directory exists and clean up stale socket
-  const socketDir = dirname(args.socketPath);
-  mkdirSync(socketDir, { recursive: true });
-  if (existsSync(args.socketPath)) {
-    unlinkSync(args.socketPath);
-  }
+  mkdirSync(args.dataDir, { recursive: true });
+  mkdirSync(dirname(args.socketPath), { recursive: true });
+  removeSocket(args.socketPath);
 
-  // Channel connection promise -- resolved when the host connects
   let resolveChannel: ((client: TempsClient) => void) | undefined;
-  const channelReady = new Promise<TempsClient>((resolve) => {
+  let rejectChannel: ((error: Error) => void) | undefined;
+  const channelReady = new Promise<TempsClient>((resolve, reject) => {
     resolveChannel = resolve;
+    rejectChannel = reject;
   });
 
-  // Track state
+  const messageListeners = new Map<unknown, Set<(data: unknown) => void>>();
+  const closeListeners = new Map<unknown, Set<() => void>>();
+  const errorListeners = new Map<unknown, Set<(error: unknown) => void>>();
+  let channelClaimed = false;
   let currentContext: PluginContext | undefined;
-  let pluginReady = false;
+  let pluginFetch:
+    | ((request: Request, caller?: AuthenticatedCaller) => Promise<Response>)
+    | undefined;
+  let shuttingDown = false;
 
-  // Embedded UI
   const embeddedAssets = plugin.embeddedUiAssets?.();
-  const hasUi = embeddedAssets !== undefined || plugin.uiDistPath?.() !== undefined;
-
-  // Build embedded UI handler if available
+  const uiDistPath = plugin.uiDistPath?.();
   const embeddedUiHandler = embeddedAssets
     ? createEmbeddedUiHandler(embeddedAssets)
     : undefined;
+  const filesystemUiHandler = uiDistPath ? createUiHandler(uiDistPath) : undefined;
+  const hasUi = embeddedUiHandler !== undefined || filesystemUiHandler !== undefined;
 
-  // Active plugin fetch handler -- set once plugin is initialized
-  let pluginFetch: ((req: Request) => Response | Promise<Response>) | undefined;
-
-  // Bun WebSocket adapter plumbing
-  const wsMessageListeners = new Map<unknown, Set<(data: string) => void>>();
-  const wsCloseListeners = new Map<unknown, Set<() => void>>();
-
-  // 3. Start Bun.serve on Unix socket
   const server = Bun.serve({
     unix: args.socketPath,
 
-    fetch(req: Request, server) {
-      const url = new URL(req.url);
+    async fetch(request, bunServer) {
+      const url = new URL(request.url);
 
-      // WebSocket upgrade for platform channel
       if (url.pathname === PLUGIN_CHANNEL_PATH) {
-        if (server.upgrade(req)) {
-          return undefined as unknown as Response;
+        const verification = verifyProxyHeaders(request.headers, launch.auth_secret);
+        if (!verification.verified) {
+          log("warn", "Rejected unauthenticated platform channel attempt", {
+            plugin: manifest.name,
+          });
+          return new Response("Unauthorized", { status: 401 });
         }
+        if (channelClaimed) return new Response("Channel already connected", { status: 409 });
+
+        channelClaimed = true;
+        if (bunServer.upgrade(request)) return undefined;
+        channelClaimed = false;
         return new Response("WebSocket upgrade failed", { status: 500 });
       }
 
-      // Health endpoint -- always available
-      if (url.pathname === manifest.health_path || url.pathname === "/health") {
+      // Health remains available before channel initialization, matching the Rust SDK.
+      if (url.pathname === manifest.health_path) {
         return Response.json({ status: "ok", plugin: manifest.name });
       }
 
-      // Event delivery endpoint
-      if (url.pathname === "/_events" && req.method === "POST") {
-        return handleEventDelivery(req, plugin, currentContext);
-      }
-
-      // Not initialized yet
-      if (!pluginReady || !pluginFetch) {
+      if (!pluginFetch || !currentContext) {
         return new Response("Plugin initializing", { status: 503 });
       }
 
-      // Try embedded UI
-      if (embeddedUiHandler) {
-        const uiResponse = handleEmbeddedUi(url, embeddedAssets!);
-        if (uiResponse) return uiResponse;
+      if (
+        manifest.events.length > 0 &&
+        url.pathname === PLUGIN_EVENTS_PATH &&
+        request.method === "POST"
+      ) {
+        const verification = verifyProxyHeaders(request.headers, launch.auth_secret);
+        if (!verification.verified) return authenticationRequired();
+        return handleEventDelivery(request, plugin, currentContext);
       }
 
-      // Delegate to plugin
-      return pluginFetch(req);
+      const verification = verifyProxyHeaders(request.headers, launch.auth_secret);
+      if (!verification.verified) return authenticationRequired();
+      return pluginFetch(request, verification.caller);
     },
 
     websocket: {
-      open(ws) {
-        wsMessageListeners.set(ws, new Set());
-        wsCloseListeners.set(ws, new Set());
-
-        const adapter = createWsAdapter(ws, wsMessageListeners, wsCloseListeners);
-        const client = new TempsClient(adapter);
-        resolveChannel?.(client);
+      open(socket) {
+        messageListeners.set(socket, new Set());
+        closeListeners.set(socket, new Set());
+        errorListeners.set(socket, new Set());
+        resolveChannel?.(
+          new TempsClient(
+            createWsAdapter(socket, messageListeners, closeListeners, errorListeners)
+          )
+        );
+        resolveChannel = undefined;
+        rejectChannel = undefined;
       },
-      message(ws, message) {
-        const msgStr = typeof message === "string" ? message : message.toString();
-        const listeners = wsMessageListeners.get(ws);
-        if (listeners) {
-          for (const fn of listeners) fn(msgStr);
-        }
+      message(socket, message) {
+        for (const listener of messageListeners.get(socket) ?? []) listener(message);
       },
-      close(ws) {
-        const listeners = wsCloseListeners.get(ws);
-        if (listeners) {
-          for (const fn of listeners) fn();
-        }
-        wsMessageListeners.delete(ws);
-        wsCloseListeners.delete(ws);
+      close(socket) {
+        for (const listener of closeListeners.get(socket) ?? []) listener();
+        messageListeners.delete(socket);
+        closeListeners.delete(socket);
+        errorListeners.delete(socket);
       },
     },
   });
 
-  // 4. Emit ready (handshake phase 2)
-  emitReady(hasUi);
-
-  // 5. Wait for the host to connect via WebSocket channel (with timeout)
-  const channelTimeoutMs = 30_000;
-  let client: TempsClient;
   try {
-    client = await Promise.race([
+    chmodSync(args.socketPath, 0o600);
+
+    // Stage 2: only report ready after the socket is bound.
+    emitReady({ hasUi, openapi: plugin.openapiSchema?.() });
+
+    const client = await withTimeout(
       channelReady,
-      new Promise<never>((_, reject) =>
-        setTimeout(
-          () => reject(new Error("Channel connection timeout")),
-          channelTimeoutMs
-        )
-      ),
-    ]);
-  } catch {
-    console.error(
-      "[temps-plugin] Warning: platform channel not connected, running without platform data access"
+      CHANNEL_TIMEOUT_MS,
+      new InitializationError(
+        manifest.name,
+        `Platform channel connection timed out after ${CHANNEL_TIMEOUT_MS}ms`
+      )
     );
-    client = null as unknown as TempsClient;
-  }
 
-  // 6. Create PluginContext
-  const ctx = new PluginContext({
-    pluginName: manifest.name,
-    dataDir: args.dataDir,
-    authSecret: args.authSecret,
-    client,
-  });
-  currentContext = ctx;
-
-  if (client) {
-    client.onEvent((event: PluginEvent) => {
-      plugin.onEvent?.(ctx, event);
+    const context = new PluginContext({
+      pluginName: manifest.name,
+      dataDir: args.dataDir,
+      databaseUrl: launch.database_url ?? undefined,
+      hostDataDir: launch.host_data_dir ?? undefined,
+      hostApiUrl: args.hostApiUrl,
+      authSecret: launch.auth_secret,
+      client,
     });
-  }
+    currentContext = context;
 
-  // 7. Call plugin.onStart()
-  try {
-    await plugin.onStart?.(ctx);
-  } catch (err) {
-    throw new InitializationError(
-      manifest.name,
-      err instanceof Error ? err.message : String(err)
-    );
-  }
+    client.onEvent(async (event) => {
+      try {
+        await plugin.onEvent?.(context, event);
+      } catch (error) {
+        log("error", "Plugin event handler failed", {
+          plugin: manifest.name,
+          event_type: event.event_type,
+          reason: errorMessage(error),
+        });
+      }
+    });
 
-  // 8. Mount the plugin handler
-  const nodeHandler = await plugin.handler(ctx);
-
-  // Wrap the Node-style (req, res) handler into a Bun fetch handler
-  pluginFetch = (req: Request) => nodeRequestBridge(req, nodeHandler);
-  pluginReady = true;
-
-  // 9. Graceful shutdown
-  const shutdown = async () => {
-    console.error(`[temps-plugin] Shutting down ${manifest.name}...`);
     try {
-      await plugin.onShutdown?.();
-    } catch (err) {
-      console.error("[temps-plugin] Error during shutdown:", err);
+      await plugin.onStart?.(context);
+    } catch (error) {
+      throw new InitializationError(manifest.name, errorMessage(error));
     }
-    client?.close();
-    server.stop();
 
-    if (existsSync(args.socketPath)) {
-      try { unlinkSync(args.socketPath); } catch { /* ignore */ }
+    const handler = await plugin.handler(context);
+    pluginFetch = (request, caller) =>
+      nodeRequestBridge(request, handler, caller, manifest.name, [
+        embeddedUiHandler,
+        filesystemUiHandler,
+      ]);
+
+    const shutdown = async (signal: string) => {
+      if (shuttingDown) return;
+      shuttingDown = true;
+      log("info", "Shutting down plugin", { plugin: manifest.name, signal });
+      try {
+        await plugin.onShutdown?.();
+      } catch (error) {
+        log("error", "Plugin shutdown hook failed", {
+          plugin: manifest.name,
+          reason: errorMessage(error),
+        });
+      }
+      client.close();
+      server.stop(true);
+      removeSocket(args.socketPath);
+    };
+
+    process.once("SIGTERM", () => void shutdown("SIGTERM"));
+    process.once("SIGINT", () => void shutdown("SIGINT"));
+
+    log("info", "Plugin fully initialized", {
+      plugin: manifest.name,
+      version: manifest.version,
+      socket_path: args.socketPath,
+    });
+  } catch (error) {
+    rejectChannel?.(error instanceof Error ? error : new Error(String(error)));
+    server.stop(true);
+    removeSocket(args.socketPath);
+    throw error;
+  }
+}
+
+export function parsePluginArgs(argv: string[]): PluginArgs {
+  const values = new Map<string, string>();
+  const supported = new Set(["--socket-path", "--data-dir", "--host-api-url"]);
+
+  for (let index = 0; index < argv.length; index += 2) {
+    const flag = argv[index];
+    const value = argv[index + 1];
+    if (!flag || !supported.has(flag)) {
+      throw new ArgsError(`unexpected argument: ${flag ?? "<missing>"}`);
     }
-    process.exit(0);
+    if (!value || value.startsWith("--")) {
+      throw new ArgsError(`${flag} requires a value`);
+    }
+    values.set(flag, value);
+  }
+
+  const socketPath = values.get("--socket-path");
+  const dataDir = values.get("--data-dir");
+  if (!socketPath) throw new ArgsError("--socket-path is required");
+  if (!dataDir) throw new ArgsError("--data-dir is required");
+
+  return {
+    socketPath,
+    dataDir,
+    ...(values.has("--host-api-url")
+      ? { hostApiUrl: values.get("--host-api-url") }
+      : {}),
   };
-
-  process.on("SIGTERM", shutdown);
-  process.on("SIGINT", shutdown);
-
-  console.error(
-    `[temps-plugin] ${manifest.display_name ?? manifest.name} v${manifest.version} running on ${args.socketPath}`
-  );
 }
-
-// ---------------------------------------------------------------------------
-// Embedded UI serving (pure Bun Response)
-// ---------------------------------------------------------------------------
-
-function handleEmbeddedUi(
-  url: URL,
-  assets: EmbeddedAssets
-): Response | undefined {
-  const pathname = url.pathname;
-
-  // Redirect /ui to /ui/
-  if (pathname === "/ui") {
-    return new Response(null, {
-      status: 302,
-      headers: { Location: "/ui/" },
-    });
-  }
-
-  if (!pathname.startsWith("/ui/")) {
-    return undefined;
-  }
-
-  const relativePath = pathname.slice("/ui/".length) || "index.html";
-
-  if (relativePath.includes("..")) {
-    return new Response("Forbidden", { status: 403 });
-  }
-
-  // Exact match
-  const file = assets.get(relativePath);
-  if (file) {
-    return new Response(new Uint8Array(file.content), {
-      headers: {
-        "Content-Type": file.contentType,
-        "Content-Length": String(file.content.byteLength),
-        "Cache-Control": file.immutable
-          ? "public, max-age=31536000, immutable"
-          : "no-cache, no-store, must-revalidate",
-      },
-    });
-  }
-
-  // SPA fallback for paths without file extensions
-  const hasExt = (relativePath.split("/").pop() ?? "").includes(".");
-  if (!hasExt) {
-    const index = assets.get("index.html");
-    if (index) {
-      return new Response(new Uint8Array(index.content), {
-        headers: {
-          "Content-Type": index.contentType,
-          "Content-Length": String(index.content.byteLength),
-          "Cache-Control": "no-cache, no-store, must-revalidate",
-        },
-      });
-    }
-  }
-
-  return new Response("Not Found", { status: 404 });
-}
-
-// ---------------------------------------------------------------------------
-// Bun WebSocket -> WsLike adapter
-// ---------------------------------------------------------------------------
 
 function createWsAdapter(
-  ws: { send: (msg: string | Buffer) => void; close: () => void },
-  messageListeners: Map<unknown, Set<(data: string) => void>>,
-  closeListeners: Map<unknown, Set<() => void>>
+  socket: { send(message: string | Buffer): number; close(): void },
+  messageListeners: Map<unknown, Set<(data: unknown) => void>>,
+  closeListeners: Map<unknown, Set<() => void>>,
+  errorListeners: Map<unknown, Set<(error: unknown) => void>>
 ): WsLike {
   return {
-    on(event: string, fn: (...args: unknown[]) => void) {
+    on(event: string, listener: (...args: unknown[]) => void) {
       if (event === "message") {
-        messageListeners.get(ws)?.add(fn as (data: string) => void);
-      } else if (event === "close") {
-        closeListeners.get(ws)?.add(fn as () => void);
+        messageListeners.get(socket)?.add(listener as (data: unknown) => void);
+      }
+      if (event === "close") {
+        closeListeners.get(socket)?.add(listener as () => void);
+      }
+      if (event === "error") {
+        errorListeners.get(socket)?.add(listener as (error: unknown) => void);
       }
     },
-    send(data: string, cb?: (err?: Error) => void) {
+    send(data, callback) {
       try {
-        ws.send(data);
-        cb?.();
-      } catch (err) {
-        cb?.(err as Error);
+        socket.send(data);
+        callback?.();
+      } catch (error) {
+        callback?.(error instanceof Error ? error : new Error(String(error)));
       }
     },
     close() {
-      ws.close();
+      socket.close();
     },
-  };
+  } as WsLike;
 }
 
-// ---------------------------------------------------------------------------
-// Node (req, res) handler -> Bun fetch bridge
-// ---------------------------------------------------------------------------
-
-import type { IncomingMessage, ServerResponse } from "node:http";
-
 async function nodeRequestBridge(
-  req: Request,
-  handler: (req: IncomingMessage, res: ServerResponse) => void | Promise<void>
+  request: Request,
+  handler: RequestHandler,
+  caller: AuthenticatedCaller | undefined,
+  pluginName: string,
+  uiHandlers: Array<ReturnType<typeof createUiHandler> | undefined>
 ): Promise<Response> {
-  const url = new URL(req.url);
-
-  // Read body upfront
-  let bodyBuffer = Buffer.alloc(0);
-  if (req.body) {
-    bodyBuffer = Buffer.from(await req.arrayBuffer());
+  const url = new URL(request.url);
+  let body: Buffer;
+  try {
+    body = await readRequestBody(request);
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) return payloadTooLarge(error);
+    throw error;
   }
 
   return new Promise<Response>((resolve) => {
-    // Build a minimal IncomingMessage shim
-    const fakeReq = Object.create(null) as IncomingMessage;
-    fakeReq.url = url.pathname + url.search;
-    fakeReq.method = req.method;
+    const incoming = Object.create(null) as IncomingMessage;
+    incoming.url = `${url.pathname}${url.search}`;
+    incoming.method = request.method;
+    const incomingHeaders: Record<string, string> = {};
+    request.headers.forEach((value, name) => {
+      incomingHeaders[name] = value;
+    });
+    incoming.headers = incomingHeaders;
+    attachVerifiedCaller(incoming, caller);
 
-    const hdrs: Record<string, string> = {};
-    req.headers.forEach((v, k) => { hdrs[k] = v; });
-    fakeReq.headers = hdrs;
+    const dataListeners: Array<(chunk: Buffer) => void> = [];
+    const endListeners: Array<() => void> = [];
+    incoming.on = ((event: string, listener: (...args: unknown[]) => void) => {
+      if (event === "data") dataListeners.push(listener as (chunk: Buffer) => void);
+      if (event === "end") endListeners.push(listener as () => void);
+      return incoming;
+    }) as typeof incoming.on;
 
-    // Body event emitter shim
-    const dataFns: Array<(chunk: Buffer) => void> = [];
-    const endFns: Array<() => void> = [];
-    fakeReq.on = ((event: string, fn: (...a: unknown[]) => void) => {
-      if (event === "data") dataFns.push(fn as (c: Buffer) => void);
-      if (event === "end") endFns.push(fn as () => void);
-      return fakeReq;
-    }) as typeof fakeReq.on;
+    let status = 200;
+    let ended = false;
+    const headers: Record<string, string> = {};
+    const responseBody = new ResponseBodyAccumulator();
+    const response = Object.create(null) as ServerResponse;
 
-    // Response collector shim
-    let statusCode = 200;
-    const resHeaders: Record<string, string> = {};
-    const chunks: Buffer[] = [];
+    const failOversizedResponse = (error: ResponseBodyTooLargeError) => {
+      if (ended) return;
+      ended = true;
+      log("error", "Plugin response exceeded the runtime body limit", {
+        plugin: pluginName,
+        actual_bytes: error.actualBytes,
+        maximum_bytes: error.maximumBytes,
+      });
+      resolve(responseTooLarge(error));
+    };
 
-    const fakeRes = Object.create(null) as ServerResponse;
-    fakeRes.writeHead = ((code: number, h?: Record<string, string>) => {
-      statusCode = code;
-      if (h) Object.assign(resHeaders, h);
-      return fakeRes;
-    }) as typeof fakeRes.writeHead;
-
-    fakeRes.end = ((data?: string | Buffer) => {
-      if (data) chunks.push(typeof data === "string" ? Buffer.from(data) : data);
-      const body = Buffer.concat(chunks);
-      resolve(new Response(body.length > 0 ? body : null, {
-        status: statusCode,
-        headers: resHeaders,
-      }));
-    }) as typeof fakeRes.end;
-
-    fakeRes.write = ((data: string | Buffer) => {
-      chunks.push(typeof data === "string" ? Buffer.from(data) : data);
-      return true;
-    }) as typeof fakeRes.write;
-
-    // Call the handler
-    handler(fakeReq, fakeRes);
-
-    // Deliver body
-    queueMicrotask(() => {
-      if (bodyBuffer.length > 0) {
-        for (const fn of dataFns) fn(bodyBuffer);
+    Object.defineProperty(response, "statusCode", {
+      get: () => status,
+      set: (value: number) => {
+        status = value;
+      },
+    });
+    response.setHeader = ((name: string, value: string | number | readonly string[]) => {
+      headers[name] = Array.isArray(value) ? value.join(", ") : String(value);
+      return response;
+    }) as typeof response.setHeader;
+    response.getHeader = ((name: string) => headers[name]) as typeof response.getHeader;
+    response.writeHead = ((code: number, values?: Record<string, string>) => {
+      status = code;
+      if (values) Object.assign(headers, values);
+      return response;
+    }) as typeof response.writeHead;
+    response.write = ((value: string | Buffer) => {
+      if (ended) return false;
+      try {
+        responseBody.append(value);
+        return true;
+      } catch (error) {
+        if (error instanceof ResponseBodyTooLargeError) {
+          failOversizedResponse(error);
+          return false;
+        }
+        throw error;
       }
-      for (const fn of endFns) fn();
+    }) as typeof response.write;
+    response.end = ((value?: string | Buffer) => {
+      if (ended) return response;
+      try {
+        if (value) responseBody.append(value);
+      } catch (error) {
+        if (error instanceof ResponseBodyTooLargeError) {
+          failOversizedResponse(error);
+          return response;
+        }
+        throw error;
+      }
+      ended = true;
+      const body = responseBody.toBuffer();
+      resolve(
+        new Response(body.length === 0 ? null : (body as unknown as BodyInit), {
+          status,
+          headers,
+        })
+      );
+      return response;
+    }) as typeof response.end;
+
+    const uiHandled = uiHandlers.some((uiHandler) => uiHandler?.(incoming, response));
+    if (!uiHandled) {
+      void Promise.resolve(handler(incoming, response)).catch((error) => {
+        if (ended) return;
+        log("error", "Plugin request handler failed", {
+          plugin: pluginName,
+          reason: errorMessage(error),
+        });
+        status = 500;
+        headers["Content-Type"] = "application/problem+json";
+        response.end(
+          JSON.stringify({
+            type: "https://temps.sh/problems/plugin-handler-failed",
+            title: "Plugin Handler Failed",
+            status: 500,
+            detail: "The plugin could not complete this request.",
+          })
+        );
+      });
+    }
+
+    queueMicrotask(() => {
+      if (body.length > 0) for (const listener of dataListeners) listener(body);
+      for (const listener of endListeners) listener();
     });
   });
 }
 
-// ---------------------------------------------------------------------------
-// Event delivery handler (POST /_events)
-// ---------------------------------------------------------------------------
-
 async function handleEventDelivery(
-  req: Request,
+  request: Request,
   plugin: TempsPlugin,
-  ctx?: PluginContext
+  context: PluginContext
 ): Promise<Response> {
+  let event: PluginEvent;
   try {
-    const event = (await req.json()) as PluginEvent;
-    if (ctx) {
-      plugin.onEvent?.(ctx, event);
+    const body = await readRequestBody(request);
+    event = JSON.parse(body.toString("utf8")) as PluginEvent;
+    if (
+      typeof event.id !== "string" ||
+      typeof event.event_type !== "string" ||
+      typeof event.timestamp !== "string" ||
+      typeof event.data !== "object" ||
+      event.data === null
+    ) {
+      throw new Error("event is missing required fields");
     }
-    return Response.json({ ok: true });
-  } catch (err) {
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) return payloadTooLarge(error);
     return Response.json(
       {
-        error: "Invalid event payload",
-        detail: err instanceof Error ? err.message : String(err),
+        type: "https://temps.sh/problems/plugin-event-invalid",
+        title: "Invalid Plugin Event",
+        status: 400,
+        detail: "The event payload is not valid.",
       },
       { status: 400 }
     );
   }
+
+  try {
+    await plugin.onEvent?.(context, event);
+    return new Response(null, { status: 200 });
+  } catch (error) {
+    log("error", "Plugin event handler failed", {
+      plugin: context.pluginName,
+      event_type: event.event_type,
+      reason: errorMessage(error),
+    });
+    return Response.json(
+      {
+        type: "https://temps.sh/problems/plugin-event-handler-failed",
+        title: "Plugin Event Handler Failed",
+        status: 500,
+        detail: "The plugin could not process this event.",
+      },
+      { status: 500 }
+    );
+  }
 }
 
-// ---------------------------------------------------------------------------
-// CLI argument parsing
-// ---------------------------------------------------------------------------
-
-function parseArgs(argv: string[]): PluginArgs {
-  const args: Partial<PluginArgs> = {};
-
-  for (let i = 0; i < argv.length; i++) {
-    const arg = argv[i]!;
-    const next = argv[i + 1];
-
-    switch (arg) {
-      case "--socket-path":
-        args.socketPath = next;
-        i++;
-        break;
-      case "--database-url":
-        args.databaseUrl = next;
-        i++;
-        break;
-      case "--auth-secret":
-        args.authSecret = next;
-        i++;
-        break;
-      case "--data-dir":
-        args.dataDir = next;
-        i++;
-        break;
+/** @internal Read a plugin request without allowing unbounded process memory growth. */
+export async function readRequestBody(
+  request: Request,
+  maximumBytes = MAX_PLUGIN_REQUEST_BODY_BYTES
+): Promise<Buffer> {
+  const declaredLength = request.headers.get("content-length");
+  if (declaredLength !== null) {
+    const parsedLength = Number(declaredLength);
+    if (Number.isFinite(parsedLength) && parsedLength > maximumBytes) {
+      throw new RequestBodyTooLargeError(parsedLength, maximumBytes);
     }
   }
 
-  if (!args.socketPath) {
-    throw new ArgsError("--socket-path is required");
+  if (!request.body) return Buffer.alloc(0);
+
+  const reader = request.body.getReader();
+  const chunks: Buffer[] = [];
+  let totalBytes = 0;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    totalBytes += value.byteLength;
+    if (totalBytes > maximumBytes) {
+      await reader.cancel("plugin request body limit exceeded");
+      throw new RequestBodyTooLargeError(totalBytes, maximumBytes);
+    }
+    chunks.push(Buffer.from(value));
   }
-  if (!args.authSecret) {
-    throw new ArgsError("--auth-secret is required");
-  }
-  if (!args.dataDir) {
-    throw new ArgsError("--data-dir is required");
+  return Buffer.concat(chunks, totalBytes);
+}
+
+/** @internal Bounded response collector used by the Node-compatible bridge. */
+export class ResponseBodyAccumulator {
+  readonly #maximumBytes: number;
+  readonly #chunks: Buffer[] = [];
+  #totalBytes = 0;
+
+  constructor(maximumBytes = MAX_PLUGIN_RESPONSE_BODY_BYTES) {
+    this.#maximumBytes = maximumBytes;
   }
 
-  return args as PluginArgs;
+  append(value: string | Buffer): void {
+    const chunk = typeof value === "string" ? Buffer.from(value) : value;
+    const nextTotal = this.#totalBytes + chunk.byteLength;
+    if (nextTotal > this.#maximumBytes) {
+      throw new ResponseBodyTooLargeError(nextTotal, this.#maximumBytes);
+    }
+    this.#chunks.push(chunk);
+    this.#totalBytes = nextTotal;
+  }
+
+  toBuffer(): Buffer {
+    return Buffer.concat(this.#chunks, this.#totalBytes);
+  }
+}
+
+function authenticationRequired(): Response {
+  return Response.json(
+    {
+      type: "https://temps.sh/problems/plugin-authentication-required",
+      title: "Authentication Required",
+      status: 401,
+      detail: "This plugin route requires a request asserted by Temps.",
+    },
+    { status: 401, headers: { "Content-Type": "application/problem+json" } }
+  );
+}
+
+function payloadTooLarge(error: RequestBodyTooLargeError): Response {
+  return Response.json(
+    {
+      type: "https://temps.sh/problems/plugin-request-body-too-large",
+      title: "Plugin Request Body Too Large",
+      status: 413,
+      detail: error.message,
+      maximum_bytes: error.maximumBytes,
+    },
+    { status: 413, headers: { "Content-Type": "application/problem+json" } }
+  );
+}
+
+function responseTooLarge(error: ResponseBodyTooLargeError): Response {
+  return Response.json(
+    {
+      type: "https://temps.sh/problems/plugin-response-body-too-large",
+      title: "Plugin Response Body Too Large",
+      status: 502,
+      detail: "The plugin produced a response larger than the runtime limit.",
+      maximum_bytes: error.maximumBytes,
+    },
+    { status: 502, headers: { "Content-Type": "application/problem+json" } }
+  );
+}
+
+function validateManifest(name: string, healthPath: string): void {
+  if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(name)) {
+    throw new InitializationError(name, "Plugin name must be lowercase kebab-case");
+  }
+  if (!healthPath.startsWith("/") || healthPath.includes("..")) {
+    throw new InitializationError(name, `Invalid health path: ${healthPath}`);
+  }
+}
+
+function withTimeout<T>(promise: Promise<T>, milliseconds: number, error: Error): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(error), milliseconds);
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (reason) => {
+        clearTimeout(timer);
+        reject(reason);
+      }
+    );
+  });
+}
+
+function removeSocket(path: string): void {
+  if (!existsSync(path)) return;
+  try {
+    unlinkSync(path);
+  } catch (error) {
+    throw new InitializationError(path, `Failed to remove Unix socket: ${errorMessage(error)}`);
+  }
+}
+
+function log(
+  level: "info" | "warn" | "error",
+  message: string,
+  fields: Record<string, unknown>
+): void {
+  process.stderr.write(
+    `${JSON.stringify({ timestamp: new Date().toISOString(), level, message, ...fields })}\n`
+  );
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }

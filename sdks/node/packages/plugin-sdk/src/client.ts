@@ -1,246 +1,211 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-/**
- * TempsClient -- typed async client for querying platform data over
- * the WebSocket data channel.
- *
- * Mirrors: crates/temps-plugin-sdk/src/client.rs
- *
- * The client maintains a monotonically increasing request ID and a map
- * of pending requests. Each request sends a `ChannelRequest` frame over
- * the WebSocket and waits for a matching `ChannelResponse` by ID.
- */
-
 import type {
+  ApiCall,
+  ApiCallResult,
   ChannelMessage,
   ChannelRequest,
   ChannelResponse,
-  ProjectInfo,
-  EnvironmentInfo,
   DeploymentInfo,
+  EnvironmentInfo,
+  PlatformCallMap,
+  PlatformCallResponse,
+  PlatformMethod,
   PluginEvent,
+  ProjectInfo,
 } from "./types.js";
 import {
   ChannelClosedError,
   ChannelTimeoutError,
   PlatformError,
+  ProtocolMismatchError,
 } from "./errors.js";
 
 const DEFAULT_TIMEOUT_MS = 10_000;
 
-/**
- * Minimal WebSocket-like interface accepted by TempsClient.
- * Compatible with both the `ws` package and the Bun WebSocket adapter.
- */
 export interface WsLike {
-  on(event: string, fn: (...args: unknown[]) => void): void;
-  send(data: string, cb?: (err?: Error) => void): void;
+  on(event: "message", fn: (data: unknown) => void): void;
+  on(event: "close", fn: () => void): void;
+  on(event: "error", fn: (error: unknown) => void): void;
+  send(data: string, callback?: (error?: Error) => void): void;
   close(): void;
 }
 
 interface PendingRequest {
+  method: PlatformMethod;
   resolve: (value: unknown) => void;
   reject: (reason: Error) => void;
   timer: ReturnType<typeof setTimeout>;
 }
 
 export class TempsClient {
-  private ws: WsLike;
-  private nextId = 1;
-  private pending = new Map<number, PendingRequest>();
-  private closed = false;
-  private eventHandler?: (event: PluginEvent) => void;
-  private timeoutMs: number;
+  readonly #ws: WsLike;
+  readonly #pending = new Map<number, PendingRequest>();
+  readonly #timeoutMs: number;
+  #nextId = 1;
+  #closed = false;
+  #eventHandler?: (event: PluginEvent) => void | Promise<void>;
 
   constructor(ws: WsLike, options?: { timeoutMs?: number }) {
-    this.ws = ws;
-    this.timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.#ws = ws;
+    this.#timeoutMs = options?.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
-    this.ws.on("message", (data: unknown) => {
-      this.handleMessage(data);
-    });
-
-    this.ws.on("close", () => {
-      this.closed = true;
-      // Reject all pending requests
-      for (const [id, pending] of this.pending) {
-        clearTimeout(pending.timer);
-        pending.reject(new ChannelClosedError());
-        this.pending.delete(id);
-      }
-    });
-
-    this.ws.on("error", (err: unknown) => {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[temps-plugin] WebSocket error:", msg);
+    ws.on("message", (data) => this.#handleMessage(data));
+    ws.on("close", () => this.#closePending());
+    ws.on("error", (error) => {
+      this.#closePending(error instanceof Error ? error : new ChannelClosedError());
     });
   }
 
-  /**
-   * Register a handler for platform events pushed over the channel.
-   */
-  onEvent(handler: (event: PluginEvent) => void): void {
-    this.eventHandler = handler;
+  onEvent(handler: (event: PluginEvent) => void | Promise<void>): void {
+    this.#eventHandler = handler;
   }
 
-  // -------------------------------------------------------------------------
-  // Platform Data Queries
-  // -------------------------------------------------------------------------
-
-  async getProject(projectId: number): Promise<ProjectInfo> {
-    return this.request<ProjectInfo>("get_project", { project_id: projectId });
+  getProject(projectId: number): Promise<ProjectInfo> {
+    return this.call("get_project", { project_id: projectId });
   }
 
-  async listProjects(limit?: number): Promise<ProjectInfo[]> {
-    return this.request<ProjectInfo[]>("list_projects", { limit });
+  listProjects(): Promise<ProjectInfo[]> {
+    return this.call("list_projects", {});
   }
 
-  async getEnvironment(environmentId: number): Promise<EnvironmentInfo> {
-    return this.request<EnvironmentInfo>("get_environment", {
-      environment_id: environmentId,
-    });
+  getEnvironment(environmentId: number): Promise<EnvironmentInfo> {
+    return this.call("get_environment", { environment_id: environmentId });
   }
 
-  async listEnvironments(projectId: number): Promise<EnvironmentInfo[]> {
-    return this.request<EnvironmentInfo[]>("list_environments", {
-      project_id: projectId,
-    });
+  listEnvironments(projectId: number): Promise<EnvironmentInfo[]> {
+    return this.call("list_environments", { project_id: projectId });
   }
 
-  async getDeployment(deploymentId: number): Promise<DeploymentInfo> {
-    return this.request<DeploymentInfo>("get_deployment", {
-      deployment_id: deploymentId,
-    });
+  getDeployment(deploymentId: number): Promise<DeploymentInfo> {
+    return this.call("get_deployment", { deployment_id: deploymentId });
   }
 
-  async getLastDeployment(
+  getLastDeployment(
     projectId: number,
     environmentId?: number
   ): Promise<DeploymentInfo> {
-    return this.request<DeploymentInfo>("get_last_deployment", {
+    return this.call("get_last_deployment", compact({
       project_id: projectId,
       environment_id: environmentId,
-    });
+    }));
   }
 
-  async listDeployments(
+  listDeployments(
     projectId: number,
     options?: { environmentId?: number; limit?: number }
   ): Promise<DeploymentInfo[]> {
-    return this.request<DeploymentInfo[]>("list_deployments", {
+    return this.call("list_deployments", compact({
       project_id: projectId,
       environment_id: options?.environmentId,
       limit: options?.limit,
-    });
+    }));
   }
 
-  // -------------------------------------------------------------------------
-  // Low-level request/response
-  // -------------------------------------------------------------------------
+  apiCall(call: ApiCall): Promise<ApiCallResult> {
+    return this.call("api_call", call);
+  }
 
-  /**
-   * Send a typed channel request and wait for the response.
-   */
-  private request<T>(
-    method: string,
-    params: Record<string, unknown>
-  ): Promise<T> {
-    if (this.closed) {
-      return Promise.reject(new ChannelClosedError());
-    }
+  call<Method extends PlatformMethod>(
+    method: Method,
+    params: PlatformCallMap[Method]["params"]
+  ): Promise<PlatformCallMap[Method]["result"]> {
+    if (this.#closed) return Promise.reject(new ChannelClosedError());
 
-    const id = this.nextId++;
-
-    // Filter out undefined values from params
-    const cleanParams: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined) {
-        cleanParams[key] = value;
-      }
-    }
-
-    const msg: ChannelRequest = {
+    const id = this.#nextId++;
+    const message: ChannelRequest = {
       type: "request",
       id,
-      method,
-      params: cleanParams,
+      call: { method, params } as ChannelRequest["call"],
     };
 
-    return new Promise<T>((resolve, reject) => {
+    return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        reject(new ChannelTimeoutError(method, this.timeoutMs));
-      }, this.timeoutMs);
+        this.#pending.delete(id);
+        reject(new ChannelTimeoutError(method, this.#timeoutMs));
+      }, this.#timeoutMs);
 
-      this.pending.set(id, {
-        resolve: resolve as (value: unknown) => void,
+      this.#pending.set(id, {
+        method,
+        resolve: (value) => resolve(value as PlatformCallMap[Method]["result"]),
         reject,
         timer,
       });
 
-      this.ws.send(JSON.stringify(msg), (err) => {
-        if (err) {
-          clearTimeout(timer);
-          this.pending.delete(id);
-          reject(err);
-        }
+      this.#ws.send(JSON.stringify(message), (error) => {
+        if (!error) return;
+        clearTimeout(timer);
+        this.#pending.delete(id);
+        reject(error);
       });
     });
   }
 
-  private handleMessage(data: unknown): void {
-    let msg: ChannelMessage;
+  close(): void {
+    this.#closed = true;
+    this.#ws.close();
+    this.#closePending();
+  }
+
+  #handleMessage(data: unknown): void {
+    let message: ChannelMessage;
     try {
-      const str = typeof data === "string" ? data : String(data);
-      msg = JSON.parse(str) as ChannelMessage;
+      message = JSON.parse(normalizeMessage(data)) as ChannelMessage;
     } catch {
-      console.error("[temps-plugin] Failed to parse channel message");
       return;
     }
 
-    switch (msg.type) {
-      case "response":
-        this.handleResponse(msg as ChannelResponse);
-        break;
-      case "event":
-        if (this.eventHandler) {
-          this.eventHandler(msg.event);
-        }
-        break;
-      case "request":
-        // Plugins don't handle inbound requests from the host (yet)
-        console.warn(
-          `[temps-plugin] Received unexpected request: ${msg.method}`
-        );
-        break;
+    if (message.type === "response") {
+      this.#handleResponse(message);
+      return;
+    }
+
+    if (message.type === "event") {
+      void Promise.resolve(this.#eventHandler?.(message.event)).catch(() => undefined);
     }
   }
 
-  private handleResponse(msg: ChannelResponse): void {
-    const pending = this.pending.get(msg.id);
-    if (!pending) {
-      console.warn(
-        `[temps-plugin] Received response for unknown request ID: ${msg.id}`
+  #handleResponse(message: ChannelResponse): void {
+    const pending = this.#pending.get(message.id);
+    if (!pending) return;
+
+    clearTimeout(pending.timer);
+    this.#pending.delete(message.id);
+
+    if ("err" in message.outcome) {
+      pending.reject(
+        new PlatformError(message.outcome.err.code, message.outcome.err.message)
       );
       return;
     }
 
-    clearTimeout(pending.timer);
-    this.pending.delete(msg.id);
-
-    if (msg.error) {
-      pending.reject(new PlatformError(msg.error.code, msg.error.message));
-    } else {
-      pending.resolve(msg.result);
+    const response: PlatformCallResponse = message.outcome.ok;
+    if (response.method !== pending.method) {
+      pending.reject(new ProtocolMismatchError(pending.method, response.method));
+      return;
     }
+    pending.resolve(response.result);
   }
 
-  /**
-   * Close the WebSocket connection.
-   */
-  close(): void {
-    this.closed = true;
-    this.ws.close();
+  #closePending(reason: Error = new ChannelClosedError()): void {
+    this.#closed = true;
+    for (const pending of this.#pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(reason);
+    }
+    this.#pending.clear();
   }
+}
+
+function normalizeMessage(data: unknown): string {
+  if (typeof data === "string") return data;
+  if (data instanceof Uint8Array) return Buffer.from(data).toString("utf8");
+  return String(data);
+}
+
+function compact<T extends Record<string, unknown>>(value: T): T {
+  return Object.fromEntries(
+    Object.entries(value).filter(([, entry]) => entry !== undefined)
+  ) as T;
 }

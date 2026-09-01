@@ -7,7 +7,13 @@
  * Mirrors the Rust `PluginManifest::builder()` pattern.
  */
 
-import type { NavEntry, NavSection, PluginManifest, UiManifest } from "./types.js";
+import type {
+  NavEntry,
+  NavSection,
+  PluginCapability,
+  PluginManifest,
+  UiManifest,
+} from "./types.js";
 
 export class ManifestBuilder {
   private _name: string;
@@ -17,7 +23,11 @@ export class ManifestBuilder {
   private _nav: NavEntry[] = [];
   private _ui?: UiManifest;
   private _requiresDb = false;
+  private _requiresHostDataAccess = false;
   private _healthPath = "/health";
+  private _hideHeader = false;
+  private _publicPaths: string[] = [];
+  private _capabilities: PluginCapability[] = [];
   private _events: string[] = [];
 
   constructor(name: string, version: string) {
@@ -69,8 +79,30 @@ export class ManifestBuilder {
     return this;
   }
 
+  requiresHostDataAccess(requires: boolean): this {
+    this._requiresHostDataAccess = requires;
+    return this;
+  }
+
   healthPath(path: string): this {
     this._healthPath = path;
+    return this;
+  }
+
+  hideHeader(hide = true): this {
+    this._hideHeader = hide;
+    return this;
+  }
+
+  publicPath(path: string): this {
+    this._publicPaths.push(path);
+    return this;
+  }
+
+  capability(capability: PluginCapability): this {
+    if (!this._capabilities.includes(capability)) {
+      this._capabilities.push(capability);
+    }
     return this;
   }
 
@@ -93,7 +125,11 @@ export class ManifestBuilder {
       nav: this._nav,
       ui: this._ui,
       requires_db: this._requiresDb,
+      requires_host_data_access: this._requiresHostDataAccess,
       health_path: this._healthPath,
+      hide_header: this._hideHeader,
+      public_paths: this._publicPaths,
+      capabilities: this._capabilities,
       events: this._events,
     };
   }

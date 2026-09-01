@@ -9,6 +9,7 @@ export const metadata = {
 export const sections = [
   { title: 'Overview', id: 'overview' },
   { title: 'Example Plugins', id: 'examples' },
+  { title: 'TypeScript Plugins', id: 'typescript' },
   { title: 'Plugin Architecture', id: 'architecture' },
   { title: 'Key Plugins', id: 'key-plugins' },
   { title: 'Service Registration', id: 'service-registration' },
@@ -19,7 +20,7 @@ export const sections = [
 
 Temps uses a modular plugin architecture that enables extensibility without modifying core code. All functionality is organized as plugins implementing the `TempsPlugin` trait. {{ className: 'lead' }}
 
-> **Looking for working code?** Official external plugins — Lighthouse audits, IndexNow, Google Indexing, and a minimal hello-world — live in the dedicated [`gotempsh/plugins`](https://github.com/gotempsh/plugins) repository. Each one is a standalone Cargo crate you can clone, build, and install as a drop-in binary.
+> **Looking for working code?** Official Rust plugins — Lighthouse audits, IndexNow, Google Indexing, and a minimal hello-world — live in [`gotempsh/plugins`](https://github.com/gotempsh/plugins). The TypeScript SDK and its compiled example live in the main Temps repository under [`sdks/node`](https://github.com/gotempsh/temps/tree/main/sdks/node).
 
 > **Building an external plugin?** See the [External Plugin SDK authentication and platform API reference](/docs/reference/external-plugin-sdk) for protected routes, caller permissions, delegated API calls, manifest capabilities, and public endpoints.
 
@@ -88,7 +89,7 @@ graph TB
 
 ## Example Plugins {{ anchor: true, id: 'examples' }}
 
-The [`gotempsh/plugins`](https://github.com/gotempsh/plugins) repository ships four reference plugins that demonstrate the external plugin SDK end-to-end. Each one is a standalone Cargo crate with source, tests, and an optional Vite/React UI bundle.
+The [`gotempsh/plugins`](https://github.com/gotempsh/plugins) repository ships four Rust reference plugins that demonstrate the external plugin SDK end-to-end. Each one is a standalone Cargo crate with source, tests, and an optional Vite/React UI bundle. The main repository also contains a TypeScript/Bun example that compiles to the same standalone plugin format.
 
 | Plugin | Purpose |
 | --- | --- |
@@ -96,8 +97,47 @@ The [`gotempsh/plugins`](https://github.com/gotempsh/plugins) repository ships f
 | [`lighthouse-plugin`](https://github.com/gotempsh/plugins/tree/main/lighthouse-plugin) | Runs Google Lighthouse audits after every deployment and tracks Core Web Vitals over time. |
 | [`indexnow-plugin`](https://github.com/gotempsh/plugins/tree/main/indexnow-plugin) | Submits deployed URLs to IndexNow-supporting search engines (Bing, Yandex, Seznam). |
 | [`google-indexing-plugin`](https://github.com/gotempsh/plugins/tree/main/google-indexing-plugin) | Notifies the Google Indexing API when pages are published or removed. |
+| [`typescript-hello-plugin`](https://github.com/gotempsh/temps/tree/main/sdks/node/examples/node-hello-plugin) | Complete TypeScript plugin with authenticated routes, platform queries, events, an embedded React UI, and a protocol integration test. |
 
 Every tagged release publishes per-platform binaries on [GitHub Releases](https://github.com/gotempsh/plugins/releases) — drop one into `~/.temps/plugins/`, click **Reload Plugins** in the dashboard, and it's live. Or clone the repo and run `cargo build --release` to build from source.
+
+---
+
+## TypeScript Plugins {{ anchor: true, id: 'typescript' }}
+
+Install [`@temps-sdk/plugin`](https://www.npmjs.com/package/@temps-sdk/plugin) and use Bun to compile a TypeScript entry point into a standalone executable. Bun is a build dependency only; the Temps host does not need a JavaScript runtime.
+
+```bash
+bun add @temps-sdk/plugin
+bun build src/index.ts --compile --outfile dist/temps-my-plugin
+```
+
+```ts
+import { createManifest, extractAuthContext, runPlugin, type TempsPlugin } from '@temps-sdk/plugin'
+
+const plugin: TempsPlugin = {
+  manifest: () =>
+    createManifest('my-plugin', '0.1.0')
+      .displayName('My Plugin')
+      .description('A plugin built with TypeScript')
+      .build(),
+
+  handler: (context) => (request, response) => {
+    const caller = extractAuthContext(request)
+    response.writeHead(200, { 'content-type': 'application/json' })
+    response.end(JSON.stringify({
+      message: `Hello ${caller?.userEmail ?? 'system'}`,
+      plugin: context.pluginName,
+    }))
+  },
+}
+
+await runPlugin(plugin)
+```
+
+The SDK implements external-plugin protocol v2, verifies the host's per-process request assertion before exposing caller identity, and provides typed read-only platform queries. Plugins that need the platform HTTP API must declare `api_read` or `api_write` and use `context.apiAsCaller(caller)` so Temps re-applies the caller's permissions.
+
+Start with the [complete TypeScript example](https://github.com/gotempsh/temps/tree/main/sdks/node/examples/node-hello-plugin), which includes build scripts and an executable-level integration test.
 
 ---
 
