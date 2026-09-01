@@ -43,6 +43,10 @@ import {
 } from '@/components/ui/select'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
+  SERVICE_CATALOG_PAGE_SIZE,
+  ServiceCatalogPagination,
+} from '@/components/service-templates/ServiceCatalogPagination'
+import {
   deployComposeSource,
   saveComposeSource,
 } from '@/lib/compose-source-api'
@@ -72,8 +76,6 @@ import {
   Braces,
   CheckCircle2,
   ChevronDown,
-  ChevronLeft,
-  ChevronRight,
   Cloud,
   Code2,
   Coins,
@@ -99,8 +101,6 @@ import { useTheme } from 'next-themes'
 import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router'
 import { toast } from 'sonner'
-
-const PER_PAGE = 24
 
 const CATEGORY_ICONS: Record<
   ServiceCategoryIcon,
@@ -1264,7 +1264,7 @@ export function ServiceTemplateCatalog() {
         category: category === 'all' ? undefined : category,
         tag: tag || undefined,
         page,
-        per_page: PER_PAGE,
+        per_page: SERVICE_CATALOG_PAGE_SIZE,
       },
     }),
     placeholderData: keepPreviousData,
@@ -1497,29 +1497,12 @@ export function ServiceTemplateCatalog() {
           (Apache-2.0). Each install becomes an independent, editable
           Temps-owned Compose source.
         </p>
-        <div className="flex items-center gap-2">
-          <span>
-            Page {catalog.data.page} of {Math.max(1, catalog.data.total_pages)}
-          </span>
-          <Button
-            variant="outline"
-            size="icon"
-            disabled={page <= 1}
-            onClick={() => setPage((current) => Math.max(1, current - 1))}
-            aria-label="Previous services page"
-          >
-            <ChevronLeft className="size-4" />
-          </Button>
-          <Button
-            variant="outline"
-            size="icon"
-            disabled={page >= catalog.data.total_pages}
-            onClick={() => setPage((current) => current + 1)}
-            aria-label="Next services page"
-          >
-            <ChevronRight className="size-4" />
-          </Button>
-        </div>
+        <ServiceCatalogPagination
+          page={catalog.data.page}
+          total={catalog.data.total}
+          totalPages={catalog.data.total_pages}
+          onPageChange={setPage}
+        />
       </div>
     </div>
   )

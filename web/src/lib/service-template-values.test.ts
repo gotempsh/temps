@@ -261,4 +261,32 @@ describe('service template slug conflict recovery', () => {
     ).rejects.toBe(failure)
     expect(replans).toBe(0)
   })
+
+  test('does not create from a stale plan when revision preflight rejects the retry', async () => {
+    const revisionChanged = {
+      status: 409,
+      title: 'Service Template Revision Changed',
+    }
+    let createAttempts = 0
+
+    await expect(
+      createServiceTemplateWithSlugRetry(
+        { slug: 'service', installPlanDigest: 'digest-a' },
+        async () => {
+          createAttempts += 1
+          throw { status: 409, title: 'Project Slug Conflict' }
+        },
+        async () => {
+          throw revisionChanged
+        },
+        (error) =>
+          typeof error === 'object' &&
+          error !== null &&
+          'title' in error &&
+          error.title === 'Project Slug Conflict'
+      )
+    ).rejects.toBe(revisionChanged)
+
+    expect(createAttempts).toBe(1)
+  })
 })
