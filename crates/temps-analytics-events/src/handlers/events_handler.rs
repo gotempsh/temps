@@ -20,19 +20,28 @@ use crate::types::{
 };
 use axum::Extension;
 use axum::{
-    extract::{Path, Query, State},
-    http::{header::HeaderMap, StatusCode},
+    extract::{Path, Query, RawQuery, State},
+    http::{
+        header::{self, HeaderMap, HeaderName},
+        Method, StatusCode,
+    },
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
 use std::sync::Arc;
+use std::time::Duration;
+use temps_analytics::ingest_keys::{
+    extract_analytics_key, resolve_client_identity, resolve_keyed_ingest_scope,
+    AnalyticsIngestKeyService, AnalyticsIngestRateLimiter, ANALYTICS_INGEST_KEY_HEADER,
+};
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_proxy::CachedPeerTable;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::error;
 
 pub struct AppState {
@@ -48,6 +57,12 @@ pub struct AppState {
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// ADR-040: resolves an `X-Temps-Analytics-Key` / `?temps_key=` credential
+    /// to a project scope for apps Temps does not deploy, where the route table
+    /// has no entry to match `Host` against.
+    pub ingest_key_service: Arc<AnalyticsIngestKeyService>,
+    /// Per-key sliding-window limiter for the keyed ingest path.
+    pub ingest_rate_limiter: Arc<AnalyticsIngestRateLimiter>,
 }
 
 /// Get event counts with filtering
@@ -706,6 +721,10 @@ fn primary_accept_language(header: &str) -> Option<String> {
     post,
     path = "/_temps/event",
     request_body = EventMetricsPayload,
+    params(
+        ("x-temps-analytics-key" = Option<String>, Header, description = "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else."),
+        ("temps_key" = Option<String>, Query, description = "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.")
+    ),
     responses(
         (status = 204, description = "Event recorded successfully"),
         (status = 400, description = "Bad request"),
@@ -715,6 +734,7 @@ fn primary_accept_language(header: &str) -> Option<String> {
 pub async fn record_event_metrics(
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<temps_core::RequestMetadata>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     Json(payload): Json<EventMetricsPayload>,
 ) -> impl IntoResponse {
@@ -730,40 +750,95 @@ pub async fn record_event_metrics(
     // directly — a raw Host header would break on non-default ports like the
     // local dev proxy's :8080, which is what the route table never contains.
     let host = metadata.host.clone();
-    if host.is_empty() {
-        error!("Missing Host header");
-        return StatusCode::BAD_REQUEST.into_response();
-    }
 
-    // Look up project/environment/deployment from route table o(1)
-    let (project_id, environment_id, deployment_id) = match state.route_table.get_route(&host) {
-        Some(route_info) => {
-            // A route without a project is a sandbox/orphaned route — we can't
-            // attribute the event to anything, so silently drop it (204) rather
-            // than falling back to project_id=1 which FK-violates on insert.
-            let Some(project) = route_info.project.as_ref() else {
+    // ADR-040 §3. A presented ingest key resolves the scope outright; `Host` is
+    // never consulted for resolution in that branch, and an unresolvable key is
+    // a 401 rather than a silent fall-through to `Host` (which would either
+    // mis-attribute a typo'd key's data or 404 confusingly).
+    //
+    // `site_hostname` is resolved alongside the scope, because what the Host
+    // header *means* differs per branch. On the Host-resolved branch it is the
+    // tracked site itself. On the keyed branch the request terminates at the
+    // Temps server, so `metadata.host` is *Temps'* own hostname and has nothing
+    // to do with the customer's site — passing it through would make every
+    // keyed event look like it happened on the analytics backend, and
+    // `get_channel` would classify the customer's real internal navigation as
+    // "Referral" instead of a self-referral.
+    let (project_id, environment_id, deployment_id, site_hostname, is_keyed) = if let Some(key) =
+        extract_analytics_key(&headers, raw_query.as_deref())
+    {
+        let origin = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok());
+        match resolve_keyed_ingest_scope(
+            state.ingest_key_service.as_ref(),
+            state.ingest_rate_limiter.as_ref(),
+            &key,
+            origin,
+        )
+        .await
+        {
+            Ok(scope) => {
                 info!(
-                    "Dropping event for host {} — route has no associated project (sandbox/orphan)",
-                    host
+                    "Resolved analytics ingest key {} to project={}, env={:?}, deploy={:?}",
+                    scope.key_id, scope.project_id, scope.environment_id, scope.deployment_id
                 );
-                return StatusCode::NO_CONTENT.into_response();
-            };
-
-            let project_id = project.id;
-            let environment_id = route_info.environment.as_ref().map(|e| e.id);
-            let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
-
-            info!(
-                "Resolved host {} to project={}, env={:?}, deploy={:?}",
-                host, project_id, environment_id, deployment_id
-            );
-
-            (project_id, environment_id, deployment_id)
+                // No site hostname from this branch — see above. The service
+                // falls back to what the SDK put in the payload.
+                (
+                    scope.project_id,
+                    scope.environment_id,
+                    scope.deployment_id,
+                    None,
+                    true,
+                )
+            }
+            Err(problem) => return problem.into_response(),
         }
-        None => {
-            error!("Host {} not found in route table", host);
-            // Return 404 or BAD_REQUEST since we can't track events for unknown hosts
-            return StatusCode::NOT_FOUND.into_response();
+    } else {
+        if host.is_empty() {
+            error!("Missing Host header");
+            return StatusCode::BAD_REQUEST.into_response();
+        }
+
+        // Look up project/environment/deployment from route table o(1)
+        match state.route_table.get_route(&host) {
+            Some(route_info) => {
+                // A route without a project is a sandbox/orphaned route — we can't
+                // attribute the event to anything, so silently drop it (204) rather
+                // than falling back to project_id=1 which FK-violates on insert.
+                let Some(project) = route_info.project.as_ref() else {
+                    info!(
+                            "Dropping event for host {} — route has no associated project (sandbox/orphan)",
+                            host
+                        );
+                    return StatusCode::NO_CONTENT.into_response();
+                };
+
+                let project_id = project.id;
+                let environment_id = route_info.environment.as_ref().map(|e| e.id);
+                let deployment_id = route_info.deployment.as_ref().map(|d| d.id);
+
+                info!(
+                    "Resolved host {} to project={}, env={:?}, deploy={:?}",
+                    host, project_id, environment_id, deployment_id
+                );
+
+                // Unchanged: on this branch the Host header *is* the tracked
+                // site, so it stays the site hostname exactly as before.
+                (
+                    project_id,
+                    environment_id,
+                    deployment_id,
+                    (!host.is_empty()).then(|| host.clone()),
+                    false,
+                )
+            }
+            None => {
+                error!("Host {} not found in route table", host);
+                // Return 404 or BAD_REQUEST since we can't track events for unknown hosts
+                return StatusCode::NOT_FOUND.into_response();
+            }
         }
     };
 
@@ -850,21 +925,46 @@ pub async fn record_event_metrics(
         None
     };
 
+    let session_id = resolve_client_identity(
+        metadata.session_id_cookie,
+        payload.session_id.clone(),
+        is_keyed,
+    );
+    let visitor_id = resolve_client_identity(
+        metadata.visitor_id_cookie,
+        payload.visitor_id.clone(),
+        is_keyed,
+    );
+
+    // The SDK sends `domain` as a sibling of `event_data`, not nested inside
+    // it, but `resolve_site_hostname`'s data-derived fallback (ADR-040 §3)
+    // only looks inside `event_data`. Fold it in here rather than widening
+    // that function's signature, so the fallback works for real browser
+    // traffic on the keyed path instead of only in tests that construct
+    // `event_data.domain` directly.
+    let mut event_data = payload.event_data;
+    if let (Some(domain), serde_json::Value::Object(map)) = (&payload.domain, &mut event_data) {
+        map.entry("domain")
+            .or_insert_with(|| serde_json::Value::String(domain.clone()));
+    }
+
     match state
         .events_writer
         .record_event(
             project_id,
             environment_id,
             deployment_id,
-            metadata.session_id_cookie,
-            metadata.visitor_id_cookie,
+            session_id,
+            visitor_id,
             &payload.event_name,
-            payload.event_data,
+            event_data,
             &payload.request_path,
             &payload.request_query,
-            // The tracked site's own host, already resolved against the route
-            // table above — lets the service detect self-referrals.
-            Some(host.as_str()),
+            // The tracked site's own host — lets the service detect
+            // self-referrals and attribute channels. `None` on the keyed path,
+            // where the Host header names the Temps server rather than the
+            // customer's site (ADR-040 §3).
+            site_hostname.as_deref(),
             payload.screen_width,
             payload.screen_height,
             payload.viewport_width,
@@ -1233,9 +1333,32 @@ pub fn configure_routes() -> Router<Arc<AppState>> {
 /// Configure public ingest routes for events.
 ///
 /// These are called by browser SDKs on customer sites and must be reachable
-/// without authentication — the project is resolved from the Host header.
+/// without authentication — the project is resolved from the Host header, or
+/// from an `X-Temps-Analytics-Key` / `?temps_key=` ingest key (ADR-040).
 pub fn configure_public_routes() -> Router<Arc<AppState>> {
-    Router::new().route("/_temps/event", post(record_event_metrics))
+    Router::new()
+        .route("/_temps/event", post(record_event_metrics))
+        .layer(public_ingest_cors())
+}
+
+/// CORS for the public analytics ingest routes.
+///
+/// Required by ADR-040: with a key, the request is cross-origin by definition,
+/// and without this layer the browser blocks it before it ever leaves the page.
+///
+/// `allow_credentials` stays at its default `false`, and must never be set
+/// true. The entire point of key-based ingest is that it needs no cookies;
+/// credentialed CORS on a wildcard origin would be a real vulnerability, and
+/// the browser rejects the combination outright.
+pub(crate) fn public_ingest_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            HeaderName::from_static(ANALYTICS_INGEST_KEY_HEADER),
+        ])
+        .max_age(Duration::from_secs(600))
 }
 
 #[derive(utoipa::OpenApi)]
@@ -1405,6 +1528,8 @@ mod tests {
             cookie_crypto: cookie_crypto.clone(),
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             project_access_checker: None,
+            ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
+            ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
         });
 
         let auth_middleware = middleware::from_fn(
@@ -1904,6 +2029,8 @@ mod tests {
             cookie_crypto,
             telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
             project_access_checker: None,
+            ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
+            ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
         });
 
         // No auth middleware — should return 401
@@ -2075,6 +2202,642 @@ mod tests {
             .collect();
         assert_eq!(event_names.iter().filter(|n| **n == "signup").count(), 1);
         assert_eq!(event_names.iter().filter(|n| **n == "purchase").count(), 2);
+
+        test_db.cleanup().await;
+    }
+
+    // ── ADR-040: keyed ingest on POST /_temps/event ──────────────────────
+    //
+    // Two things are under test here, and the second matters more than the
+    // first: that a key resolves the scope without the route table, and that
+    // the *no-key* path is byte-for-byte what it was before keys existed.
+    // Breaking a Temps-deployed app's analytics would be worse than not
+    // shipping keyed ingest at all.
+
+    /// A syntactically valid key that is guaranteed not to exist.
+    const UNKNOWN_KEY: &str = "pa_0000000000000000000000000000000000000000000000000000000000000000";
+
+    fn test_request_metadata(headers: &axum::http::HeaderMap) -> temps_core::RequestMetadata {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        temps_core::RequestMetadata {
+            ip_address: String::new(),
+            user_agent: String::new(),
+            headers: headers.clone(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: format!("http://{host}"),
+            scheme: "http".to_string(),
+            host,
+            is_secure: false,
+        }
+    }
+
+    /// The public ingest router with a middleware that fabricates the
+    /// `RequestMetadata` the real server injects, deriving `host` from the
+    /// request's own `Host` header so tests can exercise both branches.
+    fn setup_public_app(state: Arc<AppState>) -> axum::Router {
+        let metadata_middleware = middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let metadata = test_request_metadata(req.headers());
+                req.extensions_mut().insert(metadata);
+                next.run(req).await
+            },
+        );
+
+        configure_public_routes()
+            .layer(metadata_middleware)
+            .with_state(state)
+    }
+
+    fn event_payload() -> serde_json::Value {
+        serde_json::json!({
+            "event_name": "page_view",
+            "event_data": {},
+            "request_path": "/pricing",
+            "request_query": ""
+        })
+    }
+
+    async fn stored_events(db: &sea_orm::DatabaseConnection) -> Vec<temps_entities::events::Model> {
+        temps_entities::events::Entity::find()
+            .all(db)
+            .await
+            .expect("Failed to query events")
+    }
+
+    /// Register a host in the route table so the no-key branch can resolve it,
+    /// without needing a real deployment to exist.
+    fn insert_test_route(
+        route_table: &temps_proxy::CachedPeerTable,
+        host: &str,
+        project: Option<projects::Model>,
+    ) {
+        route_table.insert_route_for_test(
+            host,
+            temps_routes::RouteInfo {
+                backend: temps_routes::BackendType::StaticDir {
+                    path: "/tmp".to_string(),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: project.map(Arc::new),
+                environment: None,
+                deployment: None,
+                cert_eligible: false,
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_event_ingest_resolves_the_keys_project_without_the_route_table() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        // Deliberately a host the route table has never heard of — this is the
+        // whole point of ADR-040.
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let events = stored_events(db.as_ref()).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].project_id, project.id);
+        assert_eq!(events[0].environment_id, None);
+        assert_eq!(events[0].deployment_id, None);
+        // On the keyed path the request terminates at Temps, so the Host header
+        // is *Temps'* hostname, not the customer's site. It must not be
+        // inherited as the event's site hostname: doing so would break
+        // self-referral detection and misreport every keyed event's origin.
+        assert_ne!(
+            events[0].hostname, "app.not-deployed-by-temps.test",
+            "a keyed event must not inherit the Temps server's own hostname"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    /// The site's real domain reaches the stored event through the payload, not
+    /// through `Host`, on the keyed path.
+    #[tokio::test]
+    async fn keyed_event_ingest_takes_its_hostname_from_the_payload_domain() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let mut payload = event_payload();
+        payload["event_data"] = serde_json::json!({ "domain": "shop.example.com" });
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    // The Temps server's own hostname, as the browser would
+                    // send it on a cross-origin POST.
+                    .header("host", "analytics.temps.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let events = stored_events(db.as_ref()).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].hostname, "shop.example.com",
+            "the customer's own domain must win over the Temps host"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    /// The SDK actually sends `domain` as a sibling of `event_data`, not
+    /// nested inside it (see `Analytics.ts`'s request body construction) —
+    /// this is the shape real browser traffic uses, unlike the previous test.
+    #[tokio::test]
+    async fn keyed_event_ingest_takes_its_hostname_from_the_top_level_domain_field() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let mut payload = event_payload();
+        payload["domain"] = serde_json::json!("shop.example.com");
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "analytics.temps.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let events = stored_events(db.as_ref()).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0].hostname, "shop.example.com",
+            "the top-level `domain` field the real SDK sends must be folded \
+             into event_data so the site's own hostname is stored, not \
+             \"localhost\""
+        );
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_event_ingest_accepts_the_query_param_fallback() {
+        // `navigator.sendBeacon` cannot set headers, so `?temps_key=` is the
+        // only way the page-unload event can authenticate.
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/_temps/event?temps_key={}", key.public_key))
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(stored_events(db.as_ref()).await.len(), 1);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_event_key_returns_401_and_never_falls_back_to_host() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        // The Host *would* resolve. A typo'd key must still be a loud 401
+        // rather than silently mis-attributed data.
+        insert_test_route(
+            &state.route_table,
+            "app.example.test",
+            Some(project.clone()),
+        );
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", UNKNOWN_KEY)
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            stored_events(db.as_ref()).await.is_empty(),
+            "a rejected key must not fall through to Host-based resolution"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn malformed_event_key_returns_401() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        insert_test_route(&state.route_table, "app.example.test", Some(project));
+
+        // A `tk_` admin API key pasted into the analytics header must never be
+        // accepted, and must never be looked up against `api_keys` either.
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", "tk_not_an_analytics_key")
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn scoped_event_key_enforces_the_origin_allowlist() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        let key = state
+            .ingest_key_service
+            .create(
+                project.id,
+                None,
+                None,
+                Some(vec!["https://app.example.com".to_string()]),
+                None,
+                None,
+            )
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let post = |origin: Option<&'static str>| {
+            let app = setup_public_app(state.clone());
+            let public_key = key.public_key.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.com")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", public_key);
+                if let Some(origin) = origin {
+                    builder = builder.header("origin", origin);
+                }
+                app.oneshot(
+                    builder
+                        .body(Body::from(event_payload().to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        // No Origin at all against a non-empty allowlist.
+        assert_eq!(post(None).await, StatusCode::FORBIDDEN);
+        // Wrong origin.
+        assert_eq!(
+            post(Some("https://evil.example.com")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(
+            stored_events(db.as_ref()).await.is_empty(),
+            "rejected origins must not store an event"
+        );
+
+        // Matching origin passes.
+        assert_eq!(
+            post(Some("https://app.example.com")).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(stored_events(db.as_ref()).await.len(), 1);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn event_key_over_its_rate_limit_returns_429() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, Some(1), None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let post = || {
+            let app = setup_public_app(state.clone());
+            let public_key = key.public_key.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_temps/event")
+                        .header("host", "app.example.com")
+                        .header("content-type", "application/json")
+                        .header("x-temps-analytics-key", public_key)
+                        .body(Body::from(event_payload().to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        assert_eq!(post().await, StatusCode::NO_CONTENT);
+        assert_eq!(post().await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(stored_events(db.as_ref()).await.len(), 1);
+
+        test_db.cleanup().await;
+    }
+
+    /// Regression: no key at all must behave exactly as it did before ADR-040 —
+    /// resolve from Host, record the event with that project.
+    #[tokio::test]
+    async fn no_key_still_resolves_the_event_scope_from_host() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_test_project(db.as_ref()).await;
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        insert_test_route(
+            &state.route_table,
+            "app.example.test",
+            Some(project.clone()),
+        );
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let events = stored_events(db.as_ref()).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].project_id, project.id);
+        assert_eq!(events[0].hostname, "app.example.test");
+
+        test_db.cleanup().await;
+    }
+
+    /// Regression: the three no-key rejection shapes are unchanged — empty Host
+    /// is 400, an unknown host is 404, and a sandbox/orphan route silently
+    /// drops with 204.
+    #[tokio::test]
+    async fn no_key_rejection_shapes_are_unchanged() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+        insert_test_route(&state.route_table, "orphan.example.test", None);
+
+        // Empty Host -> 400.
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Unknown host -> 404.
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "unknown.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Route without a project -> 204, silently dropped.
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/event")
+                    .header("host", "orphan.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(event_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        assert!(stored_events(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    /// The preflight the browser sends before a cross-origin keyed POST must
+    /// succeed, and must not advertise credentialed CORS.
+    #[tokio::test]
+    async fn public_ingest_answers_cors_preflight_without_credentials() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (_app, state, _crypto) = setup_test_app(db.clone()).await;
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/_temps/event")
+                    .header("host", "app.example.com")
+                    .header("origin", "https://app.example.com")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "x-temps-analytics-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success(), "{}", response.status());
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+        assert!(
+            headers.get("access-control-allow-credentials").is_none(),
+            "wildcard-origin ingest must never be credentialed"
+        );
 
         test_db.cleanup().await;
     }

@@ -29,6 +29,7 @@ pub mod public_hostname;
 pub mod public_hostname_resolver;
 pub mod retention;
 pub mod retry;
+pub mod runtime;
 pub mod secrets_manager;
 pub mod self_update;
 pub mod sensitive_action;
@@ -89,6 +90,11 @@ pub use public_hostname_resolver::{
 };
 pub use retention::{
     FixedRetentionResolver, RetentionResolver, RetentionResolverSlot, RetentionTable,
+};
+pub use runtime::{
+    initialize_process_runtime_context, ExecutionEnvironment, ExecutionEnvironmentSource,
+    RuntimeConfigurationError, RuntimeContext, ServiceEndpoint, ServiceEndpointResolver,
+    ServiceEndpointScheme, EXECUTION_ENVIRONMENT_VARIABLE, LEGACY_DEPLOYMENT_MODE_VARIABLE,
 };
 pub use secrets_manager::SecretsManagerResolver;
 pub use sensitive_action::{

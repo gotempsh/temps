@@ -37,6 +37,16 @@ pub struct PresetInfo {
     /// Compose file paths found in the repository (only for docker-compose preset)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub compose_files: Option<Vec<String>>,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+    /// rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+    /// directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+    ///
+    /// `default` keeps deserialization of preset caches written before this
+    /// field existed (`repositories.preset` JSON column) backward
+    /// compatible.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dockerfile_path: Option<String>,
 }
 
 /// Repository preset cache structure
@@ -113,5 +123,74 @@ impl ActiveModelBehavior for ActiveModel {
         }
 
         Ok(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A rolled-up bare Dockerfile (e.g. `docker/Dockerfile`) must survive a
+    /// round trip through the JSON representation cached in
+    /// `repositories.preset`.
+    #[test]
+    fn preset_info_dockerfile_path_round_trips_through_json() {
+        let preset = PresetInfo {
+            path: "./".to_string(),
+            preset: "dockerfile".to_string(),
+            preset_label: "Dockerfile".to_string(),
+            exposed_port: None,
+            icon_url: None,
+            project_type: "backend".to_string(),
+            compose_files: None,
+            dockerfile_path: Some("docker/Dockerfile".to_string()),
+        };
+
+        let json = serde_json::to_value(&preset).unwrap();
+        assert_eq!(json["dockerfilePath"], "docker/Dockerfile");
+
+        let round_tripped: PresetInfo = serde_json::from_value(json).unwrap();
+        assert_eq!(round_tripped, preset);
+    }
+
+    /// A genuine monorepo service directory (its own Dockerfile plus its own
+    /// manifest) keeps `dockerfile_path: None`, and that `None` must be
+    /// omitted from the serialized JSON entirely (matching the existing
+    /// `compose_files` convention) rather than written as `null`.
+    #[test]
+    fn preset_info_without_dockerfile_path_omits_the_field() {
+        let preset = PresetInfo {
+            path: "apps/api".to_string(),
+            preset: "dockerfile".to_string(),
+            preset_label: "Dockerfile".to_string(),
+            exposed_port: None,
+            icon_url: None,
+            project_type: "backend".to_string(),
+            compose_files: None,
+            dockerfile_path: None,
+        };
+
+        let json = serde_json::to_value(&preset).unwrap();
+        assert!(json.get("dockerfilePath").is_none());
+    }
+
+    /// Preset cache rows written by an older server version won't have a
+    /// `dockerfilePath` key at all. Deserializing them must still succeed
+    /// (via `#[serde(default)]`) rather than erroring, or every cached
+    /// branch preset in production would break on the next read.
+    #[test]
+    fn preset_info_deserializes_pre_existing_cache_rows_missing_the_field() {
+        let legacy_json = serde_json::json!({
+            "path": "apps/web",
+            "preset": "nextjs",
+            "presetLabel": "Next.js",
+            "exposedPort": 3000,
+            "iconUrl": null,
+            "projectType": "frontend"
+            // no "dockerfilePath" key -- this is what pre-fix cached rows look like
+        });
+
+        let preset: PresetInfo = serde_json::from_value(legacy_json).unwrap();
+        assert_eq!(preset.dockerfile_path, None);
     }
 }

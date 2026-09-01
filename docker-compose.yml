@@ -8,7 +8,7 @@ services:
     network_mode: none
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
     command:
       - /bin/sh
       - -ec
@@ -19,9 +19,9 @@ services:
             exit 1
             ;;
         esac
-        case "$$REDIS_PASSWORD" in
+        case "$$CLICKHOUSE_PASSWORD" in
           *[!A-Za-z0-9_-]*)
-            echo "REDIS_PASSWORD must contain only URL-safe characters: A-Z, a-z, 0-9, underscore, or hyphen" >&2
+            echo "CLICKHOUSE_PASSWORD must contain only URL-safe characters: A-Z, a-z, 0-9, underscore, or hyphen" >&2
             exit 1
             ;;
         esac
@@ -51,7 +51,12 @@ services:
       # public interfaces.
       - "127.0.0.1:5432:5432"
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      # This image (Spilo/timescaledb-ha based) initialises its cluster at
+      # PGDATA=/home/postgres/pgdata/data, not the stock postgres image's
+      # /var/lib/postgresql/data. Mounting the wrong path silently leaves the
+      # real cluster in the container's writable layer, so every recreation
+      # (image update, `compose down && up`, host reboot) loses all data.
+      - postgres_data:/home/postgres/pgdata/data
       - postgres_socket:/var/run/postgresql
     # NOTE: archive_command is NOT set here on purpose.
     # Command-line parameters take highest priority in PostgreSQL and cannot be
@@ -63,7 +68,12 @@ services:
       -c archive_mode=on
       -c archive_timeout=60
     networks:
-      - temps-network
+      temps-network:
+        ipv4_address: ${TEMPS_POSTGRES_INTERNAL_IP:-198.18.255.11}
+      # Docker does not realize published ports for containers attached only to
+      # an internal bridge. This dedicated bridge exists solely so the
+      # loopback-bound diagnostic port is actually reachable from the host.
+      temps-host-network:
     healthcheck:
       # Authenticated TCP query: unlike pg_isready, this catches a password
       # mismatch after upgrading an existing data volume.
@@ -106,41 +116,55 @@ services:
         umask 077
         trap 'rm -f /tmp/rotate-password.sql' EXIT
         printf "\\set password '%s'\nSET password_encryption = 'scram-sha-256';\nALTER ROLE temps WITH PASSWORD :'password';\n" "$$POSTGRES_PASSWORD" > /tmp/rotate-password.sql
-        psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U temps -d postgres -f /tmp/rotate-password.sql
+        # A new image briefly starts an initialization postmaster and then
+        # replaces it with the final server. If that handoff races this command,
+        # retry the idempotent role update instead of failing first startup.
+        rotate_attempts=0
+        until psql -v ON_ERROR_STOP=1 -h /var/run/postgresql -U temps -d postgres -f /tmp/rotate-password.sql; do
+          rotate_attempts=$$((rotate_attempts + 1))
+          if [ "$$rotate_attempts" -ge 120 ]; then
+            echo "PostgreSQL password synchronization did not complete within 120 seconds" >&2
+            exit 1
+          fi
+          sleep 1
+        done
 
-  # Redis Cache
-  redis:
-    image: redis:8-alpine
-    container_name: temps-redis
-    user: redis
-    # Require a password. No default: compose fails fast if REDIS_PASSWORD is unset.
+  # ClickHouse analytics and OpenTelemetry backend
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.7.5.10-alpine
+    container_name: temps-clickhouse
+    restart: always
     environment:
-      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
+      CLICKHOUSE_DB: temps
+      CLICKHOUSE_USER: temps
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set (put it in a .env file next to docker-compose.yml)}
     depends_on:
       credential-check:
         condition: service_completed_successfully
-    # Keep the secret out of the long-lived redis-server argv. The validator
-    # above rejects whitespace/newlines and other Redis-config metacharacters.
-    command:
-      - /bin/sh
-      - -ec
-      - |
-        umask 077
-        printf 'appendonly yes\nrequirepass %s\n' "$$REDIS_PASSWORD" > /tmp/redis.conf
-        unset REDIS_PASSWORD
-        exec redis-server /tmp/redis.conf
     ports:
-      # Loopback only — Redis is reachable over the internal temps-network.
-      - "127.0.0.1:6379:6379"
+      # The HTTP API is available locally for diagnostics. Temps connects over
+      # the internal network; the native protocol is not published to the host.
+      - "127.0.0.1:8123:8123"
     volumes:
-      - redis_data:/data
+      - clickhouse_data:/var/lib/clickhouse
     networks:
-      - temps-network
+      temps-network:
+        ipv4_address: ${TEMPS_CLICKHOUSE_INTERNAL_IP:-198.18.255.12}
+      # Keep host publication separate from the internal control plane. ICC is
+      # disabled on this bridge; Temps still connects over temps-network.
+      temps-host-network:
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
     healthcheck:
-      test: ["CMD-SHELL", "REDISCLI_AUTH=\"$$REDIS_PASSWORD\" redis-cli ping | grep -q PONG"]
+      # clickhouse-client reads CLICKHOUSE_PASSWORD from the container
+      # environment, keeping the credential out of the process arguments.
+      test: ["CMD", "clickhouse-client", "--user", "temps", "--database", "temps", "--query", "SELECT 1"]
       interval: 10s
       timeout: 5s
-      retries: 5
+      retries: 10
+      start_period: 30s
 
   # Temps Application
   # The image bundles the tracked GeoLite2 City database outside /app/data so
@@ -156,15 +180,20 @@ services:
     group_add:
       - ${DOCKER_GID:?DOCKER_GID must be the group ID that owns /var/run/docker.sock}
     environment:
+      # Select Docker-internal endpoint resolution for managed workloads.
+      TEMPS_EXECUTION_ENV: docker
+      TEMPS_NETWORK_NAME: ${TEMPS_NETWORK_NAME:-temps-docker-workloads}
+
       # Database configuration (password sourced from the same env var as postgres)
-      TEMPS_DATABASE_URL: postgresql://temps:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@postgres:5432/temps
+      TEMPS_DATABASE_URL: postgresql://temps:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}@${TEMPS_POSTGRES_INTERNAL_IP:-198.18.255.11}:5432/temps
 
-      # Server configuration
-      TEMPS_ADDRESS: 0.0.0.0:3000
-      TEMPS_TLS_ADDRESS: 0.0.0.0:3443
-
-      # Console API configuration
-      TEMPS_CONSOLE_ADDRESS: 0.0.0.0:9000
+      # Bind only to the private control-network address. Static addresses are
+      # used because Docker DNS queries from a dual-network container can be
+      # confused by a workload claiming the same alias as a private service.
+      TEMPS_ADDRESS: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}:3000
+      TEMPS_TLS_ADDRESS: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}:3443
+      TEMPS_CONSOLE_ADDRESS: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}:9000
+      TEMPS_CONSOLE_ADMIN_ADDRESS: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}:9001
 
       # Data directory
       TEMPS_DATA_DIR: /app/data
@@ -177,13 +206,11 @@ services:
       # Logging
       TEMPS_LOG_LEVEL: info
 
-      # Redis configuration (authenticated; password from REDIS_PASSWORD)
-      REDIS_URL: redis://:${REDIS_PASSWORD:?REDIS_PASSWORD must be set}@redis:6379
-    ports:
-      - "3000:3000"              # HTTP API (public)
-      - "3443:3443"              # HTTPS API (public, if configured)
-      # Console admin API — loopback only, never published to public interfaces.
-      - "127.0.0.1:9000:9000"    # Console API
+      # ClickHouse stores analytics, request logs, metrics, and OpenTelemetry.
+      TEMPS_CLICKHOUSE_URL: http://${TEMPS_CLICKHOUSE_INTERNAL_IP:-198.18.255.12}:8123
+      TEMPS_CLICKHOUSE_DATABASE: temps
+      TEMPS_CLICKHOUSE_USER: temps
+      TEMPS_CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:?CLICKHOUSE_PASSWORD must be set}
     volumes:
       # Persistent data directory
       - temps_data:/app/data
@@ -203,23 +230,110 @@ services:
         condition: service_healthy
       postgres-credential-sync:
         condition: service_completed_successfully
-      redis:
+      clickhouse:
         condition: service_healthy
     networks:
-      - temps-network
+      temps-network:
+        ipv4_address: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}
+      # Managed applications and database providers run on this shared network.
+      # Joining it lets Docker runtime resolution use container DNS/internal
+      # ports without exposing workload ports on the host.
+      temps-app-network:
     healthcheck:
-      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:9000/readyz"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}:9000/readyz"]
       interval: 30s
       timeout: 5s
       retries: 3
       start_period: 40s
+
+  # Publish public listeners on host loopback and make the same surface
+  # reachable from managed workloads. Keeping this proxy separate from the
+  # admin proxy prevents its workload-network attachment from exposing the UI
+  # or management API.
+  temps-ingress:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingress
+    container_name: temps-ingress
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    read_only: true
+    mem_limit: 128m
+    pids_limit: 32
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    depends_on:
+      temps:
+        condition: service_healthy
+    environment:
+      TEMPS_CONTROL_INTERNAL_IP: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}
+      TEMPS_INGRESS_MODE: public
+      TEMPS_INGRESS_LISTEN_IP: ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10}
+    ports:
+      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3443:3443"
+      - "127.0.0.1:9000:9000"
+    networks:
+      temps-network:
+      temps-app-network:
+        ipv4_address: ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10} 3000 && nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10} 3443 && nc -z -w 1 ${TEMPS_PUBLIC_INGRESS_IP:-198.20.255.10} 9000 && nc -z -w 1 ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10} 9000"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+
+  # The admin/UI listener has an independent, loopback-only Basic-auth barrier
+  # and never joins the workload network. Both ingress containers run
+  # unprivileged with read-only roots and never receive the Docker socket.
+  temps-admin-ingress:
+    build:
+      context: .
+      dockerfile: Dockerfile.ingress
+    container_name: temps-admin-ingress
+    restart: unless-stopped
+    cap_drop:
+      - ALL
+    read_only: true
+    mem_limit: 128m
+    pids_limit: 32
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    depends_on:
+      temps:
+        condition: service_healthy
+    environment:
+      TEMPS_CONTROL_INTERNAL_IP: ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10}
+      TEMPS_INGRESS_MODE: admin
+      TEMPS_INGRESS_LISTEN_IP: ${TEMPS_ADMIN_INGRESS_IP:-198.19.255.10}
+    secrets:
+      - source: temps_admin_ingress_password
+        target: temps_admin_ingress_password
+    ports:
+      - "127.0.0.1:9001:9001"
+    networks:
+      temps-network:
+      temps-ingress-network:
+        ipv4_address: ${TEMPS_ADMIN_INGRESS_IP:-198.19.255.10}
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z -w 1 ${TEMPS_ADMIN_INGRESS_IP:-198.19.255.10} 9001 && nc -z -w 1 ${TEMPS_CONTROL_INTERNAL_IP:-198.18.255.10} 9001"]
+      interval: 10s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
 
 volumes:
   postgres_data:
     driver: local
   postgres_socket:
     driver: local
-  redis_data:
+  clickhouse_data:
     driver: local
   temps_data:
     driver: local
@@ -227,7 +341,40 @@ volumes:
 networks:
   temps-network:
     driver: bridge
+    internal: true
+    ipam:
+      config:
+        - subnet: ${TEMPS_CONTROL_SUBNET:-198.18.255.0/24}
+  temps-app-network:
+    # This must match TEMPS_NETWORK_NAME. A stable engine-level name lets both
+    # Compose and containers created through the Docker API share the network.
+    name: ${TEMPS_NETWORK_NAME:-temps-docker-workloads}
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${TEMPS_WORKLOAD_SUBNET:-198.20.255.0/24}
+  temps-ingress-network:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+      com.docker.network.bridge.trusted_host_interfaces: "lo"
+    ipam:
+      config:
+        - subnet: ${TEMPS_INGRESS_SUBNET:-198.19.255.0/24}
+          gateway: ${TEMPS_INGRESS_GATEWAY_IP:-198.19.255.1}
+  temps-host-network:
+    # Docker Engine does not install host port mappings for a container that is
+    # attached only to an internal bridge. This non-internal bridge enables the
+    # explicitly loopback-bound PostgreSQL and ClickHouse diagnostic ports,
+    # while disabling direct container-to-container traffic on the bridge.
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+      com.docker.network.bridge.enable_ip_masquerade: "false"
+      com.docker.network.bridge.trusted_host_interfaces: "lo"
 
 secrets:
   temps_admin_password:
     file: ${TEMPS_ADMIN_PASSWORD_FILE:?TEMPS_ADMIN_PASSWORD_FILE must point to a permission-restricted initial admin password file}
+  temps_admin_ingress_password:
+    file: ${TEMPS_ADMIN_INGRESS_PASSWORD_FILE:?TEMPS_ADMIN_INGRESS_PASSWORD_FILE must point to a permission-restricted admin ingress password file}

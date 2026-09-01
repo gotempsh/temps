@@ -24,8 +24,11 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { EmptyState } from '@/components/ui/empty-state'
+import { KbdBadge } from '@/components/ui/kbd-badge'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 import { useMutation, useQuery } from '@tanstack/react-query'
-import { EllipsisVertical } from 'lucide-react'
+import { EllipsisVertical, Globe } from 'lucide-react'
 import { useMemo, useState } from 'react'
 import { toast } from 'sonner'
 import { AddDomainDialog } from './AddDomainDialog'
@@ -42,6 +45,11 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
     CustomDomainResponse | undefined
   >()
   const [domainToDelete, setDomainToDelete] = useState<number | null>(null)
+
+  useKeyboardShortcut({
+    key: 'n',
+    callback: () => setIsAddDialogOpen(true),
+  })
 
   const { data: customDomains, refetch: refetchCustomDomains } = useQuery({
     ...listCustomDomainsForProjectOptions({
@@ -89,7 +97,10 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
     <div>
       <div className="flex items-center justify-between mb-4">
         <h2 className="text-lg font-semibold">Domains</h2>
-        <Button onClick={() => setIsAddDialogOpen(true)}>Add Domain</Button>
+        <Button onClick={() => setIsAddDialogOpen(true)}>
+          Add Domain
+          <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+        </Button>
       </div>
 
       <p className="text-sm text-muted-foreground mb-6">
@@ -150,9 +161,17 @@ export function DomainsSettings({ project }: DomainsSettingsProps) {
           ))}
         </div>
       ) : (
-        <div className="text-sm text-muted-foreground">
-          No domains configured yet. Add a domain to get started.
-        </div>
+        <EmptyState
+          icon={Globe}
+          title="No domains configured yet"
+          description="Add a domain to get started."
+          action={
+            <Button onClick={() => setIsAddDialogOpen(true)}>
+              Add Domain
+              <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+            </Button>
+          }
+        />
       )}
 
       <AddDomainDialog

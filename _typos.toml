@@ -26,6 +26,10 @@ AIMD = "AIMD"
 nin = "nin"
 # Expected last four characters of "properly" in a masking regression test.
 erly = "erly"
+# The hyphenated prefix in "mis-attribute"/"mis-attributed" (ADR-040 docs and
+# ingest-key handlers) tokenizes to the bare word "mis", which typos reads as
+# a misspelling of "miss"/"mist".
+mis = "mis"
 
 [default.extend-identifiers]
 # W3C traceparent spec example span-id used in test fixtures

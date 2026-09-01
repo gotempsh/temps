@@ -577,6 +577,21 @@ pub struct DetectedPreset {
     pub exposed_port: Option<u16>,
     /// Compose file paths found in the repository (only for docker-compose preset)
     pub compose_files: Option<Vec<String>>,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{path}/Dockerfile`.
+    ///
+    /// Set only for a `dockerfile` preset whose Dockerfile was found alone
+    /// (no manifest of its own) in a subdirectory conventionally used to
+    /// hold one, e.g. `docker/Dockerfile` or `.devcontainer/Dockerfile`.
+    /// That Dockerfile's `COPY`/`ADD` instructions typically reach back to
+    /// the real repository root, so the candidate is rooted at `path =
+    /// "./"` with this field pointing at the nested file, rather than
+    /// promoting the subdirectory itself to a project root (which would
+    /// wrongly become the build context too). `None` for a Dockerfile at
+    /// `{path}/Dockerfile` (including a genuine monorepo service directory
+    /// that has both its own Dockerfile and its own manifest) and for every
+    /// non-Dockerfile preset.
+    pub dockerfile_path: Option<String>,
 }
 
 /// Detection result with the evidence that selected the preset. This is used
@@ -588,6 +603,11 @@ pub struct ProjectCandidate {
     pub preset: PresetType,
     pub confidence: &'static str,
     pub reason: String,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{path}/Dockerfile`. See
+    /// [`DetectedPreset::dockerfile_path`] for the full explanation — this
+    /// is the same concept for the archive-upload detection path.
+    pub dockerfile_path: Option<String>,
 }
 
 impl ProjectCandidate {
@@ -611,6 +631,32 @@ impl ProjectCandidate {
             _ => self.preset.as_str(),
         }
     }
+}
+
+/// Directory names conventionally used to hold a Dockerfile that is not
+/// itself an independent project — its `COPY`/`ADD` instructions typically
+/// reach back to the real repository root, unlike a Dockerfile that happens
+/// to sit alone in a monorepo service directory (e.g. `apps/api/Dockerfile`
+/// with no `apps/api/package.json`, which — by convention — genuinely is
+/// that service's own root and build context).
+///
+/// Directory *contents* alone cannot tell these two shapes apart: both are
+/// "a Dockerfile with no manifest next to it". The directory *name* is the
+/// only reliable signal, so this list is deliberately an allowlist of
+/// well-known Docker-tooling conventions rather than a broader heuristic
+/// that would risk misrouting a real monorepo service.
+const DOCKERFILE_ONLY_DIR_NAMES: [&str; 6] = [
+    "docker",
+    ".docker",
+    ".devcontainer",
+    "deploy",
+    "deployment",
+    "dockerfiles",
+];
+
+/// The final path segment of `directory` (the part after the last `/`).
+fn dir_basename(directory: &str) -> &str {
+    directory.rsplit('/').next().unwrap_or(directory)
 }
 
 /// Detect deployable project roots from normalized archive entries.
@@ -660,13 +706,18 @@ pub fn detect_project_candidates(
         by_directory.entry(directory).or_default().push(name);
     }
 
-    let mut roots = BTreeSet::new();
-    for (directory, names) in &by_directory {
-        if names.iter().any(|name| {
+    // Manifests that make a directory an independently buildable project on
+    // its own, regardless of whether a Dockerfile also lives there. This
+    // distinguishes a genuine monorepo service (its own Dockerfile *and* its
+    // own manifest, e.g. `apps/api/Dockerfile` + `apps/api/package.json`)
+    // from a bare Dockerfile conventionally tucked into a subdirectory like
+    // `docker/` or `.devcontainer/`, whose `COPY`/`ADD` instructions
+    // typically reach back to the real repository root.
+    let has_independent_manifest = |names: &[&str]| {
+        names.iter().any(|name| {
             matches!(
                 *name,
                 "package.json"
-                    | "Dockerfile"
                     | "docker-compose.yml"
                     | "docker-compose.yaml"
                     | "compose.yml"
@@ -682,7 +733,26 @@ pub fn detect_project_candidates(
                 || name.starts_with("next.config.")
                 || name.starts_with("vite.config.")
                 || name.starts_with("astro.config.")
-        }) {
+        })
+    };
+
+    let mut roots = BTreeSet::new();
+    // Subdirectories whose only signal is a bare `Dockerfile`, in a
+    // directory conventionally used to hold one — not promoted to their own
+    // project root. Surfaced as a build option on the repository root
+    // instead (see below).
+    let mut orphan_dockerfile_dirs: Vec<&str> = Vec::new();
+    for (directory, names) in &by_directory {
+        let has_dockerfile = names.contains(&"Dockerfile");
+        if *directory != "."
+            && has_dockerfile
+            && !has_independent_manifest(names)
+            && DOCKERFILE_ONLY_DIR_NAMES.contains(&dir_basename(directory))
+        {
+            orphan_dockerfile_dirs.push(directory);
+            continue;
+        }
+        if has_dockerfile || has_independent_manifest(names) {
             roots.insert(*directory);
         }
     }
@@ -753,8 +823,24 @@ pub fn detect_project_candidates(
                 preset,
                 confidence,
                 reason,
+                dockerfile_path: None,
             });
         }
+    }
+
+    // Every orphaned Dockerfile becomes a build option rooted at the
+    // repository root, not at the subdirectory it was found in — so the
+    // default build context stays the root the Dockerfile's own COPY/ADD
+    // paths almost always assume.
+    orphan_dockerfile_dirs.sort_unstable();
+    for dir in orphan_dockerfile_dirs {
+        candidates.push(ProjectCandidate {
+            path: ".".to_string(),
+            preset: PresetType::Dockerfile,
+            confidence: "medium",
+            reason: format!("Dockerfile found in {dir}/ (build context defaults to the repository root)"),
+            dockerfile_path: Some(format!("{dir}/Dockerfile")),
+        });
     }
 
     candidates.sort_by(|left, right| {
@@ -880,12 +966,36 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
         }
 
         let detected = detect_all_presets_from_files(dir_files);
+        // A subdirectory whose only detected preset is a bare Dockerfile (no
+        // manifest of its own — that would have produced additional entries
+        // here) AND whose name is a known Docker-tooling convention (e.g.
+        // `docker/Dockerfile`, `.devcontainer/Dockerfile`) typically has
+        // COPY/ADD instructions that reach back to the real repository root.
+        // Root the candidate at "./" and record the nested path instead of
+        // promoting the subdirectory to its own project root, which would
+        // wrongly become the build context too.
+        //
+        // A directory with its own manifest alongside the Dockerfile (a
+        // genuine monorepo service) produces more than one entry here and
+        // keeps today's behaviour. So does a directory with only a
+        // Dockerfile whose name is NOT one of those conventions — e.g.
+        // `apps/api/Dockerfile` with no `apps/api/package.json` is, by
+        // monorepo convention, that service's own root; directory contents
+        // alone cannot distinguish it from the `docker/` case, so the
+        // directory name is the deciding signal.
+        let has_only_dockerfile = !dir.is_empty()
+            && detected.len() == 1
+            && detected[0].slug() == "dockerfile"
+            && DOCKERFILE_ONLY_DIR_NAMES.contains(&dir_basename(dir));
+
         for preset in detected {
             // Use relative paths: "./" for root, subdirectory name for others
-            let path = if dir.is_empty() {
-                "./".to_string()
+            let (path, dockerfile_path) = if has_only_dockerfile {
+                ("./".to_string(), Some(format!("{dir}/Dockerfile")))
+            } else if dir.is_empty() {
+                ("./".to_string(), None)
             } else {
-                dir.clone()
+                (dir.clone(), None)
             };
 
             // For docker-compose presets, collect all compose file paths in the repo
@@ -917,6 +1027,7 @@ pub fn detect_presets_from_file_tree(files: &[String]) -> Vec<DetectedPreset> {
                 label: preset.label(),
                 exposed_port: None, // Port will be determined during deployment
                 compose_files,
+                dockerfile_path,
             });
         }
     }
@@ -989,6 +1100,52 @@ mod uploaded_source_detection_tests {
         let candidates = detect_project_candidates(&files);
 
         assert_eq!(candidates[0].preset, PresetType::Dockerfile);
+    }
+
+    #[test]
+    fn a_bare_dockerfile_in_a_conventional_subdirectory_roots_at_the_repository_root() {
+        // Mirrors a real repository (JupyterLab) that ships a `docker/Dockerfile`
+        // whose COPY instructions reach back to files at the repository root
+        // (pyproject.toml, LICENSE, README.md, ...). Rooting the candidate at
+        // "docker" instead would make "docker" the default build context and
+        // break every one of those COPY paths.
+        let files = BTreeMap::from([
+            ("pyproject.toml".to_string(), "[project]\nname = \"x\"\n".to_string()),
+            ("docker/Dockerfile".to_string(), "FROM debian\nCOPY pyproject.toml ./\n".to_string()),
+        ]);
+
+        let candidates = detect_project_candidates(&files);
+
+        let dockerfile_candidate = candidates
+            .iter()
+            .find(|c| c.preset == PresetType::Dockerfile)
+            .expect("Dockerfile should still be offered as a candidate");
+        assert_eq!(dockerfile_candidate.path, ".");
+        assert_eq!(
+            dockerfile_candidate.dockerfile_path.as_deref(),
+            Some("docker/Dockerfile")
+        );
+        // The root's own Python detection must survive alongside it.
+        assert!(candidates.iter().any(|c| c.preset == PresetType::Python));
+    }
+
+    #[test]
+    fn a_bare_dockerfile_in_a_monorepo_service_directory_keeps_its_own_root() {
+        // `apps/api/Dockerfile` with no manifest of its own is, by monorepo
+        // convention, that service's own root — "apps" is not one of the
+        // Docker-tooling directory names, so it must NOT be treated as an
+        // orphan even though the directory contains only a Dockerfile.
+        let files = BTreeMap::from([(
+            "apps/api/Dockerfile".to_string(),
+            "FROM node:22".to_string(),
+        )]);
+
+        let candidates = detect_project_candidates(&files);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].path, "apps/api");
+        assert_eq!(candidates[0].preset, PresetType::Dockerfile);
+        assert_eq!(candidates[0].dockerfile_path, None);
     }
 
     #[test]

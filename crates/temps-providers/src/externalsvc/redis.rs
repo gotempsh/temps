@@ -273,6 +273,64 @@ impl RedisService {
             .unwrap_or_else(|| self.get_container_name())
     }
 
+    fn get_effective_address_for_environment(
+        &self,
+        service_config: ServiceConfig,
+        execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Result<(String, String)> {
+        let config = self.get_redis_config(service_config)?;
+        Ok(match execution_environment {
+            temps_core::ExecutionEnvironment::Host => ("localhost".to_string(), config.port),
+            temps_core::ExecutionEnvironment::Docker => (
+                self.get_live_container_name(&config),
+                REDIS_INTERNAL_PORT.to_string(),
+            ),
+        })
+    }
+
+    fn get_docker_environment_variables_for_environment(
+        &self,
+        parameters: &HashMap<String, String>,
+        execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Result<HashMap<String, String>> {
+        let mut env_vars = HashMap::new();
+        let port = parameters
+            .get("port")
+            .ok_or_else(|| anyhow::anyhow!("Missing port parameter"))?;
+        let password = parameters.get("password");
+
+        let (effective_host, effective_port) = match execution_environment {
+            temps_core::ExecutionEnvironment::Host => ("localhost".to_string(), port.clone()),
+            temps_core::ExecutionEnvironment::Docker => (
+                parameters
+                    .get("container_name")
+                    .cloned()
+                    .unwrap_or_else(|| self.get_container_name()),
+                REDIS_INTERNAL_PORT.to_string(),
+            ),
+        };
+
+        let url = if let Some(pass) = password {
+            format!(
+                "redis://:{}@{}:{}",
+                urlencoding::encode(pass),
+                effective_host,
+                effective_port
+            )
+        } else {
+            format!("redis://{}:{}", effective_host, effective_port)
+        };
+
+        env_vars.insert("REDIS_URL".to_string(), url);
+        env_vars.insert("REDIS_HOST".to_string(), effective_host);
+        env_vars.insert("REDIS_PORT".to_string(), effective_port);
+        if let Some(pass) = password {
+            env_vars.insert("REDIS_PASSWORD".to_string(), pass.clone());
+        }
+
+        Ok(env_vars)
+    }
+
     /// Creates and starts the Redis container, retrying with a fresh host
     /// port if the chosen one lost the race described in `port_util` docs
     /// (bindable when we checked, but taken by the time Docker actually binds
@@ -1853,18 +1911,10 @@ const REDIS_INTERNAL_PORT: &str = "6379";
 #[async_trait]
 impl ExternalService for RedisService {
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
-        let config = self.get_redis_config(service_config)?;
-
-        if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            Ok((
-                self.get_live_container_name(&config),
-                REDIS_INTERNAL_PORT.to_string(),
-            ))
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            Ok(("localhost".to_string(), config.port))
-        }
+        self.get_effective_address_for_environment(
+            service_config,
+            temps_core::runtime::execution_environment_compatibility(),
+        )
     }
 
     fn get_docker_container_name(&self) -> String {
@@ -2071,47 +2121,10 @@ impl ExternalService for RedisService {
         &self,
         parameters: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>> {
-        let mut env_vars = HashMap::new();
-        let port = parameters
-            .get("port")
-            .ok_or_else(|| anyhow::anyhow!("Missing port parameter"))?;
-        let password = parameters.get("password");
-
-        // Get effective host and port based on deployment mode. An imported
-        // service's real container name (stored raw in parameters, since the
-        // typed config isn't available here) wins over the derived one.
-        let (effective_host, effective_port) = if temps_core::DeploymentMode::is_docker() {
-            (
-                parameters
-                    .get("container_name")
-                    .cloned()
-                    .unwrap_or_else(|| self.get_container_name()),
-                REDIS_INTERNAL_PORT.to_string(),
-            )
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            ("localhost".to_string(), port.clone())
-        };
-
-        let url = if let Some(pass) = password {
-            format!(
-                "redis://:{}@{}:{}",
-                urlencoding::encode(pass),
-                effective_host,
-                effective_port
-            )
-        } else {
-            format!("redis://{}:{}", effective_host, effective_port)
-        };
-
-        env_vars.insert("REDIS_URL".to_string(), url);
-        env_vars.insert("REDIS_HOST".to_string(), effective_host);
-        env_vars.insert("REDIS_PORT".to_string(), effective_port);
-        if let Some(pass) = password {
-            env_vars.insert("REDIS_PASSWORD".to_string(), pass.clone());
-        }
-
-        Ok(env_vars)
+        self.get_docker_environment_variables_for_environment(
+            parameters,
+            temps_core::runtime::execution_environment_compatibility(),
+        )
     }
 
     fn get_parameter_schema(&self) -> Option<serde_json::Value> {
@@ -3036,8 +3049,6 @@ impl ExternalService for RedisService {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use crate::externalsvc::DEPLOYMENT_MODE_MUTEX as ENV_MUTEX;
 
     #[test]
     fn health_probe_config_preserves_missing_and_short_passwords() {
@@ -3989,10 +4000,6 @@ mod tests {
 
     #[test]
     fn test_get_effective_address_baremetal_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Clear Docker mode to ensure baremetal mode
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = RedisService::new("test-effective-addr".to_string(), docker);
 
@@ -4007,7 +4014,9 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Host)
+            .unwrap();
 
         // In baremetal mode, should return localhost with exposed port
         assert_eq!(host, "localhost");
@@ -4016,10 +4025,6 @@ mod tests {
 
     #[test]
     fn test_get_effective_address_docker_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Set Docker mode
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = RedisService::new("test-effective-addr-docker".to_string(), docker);
 
@@ -4034,21 +4039,17 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
 
         // In Docker mode, should return container name with internal port
         assert_eq!(host, "redis-test-effective-addr-docker");
         assert_eq!(port, "6379"); // Internal port
-
-        // Clean up
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
     }
 
     #[test]
     fn test_get_effective_address_docker_mode_uses_imported_container_name() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = RedisService::new("imported-svc".to_string(), docker);
 
@@ -4064,12 +4065,12 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
         // The imported container name wins over the derived `redis-{name}`.
         assert_eq!(host, "legacy-redis");
         assert_eq!(port, "6379");
-
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
     }
 
     #[test]
@@ -4109,10 +4110,6 @@ mod tests {
 
     #[test]
     fn test_get_docker_environment_variables_baremetal_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Clear Docker mode to ensure baremetal mode
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = RedisService::new("test-docker-env".to_string(), docker);
 
@@ -4120,7 +4117,12 @@ mod tests {
         params.insert("port".to_string(), "6381".to_string());
         params.insert("password".to_string(), "testpass".to_string());
 
-        let env_vars = service.get_docker_environment_variables(&params).unwrap();
+        let env_vars = service
+            .get_docker_environment_variables_for_environment(
+                &params,
+                temps_core::ExecutionEnvironment::Host,
+            )
+            .unwrap();
 
         // In baremetal mode, should use localhost with exposed port
         assert_eq!(env_vars.get("REDIS_HOST").unwrap(), "localhost");
@@ -4129,10 +4131,6 @@ mod tests {
 
     #[test]
     fn test_get_docker_environment_variables_docker_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        // Set Docker mode
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = RedisService::new("test-docker-env-mode".to_string(), docker);
 
@@ -4140,7 +4138,12 @@ mod tests {
         params.insert("port".to_string(), "6381".to_string());
         params.insert("password".to_string(), "testpass".to_string());
 
-        let env_vars = service.get_docker_environment_variables(&params).unwrap();
+        let env_vars = service
+            .get_docker_environment_variables_for_environment(
+                &params,
+                temps_core::ExecutionEnvironment::Docker,
+            )
+            .unwrap();
 
         // In Docker mode, should use container name and internal port
         assert_eq!(
@@ -4148,8 +4151,5 @@ mod tests {
             "redis-test-docker-env-mode"
         );
         assert_eq!(env_vars.get("REDIS_PORT").unwrap(), "6379"); // Internal port
-
-        // Clean up
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
     }
 }

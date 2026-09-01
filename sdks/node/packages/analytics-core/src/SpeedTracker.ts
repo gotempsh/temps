@@ -7,6 +7,8 @@ import type { JsonValue, WebVitalMetric } from "./types";
 
 export interface SpeedTrackerOptions {
   basePath: string;
+  /** Analytics ingest key (`pa_…`). See `AnalyticsClientOptions.ingestKey`. */
+  ingestKey?: string;
 }
 
 /**
@@ -16,10 +18,12 @@ export interface SpeedTrackerOptions {
  */
 export class SpeedTracker {
   private readonly basePath: string;
+  private readonly ingestKey?: string;
   private initialMetrics: Record<string, WebVitalMetric> = {};
 
   constructor(options: SpeedTrackerOptions) {
     this.basePath = options.basePath;
+    this.ingestKey = options.ingestKey;
     if (typeof window === "undefined") return;
     this.start();
   }
@@ -56,7 +60,7 @@ export class SpeedTracker {
       path: window.location.pathname,
       query: window.location.search,
     } as Record<string, JsonValue>;
-    void sendAnalytics("speed", payload, "POST", this.basePath);
+    void sendAnalytics("speed", payload, "POST", this.basePath, this.ingestKey);
   }
 
   private sendLate(name: string, value: number): void {
@@ -65,7 +69,7 @@ export class SpeedTracker {
       path: window.location.pathname,
       query: window.location.search,
     } as Record<string, JsonValue>;
-    void sendAnalytics("speed", payload, "POST", this.basePath);
+    void sendAnalytics("speed", payload, "POST", this.basePath, this.ingestKey);
   }
 
   // Web-vitals subscriptions are fire-and-forget; there's nothing to tear down.

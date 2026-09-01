@@ -7,20 +7,26 @@ use crate::services::service::{
     PerformanceMetricsResponse, RecordPerformanceMetricsConfig, SpeedSegmentFilters,
     UpdatePerformanceMetricsConfig,
 };
-use axum::http::header::HeaderMap;
+use axum::http::header::{self, HeaderMap, HeaderName};
 use axum::Extension;
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Query, RawQuery, State},
+    http::{Method, StatusCode},
     response::{IntoResponse, Json},
     routing::{get, post},
     Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
+use temps_analytics::ingest_keys::{
+    extract_analytics_key, resolve_client_identity, resolve_keyed_ingest_scope,
+    ANALYTICS_INGEST_KEY_HEADER,
+};
 use temps_auth::{project_access_guard, AuthContext, Permission, RequireAuth};
 use temps_core::problemdetails::Problem;
 use temps_core::DateTime;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
 
@@ -180,6 +186,12 @@ pub struct SpeedMetricsPayload {
     pub pathname: Option<String>,
     /// Query string
     pub query: Option<String>,
+    /// Client-generated visitor id, used only when the request carries no
+    /// Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+    /// an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+    pub visitor_id: Option<String>,
+    /// Client-generated session id fallback (see `visitor_id`).
+    pub session_id: Option<String>,
 }
 
 /// Update speed metrics payload for late-loading metrics
@@ -190,6 +202,12 @@ pub struct UpdateSpeedMetricsPayload {
     pub cls: Option<f32>,
     /// Interaction to Next Paint (milliseconds)
     pub inp: Option<f32>,
+    /// Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+    /// Required to identify the right row on the keyed path, where there is
+    /// no Temps-issued cookie to fall back on.
+    pub visitor_id: Option<String>,
+    /// Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+    pub session_id: Option<String>,
 }
 
 #[derive(OpenApi)]
@@ -237,6 +255,28 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
     Router::new()
         .route("/_temps/speed", post(record_speed_metrics))
         .route("/_temps/speed/update", post(update_speed_metrics))
+        .layer(public_ingest_cors())
+}
+
+/// CORS for the public performance ingest routes.
+///
+/// Required by ADR-040: with an ingest key the request is cross-origin by
+/// definition, and without this layer the browser blocks it before it ever
+/// leaves the page.
+///
+/// `allow_credentials` stays at its default `false`, and must never be set
+/// true. Key-based ingest needs no cookies by design; credentialed CORS on a
+/// wildcard origin would be a real vulnerability, and browsers reject the
+/// combination outright.
+pub(crate) fn public_ingest_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            HeaderName::from_static(ANALYTICS_INGEST_KEY_HEADER),
+        ])
+        .max_age(Duration::from_secs(600))
 }
 
 /// Get performance metrics
@@ -497,12 +537,59 @@ async fn has_performance_metrics(
     }
 }
 
+/// The scope a performance metric is attributed to.
+#[derive(Debug, PartialEq, Eq)]
+struct MetricScope {
+    project_id: i32,
+    /// `None` when the route has no environment — an app Temps does not deploy.
+    environment_id: Option<i32>,
+    /// `None` when the environment has no live Temps deployment.
+    deployment_id: Option<i32>,
+}
+
+/// Derive the metric scope from a resolved route.
+///
+/// **Only a missing project drops the event.** A route without an environment
+/// or without a deployment is a normal, recordable state: the environment may
+/// simply have nothing deployed right now, and (per ADR-040) the app may not be
+/// Temps-deployed at all. Both handlers previously early-returned `204` in
+/// those cases, which looked like success to the browser SDK while silently
+/// discarding every web vital. Both DB columns are nullable, so pass the
+/// `Option` through instead of dropping the row.
+fn metric_scope_from_route(route: &temps_routes::RouteInfo) -> Option<MetricScope> {
+    // No project means a sandbox/orphaned route with nothing to attribute the
+    // metric to; `project_id` is `NOT NULL` with a real FK, so there is no
+    // value we could write.
+    let project = route.project.as_ref()?;
+    Some(MetricScope {
+        project_id: project.id,
+        environment_id: route.environment.as_ref().map(|e| e.id),
+        deployment_id: route.deployment.as_ref().map(|d| d.id),
+    })
+}
+
+impl From<temps_analytics::ResolvedIngestScope> for MetricScope {
+    /// A resolved ingest key **replaces** Host-based resolution (ADR-040 §3) —
+    /// it is never merged with a route lookup.
+    fn from(scope: temps_analytics::ResolvedIngestScope) -> Self {
+        Self {
+            project_id: scope.project_id,
+            environment_id: scope.environment_id,
+            deployment_id: scope.deployment_id,
+        }
+    }
+}
+
 /// Record performance metrics from client
 #[utoipa::path(
     tag = "Performance",
     post,
     path = "/_temps/speed",
     request_body = SpeedMetricsPayload,
+    params(
+        ("x-temps-analytics-key" = Option<String>, Header, description = "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else."),
+        ("temps_key" = Option<String>, Query, description = "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.")
+    ),
     responses(
         (status = 204, description = "Metrics recorded successfully"),
         (status = 400, description = "Bad request", body = ErrorResponse),
@@ -513,6 +600,7 @@ async fn has_performance_metrics(
 pub async fn record_speed_metrics(
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<temps_core::RequestMetadata>,
+    RawQuery(raw_query): RawQuery,
     headers: HeaderMap,
     Json(payload): Json<SpeedMetricsPayload>,
 ) -> impl IntoResponse {
@@ -523,61 +611,75 @@ pub async fn record_speed_metrics(
     // route-table keying so `get_route` works correctly even on non-default
     // ports (e.g. the :8080 dev proxy).
     let host = metadata.host.clone();
-    if host.is_empty() {
-        error!("Missing Host header");
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "error": "Missing Host header"
-            })),
+
+    // ADR-040 §3. A presented ingest key resolves the scope outright; `Host` is
+    // never consulted for resolution in that branch, and an unresolvable key is
+    // a 401 rather than a silent fall-through to `Host`.
+    let (scope, is_keyed) = if let Some(key) = extract_analytics_key(&headers, raw_query.as_deref())
+    {
+        let origin = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok());
+        match resolve_keyed_ingest_scope(
+            state.ingest_key_service.as_ref(),
+            state.ingest_rate_limiter.as_ref(),
+            &key,
+            origin,
         )
-            .into_response();
-    }
-
-    // Look up project/environment/deployment from route table
-    let (project_id, environment_id, deployment_id) = match state.route_table.get_route(&host) {
-        Some(route_info) => {
-            let Some(project) = route_info.project.as_ref() else {
+        .await
+        {
+            Ok(resolved) => {
                 info!(
-                    "Dropping performance event for host {} — no associated project",
-                    host
+                    "Resolved analytics ingest key {} to project={}, env={:?}, deploy={:?}",
+                    resolved.key_id,
+                    resolved.project_id,
+                    resolved.environment_id,
+                    resolved.deployment_id
                 );
-                return StatusCode::NO_CONTENT.into_response();
-            };
-            let Some(environment) = route_info.environment.as_ref() else {
-                info!(
-                    "Dropping performance event for host {} — no associated environment",
-                    host
-                );
-                return StatusCode::NO_CONTENT.into_response();
-            };
-            let Some(deployment) = route_info.deployment.as_ref() else {
-                info!(
-                    "Dropping performance event for host {} — no associated deployment",
-                    host
-                );
-                return StatusCode::NO_CONTENT.into_response();
-            };
-            let project_id = project.id;
-            let environment_id = environment.id;
-            let deployment_id = deployment.id;
-
-            info!(
-                "Resolved host {} to project={}, env={}, deploy={}",
-                host, project_id, environment_id, deployment_id
-            );
-
-            (project_id, environment_id, deployment_id)
+                (MetricScope::from(resolved), true)
+            }
+            Err(problem) => return problem.into_response(),
         }
-        None => {
-            error!("Host {} not found in route table", host);
+    } else {
+        if host.is_empty() {
+            error!("Missing Host header");
             return (
-                StatusCode::NOT_FOUND,
+                StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": format!("Host {} not found", host)
+                    "error": "Missing Host header"
                 })),
             )
                 .into_response();
+        }
+
+        // Look up project/environment/deployment from route table
+        match state.route_table.get_route(&host) {
+            Some(route_info) => {
+                let Some(scope) = metric_scope_from_route(&route_info) else {
+                    info!(
+                        "Dropping performance event for host {} — no associated project",
+                        host
+                    );
+                    return StatusCode::NO_CONTENT.into_response();
+                };
+
+                info!(
+                    "Resolved host {} to project={}, env={:?}, deploy={:?}",
+                    host, scope.project_id, scope.environment_id, scope.deployment_id
+                );
+
+                (scope, false)
+            }
+            None => {
+                error!("Host {} not found in route table", host);
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("Host {} not found", host)
+                    })),
+                )
+                    .into_response();
+            }
         }
     };
 
@@ -607,14 +709,25 @@ pub async fn record_speed_metrics(
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
+    let session_id = resolve_client_identity(
+        metadata.session_id_cookie,
+        payload.session_id.clone(),
+        is_keyed,
+    );
+    let visitor_id = resolve_client_identity(
+        metadata.visitor_id_cookie,
+        payload.visitor_id.clone(),
+        is_keyed,
+    );
+
     match state
         .performance_service
         .record_performance_metrics(RecordPerformanceMetricsConfig {
-            project_id,
-            environment_id,
-            deployment_id,
-            session_id: metadata.session_id_cookie,
-            visitor_id: metadata.visitor_id_cookie,
+            project_id: scope.project_id,
+            environment_id: scope.environment_id,
+            deployment_id: scope.deployment_id,
+            session_id,
+            visitor_id,
             ip_address_id,
             ttfb: payload.ttfb,
             lcp: payload.lcp,
@@ -624,7 +737,10 @@ pub async fn record_speed_metrics(
             inp: payload.inp,
             pathname: payload.pathname,
             query: payload.query,
-            host: Some(host),
+            // Still read and stored on the keyed path (ADR-040 §3), where it is
+            // data rather than a lookup key — and where it can legitimately be
+            // absent, since Temps never served this page.
+            host: (!host.is_empty()).then_some(host),
             user_agent,
             screen_width: payload.screen_width,
             screen_height: payload.screen_height,
@@ -655,6 +771,10 @@ pub async fn record_speed_metrics(
     post,
     path = "/_temps/speed/update",
     request_body = UpdateSpeedMetricsPayload,
+    params(
+        ("x-temps-analytics-key" = Option<String>, Header, description = "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else."),
+        ("temps_key" = Option<String>, Query, description = "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers. This endpoint is called via `navigator.sendBeacon` on page unload, so the query form is the only one available there. Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.")
+    ),
     responses(
         (status = 204, description = "Metrics updated successfully"),
         (status = 400, description = "Bad request", body = ErrorResponse),
@@ -665,6 +785,8 @@ pub async fn record_speed_metrics(
 pub async fn update_speed_metrics(
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<temps_core::RequestMetadata>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
     Json(payload): Json<UpdateSpeedMetricsPayload>,
 ) -> impl IntoResponse {
     info!("Updating late performance metrics from client");
@@ -674,72 +796,117 @@ pub async fn update_speed_metrics(
     // route-table keying so `get_route` works correctly even on non-default
     // ports (e.g. the :8080 dev proxy).
     let host = metadata.host.clone();
-    if host.is_empty() {
-        error!("Missing Host header");
+
+    // ADR-040 §3. This route is called via `navigator.sendBeacon`, which cannot
+    // set headers — so the `?temps_key=` fallback is the only way a keyed
+    // client can authenticate here, and `extract_analytics_key` accepts both.
+    let (scope, is_keyed) = if let Some(key) = extract_analytics_key(&headers, raw_query.as_deref())
+    {
+        let origin = headers
+            .get(header::ORIGIN)
+            .and_then(|value| value.to_str().ok());
+        match resolve_keyed_ingest_scope(
+            state.ingest_key_service.as_ref(),
+            state.ingest_rate_limiter.as_ref(),
+            &key,
+            origin,
+        )
+        .await
+        {
+            Ok(resolved) => {
+                info!(
+                    "Resolved analytics ingest key {} to project={}, env={:?}, deploy={:?}",
+                    resolved.key_id,
+                    resolved.project_id,
+                    resolved.environment_id,
+                    resolved.deployment_id
+                );
+                (MetricScope::from(resolved), true)
+            }
+            Err(problem) => return problem.into_response(),
+        }
+    } else {
+        if host.is_empty() {
+            error!("Missing Host header");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": "Missing Host header"
+                })),
+            )
+                .into_response();
+        }
+
+        // Look up project/environment/deployment from route table. The update must
+        // resolve to the same scope the original insert used — including when that
+        // scope was NULL — so it goes through the same helper.
+        match state.route_table.get_route(&host) {
+            Some(route_info) => {
+                let Some(scope) = metric_scope_from_route(&route_info) else {
+                    info!(
+                        "Dropping performance update for host {} — no associated project",
+                        host
+                    );
+                    return StatusCode::NO_CONTENT.into_response();
+                };
+
+                info!(
+                    "Resolved host {} to project={}, env={:?}, deploy={:?}",
+                    host, scope.project_id, scope.environment_id, scope.deployment_id
+                );
+
+                (scope, false)
+            }
+            None => {
+                error!("Host {} not found in route table", host);
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({
+                        "error": format!("Host {} not found", host)
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    };
+
+    // On the keyed path there is never a Temps cookie (ADR-040 §3), so
+    // identity has to come from the payload — resolving it the same way
+    // `record_speed_metrics` does. Without this, both filters below would be
+    // `None` and the update would silently land on whichever row is newest
+    // for the project/env/deployment scope, i.e. a different visitor's data.
+    let session_id = resolve_client_identity(
+        metadata.session_id_cookie,
+        payload.session_id.clone(),
+        is_keyed,
+    );
+    let visitor_id = resolve_client_identity(
+        metadata.visitor_id_cookie,
+        payload.visitor_id.clone(),
+        is_keyed,
+    );
+
+    if is_keyed && session_id.is_none() && visitor_id.is_none() {
+        error!(
+            "Keyed speed-metrics update carries no resolvable identity; refusing to guess a row"
+        );
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
-                "error": "Missing Host header"
+                "error": "No visitorId or sessionId in the request body — required on the keyed ingest path"
             })),
         )
             .into_response();
     }
 
-    // Look up project/environment/deployment from route table
-    let (project_id, environment_id, deployment_id) = match state.route_table.get_route(&host) {
-        Some(route_info) => {
-            let Some(project) = route_info.project.as_ref() else {
-                info!(
-                    "Dropping performance update for host {} — no associated project",
-                    host
-                );
-                return StatusCode::NO_CONTENT.into_response();
-            };
-            let Some(environment) = route_info.environment.as_ref() else {
-                info!(
-                    "Dropping performance update for host {} — no associated environment",
-                    host
-                );
-                return StatusCode::NO_CONTENT.into_response();
-            };
-            let Some(deployment) = route_info.deployment.as_ref() else {
-                info!(
-                    "Dropping performance update for host {} — no associated deployment",
-                    host
-                );
-                return StatusCode::NO_CONTENT.into_response();
-            };
-            let project_id = project.id;
-            let environment_id = environment.id;
-            let deployment_id = deployment.id;
-
-            info!(
-                "Resolved host {} to project={}, env={}, deploy={}",
-                host, project_id, environment_id, deployment_id
-            );
-
-            (project_id, environment_id, deployment_id)
-        }
-        None => {
-            error!("Host {} not found in route table", host);
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "error": format!("Host {} not found", host)
-                })),
-            )
-                .into_response();
-        }
-    };
-
     match state
         .performance_service
         .update_performance_metrics(UpdatePerformanceMetricsConfig {
-            project_id,
-            environment_id,
-            deployment_id,
-            session_id: metadata.session_id_cookie,
-            visitor_id: metadata.visitor_id_cookie,
+            project_id: scope.project_id,
+            environment_id: scope.environment_id,
+            deployment_id: scope.deployment_id,
+            session_id,
+            visitor_id,
             cls: payload.cls,
             inp: payload.inp,
         })
@@ -766,6 +933,201 @@ mod tests {
     use async_trait::async_trait;
     use temps_auth::Role;
     use temps_core::ProjectAccessChecker;
+    use temps_entities::deployments::Model as DeploymentModel;
+
+    fn test_project(id: i32) -> temps_entities::projects::Model {
+        let now = chrono::Utc::now();
+        temps_entities::projects::Model {
+            id,
+            name: "test-project".to_string(),
+            repo_name: "test-repo".to_string(),
+            repo_owner: "test-owner".to_string(),
+            directory: String::new(),
+            main_branch: "main".to_string(),
+            preset: temps_entities::preset::Preset::NextJs,
+            preset_config: None,
+            deployment_config: None,
+            created_at: now,
+            updated_at: now,
+            slug: "test-project".to_string(),
+            is_deleted: false,
+            deleted_at: None,
+            last_deployment: None,
+            is_public_repo: false,
+            git_url: None,
+            git_provider_connection_id: None,
+            attack_mode: false,
+            ai_alert_summaries_enabled: None,
+            ai_debug_chat_enabled: None,
+            ai_write_actions_enabled: false,
+            error_source_context_enabled: false,
+            error_source_root: None,
+            enable_preview_environments: false,
+            preview_envs_on_demand: false,
+            preview_envs_idle_timeout_seconds: 300,
+            preview_envs_wake_timeout_seconds: 30,
+            source_type: temps_entities::source_type::SourceType::Git,
+            allow_alternate_sources: None,
+            template_slug: None,
+            gitlab_webhook_id: None,
+            gitlab_webhook_signing_token: None,
+            gitea_webhook_signing_token: None,
+            bitbucket_webhook_token: None,
+            bitbucket_webhook_hook_id: None,
+            generic_webhook_token: None,
+            cross_project_trace_sharing: true,
+            ai_api_traffic_summary_enabled: None,
+            image_retention_hours: None,
+        }
+    }
+
+    fn test_environment(id: i32, project_id: i32) -> temps_entities::environments::Model {
+        let now = chrono::Utc::now();
+        temps_entities::environments::Model {
+            id,
+            name: "production".to_string(),
+            slug: "production".to_string(),
+            subdomain: "prod".to_string(),
+            last_deployment: None,
+            host: "app.example.com".to_string(),
+            upstreams: Default::default(),
+            created_at: now,
+            updated_at: now,
+            project_id,
+            current_deployment_id: None,
+            branch: None,
+            deleted_at: None,
+            deployment_config: None,
+            is_preview: false,
+            protected: false,
+            sleeping: false,
+            attack_mode: None,
+            force_https: None,
+            last_activity_at: None,
+        }
+    }
+
+    fn test_deployment(id: i32, project_id: i32, environment_id: i32) -> DeploymentModel {
+        let now = chrono::Utc::now();
+        DeploymentModel {
+            id,
+            project_id,
+            environment_id,
+            created_at: now,
+            updated_at: now,
+            slug: "deploy-1".to_string(),
+            state: "ready".to_string(),
+            metadata: None,
+            deploying_at: None,
+            ready_at: None,
+            started_at: None,
+            finished_at: None,
+            context_vars: None,
+            branch_ref: None,
+            tag_ref: None,
+            commit_sha: None,
+            commit_message: None,
+            commit_author: None,
+            commit_json: None,
+            cancelled_reason: None,
+            static_dir_location: None,
+            screenshot_location: None,
+            image_name: None,
+            deployment_config: None,
+            promoted_from_deployment_id: None,
+        }
+    }
+
+    fn test_route(
+        project: Option<temps_entities::projects::Model>,
+        environment: Option<temps_entities::environments::Model>,
+        deployment: Option<DeploymentModel>,
+    ) -> temps_routes::RouteInfo {
+        temps_routes::RouteInfo {
+            backend: temps_routes::BackendType::StaticDir {
+                path: "/tmp".to_string(),
+            },
+            redirect_to: None,
+            status_code: None,
+            project: project.map(Arc::new),
+            environment: environment.map(Arc::new),
+            deployment: deployment.map(Arc::new),
+            cert_eligible: false,
+        }
+    }
+
+    /// Regression test for the silent web-vitals loss fixed alongside ADR-040:
+    /// a project whose route has no deployment (nothing deployed right now, or
+    /// an app Temps does not deploy at all) used to early-return `204` from
+    /// both `/speed` and `/speed/update`, which looks like success to the SDK
+    /// while discarding every metric. The scope must resolve with `None`s, not
+    /// vanish.
+    #[test]
+    fn metric_scope_records_project_without_environment_or_deployment() {
+        let route = test_route(Some(test_project(7)), None, None);
+
+        let scope = metric_scope_from_route(&route)
+            .expect("a project without environment/deployment must still be recorded");
+
+        assert_eq!(
+            scope,
+            MetricScope {
+                project_id: 7,
+                environment_id: None,
+                deployment_id: None,
+            }
+        );
+    }
+
+    /// An environment that exists but currently has nothing deployed is the
+    /// other half of the same bug — `deployment_id` alone must be allowed to
+    /// be `None` without losing the environment attribution.
+    #[test]
+    fn metric_scope_records_environment_without_deployment() {
+        let route = test_route(Some(test_project(7)), Some(test_environment(3, 7)), None);
+
+        let scope = metric_scope_from_route(&route)
+            .expect("an environment without a deployment must still be recorded");
+
+        assert_eq!(
+            scope,
+            MetricScope {
+                project_id: 7,
+                environment_id: Some(3),
+                deployment_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn metric_scope_carries_full_attribution_when_deployed() {
+        let route = test_route(
+            Some(test_project(7)),
+            Some(test_environment(3, 7)),
+            Some(test_deployment(11, 7, 3)),
+        );
+
+        let scope = metric_scope_from_route(&route).expect("fully resolved route must be recorded");
+
+        assert_eq!(
+            scope,
+            MetricScope {
+                project_id: 7,
+                environment_id: Some(3),
+                deployment_id: Some(11),
+            }
+        );
+    }
+
+    /// The one case that *is* still a drop: `performance_metrics.project_id` is
+    /// `NOT NULL` with a real FK, so a sandbox/orphaned route has no value that
+    /// could be written.
+    #[test]
+    fn metric_scope_drops_route_without_project() {
+        let route = test_route(None, None, None);
+
+        assert!(metric_scope_from_route(&route).is_none());
+    }
 
     fn test_user_auth(role: Role) -> AuthContext {
         let user = temps_entities::users::Model {
@@ -891,5 +1253,564 @@ mod tests {
         let (status, body) = result.expect_err("role without AnalyticsRead must be denied");
         assert_eq!(status, StatusCode::FORBIDDEN);
         assert_eq!(body.0.error, "Insufficient permissions");
+    }
+
+    // ── ADR-040: keyed ingest on POST /_temps/speed and /_temps/speed/update ─
+    //
+    // The no-key regression cases matter most: breaking web-vitals ingest for a
+    // Temps-deployed app would be worse than not shipping keyed ingest at all.
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::middleware;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+    use temps_analytics::ingest_keys::{AnalyticsIngestKeyService, AnalyticsIngestRateLimiter};
+    use temps_database::test_utils::TestDatabase;
+    use tower::ServiceExt;
+
+    /// A syntactically valid key that is guaranteed not to exist.
+    const UNKNOWN_KEY: &str = "pa_0000000000000000000000000000000000000000000000000000000000000000";
+
+    async fn insert_db_project(
+        db: &sea_orm::DatabaseConnection,
+    ) -> temps_entities::projects::Model {
+        temps_entities::projects::ActiveModel {
+            name: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            slug: Set("test-project".to_string()),
+            source_type: Set(temps_entities::source_type::SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("Failed to insert test project")
+    }
+
+    fn build_state(db: Arc<sea_orm::DatabaseConnection>) -> Arc<AppState> {
+        let geoip_service = Arc::new(temps_geo::GeoIpService::Mock(
+            temps_geo::MockGeoIpService::new(),
+        ));
+        Arc::new(AppState {
+            performance_service: Arc::new(crate::services::service::PerformanceService::new(
+                db.clone(),
+            )),
+            route_table: Arc::new(temps_routes::CachedPeerTable::new(db.clone())),
+            ip_address_service: Arc::new(temps_geo::IpAddressService::new(
+                db.clone(),
+                geoip_service,
+            )),
+            project_access_checker: None,
+            ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
+            ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+        })
+    }
+
+    fn test_request_metadata(headers: &HeaderMap) -> temps_core::RequestMetadata {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        temps_core::RequestMetadata {
+            ip_address: String::new(),
+            user_agent: String::new(),
+            headers: headers.clone(),
+            visitor_id_cookie: None,
+            session_id_cookie: None,
+            base_url: format!("http://{host}"),
+            scheme: "http".to_string(),
+            host,
+            is_secure: false,
+        }
+    }
+
+    /// The public ingest router with a middleware that fabricates the
+    /// `RequestMetadata` the real server injects, deriving `host` from the
+    /// request's own `Host` header so tests can exercise both branches.
+    fn setup_public_app(state: Arc<AppState>) -> axum::Router {
+        let metadata_middleware = middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let metadata = test_request_metadata(req.headers());
+                req.extensions_mut().insert(metadata);
+                next.run(req).await
+            },
+        );
+
+        configure_public_routes()
+            .layer(metadata_middleware)
+            .with_state(state)
+    }
+
+    fn insert_test_route(
+        route_table: &temps_routes::CachedPeerTable,
+        host: &str,
+        project: Option<temps_entities::projects::Model>,
+    ) {
+        route_table.insert_route_for_test(host, test_route(project, None, None));
+    }
+
+    fn speed_payload() -> serde_json::Value {
+        serde_json::json!({ "ttfb": 120.0, "lcp": 900.0, "pathname": "/pricing" })
+    }
+
+    async fn stored_metrics(
+        db: &sea_orm::DatabaseConnection,
+    ) -> Vec<temps_entities::performance_metrics::Model> {
+        temps_entities::performance_metrics::Entity::find()
+            .all(db)
+            .await
+            .expect("Failed to query performance metrics")
+    }
+
+    #[tokio::test]
+    async fn keyed_speed_ingest_resolves_the_keys_project_without_the_route_table() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/speed")
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(speed_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let metrics = stored_metrics(db.as_ref()).await;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].project_id, project.id);
+        assert_eq!(metrics[0].environment_id, None);
+        assert_eq!(metrics[0].deployment_id, None);
+        assert_eq!(
+            metrics[0].host.as_deref(),
+            Some("app.not-deployed-by-temps.test")
+        );
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_speed_update_accepts_the_query_param_fallback() {
+        // `/speed/update` is delivered by `navigator.sendBeacon`, which cannot
+        // set headers — the query param is the only usable transport there.
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        // The keyed path never carries a Temps cookie, so `visitorId` in the
+        // payload is the only way to bind the update to the row the insert
+        // created — see `resolve_client_identity`.
+        let mut seed_payload = speed_payload();
+        seed_payload["visitorId"] = serde_json::json!("keyed-update-test-visitor");
+
+        // Seed the row the late-metrics call will update.
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/speed")
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(seed_payload.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/_temps/speed/update?temps_key={}", key.public_key))
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "cls": 0.02,
+                            "inp": 40.0,
+                            "visitorId": "keyed-update-test-visitor",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The update must land on the row the insert created, matched by the
+        // shared client-generated visitorId — not by guessing "most recent row".
+        let metrics = stored_metrics(db.as_ref()).await;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].cls, Some(0.02));
+        assert_eq!(metrics[0].inp, Some(40.0));
+
+        test_db.cleanup().await;
+    }
+
+    /// Mirrors the fix for the cross-visitor-corruption bug this replaces:
+    /// a keyed update with no resolvable identity must be rejected outright
+    /// rather than silently landing on "whichever row is newest."
+    #[tokio::test]
+    async fn keyed_speed_update_without_identity_is_rejected() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/_temps/speed/update?temps_key={}", key.public_key))
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({ "cls": 0.02, "inp": 40.0 }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(stored_metrics(db.as_ref()).await.len(), 0);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_speed_key_returns_401_and_never_falls_back_to_host() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        // The Host *would* resolve — a typo'd key must not silently use it.
+        insert_test_route(&state.route_table, "app.example.test", Some(project));
+
+        for uri in ["/_temps/speed", "/_temps/speed/update"] {
+            let response = setup_public_app(state.clone())
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("host", "app.example.test")
+                        .header("content-type", "application/json")
+                        .header("x-temps-analytics-key", UNKNOWN_KEY)
+                        .body(Body::from(speed_payload().to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{uri}");
+        }
+
+        assert!(
+            stored_metrics(db.as_ref()).await.is_empty(),
+            "a rejected key must not fall through to Host-based resolution"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn scoped_speed_key_enforces_the_origin_allowlist() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(
+                project.id,
+                None,
+                None,
+                Some(vec!["https://app.example.com".to_string()]),
+                None,
+                None,
+            )
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let post = |origin: Option<&'static str>| {
+            let app = setup_public_app(state.clone());
+            let public_key = key.public_key.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .method("POST")
+                    .uri("/_temps/speed")
+                    .header("host", "app.example.com")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", public_key);
+                if let Some(origin) = origin {
+                    builder = builder.header("origin", origin);
+                }
+                app.oneshot(
+                    builder
+                        .body(Body::from(speed_payload().to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        assert_eq!(post(None).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            post(Some("https://evil.example.com")).await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(stored_metrics(db.as_ref()).await.is_empty());
+
+        assert_eq!(
+            post(Some("https://app.example.com")).await,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(stored_metrics(db.as_ref()).await.len(), 1);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn speed_key_over_its_rate_limit_returns_429() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, Some(1), None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let post = || {
+            let app = setup_public_app(state.clone());
+            let public_key = key.public_key.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_temps/speed")
+                        .header("host", "app.example.com")
+                        .header("content-type", "application/json")
+                        .header("x-temps-analytics-key", public_key)
+                        .body(Body::from(speed_payload().to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        assert_eq!(post().await, StatusCode::NO_CONTENT);
+        assert_eq!(post().await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(stored_metrics(db.as_ref()).await.len(), 1);
+
+        test_db.cleanup().await;
+    }
+
+    /// Regression: no key at all resolves from Host exactly as before.
+    #[tokio::test]
+    async fn no_key_still_resolves_the_speed_scope_from_host() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        insert_test_route(
+            &state.route_table,
+            "app.example.test",
+            Some(project.clone()),
+        );
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/speed")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(speed_payload().to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let metrics = stored_metrics(db.as_ref()).await;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].project_id, project.id);
+        assert_eq!(metrics[0].host.as_deref(), Some("app.example.test"));
+
+        test_db.cleanup().await;
+    }
+
+    /// Regression: the no-key rejection shapes on both routes are unchanged —
+    /// empty Host is 400, unknown host is 404, orphan route is a silent 204.
+    #[tokio::test]
+    async fn no_key_speed_rejection_shapes_are_unchanged() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let state = build_state(db.clone());
+        insert_test_route(&state.route_table, "orphan.example.test", None);
+
+        for uri in ["/_temps/speed", "/_temps/speed/update"] {
+            for (host, expected) in [
+                ("", StatusCode::BAD_REQUEST),
+                ("unknown.example.test", StatusCode::NOT_FOUND),
+                ("orphan.example.test", StatusCode::NO_CONTENT),
+            ] {
+                let response = setup_public_app(state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("host", host)
+                            .header("content-type", "application/json")
+                            .body(Body::from(speed_payload().to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(response.status(), expected, "{uri} with host {host:?}");
+            }
+        }
+
+        assert!(stored_metrics(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn public_speed_routes_answer_cors_preflight_without_credentials() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let state = build_state(db.clone());
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/_temps/speed")
+                    .header("host", "app.example.com")
+                    .header("origin", "https://app.example.com")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "x-temps-analytics-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success(), "{}", response.status());
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+        assert!(
+            headers.get("access-control-allow-credentials").is_none(),
+            "wildcard-origin ingest must never be credentialed"
+        );
+
+        test_db.cleanup().await;
     }
 }

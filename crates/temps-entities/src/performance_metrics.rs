@@ -11,8 +11,11 @@ pub struct Model {
     #[sea_orm(primary_key)]
     pub id: i32,
     pub project_id: i32,
-    pub environment_id: i32,
-    pub deployment_id: i32,
+    /// `None` when the metric belongs to a project that has no Temps
+    /// environment for this host (e.g. an app Temps does not deploy).
+    pub environment_id: Option<i32>,
+    /// `None` when the environment has no live Temps deployment.
+    pub deployment_id: Option<i32>,
     pub ttfb: Option<f32>,
     pub lcp: Option<f32>,
     pub fid: Option<f32>,

@@ -7,20 +7,29 @@ use crate::services::service::{
     SessionReplayWithVisitor, Viewport,
 };
 use axum::{
-    extract::{DefaultBodyLimit, Path, Query, State},
-    http::StatusCode,
+    extract::{DefaultBodyLimit, Path, Query, RawQuery, State},
+    http::{
+        header::{self, HeaderMap, HeaderName},
+        Method, StatusCode,
+    },
     response::Json,
     routing::{get, post, put},
     Extension, Router,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use std::time::Duration;
+use temps_analytics::ingest_keys::{
+    extract_analytics_key, resolve_client_identity, resolve_keyed_ingest_scope,
+    ANALYTICS_INGEST_KEY_HEADER,
+};
 use temps_auth::{
     deny_deployment_token, permission_guard, project_access_guard, project_scope_guard, RequireAuth,
 };
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
 use temps_core::RequestMetadata;
+use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 use utoipa::{OpenApi, ToSchema};
 
@@ -204,6 +213,12 @@ pub struct AddEventsResponse {
 #[serde(rename_all = "camelCase")]
 pub struct SessionReplayInitRequest {
     pub session_id: String,
+    /// Client-generated visitor id, used only when the request carries no
+    /// Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+    /// an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+    /// The SDK already sends this today via `getSessionMetadata()`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visitor_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_agent: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -776,6 +791,10 @@ pub async fn add_events(
     post,
     path = "/_temps/session-replay/init",
     request_body = SessionReplayInitRequest,
+    params(
+        ("x-temps-analytics-key" = Option<String>, Header, description = "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else."),
+        ("temps_key" = Option<String>, Query, description = "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.")
+    ),
     responses(
         (status = 201, description = "Session initialized successfully", body = SessionReplayInitResponse),
         (status = 400, description = "Bad request", body = ErrorResponse),
@@ -786,6 +805,8 @@ pub async fn add_events(
 pub async fn init_session_replay(
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
     Json(request): Json<SessionReplayInitRequest>,
 ) -> Result<(StatusCode, Json<SessionReplayInitResponse>), Problem> {
     debug!(
@@ -793,15 +814,62 @@ pub async fn init_session_replay(
         request.session_id
     );
 
-    let visitor_id = metadata.visitor_id_cookie.ok_or_else(|| {
+    // ADR-040 §3. Resolved before the payload checks below so a bad credential
+    // is answered as such, and so an invalid key can never fall through to the
+    // `Host` path. The no-key branch is untouched: when no key is presented
+    // this resolves to `None` and the original ordering (visitor check, then
+    // route table) stands exactly as before.
+    let keyed_scope = match extract_analytics_key(&headers, raw_query.as_deref()) {
+        Some(key) => {
+            let origin = headers
+                .get(header::ORIGIN)
+                .and_then(|value| value.to_str().ok());
+            Some(
+                resolve_keyed_ingest_scope(
+                    state.ingest_key_service.as_ref(),
+                    state.ingest_rate_limiter.as_ref(),
+                    &key,
+                    origin,
+                )
+                .await?,
+            )
+        }
+        None => None,
+    };
+    let is_keyed = keyed_scope.is_some();
+
+    // Only reject the request if the client sent neither a cookie nor a
+    // fallback id, which means it's an SDK version too old to generate one
+    // (or, on the Host-resolved branch, that no cookie is present at all —
+    // the fallback id is never trusted there; see `resolve_client_identity`).
+    let visitor_id = resolve_client_identity(
+        metadata.visitor_id_cookie,
+        request.visitor_id.clone(),
+        is_keyed,
+    )
+    .ok_or_else(|| {
         ErrorBuilder::new(StatusCode::BAD_REQUEST)
             .title("Visitor ID is required")
+            .detail(
+                "No _temps_visitor_id cookie and no visitorId in the request body. \
+                     Update the Temps analytics SDK to a version that sends a \
+                     client-generated visitorId fallback.",
+            )
             .build()
     })?;
 
-    // Resolve project, environment, and deployment from route table
-    let (project_id, environment_id, deployment_id) =
-        match state.route_table.get_route(&metadata.host) {
+    // A resolved key replaces Host-based resolution outright (ADR-040 §3); the
+    // route table is not consulted at all in that case.
+    let (project_id, environment_id, deployment_id) = match keyed_scope {
+        Some(scope) => {
+            debug!(
+                "Resolved analytics ingest key {} to project={}, env={:?}, deploy={:?}",
+                scope.key_id, scope.project_id, scope.environment_id, scope.deployment_id
+            );
+            (scope.project_id, scope.environment_id, scope.deployment_id)
+        }
+        // Resolve project, environment, and deployment from route table
+        None => match state.route_table.get_route(&metadata.host) {
             Some(route_info) => {
                 let Some(project) = route_info.project.as_ref() else {
                     return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
@@ -829,7 +897,8 @@ pub async fn init_session_replay(
                     .detail(format!("Host {} not found", metadata.host))
                     .build());
             }
-        };
+        },
+    };
 
     let session_metadata = SessionMetadata {
         visitor_id,
@@ -889,6 +958,10 @@ pub async fn init_session_replay(
     post,
     path = "/_temps/session-replay/events",
     request_body = SessionReplayEventsRequest,
+    params(
+        ("x-temps-analytics-key" = Option<String>, Header, description = "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else."),
+        ("temps_key" = Option<String>, Query, description = "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used to flush the final replay batch on page unload). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.")
+    ),
     responses(
         (status = 200, description = "Events added successfully", body = AddEventsResponse),
         (status = 400, description = "Bad request", body = ErrorResponse),
@@ -900,6 +973,8 @@ pub async fn init_session_replay(
 pub async fn add_session_replay_events(
     State(state): State<Arc<AppState>>,
     Extension(metadata): Extension<RequestMetadata>,
+    RawQuery(raw_query): RawQuery,
+    headers: HeaderMap,
     Json(request): Json<SessionReplayEventsRequest>,
 ) -> Result<Json<AddEventsResponse>, Problem> {
     debug!(
@@ -907,29 +982,55 @@ pub async fn add_session_replay_events(
         request.session_id
     );
 
+    // ADR-040 §3: an ingest key resolves the owning project outright and the
+    // Host header is not consulted. The binding is just as tight as the Host
+    // path below — `add_session_events` still enforces that the session belongs
+    // to the resolved project — so a key for project A cannot append events to
+    // project B's session.
+    let keyed_scope = match extract_analytics_key(&headers, raw_query.as_deref()) {
+        Some(key) => {
+            let origin = headers
+                .get(header::ORIGIN)
+                .and_then(|value| value.to_str().ok());
+            Some(
+                resolve_keyed_ingest_scope(
+                    state.ingest_key_service.as_ref(),
+                    state.ingest_rate_limiter.as_ref(),
+                    &key,
+                    origin,
+                )
+                .await?,
+            )
+        }
+        None => None,
+    };
+
     // Resolve the project from the Host header — the same path used by
     // init_session_replay.  This binds the event-append operation to the
     // project that owns the originating host, preventing a cross-tenant
     // attacker from injecting rrweb events into another project's session.
-    let project_id = match state.route_table.get_route(&metadata.host) {
-        Some(route_info) => {
-            let Some(project) = route_info.project.as_ref() else {
+    let project_id = match keyed_scope {
+        Some(scope) => scope.project_id,
+        None => match state.route_table.get_route(&metadata.host) {
+            Some(route_info) => {
+                let Some(project) = route_info.project.as_ref() else {
+                    return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
+                        .title("No project associated with host")
+                        .detail(format!(
+                            "Host {} resolved but has no project (sandbox/orphan route)",
+                            metadata.host
+                        ))
+                        .build());
+                };
+                project.id
+            }
+            None => {
                 return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                    .title("No project associated with host")
-                    .detail(format!(
-                        "Host {} resolved but has no project (sandbox/orphan route)",
-                        metadata.host
-                    ))
+                    .title("Host not found in route table")
+                    .detail(format!("Host {} not found", metadata.host))
                     .build());
-            };
-            project.id
-        }
-        None => {
-            return Err(ErrorBuilder::new(StatusCode::NOT_FOUND)
-                .title("Host not found in route table")
-                .detail(format!("Host {} not found", metadata.host))
-                .build());
-        }
+            }
+        },
     };
 
     match state
@@ -995,6 +1096,28 @@ pub fn configure_public_routes() -> Router<Arc<AppState>> {
             post(add_session_replay_events),
         )
         .layer(DefaultBodyLimit::max(SESSION_REPLAY_INGEST_BODY_LIMIT))
+        .layer(public_ingest_cors())
+}
+
+/// CORS for the public session-replay ingest routes.
+///
+/// Required by ADR-040: with an ingest key the request is cross-origin by
+/// definition, and without this layer the browser blocks it before it ever
+/// leaves the page.
+///
+/// `allow_credentials` stays at its default `false`, and must never be set
+/// true. Key-based ingest needs no cookies by design; credentialed CORS on a
+/// wildcard origin would be a real vulnerability, and browsers reject the
+/// combination outright.
+pub(crate) fn public_ingest_cors() -> CorsLayer {
+    CorsLayer::new()
+        .allow_origin(Any)
+        .allow_methods([Method::POST, Method::OPTIONS])
+        .allow_headers([
+            header::CONTENT_TYPE,
+            HeaderName::from_static(ANALYTICS_INGEST_KEY_HEADER),
+        ])
+        .max_age(Duration::from_secs(600))
 }
 
 #[cfg(test)]
@@ -1071,5 +1194,718 @@ mod tests {
             Some("Session not found"),
             "title must be identical to SessionNotFound title"
         );
+    }
+
+    // ── ADR-040: keyed ingest on POST /_temps/session-replay/{init,events} ──
+    //
+    // The no-key regression cases matter most: breaking session replay for a
+    // Temps-deployed app would be worse than not shipping keyed ingest at all.
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::middleware;
+    use base64::Engine;
+    use sea_orm::{ActiveModelTrait, ActiveValue::Set, EntityTrait};
+    use temps_analytics::ingest_keys::{AnalyticsIngestKeyService, AnalyticsIngestRateLimiter};
+    use temps_database::test_utils::TestDatabase;
+    use tower::ServiceExt;
+
+    /// A syntactically valid key that is guaranteed not to exist.
+    const UNKNOWN_KEY: &str = "pa_0000000000000000000000000000000000000000000000000000000000000000";
+
+    async fn insert_db_project(
+        db: &sea_orm::DatabaseConnection,
+    ) -> temps_entities::projects::Model {
+        temps_entities::projects::ActiveModel {
+            name: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            slug: Set("test-project".to_string()),
+            source_type: Set(temps_entities::source_type::SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("Failed to insert test project")
+    }
+
+    /// `initialize_session` resolves the visitor row by its GUID and 404s when
+    /// it is absent — pre-existing behaviour, independent of ADR-040: the
+    /// browser SDK sends the `page_view` event (which upserts the visitor)
+    /// before it starts a replay. Seed one so these tests exercise the
+    /// resolution branch under test rather than that lookup.
+    async fn insert_db_visitor(
+        db: &sea_orm::DatabaseConnection,
+        project_id: i32,
+        visitor_id: &str,
+    ) -> temps_entities::visitor::Model {
+        temps_entities::visitor::ActiveModel {
+            visitor_id: Set(visitor_id.to_string()),
+            project_id: Set(project_id),
+            // `visitor.environment_id` is still `NOT NULL` with no FK; making
+            // it nullable is tracked separately (ADR-040 §4 follow-up).
+            environment_id: Set(0),
+            first_seen: Set(chrono::Utc::now()),
+            last_seen: Set(chrono::Utc::now()),
+            has_activity: Set(false),
+            is_crawler: Set(false),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("Failed to insert test visitor")
+    }
+
+    /// A no-op audit logger — the public ingest routes never write audit logs,
+    /// but `AppState` is shared with the admin router that does.
+    struct NoopAuditLogger;
+
+    #[async_trait::async_trait]
+    impl temps_core::AuditLogger for NoopAuditLogger {
+        async fn create_audit_log(
+            &self,
+            _operation: &dyn temps_core::AuditOperation,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn build_state(db: Arc<sea_orm::DatabaseConnection>) -> Arc<AppState> {
+        Arc::new(AppState {
+            session_replay_service: Arc::new(crate::services::SessionReplayService::new(
+                db.clone(),
+            )),
+            audit_service: Arc::new(NoopAuditLogger),
+            route_table: Arc::new(temps_routes::CachedPeerTable::new(db.clone())),
+            telemetry: Arc::new(temps_core::telemetry::NoopTelemetryReporter),
+            project_access_checker: None,
+            ingest_key_service: Arc::new(AnalyticsIngestKeyService::new(db.clone())),
+            ingest_rate_limiter: Arc::new(AnalyticsIngestRateLimiter::new()),
+        })
+    }
+
+    /// Test-only stand-in for the `_temps_visitor_id` cookie header, since this
+    /// harness fabricates `RequestMetadata` from plain request headers rather
+    /// than decrypting a real cookie. Never a real header name — it exists so
+    /// Host-resolved-path tests can simulate "the Temps proxy already issued
+    /// this visitor a cookie" without pulling in `CookieCrypto`.
+    const TEST_VISITOR_ID_COOKIE_HEADER: &str = "x-test-visitor-id-cookie";
+
+    fn test_request_metadata(headers: &HeaderMap) -> RequestMetadata {
+        let host = headers
+            .get(axum::http::header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_string();
+        let visitor_id_cookie = headers
+            .get(TEST_VISITOR_ID_COOKIE_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .map(|s| s.to_string());
+        RequestMetadata {
+            ip_address: String::new(),
+            user_agent: String::new(),
+            headers: headers.clone(),
+            visitor_id_cookie,
+            session_id_cookie: None,
+            base_url: format!("http://{host}"),
+            scheme: "http".to_string(),
+            host,
+            is_secure: false,
+        }
+    }
+
+    /// The public ingest router with a middleware that fabricates the
+    /// `RequestMetadata` the real server injects, deriving `host` from the
+    /// request's own `Host` header so tests can exercise both branches.
+    fn setup_public_app(state: Arc<AppState>) -> axum::Router {
+        let metadata_middleware = middleware::from_fn(
+            |mut req: Request<Body>, next: axum::middleware::Next| async move {
+                let metadata = test_request_metadata(req.headers());
+                req.extensions_mut().insert(metadata);
+                next.run(req).await
+            },
+        );
+
+        configure_public_routes()
+            .layer(metadata_middleware)
+            .with_state(state)
+    }
+
+    fn insert_test_route(
+        route_table: &temps_routes::CachedPeerTable,
+        host: &str,
+        project: Option<temps_entities::projects::Model>,
+    ) {
+        route_table.insert_route_for_test(
+            host,
+            temps_routes::RouteInfo {
+                backend: temps_routes::BackendType::StaticDir {
+                    path: "/tmp".to_string(),
+                },
+                redirect_to: None,
+                status_code: None,
+                project: project.map(Arc::new),
+                environment: None,
+                deployment: None,
+                cert_eligible: false,
+            },
+        );
+    }
+
+    fn init_payload(session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "sessionId": session_id,
+            "visitorId": "client-generated-visitor",
+            "url": "/pricing"
+        })
+    }
+
+    /// Base64(zlib(json)) — the wire format `add_session_events` expects.
+    fn encoded_events() -> String {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+
+        let json =
+            serde_json::json!([{ "type": 2, "timestamp": 1_700_000_000_000i64, "data": {} }])
+                .to_string();
+        let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+        encoder
+            .write_all(json.as_bytes())
+            .expect("zlib write must succeed");
+        let compressed = encoder.finish().expect("zlib finish must succeed");
+        base64::engine::general_purpose::STANDARD.encode(compressed)
+    }
+
+    async fn stored_sessions(
+        db: &sea_orm::DatabaseConnection,
+    ) -> Vec<temps_entities::session_replay_sessions::Model> {
+        temps_entities::session_replay_sessions::Entity::find()
+            .all(db)
+            .await
+            .expect("Failed to query session replay sessions")
+    }
+
+    #[tokio::test]
+    async fn keyed_session_replay_init_resolves_the_keys_project_without_the_route_table() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(init_payload("session-a").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let sessions = stored_sessions(db.as_ref()).await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project_id, project.id);
+        // The `unwrap_or(0)` sentinel is gone: no environment means NULL, not a
+        // pointer at a nonexistent `environments.id = 0`.
+        assert_eq!(sessions[0].environment_id, None);
+        assert_eq!(sessions[0].deployment_id, None);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn keyed_session_replay_events_append_accepts_the_query_param_fallback() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", &key.public_key)
+                    .body(Body::from(init_payload("session-b").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/_temps/session-replay/events?temps_key={}",
+                        key.public_key
+                    ))
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": "session-b",
+                            "events": encoded_events(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(parsed["event_count"], 1);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_session_replay_key_returns_401_and_never_falls_back_to_host() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        let state = build_state(db.clone());
+        // The Host *would* resolve — a typo'd key must not silently use it.
+        insert_test_route(&state.route_table, "app.example.test", Some(project));
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", UNKNOWN_KEY)
+                    .body(Body::from(init_payload("session-c").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/events")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    // A `tk_` admin secret pasted here must never authenticate,
+                    // and must never be looked up against `api_keys` either.
+                    .header("x-temps-analytics-key", "tk_not_an_analytics_key")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": "session-c",
+                            "events": encoded_events(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        assert!(
+            stored_sessions(db.as_ref()).await.is_empty(),
+            "a rejected key must not fall through to Host-based resolution"
+        );
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn scoped_session_replay_key_enforces_the_origin_allowlist() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(
+                project.id,
+                None,
+                None,
+                Some(vec!["https://app.example.com".to_string()]),
+                None,
+                None,
+            )
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let post = |origin: Option<&'static str>, session: &'static str| {
+            let app = setup_public_app(state.clone());
+            let public_key = key.public_key.clone();
+            async move {
+                let mut builder = Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.example.com")
+                    .header("content-type", "application/json")
+                    .header("x-temps-analytics-key", public_key);
+                if let Some(origin) = origin {
+                    builder = builder.header("origin", origin);
+                }
+                app.oneshot(
+                    builder
+                        .body(Body::from(init_payload(session).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        assert_eq!(post(None, "session-d").await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            post(Some("https://evil.example.com"), "session-e").await,
+            StatusCode::FORBIDDEN
+        );
+        assert!(stored_sessions(db.as_ref()).await.is_empty());
+
+        assert_eq!(
+            post(Some("https://app.example.com"), "session-f").await,
+            StatusCode::CREATED
+        );
+        assert_eq!(stored_sessions(db.as_ref()).await.len(), 1);
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn session_replay_key_over_its_rate_limit_returns_429() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, Some(1), None)
+            .await
+            .expect("minting an ingest key must succeed");
+
+        let post = |session: &'static str| {
+            let app = setup_public_app(state.clone());
+            let public_key = key.public_key.clone();
+            async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/_temps/session-replay/init")
+                        .header("host", "app.example.com")
+                        .header("content-type", "application/json")
+                        .header("x-temps-analytics-key", public_key)
+                        .body(Body::from(init_payload(session).to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+            }
+        };
+
+        assert_eq!(post("session-g").await, StatusCode::CREATED);
+        assert_eq!(post("session-h").await, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(stored_sessions(db.as_ref()).await.len(), 1);
+
+        test_db.cleanup().await;
+    }
+
+    /// Regression: no key at all resolves from Host exactly as before — via
+    /// the Temps-issued cookie, exactly as it always did. The client-supplied
+    /// `visitorId` fallback (ADR-040 §3) is keyed-path-only: a Host-resolved
+    /// request without a cookie is now a 400, never a silent trust of
+    /// whatever `visitorId` the request body claims (see
+    /// `no_key_session_replay_init_without_a_cookie_requires_one`).
+    #[tokio::test]
+    async fn no_key_still_resolves_the_session_replay_scope_from_host() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        insert_db_visitor(db.as_ref(), project.id, "client-generated-visitor").await;
+        let state = build_state(db.clone());
+        insert_test_route(
+            &state.route_table,
+            "app.example.test",
+            Some(project.clone()),
+        );
+
+        let response = setup_public_app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.example.test")
+                    .header(TEST_VISITOR_ID_COOKIE_HEADER, "client-generated-visitor")
+                    .header("content-type", "application/json")
+                    .body(Body::from(init_payload("session-i").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let sessions = stored_sessions(db.as_ref()).await;
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].project_id, project.id);
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/events")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "sessionId": "session-i",
+                            "events": encoded_events(),
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        test_db.cleanup().await;
+    }
+
+    /// The client-supplied `visitorId` fallback (ADR-040 §3) exists only for
+    /// the keyed cross-origin path. A Host-resolved request — the case every
+    /// Temps-hosted app takes — must still 400 when it carries no
+    /// `_temps_visitor_id` cookie, even though the payload includes a
+    /// plausible-looking `visitorId`: trusting that value here would let any
+    /// unauthenticated caller forge a visitor's identity on an app Temps
+    /// *does* deploy just by omitting the cookie, which is exactly what the
+    /// cookie's tamper-evidence is supposed to prevent.
+    #[tokio::test]
+    async fn no_key_session_replay_init_without_a_cookie_requires_one() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+        insert_test_route(
+            &state.route_table,
+            "app.example.test",
+            Some(project.clone()),
+        );
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.example.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(init_payload("session-j").to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(stored_sessions(db.as_ref()).await.len(), 0);
+
+        test_db.cleanup().await;
+    }
+
+    /// Regression: the no-key rejection shapes are unchanged — an unknown host
+    /// and a sandbox/orphan route both stay 404 Problems on both routes.
+    #[tokio::test]
+    async fn no_key_session_replay_rejection_shapes_are_unchanged() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let state = build_state(db.clone());
+        insert_test_route(&state.route_table, "orphan.example.test", None);
+
+        for (uri, body) in [
+            (
+                "/_temps/session-replay/init",
+                init_payload("session-j").to_string(),
+            ),
+            (
+                "/_temps/session-replay/events",
+                serde_json::json!({
+                    "sessionId": "session-j",
+                    "events": encoded_events(),
+                })
+                .to_string(),
+            ),
+        ] {
+            for (host, expected_title) in [
+                ("unknown.example.test", "Host not found in route table"),
+                ("orphan.example.test", "No project associated with host"),
+            ] {
+                let response = setup_public_app(state.clone())
+                    .oneshot(
+                        Request::builder()
+                            .method("POST")
+                            .uri(uri)
+                            .header("host", host)
+                            // Irrelevant to `/events`; lets `/init` reach the
+                            // host-resolution logic this test actually
+                            // targets instead of tripping the (correct,
+                            // unrelated) no-cookie 400 first.
+                            .header(TEST_VISITOR_ID_COOKIE_HEADER, "client-generated-visitor")
+                            .header("content-type", "application/json")
+                            .body(Body::from(body.clone()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::NOT_FOUND,
+                    "{uri} with host {host}"
+                );
+                let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                let problem: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    problem["title"].as_str(),
+                    Some(expected_title),
+                    "{uri} with host {host}"
+                );
+            }
+        }
+
+        assert!(stored_sessions(db.as_ref()).await.is_empty());
+
+        test_db.cleanup().await;
+    }
+
+    #[tokio::test]
+    async fn public_session_replay_routes_answer_cors_preflight_without_credentials() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let state = build_state(db.clone());
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("OPTIONS")
+                    .uri("/_temps/session-replay/init")
+                    .header("host", "app.example.com")
+                    .header("origin", "https://app.example.com")
+                    .header("access-control-request-method", "POST")
+                    .header("access-control-request-headers", "x-temps-analytics-key")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(response.status().is_success(), "{}", response.status());
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("access-control-allow-origin")
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+        assert!(
+            headers.get("access-control-allow-credentials").is_none(),
+            "wildcard-origin ingest must never be credentialed"
+        );
+
+        test_db.cleanup().await;
     }
 }

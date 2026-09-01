@@ -210,6 +210,9 @@ mod m20260828_000002_add_alarms_silenced_until;
 mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
 mod m20260830_000001_add_external_service_creator;
 mod m20260830_000001_create_traefik_discovered_routes;
+// Main shipped this migration first with the same date and sequence stamp as
+// the certificates migration below. Preserve that upgrade history.
+mod m20260831_000001_create_analytics_ingest_keys;
 mod m20260831_000001_create_traefik_route_certificates;
 mod m20260831_000002_backfill_acme_verification_method;
 
@@ -459,6 +462,10 @@ impl MigratorTrait for Migrator {
             // upgrade history.
             Box::new(m20260830_000001_add_external_service_creator::Migration),
             Box::new(m20260830_000001_create_traefik_discovered_routes::Migration),
+            // Main shipped this migration first with the same date and sequence
+            // stamp as the certificates migration below. Preserve that upgrade
+            // history.
+            Box::new(m20260831_000001_create_analytics_ingest_keys::Migration),
             // ADR-041: durable per-host TLS authorization records for discovered routes.
             Box::new(m20260831_000001_create_traefik_route_certificates::Migration),
             // ADR-041 §7a step (b): backfill "acme"/"http" → "http-01" so the renewal
@@ -513,5 +520,31 @@ mod registry_tests {
                 "shipped migration '{shipped}' must precede '{added}'"
             );
         }
+    }
+
+    /// The analytics ingest-key migration also drops `NOT NULL` on
+    /// `performance_metrics` / `session_replay_sessions` / `events` scope
+    /// columns, which the entity models already assume. An unregistered
+    /// migration means those entities decode `Option<i32>` out of a `NOT
+    /// NULL` column and every no-deployment ingest keeps failing — so
+    /// registration is asserted, not left to review.
+    ///
+    /// Checks presence only, not position. An earlier version of this test
+    /// asserted the migration was registered *last*, which would fail the
+    /// moment any unrelated PR registered a newer migration — a maintenance
+    /// burden unconnected to whatever that PR actually changed.
+    #[test]
+    fn analytics_ingest_keys_migration_is_registered() {
+        let names = Migrator::migrations()
+            .into_iter()
+            .map(|migration| migration.name().to_string())
+            .collect::<Vec<_>>();
+
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "m20260831_000001_create_analytics_ingest_keys"),
+            "the analytics ingest-key migration must be registered in Migrator::migrations()"
+        );
     }
 }

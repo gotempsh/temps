@@ -16,15 +16,13 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card'
+import { Card, CardContent } from '@/components/ui/card'
 import { CodeBlock } from '@/components/ui/code-block'
 import { EmptyState } from '@/components/ui/empty-state'
+import {
+  SetupWizardShell,
+  WizardStepId,
+} from '@/components/project/setup/SetupWizardShell'
 import { Input } from '@/components/ui/input'
 import { useDebounce } from '@/hooks/useDebounce'
 import {
@@ -56,6 +54,8 @@ import { format } from 'date-fns'
 import {
   AlertTriangle,
   ArrowDown,
+  ArrowLeft,
+  ArrowRight,
   ArrowUp,
   ArrowUpDown,
   Bot,
@@ -63,9 +63,9 @@ import {
   ChevronLeft,
   ChevronRight,
   Clock,
-  Code2,
   FileCode,
   Gauge,
+  Loader2,
   RefreshCw,
   Search,
   Settings2,
@@ -397,7 +397,16 @@ fn init_tracing() {
   },
 ]
 
-function OtelSetupSection({ project }: { project: ProjectResponse }) {
+function OtelSetupSection({
+  project,
+  onVerified,
+}: {
+  project: ProjectResponse
+  onVerified?: () => void
+}) {
+  const navigate = useNavigate()
+  const [wizardStep, setWizardStep] = useState<WizardStepId>('framework')
+  const [celebrate, setCelebrate] = useState(false)
   const [selectedEnvId, setSelectedEnvId] = useState<string>('')
   const [selectedFrameworkId, setSelectedFrameworkId] = useState<string>('nextjs')
 
@@ -438,146 +447,260 @@ OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
 OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer <YOUR_API_KEY>
 OTEL_SERVICE_NAME=${project.name}`
 
+  const { data: waitingProbe } = useQuery({
+    ...hasTracesOptions({ path: { project_id: project.id } }),
+    enabled: !!project.id && wizardStep === 'waiting',
+    refetchInterval: wizardStep === 'waiting' ? 2000 : false,
+    refetchOnWindowFocus: false,
+  })
+  const hasTraceNow = !!waitingProbe?.has_traces
+
+  useEffect(() => {
+    if (wizardStep === 'waiting' && hasTraceNow && !celebrate) {
+      setCelebrate(true)
+      const timer = setTimeout(() => {
+        onVerified?.()
+      }, 1600)
+      return () => clearTimeout(timer)
+    }
+  }, [wizardStep, hasTraceNow, celebrate, onVerified])
+
+  const steps = [
+    { id: 'framework' as WizardStepId, label: 'Framework' },
+    { id: 'install' as WizardStepId, label: 'Install' },
+    { id: 'waiting' as WizardStepId, label: 'Verify' },
+  ]
+
   return (
-    <Card id="traces-setup">
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-base">
-          <Code2 className="h-4 w-4" />
-          Setup OpenTelemetry
-        </CardTitle>
-        <CardDescription>
-          Pick your framework — the snippet and endpoint are pre-filled for{' '}
-          <strong>{project.name}</strong>. Apps deployed on Temps get these env
-          vars automatically.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-6">
-        {/* Framework picker */}
-        <div className="space-y-2">
-          <h4 className="text-sm font-medium">Framework / runtime</h4>
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-4">
-            {frameworkPresets.map((fw) => {
-              const Icon = fw.icon
-              const isSelected = selectedFrameworkId === fw.id
-              return (
-                <button
-                  key={fw.id}
-                  type="button"
-                  onClick={() => setSelectedFrameworkId(fw.id)}
-                  className={cn(
-                    'flex items-center gap-3 rounded-lg border bg-card p-3 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
-                    isSelected &&
-                      'border-primary bg-primary/5 ring-2 ring-primary/20'
-                  )}
-                  aria-pressed={isSelected}
-                >
-                  <div className="rounded-md bg-muted p-1.5 text-foreground shrink-0">
-                    <Icon />
-                  </div>
-                  <div className="flex-1 min-w-0">
-                    <p className="text-sm font-medium leading-none truncate">
-                      {fw.name}
-                    </p>
-                    <p className="mt-1 text-[11px] text-muted-foreground truncate">
-                      {fw.description}
-                    </p>
-                  </div>
-                  {isSelected && (
-                    <Check className="size-4 shrink-0 text-primary" />
-                  )}
-                </button>
-              )
-            })}
-          </div>
-        </div>
-
-        {/* Deployed-on-Temps note */}
-        <div className="rounded-md border border-green-200 bg-green-50 dark:border-green-900/50 dark:bg-green-900/10 p-3">
-          <p className="text-xs text-green-800 dark:text-green-200">
-            <strong>Deployed on Temps?</strong> The OTLP endpoint, auth token,
-            service name, and version are injected automatically. Just install
-            the SDK and add the instrumentation file below.
-          </p>
-        </div>
-
-        {/* Step 1: Install */}
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <Terminal className="size-4 text-muted-foreground" />
-            <h4 className="text-sm font-medium">1. Install dependencies</h4>
-          </div>
-          <CodeBlock code={preset.install} language={preset.installLang} />
-        </div>
-
-        {/* Step 2: Instrumentation file */}
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <FileCode className="size-4 text-muted-foreground" />
-            <h4 className="text-sm font-medium">
-              2. Create <code>{preset.fileName}</code>
-            </h4>
-          </div>
-          <CodeBlock
-            code={setupCode}
-            language={preset.setupLang}
-            title={preset.fileName}
-          />
-        </div>
-
-        {/* Optional extra step */}
-        {preset.extra && (
-          <div className="space-y-2">
-            <div className="flex items-center gap-2">
-              <FileCode className="size-4 text-muted-foreground" />
-              <h4 className="text-sm font-medium">3. {preset.extra.title}</h4>
+    <div id="traces-setup">
+      <SetupWizardShell
+        title="Setup OpenTelemetry"
+        description="Pick your framework — the snippet and endpoint are pre-filled for this project. Apps deployed on Temps get these env vars automatically."
+        currentStep={wizardStep}
+        steps={steps}
+        celebrate={celebrate}
+      >
+        {wizardStep === 'framework' && (
+          <div className="space-y-6">
+            <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm">
+              <p className="font-medium">Deployed on Temps?</p>
+              <p className="mt-0.5 text-xs text-muted-foreground">
+                The OTLP endpoint, auth token, service name, and version are
+                injected automatically. Just install the SDK and add the
+                instrumentation file below.
+              </p>
             </div>
-            <CodeBlock
-              code={preset.extra.code}
-              language={preset.extra.lang}
-              title={preset.extra.fileName}
-            />
+
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+              {frameworkPresets.map((fw) => {
+                const Icon = fw.icon
+                const isSelected = selectedFrameworkId === fw.id
+                return (
+                  <button
+                    key={fw.id}
+                    type="button"
+                    onClick={() => setSelectedFrameworkId(fw.id)}
+                    className={cn(
+                      'flex items-center gap-3 rounded-lg border bg-card p-4 text-left transition-all hover:border-primary/60 hover:bg-accent/40',
+                      isSelected &&
+                        'border-primary bg-primary/5 ring-2 ring-primary/20'
+                    )}
+                    aria-pressed={isSelected}
+                  >
+                    <div className="rounded-md bg-muted p-2 text-foreground shrink-0">
+                      <Icon />
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-medium leading-none truncate">
+                        {fw.name}
+                      </p>
+                      <p className="mt-1 text-xs text-muted-foreground truncate">
+                        {fw.description}
+                      </p>
+                    </div>
+                    {isSelected && (
+                      <Check className="size-4 shrink-0 text-primary" />
+                    )}
+                  </button>
+                )
+              })}
+            </div>
+
+            <div className="flex justify-end">
+              <Button onClick={() => setWizardStep('install')}>
+                Continue
+                <ArrowRight className="ml-2 size-4" />
+              </Button>
+            </div>
           </div>
         )}
 
-        {/* External hosting env vars */}
-        <div className="space-y-2">
-          <div className="flex items-center gap-2">
-            <Settings2 className="size-4 text-muted-foreground" />
-            <h4 className="text-sm font-medium">
-              {preset.extra ? '4' : '3'}. External hosting — environment
-              variables
-            </h4>
+        {wizardStep === 'install' && (
+          <div className="space-y-6">
+            <div className="flex items-center gap-3 rounded-lg border bg-card p-4">
+              <div className="rounded-md bg-muted p-2">
+                <preset.icon />
+              </div>
+              <div className="min-w-0">
+                <p className="font-medium leading-none">{preset.name}</p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {preset.description}
+                </p>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Terminal className="size-4 text-muted-foreground" />
+                <h4 className="text-sm font-medium">1. Install dependencies</h4>
+              </div>
+              <CodeBlock code={preset.install} language={preset.installLang} />
+            </div>
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <FileCode className="size-4 text-muted-foreground" />
+                <h4 className="text-sm font-medium">
+                  2. Create <code>{preset.fileName}</code>
+                </h4>
+              </div>
+              <CodeBlock
+                code={setupCode}
+                language={preset.setupLang}
+                title={preset.fileName}
+              />
+            </div>
+
+            {preset.extra && (
+              <div className="space-y-2">
+                <div className="flex items-center gap-2">
+                  <FileCode className="size-4 text-muted-foreground" />
+                  <h4 className="text-sm font-medium">
+                    3. {preset.extra.title}
+                  </h4>
+                </div>
+                <CodeBlock
+                  code={preset.extra.code}
+                  language={preset.extra.lang}
+                  title={preset.extra.fileName}
+                />
+              </div>
+            )}
+
+            <div className="space-y-2">
+              <div className="flex items-center gap-2">
+                <Settings2 className="size-4 text-muted-foreground" />
+                <h4 className="text-sm font-medium">
+                  {preset.extra ? '4' : '3'}. External hosting — environment
+                  variables
+                </h4>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Skip this if you deploy on Temps. Required when running the
+                app on Vercel, Fly, AWS, bare metal, etc.
+              </p>
+              <div className="flex items-center gap-3">
+                <span className="text-xs text-muted-foreground shrink-0">
+                  Environment:
+                </span>
+                <Select value={selectedEnvId} onValueChange={setSelectedEnvId}>
+                  <SelectTrigger className="w-[200px] h-8">
+                    <SelectValue placeholder="Select environment" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {environments?.map((env: EnvironmentResponse) => (
+                      <SelectItem key={env.id} value={String(env.id)}>
+                        {env.name}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              </div>
+              <CodeBlock code={envVarsCode} language="bash" title=".env" />
+              <p className="text-xs text-muted-foreground">
+                Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key
+                (<code>tk_...</code>) from{' '}
+                <strong>Settings &rarr; API Keys</strong>.
+              </p>
+            </div>
+
+            <div className="flex items-center justify-between gap-3">
+              <Button variant="ghost" onClick={() => setWizardStep('framework')}>
+                <ArrowLeft className="mr-2 size-4" />
+                Back
+              </Button>
+              <Button onClick={() => setWizardStep('waiting')}>
+                Continue
+                <ArrowRight className="ml-2 size-4" />
+              </Button>
+            </div>
           </div>
-          <p className="text-xs text-muted-foreground">
-            Skip this if you deploy on Temps. Required when running the app on
-            Vercel, Fly, AWS, bare metal, etc.
-          </p>
-          <div className="flex items-center gap-3">
-            <span className="text-xs text-muted-foreground shrink-0">
-              Environment:
-            </span>
-            <Select value={selectedEnvId} onValueChange={setSelectedEnvId}>
-              <SelectTrigger className="w-[200px] h-8">
-                <SelectValue placeholder="Select environment" />
-              </SelectTrigger>
-              <SelectContent>
-                {environments?.map((env: EnvironmentResponse) => (
-                  <SelectItem key={env.id} value={String(env.id)}>
-                    {env.name}
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+        )}
+
+        {wizardStep === 'waiting' && (
+          <div className="space-y-6">
+            <div className="flex flex-col items-center justify-center gap-4 rounded-xl border bg-card px-6 py-12 text-center">
+              {hasTraceNow ? (
+                <>
+                  <div className="flex size-14 items-center justify-center rounded-full bg-emerald-500/10">
+                    <Check
+                      className="size-7 text-emerald-500"
+                      strokeWidth={3}
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <h3 className="text-lg font-semibold">
+                      First trace received
+                    </h3>
+                    <p className="text-sm text-muted-foreground">
+                      Taking you to your traces…
+                    </p>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <div className="relative flex size-14 items-center justify-center">
+                    <span className="absolute inline-flex size-full animate-ping rounded-full bg-primary/20" />
+                    <span className="absolute inline-flex size-10 animate-ping rounded-full bg-primary/30 [animation-delay:200ms]" />
+                    <span className="relative inline-flex size-4 rounded-full bg-primary" />
+                  </div>
+                  <div className="space-y-1">
+                    <h3 className="text-lg font-semibold">
+                      Waiting for your first trace…
+                    </h3>
+                    <p className="text-sm text-muted-foreground">
+                      Deploy or run your app and trigger a request. We'll
+                      pick it up as soon as it arrives.
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Loader2 className="size-3 animate-spin" />
+                    Polling every 2s
+                  </div>
+                </>
+              )}
+            </div>
+
+            <div className="flex items-center justify-between gap-3">
+              <Button
+                variant="ghost"
+                onClick={() => setWizardStep('install')}
+                disabled={celebrate}
+              >
+                <ArrowLeft className="mr-2 size-4" />
+                Back to instructions
+              </Button>
+              <Button
+                variant="outline"
+                onClick={() => navigate(`/projects/${project.slug}/traces`)}
+              >
+                Skip to traces
+              </Button>
+            </div>
           </div>
-          <CodeBlock code={envVarsCode} language="bash" title=".env" />
-          <p className="text-xs text-muted-foreground">
-            Replace <code>&lt;YOUR_API_KEY&gt;</code> with a Temps API key (
-            <code>tk_...</code>) from{' '}
-            <strong>Settings &rarr; API Keys</strong>.
-          </p>
-        </div>
-      </CardContent>
-    </Card>
+        )}
+      </SetupWizardShell>
+    </div>
   )
 }
 
@@ -998,7 +1121,13 @@ export default function TracesList({ project }: TracesListProps) {
           here", not "never set up", and must not resurface the setup wizard for
           a project with existing traces (see hasEverReceivedTraces probe). */}
       {((!isProbeLoading && !hasEverReceivedTraces) || showSetup) && (
-        <OtelSetupSection project={project} />
+        <OtelSetupSection
+          project={project}
+          onVerified={() => {
+            refetchProbe()
+            setShowSetup(false)
+          }}
+        />
       )}
 
       {/* Filters */}

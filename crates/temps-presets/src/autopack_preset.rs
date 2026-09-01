@@ -119,6 +119,13 @@ pub(crate) fn render_or_explain(
         Ok(dockerfile) => dockerfile,
         Err(message) => {
             warn!("autopack could not plan this application: {message}");
+            // `message` can itself contain newlines (e.g. a multi-line "how to
+            // fix this" hint). A raw newline inside the `RUN echo '...'`
+            // argument would split it into a second physical Dockerfile line
+            // that Docker parses as its own instruction — collapse to spaces
+            // so the RUN instruction stays on one line; the comment block
+            // above still renders the message with its original line breaks.
+            let single_line_message = message.split_whitespace().collect::<Vec<_>>().join(" ");
             DockerfileWithArgs::new(format!(
                 "# autopack could not plan this application.\n\
                  #\n\
@@ -126,7 +133,7 @@ pub(crate) fn render_or_explain(
                  FROM debian:bookworm-slim\n\
                  RUN echo {} >&2 && exit 1\n",
                 message.replace('\n', "\n# "),
-                shell_quote(&message)
+                shell_quote(&single_line_message)
             ))
         }
     }
@@ -238,6 +245,41 @@ mod tests {
 
         assert!(result.content.contains("exit 1"), "{}", result.content);
         assert!(result.content.contains("autopack could not plan"));
+    }
+
+    #[tokio::test]
+    async fn a_multiline_failure_reason_stays_on_one_run_line() {
+        // A detected-but-unstartable project (Python with dependencies but no
+        // recognisable entrypoint, Procfile, or WSGI/ASGI module) hits
+        // autopack_core::Error::MissingStartCommand, whose message spans two
+        // lines. A raw newline spliced into `RUN echo '...'` used to split the
+        // Dockerfile into a second physical line, which Docker parsed as its
+        // own instruction — breaking on whatever word started that second
+        // line (e.g. "unknown instruction: Set").
+        let dir = fixture(&[
+            ("requirements.txt", "flask==2.0.0\n"),
+            ("README.md", "# no entrypoint here\n"),
+        ]);
+
+        let result = AutopackPreset::new()
+            .dockerfile_with_build_dir(dir.path())
+            .await;
+
+        assert!(result.content.contains("exit 1"), "{}", result.content);
+        let run_lines: Vec<&str> = result
+            .content
+            .lines()
+            .filter(|l| l.trim_start().starts_with("RUN"))
+            .collect();
+        assert_eq!(run_lines.len(), 1, "{}", result.content);
+        assert!(
+            !result
+                .content
+                .lines()
+                .any(|l| l.trim_start().starts_with("Set ")),
+            "a bare 'Set' line means the RUN instruction got split by an embedded newline: {}",
+            result.content
+        );
     }
 
     #[tokio::test]

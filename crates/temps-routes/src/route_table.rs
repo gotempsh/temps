@@ -29,7 +29,10 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use temps_core::public_hostname_resolver::match_strategy;
-use temps_core::{AppSettings, DeploymentMode, PublicHostnameStrategy};
+use temps_core::{
+    AppSettings, ExecutionEnvironment, PublicHostnameStrategy, RuntimeContext,
+    ServiceEndpointScheme,
+};
 use temps_entities::custom_routes::RouteType;
 use temps_entities::preset::ComposePublicPort;
 use temps_entities::{deployments, environments, nodes, projects};
@@ -64,12 +67,14 @@ async fn resolve_node_private_address(
 fn build_backend_entry(
     container: &temps_entities::deployment_containers::Model,
     node_private_address: Option<&str>,
+    runtime_context: &RuntimeContext,
 ) -> BackendEntry {
     let address = build_container_backend_addr(
         &container.container_name,
         container.container_port,
         container.host_port,
         node_private_address,
+        runtime_context,
     );
     BackendEntry {
         address,
@@ -90,11 +95,13 @@ fn build_public_compose_backend_addr(
     recorded_host_port: Option<i32>,
     node_private_address: Option<&str>,
     public_port: &ComposePublicPort,
+    runtime_context: &RuntimeContext,
 ) -> Option<String> {
     if recorded_container_port != i32::from(public_port.port) {
         return None;
     }
-    if (node_private_address.is_some() || DeploymentMode::is_baremetal())
+    if (node_private_address.is_some()
+        || runtime_context.execution_environment() == ExecutionEnvironment::Host)
         && recorded_host_port.is_none()
     {
         return None;
@@ -104,6 +111,7 @@ fn build_public_compose_backend_addr(
         i32::from(public_port.port),
         recorded_host_port,
         node_private_address,
+        runtime_context,
     ))
 }
 
@@ -147,6 +155,7 @@ fn build_public_compose_backend_entry(
     container: &temps_entities::deployment_containers::Model,
     node_private_address: Option<&str>,
     public_port: &ComposePublicPort,
+    runtime_context: &RuntimeContext,
 ) -> Option<BackendEntry> {
     let address = build_public_compose_backend_addr(
         &container.container_name,
@@ -154,6 +163,7 @@ fn build_public_compose_backend_entry(
         container.host_port,
         node_private_address,
         public_port,
+        runtime_context,
     )?;
     Some(BackendEntry {
         address,
@@ -202,19 +212,20 @@ fn build_container_backend_addr(
     container_port: i32,
     host_port: Option<i32>,
     node_private_address: Option<&str>,
+    runtime_context: &RuntimeContext,
 ) -> String {
     if let Some(private_addr) = node_private_address {
         // Remote node: use the node's private/WireGuard IP with host_port
         let port = host_port.unwrap_or(container_port);
         format!("{}:{}", private_addr, port)
     } else {
-        // Local node: use existing logic
-        let (host, port) = DeploymentMode::get_effective_host_port(
+        let endpoint = runtime_context.resolve_service_endpoint(
             container_name,
+            ServiceEndpointScheme::Http,
             container_port as u16,
             host_port.unwrap_or(container_port) as u16,
         );
-        format!("{}:{}", host, port)
+        endpoint.authority()
     }
 }
 
@@ -459,6 +470,9 @@ pub struct CachedPeerTable {
     /// Database connection for loading routes
     db: Arc<DatabaseConnection>,
 
+    /// Immutable execution environment and endpoint resolver selected at startup.
+    runtime_context: Arc<RuntimeContext>,
+
     /// Optional callback invoked after each route reload with sleeping environment entries.
     on_sleeping_callback: parking_lot::Mutex<Option<OnSleepingCallback>>,
 
@@ -505,6 +519,13 @@ pub struct CachedPeerTable {
 
 impl CachedPeerTable {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
+        Self::new_with_runtime_context(db, Arc::new(RuntimeContext::host()))
+    }
+
+    pub fn new_with_runtime_context(
+        db: Arc<DatabaseConnection>,
+        runtime_context: Arc<RuntimeContext>,
+    ) -> Self {
         Self {
             http_routes: Arc::new(RwLock::new(HashMap::new())),
             tls_routes: Arc::new(RwLock::new(HashMap::new())),
@@ -512,6 +533,7 @@ impl CachedPeerTable {
             tls_wildcards: Arc::new(RwLock::new(WildcardMatcher::new())),
             routes: Arc::new(RwLock::new(HashMap::new())),
             db,
+            runtime_context,
             on_sleeping_callback: parking_lot::Mutex::new(None),
             on_reload_callback: parking_lot::Mutex::new(None),
             on_cert_eligible_callback: parking_lot::Mutex::new(None),
@@ -884,8 +906,13 @@ impl CachedPeerTable {
                                         c,
                                         node_addr.as_deref(),
                                         port,
+                                        self.runtime_context.as_ref(),
                                     ),
-                                    None => Some(build_backend_entry(c, node_addr.as_deref())),
+                                    None => Some(build_backend_entry(
+                                        c,
+                                        node_addr.as_deref(),
+                                        self.runtime_context.as_ref(),
+                                    )),
                                 };
                                 if let Some(entry) = entry {
                                     backend_entries.push(entry);
@@ -1149,7 +1176,11 @@ impl CachedPeerTable {
                                     self.db.as_ref(),
                                 )
                                 .await;
-                                backend_entries.push(build_backend_entry(c, node_addr.as_deref()));
+                                backend_entries.push(build_backend_entry(
+                                    c,
+                                    node_addr.as_deref(),
+                                    self.runtime_context.as_ref(),
+                                ));
                             }
                             BackendType::Upstream {
                                 backends: backend_entries,
@@ -1379,8 +1410,13 @@ impl CachedPeerTable {
                                     c,
                                     node_addr.as_deref(),
                                     port,
+                                    self.runtime_context.as_ref(),
                                 ),
-                                None => Some(build_backend_entry(c, node_addr.as_deref())),
+                                None => Some(build_backend_entry(
+                                    c,
+                                    node_addr.as_deref(),
+                                    self.runtime_context.as_ref(),
+                                )),
                             };
                             if let Some(entry) = entry {
                                 backend_entries.push(entry);
@@ -1557,6 +1593,7 @@ impl CachedPeerTable {
                                         c,
                                         node_addr.as_deref(),
                                         public_port,
+                                        self.runtime_context.as_ref(),
                                     ) else {
                                         warn!(
                                             service = %public_port.service,
@@ -1738,8 +1775,13 @@ impl CachedPeerTable {
                                     c,
                                     node_addr.as_deref(),
                                     port,
+                                    self.runtime_context.as_ref(),
                                 ),
-                                None => Some(build_backend_entry(c, node_addr.as_deref())),
+                                None => Some(build_backend_entry(
+                                    c,
+                                    node_addr.as_deref(),
+                                    self.runtime_context.as_ref(),
+                                )),
                             };
                             if let Some(entry) = entry {
                                 backend_entries.push(entry);
@@ -2617,21 +2659,22 @@ mod tests {
 
     #[test]
     fn test_build_container_backend_addr_local_docker() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // In Docker mode, local containers use container_name:container_port
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-        let addr = build_container_backend_addr("my-app", 3000, Some(8080), None);
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        let addr = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            None,
+            &RuntimeContext::docker(),
+        );
         assert_eq!(addr, "my-app:3000");
     }
 
     #[test]
     fn test_build_container_backend_addr_local_baremetal() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // In baremetal mode (default), local containers use 127.0.0.1:host_port
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
-        let addr = build_container_backend_addr("my-app", 3000, Some(8080), None);
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        let addr =
+            build_container_backend_addr("my-app", 3000, Some(8080), None, &RuntimeContext::host());
         assert_eq!(addr, "127.0.0.1:8080");
     }
 
@@ -2737,33 +2780,61 @@ mod tests {
 
     #[test]
     fn public_compose_mapping_uses_docker_recorded_port_on_baremetal() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
         let mapping = ComposePublicPort {
             service: "web".to_string(),
             port: 80,
             published: Some(65535),
         };
 
-        let addr = build_public_compose_backend_addr("web", 80, Some(15455), None, &mapping);
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            Some(15455),
+            None,
+            &mapping,
+            &RuntimeContext::host(),
+        );
 
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
         assert_eq!(addr.as_deref(), Some("127.0.0.1:15455"));
     }
 
     #[test]
     fn public_compose_mapping_uses_container_port_in_docker() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
         let mapping = ComposePublicPort {
             service: "web".to_string(),
             port: 80,
             published: Some(15455),
         };
 
-        let addr = build_public_compose_backend_addr("web", 80, Some(15455), None, &mapping);
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            Some(15455),
+            None,
+            &mapping,
+            &RuntimeContext::docker(),
+        );
 
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        assert_eq!(addr.as_deref(), Some("web:80"));
+    }
+
+    #[test]
+    fn test_public_compose_mapping_docker_without_host_port_uses_container_port() {
+        let mapping = ComposePublicPort {
+            service: "web".to_string(),
+            port: 80,
+            published: None,
+        };
+
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            None,
+            None,
+            &mapping,
+            &RuntimeContext::docker(),
+        );
+
         assert_eq!(addr.as_deref(), Some("web:80"));
     }
 
@@ -2775,25 +2846,35 @@ mod tests {
             published: Some(65535),
         };
 
-        let addr =
-            build_public_compose_backend_addr("web", 80, Some(15455), Some("10.100.0.5"), &mapping);
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            Some(15455),
+            Some("10.100.0.5"),
+            &mapping,
+            &RuntimeContext::host(),
+        );
 
         assert_eq!(addr.as_deref(), Some("10.100.0.5:15455"));
     }
 
     #[test]
     fn legacy_public_compose_mapping_uses_recorded_host_port() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
         let mapping = ComposePublicPort {
             service: "web".to_string(),
             port: 80,
             published: None,
         };
 
-        let addr = build_public_compose_backend_addr("web", 80, Some(15455), None, &mapping);
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            Some(15455),
+            None,
+            &mapping,
+            &RuntimeContext::host(),
+        );
 
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
         assert_eq!(addr.as_deref(), Some("127.0.0.1:15455"));
     }
 
@@ -2806,52 +2887,81 @@ mod tests {
         };
 
         assert_eq!(
-            build_public_compose_backend_addr("web", 80, Some(15455), None, &mapping),
+            build_public_compose_backend_addr(
+                "web",
+                80,
+                Some(15455),
+                None,
+                &mapping,
+                &RuntimeContext::host(),
+            ),
             None
         );
     }
 
     #[test]
     fn public_compose_mapping_requires_discovered_host_port_off_docker_network() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
         let mapping = ComposePublicPort {
             service: "web".to_string(),
             port: 80,
             published: Some(8211),
         };
 
-        let addr = build_public_compose_backend_addr("web", 80, None, None, &mapping);
+        let addr = build_public_compose_backend_addr(
+            "web",
+            80,
+            None,
+            None,
+            &mapping,
+            &RuntimeContext::host(),
+        );
 
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
         assert_eq!(addr, None);
     }
 
     #[test]
     fn test_build_container_backend_addr_remote_with_host_port() {
         // Remote containers always use private_address:host_port
-        let addr = build_container_backend_addr("my-app", 3000, Some(8080), Some("10.100.0.5"));
+        let addr = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            Some("10.100.0.5"),
+            &RuntimeContext::host(),
+        );
         assert_eq!(addr, "10.100.0.5:8080");
     }
 
     #[test]
     fn test_build_container_backend_addr_remote_without_host_port() {
         // When host_port is None, remote falls back to container_port
-        let addr = build_container_backend_addr("my-app", 3000, None, Some("10.100.0.5"));
+        let addr = build_container_backend_addr(
+            "my-app",
+            3000,
+            None,
+            Some("10.100.0.5"),
+            &RuntimeContext::host(),
+        );
         assert_eq!(addr, "10.100.0.5:3000");
     }
 
     #[test]
     fn test_build_container_backend_addr_remote_ignores_deployment_mode() {
-        let _lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
         // Remote address should be the same regardless of deployment mode
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-        let addr_docker =
-            build_container_backend_addr("my-app", 3000, Some(8080), Some("10.100.0.5"));
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "baremetal") };
-        let addr_baremetal =
-            build_container_backend_addr("my-app", 3000, Some(8080), Some("10.100.0.5"));
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+        let addr_docker = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            Some("10.100.0.5"),
+            &RuntimeContext::docker(),
+        );
+        let addr_baremetal = build_container_backend_addr(
+            "my-app",
+            3000,
+            Some(8080),
+            Some("10.100.0.5"),
+            &RuntimeContext::host(),
+        );
 
         assert_eq!(addr_docker, addr_baremetal);
         assert_eq!(addr_docker, "10.100.0.5:8080");

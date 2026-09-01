@@ -83,6 +83,26 @@ export interface AnalyticsClientOptions {
   ignoreLocalhost?: boolean;
   /** Custom domain to use for analytics. Defaults to window.location.hostname. */
   domain?: string;
+  /**
+   * Analytics ingest key (`pa_…`), minted per project in the Temps Console
+   * (Project → Analytics → Setup) or with
+   * `bunx @temps-sdk/cli analytics keys create`.
+   *
+   * Only needed when Temps neither serves nor proxies the app. Without a
+   * Temps-managed deployment there is no `Host` entry in the proxy route
+   * table, so the server cannot tell which project an event belongs to and
+   * rejects ingest outright. Presenting the key resolves project and
+   * environment scope directly and the `Host` header stops being consulted
+   * for attribution. Leave it unset for apps deployed by Temps — that path is
+   * unchanged and remains the default.
+   *
+   * The key is **public by design**: it ships in your browser bundle and
+   * appears in request URLs on the `sendBeacon` path. It grants analytics
+   * ingest and nothing else. Never put a `tk_` API key, a `dt_` deployment
+   * token or an `si_` service ingest token here — those are secrets and do
+   * not work on this endpoint.
+   */
+  ingestKey?: string;
 }
 
 export interface AnalyticsOptions extends AnalyticsClientOptions {
@@ -111,6 +131,14 @@ export interface AnalyticsOptions extends AnalyticsClientOptions {
 export interface AnalyticsApi {
   /** Whether analytics are currently enabled. */
   readonly enabled: boolean;
+  /**
+   * The ingest key this instance was configured with, if any. Framework
+   * hooks that send their own beacons outside the plugin instance (e.g.
+   * `usePageLeave`'s unload handler) read this as their default so a
+   * cross-origin setup only has to configure the key once, on the plugin —
+   * not again on every hook that bypasses it.
+   */
+  readonly ingestKey?: string;
   /** Send a custom event. */
   trackEvent(eventName: string, data?: Record<string, JsonValue>): Promise<void>;
   /** Manually trigger a pageview. */

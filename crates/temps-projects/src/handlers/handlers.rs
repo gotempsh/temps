@@ -345,6 +345,13 @@ pub struct DropPresetCandidate {
     pub confidence: String,
     pub reason: String,
     pub is_static: bool,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{directory}/Dockerfile` (e.g. `docker/Dockerfile`
+    /// rolled up to a `directory` of `"."`). `None` for a Dockerfile located
+    /// directly at `{directory}/Dockerfile` and for every non-Dockerfile
+    /// preset.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dockerfile_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, utoipa::ToSchema)]
@@ -445,19 +452,7 @@ pub async fn inspect_drop_archive(
         let manifests = inspect_zip_manifests(&archive_path)?;
         let mut candidates = temps_presets::detect_project_candidates(&manifests)
             .into_iter()
-            .map(|candidate| {
-                let preset = candidate.catalog_slug().to_string();
-                let compose_path = compose_path_for_candidate(&manifests, &candidate);
-                DropPresetCandidate {
-                    directory: candidate.path,
-                    preset,
-                    compose_path,
-                    label: candidate.preset.display_name().to_string(),
-                    confidence: candidate.confidence.to_string(),
-                    reason: candidate.reason,
-                    is_static: candidate.preset == temps_entities::preset::Preset::Static,
-                }
-            })
+            .map(|candidate| drop_preset_candidate_from(&manifests, candidate))
             .collect::<Vec<_>>();
         // The response is rendered as a picker; an unbounded list is neither
         // useful to a human nor safe to serialise.
@@ -490,6 +485,26 @@ pub async fn inspect_drop_archive(
         suggested_name,
         candidates,
     }))
+}
+
+/// Convert a detected project candidate into the response DTO for the
+/// drop-inspection endpoint, resolving the compose file path alongside it.
+fn drop_preset_candidate_from(
+    manifests: &BTreeMap<String, String>,
+    candidate: temps_presets::ProjectCandidate,
+) -> DropPresetCandidate {
+    let preset = candidate.catalog_slug().to_string();
+    let compose_path = compose_path_for_candidate(manifests, &candidate);
+    DropPresetCandidate {
+        directory: candidate.path,
+        preset,
+        compose_path,
+        label: candidate.preset.display_name().to_string(),
+        confidence: candidate.confidence.to_string(),
+        reason: candidate.reason,
+        is_static: candidate.preset == temps_entities::preset::Preset::Static,
+        dockerfile_path: candidate.dockerfile_path,
+    }
 }
 
 fn compose_path_for_candidate(
@@ -2535,9 +2550,9 @@ pub async fn create_project_from_template(
 #[cfg(test)]
 mod tests {
     use super::{
-        authorize_storage_service_scopes, compose_path_for_candidate,
+        authorize_storage_service_scopes, compose_path_for_candidate, drop_preset_candidate_from,
         parse_owner_repo_from_git_url, project_created_from_template_telemetry_event,
-        require_git_settings_permissions,
+        require_git_settings_permissions, DropPresetCandidate,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -2835,6 +2850,80 @@ mod tests {
             compose_path_for_candidate(&manifests, &candidate).as_deref(),
             Some("compose.yml")
         );
+    }
+
+    /// A bare Dockerfile in a `docker/`-named subdirectory, with something
+    /// else at the repository root, must be rolled up into a repo-root
+    /// `DropPresetCandidate` that records where the Dockerfile actually
+    /// lives, so the build context defaults correctly.
+    #[test]
+    fn drop_preset_candidate_bare_dockerfile_in_docker_dir_roots_at_repo_root() {
+        let manifests = BTreeMap::from([
+            ("package.json".to_string(), "{}".to_string()),
+            ("docker/Dockerfile".to_string(), "FROM scratch".to_string()),
+        ]);
+        let candidate = temps_presets::detect_project_candidates(&manifests)
+            .into_iter()
+            .find(|c| c.preset == temps_entities::preset::Preset::Dockerfile)
+            .expect("dockerfile candidate should be detected");
+
+        let drop_candidate = drop_preset_candidate_from(&manifests, candidate);
+
+        assert_eq!(drop_candidate.directory, ".");
+        assert_eq!(
+            drop_candidate.dockerfile_path.as_deref(),
+            Some("docker/Dockerfile")
+        );
+    }
+
+    /// A genuine monorepo service directory (its own Dockerfile plus its own
+    /// manifest, in a directory name that isn't a conventional Docker-tooling
+    /// name) keeps today's behavior: its own root, `dockerfile_path: None`.
+    #[test]
+    fn drop_preset_candidate_service_dockerfile_keeps_own_root() {
+        let manifests = BTreeMap::from([
+            (
+                "apps/api/Dockerfile".to_string(),
+                "FROM scratch".to_string(),
+            ),
+            ("apps/api/package.json".to_string(), "{}".to_string()),
+        ]);
+        let candidate = temps_presets::detect_project_candidates(&manifests)
+            .into_iter()
+            .find(|c| c.preset == temps_entities::preset::Preset::Dockerfile)
+            .expect("dockerfile candidate should be detected");
+
+        let drop_candidate = drop_preset_candidate_from(&manifests, candidate);
+
+        assert_eq!(drop_candidate.directory, "apps/api");
+        assert_eq!(drop_candidate.dockerfile_path, None);
+    }
+
+    /// `dockerfile_path: None` must be omitted from the serialized response
+    /// entirely (matching the existing `compose_path` convention), and a
+    /// populated value must serialize under the camelCase key the frontend
+    /// expects.
+    #[test]
+    fn drop_preset_candidate_dockerfile_path_serializes_camel_case_and_omits_when_none() {
+        let without = DropPresetCandidate {
+            directory: "apps/api".to_string(),
+            preset: "dockerfile".to_string(),
+            compose_path: None,
+            label: "Dockerfile".to_string(),
+            confidence: "high".to_string(),
+            reason: "Dockerfile found".to_string(),
+            is_static: false,
+            dockerfile_path: None,
+        };
+        let json = serde_json::to_value(&without).unwrap();
+        assert!(json.get("dockerfilePath").is_none());
+
+        let with = DropPresetCandidate {
+            dockerfile_path: Some("docker/Dockerfile".to_string()),
+            ..without
+        };
+        let json = serde_json::to_value(&with).unwrap();
+        assert_eq!(json["dockerfilePath"], "docker/Dockerfile");
     }
 
     #[test]

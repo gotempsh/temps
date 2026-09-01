@@ -144,9 +144,11 @@ Database migrations are **idempotent** — re-running a version that's already m
 
 Back up the `postgres_data` volume, create a private `.env` with
 `install -m 600 .env.example .env`, and set new, independent hexadecimal values
-for `POSTGRES_PASSWORD` and `REDIS_PASSWORD`. Keep the file owned by the account
-that operates Temps and mode `0600`; it grants access to the loopback-published
-data services.
+for `POSTGRES_PASSWORD` and `CLICKHOUSE_PASSWORD`. Keep the
+file owned by the account that operates Temps and mode `0600`; it grants access
+to the loopback-published data services. Existing stacks upgrading to the
+ClickHouse-enabled Compose file must add `CLICKHOUSE_PASSWORD` before running
+`docker compose up`.
 Set `TEMPS_ADMIN_EMAIL` to the administrator email; it is used only when the
 database has no existing user.
 Set `TEMPS_ADMIN_PASSWORD_FILE` to a permission-restricted password file. For a
@@ -156,8 +158,17 @@ new file that satisfies the password policy:
 mkdir -p secrets
 chmod 700 secrets
 { printf 'tT3!'; openssl rand -hex 32; } > secrets/admin_password
-chmod 444 secrets/admin_password
+{ printf 'iI4!'; openssl rand -hex 32; } > secrets/admin_ingress_password
+chmod 444 secrets/admin_password secrets/admin_ingress_password
 ```
+Set `TEMPS_ADMIN_INGRESS_PASSWORD_FILE` to the second file. It protects the
+loopback-only admin port (`127.0.0.1:9001`) with username `temps`; keep it
+independent from the Temps account password. The file must contain one non-blank
+line of 16–72 printable ASCII bytes or the ingress fails closed. The public ingest
+listener remains on `127.0.0.1:9000` and does not serve admin routes. The updated stack uses
+separate public and admin proxy containers: only the public proxy joins the
+managed-workload network, and both continue to publish exclusively on host
+loopback.
 Set `DOCKER_GID` to the group that owns `/var/run/docker.sock` as seen inside a
 container on Linux or macOS:
 
@@ -167,18 +178,23 @@ docker run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine:3.22 stat -c
 Then rebuild and start the stack normally:
 
 ```bash
-docker compose up --build --detach
+docker compose up --build --detach --remove-orphans
 ```
 
 The one-shot `postgres-credential-sync` service connects over the private Unix
 socket and rotates the existing `temps` role to the configured SCRAM password
 before the application starts. The authenticated PostgreSQL health check keeps
-Temps stopped if rotation did not succeed. Redis starts with the configured
-password in a permission-restricted config file.
+Temps stopped if rotation did not succeed. ClickHouse starts with its own
+authenticated `temps` user and persistent volume before the application starts.
+The former global Redis service can be removed; it was not a Temps control-plane
+dependency. `--remove-orphans` removes its old container; the `redis_data`
+volume is retained so deletion remains an explicit operator decision. The
+optional KV feature manages its own Redis instance.
 
 To roll back Temps, preserve the hardened `docker-compose.yml`, `Dockerfile`,
 `.dockerignore`, `.env`, and admin-password secret file, check out the previous
-application source, restore those files, and rebuild. The hardened Dockerfile builds the binary
+application source, restore those files (including the separate admin-ingress
+password secret), and rebuild. The hardened Dockerfile builds the binary
 inside its Alpine stage; older Dockerfiles expected a separately built host
 binary and are not compatible with this Compose workflow. Do not restore the
 old Compose file: it contains the retired known database password and will no

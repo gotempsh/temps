@@ -434,6 +434,19 @@ function DetectedPresetCard({
                 {pathLabel}
               </span>
             </div>
+            {/* The Dockerfile itself can live in a subdirectory even though
+                the build context (shown above) stays at the repository
+                root — call that out so the user doesn't assume the
+                Dockerfile is directly at `pathLabel`. */}
+            {project.dockerfilePath && (
+              <p
+                className="mt-1 truncate text-xs text-muted-foreground"
+                title={project.dockerfilePath}
+              >
+                Dockerfile detected in{' '}
+                <span className="font-mono">{project.dockerfilePath}</span>
+              </p>
+            )}
           </div>
         </div>
       </CardContent>
