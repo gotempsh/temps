@@ -200,7 +200,7 @@ fn validate_environment_credential(
     }
     if compose_environment_name_is_secret(name)
         && !variable_reference_only(value)
-        && !safe_database_url_template(name, value)
+        && !compose_environment_value_is_safe_connection_endpoint(name, value)
     {
         return Err(ComposeCredentialValidationError::EmbeddedCredential { location });
     }
@@ -327,9 +327,16 @@ fn url_query_name_is_secret(name: &str) -> bool {
     .any(|marker| compact == *marker || compact.ends_with(marker))
 }
 
-fn safe_database_url_template(name: &str, value: &str) -> bool {
+/// Whether a connection-like environment value is an endpoint rather than a
+/// credential. Catalogs commonly use `redis:6379` in variables named
+/// `REDIS_URL`; treating the name alone as secret turns that endpoint into a
+/// random password and breaks the stack.
+pub fn compose_environment_value_is_safe_connection_endpoint(
+    name: &str,
+    value: &str,
+) -> bool {
     let uppercase = name.trim().to_ascii_uppercase();
-    let database_url = [
+    let connection_value = [
         "DATABASE_URL",
         "POSTGRES_URL",
         "MYSQL_URL",
@@ -345,10 +352,26 @@ fn safe_database_url_template(name: &str, value: &str) -> bool {
             || uppercase.starts_with(&format!("{marker}_"))
             || uppercase.ends_with(&format!("_{marker}"))
     });
-    database_url
-        && value.contains("://")
+    connection_value
         && !authenticated_url_has_literal_credentials(value)
         && !url_query_has_literal_credential(value)
+        && (value.contains("://") || safe_host_port_endpoint(value))
+}
+
+fn safe_host_port_endpoint(value: &str) -> bool {
+    let authority = value
+        .trim()
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    !host.is_empty()
+        && host.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
+        })
+        && port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
 /// Returns whether an environment-variable name conventionally carries a
@@ -1279,6 +1302,28 @@ services:
       API_KEY_RATE_LIMIT: ${API_KEY_RATE_LIMIT:-60/minute}
 "#;
         assert_eq!(validate_compose_credentials(yaml), Ok(()));
+    }
+
+    #[test]
+    fn credential_validation_accepts_internal_connection_endpoints_without_credentials() {
+        let yaml = r#"
+services:
+  app:
+    image: example/app
+    environment:
+      REDIS_URL: redis-service:6379
+      DATABASE_URL: postgres://database:5432/app
+"#;
+
+        assert_eq!(validate_compose_credentials(yaml), Ok(()));
+        assert!(compose_environment_value_is_safe_connection_endpoint(
+            "REDIS_URL",
+            "redis-service:6379"
+        ));
+        assert!(!compose_environment_value_is_safe_connection_endpoint(
+            "REDIS_URL",
+            "literal-password"
+        ));
     }
 
     #[test]

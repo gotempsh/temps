@@ -627,8 +627,10 @@ scenario explicitly tests an upgrade.
     API call.
   - The final `ComposeExecutor` policy independently rejects the same document
     even if catalog analysis is bypassed.
-  - No template can grant its own capability approval or convert a host path
-    through environment interpolation.
+  - No template can grant its own startup permissions or convert a sensitive,
+    read-only, or interpolated host path. Narrow app-owned writable paths such
+    as `/apprise-api/config:/config` become declared project named volumes;
+    Docker sockets and system paths remain blocked.
 
 ### 12.4 Standard single-service installation
 
@@ -637,6 +639,8 @@ scenario explicitly tests an upgrade.
   open the generated URL.
 - **Pass**:
   - Search retains keyboard focus while debounced requests run.
+  - **View Docker Compose** reveals the complete normalized YAML, supports
+    copying it, and does not contain resolved secret values.
   - Fixed host ports become random loopback bindings and no fixed container or
     Compose project name survives normalization.
   - Preflight returns the planned slug and canonical public variables; create
@@ -644,17 +648,25 @@ scenario explicitly tests an upgrade.
   - Deployment succeeds, the route serves the expected response, and both the
     Compose stage log stream and runtime container log stream contain data.
 
-### 12.5 Elevated multi-service installation
+### 12.5 Multi-service installation with required startup permissions
 
 - **Setup**: A template with an application plus a bundled Postgres/Redis
-  dependency and writable named volumes.
-- **Steps**: Try preflight without approval, approve only the named services,
-  install, restart all containers, and redeploy unchanged.
+  dependency and writable named volumes. Include Activepieces, whose bundled
+  nginx also needs the limited profile even though the application container
+  has no writable volume.
+- **Steps**: Try preflight without confirming the required permission checkbox,
+  confirm it once for the stack, install, restart all containers, and redeploy
+  unchanged.
 - **Pass**:
-  - Missing approval blocks preflight with each exact service/reason; unrelated
-    approval is ignored with a warning.
+  - Installable catalog entries appear **Ready**; discovery does not imply that
+    limited startup permissions make a template unavailable.
+  - One required checkbox (`*`) confirms every listed service. Missing
+    confirmation blocks installation with the exact services/reasons;
+    unrelated service names are ignored with a warning.
   - Only the limited startup capability profile is restored—never privileged
     mode, arbitrary `cap_add`, host networking, or devices.
+  - Activepieces serves port 80, reports healthy through `/api/v1/health`, and
+    does not fail because its bundled nginx cannot initialize runtime paths.
   - Dependencies remain project-scoped, persist across restart/redeploy, and
     do not collide with another project installed from the same template.
 
@@ -669,6 +681,11 @@ scenario explicitly tests an upgrade.
 - **Pass**:
   - Optional variables have no required marker and do not block preflight;
     required variables fail with their exact name.
+  - Internal endpoints such as `redis-service:6379` remain literal endpoints
+    and never become generated password variables.
+  - Generated usernames use conventional defaults (`postgres`, Redis
+    `default`, otherwise `admin`) and remain editable; passwords and tokens
+    remain cryptographically random.
   - Generated values use Web Crypto, preserve required equality, and are never
     returned by catalog/preflight responses or printed in logs.
   - Stored secrets are encrypted/write-only and Compose receives the exact

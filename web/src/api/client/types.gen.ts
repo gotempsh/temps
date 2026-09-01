@@ -3060,15 +3060,18 @@ export type ComposeSourceServiceResponse = {
 };
 
 /**
- * Informational catalog origin captured from the install request.
+ * Catalog origin captured from the install request.
  *
- * The server preserves it after creation, but it is not a cryptographic
- * attestation: API clients can supply project configuration directly.
+ * The server preserves it after creation. The complete install-plan digest is
+ * revalidated against the live catalog and the first saved Compose revision
+ * must exactly match before its public slug is promoted to anonymous telemetry
+ * provenance; the remaining fields are informational.
  */
 export type ComposeTemplateOrigin = {
     /**
      * Digest of the complete normalized install plan reviewed during
-     * preflight. Used to attest anonymous catalog telemetry at creation time.
+     * preflight. Used with the first saved Compose source to attest anonymous
+     * catalog telemetry provenance.
      */
     installPlanDigest?: string | null;
     provider: string;
@@ -13507,7 +13510,7 @@ export type PostgresWalHealth = {
 
 export type PreflightServiceTemplateRequest = {
     /**
-     * Services for which the user explicitly approved limited startup capabilities.
+     * Services for which the user confirmed the required startup permissions.
      */
     approved_capability_services?: Array<string>;
     /**

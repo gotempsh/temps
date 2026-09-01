@@ -417,7 +417,7 @@ pub async fn preflight_template(
     for requirement in &prepared.capability_requirements {
         if !approved.contains(requirement.service.as_str()) {
             errors.push(format!(
-                "Service '{}' requires explicit approval for limited startup capabilities: {}",
+                "Service '{}' requires confirmation of limited startup permissions: {}",
                 requirement.service, requirement.reason
             ));
         }
@@ -429,7 +429,7 @@ pub async fn preflight_template(
             .any(|requirement| requirement.service == *service)
         {
             warnings.push(format!(
-                "Capability approval for service '{service}' is unnecessary and will be ignored"
+                "Startup permission confirmation for service '{service}' is unnecessary and will be ignored"
             ));
         }
     }
@@ -1005,6 +1005,8 @@ pub fn prepare_template(
     let mut transformations = Vec::new();
     normalize_project_owned_names(&mut root, &mut transformations);
     externalize_literal_credentials(&mut root, &mut transformations);
+    normalize_project_storage_bind_mounts(&mut root, &mut transformations);
+    normalize_known_service_healthchecks(&mut root, &mut transformations);
     let mut compatibility_issues = compatibility_issues(&root);
     let requires_host_access = requires_host_access(&root);
     let mut warnings = compatibility_warnings(&root);
@@ -1030,10 +1032,10 @@ pub fn prepare_template(
             variable.name
         ));
     }
-    // Capability approval is meaningful only for an otherwise installable
+    // Capability confirmation is meaningful only for an otherwise installable
     // plan. Asking the user to approve volume initialization on a stack that
     // already requires a Docker socket or another unsupported feature implies
-    // that the approval could unblock it, which is both confusing and unsafe.
+    // that confirmation could unblock it, which is both confusing and unsafe.
     let capability_requirements = if compatibility_issues.is_empty() {
         capability_requirements(&root)
     } else {
@@ -1041,7 +1043,7 @@ pub fn prepare_template(
     };
     if !capability_requirements.is_empty() {
         warnings.push(
-            "Some images commonly need limited startup capabilities to initialize persistent data; explicit approval is required before installation"
+            "Some images commonly need limited startup permissions to initialize runtime state; confirmation is required before installation"
                 .to_string(),
         );
     }
@@ -1151,6 +1153,7 @@ fn should_externalize_literal_credential(name: &str, value: &str) -> bool {
         && !value.trim().is_empty()
         && !safe_compose_variable_reference(value)
         && !value.contains("://")
+        && !temps_presets::compose_environment_value_is_safe_connection_endpoint(name, value)
         && !value.to_ascii_uppercase().contains("-----BEGIN ")
 }
 
@@ -1252,13 +1255,7 @@ fn discover_backing_services(root: &YamlValue) -> Vec<TemplateBackingService> {
 }
 
 fn classify_backing_service_image(image: &str) -> Option<TemplateBackingServiceKind> {
-    let image = image.trim().split('@').next().unwrap_or_default();
-    let last_slash = image.rfind('/');
-    let repository = match image.rfind(':') {
-        Some(colon) if last_slash.is_none_or(|slash| colon > slash) => &image[..colon],
-        _ => image,
-    }
-    .to_ascii_lowercase();
+    let repository = normalized_image_repository(image);
     let image_name = repository.rsplit('/').next().unwrap_or(repository.as_str());
 
     if image_name == "postgres"
@@ -1282,6 +1279,81 @@ fn classify_backing_service_image(image: &str) -> Option<TemplateBackingServiceK
         return Some(TemplateBackingServiceKind::S3);
     }
     None
+}
+
+fn normalized_image_repository(image: &str) -> String {
+    let image = image.trim().split('@').next().unwrap_or_default();
+    let last_slash = image.rfind('/');
+    match image.rfind(':') {
+        Some(colon) if last_slash.is_none_or(|slash| colon > slash) => &image[..colon],
+        _ => image,
+    }
+    .to_ascii_lowercase()
+}
+
+/// Correct known upstream probes that only prove a bundled web server is up.
+/// Activepieces serves its static UI through nginx on port 80 while its API
+/// listens behind nginx on port 3000. Probing `/api/v1/health` therefore waits
+/// for the application itself instead of declaring a half-started container
+/// ready as soon as nginx can return `index.html`.
+fn normalize_known_service_healthchecks(
+    root: &mut YamlValue,
+    transformations: &mut Vec<TemplateTransformation>,
+) {
+    let Some(services) = root.get_mut("services").and_then(YamlValue::as_mapping_mut) else {
+        return;
+    };
+    for (name, definition) in services {
+        let service_name = name.as_str().unwrap_or("service");
+        let Some(service) = definition.as_mapping_mut() else {
+            continue;
+        };
+        let is_activepieces = service
+            .get("image")
+            .and_then(YamlValue::as_str)
+            .is_some_and(|image| is_activepieces_image(&normalized_image_repository(image)));
+        if !is_activepieces {
+            continue;
+        }
+        let Some(healthcheck) = service.get_mut("healthcheck") else {
+            continue;
+        };
+        if temps_presets::http_healthcheck_path(healthcheck).as_deref() != Some("/") {
+            continue;
+        }
+        let ports = healthcheck_ports(healthcheck);
+        let Some(port) = (ports.len() == 1)
+            .then(|| ports.iter().next().copied())
+            .flatten()
+        else {
+            continue;
+        };
+        let Some(healthcheck) = healthcheck.as_mapping_mut() else {
+            continue;
+        };
+        healthcheck.insert(
+            YamlValue::String("test".to_string()),
+            YamlValue::Sequence(vec![
+                YamlValue::String("CMD".to_string()),
+                YamlValue::String("curl".to_string()),
+                YamlValue::String("-f".to_string()),
+                YamlValue::String(format!("http://127.0.0.1:{port}/api/v1/health")),
+            ]),
+        );
+        transformations.push(TemplateTransformation {
+            code: "normalize_healthcheck",
+            description: format!(
+                "Changed {service_name}'s health probe from the static root page to Activepieces' application health endpoint"
+            ),
+        });
+    }
+}
+
+fn is_activepieces_image(repository: &str) -> bool {
+    matches!(
+        repository,
+        "activepieces/activepieces" | "ghcr.io/activepieces/activepieces"
+    )
 }
 
 fn first_service_name(root: &YamlValue) -> Option<String> {
@@ -1627,6 +1699,171 @@ fn compose_target_port(value: &YamlValue) -> Option<u16> {
     compose_port_target_and_protocol(value)
         .filter(|(_, protocol)| protocol == "tcp")
         .map(|(target, _)| target)
+}
+
+/// Convert a narrowly-defined app-owned host path into a project-scoped named
+/// volume. Some upstream templates spell writable runtime state as
+/// `/service/config:/config`; mounting that host path is neither portable nor
+/// allowed by Temps, while a named volume preserves the intended persistence
+/// without granting access outside the project.
+fn normalize_project_storage_bind_mounts(
+    root: &mut YamlValue,
+    transformations: &mut Vec<TemplateTransformation>,
+) {
+    let Some(services) = root.get_mut("services").and_then(YamlValue::as_mapping_mut) else {
+        return;
+    };
+    for (service_name, definition) in services {
+        let Some(service_name) = service_name.as_str() else {
+            continue;
+        };
+        let Some(volumes) = definition
+            .as_mapping_mut()
+            .and_then(|service| service.get_mut("volumes"))
+            .and_then(YamlValue::as_sequence_mut)
+        else {
+            continue;
+        };
+        for volume in volumes {
+            let Some((source, target, mode)) = short_bind_mount_parts(volume) else {
+                continue;
+            };
+            if !is_project_storage_bind_mount(service_name, &source, &target, mode.as_deref()) {
+                continue;
+            }
+            let volume_name = project_storage_volume_name(service_name, &target);
+            let replacement = mode.as_deref().map_or_else(
+                || format!("{volume_name}:{target}"),
+                |mode| format!("{volume_name}:{target}:{mode}"),
+            );
+            *volume = YamlValue::String(replacement);
+            transformations.push(TemplateTransformation {
+                code: "project_storage_volume",
+                description: format!(
+                    "Converted app-owned path {source} for {service_name} into project volume {volume_name}"
+                ),
+            });
+        }
+    }
+}
+
+fn short_bind_mount_parts(volume: &YamlValue) -> Option<(String, String, Option<String>)> {
+    let volume = volume.as_str()?;
+    let fields = volume.split(':').map(str::trim).collect::<Vec<_>>();
+    if !(2..=3).contains(&fields.len()) || !fields[0].starts_with('/') {
+        return None;
+    }
+    Some((
+        fields[0].to_string(),
+        fields[1].to_string(),
+        fields.get(2).map(|mode| (*mode).to_string()),
+    ))
+}
+
+fn is_project_storage_bind_mount(
+    service_name: &str,
+    source: &str,
+    target: &str,
+    mode: Option<&str>,
+) -> bool {
+    if mode.is_some_and(|mode| {
+        mode.split(',')
+            .any(|option| !matches!(option, "rw" | "z" | "Z"))
+    }) || !target.starts_with('/')
+    {
+        return false;
+    }
+    let source_parts = source
+        .trim_matches('/')
+        .split('/')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    let Some(target_leaf) = target.trim_end_matches('/').rsplit('/').next() else {
+        return false;
+    };
+    let Some(source_owner) = source_parts
+        .first()
+        .map(|owner| normalized_storage_component(owner))
+    else {
+        return false;
+    };
+    source_parts.len() == 2
+        && !is_system_root_component(&source_owner)
+        && source_owner == normalized_storage_component(service_name)
+        && source_parts[1].eq_ignore_ascii_case(target_leaf)
+        && matches!(
+            target_leaf.to_ascii_lowercase().as_str(),
+            "config" | "data" | "storage" | "uploads" | "files" | "cache"
+        )
+}
+
+fn is_system_root_component(component: &str) -> bool {
+    matches!(
+        component,
+        // Linux/FHS roots plus common host-runtime mount roots.
+        "bin"
+            | "boot"
+            | "dev"
+            | "docker"
+            | "etc"
+            | "home"
+            | "host-mnt"
+            | "lib"
+            | "lib32"
+            | "lib64"
+            | "libx32"
+            | "lost-found"
+            | "media"
+            | "mnt"
+            | "nix"
+            | "opt"
+            | "proc"
+            | "root"
+            | "run"
+            | "sbin"
+            | "snap"
+            | "srv"
+            | "sys"
+            | "tmp"
+            | "usr"
+            | "var"
+            // macOS host roots visible to Docker Desktop bind mounts.
+            | "applications"
+            | "library"
+            | "network"
+            | "private"
+            | "system"
+            | "users"
+            | "volumes"
+    )
+}
+
+fn project_storage_volume_name(service_name: &str, target: &str) -> String {
+    let target_leaf = target
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("storage");
+    format!(
+        "{}-{}",
+        normalized_storage_component(service_name),
+        normalized_storage_component(target_leaf)
+    )
+}
+
+fn normalized_storage_component(value: &str) -> String {
+    value
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 fn declare_implicit_named_volumes(root: &mut YamlValue) {
@@ -1997,12 +2234,15 @@ fn capability_requirements(root: &YamlValue) -> Vec<TemplateCapabilityRequiremen
             let name = name.as_str()?;
             let database = database_services.contains(name);
             let persistent_volume = service_has_writable_volume(definition);
-            (database || persistent_volume).then(|| TemplateCapabilityRequirement {
+            let known_runtime_reason = known_runtime_capability_reason(definition);
+            (database || persistent_volume || known_runtime_reason.is_some()).then(|| TemplateCapabilityRequirement {
                 service: name.to_string(),
                 capability: "relaxed_linux_capabilities",
                 reason: if database {
                     "This image commonly initializes persistent data as root before dropping to its runtime user"
                         .to_string()
+                } else if let Some(reason) = known_runtime_reason {
+                    reason.to_string()
                 } else {
                     "This service has a writable Docker volume; some images need limited ownership capabilities to initialize the empty volume"
                         .to_string()
@@ -2010,6 +2250,17 @@ fn capability_requirements(root: &YamlValue) -> Vec<TemplateCapabilityRequiremen
             })
         })
         .collect()
+}
+
+fn known_runtime_capability_reason(definition: &YamlValue) -> Option<&'static str> {
+    let repository = definition
+        .as_mapping()?
+        .get("image")
+        .and_then(YamlValue::as_str)
+        .map(normalized_image_repository)?;
+    is_activepieces_image(&repository).then_some(
+        "This Activepieces image starts nginx as root and needs limited ownership and user-switch capabilities before it can serve port 80",
+    )
 }
 
 fn service_has_writable_volume(definition: &YamlValue) -> bool {
@@ -2276,6 +2527,7 @@ fn insert_variable(
     required: bool,
 ) {
     let kind = variable_kind(name);
+    let default_value = default_value.or_else(|| generated_user_default(name, &kind));
     found
         .entry(name.to_string())
         .and_modify(|variable| {
@@ -2350,6 +2602,23 @@ fn variable_kind(name: &str) -> TemplateVariableKind {
         }
     }
     TemplateVariableKind::UserInput
+}
+
+fn generated_user_default(name: &str, kind: &TemplateVariableKind) -> Option<String> {
+    if !matches!(
+        kind,
+        TemplateVariableKind::GeneratedUser | TemplateVariableKind::GeneratedLowercaseUser
+    ) {
+        return None;
+    }
+    let name = name.to_ascii_uppercase();
+    if name.contains("POSTGRES") {
+        Some("postgres".to_string())
+    } else if name.contains("REDIS") || name.contains("VALKEY") {
+        Some("default".to_string())
+    } else {
+        Some("admin".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -2584,6 +2853,57 @@ volumes:
     }
 
     #[test]
+    fn converts_app_owned_config_paths_to_project_scoped_volumes() {
+        let prepared = prepare_template(
+            "apprise-api",
+            &template(
+                r#"services:
+  apprise-api:
+    image: linuxserver/apprise-api:latest
+    volumes:
+      - /apprise-api/config:/config
+"#,
+                None,
+            ),
+        )
+        .expect("app-owned config should normalize safely");
+
+        assert!(prepared.installable());
+        assert!(!prepared.requires_host_access);
+        assert!(!prepared.compose.contains("/apprise-api/config"));
+        assert!(prepared.compose.contains("apprise-api-config:/config"));
+        assert!(prepared
+            .transformations
+            .iter()
+            .any(|transformation| transformation.code == "project_storage_volume"));
+        assert_eq!(
+            prepared.compatibility_tier(),
+            TemplateCompatibilityTier::Elevated
+        );
+    }
+
+    #[test]
+    fn does_not_rewrite_sensitive_or_read_only_host_config_paths() {
+        for (service, mount) in [
+            ("app", "/etc/example/config:/config"),
+            ("app", "/app/config:/config:ro"),
+            ("app", "/app/config:/config:rshared"),
+            ("etc", "/etc/config:/config"),
+            ("bin", "/bin/config:/config"),
+            ("lib64", "/lib64/data:/data"),
+            ("Users", "/Users/config:/config"),
+            ("private", "/private/data:/data"),
+        ] {
+            let compose = format!(
+                "services:\n  {service}:\n    image: example/app:1\n    volumes:\n      - {mount}\n"
+            );
+            let prepared = prepare_template("unsafe-config", &template(&compose, None)).unwrap();
+            assert!(!prepared.installable(), "{mount}");
+            assert!(prepared.requires_host_access, "{mount}");
+        }
+    }
+
+    #[test]
     fn distinguishes_non_host_incompatibility_from_host_access() {
         let prepared = prepare_template(
             "missing-image",
@@ -2660,6 +2980,47 @@ volumes:
             .unwrap();
         assert!(api_key.required);
         assert_eq!(api_key.kind, TemplateVariableKind::UserInput);
+    }
+
+    #[test]
+    fn keeps_internal_redis_endpoints_and_suggests_conventional_users() {
+        let prepared = prepare_template(
+            "budibase",
+            &template(
+                r#"services:
+  app-service:
+    image: example/app:1
+    environment:
+      - REDIS_URL=redis-service:6379
+      - POSTGRES_USER=$SERVICE_USER_POSTGRES
+      - REDIS_USER=$SERVICE_USER_REDIS
+      - ADMIN_USER=$SERVICE_USER_APP
+"#,
+                None,
+            ),
+        )
+        .expect("internal endpoints and generated users should normalize");
+
+        assert!(prepared.compose.contains("REDIS_URL=redis-service:6379"));
+        assert!(!prepared
+            .compose
+            .contains("SERVICE_PASSWORD_APP_SERVICE_REDIS_URL"));
+        for (name, expected) in [
+            ("SERVICE_USER_POSTGRES", "postgres"),
+            ("SERVICE_USER_REDIS", "default"),
+            ("SERVICE_USER_APP", "admin"),
+        ] {
+            let variable = prepared
+                .variables
+                .iter()
+                .find(|variable| variable.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"));
+            assert_eq!(variable.default_value.as_deref(), Some(expected));
+        }
+        assert_eq!(
+            temps_presets::validate_compose_credentials(&prepared.compose),
+            Ok(())
+        );
     }
 
     #[test]
@@ -2893,7 +3254,84 @@ services:
     }
 
     #[test]
-    fn requires_approval_for_writable_named_volume_initialization() {
+    fn activepieces_uses_application_healthcheck_and_startup_permissions() {
+        let prepared = prepare_template(
+            "activepieces",
+            &template(
+                r#"services:
+  activepieces:
+    image: ghcr.io/activepieces/activepieces:0.75.0
+    environment:
+      - SERVICE_URL_ACTIVEPIECES
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:80"]
+      interval: 5s
+      timeout: 20s
+      retries: 10
+"#,
+                Some("80"),
+            ),
+        )
+        .expect("Activepieces template should prepare");
+
+        assert_eq!(
+            prepared.compatibility_tier(),
+            TemplateCompatibilityTier::Elevated
+        );
+        assert_eq!(prepared.capability_requirements.len(), 1);
+        assert_eq!(prepared.capability_requirements[0].service, "activepieces");
+        assert!(prepared.capability_requirements[0]
+            .reason
+            .contains("starts nginx as root"));
+        assert_eq!(
+            prepared.routes[0].health_check_path.as_deref(),
+            Some("/api/v1/health")
+        );
+        assert!(prepared
+            .compose
+            .contains("http://127.0.0.1:80/api/v1/health"));
+        assert!(prepared
+            .transformations
+            .iter()
+            .any(|transformation| transformation.code == "normalize_healthcheck"));
+    }
+
+    #[test]
+    fn activepieces_capabilities_do_not_match_untrusted_image_references() {
+        for image in [
+            "activepieces/activepieces.evil:0.75.0",
+            "docker.io/activepieces/activepieces:0.75.0",
+            "registry.example.com/activepieces/activepieces:0.75.0",
+            "${ACTIVEPIECES_IMAGE}",
+        ] {
+            let compose = format!(
+                r#"services:
+  app:
+    image: {image}
+    environment:
+      - SERVICE_URL_APP
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://127.0.0.1:80"]
+"#
+            );
+            let prepared =
+                prepare_template("untrusted-activepieces", &template(&compose, Some("80")))
+                    .expect("lookalike image template should prepare without implicit permissions");
+
+            assert!(
+                prepared.capability_requirements.is_empty(),
+                "{image} must not receive the Activepieces capability requirement"
+            );
+            assert_eq!(prepared.routes[0].health_check_path.as_deref(), Some("/"));
+            assert!(!prepared
+                .transformations
+                .iter()
+                .any(|transformation| transformation.code == "normalize_healthcheck"));
+        }
+    }
+
+    #[test]
+    fn requires_confirmation_for_writable_named_volume_initialization() {
         let prepared = prepare_template(
             "persistent-app",
             &template(
@@ -2970,7 +3408,7 @@ volumes:
     }
 
     #[tokio::test]
-    async fn preflight_requires_explicit_capability_approval() {
+    async fn preflight_requires_startup_permission_confirmation() {
         let result = preflight_template(
             "database-stack",
             &template(
@@ -2990,7 +3428,7 @@ volumes:
         assert!(result
             .errors
             .iter()
-            .any(|error| error.contains("explicit approval")));
+            .any(|error| error.contains("requires confirmation")));
     }
 
     #[tokio::test]

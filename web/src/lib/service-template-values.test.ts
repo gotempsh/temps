@@ -3,11 +3,33 @@
 
 import { describe, expect, test } from 'bun:test'
 import {
+  confirmedServiceTemplateCapabilities,
   createServiceTemplateWithSlugRetry,
   generateDependentServiceTemplateValue,
   generateServiceTemplateValue,
   serviceTemplateVariableIsGenerated,
 } from './service-template-values'
+
+describe('confirmedServiceTemplateCapabilities', () => {
+  const requirements = [
+    { service: 'postgres' },
+    { service: 'redis' },
+    { service: 'postgres' },
+  ]
+
+  test('confirms every required service with one stack-level choice', () => {
+    expect(confirmedServiceTemplateCapabilities(requirements, true)).toEqual([
+      'postgres',
+      'redis',
+    ])
+  })
+
+  test('does not grant startup capabilities before confirmation', () => {
+    expect(confirmedServiceTemplateCapabilities(requirements, false)).toEqual(
+      []
+    )
+  })
+})
 
 const base = { scheme: 'https' as const, host: 'apps.example.com' }
 
@@ -101,6 +123,41 @@ describe('service template value generation', () => {
         base
       )
     ).toHaveLength(64)
+  })
+
+  test('uses conventional service usernames instead of random identifiers', () => {
+    expect(
+      generateServiceTemplateValue(
+        { name: 'SERVICE_USER_POSTGRES', kind: 'generated_user' },
+        'example',
+        base
+      )
+    ).toBe('postgres')
+    expect(
+      generateServiceTemplateValue(
+        { name: 'SERVICE_USER_REDIS', kind: 'generated_user' },
+        'example',
+        base
+      )
+    ).toBe('default')
+    expect(
+      generateServiceTemplateValue(
+        { name: 'SERVICE_USER_MINIO', kind: 'generated_user' },
+        'example',
+        base
+      )
+    ).toBe('admin')
+    expect(
+      generateServiceTemplateValue(
+        {
+          name: 'SERVICE_USER_POSTGRES',
+          kind: 'generated_user',
+          defaultValue: 'app_owner',
+        },
+        'example',
+        base
+      )
+    ).toBe('app_owner')
   })
 
   test('only user inputs require manual entry', () => {

@@ -225,7 +225,7 @@ pub struct PreflightServiceTemplateRequest {
     /// Final environment values the project would persist. Values are never returned.
     #[serde(default)]
     pub variables: BTreeMap<String, String>,
-    /// Services for which the user explicitly approved limited startup capabilities.
+    /// Services for which the user confirmed the required startup permissions.
     #[serde(default)]
     pub approved_capability_services: Vec<String>,
 }

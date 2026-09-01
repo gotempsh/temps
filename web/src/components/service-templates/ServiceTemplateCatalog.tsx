@@ -19,6 +19,12 @@ import { Badge } from '@/components/ui/badge'
 import { FeatureMaturityBadge } from '@/components/feature-maturity/FeatureMaturityBadge'
 import { Button } from '@/components/ui/button'
 import { Checkbox } from '@/components/ui/checkbox'
+import { CodeBlock } from '@/components/ui/code-block'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import {
   Card,
   CardContent,
@@ -41,6 +47,7 @@ import {
   saveComposeSource,
 } from '@/lib/compose-source-api'
 import {
+  confirmedServiceTemplateCapabilities,
   createServiceTemplateWithSlugRetry,
   generateDependentServiceTemplateValue,
   generateServiceTemplateValue,
@@ -64,6 +71,7 @@ import {
   Boxes,
   Braces,
   CheckCircle2,
+  ChevronDown,
   ChevronLeft,
   ChevronRight,
   Cloud,
@@ -183,18 +191,13 @@ function TemplateCard({
       <CardHeader className="space-y-4">
         <div className="flex items-start justify-between gap-3">
           {templateLogo(template)}
-          {template.compatibility_tier === 'standard' ? (
+          {template.installable ? (
             <Badge
               variant="secondary"
               className="border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
             >
               <CheckCircle2 className="mr-1 size-3" />
               Ready
-            </Badge>
-          ) : template.compatibility_tier === 'elevated' ? (
-            <Badge className="border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300">
-              <ShieldAlert className="mr-1 size-3" />
-              Approval required
             </Badge>
           ) : template.compatibility_tier === 'host_access' ? (
             <Badge className="border-red-500/20 bg-red-500/10 text-red-700 dark:text-red-300">
@@ -273,9 +276,9 @@ function TemplateInstaller({
   const [name, setName] = useState(detail.name)
   const [visible, setVisible] = useState<Record<string, boolean>>({})
   const [installing, setInstalling] = useState(false)
-  const [approvedCapabilities, setApprovedCapabilities] = useState<
-    Record<string, boolean>
-  >({})
+  const [startupPermissionsAccepted, setStartupPermissionsAccepted] =
+    useState(false)
+  const [composeOpen, setComposeOpen] = useState(false)
   const [preflightErrors, setPreflightErrors] = useState<string[]>([])
   const [generationError, setGenerationError] = useState<string | null>(null)
   const [generatingDependencies, setGeneratingDependencies] = useState(false)
@@ -384,9 +387,8 @@ function TemplateInstaller({
       !['public_url', 'public_host'].includes(variable.kind) &&
       !valueFor(variable).trim()
   )
-  const missingCapabilityApprovals = detail.capability_requirements.filter(
-    (requirement) => !approvedCapabilities[requirement.service]
-  )
+  const missingStartupPermissions =
+    detail.capability_requirements.length > 0 && !startupPermissionsAccepted
 
   const regenerateVariable = async (
     variable: ServiceTemplateDetailResponse['variables'][number]
@@ -426,10 +428,8 @@ function TemplateInstaller({
       )
       return
     }
-    if (missingCapabilityApprovals.length > 0) {
-      toast.error(
-        `Approve startup permissions for: ${missingCapabilityApprovals.map((requirement) => requirement.service).join(', ')}`
-      )
+    if (missingStartupPermissions) {
+      toast.error('Confirm the required startup permissions')
       return
     }
 
@@ -466,9 +466,10 @@ function TemplateInstaller({
           )
         ),
       }
-      const approvedCapabilityServices = detail.capability_requirements
-        .filter((requirement) => approvedCapabilities[requirement.service])
-        .map((requirement) => requirement.service)
+      const approvedCapabilityServices = confirmedServiceTemplateCapabilities(
+        detail.capability_requirements,
+        startupPermissionsAccepted
+      )
       const runPreflight = async () => {
         const response = await preflightServiceTemplate({
           throwOnError: true,
@@ -758,44 +759,84 @@ function TemplateInstaller({
               </div>
             )}
 
+            <Collapsible open={composeOpen} onOpenChange={setComposeOpen}>
+              <div className="rounded-lg border bg-muted/20">
+                <CollapsibleTrigger asChild>
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    className="flex h-auto w-full items-center justify-between rounded-lg px-4 py-3 text-left"
+                  >
+                    <span>
+                      <span className="block font-medium">
+                        View Docker Compose
+                      </span>
+                      <span className="mt-0.5 block text-xs font-normal text-muted-foreground">
+                        Inspect the normalized stack Temps will deploy
+                      </span>
+                    </span>
+                    <ChevronDown
+                      className={`size-4 shrink-0 transition-transform ${composeOpen ? 'rotate-180' : ''}`}
+                    />
+                  </Button>
+                </CollapsibleTrigger>
+                <CollapsibleContent className="border-t p-3">
+                  <div className="max-h-[32rem] overflow-auto rounded-2xl">
+                    <CodeBlock
+                      code={detail.compose}
+                      language="yaml"
+                      title="docker-compose.yml"
+                      defaultShowLineNumbers
+                    />
+                  </div>
+                </CollapsibleContent>
+              </div>
+            </Collapsible>
+
             {detail.capability_requirements.length > 0 && (
               <div className="space-y-3">
                 <div>
-                  <h3 className="font-medium">Startup permissions</h3>
+                  <h3 className="font-medium">Required startup permissions</h3>
                   <p className="text-sm text-muted-foreground">
                     These images commonly need a limited capability set while
-                    initializing their persistent directories. Approval is
-                    explicit and scoped per service.
+                    initializing their persistent directories. Temps grants it
+                    only to the services listed below.
                   </p>
                 </div>
-                {detail.capability_requirements.map((requirement) => (
-                  <label
-                    key={requirement.service}
-                    className="flex cursor-pointer items-start gap-3 rounded-lg border p-3"
-                  >
-                    <Checkbox
-                      checked={Boolean(
-                        approvedCapabilities[requirement.service]
-                      )}
-                      onCheckedChange={(checked) =>
-                        setApprovedCapabilities((current) => ({
-                          ...current,
-                          [requirement.service]: checked === true,
-                        }))
-                      }
-                      disabled={!detail.installable || installing}
-                    />
-                    <span className="space-y-1">
-                      <span className="block text-sm font-medium">
-                        Allow limited startup capabilities for{' '}
-                        <code>{requirement.service}</code>
-                      </span>
-                      <span className="block text-xs text-muted-foreground">
-                        {requirement.reason}
-                      </span>
+                <label className="flex cursor-pointer items-start gap-3 rounded-lg border p-4">
+                  <Checkbox
+                    checked={startupPermissionsAccepted}
+                    onCheckedChange={(checked) =>
+                      setStartupPermissionsAccepted(checked === true)
+                    }
+                    disabled={!detail.installable || installing}
+                    aria-required="true"
+                  />
+                  <span className="space-y-3">
+                    <span className="block text-sm font-medium">
+                      Enable the required startup permissions
+                      <span className="text-destructive"> *</span>
                     </span>
-                  </label>
-                ))}
+                    <span className="block text-xs text-muted-foreground">
+                      Required to install this stack. Permissions are limited to
+                      initialization and scoped to these containers:
+                    </span>
+                    <span className="block space-y-2">
+                      {detail.capability_requirements.map((requirement) => (
+                        <span
+                          key={requirement.service}
+                          className="block text-xs"
+                        >
+                          <code>{requirement.service}</code>
+                          <span className="text-muted-foreground">
+                            {' '}
+                            — {requirement.reason}
+                          </span>
+                        </span>
+                      ))}
+                    </span>
+                  </span>
+                </label>
               </div>
             )}
 
@@ -958,7 +999,7 @@ function TemplateInstaller({
               generatingDependencies ||
               Boolean(generationError) ||
               missing.length > 0 ||
-              missingCapabilityApprovals.length > 0
+              missingStartupPermissions
             }
             onClick={() => void install()}
           >
@@ -1336,10 +1377,9 @@ export function ServiceTemplateCatalog() {
               variant="secondary"
               className="border-emerald-500/20 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
             >
-              {catalog.data.compatibility.standard} ready
-            </Badge>
-            <Badge className="border-amber-500/20 bg-amber-500/10 text-amber-700 dark:text-amber-300">
-              {catalog.data.compatibility.elevated} need approval
+              {catalog.data.compatibility.standard +
+                catalog.data.compatibility.elevated}{' '}
+              ready
             </Badge>
             <Badge variant="outline" className="text-muted-foreground">
               {catalog.data.compatibility.host_access} require host access

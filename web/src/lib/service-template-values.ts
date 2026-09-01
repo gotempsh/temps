@@ -141,9 +141,11 @@ export function generateServiceTemplateValue(
     case 'generated_password_with_symbols_64':
       return randomPasswordWithSymbols(64)
     case 'generated_user':
-      return randomAlphaNumeric(16)
+      return input.defaultValue || conventionalGeneratedUser(input.name)
     case 'generated_lowercase_user':
-      return randomAlphaNumeric(16, true)
+      return (
+        input.defaultValue || conventionalGeneratedUser(input.name)
+      ).toLowerCase()
     case 'generated_random_32':
       return randomAlphaNumeric(32)
     case 'generated_random_64':
@@ -165,6 +167,15 @@ export function generateServiceTemplateValue(
     default:
       return ''
   }
+}
+
+function conventionalGeneratedUser(name: string): string {
+  const normalized = name.toUpperCase()
+  if (normalized.includes('POSTGRES')) return 'postgres'
+  if (normalized.includes('REDIS') || normalized.includes('VALKEY')) {
+    return 'default'
+  }
+  return 'admin'
 }
 
 function base64Url(bytes: Uint8Array): string {
@@ -250,6 +261,17 @@ export function serviceTemplateVariableIsGenerated(kind: string): boolean {
     'generated_supabase_anon',
     'generated_supabase_service',
   ].includes(kind)
+}
+
+export function confirmedServiceTemplateCapabilities(
+  requirements: ReadonlyArray<{ service: string }>,
+  confirmed: boolean
+): string[] {
+  return confirmed
+    ? Array.from(
+        new Set(requirements.map((requirement) => requirement.service))
+      )
+    : []
 }
 
 /**
