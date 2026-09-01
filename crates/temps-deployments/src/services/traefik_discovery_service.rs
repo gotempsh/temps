@@ -611,9 +611,15 @@ impl TraefikDiscoveryAdminService {
     /// 1. `environment_domains` — auto-generated `<env>.<project>.temps.local` and
     ///    custom environment subdomains.
     /// 2. `project_custom_domains` — operator-added custom domains.
-    /// 3. `domains` — if a row exists for this host and it is NOT already linked
-    ///    to the current `traefik_route_certificates` row (via `certificate_id`),
-    ///    another resource owns it.
+    /// 3. `domains` — if a row exists for this host and no `traefik_route_certificates`
+    ///    row exists for it, a different Temps feature (e.g. the wildcard setup
+    ///    domain, or a generic custom TLS domain) owns it. Only this service ever
+    ///    writes `traefik_route_certificates`, so the mere existence of a row for
+    ///    the host — regardless of `cert_authorized` or whether `certificate_id`
+    ///    has been linked yet — is sufficient proof of ownership. `authorize_acme_cert`
+    ///    relies on this: it writes an unauthorized claim row *before* calling the
+    ///    provisioner, precisely so a failed first attempt still leaves this check
+    ///    passable on retry instead of a permanently unreachable orphan.
     ///
     /// The check is always evaluated fresh from the database — never from a
     /// stale in-memory set — so a domain added or removed between reconcile
@@ -669,12 +675,7 @@ impl TraefikDiscoveryAdminService {
             })?;
 
         if let Some(domain) = domain_row {
-            // If the existing cert row already points to this domain, we own it.
-            let owned_by_us = existing_cert_row
-                .and_then(|cert| cert.certificate_id)
-                .map(|cert_id| cert_id == domain.id)
-                .unwrap_or(false);
-            if !owned_by_us {
+            if existing_cert_row.is_none() {
                 return Err(TraefikDiscoveryAdminError::HostOwned {
                     host: host.to_string(),
                     owner: format!("a domains row (id={}, status={})", domain.id, domain.status),
@@ -948,9 +949,39 @@ impl TraefikDiscoveryAdminService {
         // fresh from the DB, never from a stale reconcile-time set.
         self.check_host_ownership(&host, existing.as_ref()).await?;
 
-        // Step 5: delegate to provisioner BEFORE writing the authorization record
-        // so a provisioner failure doesn't leave a permanently-authorized row
-        // with no certificate behind it.
+        // Step 5: claim the host now, before calling the provisioner. This is
+        // what makes the ownership check above survivable on retry: if a
+        // brand-new host's ACME challenge request fails below, this claim row
+        // already exists, so a future `authorize_acme_cert` call for the same
+        // host passes `check_host_ownership` and can retry rather than being
+        // permanently rejected as owned by an indistinguishable orphaned
+        // `domains` row. A pre-existing row (a prior authorization, or one
+        // left `cert_authorized = false` by `deauthorize_cert`) is reused
+        // as-is; only a genuinely new host gets an INSERT here.
+        let claim = match existing {
+            Some(row) => row,
+            None => certs::ActiveModel {
+                host: Set(host.clone()),
+                cert_authorized: Set(false),
+                authorized_network: Set(network.clone()),
+                authorized_container_id: Set(route.target_container_id.clone()),
+                authorized_container_name: Set(route.target_container_name.clone()),
+                renewal_method: Set(request.challenge_type.clone()),
+                source: Set("acme".to_string()),
+                certificate_id: Set(None),
+                imported_at: Set(None),
+                ..Default::default()
+            }
+            .insert(self.db.as_ref())
+            .await
+            .map_err(|e| {
+                TraefikDiscoveryAdminError::database("claiming cert authorization record", e)
+            })?,
+        };
+
+        // Step 6: delegate to provisioner. A failure here just leaves the claim
+        // above at `cert_authorized = false` for the caller to retry — no
+        // rollback of the `domains` row it may have created is needed.
         self.provisioner
             .request_acme_cert(&host, &request.challenge_type)
             .await
@@ -970,48 +1001,35 @@ impl TraefikDiscoveryAdminService {
                 }
             })?;
 
-        // Step 6: persist or update the authorization record now that the
-        // provisioner has confirmed success.
+        // Step 7: the provisioner succeeded, so a `domains` row for this host
+        // definitely exists now — link the claim to it via `certificate_id`
+        // and mark it authorized.
         let now = chrono::Utc::now();
-        let cert_row = if let Some(existing) = existing {
-            let mut active = existing.into_active_model();
-            active.cert_authorized = Set(true);
-            active.authorized_at = Set(Some(now));
-            active.authorized_by_user_id = Set(Some(user_id));
-            active.authorized_network = Set(network.clone());
-            active.authorized_container_id = Set(route.target_container_id.clone());
-            active.authorized_container_name = Set(route.target_container_name.clone());
-            active.renewal_method = Set(request.challenge_type.clone());
-            active.source = Set("acme".to_string());
-            // Clear any existing drift state when re-authorizing.
-            active.container_drift_detected_at = Set(None);
-            active.last_drift_alarmed_container_id = Set(None);
-            active.update(self.db.as_ref()).await.map_err(|e| {
-                TraefikDiscoveryAdminError::database("updating cert authorization record", e)
-            })?
-        } else {
-            certs::ActiveModel {
-                host: Set(host.clone()),
-                cert_authorized: Set(true),
-                authorized_at: Set(Some(now)),
-                authorized_by_user_id: Set(Some(user_id)),
-                authorized_network: Set(network.clone()),
-                authorized_container_id: Set(route.target_container_id.clone()),
-                authorized_container_name: Set(route.target_container_name.clone()),
-                container_drift_detected_at: Set(None),
-                last_drift_alarmed_container_id: Set(None),
-                renewal_method: Set(request.challenge_type.clone()),
-                source: Set("acme".to_string()),
-                certificate_id: Set(None),
-                imported_at: Set(None),
-                ..Default::default()
-            }
-            .insert(self.db.as_ref())
+        let domain_id = domains::Entity::find()
+            .filter(domains::Column::Domain.eq(host.clone()))
+            .one(self.db.as_ref())
             .await
             .map_err(|e| {
-                TraefikDiscoveryAdminError::database("inserting cert authorization record", e)
+                TraefikDiscoveryAdminError::database("looking up domain to link authorization", e)
             })?
-        };
+            .map(|d| d.id);
+
+        let mut active = claim.into_active_model();
+        active.cert_authorized = Set(true);
+        active.authorized_at = Set(Some(now));
+        active.authorized_by_user_id = Set(Some(user_id));
+        active.authorized_network = Set(network.clone());
+        active.authorized_container_id = Set(route.target_container_id.clone());
+        active.authorized_container_name = Set(route.target_container_name.clone());
+        active.renewal_method = Set(request.challenge_type.clone());
+        active.source = Set("acme".to_string());
+        active.certificate_id = Set(domain_id);
+        // Clear any existing drift state when re-authorizing.
+        active.container_drift_detected_at = Set(None);
+        active.last_drift_alarmed_container_id = Set(None);
+        let cert_row = active.update(self.db.as_ref()).await.map_err(|e| {
+            TraefikDiscoveryAdminError::database("updating cert authorization record", e)
+        })?;
 
         Ok(cert_row)
     }
@@ -1869,8 +1887,11 @@ mod tests {
 
     #[tokio::test]
     async fn authorize_acme_cert_with_failing_provisioner_returns_upstream_error() {
-        // The host exists as an enabled route, but the provisioner fails.
-        // The service must propagate the error and NOT write an authorization row.
+        // The host exists as an enabled route, but the provisioner fails. The
+        // service must propagate the error; the claim row it wrote before
+        // calling the provisioner (Step 5) is deliberately left in place at
+        // `cert_authorized = false` rather than rolled back — see
+        // `check_host_ownership`'s doc comment.
         let db = MockDatabase::new(DatabaseBackend::Postgres)
             // discovered route lookup
             .append_query_results([vec![route_model("app.example.com", true)]])
@@ -1880,6 +1901,8 @@ mod tests {
             .append_query_results([vec![count_row(0)]])
             .append_query_results([vec![count_row(0)]])
             .append_query_results([Vec::<temps_entities::domains::Model>::new()])
+            // claim row insert (Step 5), before the provisioner is called
+            .append_query_results([vec![cert_model("app.example.com")]])
             .into_connection();
         let service = TraefikDiscoveryAdminService::new(
             Arc::new(db),
@@ -1899,6 +1922,139 @@ mod tests {
         assert!(
             matches!(&err, TraefikDiscoveryAdminError::Upstream { .. }),
             "expected Upstream error from failing provisioner, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_acme_cert_retry_is_not_blocked_by_ownership_check() {
+        // Two real scenarios collapse to the same DB state: (a) a first
+        // attempt whose ACME challenge request failed after a claim row and
+        // a `domains` row were already written, or (b) a host that was
+        // `deauthorize_cert`-ed earlier and is now being re-authorized. In
+        // both, `certs::Entity::find` returns an existing row with
+        // `cert_authorized = false`, and a `domains` row for the host already
+        // exists. Before this fix, `check_host_ownership` compared
+        // `certificate_id` (never populated on the ACME path) to the
+        // domain's id and always rejected this as owned by someone else,
+        // permanently blocking retry/re-authorization. It must now succeed.
+        let existing_claim = cert_model("app.example.com");
+        let now = Utc::now();
+        let domain_row = temps_entities::domains::Model {
+            id: 42,
+            domain: "app.example.com".to_string(),
+            certificate: None,
+            private_key: None,
+            expiration_time: None,
+            last_renewed: None,
+            status: "pending".to_string(),
+            dns_challenge_token: None,
+            dns_challenge_value: None,
+            http_challenge_token: None,
+            http_challenge_key_authorization: None,
+            last_error: None,
+            last_error_type: None,
+            is_wildcard: false,
+            verification_method: "http-01".to_string(),
+            on_demand_backoff_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // discovered route lookup
+            .append_query_results([vec![route_model("app.example.com", true)]])
+            // existing cert row lookup — the leftover unauthorized claim
+            .append_query_results([vec![existing_claim]])
+            // ownership checks (env_domains, project_custom_domains, domains)
+            .append_query_results([vec![count_row(0)]])
+            .append_query_results([vec![count_row(0)]])
+            .append_query_results([vec![domain_row.clone()]])
+            // Step 5 reuses the existing claim row — no insert.
+            // provisioner succeeds (noop_provisioner issues no DB calls).
+            // Step 7: domain lookup to link certificate_id
+            .append_query_results([vec![domain_row]])
+            // UPDATE returning the now-authorized row
+            .append_query_results([vec![{
+                let mut m = cert_model("app.example.com");
+                m.cert_authorized = true;
+                m.certificate_id = Some(42);
+                m
+            }]])
+            .into_connection();
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
+
+        let req = RequestDiscoveredRouteCertRequest {
+            challenge_type: "http-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+        };
+        let cert = service
+            .authorize_acme_cert("app.example.com", &req, 1)
+            .await
+            .expect("retrying/re-authorizing a host we already claimed must succeed");
+
+        assert!(cert.cert_authorized);
+        assert_eq!(
+            cert.certificate_id,
+            Some(42),
+            "a successful ACME authorization must link certificate_id to the domains row"
+        );
+    }
+
+    #[tokio::test]
+    async fn authorize_acme_cert_rejects_a_host_owned_by_a_foreign_domains_row() {
+        // Widening the ownership check to "any certs row proves ownership"
+        // must not also widen it to "any domains row is fine" — a `domains`
+        // row that exists for the host but was never claimed via a
+        // `traefik_route_certificates` row (e.g. the wildcard-setup flow or
+        // the generic custom-TLS-domain handler created it) is still owned
+        // by that other feature and must still be rejected, with no claim
+        // written and no provisioner call made.
+        let now = Utc::now();
+        let foreign_domain = temps_entities::domains::Model {
+            id: 7,
+            domain: "app.example.com".to_string(),
+            certificate: Some("pem".to_string()),
+            private_key: Some("key".to_string()),
+            expiration_time: None,
+            last_renewed: None,
+            status: "active".to_string(),
+            dns_challenge_token: None,
+            dns_challenge_value: None,
+            http_challenge_token: None,
+            http_challenge_key_authorization: None,
+            last_error: None,
+            last_error_type: None,
+            is_wildcard: false,
+            verification_method: "dns-01".to_string(),
+            on_demand_backoff_until: None,
+            created_at: now,
+            updated_at: now,
+        };
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            // discovered route lookup
+            .append_query_results([vec![route_model("app.example.com", true)]])
+            // existing cert row lookup — no traefik_route_certificates row
+            .append_query_results([Vec::<certs::Model>::new()])
+            // ownership checks (env_domains, project_custom_domains, domains)
+            .append_query_results([vec![count_row(0)]])
+            .append_query_results([vec![count_row(0)]])
+            .append_query_results([vec![foreign_domain]])
+            .into_connection();
+        let service =
+            TraefikDiscoveryAdminService::new(Arc::new(db), disabled_handle(), noop_provisioner());
+
+        let req = RequestDiscoveredRouteCertRequest {
+            challenge_type: "http-01".to_string(),
+            acknowledge_manual_dns_renewal: false,
+        };
+        let err = service
+            .authorize_acme_cert("app.example.com", &req, 1)
+            .await
+            .expect_err("a domains row with no matching certs claim must stay rejected");
+
+        assert!(
+            matches!(&err, TraefikDiscoveryAdminError::HostOwned { .. }),
+            "expected HostOwned, got {err:?}"
         );
     }
 

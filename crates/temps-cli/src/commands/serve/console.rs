@@ -2918,9 +2918,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     }
                 })?;
 
-                let created_domain_this_call = match existing {
+                match existing {
                     None => {
-                        // No row yet — create one with the declared challenge type.
+                        // No row yet — create one with the declared challenge
+                        // type. If the ACME challenge request below fails, this
+                        // row is deliberately left in place rather than rolled
+                        // back: `TraefikDiscoveryAdminService::authorize_acme_cert`
+                        // already wrote a `traefik_route_certificates` claim for
+                        // this host before calling here, so a retry is never
+                        // blocked by the host-ownership check, and it reuses
+                        // this same pending row via the branch below.
                         self.domain_service
                             .create_domain(host, challenge_type)
                             .await
@@ -2928,11 +2935,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                                 host: host.to_string(),
                                 reason: e.to_string(),
                             })?;
-                        true
                     }
                     Some(cert) if cert.verification_method == challenge_type => {
                         // Row exists with a matching method — reuse it as-is.
-                        false
                     }
                     Some(cert) => {
                         // Row exists but the stored method differs — 409.
@@ -2944,45 +2949,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                     }
                 };
 
-                // Initiate the ACME challenge order. If we just created the
-                // domain row above and this fails, roll it back — otherwise the
-                // domain is left authorized-but-uncertificated with no matching
-                // `traefik_route_certificates` row (the caller only writes that
-                // after this call succeeds), and every retry is then rejected by
-                // the host-ownership check as "owned by a domains row" with no
-                // way to clear it short of manual intervention. A pre-existing
-                // domain row we merely reused is left untouched: it may already
-                // be serving a certificate that a failed re-challenge must not
-                // destroy.
-                if let Err(e) = self.domain_service.request_challenge(host, &email).await {
-                    if created_domain_this_call {
-                        // The row we're rolling back was inserted moments ago in
-                        // this same call, so the only realistic way `delete_domain`
-                        // fails here is a transient DB error (connection blip,
-                        // timeout) — not a real invariant violation. Retry a few
-                        // times before accepting the orphan, since a single
-                        // failed attempt would otherwise permanently block every
-                        // future retry at the host-ownership check.
-                        let cleanup_retry = temps_core::retry::RetryConfig::new(3)
-                            .with_base_delay(std::time::Duration::from_millis(200))
-                            .with_max_delay(std::time::Duration::from_secs(2));
-                        if let Err(cleanup_err) = cleanup_retry
-                            .retry(|| self.domain_service.delete_domain(host))
-                            .await
-                        {
-                            tracing::error!(
-                                "Failed to roll back domain {host} after a failed ACME challenge \
-                                 request ({e}) even after retrying; the domain row is now \
-                                 orphaned and must be removed manually before retrying: \
-                                 {cleanup_err}"
-                            );
-                        }
-                    }
-                    return Err(TlsProvisionerError::Failed {
+                self.domain_service
+                    .request_challenge(host, &email)
+                    .await
+                    .map_err(|e| TlsProvisionerError::Failed {
                         host: host.to_string(),
                         reason: e.to_string(),
-                    });
-                }
+                    })?;
 
                 Ok(())
             }
