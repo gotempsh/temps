@@ -16,8 +16,10 @@ use serde_yaml::Value as YamlValue;
 use serde_yaml::{Mapping, Value};
 use std::collections::{HashMap, HashSet};
 use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::sync::{Arc, LazyLock, Weak};
 use thiserror::Error;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tracing::{debug, info, warn};
@@ -37,6 +39,19 @@ const COMPOSE_READY_POLL_INTERVAL: std::time::Duration = std::time::Duration::fr
 /// single phase of the deployment that should complete within minutes, not
 /// hours, on any reasonable network.
 const COMPOSE_PULL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// Resolving the fully merged Compose model is local work and should complete
+/// quickly. Keep it bounded independently from image pulls so a wedged Compose
+/// plugin cannot stall a deployment after all images have already downloaded.
+const COMPOSE_CONFIG_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A merged Compose model expands anchors and interpolation, so its output can
+/// be much larger than the source. Bound both memory and subsequent Docker API
+/// fan-out before parsing tenant-controlled output.
+const MAX_RESOLVED_COMPOSE_CONFIG_BYTES: usize = 4 * 1024 * 1024;
+const MAX_RESOLVED_COMPOSE_SERVICES: usize = 256;
+const DOCKER_IMAGE_INSPECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const MAX_CONCURRENT_IMAGE_INSPECTIONS: usize = 8;
 
 /// How long a single TCP connect attempt against a published port may take
 /// before `port_reachable` gives up and reports the port not yet listening.
@@ -427,14 +442,34 @@ fn quote_service_list(services: &[&String]) -> String {
 /// a secret and an environment variable may share a name, and merging them
 /// into one map would silently drop one of the two values from redaction.
 fn collect_redactable_values(request: &ComposeDeployRequest) -> Vec<String> {
-    request
+    let mut values = request
         .environment_vars
         .values()
         .chain(request.build_args.values())
         .chain(request.secrets.values())
         .filter(|value| !value.is_empty())
         .cloned()
-        .collect()
+        .collect::<Vec<_>>();
+    if let Some(env_content) = request.env_content.as_deref() {
+        values.extend(env_content.lines().filter_map(|line| {
+            let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
+            if line.is_empty() || line.starts_with('#') {
+                return None;
+            }
+            let (_, value) = line.split_once('=')?;
+            let value = value.trim();
+            let value = if value.len() >= 2
+                && ((value.starts_with('"') && value.ends_with('"'))
+                    || (value.starts_with('\'') && value.ends_with('\'')))
+            {
+                &value[1..value.len() - 1]
+            } else {
+                value
+            };
+            (!value.is_empty()).then(|| value.to_string())
+        }));
+    }
+    values
 }
 
 fn sanitize_compose_diagnostic(diagnostic: &str, redact_values: &[String]) -> String {
@@ -1285,6 +1320,26 @@ impl ComposeExecutor {
         self.compose_pull(&effective_dir, &project_name, &compose_file, &redact_values)
             .await?;
 
+        // Docker's injected init process is useful for ordinary application
+        // images, but it must not sit in front of an init system already owned
+        // by the image. Some init systems (notably s6-overlay) require PID 1;
+        // others (Tini/dumb-init) lose their reaping role when wrapped. Inspect
+        // the images we just built/pulled instead of coupling this behavior to
+        // registry names or catalog templates, then rewrite only the generated
+        // security override. Explicit `init: false` remains supported as a
+        // user-controlled fallback when an image hides its init behind a shell
+        // entrypoint that metadata cannot identify safely.
+        let image_owned_init_services = self
+            .detect_image_owned_init_services(
+                &effective_dir,
+                &project_name,
+                &compose_file,
+                &redact_values,
+            )
+            .await?;
+        self.write_security_override(&effective_dir, request, &image_owned_init_services)
+            .await?;
+
         Ok(PreparedComposeDeploy {
             effective_dir,
             project_name,
@@ -1881,33 +1936,11 @@ impl ComposeExecutor {
                 })?;
         }
 
-        // Write Temps security override for every service that has not
-        // explicitly opted out of the runtime sandbox.
-        let security_content = self.generate_security_override(
-            &request.compose_content,
-            &request.relaxed_capability_services,
-            &request.unsandboxed_services,
-        );
-        let security_override_path = Self::confined_write_path(
-            project_dir,
-            Path::new("docker-compose.temps-security.yml"),
-            "docker-compose.temps-security.yml",
-        )?;
-        if !security_content.is_empty() {
-            tokio::fs::write(&security_override_path, &security_content)
-                .await
-                .map_err(|e| ComposeError::FileWriteFailed {
-                    path: security_override_path.display().to_string(),
-                    reason: e.to_string(),
-                })?;
-        } else if let Err(error) = tokio::fs::remove_file(&security_override_path).await {
-            if error.kind() != std::io::ErrorKind::NotFound {
-                return Err(ComposeError::FileWriteFailed {
-                    path: security_override_path.display().to_string(),
-                    reason: format!("failed to remove stale security override: {error}"),
-                });
-            }
-        }
+        // Write Temps' runtime policy/compatibility override. Sandboxing applies
+        // only to opted-in services; safe health/PID-1 corrections also apply
+        // to unsandboxed services without adding any isolation controls.
+        self.write_security_override(project_dir, request, &HashSet::new())
+            .await?;
 
         // Materialize project secrets and mount them at /run/secrets in every
         // service. Values never enter the compose documents, the env files or
@@ -2020,6 +2053,46 @@ impl ComposeExecutor {
             "Wrote compose files"
         );
 
+        Ok(())
+    }
+
+    async fn write_security_override(
+        &self,
+        project_dir: &Path,
+        request: &ComposeDeployRequest,
+        detected_image_owned_init_services: &HashSet<String>,
+    ) -> Result<(), ComposeError> {
+        let healthcheck_loopback_overrides = Self::healthcheck_loopback_overrides(
+            &request.compose_content,
+            request.compose_override.as_deref(),
+        );
+        let security_content = self.generate_security_override_with_image_init(
+            &request.compose_content,
+            &request.relaxed_capability_services,
+            &request.unsandboxed_services,
+            detected_image_owned_init_services,
+            &healthcheck_loopback_overrides,
+        );
+        let security_override_path = Self::confined_write_path(
+            project_dir,
+            Path::new("docker-compose.temps-security.yml"),
+            "docker-compose.temps-security.yml",
+        )?;
+        if !security_content.is_empty() {
+            tokio::fs::write(&security_override_path, &security_content)
+                .await
+                .map_err(|error| ComposeError::FileWriteFailed {
+                    path: security_override_path.display().to_string(),
+                    reason: error.to_string(),
+                })?;
+        } else if let Err(error) = tokio::fs::remove_file(&security_override_path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                return Err(ComposeError::FileWriteFailed {
+                    path: security_override_path.display().to_string(),
+                    reason: format!("failed to remove stale security override: {error}"),
+                });
+            }
+        }
         Ok(())
     }
 
@@ -3941,6 +4014,227 @@ impl ComposeExecutor {
         }
     }
 
+    async fn detect_image_owned_init_services(
+        &self,
+        project_dir: &Path,
+        project_name: &str,
+        compose_file: &str,
+        redact_values: &[String],
+    ) -> Result<HashSet<String>, ComposeError> {
+        let mut cmd = isolated_docker_command();
+        cmd.args(["compose", "-p", project_name]);
+        Self::append_compose_file_args(&mut cmd, project_dir, compose_file);
+        Self::append_compose_env_file_args(&mut cmd, project_dir);
+        cmd.arg("config")
+            .current_dir(project_dir)
+            .env("PWD", project_dir.to_string_lossy().to_string());
+        cmd.kill_on_drop(true)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = cmd.spawn().map_err(ComposeError::Io)?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: "docker compose config stdout was unavailable".to_string(),
+            })?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: "docker compose config stderr was unavailable".to_string(),
+            })?;
+        let stdout_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stdout
+                .take((MAX_RESOLVED_COMPOSE_CONFIG_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map(|_| bytes)
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut bytes = Vec::new();
+            stderr
+                .take((MAX_COMPOSE_DIAGNOSTIC_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .await
+                .map(|_| bytes)
+        });
+        let collect_output = async {
+            let status = child.wait().await?;
+            let stdout = stdout_task.await.map_err(|error| {
+                std::io::Error::other(format!("stdout reader failed: {error}"))
+            })??;
+            let stderr = stderr_task.await.map_err(|error| {
+                std::io::Error::other(format!("stderr reader failed: {error}"))
+            })??;
+            Ok::<_, std::io::Error>((status, stdout, stderr))
+        };
+        let (status, stdout, stderr) = tokio::time::timeout(COMPOSE_CONFIG_TIMEOUT, collect_output)
+            .await
+            .map_err(|_| ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "docker compose config timed out after {} seconds while resolving image entrypoints",
+                    COMPOSE_CONFIG_TIMEOUT.as_secs()
+                ),
+            })??;
+        if stdout.len() > MAX_RESOLVED_COMPOSE_CONFIG_BYTES {
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "resolved Compose config exceeds the {} MiB safety limit",
+                    MAX_RESOLVED_COMPOSE_CONFIG_BYTES / 1024 / 1024
+                ),
+            });
+        }
+        if !status.success() {
+            let stderr =
+                sanitize_compose_diagnostic(&String::from_utf8_lossy(&stderr), redact_values);
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "docker compose config failed while resolving image entrypoints: {stderr}"
+                ),
+            });
+        }
+
+        let resolved: YamlValue =
+            serde_yaml::from_slice(&stdout).map_err(|error| ComposeError::InvalidComposeYaml {
+                compose_source: format!("resolved Compose config for project '{project_name}'"),
+                reason: error.to_string(),
+            })?;
+        let services = resolved
+            .get("services")
+            .and_then(YamlValue::as_mapping)
+            .ok_or_else(|| ComposeError::InvalidComposeYaml {
+                compose_source: format!("resolved Compose config for project '{project_name}'"),
+                reason: "missing top-level services mapping".to_string(),
+            })?;
+        if services.len() > MAX_RESOLVED_COMPOSE_SERVICES {
+            return Err(ComposeError::CommandFailed {
+                project: project_name.to_string(),
+                reason: format!(
+                    "resolved Compose config declares {} services; the safety limit is {}",
+                    services.len(),
+                    MAX_RESOLVED_COMPOSE_SERVICES
+                ),
+            });
+        }
+
+        let mut services_by_image = HashMap::<String, Vec<String>>::new();
+        for (name, definition) in services {
+            let (Some(service), Some(image)) = (
+                name.as_str(),
+                definition.get("image").and_then(YamlValue::as_str),
+            ) else {
+                continue;
+            };
+            services_by_image
+                .entry(image.to_string())
+                .or_default()
+                .push(service.to_string());
+        }
+        let docker = self.docker.clone();
+        let inspections = futures::stream::iter(services_by_image)
+            .map(|(image, services)| {
+                let docker = docker.clone();
+                async move {
+                    let inspection = tokio::time::timeout(
+                        DOCKER_IMAGE_INSPECT_TIMEOUT,
+                        docker.inspect_image(&image),
+                    )
+                    .await;
+                    (services, inspection)
+                }
+            })
+            .buffer_unordered(MAX_CONCURRENT_IMAGE_INSPECTIONS)
+            .collect::<Vec<_>>()
+            .await;
+        let mut detected = HashSet::new();
+        for (services, inspection) in inspections {
+            match inspection {
+                Ok(inspect) => match inspect {
+                    Ok(inspect) => {
+                        let entrypoint = inspect
+                            .config
+                            .and_then(|config| config.entrypoint)
+                            .unwrap_or_default();
+                        if Self::entrypoint_owns_pid_one(&entrypoint) {
+                            for service in services {
+                                info!(
+                                    project = %project_name,
+                                    service = %service,
+                                    "Detected image-owned init process; preserving it as PID 1"
+                                );
+                                detected.insert(service);
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        let error = sanitize_compose_diagnostic(&error.to_string(), redact_values);
+                        for service in services {
+                            warn!(
+                                project = %project_name,
+                                service = %service,
+                                error = %error,
+                                "Could not inspect image entrypoint; keeping Docker's init wrapper"
+                            );
+                        }
+                    }
+                },
+                Err(_) => {
+                    for service in services {
+                        warn!(
+                            project = %project_name,
+                            service = %service,
+                            timeout_secs = DOCKER_IMAGE_INSPECT_TIMEOUT.as_secs(),
+                            "Image entrypoint inspection timed out; keeping Docker's init wrapper"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(detected)
+    }
+
+    /// True only for entrypoints that are themselves well-known process
+    /// supervisors. Do not inspect arbitrary command arguments or image names:
+    /// a shell script may or may not eventually exec an init process, and
+    /// guessing there would silently remove zombie reaping from ordinary apps.
+    fn entrypoint_owns_pid_one(entrypoint: &[String]) -> bool {
+        let Some(executable) = entrypoint.first().map(|value| value.trim()) else {
+            return false;
+        };
+        let normalized = executable.to_ascii_lowercase();
+        if matches!(
+            normalized.as_str(),
+            "/init" | "/sbin/init" | "/usr/sbin/init"
+        ) {
+            return true;
+        }
+        Path::new(&normalized)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "tini"
+                        | "tini-static"
+                        | "dumb-init"
+                        | "docker-init"
+                        | "catatonit"
+                        | "s6-svscan"
+                        | "s6-overlay-suexec"
+                        | "runsvdir"
+                        | "runsvdir-start"
+                        | "my_init"
+                )
+            })
+    }
+
     /// Idempotently create the shared Docker network every Temps-managed
     /// external service and single-container app deployment joins
     /// (`temps_core::NETWORK_NAME`). Mirrors
@@ -5007,59 +5301,95 @@ impl ComposeExecutor {
         Ok(())
     }
 
-    /// Generate a docker-compose override that applies the same baseline sandboxing
-    /// used by the single-container Docker runtime.
+    /// Generate a docker-compose override that applies the same baseline
+    /// sandboxing used by the single-container Docker runtime plus narrowly
+    /// scoped health/PID-1 compatibility corrections.
+    #[cfg(test)]
     fn generate_security_override(
         &self,
         compose_content: &str,
         relaxed_capability_services: &[String],
         unsandboxed_services: &[String],
     ) -> String {
+        self.generate_security_override_with_image_init(
+            compose_content,
+            relaxed_capability_services,
+            unsandboxed_services,
+            &HashSet::new(),
+            &Self::healthcheck_loopback_overrides(compose_content, None),
+        )
+    }
+
+    fn generate_security_override_with_image_init(
+        &self,
+        compose_content: &str,
+        relaxed_capability_services: &[String],
+        unsandboxed_services: &[String],
+        detected_image_owned_init_services: &HashSet<String>,
+        healthcheck_loopback_overrides: &HashMap<String, String>,
+    ) -> String {
         // Enumerate service names from the parsed YAML mapping so inline
         // mappings (`web: {image: nginx}`), anchors (`web: &app`), and merge
         // keys are all hardened, not just lines that end in `:`.
         let services = self.parse_service_names_yaml(compose_content);
-        let image_owned_init_services = Self::services_with_image_owned_init(compose_content);
+        let explicitly_disabled_init_services =
+            Self::services_with_image_owned_init(compose_content);
 
-        let sandboxed_services = services
+        let affected_services = services
             .iter()
-            .filter(|service| !unsandboxed_services.contains(service))
+            .filter(|service| {
+                !unsandboxed_services.contains(service)
+                    || detected_image_owned_init_services.contains(service.as_str())
+                    || healthcheck_loopback_overrides.contains_key(service.as_str())
+            })
             .collect::<Vec<_>>();
 
-        if sandboxed_services.is_empty() {
+        if affected_services.is_empty() {
             return String::new();
         }
 
         let mut override_yaml = String::from("services:\n");
-        for service in sandboxed_services {
+        for service in affected_services {
             override_yaml.push_str(&format!("  {}:\n", service));
+            let sandboxed = !unsandboxed_services.contains(service);
             // Applied last in the `-f` order, so `privileged: false` here wins
             // over anything that smuggled `privileged: true` past validation
             // (e.g. via runtime interpolation) as a last line of defense.
-            override_yaml.push_str("    privileged: false\n");
-            override_yaml.push_str("    cap_drop:\n");
-            override_yaml.push_str("      - ALL\n");
-            if relaxed_capability_services.iter().any(|s| s == service) {
-                override_yaml.push_str("    cap_add:\n");
-                for cap in Self::RELAXED_CAPABILITIES {
-                    override_yaml.push_str(&format!("      - {}\n", cap));
+            if sandboxed {
+                override_yaml.push_str("    privileged: false\n");
+                override_yaml.push_str("    cap_drop:\n");
+                override_yaml.push_str("      - ALL\n");
+                if relaxed_capability_services.iter().any(|s| s == service) {
+                    override_yaml.push_str("    cap_add:\n");
+                    for cap in Self::RELAXED_CAPABILITIES {
+                        override_yaml.push_str(&format!("      - {}\n", cap));
+                    }
                 }
+                override_yaml.push_str("    security_opt:\n");
+                // Prevents exec-based privilege re-escalation (SUID binaries,
+                // capability gains on exec) after the entrypoint drops to the
+                // service user. Does NOT suppress a relaxed service's entrypoint
+                // from using capabilities it was already granted above (e.g.
+                // `gosu` calling `setuid()` directly) — that's the intended
+                // behavior, not a gap.
+                override_yaml.push_str("      - no-new-privileges:true\n");
+                override_yaml.push_str("    pids_limit: 512\n");
             }
-            override_yaml.push_str("    security_opt:\n");
-            // Prevents exec-based privilege re-escalation (SUID binaries,
-            // capability gains on exec) after the entrypoint drops to the
-            // service user. Does NOT suppress a relaxed service's entrypoint
-            // from using capabilities it was already granted above (e.g.
-            // `gosu` calling `setuid()` directly) — that's the intended
-            // behavior, not a gap.
-            override_yaml.push_str("      - no-new-privileges:true\n");
-            override_yaml.push_str("    pids_limit: 512\n");
             // An explicit `init: false` is a compatibility contract: the
             // image owns PID 1 (commonly s6-overlay) and Docker's init wrapper
             // would make that entrypoint fail. Keep every other sandbox guard
             // instead of forcing the user to disable the entire sandbox.
-            if !image_owned_init_services.contains(service.as_str()) {
+            if detected_image_owned_init_services.contains(service.as_str()) {
+                // This must be explicit rather than merely omitting `init`:
+                // the user's base/override may contain `init: true`, and this
+                // trusted final override has to win that scalar merge.
+                override_yaml.push_str("    init: false\n");
+            } else if sandboxed && !explicitly_disabled_init_services.contains(service.as_str()) {
                 override_yaml.push_str("    init: true\n");
+            }
+            if let Some(test) = healthcheck_loopback_overrides.get(service.as_str()) {
+                override_yaml.push_str("    healthcheck:\n");
+                override_yaml.push_str(&format!("      test: {test}\n"));
             }
         }
 
@@ -5088,6 +5418,115 @@ impl ComposeExecutor {
                     .flatten()
             })
             .collect()
+    }
+
+    /// Return only healthcheck tests that need an IPv4 loopback override.
+    /// Read the raw Compose documents rather than `docker compose config`
+    /// output so interpolation expressions remain expressions: a health probe
+    /// containing `${TOKEN}` must never cause its resolved secret to be copied
+    /// into a generated Compose file.
+    fn healthcheck_loopback_overrides(
+        compose_content: &str,
+        compose_override: Option<&str>,
+    ) -> HashMap<String, String> {
+        let mut overrides = HashMap::new();
+        for document in [Some(compose_content), compose_override]
+            .into_iter()
+            .flatten()
+        {
+            let Ok(mut root) = serde_yaml::from_str::<YamlValue>(document) else {
+                continue;
+            };
+            if root.apply_merge().is_err() {
+                continue;
+            }
+            let Some(services) = root.get("services").and_then(YamlValue::as_mapping) else {
+                continue;
+            };
+            for (name, definition) in services {
+                let Some(service_name) = name.as_str() else {
+                    continue;
+                };
+                let Some(healthcheck) = definition.get("healthcheck") else {
+                    continue;
+                };
+                let Some(healthcheck) = healthcheck.as_mapping() else {
+                    overrides.remove(service_name);
+                    continue;
+                };
+                if healthcheck.get("disable").and_then(YamlValue::as_bool) == Some(true) {
+                    overrides.remove(service_name);
+                    continue;
+                }
+                let Some(mut test) = healthcheck.get("test").cloned() else {
+                    continue;
+                };
+                if Self::rewrite_healthcheck_http_localhost(&mut test) {
+                    if let Ok(rendered) = serde_json::to_string(&test) {
+                        overrides.insert(service_name.to_string(), rendered);
+                    }
+                } else {
+                    // A later Compose override can replace a base probe with a
+                    // probe that no longer needs normalization.
+                    overrides.remove(service_name);
+                }
+            }
+        }
+        overrides
+    }
+
+    fn rewrite_healthcheck_http_localhost(value: &mut YamlValue) -> bool {
+        match value {
+            YamlValue::String(text) => {
+                let normalized = Self::replace_http_localhost(text);
+                if normalized == *text {
+                    false
+                } else {
+                    *text = normalized;
+                    true
+                }
+            }
+            YamlValue::Sequence(values) => {
+                let mut changed = false;
+                for value in values {
+                    changed |= Self::rewrite_healthcheck_http_localhost(value);
+                }
+                changed
+            }
+            YamlValue::Mapping(values) => {
+                let mut changed = false;
+                for value in values.values_mut() {
+                    changed |= Self::rewrite_healthcheck_http_localhost(value);
+                }
+                changed
+            }
+            YamlValue::Tagged(value) => Self::rewrite_healthcheck_http_localhost(&mut value.value),
+            _ => false,
+        }
+    }
+
+    fn replace_http_localhost(input: &str) -> String {
+        const NEEDLE: &str = "http://localhost";
+        const REPLACEMENT: &str = "http://127.0.0.1";
+
+        let mut remainder = input;
+        let mut output = String::with_capacity(input.len());
+        while let Some(index) = remainder.to_ascii_lowercase().find(NEEDLE) {
+            output.push_str(&remainder[..index]);
+            let after = &remainder[index + NEEDLE.len()..];
+            if after
+                .chars()
+                .next()
+                .is_none_or(|character| matches!(character, ':' | '/' | '?' | '#'))
+            {
+                output.push_str(REPLACEMENT);
+            } else {
+                output.push_str(&remainder[index..index + NEEDLE.len()]);
+            }
+            remainder = after;
+        }
+        output.push_str(remainder);
+        output
     }
 
     /// Generate a docker-compose override that adds Temps labels to every service.
@@ -6614,6 +7053,64 @@ services:
     }
 
     #[test]
+    fn test_healthcheck_loopback_override_is_generic_and_secret_safe() {
+        let compose = r#"
+services:
+  web:
+    image: example/web
+    healthcheck:
+      test: ["CMD-SHELL", "curl -H 'Authorization: Bearer ${TOKEN}' HTTP://LOCALHOST:8080/ready"]
+  lookalike:
+    image: example/lookalike
+    healthcheck:
+      test: ["CMD", "curl", "http://localhost.example/ready"]
+  disabled:
+    image: example/disabled
+    healthcheck:
+      test: ["CMD", "curl", "http://localhost:9000/ready"]
+"#;
+        let compose_override = r#"
+services:
+  disabled:
+    healthcheck:
+      disable: true
+"#;
+
+        let overrides =
+            ComposeExecutor::healthcheck_loopback_overrides(compose, Some(compose_override));
+        assert_eq!(overrides.len(), 1);
+        let web = overrides.get("web").expect("web probe normalized");
+        assert!(web.contains("http://127.0.0.1:8080/ready"));
+        assert!(
+            web.contains("${TOKEN}"),
+            "interpolation must remain unresolved"
+        );
+        assert!(!overrides.contains_key("lookalike"));
+        assert!(!overrides.contains_key("disabled"));
+
+        let executor = ComposeExecutor::new(
+            Arc::new(Docker::connect_with_defaults().expect("construct Docker client")),
+            PathBuf::from("/tmp/test"),
+        );
+        let override_yaml = executor.generate_security_override_with_image_init(
+            compose,
+            &[],
+            &["web".to_string()],
+            &HashSet::new(),
+            &overrides,
+        );
+        let parsed: YamlValue = serde_yaml::from_str(&override_yaml).unwrap();
+        assert_eq!(parsed["services"]["web"].get("privileged"), None);
+        let test = parsed["services"]["web"]["healthcheck"]["test"]
+            .as_sequence()
+            .expect("healthcheck test remains a Compose sequence");
+        assert_eq!(test[0].as_str(), Some("CMD-SHELL"));
+        assert!(test[1]
+            .as_str()
+            .is_some_and(|command| command.contains("http://127.0.0.1:8080/ready")));
+    }
+
+    #[test]
     fn test_unsandboxed_service_keeps_its_image_owned_init_process() {
         let Some(executor) = test_executor() else {
             return;
@@ -6661,6 +7158,139 @@ services:
         assert!(budge.contains_key("cap_drop"));
         assert!(budge.contains_key("cap_add"));
         assert_eq!(worker.get("init").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn test_detects_image_owned_init_entrypoints_without_image_name_rules() {
+        for entrypoint in [
+            vec!["/init"],
+            vec!["/usr/bin/tini", "--"],
+            vec!["/usr/local/bin/dumb-init", "--"],
+            vec!["/package/admin/s6/command/s6-svscan"],
+            vec!["/usr/libexec/s6-overlay/s6-overlay-suexec"],
+            vec!["/usr/bin/catatonit", "--"],
+            vec!["/usr/bin/runsvdir"],
+        ] {
+            let entrypoint = entrypoint
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert!(
+                ComposeExecutor::entrypoint_owns_pid_one(&entrypoint),
+                "expected {entrypoint:?} to own PID 1"
+            );
+        }
+
+        for entrypoint in [
+            vec!["/bin/sh", "-c", "exec /init"],
+            vec!["/app/initialize"],
+            vec!["/app/my-tini-wrapper"],
+            vec!["node", "server.js"],
+        ] {
+            let entrypoint = entrypoint
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            assert!(
+                !ComposeExecutor::entrypoint_owns_pid_one(&entrypoint),
+                "expected {entrypoint:?} to keep Docker init"
+            );
+        }
+        assert!(!ComposeExecutor::entrypoint_owns_pid_one(&[]));
+    }
+
+    #[test]
+    fn test_detected_image_init_omits_only_init_wrapper() {
+        let executor = ComposeExecutor::new(
+            Arc::new(Docker::connect_with_defaults().expect("construct Docker client")),
+            PathBuf::from("/tmp/test"),
+        );
+        let compose = r#"
+services:
+  image-init:
+    image: example.com/custom/runtime:latest
+  ordinary-app:
+    image: example.com/custom/app:latest
+"#;
+        let detected = HashSet::from(["image-init".to_string()]);
+
+        let override_yaml = executor.generate_security_override_with_image_init(
+            compose,
+            &[],
+            &[],
+            &detected,
+            &HashMap::new(),
+        );
+        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let image_init = override_value["services"]["image-init"]
+            .as_mapping()
+            .unwrap();
+        let ordinary_app = override_value["services"]["ordinary-app"]
+            .as_mapping()
+            .unwrap();
+
+        assert_eq!(image_init.get("init").and_then(Value::as_bool), Some(false));
+        assert_eq!(
+            image_init.get("pids_limit").and_then(Value::as_u64),
+            Some(512)
+        );
+        assert!(image_init.contains_key("cap_drop"));
+        assert!(image_init.contains_key("security_opt"));
+        assert_eq!(
+            ordinary_app.get("init").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolved_compose_detects_init_from_pulled_image_metadata() {
+        let Some(executor) = test_executor() else {
+            return;
+        };
+        let compose_available = tokio::process::Command::new("docker")
+            .args(["compose", "version"])
+            .output()
+            .await
+            .is_ok_and(|output| output.status.success());
+        for image in ["ghcr.io/advplyr/audiobookshelf:2.34.0", "alpine:latest"] {
+            if !compose_available || executor.docker.inspect_image(image).await.is_err() {
+                println!("Docker Compose or {image} is unavailable; skipping runtime test");
+                return;
+            }
+        }
+
+        let project_dir = tempfile::tempdir().unwrap();
+        let compose = r#"
+services:
+  custom-image-with-init:
+    image: ghcr.io/advplyr/audiobookshelf:2.34.0
+  ordinary-image:
+    image: alpine:latest
+"#;
+        tokio::fs::write(project_dir.path().join("docker-compose.yml"), compose)
+            .await
+            .unwrap();
+        tokio::fs::write(
+            project_dir.path().join("docker-compose.temps-security.yml"),
+            executor.generate_security_override(compose, &[], &[]),
+        )
+        .await
+        .unwrap();
+
+        let detected = executor
+            .detect_image_owned_init_services(
+                project_dir.path(),
+                "temps-image-init-metadata-test",
+                "docker-compose.yml",
+                &[],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            detected,
+            HashSet::from(["custom-image-with-init".to_string()])
+        );
     }
 
     #[test]
@@ -9444,7 +10074,9 @@ services:
         request
             .build_args
             .insert("BUILD_VALUE".to_string(), "known-build-secret".to_string());
+        request.env_content = Some("PRIVATE_IMAGE_TAG='known-dotenv-secret'\n".to_string());
         let diagnostic = "known-environment-secret known-build-secret known-mounted-secret \
+            known-dotenv-secret \
             password=literal-password Authorization: Bearer abc.def.ghi \
             https://user:literal-uri-password@example.test/path";
 
@@ -9455,6 +10087,7 @@ services:
             "known-environment-secret",
             "known-build-secret",
             "known-mounted-secret",
+            "known-dotenv-secret",
             "literal-password",
             "abc.def.ghi",
             "literal-uri-password",
@@ -9472,6 +10105,18 @@ services:
 
         assert!(sanitized.len() < diagnostic.len());
         assert!(sanitized.contains("diagnostic truncated"));
+    }
+
+    #[test]
+    fn image_inspection_errors_redact_secrets_interpolated_into_image_tags() {
+        let secret = "registry-token-that-must-not-leak";
+        let diagnostic =
+            format!("Docker responded with 404 for registry.example/app:{secret}: image not found");
+
+        let sanitized = sanitize_compose_diagnostic(&diagnostic, &[secret.to_string()]);
+
+        assert!(!sanitized.contains(secret));
+        assert!(sanitized.contains("registry.example/app:<redacted>"));
     }
 
     /// `teardown_at` with `remove_secrets: false` must preserve the on-disk

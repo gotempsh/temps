@@ -1006,7 +1006,7 @@ pub fn prepare_template(
     normalize_project_owned_names(&mut root, &mut transformations);
     externalize_literal_credentials(&mut root, &mut transformations);
     normalize_project_storage_bind_mounts(&mut root, &mut transformations);
-    preserve_image_owned_init_processes(&mut root, &mut transformations);
+    normalize_healthcheck_loopback_hosts(&mut root, &mut transformations);
     normalize_known_service_healthchecks(&mut root, &mut transformations);
     let mut compatibility_issues = compatibility_issues(&root);
     let requires_host_access = requires_host_access(&root);
@@ -1292,16 +1292,13 @@ fn normalized_image_repository(image: &str) -> String {
     .to_ascii_lowercase()
 }
 
-/// LinuxServer images use s6-overlay as their container init and require it to
-/// remain PID 1. Temps normally asks Docker Compose to inject a tiny init
-/// process for zombie reaping, but doing that in front of s6 makes the image
-/// exit immediately with `s6-overlay-suexec: fatal: can only run as pid 1`.
-///
-/// Persist the exception in the copied Compose source rather than coupling the
-/// deployment runtime to the Coolify catalog. The project remains editable,
-/// the setting survives redeploys, and users can apply the same `init: false`
-/// configuration to their own s6-based Compose services.
-fn preserve_image_owned_init_processes(
+/// Prefer an explicit IPv4 loopback address in HTTP container healthchecks.
+/// Several minimal images resolve `localhost` to `::1` first while their app
+/// listens only on IPv4. The service is then fully operational but Docker marks
+/// it unhealthy forever. Limit rewriting to healthcheck test values and require
+/// a URL authority boundary so lookalikes such as `localhost.example.com` are
+/// never changed.
+fn normalize_healthcheck_loopback_hosts(
     root: &mut YamlValue,
     transformations: &mut Vec<TemplateTransformation>,
 ) {
@@ -1310,35 +1307,77 @@ fn preserve_image_owned_init_processes(
     };
     for (name, definition) in services {
         let service_name = name.as_str().unwrap_or("service");
-        let Some(service) = definition.as_mapping_mut() else {
+        let Some(test) = definition
+            .as_mapping_mut()
+            .and_then(|service| service.get_mut("healthcheck"))
+            .and_then(YamlValue::as_mapping_mut)
+            .and_then(|healthcheck| healthcheck.get_mut("test"))
+        else {
             continue;
         };
-        let uses_image_owned_init = service
-            .get("image")
-            .and_then(YamlValue::as_str)
-            .map(normalized_image_repository)
-            .is_some_and(|repository| is_linuxserver_image(&repository));
-        if !uses_image_owned_init {
-            continue;
+        if rewrite_healthcheck_http_localhost(test) {
+            transformations.push(TemplateTransformation {
+                code: "normalize_healthcheck_loopback",
+                description: format!(
+                    "Changed service '{service_name}' HTTP health probe from localhost to the IPv4 loopback address"
+                ),
+            });
         }
-        service.insert(
-            YamlValue::String("init".to_string()),
-            YamlValue::Bool(false),
-        );
-        transformations.push(TemplateTransformation {
-            code: "preserve_image_init",
-            description: format!(
-                "Kept service '{service_name}' image-owned s6 init process as PID 1"
-            ),
-        });
     }
 }
 
-fn is_linuxserver_image(repository: &str) -> bool {
-    repository.starts_with("lscr.io/linuxserver/")
-        || repository.starts_with("ghcr.io/linuxserver/")
-        || repository.starts_with("docker.io/linuxserver/")
-        || repository.starts_with("linuxserver/")
+fn rewrite_healthcheck_http_localhost(value: &mut YamlValue) -> bool {
+    match value {
+        YamlValue::String(text) => {
+            let normalized = replace_http_localhost(text);
+            if normalized == *text {
+                false
+            } else {
+                *text = normalized;
+                true
+            }
+        }
+        YamlValue::Sequence(values) => {
+            let mut changed = false;
+            for value in values {
+                changed |= rewrite_healthcheck_http_localhost(value);
+            }
+            changed
+        }
+        YamlValue::Mapping(values) => {
+            let mut changed = false;
+            for value in values.values_mut() {
+                changed |= rewrite_healthcheck_http_localhost(value);
+            }
+            changed
+        }
+        YamlValue::Tagged(value) => rewrite_healthcheck_http_localhost(&mut value.value),
+        _ => false,
+    }
+}
+
+fn replace_http_localhost(input: &str) -> String {
+    const NEEDLE: &str = "http://localhost";
+    const REPLACEMENT: &str = "http://127.0.0.1";
+
+    let mut remainder = input;
+    let mut output = String::with_capacity(input.len());
+    while let Some(index) = remainder.to_ascii_lowercase().find(NEEDLE) {
+        output.push_str(&remainder[..index]);
+        let after = &remainder[index + NEEDLE.len()..];
+        if after
+            .chars()
+            .next()
+            .is_none_or(|character| matches!(character, ':' | '/' | '?' | '#'))
+        {
+            output.push_str(REPLACEMENT);
+        } else {
+            output.push_str(&remainder[index..index + NEEDLE.len()]);
+        }
+        remainder = after;
+    }
+    output.push_str(remainder);
+    output
 }
 
 /// Correct known upstream probes that only prove a bundled web server is up.
@@ -2749,50 +2788,78 @@ mod tests {
     }
 
     #[test]
-    fn linuxserver_templates_keep_s6_as_pid_one() {
+    fn http_localhost_healthchecks_use_ipv4_loopback_for_any_template() {
         let prepared = prepare_template(
-            "budge",
+            "audiobookshelf",
             &template(
                 r#"services:
-  budge:
-    image: lscr.io/linuxserver/budge:latest
-    init: true
+  audiobookshelf:
+    image: ghcr.io/advplyr/audiobookshelf:2.34.0
     environment:
-      - SERVICE_URL_BUDGE_80
+      - SERVICE_URL_AUDIOBOOKSHELF_80
+    healthcheck:
+      test:
+        - CMD
+        - wget
+        - --quiet
+        - http://localhost:80/ping
+      interval: 2s
+      timeout: 10s
+      retries: 15
     expose:
       - 80
 "#,
                 Some("80"),
             ),
         )
-        .expect("LinuxServer template should be normalized");
+        .expect("Audiobookshelf template should be normalized");
 
         let compose: YamlValue = serde_yaml::from_str(&prepared.compose).unwrap();
-        assert_eq!(compose["services"]["budge"]["init"].as_bool(), Some(false));
-        assert!(prepared.transformations.iter().any(|transformation| {
-            transformation.code == "preserve_image_init"
-                && transformation.description.contains("budge")
-        }));
+        let healthcheck = &compose["services"]["audiobookshelf"]["healthcheck"];
+        assert!(healthcheck
+            .as_mapping()
+            .and_then(|mapping| mapping.get("test"))
+            .and_then(YamlValue::as_sequence)
+            .is_some_and(|test| test
+                .iter()
+                .any(|value| { value.as_str() == Some("http://127.0.0.1:80/ping") })));
+        assert_eq!(
+            prepared.routes[0].health_check_path.as_deref(),
+            Some("/ping")
+        );
+        assert!(prepared
+            .transformations
+            .iter()
+            .any(|transformation| transformation.code == "normalize_healthcheck_loopback"));
         assert!(prepared.installable());
     }
 
     #[test]
-    fn recognizes_supported_linuxserver_image_repositories() {
-        for image in [
-            "lscr.io/linuxserver/budge:latest",
-            "ghcr.io/linuxserver/budge:latest",
-            "docker.io/linuxserver/budge:latest",
-            "linuxserver/budge:latest",
-        ] {
-            assert!(is_linuxserver_image(&normalized_image_repository(image)));
-        }
-        for image in [
-            "example.com/linuxserver/budge:latest",
-            "lscr.io/not-linuxserver/budge:latest",
-            "linuxserver.example/budge:latest",
-        ] {
-            assert!(!is_linuxserver_image(&normalized_image_repository(image)));
-        }
+    fn healthcheck_loopback_normalization_rejects_hostname_lookalikes() {
+        assert_eq!(
+            replace_http_localhost("curl http://localhost:8080/health"),
+            "curl http://127.0.0.1:8080/health"
+        );
+        assert_eq!(
+            replace_http_localhost("wget http://localhost/health"),
+            "wget http://127.0.0.1/health"
+        );
+        assert_eq!(
+            replace_http_localhost("wget HTTP://LOCALHOST/health"),
+            "wget http://127.0.0.1/health"
+        );
+        assert_eq!(
+            replace_http_localhost("curl http://localhost.example/health"),
+            "curl http://localhost.example/health"
+        );
+        assert_eq!(
+            replace_http_localhost("curl HTTP://LOCALHOST.example/health"),
+            "curl HTTP://LOCALHOST.example/health"
+        );
+        assert_eq!(
+            replace_http_localhost("curl https://localhost/health"),
+            "curl https://localhost/health"
+        );
     }
 
     #[test]
