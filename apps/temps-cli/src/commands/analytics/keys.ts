@@ -4,12 +4,14 @@
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
+import { requireProjectSlug } from '../../config/resolve-project.js'
 import {
   listAnalyticsIngestKeys,
   createAnalyticsIngestKey,
   updateAnalyticsIngestKey,
   rotateAnalyticsIngestKey,
   revokeAnalyticsIngestKey,
+  getProjectBySlug,
 } from '../../api/sdk.gen.js'
 import type {
   AnalyticsIngestKey,
@@ -32,12 +34,12 @@ import {
 } from '../../ui/output.js'
 
 interface ListOptions {
-  projectId: string
+  project?: string
   json?: boolean
 }
 
 interface CreateOptions {
-  projectId: string
+  project?: string
   name?: string
   environmentId?: string
   allowedOrigins?: string[]
@@ -47,7 +49,7 @@ interface CreateOptions {
 }
 
 interface UpdateOptions {
-  projectId: string
+  project?: string
   keyId: string
   name?: string
   allowedOrigins?: string[]
@@ -58,7 +60,7 @@ interface UpdateOptions {
 }
 
 interface RotateOptions {
-  projectId: string
+  project?: string
   keyId: string
   force?: boolean
   yes?: boolean
@@ -66,10 +68,26 @@ interface RotateOptions {
 }
 
 interface RevokeOptions {
-  projectId: string
+  project?: string
   keyId: string
   force?: boolean
   yes?: boolean
+}
+
+/** Resolve project slug/ID flag → numeric project ID, per the CLI-wide `-p, --project` convention. */
+async function resolveProjectId(flagValue?: string): Promise<number> {
+  const resolved = await requireProjectSlug(flagValue)
+  if (resolved.source !== 'flag') {
+    info(`Using project ${colors.bold(resolved.slug)} (from ${resolved.source})`)
+  }
+  const { data, error } = await getProjectBySlug({
+    client,
+    path: { slug: resolved.slug },
+  })
+  if (error || !data) {
+    throw new Error(`Project "${resolved.slug}" not found`)
+  }
+  return data.id
 }
 
 export function registerAnalyticsKeysCommands(analytics: Command): void {
@@ -83,7 +101,7 @@ export function registerAnalyticsKeysCommands(analytics: Command): void {
     .command('list')
     .alias('ls')
     .description('List analytics ingest keys for a project')
-    .requiredOption('--project-id <id>', 'Project ID')
+    .option('-p, --project <project>', 'Project slug or ID')
     .option('--json', 'Output in JSON format')
     .action(listIngestKeysAction)
 
@@ -91,7 +109,7 @@ export function registerAnalyticsKeysCommands(analytics: Command): void {
     .command('create')
     .alias('add')
     .description('Mint a new analytics ingest key')
-    .requiredOption('--project-id <id>', 'Project ID')
+    .option('-p, --project <project>', 'Project slug or ID')
     .option('-n, --name <name>', 'Operator-facing label for the key')
     .option(
       '--environment-id <id>',
@@ -112,7 +130,7 @@ export function registerAnalyticsKeysCommands(analytics: Command): void {
   keys
     .command('update')
     .description("Update an ingest key's label, origin allowlist, or rate limit")
-    .requiredOption('--project-id <id>', 'Project ID')
+    .option('-p, --project <project>', 'Project slug or ID')
     .requiredOption('--key-id <id>', 'Analytics ingest key ID')
     .option('-n, --name <name>', 'New operator-facing label')
     .option(
@@ -128,7 +146,7 @@ export function registerAnalyticsKeysCommands(analytics: Command): void {
   keys
     .command('rotate')
     .description('Replace an ingest key value, keeping the same row and scope')
-    .requiredOption('--project-id <id>', 'Project ID')
+    .option('-p, --project <project>', 'Project slug or ID')
     .requiredOption('--key-id <id>', 'Analytics ingest key ID')
     .option('-f, --force', 'Skip confirmation')
     .option('-y, --yes', 'Skip confirmation (alias for --force)')
@@ -138,7 +156,7 @@ export function registerAnalyticsKeysCommands(analytics: Command): void {
   keys
     .command('revoke')
     .description('Revoke (deactivate) an analytics ingest key')
-    .requiredOption('--project-id <id>', 'Project ID')
+    .option('-p, --project <project>', 'Project slug or ID')
     .requiredOption('--key-id <id>', 'Analytics ingest key ID')
     .option('-f, --force', 'Skip confirmation')
     .option('-y, --yes', 'Skip confirmation (alias for --force)')
@@ -153,13 +171,13 @@ it is designed to ship in client-side JavaScript, so it is always shown in full
 and there is no "reveal" step.
 
 Examples:
-  $ temps analytics keys list --project-id 7
-  $ temps analytics keys create --project-id 7 --name "marketing site" -y
-  $ temps analytics keys create --project-id 7 --environment-id 12 --allowed-origins https://example.com https://www.example.com
-  $ temps analytics keys update --project-id 7 --key-id 3 --rate-limit 1200
-  $ temps analytics keys update --project-id 7 --key-id 3 --clear-origins
-  $ temps analytics keys rotate --project-id 7 --key-id 3 --force
-  $ temps analytics keys revoke --project-id 7 --key-id 3 --force`,
+  $ temps analytics keys list -p my-site
+  $ temps analytics keys create -p my-site --name "marketing site" -y
+  $ temps analytics keys create -p my-site --environment-id 12 --allowed-origins https://example.com https://www.example.com
+  $ temps analytics keys update -p my-site --key-id 3 --rate-limit 1200
+  $ temps analytics keys update -p my-site --key-id 3 --clear-origins
+  $ temps analytics keys rotate -p my-site --key-id 3 --force
+  $ temps analytics keys revoke -p my-site --key-id 3 --force`,
   )
 }
 
@@ -167,11 +185,7 @@ async function listIngestKeysAction(options: ListOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectId = parseInt(options.projectId, 10)
-  if (isNaN(projectId)) {
-    warning('Invalid project ID')
-    return
-  }
+  const projectId = await resolveProjectId(options.project)
 
   const keys = await withSpinner('Fetching analytics ingest keys...', async () => {
     const { data, error } = await listAnalyticsIngestKeys({
@@ -197,9 +211,7 @@ async function listIngestKeysAction(options: ListOptions): Promise<void> {
     info(
       'You only need one when Temps does not deploy the app sending the events.',
     )
-    info(
-      `Run: temps analytics keys create --project-id ${options.projectId} --name my-site -y`,
-    )
+    info(`Run: temps analytics keys create -p ${projectId} --name my-site -y`)
     newline()
     return
   }
@@ -235,11 +247,7 @@ async function createIngestKeyAction(options: CreateOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectId = parseInt(options.projectId, 10)
-  if (isNaN(projectId)) {
-    warning('Invalid project ID')
-    return
-  }
+  const projectId = await resolveProjectId(options.project)
 
   let environmentId: number | undefined
   if (options.environmentId !== undefined) {
@@ -315,11 +323,7 @@ async function updateIngestKeyAction(options: UpdateOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectId = parseInt(options.projectId, 10)
-  if (isNaN(projectId)) {
-    warning('Invalid project ID')
-    return
-  }
+  const projectId = await resolveProjectId(options.project)
 
   const keyId = parseInt(options.keyId, 10)
   if (isNaN(keyId)) {
@@ -362,11 +366,7 @@ async function rotateIngestKeyAction(options: RotateOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectId = parseInt(options.projectId, 10)
-  if (isNaN(projectId)) {
-    warning('Invalid project ID')
-    return
-  }
+  const projectId = await resolveProjectId(options.project)
 
   const keyId = parseInt(options.keyId, 10)
   if (isNaN(keyId)) {
@@ -418,11 +418,7 @@ async function revokeIngestKeyAction(options: RevokeOptions): Promise<void> {
   await requireAuth()
   await setupClient()
 
-  const projectId = parseInt(options.projectId, 10)
-  if (isNaN(projectId)) {
-    warning('Invalid project ID')
-    return
-  }
+  const projectId = await resolveProjectId(options.project)
 
   const keyId = parseInt(options.keyId, 10)
   if (isNaN(keyId)) {

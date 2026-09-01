@@ -236,28 +236,37 @@ pub async fn resolve_keyed_ingest_scope(
     key: &str,
     origin: Option<&str>,
 ) -> Result<ResolvedIngestScope, Problem> {
-    // 2a. Resolve, or 401. A storage failure is a 500, never a 401.
-    let scope = key_service
-        .resolve(key)
-        .await
-        .map_err(|e| {
-            error!("Failed to resolve an analytics ingest key: {}", e);
-            ingest_key_lookup_failed_problem()
-        })?
-        .ok_or_else(invalid_ingest_key_problem)?;
-
-    // 2b. Origin allowlist, when the key carries one.
-    if !is_origin_allowed(scope.allowed_origins.as_deref(), origin) {
-        warn!(
-            key_id = scope.key_id,
-            project_id = scope.project_id,
-            "Rejecting analytics ingest: Origin not in the key's allowed_origins"
-        );
-        return Err(origin_not_allowed_problem(origin));
+    // 2a-pre. A global, IP-independent backstop against a flood of distinct
+    // valid-shaped garbage keys: `resolve()`'s cache only helps on an exact
+    // repeated string, so without this, every unique bad key costs a DB
+    // query with no limit at all (see `unresolved_budget_exhausted`'s doc).
+    if rate_limiter.unresolved_budget_exhausted().await {
+        warn!("Rejecting analytics ingest: global unresolved-key rate limit exceeded");
+        return Err(ingest_rate_limited_problem(Some(
+            super::rate_limiter::UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE,
+        )));
     }
 
-    // 2c. Rate limit, keyed by the row id so cardinality stays bounded by the
-    // number of minted keys.
+    // 2a. Resolve, or 401. A storage failure is a 500, never a 401.
+    let scope = key_service.resolve(key).await.map_err(|e| {
+        error!("Failed to resolve an analytics ingest key: {}", e);
+        ingest_key_lookup_failed_problem()
+    })?;
+    let scope = match scope {
+        Some(scope) => scope,
+        None => {
+            rate_limiter.record_unresolved_attempt().await;
+            return Err(invalid_ingest_key_problem());
+        }
+    };
+
+    // 2b. Rate limit, keyed by the row id so cardinality stays bounded by the
+    // number of minted keys. Checked *before* the origin allowlist on
+    // purpose: the key value is not a secret (it ships in client-side JS by
+    // design), so anyone can read it off the target site and hammer the
+    // origin check from a disallowed origin. Origin-mismatched requests must
+    // still burn the key's budget, or that check becomes an unthrottled loop
+    // an attacker can spin forever without ever tripping the rate limiter.
     if !rate_limiter
         .check(scope.key_id, scope.rate_limit_per_minute)
         .await
@@ -269,6 +278,16 @@ pub async fn resolve_keyed_ingest_scope(
             "Rejecting analytics ingest: key over its per-minute rate limit"
         );
         return Err(ingest_rate_limited_problem(scope.rate_limit_per_minute));
+    }
+
+    // 2c. Origin allowlist, when the key carries one.
+    if !is_origin_allowed(scope.allowed_origins.as_deref(), origin) {
+        warn!(
+            key_id = scope.key_id,
+            project_id = scope.project_id,
+            "Rejecting analytics ingest: Origin not in the key's allowed_origins"
+        );
+        return Err(origin_not_allowed_problem(origin));
     }
 
     // 2d. Account for the request. `record_usage` is internally throttled to at

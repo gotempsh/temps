@@ -23,6 +23,22 @@ use tokio::sync::Mutex;
 
 const WINDOW: Duration = Duration::from_secs(60);
 
+/// Reserved bucket id for requests whose presented key fails to resolve.
+/// Real `analytics_ingest_keys.id` values are a Postgres `SERIAL` starting at
+/// 1, so 0 can never collide with one.
+const UNRESOLVED_KEY_BUCKET: i32 = 0;
+
+/// Cap on unresolved-key attempts per minute, applied as a single global
+/// bucket rather than per-IP: it bounds the DB-query cost a bot can inflict
+/// by cycling through valid-shaped garbage keys (`resolve()`'s cache only
+/// helps on an exact repeated string) without requiring the IP/Origin trust
+/// decision this module's doc comment defers. Deliberately coarse — once
+/// tripped, every unresolved-key attempt is rejected without a DB round trip
+/// until the window clears, so a flood from one bad actor can delay another
+/// client's simultaneous key typo. That trade favors protecting the database
+/// over a diagnostic nicety.
+pub const UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE: i32 = 300;
+
 /// Requests per minute applied when a key row carries no explicit limit.
 /// Matches the `rate_limit_per_minute` column default in
 /// `m20260831_000001_create_analytics_ingest_keys`.
@@ -72,6 +88,31 @@ impl AnalyticsIngestRateLimiter {
     /// and a re-minted key does not inherit a stale budget.
     pub async fn forget(&self, key_id: i32) {
         self.entries.lock().await.remove(&key_id);
+    }
+
+    /// Read-only: true if the global unresolved-key bucket is already
+    /// saturated. Checked *before* paying for a DB lookup, so a flood of
+    /// distinct garbage keys stops costing queries once it trips.
+    pub async fn unresolved_budget_exhausted(&self) -> bool {
+        let now = Instant::now();
+        let window_start = now - WINDOW;
+        let mut entries = self.entries.lock().await;
+        let timestamps = entries.entry(UNRESOLVED_KEY_BUCKET).or_default();
+        timestamps.retain(|t| *t > window_start);
+        timestamps.len() >= UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE as usize
+    }
+
+    /// Record one confirmed unresolved-key attempt against the global
+    /// bucket. Call only after `resolve()` has actually returned `None` —
+    /// recording on every request (valid or not) would let an unresolved-key
+    /// flood burn a budget that legitimate keyed traffic shares.
+    pub async fn record_unresolved_attempt(&self) {
+        let now = Instant::now();
+        let window_start = now - WINDOW;
+        let mut entries = self.entries.lock().await;
+        let timestamps = entries.entry(UNRESOLVED_KEY_BUCKET).or_default();
+        timestamps.retain(|t| *t > window_start);
+        timestamps.push(now);
     }
 }
 
@@ -135,5 +176,30 @@ mod tests {
         limiter.forget(3).await;
 
         assert!(limiter.check(3, Some(1)).await);
+    }
+
+    #[tokio::test]
+    async fn unresolved_budget_is_not_exhausted_before_any_attempts() {
+        let limiter = AnalyticsIngestRateLimiter::new();
+        assert!(!limiter.unresolved_budget_exhausted().await);
+    }
+
+    #[tokio::test]
+    async fn unresolved_budget_trips_after_the_limit_and_stays_independent_of_keyed_traffic() {
+        let limiter = AnalyticsIngestRateLimiter::new();
+
+        for _ in 0..UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE {
+            assert!(!limiter.unresolved_budget_exhausted().await);
+            limiter.record_unresolved_attempt().await;
+        }
+
+        assert!(
+            limiter.unresolved_budget_exhausted().await,
+            "the bucket must trip once the limit's worth of attempts were recorded"
+        );
+
+        // A resolved key's own budget is a separate bucket entirely (id 0 is
+        // reserved and never assigned to a real key), so it must be unaffected.
+        assert!(limiter.check(1, Some(5)).await);
     }
 }

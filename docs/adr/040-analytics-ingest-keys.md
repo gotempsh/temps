@@ -413,6 +413,42 @@ visitor/session-id fallback in `2b990321c`
 prerequisite: this ADR makes the request *resolve*, that commit makes the
 resolved event *have an identity*. Neither is sufficient alone.
 
+#### Field caps and rate limiting — decision record
+
+Every field this ADR makes client-supplied (as opposed to Host-resolved or
+cookie-issued) gets an explicit bound, because "trust it, it's just
+analytics" is how an ingest endpoint that must stay public becomes a DoS or
+storage-exhaustion vector. Recorded here so a future change to any of these
+numbers is a deliberate revision of a decision, not an accidental drift:
+
+| What | Bound | Why | Where |
+| --- | --- | --- | --- |
+| `visitorId` / `sessionId` (client-generated fallback) | 8–64 chars, `[A-Za-z0-9_-]` | Wide enough for `crypto.randomUUID()` (36) and the SDK's non-crypto fallback shape (~30); these become unauthenticated `GROUP BY`/join keys once stored, so HTML/oversized/arbitrary-byte junk is rejected rather than persisted | `is_valid_client_identity`, `ingest_keys/request.rs` |
+| `domain` / `hostname` (event payload) | ≤253 chars, `[A-Za-z0-9.\-:\[\]]` | Not full DNS validation (`localhost`, single-label intranet hosts, and IP literals are all legitimate) — only rejects input that could not plausibly be `window.location.hostname`, since every dashboard/report reads this column back out | `is_plausible_hostname`, `temps-analytics-events/events_service.rs` |
+| Per-key request rate | default 600/min, ceiling 100k/min, `NULL`/non-positive = unlimited (operator opt-in) | Bounded by minted-key count (`key_id`), not by IP/visitor, which are unbounded | `AnalyticsIngestRateLimiter::check`, `analytics_ingest_keys.rate_limit_per_minute` |
+| Unresolved-key attempts (key doesn't resolve at all) | 300/min, **global**, not per-IP | `resolve()`'s cache only helps on an exact repeated string, so a bot cycling through fresh valid-shaped (`pa_` + 64 hex) garbage would otherwise cost one DB query per request with no limit at all. A single global bucket bounds this without an IP-trust decision (see the rate limiter's per-`(key_id, ip)` note below) | `AnalyticsIngestRateLimiter::unresolved_budget_exhausted` |
+| New `visitor` rows created per project | 120/min | Before this ADR, `visitor_id` only ever came from a server-issued cookie, so row creation was bounded by real traffic. On the keyed path it's a client-supplied string, so a request *within* its key's own rate-limit budget can still mint one new row per request forever by varying it. This caps that growth independently of, and in addition to, the request-rate limit | `MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE`, `temps-analytics-events/events_service.rs` |
+| `allowed_origins` | ≤50 entries, ≤253 chars each | A single row must not be growable into an unbounded JSON blob every hot-path resolve has to parse | `MAX_ALLOWED_ORIGINS`, `MAX_ALLOWED_ORIGIN_LEN`, `ingest_keys/types.rs` |
+
+**Known residual gap, accepted rather than closed here:** the per-key rate
+limiter is keyed by `key_id`, so one abusive client sharing a key with
+legitimate visitors burns the whole key's budget for everyone. A
+per-`(key_id, ip)` sub-limit is the natural follow-up; it needs its own
+`Origin`/IP-trust decision for cross-origin deployments (self-reported
+`X-Forwarded-For` is not authoritative), so it is deliberately not bundled
+into this ADR.
+
+**Known residual gap, out of scope for this ADR:** `request_sessions` has no
+`project_id` column at all, and `session_id` is globally unique — a
+pre-existing design that relies on the id's cryptographic randomness for
+tenant isolation rather than a schema-enforced boundary. On the keyed path
+`session_id` is client-supplied, which narrows that reliance from
+"unauthenticated but unguessable" to "unauthenticated but unguessable, and
+now also unauthenticated end to end" for whichever project's key presents a
+colliding value first. Closing this needs a schema change
+(`request_sessions.project_id` + a composite unique index), tracked as a
+follow-up rather than fixed in this pass.
+
 ### 4. Deployment context in the no-deployment case
 
 `deployment_id` becomes `None` whenever the key is project-scoped, or is
@@ -491,13 +527,19 @@ subgroup to the existing `analytics` command
 (`apps/temps-cli/src/commands/analytics/index.ts`), in a new file
 `apps/temps-cli/src/commands/analytics/keys.ts`:
 
+`-p, --project <project>` (slug or ID, resolved via the CLI-wide
+`requireProjectSlug`/`getProjectBySlug` chain — same flag every other
+multi-project command uses) rather than a raw `--project-id`, so this
+command reads a `.temps/config.json`/`TEMPS_PROJECT`/context default like
+the rest of the CLI instead of forcing every invocation to pass a numeric id:
+
 | CLI command | Endpoint |
 | --- | --- |
-| `temps analytics keys list --project-id <id> [--json]` | `GET .../ingest-keys` |
-| `temps analytics keys create --project-id <id> [--name <n>] [--environment-id <id>] [--allowed-origins <origin...>] [--rate-limit <n>] [--json] [-y]` | `POST .../ingest-keys` |
-| `temps analytics keys update --project-id <id> --key-id <id> [--name <n>] [--allowed-origins <o...>] [--clear-origins] [--rate-limit <n>] [--clear-rate-limit]` | `PATCH .../ingest-keys/{key_id}` |
-| `temps analytics keys rotate --project-id <id> --key-id <id> [-f\|-y]` | `POST .../ingest-keys/{key_id}/rotate` |
-| `temps analytics keys revoke --project-id <id> --key-id <id> [-f\|-y]` | `POST .../ingest-keys/{key_id}/revoke` |
+| `temps analytics keys list [-p <project>] [--json]` | `GET .../ingest-keys` |
+| `temps analytics keys create [-p <project>] [--name <n>] [--environment-id <id>] [--allowed-origins <origin...>] [--rate-limit <n>] [--json] [-y]` | `POST .../ingest-keys` |
+| `temps analytics keys update [-p <project>] --key-id <id> [--name <n>] [--allowed-origins <o...>] [--clear-origins] [--rate-limit <n>] [--clear-rate-limit]` | `PATCH .../ingest-keys/{key_id}` |
+| `temps analytics keys rotate [-p <project>] --key-id <id> [-f\|-y]` | `POST .../ingest-keys/{key_id}/rotate` |
+| `temps analytics keys revoke [-p <project>] --key-id <id> [-f\|-y]` | `POST .../ingest-keys/{key_id}/revoke` |
 
 Structure, flags, spinner/table/prompt helpers: copy
 `apps/temps-cli/src/commands/dsn/index.ts` (`registerDsnCommands`, `:57-111`).

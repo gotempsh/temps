@@ -18,7 +18,7 @@ use rand::RngExt;
 use sea_orm::sea_query::Expr;
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
-    QueryOrder,
+    QueryOrder, QuerySelect,
 };
 use temps_entities::{analytics_ingest_keys, environments, projects};
 use tracing::{debug, warn};
@@ -317,10 +317,22 @@ impl AnalyticsIngestKeyService {
         &self,
         project_id: i32,
     ) -> Result<Vec<AnalyticsIngestKey>, AnalyticsIngestKeyError> {
+        // Unlike events/visitors, these rows are only ever created by an
+        // authenticated operator through the admin CRUD above — there is no
+        // ingest-triggered growth path — so real per-project cardinality is a
+        // handful of rows and true offset/limit pagination would add API
+        // surface (and a client-side page-through UI) nobody needs yet. This
+        // cap exists purely as a hot-path/memory backstop, not as
+        // user-facing pagination: if a project is ever near it, that is a
+        // signal to revisit this, not a limit an operator is expected to
+        // page through.
+        const MAX_KEYS_RETURNED: u64 = 500;
+
         let models = analytics_ingest_keys::Entity::find()
             .filter(analytics_ingest_keys::Column::ProjectId.eq(project_id))
             .order_by_desc(analytics_ingest_keys::Column::CreatedAt)
             .order_by_desc(analytics_ingest_keys::Column::Id)
+            .limit(MAX_KEYS_RETURNED)
             .all(self.db.as_ref())
             .await?;
 

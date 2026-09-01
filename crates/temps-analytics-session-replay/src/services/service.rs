@@ -379,9 +379,15 @@ impl SessionReplayService {
     ) -> Result<String, SessionReplayError> {
         info!("Initializing session: {} with metadata", session_id);
 
-        // Look up visitor by visitor_id GUID
+        // Look up visitor by visitor_id GUID, scoped to this project.
+        // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
+        // visitor_id string can legitimately belong to different projects —
+        // so an unscoped lookup would bind (and let a caller mutate) another
+        // project's visitor row for any client-supplied visitor_id on the
+        // keyed ingest path (ADR-040 §3).
         let visitor = visitor::Entity::find()
             .filter(visitor::Column::VisitorId.eq(&metadata.visitor_id))
+            .filter(visitor::Column::ProjectId.eq(project_id))
             .one(self.db.as_ref())
             .await?;
 

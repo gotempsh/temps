@@ -73,7 +73,12 @@ function getSessionMetadata(): Record<string, unknown> {
   const screen = window.screen || ({} as Screen);
   const nav = window.navigator || ({} as Navigator);
   return {
-    visitorId: getOrCreateVisitorId(),
+    // `getOrCreateVisitorId()` returns `undefined` when `localStorage` is
+    // unavailable (private-browsing modes, storage-partitioned iframes). Fall
+    // back to an ephemeral id rather than sending no visitor identity at all
+    // — it won't survive a reload, but that's strictly better than a session
+    // recording with zero visitor attribution.
+    visitorId: getOrCreateVisitorId() ?? randomId("visitor"),
     userAgent: nav.userAgent,
     language: nav.language,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,

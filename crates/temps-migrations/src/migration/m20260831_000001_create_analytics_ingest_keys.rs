@@ -175,6 +175,19 @@ impl MigrationTrait for Migration {
 
         let db = manager.get_connection();
 
+        // `ALTER COLUMN ... DROP NOT NULL` is metadata-only on Postgres (no
+        // table rewrite, verified empirically against a reproduced
+        // production-shaped compressed hypertable), but *acquiring* the
+        // `ACCESS EXCLUSIVE` lock it needs can still queue indefinitely
+        // behind a long-running transaction on `events` — a high-traffic
+        // ingest table. Bound the wait so a busy production instance fails
+        // this migration loudly instead of the boot hanging. Mirrors the
+        // pattern in `m20260817_000001_index_deployments_retention_scan`.
+        db.execute_unprepared("SET LOCAL lock_timeout = '5s'")
+            .await?;
+        db.execute_unprepared("SET LOCAL statement_timeout = '30s'")
+            .await?;
+
         // sea-orm's `modify_column` does not reliably express a nullability
         // change on Postgres, so these are raw. The existing FKs
         // (fk_performance_metrics_environment_id, ...) are left alone —

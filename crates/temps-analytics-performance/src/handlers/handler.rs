@@ -202,6 +202,12 @@ pub struct UpdateSpeedMetricsPayload {
     pub cls: Option<f32>,
     /// Interaction to Next Paint (milliseconds)
     pub inp: Option<f32>,
+    /// Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+    /// Required to identify the right row on the keyed path, where there is
+    /// no Temps-issued cookie to fall back on.
+    pub visitor_id: Option<String>,
+    /// Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+    pub session_id: Option<String>,
 }
 
 #[derive(OpenApi)]
@@ -794,7 +800,8 @@ pub async fn update_speed_metrics(
     // ADR-040 §3. This route is called via `navigator.sendBeacon`, which cannot
     // set headers — so the `?temps_key=` fallback is the only way a keyed
     // client can authenticate here, and `extract_analytics_key` accepts both.
-    let scope = if let Some(key) = extract_analytics_key(&headers, raw_query.as_deref()) {
+    let (scope, is_keyed) = if let Some(key) = extract_analytics_key(&headers, raw_query.as_deref())
+    {
         let origin = headers
             .get(header::ORIGIN)
             .and_then(|value| value.to_str().ok());
@@ -814,7 +821,7 @@ pub async fn update_speed_metrics(
                     resolved.environment_id,
                     resolved.deployment_id
                 );
-                MetricScope::from(resolved)
+                (MetricScope::from(resolved), true)
             }
             Err(problem) => return problem.into_response(),
         }
@@ -848,7 +855,7 @@ pub async fn update_speed_metrics(
                     host, scope.project_id, scope.environment_id, scope.deployment_id
                 );
 
-                scope
+                (scope, false)
             }
             None => {
                 error!("Host {} not found in route table", host);
@@ -863,14 +870,43 @@ pub async fn update_speed_metrics(
         }
     };
 
+    // On the keyed path there is never a Temps cookie (ADR-040 §3), so
+    // identity has to come from the payload — resolving it the same way
+    // `record_speed_metrics` does. Without this, both filters below would be
+    // `None` and the update would silently land on whichever row is newest
+    // for the project/env/deployment scope, i.e. a different visitor's data.
+    let session_id = resolve_client_identity(
+        metadata.session_id_cookie,
+        payload.session_id.clone(),
+        is_keyed,
+    );
+    let visitor_id = resolve_client_identity(
+        metadata.visitor_id_cookie,
+        payload.visitor_id.clone(),
+        is_keyed,
+    );
+
+    if is_keyed && session_id.is_none() && visitor_id.is_none() {
+        error!(
+            "Keyed speed-metrics update carries no resolvable identity; refusing to guess a row"
+        );
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "error": "No visitorId or sessionId in the request body — required on the keyed ingest path"
+            })),
+        )
+            .into_response();
+    }
+
     match state
         .performance_service
         .update_performance_metrics(UpdatePerformanceMetricsConfig {
             project_id: scope.project_id,
             environment_id: scope.environment_id,
             deployment_id: scope.deployment_id,
-            session_id: metadata.session_id_cookie,
-            visitor_id: metadata.visitor_id_cookie,
+            session_id,
+            visitor_id,
             cls: payload.cls,
             inp: payload.inp,
         })
@@ -1401,6 +1437,12 @@ mod tests {
             .await
             .expect("minting an ingest key must succeed");
 
+        // The keyed path never carries a Temps cookie, so `visitorId` in the
+        // payload is the only way to bind the update to the row the insert
+        // created — see `resolve_client_identity`.
+        let mut seed_payload = speed_payload();
+        seed_payload["visitorId"] = serde_json::json!("keyed-update-test-visitor");
+
         // Seed the row the late-metrics call will update.
         let response = setup_public_app(state.clone())
             .oneshot(
@@ -1410,12 +1452,66 @@ mod tests {
                     .header("host", "app.not-deployed-by-temps.test")
                     .header("content-type", "application/json")
                     .header("x-temps-analytics-key", &key.public_key)
-                    .body(Body::from(speed_payload().to_string()))
+                    .body(Body::from(seed_payload.to_string()))
                     .unwrap(),
             )
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        let response = setup_public_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/_temps/speed/update?temps_key={}", key.public_key))
+                    .header("host", "app.not-deployed-by-temps.test")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "cls": 0.02,
+                            "inp": 40.0,
+                            "visitorId": "keyed-update-test-visitor",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The update must land on the row the insert created, matched by the
+        // shared client-generated visitorId — not by guessing "most recent row".
+        let metrics = stored_metrics(db.as_ref()).await;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].cls, Some(0.02));
+        assert_eq!(metrics[0].inp, Some(40.0));
+
+        test_db.cleanup().await;
+    }
+
+    /// Mirrors the fix for the cross-visitor-corruption bug this replaces:
+    /// a keyed update with no resolvable identity must be rejected outright
+    /// rather than silently landing on "whichever row is newest."
+    #[tokio::test]
+    async fn keyed_speed_update_without_identity_is_rejected() {
+        let mut test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let project = insert_db_project(db.as_ref()).await;
+        let state = build_state(db.clone());
+
+        let key = state
+            .ingest_key_service
+            .create(project.id, None, None, None, None, None)
+            .await
+            .expect("minting an ingest key must succeed");
 
         let response = setup_public_app(state)
             .oneshot(
@@ -1432,14 +1528,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-        // The update must land on the same NULL-scoped row the insert created —
-        // `= NULL` matches nothing, so this also covers the IS NULL handling.
-        let metrics = stored_metrics(db.as_ref()).await;
-        assert_eq!(metrics.len(), 1);
-        assert_eq!(metrics[0].cls, Some(0.02));
-        assert_eq!(metrics[0].inp, Some(40.0));
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(stored_metrics(db.as_ref()).await.len(), 0);
 
         test_db.cleanup().await;
     }

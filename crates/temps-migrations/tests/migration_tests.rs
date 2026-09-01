@@ -438,6 +438,7 @@ async fn test_analytics_ingest_keys_migration_up_and_down() -> anyhow::Result<()
     // sentinel and the 204 drops load-bearing.
     assert!(!column_is_nullable(&db, "performance_metrics", "environment_id").await?);
     assert!(!column_is_nullable(&db, "session_replay_sessions", "deployment_id").await?);
+    assert!(!column_is_nullable(&db, "events", "environment_id").await?);
 
     // Real parent rows — the FKs on session_replay_sessions are `NOT NULL`
     // and enforced at this point.
@@ -509,6 +510,8 @@ async fn test_analytics_ingest_keys_migration_up_and_down() -> anyhow::Result<()
         ("performance_metrics", "deployment_id"),
         ("session_replay_sessions", "environment_id"),
         ("session_replay_sessions", "deployment_id"),
+        ("events", "environment_id"),
+        ("events", "deployment_id"),
     ] {
         assert!(
             column_is_nullable(&db, table, column).await?,
@@ -587,6 +590,8 @@ async fn test_analytics_ingest_keys_migration_up_and_down() -> anyhow::Result<()
         ("performance_metrics", "deployment_id"),
         ("session_replay_sessions", "environment_id"),
         ("session_replay_sessions", "deployment_id"),
+        ("events", "environment_id"),
+        ("events", "deployment_id"),
     ] {
         assert!(
             column_is_nullable(&db, table, column).await?,

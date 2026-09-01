@@ -34,7 +34,9 @@ pub use audit::{
 pub use handlers::{
     configure_ingest_key_routes, AnalyticsIngestKeyApiDoc, AnalyticsIngestKeysAppState,
 };
-pub use rate_limiter::{AnalyticsIngestRateLimiter, DEFAULT_RATE_LIMIT_PER_MINUTE};
+pub use rate_limiter::{
+    AnalyticsIngestRateLimiter, DEFAULT_RATE_LIMIT_PER_MINUTE, UNRESOLVED_KEY_RATE_LIMIT_PER_MINUTE,
+};
 pub use request::{
     extract_analytics_key, ingest_rate_limited_problem, invalid_ingest_key_problem,
     is_origin_allowed, origin_not_allowed_problem, resolve_client_identity,

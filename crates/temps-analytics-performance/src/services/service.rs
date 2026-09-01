@@ -923,10 +923,16 @@ impl PerformanceService {
             None
         };
 
-        // Look up visitor_id in visitor table
+        // Look up visitor_id in visitor table, scoped to this project.
+        // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
+        // visitor_id string can legitimately belong to different projects —
+        // so an unscoped lookup would match (and, on the record path,
+        // update the `last_seen`/attribution of) another project's visitor
+        // row for any client-supplied visitor_id on the keyed ingest path.
         let visitor_id_i32 = if let Some(vis_id) = config.visitor_id {
             visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(&vis_id))
+                .filter(visitor::Column::ProjectId.eq(config.project_id))
                 .one(self.db.as_ref())
                 .await?
                 .map(|v| v.id)
@@ -991,10 +997,16 @@ impl PerformanceService {
             None
         };
 
-        // Look up visitor_id in visitor table
+        // Look up visitor_id in visitor table, scoped to this project.
+        // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
+        // visitor_id string can legitimately belong to different projects —
+        // so an unscoped lookup would match (and, on the record path,
+        // update the `last_seen`/attribution of) another project's visitor
+        // row for any client-supplied visitor_id on the keyed ingest path.
         let visitor_id_i32 = if let Some(vis_id) = config.visitor_id {
             visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(&vis_id))
+                .filter(visitor::Column::ProjectId.eq(config.project_id))
                 .one(self.db.as_ref())
                 .await?
                 .map(|v| v.id)

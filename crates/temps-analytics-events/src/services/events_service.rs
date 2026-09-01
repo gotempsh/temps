@@ -26,13 +26,29 @@ pub enum EventsError {
     Validation(String),
 }
 
+/// Cap on new `visitor` rows created per project per minute via the
+/// lookup-miss fallback below. Before ADR-040, `visitor_id` only ever came
+/// from a server-issued cookie, so row creation was bounded by real traffic.
+/// On the keyed path it's a client-supplied string, so an attacker within
+/// their ingest key's own request-rate budget can still mint one new
+/// `visitor` row per request forever by varying it — this bounds that
+/// growth independent of, and in addition to, the ingest key's rate limit.
+/// Keyed by `project_id` (bounded cardinality) rather than by key/IP, so it
+/// caps total storage growth per project regardless of how many ingest keys
+/// target it.
+const MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE: i32 = 120;
+
 pub struct AnalyticsEventsService {
     db: Arc<DatabaseConnection>,
+    visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter,
 }
 
 impl AnalyticsEventsService {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
-        Self { db }
+        Self {
+            db,
+            visitor_creation_limiter: temps_analytics::AnalyticsIngestRateLimiter::new(),
+        }
     }
 
     /// Get custom event counts with filtering and aggregation level
@@ -1546,8 +1562,17 @@ WHERE project_id = $1
             use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter};
             use temps_entities::visitor;
 
+            // `visitor` is uniquely keyed on (visitor_id, project_id) — the
+            // same visitor_id string can legitimately belong to different
+            // projects — so the lookup MUST scope on project_id too. Before
+            // ADR-040, visitor_id only ever came from a server-issued,
+            // encrypted cookie, so cross-project collisions were structurally
+            // impossible. On the keyed path it's a client-supplied string, so
+            // omitting this filter would let any project's ingest key update
+            // (and read-attribute) another project's visitor row.
             let visitor_record = visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(visitor_id.clone()))
+                .filter(visitor::Column::ProjectId.eq(project_id))
                 .one(self.db.as_ref())
                 .await
                 .map_err(EventsError::Database)?;
@@ -1575,6 +1600,20 @@ WHERE project_id = $1
                     let _ = active_visitor.update(self.db.as_ref()).await;
 
                     Some(v.id)
+                }
+                None if !self
+                    .visitor_creation_limiter
+                    .check(project_id, Some(MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE))
+                    .await =>
+                {
+                    tracing::warn!(
+                        visitor_id = %visitor_id,
+                        project_id,
+                        "Refusing to create a new visitor row: project is over its \
+                         per-minute visitor-creation cap; event will record with \
+                         visitor_id=NULL"
+                    );
+                    None
                 }
                 None => {
                     // The cookie decrypted to a valid UUID, but no row exists
@@ -2187,14 +2226,35 @@ impl crate::services::traits::AnalyticsEvents for AnalyticsEventsService {
 /// the real acquisition channels; get it *wrong in a specific way* — by
 /// inheriting the Temps server's hostname on the keyed path — and the referrer
 /// never matches, so nothing is ever a self-referral.
+/// Longest accepted client-supplied `domain`/`hostname` value (matches the
+/// DNS hostname limit; also generous enough for an IPv6 literal in brackets).
+const MAX_CLIENT_HOSTNAME_LEN: usize = 253;
+
+/// Whether `host` is shaped like a value a browser's `window.location.hostname`
+/// could have produced. Not full DNS validation — `localhost`, single-label
+/// intranet hosts and IP literals are all legitimate — this only rejects
+/// clearly-invalid input (HTML, oversized junk, arbitrary bytes) from landing
+/// in `events.hostname` and every dashboard/report that reads it, since on
+/// the keyed ingest path this value is entirely client-supplied.
+fn is_plausible_hostname(host: &str) -> bool {
+    !host.is_empty()
+        && host.len() <= MAX_CLIENT_HOSTNAME_LEN
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
+}
+
 fn resolve_site_hostname(site_hostname: Option<&str>, event_data: &serde_json::Value) -> String {
     let from_event_data = |key: &str| {
         event_data
             .get(key)
             .and_then(|value| value.as_str())
             .filter(|value| !value.is_empty())
+            .filter(|value| is_plausible_hostname(value))
     };
 
+    // `site_hostname` comes from the caller (Host header / route table), not
+    // the client payload, so it is not re-validated here.
     site_hostname
         .filter(|host| !host.is_empty())
         .or_else(|| from_event_data("domain"))
@@ -2297,6 +2357,43 @@ mod tests {
         assert_eq!(
             resolve_site_hostname(None, &serde_json::Value::Null),
             "localhost"
+        );
+    }
+
+    #[test]
+    fn site_hostname_rejects_implausible_payload_values() {
+        // On the keyed path this comes straight from the client; junk here
+        // must not land in `events.hostname` for every dashboard to render.
+        assert_eq!(
+            resolve_site_hostname(
+                None,
+                &serde_json::json!({ "domain": "<script>alert(1)</script>" })
+            ),
+            "localhost"
+        );
+        assert_eq!(
+            resolve_site_hostname(None, &serde_json::json!({ "domain": "a".repeat(300) })),
+            "localhost"
+        );
+        // An invalid `domain` still falls through to a plausible `hostname`.
+        assert_eq!(
+            resolve_site_hostname(
+                None,
+                &serde_json::json!({
+                    "domain": "not a hostname",
+                    "hostname": "legacy.example.com",
+                })
+            ),
+            "legacy.example.com"
+        );
+        // Legitimate non-DNS-registrable shapes stay accepted.
+        assert_eq!(
+            resolve_site_hostname(None, &serde_json::json!({ "domain": "localhost" })),
+            "localhost"
+        );
+        assert_eq!(
+            resolve_site_hostname(None, &serde_json::json!({ "domain": "192.168.1.5" })),
+            "192.168.1.5"
         );
     }
 
@@ -3660,6 +3757,178 @@ mod tests {
         assert_eq!(second_event.visitor_id, event.visitor_id);
 
         println!("✅ record_event visitor-race regression test passed!");
+    }
+
+    /// Security regression test: on the keyed ingest path, `visitor_id` is a
+    /// client-supplied string, so an attacker cycling through fresh values
+    /// could otherwise mint one new `visitor` row per request forever. Once
+    /// `MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE` new rows have been created
+    /// for a project within the window, further lookup misses must record
+    /// the event with `visitor_id = NULL` instead of creating another row.
+    #[tokio::test]
+    async fn test_record_event_caps_new_visitor_creation_per_project() {
+        use sea_orm::{
+            ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, Set,
+        };
+        use temps_database::test_utils::TestDatabase;
+        use temps_entities::{
+            environments, projects, source_type::SourceType, upstream_config::UpstreamList, visitor,
+        };
+
+        let test_db: TestDatabase = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(e) => {
+                println!("Database not available, skipping test: {}", e);
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+
+        let project = projects::ActiveModel {
+            name: Set("visitor-cap-test".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::NextJs),
+            preset_config: Set(None),
+            deployment_config: Set(None),
+            slug: Set("visitor-cap-test".to_string()),
+            is_deleted: Set(false),
+            deleted_at: Set(None),
+            last_deployment: Set(None),
+            is_public_repo: Set(false),
+            git_url: Set(None),
+            git_provider_connection_id: Set(None),
+            attack_mode: Set(false),
+            error_source_context_enabled: Set(false),
+            error_source_root: Set(None),
+            enable_preview_environments: Set(false),
+            source_type: Set(SourceType::Git),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test project");
+
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("production".to_string()),
+            branch: Set(Some("main".to_string())),
+            slug: Set("production".to_string()),
+            subdomain: Set("prod-visitor-cap".to_string()),
+            host: Set(String::new()),
+            upstreams: Set(UpstreamList::new()),
+            is_preview: Set(false),
+            current_deployment_id: Set(None),
+            deleted_at: Set(None),
+            deployment_config: Set(None),
+            last_deployment: Set(None),
+            created_at: Set(chrono::Utc::now()),
+            updated_at: Set(chrono::Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("Failed to insert test environment");
+
+        let service = AnalyticsEventsService::new(db.clone());
+
+        // Drive the cap to exhaustion with distinct client-supplied visitor
+        // ids, each a genuine lookup miss.
+        for _ in 0..MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE {
+            service
+                .record_event(
+                    project.id,
+                    Some(environment.id),
+                    None,
+                    Some(uuid::Uuid::new_v4().to_string()),
+                    Some(uuid::Uuid::new_v4().to_string()),
+                    "page_view",
+                    serde_json::json!({}),
+                    "/",
+                    "",
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("Failed to record event while under the cap");
+        }
+
+        let visitor_count_at_cap = visitor::Entity::find()
+            .filter(visitor::Column::ProjectId.eq(project.id))
+            .count(db.as_ref())
+            .await
+            .expect("count visitors");
+        assert_eq!(
+            visitor_count_at_cap, MAX_NEW_VISITORS_PER_PROJECT_PER_MINUTE as u64,
+            "every request so far was under the cap and should have created a row"
+        );
+
+        // One more distinct visitor id, now over budget: must NOT create a
+        // new row, and the event must still record with visitor_id = NULL
+        // rather than being dropped.
+        let over_cap_event = service
+            .record_event(
+                project.id,
+                Some(environment.id),
+                None,
+                Some(uuid::Uuid::new_v4().to_string()),
+                Some(uuid::Uuid::new_v4().to_string()),
+                "page_view",
+                serde_json::json!({}),
+                "/",
+                "",
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("Failed to record event over the cap");
+
+        assert_eq!(
+            over_cap_event.visitor_id, None,
+            "a lookup miss over the per-project creation cap must record with visitor_id = NULL, not skip the event"
+        );
+
+        let visitor_count_over_cap = visitor::Entity::find()
+            .filter(visitor::Column::ProjectId.eq(project.id))
+            .count(db.as_ref())
+            .await
+            .expect("count visitors");
+        assert_eq!(
+            visitor_count_over_cap, visitor_count_at_cap,
+            "no new visitor row should be created once the project is over its creation cap"
+        );
     }
 
     /// Regression test: `record_event` must self-heal the `request_sessions`

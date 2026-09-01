@@ -131,6 +131,14 @@ export interface AnalyticsOptions extends AnalyticsClientOptions {
 export interface AnalyticsApi {
   /** Whether analytics are currently enabled. */
   readonly enabled: boolean;
+  /**
+   * The ingest key this instance was configured with, if any. Framework
+   * hooks that send their own beacons outside the plugin instance (e.g.
+   * `usePageLeave`'s unload handler) read this as their default so a
+   * cross-origin setup only has to configure the key once, on the plugin —
+   * not again on every hook that bypasses it.
+   */
+  readonly ingestKey?: string;
   /** Send a custom event. */
   trackEvent(eventName: string, data?: Record<string, JsonValue>): Promise<void>;
   /** Manually trigger a pageview. */

@@ -137,6 +137,7 @@ export function createAnalytics(options: AnalyticsOptions = {}): AnalyticsApi {
     get enabled(): boolean {
       return enabled;
     },
+    ingestKey,
     trackEvent,
     trackPageview,
     identify,

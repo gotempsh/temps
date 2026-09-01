@@ -1991,7 +1991,12 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
     path: { project_id: project.id },
   }).queryKey
 
-  const { data: keys, isLoading: isLoadingKeys } = useQuery({
+  const {
+    data: keys,
+    isLoading: isLoadingKeys,
+    isError: isErrorKeys,
+    refetch: refetchKeys,
+  } = useQuery({
     ...listAnalyticsIngestKeysOptions({ path: { project_id: project.id } }),
   })
 
@@ -2044,46 +2049,51 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
               <KeyRound className="h-4 w-4 text-muted-foreground" />
               <CardTitle className="text-base">Analytics ingest key</CardTitle>
             </div>
-            {primaryKey && (
-              <AlertDialog>
-                <AlertDialogTrigger asChild>
-                  <Button
-                    variant="outline"
-                    size="sm"
+            {/* Always mounted (never conditionally rendered) so the dialog's
+                open state can't be torn down mid-interaction by an unrelated
+                `keys` refetch flipping `primaryKey` — only the trigger's
+                visibility depends on there being a key to rotate. */}
+            <AlertDialog>
+              <AlertDialogTrigger asChild>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={rotateKey.isPending}
+                  className={primaryKey ? undefined : 'hidden'}
+                >
+                  <RotateCcw className="h-4 w-4 mr-2" />
+                  Rotate
+                </Button>
+              </AlertDialogTrigger>
+              <AlertDialogContent>
+                <AlertDialogHeader>
+                  <AlertDialogTitle>Rotate this ingest key?</AlertDialogTitle>
+                  <AlertDialogDescription>
+                    The current value stops working immediately. Update it
+                    everywhere it&apos;s used — your app&apos;s code, env
+                    vars, or CDN script tag — before rotating, or analytics
+                    will stop flowing until you do.
+                  </AlertDialogDescription>
+                </AlertDialogHeader>
+                <AlertDialogFooter>
+                  <AlertDialogCancel>Cancel</AlertDialogCancel>
+                  <AlertDialogAction
                     disabled={rotateKey.isPending}
+                    onClick={() =>
+                      primaryKey &&
+                      rotateKey.mutate({
+                        path: {
+                          project_id: project.id,
+                          key_id: primaryKey.id,
+                        },
+                      })
+                    }
                   >
-                    <RotateCcw className="h-4 w-4 mr-2" />
-                    Rotate
-                  </Button>
-                </AlertDialogTrigger>
-                <AlertDialogContent>
-                  <AlertDialogHeader>
-                    <AlertDialogTitle>Rotate this ingest key?</AlertDialogTitle>
-                    <AlertDialogDescription>
-                      The current value stops working immediately. Update it
-                      everywhere it&apos;s used — your app&apos;s code, env
-                      vars, or CDN script tag — before rotating, or analytics
-                      will stop flowing until you do.
-                    </AlertDialogDescription>
-                  </AlertDialogHeader>
-                  <AlertDialogFooter>
-                    <AlertDialogCancel>Cancel</AlertDialogCancel>
-                    <AlertDialogAction
-                      onClick={() =>
-                        rotateKey.mutate({
-                          path: {
-                            project_id: project.id,
-                            key_id: primaryKey.id,
-                          },
-                        })
-                      }
-                    >
-                      Rotate key
-                    </AlertDialogAction>
-                  </AlertDialogFooter>
-                </AlertDialogContent>
-              </AlertDialog>
-            )}
+                    {rotateKey.isPending ? 'Rotating…' : 'Rotate key'}
+                  </AlertDialogAction>
+                </AlertDialogFooter>
+              </AlertDialogContent>
+            </AlertDialog>
           </div>
           <CardDescription>
             Not a secret — it&apos;s designed to be embedded in client-side
@@ -2094,14 +2104,32 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
         <CardContent className="space-y-3">
           {isLoadingKeys ? (
             <Skeleton className="h-10 w-full" />
+          ) : isErrorKeys ? (
+            <Alert variant="destructive">
+              <AlertDescription className="flex items-center justify-between gap-2">
+                <span>Failed to load analytics ingest keys.</span>
+                <Button size="sm" variant="outline" onClick={() => refetchKeys()}>
+                  Retry
+                </Button>
+              </AlertDescription>
+            </Alert>
           ) : primaryKey ? (
-            <div className="flex gap-2">
-              <Input
-                value={primaryKey.public_key}
-                readOnly
-                className="font-mono text-sm"
-              />
-              <CopyButton value={primaryKey.public_key} />
+            <div className="space-y-1.5">
+              <div className="flex gap-2">
+                <Input
+                  value={primaryKey.public_key}
+                  readOnly
+                  className="font-mono text-sm"
+                />
+                <CopyButton value={primaryKey.public_key} />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {primaryKey.event_count.toLocaleString()} event
+                {primaryKey.event_count === 1 ? '' : 's'} ingested · Last used:{' '}
+                {primaryKey.last_used_at
+                  ? new Date(primaryKey.last_used_at).toLocaleString()
+                  : 'never'}
+              </p>
             </div>
           ) : (
             <div className="space-y-3">
@@ -2128,45 +2156,50 @@ function IngestKeySetup({ project }: ProjectAnalyticsProps) {
             </div>
           )}
 
-          {primaryKey && (
-            <AlertDialog>
-              <AlertDialogTrigger asChild>
-                <Button
-                  variant="ghost"
-                  size="sm"
-                  className="text-muted-foreground"
+          {/* Always mounted for the same reason as the Rotate dialog above —
+              only the trigger's visibility depends on `primaryKey`. */}
+          <AlertDialog>
+            <AlertDialogTrigger asChild>
+              <Button
+                variant="ghost"
+                size="sm"
+                className={
+                  primaryKey ? 'text-muted-foreground' : 'hidden'
+                }
+                disabled={revokeKey.isPending}
+              >
+                <Ban className="h-4 w-4 mr-2" />
+                Revoke key
+              </Button>
+            </AlertDialogTrigger>
+            <AlertDialogContent>
+              <AlertDialogHeader>
+                <AlertDialogTitle>Revoke this ingest key?</AlertDialogTitle>
+                <AlertDialogDescription>
+                  Analytics from apps using this key stop being recorded
+                  immediately. The key stays listed here, marked revoked, so
+                  you can still tell which key ingested past data.
+                </AlertDialogDescription>
+              </AlertDialogHeader>
+              <AlertDialogFooter>
+                <AlertDialogCancel>Cancel</AlertDialogCancel>
+                <AlertDialogAction
+                  disabled={revokeKey.isPending}
+                  onClick={() =>
+                    primaryKey &&
+                    revokeKey.mutate({
+                      path: {
+                        project_id: project.id,
+                        key_id: primaryKey.id,
+                      },
+                    })
+                  }
                 >
-                  <Ban className="h-4 w-4 mr-2" />
-                  Revoke key
-                </Button>
-              </AlertDialogTrigger>
-              <AlertDialogContent>
-                <AlertDialogHeader>
-                  <AlertDialogTitle>Revoke this ingest key?</AlertDialogTitle>
-                  <AlertDialogDescription>
-                    Analytics from apps using this key stop being recorded
-                    immediately. The key stays listed here, marked revoked, so
-                    you can still tell which key ingested past data.
-                  </AlertDialogDescription>
-                </AlertDialogHeader>
-                <AlertDialogFooter>
-                  <AlertDialogCancel>Cancel</AlertDialogCancel>
-                  <AlertDialogAction
-                    onClick={() =>
-                      revokeKey.mutate({
-                        path: {
-                          project_id: project.id,
-                          key_id: primaryKey.id,
-                        },
-                      })
-                    }
-                  >
-                    Revoke key
-                  </AlertDialogAction>
-                </AlertDialogFooter>
-              </AlertDialogContent>
-            </AlertDialog>
-          )}
+                  {revokeKey.isPending ? 'Revoking…' : 'Revoke key'}
+                </AlertDialogAction>
+              </AlertDialogFooter>
+            </AlertDialogContent>
+          </AlertDialog>
         </CardContent>
       </Card>
 

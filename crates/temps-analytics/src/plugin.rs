@@ -163,12 +163,24 @@ impl TempsPlugin for AnalyticsPlugin {
                             ingest_key_service.invalidate_all_cached_scopes();
                         }
                         Ok(_) => {}
+                        Err(temps_core::QueueError::ChannelClosed) => {
+                            // The queue is gone — the process is shutting down.
+                            tracing::warn!(
+                                "analytics: ingest-key cache invalidation subscriber stopping, queue channel closed"
+                            );
+                            break;
+                        }
                         Err(e) => {
-                            tracing::error!(
-                                "analytics: error receiving job for ingest-key cache invalidation: {:?}",
+                            // Broadcast receiver lagged: a RouteTableUpdated may
+                            // have been missed. Invalidate defensively — the next
+                            // resolve simply re-reads the current deployment id,
+                            // which is always correct regardless of how many
+                            // updates were dropped.
+                            tracing::warn!(
+                                "analytics: ingest-key cache invalidation subscriber lagged ({}); invalidating defensively",
                                 e
                             );
-                            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                            ingest_key_service.invalidate_all_cached_scopes();
                         }
                     }
                 }
