@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Middleware that stamps every `/v1/sandbox/*` response with the
 //! `X-Sandbox-API-Version` header. Used for support triage — see
 //! [ADR-009] for the full policy.

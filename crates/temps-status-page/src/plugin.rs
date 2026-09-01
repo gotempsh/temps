@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -216,10 +219,12 @@ impl TempsPlugin for StatusPagePlugin {
             .unwrap_or_else(|| Arc::new(temps_core::telemetry::NoopTelemetryReporter));
 
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
+        let audit_service = context.require_service::<dyn temps_core::AuditLogger>();
 
         struct AppState {
             status_page_service: Arc<StatusPageService>,
             telemetry: Arc<dyn temps_core::TelemetryReporter>,
+            audit_service: Arc<dyn temps_core::AuditLogger>,
             project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
         }
 
@@ -232,6 +237,10 @@ impl TempsPlugin for StatusPagePlugin {
                 &self.telemetry
             }
 
+            fn audit_service(&self) -> &Arc<dyn temps_core::AuditLogger> {
+                &self.audit_service
+            }
+
             fn project_access_checker(&self) -> Option<Arc<dyn temps_core::ProjectAccessChecker>> {
                 self.project_access_checker.clone()
             }
@@ -240,6 +249,7 @@ impl TempsPlugin for StatusPagePlugin {
         let app_state = Arc::new(AppState {
             status_page_service,
             telemetry,
+            audit_service,
             project_access_checker,
         });
 

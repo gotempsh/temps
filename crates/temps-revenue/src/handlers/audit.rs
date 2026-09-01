@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Audit event structs for revenue integration management.
 //!
 //! Audit logging is mandatory for every write operation (CLAUDE.md). These

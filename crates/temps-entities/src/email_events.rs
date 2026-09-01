@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Email events entity — tracks opens, clicks, bounces, complaints, deliveries
 
 use sea_orm::entity::prelude::*;

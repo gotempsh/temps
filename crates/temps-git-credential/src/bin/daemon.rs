@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `temps-git-credential-daemon` — long-running per-sandbox process that
 //! holds the workspace's deployment token and mints scoped git
 //! credentials on demand.

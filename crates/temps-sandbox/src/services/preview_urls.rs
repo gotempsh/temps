@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Preview URL construction for standalone sandboxes. Reuses the same
 //! `ws-<id>-<port>.<domain>` hostname scheme used by workspace sessions
 //! so the existing preview gateway routes both kinds of sandbox without

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Docker reports container CPU as a multi-core percentage: 200% = 2 cores
 // fully pinned. That number is meaningless to a user reading a stat strip,
 // so we render it as decimal cores used (and `/ limit` when a cap is set).

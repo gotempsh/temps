@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Test utilities for external services backup and restore tests
 //!
 //! This module provides utilities to set up MinIO (S3-compatible storage) containers
@@ -462,6 +465,7 @@ pub fn create_mock_external_service(
         default_backup_provisioned: false,
         ai_data_access: false,
         container_name: None,
+        created_by_user_id: None,
     }
 }
 

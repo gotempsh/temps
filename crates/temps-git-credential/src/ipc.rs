@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! IPC protocol between the helper (uid 1000) and the daemon (uid 1001)
 //! over a Unix socket.
 //!

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Split the generated Temps CLI catalog into one reference per command group."""
 
 from __future__ import annotations

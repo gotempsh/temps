@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::services::{
     cache::GitProviderCacheManager, connection_health::ConnectionHealthService,
     git_provider_manager::GitProviderManager, github::GithubAppService,
@@ -9,6 +12,7 @@ use temps_config::ConfigService;
 use temps_core::AuditLogger;
 use utoipa::ToSchema;
 
+#[derive(Clone)]
 pub struct GitAppState {
     pub git_provider_manager: Arc<GitProviderManager>,
     pub audit_service: Arc<dyn AuditLogger>,
@@ -19,6 +23,10 @@ pub struct GitAppState {
     pub cache_manager: Arc<GitProviderCacheManager>,
     pub connection_health_service: Arc<ConnectionHealthService>,
     pub telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    /// Central policy evaluator for sensitive mutations (e.g. deleting a git
+    /// provider or connection) — challenges with MFA step-up when the acting
+    /// user has one enrolled. See [`temps_core::SensitiveActionAuthorizer`].
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -31,6 +39,7 @@ pub fn create_git_app_state(
     cache_manager: Arc<GitProviderCacheManager>,
     connection_health_service: Arc<ConnectionHealthService>,
     telemetry: Arc<dyn temps_core::telemetry::TelemetryReporter>,
+    sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 ) -> Arc<GitAppState> {
     Arc::new(GitAppState {
         git_provider_manager,
@@ -41,6 +50,7 @@ pub fn create_git_app_state(
         cache_manager,
         connection_health_service,
         telemetry,
+        sensitive_action_authorizer,
     })
 }
 

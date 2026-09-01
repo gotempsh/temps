@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /// Test for chunked transfer encoding streaming
 /// This test verifies that the proxy properly streams chunked responses
 /// without buffering all chunks until the response completes

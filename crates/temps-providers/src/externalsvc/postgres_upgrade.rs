@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! PostgreSQL major version upgrade orchestrator
 //!
 //! CNPG-inspired declarative major upgrades for Postgres external services
@@ -1396,28 +1399,12 @@ impl PostgresUpgradeOrchestrator {
         row: &postgres_major_upgrades::Model,
         image: &str,
     ) -> Result<(), PostgresUpgradeError> {
-        use futures::TryStreamExt;
-        let (image_name, tag) = match image.split_once(':') {
-            Some((n, t)) => (n.to_string(), t.to_string()),
-            None => (image.to_string(), "latest".to_string()),
-        };
-        self.docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
+        crate::utils::pull_image_with_retry(&self.docker, image, None)
             .await
             .map_err(|e| PostgresUpgradeError::Docker {
                 upgrade_id: row.id,
-                reason: format!("pull image '{}' failed: {}", image, e),
-            })?;
-        Ok(())
+                reason: e,
+            })
     }
 
     /// Check whether the dump volume already contains the `/dump/.done`
@@ -1668,24 +1655,12 @@ impl PostgresUpgradeOrchestrator {
         &self,
         row: &postgres_major_upgrades::Model,
     ) -> Result<(), PostgresUpgradeError> {
-        use futures::TryStreamExt;
-        self.docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some("busybox".to_string()),
-                    tag: Some("latest".to_string()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
+        crate::utils::pull_image_with_retry(&self.docker, "busybox:latest", None)
             .await
             .map_err(|e| PostgresUpgradeError::Docker {
                 upgrade_id: row.id,
-                reason: format!("failed to pull busybox: {}", e),
-            })?;
-        Ok(())
+                reason: e,
+            })
     }
 
     /// Create a named Docker volume. Ignores "already exists" — we treat
@@ -2376,7 +2351,7 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
                     .with_detail(error.to_string())
             }
 
-            PostgresUpgradeError::PreBackupFailed { .. }
+            internal_error @ (PostgresUpgradeError::PreBackupFailed { .. }
             | PostgresUpgradeError::SnapshotFailed { .. }
             | PostgresUpgradeError::DumpFailed { .. }
             | PostgresUpgradeError::NewContainerFailed { .. }
@@ -2387,10 +2362,11 @@ impl From<PostgresUpgradeError> for temps_core::problemdetails::Problem {
             | PostgresUpgradeError::Docker { .. }
             | PostgresUpgradeError::Log { .. }
             | PostgresUpgradeError::ServiceConfiguration { .. }
-            | PostgresUpgradeError::Database(_) => {
+            | PostgresUpgradeError::Database(_)) => {
+                tracing::error!(error = %internal_error, "PostgreSQL upgrade request failed internally");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(error.to_string())
+                    .with_detail("The PostgreSQL upgrade operation could not be completed")
             }
         }
     }

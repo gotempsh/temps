@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use anyhow::Result;
 use chrono::{DateTime, Duration, Utc};
 use sea_orm::{
@@ -2651,6 +2654,13 @@ mod tests {
             .with_wait_for(WaitFor::message_on_stdout("ACME directory available at"))
             .with_env_var("PEBBLE_VA_ALWAYS_VALID", "0")
             .with_env_var("PEBBLE_VA_NOSLEEP", "1")
+            // Pebble deliberately rejects 5% of otherwise valid nonces by
+            // default. instant-acme retries badNonce responses internally,
+            // but three consecutive injected rejections exhaust its bounded
+            // retry budget and make this HTTP-01 integration test flaky. Nonce
+            // recovery is instant-acme's responsibility; keep this test focused
+            // on Temps' real challenge-serving and certificate-storage flow.
+            .with_env_var("PEBBLE_WFE_NONCEREJECT", "0")
             // Add host-gateway so Pebble's VA can reach the host's challenge
             // responder (the A-record points the hostname at the gateway IP).
             .with_host(

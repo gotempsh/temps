@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared helpers for reading repository content via the Git provider API.
 //!
 //! Used by both [`super::repo_tools::RepoToolsProvider`] (the sentinel that

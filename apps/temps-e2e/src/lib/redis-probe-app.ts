@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * A throwaway Go app that proves a linked managed Redis service is actually
  * writable, not just linked in the DB row. On boot it connects with whatever

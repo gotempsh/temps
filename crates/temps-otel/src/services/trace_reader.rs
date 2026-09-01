@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `temps_core::TraceReader` implementation for [`OtelService`].
 //!
 //! Adapts the rich storage-layer trace types to the flat, dependency-light DTOs

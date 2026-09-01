@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Bridge that plugs [`SandboxService`] into the agents' sandbox registry.
 //!
 //! `temps-sandbox` depends on `temps-agents`, so agent code can't call this

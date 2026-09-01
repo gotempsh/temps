@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Adds compute-network fields used by the multi-host networking layer
 //! (`temps-network` crate):
 //!

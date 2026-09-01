@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /// Guard function that checks permission and returns early if not authorized
 ///
 /// Usage in handler:
@@ -1166,6 +1169,7 @@ mod tests {
             "temps-analytics",
             "temps-analytics-events",
             "temps-analytics-funnels",
+            "temps-analytics-performance",
             "temps-analytics-session-replay",
             "temps-blob",
             "temps-deployments",
@@ -1295,7 +1299,9 @@ mod tests {
             // with the instance-wide FlagsWrite the default role carries.
             "temps-flags",
             "temps-projects",
+            "temps-providers",
             "temps-proxy",
+            "temps-status-page",
         ];
 
         let mut sorted = expected_crates.to_vec();

@@ -4,7 +4,7 @@
 
 Apply [the CLI runtime and safety contract](../cli-runtime.md) before executing a command. Runtime `--help` is authoritative.
 
-## `mcp-servers` (alias: `mcp`)
+## `mcp-servers`
 
 Manage MCP server definitions (global or project-scoped)
 

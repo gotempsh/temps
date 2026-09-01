@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Setup wizard for `temps up` when no project is linked.
  * Guides the user through: detection → naming → git/manual → services → create → deploy.

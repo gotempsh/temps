@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Isolated, throwaway 2-node Temps cluster for the `multinode-join-scenario`
 # e2e test (apps/temps-e2e/src/commands/multinode-join-scenario.ts).
 #

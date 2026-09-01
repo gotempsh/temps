@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Concrete job implementations for deployment workflows
 //!
 //! This module provides ready-to-use job implementations for common deployment tasks.
@@ -58,6 +61,7 @@ pub mod deploy_compose;
 pub mod deploy_image;
 pub mod deploy_static;
 pub mod deploy_static_bundle;
+pub mod deploy_static_from_source;
 pub mod download_repo;
 pub mod mark_deployment_complete;
 pub mod node_health_check;
@@ -80,6 +84,7 @@ pub use deploy_compose::*;
 pub use deploy_image::*;
 pub use deploy_static::*;
 pub use deploy_static_bundle::*;
+pub use deploy_static_from_source::*;
 pub use download_repo::*;
 pub use mark_deployment_complete::*;
 pub use persist_static_assets::*;

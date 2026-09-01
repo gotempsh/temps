@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import * as React from 'react'
 import { ChevronLeft, ChevronRight } from 'lucide-react'
 import { DayPicker, type DayButtonProps } from 'react-day-picker'

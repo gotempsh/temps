@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Build command for building Docker images locally
 //!
 //! This command builds Docker images locally using the Docker daemon,

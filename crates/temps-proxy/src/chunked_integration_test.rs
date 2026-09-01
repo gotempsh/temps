@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /// Integration test for chunked transfer encoding with simulated backends
 /// This test verifies that the proxy properly streams chunked responses
 /// without buffering all chunks until the response completes

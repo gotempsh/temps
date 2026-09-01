@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Detects AI agent / LLM crawler user agents and classifies them by provider.
 //!
 //! Unlike the generic [`crate::crawler_detector::CrawlerDetector`], which only

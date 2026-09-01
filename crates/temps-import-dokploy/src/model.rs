@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed models for the Dokploy REST API.
 //!
 //! Field sets captured from a live Dokploy v0.29 instance (July 2026).

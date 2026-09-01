@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { z } from 'zod'
 
 export const projectAlertsSchema = z.object({
@@ -64,138 +67,156 @@ export const weeklyDigestSchema = z.object({
  */
 const MASKED_VALUE = '***'
 
-const buildProviderSchema = (allowMaskedValues: boolean) => z
-  .object({
-    name: z.string().min(1, 'Name is required'),
-    provider_type: z.enum(['email', 'slack', 'webhook', 'cloudflare']),
-    config: z.object({
-      // Slack config
-      webhook_url: z.string().optional(),
-      channel: z.string().optional(),
-      slack_username: z.string().optional(),
+export const notificationRouteSeveritySchema = z.enum([
+  'debug',
+  'info',
+  'warning',
+  'error',
+  'critical',
+  'emergency',
+])
 
-      // Cloudflare config
-      account_id: z.string().optional(),
-      api_token: z.string().optional(),
+const buildProviderSchema = (allowMaskedValues: boolean) =>
+  z
+    .object({
+      name: z.string().min(1, 'Name is required'),
+      provider_type: z.enum(['email', 'slack', 'webhook', 'cloudflare']),
+      config: z.object({
+        // Slack config
+        webhook_url: z.string().optional(),
+        channel: z.string().optional(),
+        slack_username: z.string().optional(),
 
-      // Email config
-      smtp_host: z.string().optional(),
-      smtp_port: z.number().min(1).max(65535).optional(),
-      use_credentials: z.boolean().optional(),
-      smtp_username: z.string().optional(),
-      password: z.string().optional(),
-      from_name: z.string().optional(),
-      from_address: z.string().optional(),
-      to_addresses: z.array(z.string()).optional(),
-      tls_mode: z.enum(['None', 'Starttls', 'Tls']).optional(),
-      starttls_required: z.boolean().optional(),
-      accept_invalid_certs: z.boolean().optional(),
+        // Cloudflare config
+        account_id: z.string().optional(),
+        api_token: z.string().optional(),
 
-      // Webhook config
-      url: z.string().optional(),
-      method: z.enum(['POST', 'PUT', 'PATCH']).optional(),
-      headers: z.record(z.string(), z.string()).optional(),
-      timeout_secs: z.number().min(1).max(300).optional(),
-    }),
-  })
-  .refine(
-    (data) => {
-      // Validate based on provider type
-      if (data.provider_type === 'slack') {
-        // Validate webhook URL only for Slack
-        const url = data.config.webhook_url
-        if (!url || url === '') {
-          return false
-        }
-        if (allowMaskedValues && url === MASKED_VALUE) {
-          return true
-        }
-        // Check if it's a valid URL
-        try {
-          new URL(url)
-          return true
-        } catch {
-          return false
-        }
-      }
-      // Email provider validation
-      if (data.provider_type === 'email') {
-        const { smtp_host, smtp_port, from_address, to_addresses } = data.config
+        // Email config
+        smtp_host: z.string().optional(),
+        smtp_port: z.number().min(1).max(65535).optional(),
+        use_credentials: z.boolean().optional(),
+        smtp_username: z.string().optional(),
+        password: z.string().optional(),
+        from_name: z.string().optional(),
+        from_address: z.string().optional(),
+        to_addresses: z.array(z.string()).optional(),
+        tls_mode: z.enum(['None', 'Starttls', 'Tls']).optional(),
+        starttls_required: z.boolean().optional(),
+        accept_invalid_certs: z.boolean().optional(),
 
-        // Check required email fields
-        if (!smtp_host || !smtp_port || !from_address || !to_addresses || to_addresses.length === 0) {
-          return false
-        }
-
-        // Validate from_address is a valid email
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-        if (!emailRegex.test(from_address)) {
-          return false
-        }
-
-        // Validate all to_addresses are valid emails
-        for (const email of to_addresses) {
-          if (!emailRegex.test(email)) {
+        // Webhook config
+        url: z.string().optional(),
+        method: z.enum(['POST', 'PUT', 'PATCH']).optional(),
+        headers: z.record(z.string(), z.string()).optional(),
+        timeout_secs: z.number().min(1).max(300).optional(),
+      }),
+    })
+    .refine(
+      (data) => {
+        // Validate based on provider type
+        if (data.provider_type === 'slack') {
+          // Validate webhook URL only for Slack
+          const url = data.config.webhook_url
+          if (!url || url === '') {
+            return false
+          }
+          if (allowMaskedValues && url === MASKED_VALUE) {
+            return true
+          }
+          // Check if it's a valid URL
+          try {
+            new URL(url)
+            return true
+          } catch {
             return false
           }
         }
+        // Email provider validation
+        if (data.provider_type === 'email') {
+          const { smtp_host, smtp_port, from_address, to_addresses } =
+            data.config
 
-        return true
-      }
-      // Webhook provider validation
-      if (data.provider_type === 'webhook') {
-        const { url } = data.config
-        if (!url || url === '') {
-          return false
-        }
-        if (allowMaskedValues && url === MASKED_VALUE) {
-          return true
-        }
-        // Check if it's a valid URL
-        try {
-          const parsedUrl = new URL(url)
-          // Only allow http and https protocols
-          if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+          // Check required email fields
+          if (
+            !smtp_host ||
+            !smtp_port ||
+            !from_address ||
+            !to_addresses ||
+            to_addresses.length === 0
+          ) {
             return false
           }
+
+          // Validate from_address is a valid email
+          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+          if (!emailRegex.test(from_address)) {
+            return false
+          }
+
+          // Validate all to_addresses are valid emails
+          for (const email of to_addresses) {
+            if (!emailRegex.test(email)) {
+              return false
+            }
+          }
+
           return true
-        } catch {
-          return false
         }
-      }
-      // Cloudflare provider validation
-      if (data.provider_type === 'cloudflare') {
-        const { account_id, api_token, from_address, to_addresses } =
-          data.config
-
-        if (
-          !account_id ||
-          !api_token ||
-          !from_address ||
-          !to_addresses ||
-          to_addresses.length === 0
-        ) {
-          return false
-        }
-
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
-        if (!emailRegex.test(from_address)) {
-          return false
-        }
-        for (const email of to_addresses) {
-          if (!emailRegex.test(email)) {
+        // Webhook provider validation
+        if (data.provider_type === 'webhook') {
+          const { url } = data.config
+          if (!url || url === '') {
+            return false
+          }
+          if (allowMaskedValues && url === MASKED_VALUE) {
+            return true
+          }
+          // Check if it's a valid URL
+          try {
+            const parsedUrl = new URL(url)
+            // Only allow http and https protocols
+            if (!['http:', 'https:'].includes(parsedUrl.protocol)) {
+              return false
+            }
+            return true
+          } catch {
             return false
           }
         }
-        return true
+        // Cloudflare provider validation
+        if (data.provider_type === 'cloudflare') {
+          const { account_id, api_token, from_address, to_addresses } =
+            data.config
+
+          if (
+            !account_id ||
+            !api_token ||
+            !from_address ||
+            !to_addresses ||
+            to_addresses.length === 0
+          ) {
+            return false
+          }
+
+          const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+          if (!emailRegex.test(from_address)) {
+            return false
+          }
+          for (const email of to_addresses) {
+            if (!emailRegex.test(email)) {
+              return false
+            }
+          }
+          return true
+        }
+        return false
+      },
+      {
+        message:
+          'Please fill in all required fields for the selected provider type',
+        path: ['config'],
       }
-      return false
-    },
-    {
-      message: 'Please fill in all required fields for the selected provider type',
-      path: ['config'],
-    }
-  )
+    )
 
 export const providerSchema = buildProviderSchema(false)
 export const providerUpdateSchema = buildProviderSchema(true)

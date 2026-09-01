@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useMemo, useState, type ReactNode } from 'react'
 import { ChevronDown, ChevronRight, CheckCircle2, XCircle } from 'lucide-react'
 import { cn } from '@/lib/utils'

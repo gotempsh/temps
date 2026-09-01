@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Snapshot API handlers (ADR-037).
 //!
 //! Routes:
@@ -143,6 +146,16 @@ impl From<SandboxSnapshotError> for Problem {
             SandboxSnapshotError::ArtifactMissing { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Snapshot Artifact Missing")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::InvalidArtifactMetadata { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Invalid Snapshot Artifact")
+                    .with_detail(error.to_string())
+            }
+            SandboxSnapshotError::LegacyArtifactUnsupported { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Legacy Snapshot Cannot Be Restored")
                     .with_detail(error.to_string())
             }
             SandboxSnapshotError::Database(_) => {
@@ -678,6 +691,16 @@ mod tests {
             409,
             "SnapshotInProgress must map to 409 Conflict"
         );
+    }
+
+    #[test]
+    fn from_snapshot_error_maps_legacy_artifact_to_422() {
+        let err = SandboxSnapshotError::LegacyArtifactUnsupported {
+            snapshot_id: "snap_legacy".to_string(),
+            reason: "missing immutable image ID".to_string(),
+        };
+        let prob = Problem::from(err);
+        assert_eq!(prob.status_code.as_u16(), 422);
     }
 
     #[test]

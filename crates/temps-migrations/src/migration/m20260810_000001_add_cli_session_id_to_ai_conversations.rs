@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ADR-038 Phase 2, milestone 2: add `cli_session_id` to `ai_conversations`.
 //!
 //! Stores the Claude CLI session UUID returned by the `system/init` or

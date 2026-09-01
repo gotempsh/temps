@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add `label_filters` (jsonb, default `[]`) to `metric_alert_rules`.
 //!
 //! Format: `[["key1","val1"],["key2","val2"]]` — an AND-combined list of

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import LogViewer from '../runtime-logs/log-viewer'
 import HistoryLogViewer from '../runtime-logs/history-log-viewer'

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import {
@@ -43,6 +46,7 @@ import {
 import { TimeAgo } from '@/components/utils/TimeAgo'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { listBackupChildrenOptions } from '@/lib/backup-children'
 import { deleteBackup } from '@/lib/backup-cleanup'
 import { cancelBackup } from '@/lib/schedule-runs'
@@ -298,6 +302,8 @@ export function BackupDetail() {
   const queryClient = useQueryClient()
   const [showCancelDialog, setShowCancelDialog] = useState(false)
   const [showDeleteDialog, setShowDeleteDialog] = useState(false)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const cancelMutation = useMutation({
     mutationFn: () => cancelBackup(backup!.id),
@@ -329,6 +335,10 @@ export function BackupDetail() {
       navigate(`/backups/s3-sources/${id}`)
     },
     onError: (err: unknown) => {
+      if (handleSensitiveActionError(err, () => deleteMutation.mutate())) {
+        setShowDeleteDialog(false)
+        return
+      }
       const message = err instanceof Error ? err.message : 'Unknown error'
       toast.error('Failed to delete backup', { description: message })
     },
@@ -906,6 +916,8 @@ export function BackupDetail() {
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {verificationDialog}
     </div>
   )
 }

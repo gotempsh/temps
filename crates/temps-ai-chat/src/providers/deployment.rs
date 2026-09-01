@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The deployment-failure context provider (ADR-023, consumer #1).
 //!
 //! Seeds a chat from a failed deployment: its state + reason, each failed step's

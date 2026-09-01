@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Datadog-style firing status for metric dashboards.
 //
 // A dashboard's status is the worst monitor status across the metrics its tiles

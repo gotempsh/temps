@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Wiring for ADR-018 on-demand HTTP-01 TLS (Layer 5).
 //!
 //! Both proxy startup paths — the standalone `temps proxy`

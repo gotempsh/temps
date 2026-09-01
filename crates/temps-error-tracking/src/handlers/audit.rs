@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Audit types for error-tracking source-file operations.
 //!
 //! Uploading and deleting application source is a write on sensitive data

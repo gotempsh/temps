@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! External service health monitor.
 //!
 //! Periodically probes every `external_services` row where `status = 'running'`
@@ -12,25 +15,24 @@
 
 use crate::externalsvc::mariadb::{BinlogArchiveInterval, MariaDbConfig, MariaDbService};
 use crate::externalsvc::postgres_wal_health::{self, PostgresWalHealth};
-use crate::externalsvc::{HealthProbeStatus, S3Credentials, ServiceType};
+use crate::externalsvc::{HealthProbeStatus, S3Credentials};
 use crate::services::ExternalServiceManager;
 use bollard::Docker;
 use chrono::Utc;
+use futures::{stream, StreamExt};
 use sea_orm::{
     ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use temps_core::notifications::{
-    NotificationData, NotificationPriority, NotificationService, NotificationType,
-};
 use temps_core::EncryptionService;
 use temps_entities::{
     backup_schedule_services, backup_schedules, external_service_health_checks, external_services,
-    s3_sources,
+    project_services, s3_sources,
 };
 use temps_metrics::{MetricKind, MetricPoint, MetricsStore, SourceKind};
+use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, warn};
@@ -79,7 +81,7 @@ pub enum HealthMonitorError {
 pub struct ExternalServiceHealthMonitor {
     db: Arc<DatabaseConnection>,
     manager: Arc<ExternalServiceManager>,
-    notification_service: Arc<dyn NotificationService>,
+    alarm_service: Arc<AlarmService>,
     config: ExternalServiceHealthConfig,
     /// Docker handle used by the per-service MariaDB binlog archiver to read
     /// closed binlog segments out of the container.
@@ -107,7 +109,7 @@ impl ExternalServiceHealthMonitor {
     pub fn new(
         db: Arc<DatabaseConnection>,
         manager: Arc<ExternalServiceManager>,
-        notification_service: Arc<dyn NotificationService>,
+        alarm_service: Arc<AlarmService>,
         config: ExternalServiceHealthConfig,
         docker: Arc<Docker>,
         encryption_service: Arc<EncryptionService>,
@@ -115,7 +117,7 @@ impl ExternalServiceHealthMonitor {
         Self {
             db,
             manager,
-            notification_service,
+            alarm_service,
             config,
             docker,
             encryption_service,
@@ -177,14 +179,17 @@ impl ExternalServiceHealthMonitor {
 
         let service_ids: Vec<i32> = services.iter().map(|s| s.id).collect();
 
-        for service in services {
-            if let Err(e) = self.check_service(&service).await {
-                warn!(
-                    "Health check error for service {} ({}): {}",
-                    service.id, service.name, e
-                );
-            }
-        }
+        const MAX_CONCURRENT_HEALTH_CHECKS: usize = 8;
+        stream::iter(services)
+            .for_each_concurrent(MAX_CONCURRENT_HEALTH_CHECKS, |service| async move {
+                if let Err(e) = self.check_service(&service).await {
+                    warn!(
+                        "Health check error for service {} ({}): {}",
+                        service.id, service.name, e
+                    );
+                }
+            })
+            .await;
 
         // Drop stats baselines for services that no longer exist so the map
         // doesn't grow forever as services are created and deleted.
@@ -236,6 +241,7 @@ impl ExternalServiceHealthMonitor {
         // Degraded but never escalate Down upward — liveness wins.
         let wal_snapshot = if service.service_type == "postgres"
             && service.topology == "standalone"
+            && service.node_id.is_none()
             && !matches!(status, HealthProbeStatus::Down)
         {
             self.run_postgres_wal_probe(service).await
@@ -322,6 +328,7 @@ impl ExternalServiceHealthMonitor {
         //    Failures here never affect health monitoring of other services.
         if service.service_type == "mariadb"
             && service.topology == "standalone"
+            && service.node_id.is_none()
             && service.status == "running"
             && !matches!(status, HealthProbeStatus::Down)
         {
@@ -333,7 +340,7 @@ impl ExternalServiceHealthMonitor {
         //    store. Gated on the same per-service `metrics_enabled` flag the
         //    engine-metrics scraper uses. Failures are logged and swallowed —
         //    metrics must never disrupt health monitoring.
-        if service.status == "running" && service.metrics_enabled {
+        if service.status == "running" && service.node_id.is_none() && service.metrics_enabled {
             if let Some(store) = self.metrics_store.clone() {
                 self.record_container_metrics(&store, service).await;
             }
@@ -641,17 +648,6 @@ impl ExternalServiceHealthMonitor {
         &self,
         service: &external_services::Model,
     ) -> (HealthProbeStatus, Option<i32>, Option<String>) {
-        let service_type = match ServiceType::from_str(&service.service_type) {
-            Ok(t) => t,
-            Err(_) => {
-                return (
-                    HealthProbeStatus::Down,
-                    None,
-                    Some(format!("Unknown service type: {}", service.service_type)),
-                );
-            }
-        };
-
         // Cluster services need a fan-out probe — the standalone
         // ExternalService::health_probe path can't reach a multi-host
         // cluster (it falls through to localhost:5432). Route through the
@@ -661,22 +657,7 @@ impl ExternalServiceHealthMonitor {
             return (result.status, result.response_time_ms, result.error_message);
         }
 
-        let service_config = match self.manager.get_service_config(service.id).await {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                return (
-                    HealthProbeStatus::Down,
-                    None,
-                    Some(format!("Failed to load service config: {}", e)),
-                );
-            }
-        };
-
-        let instance = self
-            .manager
-            .get_service_instance(service.name.clone(), service_type);
-
-        match instance.health_probe(service_config).await {
+        match self.manager.probe_service_health(service).await {
             Ok(result) => (result.status, result.response_time_ms, result.error_message),
             Err(e) => (
                 HealthProbeStatus::Down,
@@ -684,6 +665,19 @@ impl ExternalServiceHealthMonitor {
                 Some(format!("health_probe raised an error: {}", e)),
             ),
         }
+    }
+
+    /// Resolve the project a service belongs to, for scoping its alarm.
+    /// External services have no `project_id` column of their own — it's
+    /// only known via the `project_services` join table.
+    async fn resolve_project_id(&self, service_id: i32) -> Option<i32> {
+        project_services::Entity::find()
+            .filter(project_services::Column::ServiceId.eq(service_id))
+            .one(self.db.as_ref())
+            .await
+            .ok()
+            .flatten()
+            .map(|ps| ps.project_id)
     }
 
     async fn send_down_alert(
@@ -701,76 +695,61 @@ impl ExternalServiceHealthMonitor {
             error_message.unwrap_or("(no details)")
         );
 
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
+        let project_id = self.resolve_project_id(service.id).await;
+        let request = FireAlarmRequest {
+            project_id,
+            environment_id: None,
+            deployment_id: None,
+            container_id: None,
+            service_id: Some(service.id),
+            alarm_type: AlarmType::ExternalServiceDown,
+            severity: AlarmSeverity::Critical,
             title,
             message,
-            notification_type: NotificationType::Error,
-            priority: NotificationPriority::Critical,
-            severity: Some("critical".to_string()),
-            timestamp: Utc::now(),
-            metadata: [
-                ("source".to_string(), "external_service_health".to_string()),
-                ("service_id".to_string(), service.id.to_string()),
-                ("service_name".to_string(), service.name.clone()),
-                ("service_type".to_string(), service.service_type.clone()),
-            ]
-            .into_iter()
-            .collect(),
-            bypass_throttling: true,
+            metadata: Some(serde_json::json!({
+                "service_name": service.name,
+                "service_type": service.service_type,
+            })),
         };
 
-        if let Err(e) = self
-            .notification_service
-            .send_notification(notification)
-            .await
-        {
-            error!(
-                "Failed to send down-alert notification for service {}: {}",
-                service.id, e
-            );
-        } else {
-            info!(
+        match self.alarm_service.fire_alarm(request).await {
+            Ok(Some(_)) => info!(
                 "Sent health-check down alert for service {} ({})",
                 service.id, service.name
-            );
+            ),
+            Ok(None) => debug!(
+                "Down alert for service {} suppressed by cooldown/silence",
+                service.id
+            ),
+            Err(e) => error!(
+                "Failed to fire down-alert alarm for service {}: {}",
+                service.id, e
+            ),
         }
     }
 
     async fn send_recovered_alert(&self, service: &external_services::Model) {
-        let title = format!("Service recovered: {}", service.name);
-        let message = format!(
-            "External service '{}' ({}) is responding to health checks again.",
-            service.name, service.service_type,
-        );
-
-        let notification = NotificationData {
-            id: uuid::Uuid::new_v4().to_string(),
-            title,
-            message,
-            notification_type: NotificationType::Info,
-            priority: NotificationPriority::Normal,
-            severity: None,
-            timestamp: Utc::now(),
-            metadata: [
-                ("source".to_string(), "external_service_health".to_string()),
-                ("service_id".to_string(), service.id.to_string()),
-                ("service_name".to_string(), service.name.clone()),
-                ("status".to_string(), "recovered".to_string()),
-            ]
-            .into_iter()
-            .collect(),
-            bypass_throttling: false,
-        };
-
+        let project_id = self.resolve_project_id(service.id).await;
         if let Err(e) = self
-            .notification_service
-            .send_notification(notification)
+            .alarm_service
+            .resolve_alarms_by_scope(
+                project_id,
+                None,
+                None,
+                None,
+                Some(service.id),
+                AlarmType::ExternalServiceDown,
+            )
             .await
         {
             error!(
-                "Failed to send recovery notification for service {}: {}",
+                "Failed to resolve down-alert alarm(s) for recovered service {}: {}",
                 service.id, e
+            );
+        } else {
+            info!(
+                "Service {} ({}) recovered — resolved its down alarm(s)",
+                service.id, service.name
             );
         }
     }

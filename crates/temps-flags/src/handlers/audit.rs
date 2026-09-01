@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Audit events for feature-flag mutations.
 //!
 //! A flag change is a production change with no deployment record and no code

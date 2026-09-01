@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Registry of source-based example projects (from the repo's `examples/` tree)
  * and a helper to build each into a local Docker image the e2e scenario can

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for the Postgres WAL/archive health probe.
 //!
 //! Boots a real Postgres in a Docker container, then drives the probe against

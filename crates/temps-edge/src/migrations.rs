@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sea-ORM migration for the edge SQLite database.
 //!
 //! Runs automatically on startup — creates the edge_requests table

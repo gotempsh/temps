@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Wire-format records consumed from the sync API and the on-disk snapshot.
 //!
 //! Mirrors `temps-dns::handlers::dns_sync::EndpointDto` but is defined here

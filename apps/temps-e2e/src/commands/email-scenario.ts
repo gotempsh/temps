@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Email-via-Mailpit lifecycle against a live Temps instance:
  *   1. create an SMTP email provider pointed at a local Mailpit instance

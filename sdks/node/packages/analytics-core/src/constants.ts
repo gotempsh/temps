@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 export const DEFAULT_BASE_PATH = "/api/_temps";
 export const SESSION_RECORDER_ENDPOINT = "session-replay";
 

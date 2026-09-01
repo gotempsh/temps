@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ADR-038 Phase 2, milestone 4+: add `interactive_bridge_enabled` to
 //! `ai_gateway_config`.
 //!

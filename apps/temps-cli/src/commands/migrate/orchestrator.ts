@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Migration orchestrator — executes a migration plan against the Temps API.
  *
@@ -31,7 +34,7 @@ import type {
   StepResult,
   MigrationStep,
 } from './types.js'
-import type { ServiceTypeRoute } from '../../api/types.gen.js'
+import type { CreatableServiceTypeRoute } from '../../api/types.gen.js'
 
 // ---------------------------------------------------------------------------
 // Orchestrator
@@ -290,7 +293,7 @@ async function executeCreateService(
   }
 
   // Map service type to Temps ServiceTypeRoute
-  const serviceTypeMap: Record<string, ServiceTypeRoute> = {
+  const serviceTypeMap: Record<string, CreatableServiceTypeRoute> = {
     postgres: 'postgres',
     redis: 'redis',
     mongodb: 'mongodb',

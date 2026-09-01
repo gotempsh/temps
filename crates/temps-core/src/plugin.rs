@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Plugin system for modular service registration and route configuration
 //!
 //! This module provides a trait-based plugin system that enables:

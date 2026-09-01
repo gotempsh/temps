@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Bounded time windows for high-volume time-series read endpoints.
 //!
 //! Proxy logs, OTel spans and the unified Observe feed are all append-only

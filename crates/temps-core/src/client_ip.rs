@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared helper for resolving the true client IP from a request.
 //!
 //! SECURITY: `X-Forwarded-For` and `X-Real-IP` are honored ONLY when the

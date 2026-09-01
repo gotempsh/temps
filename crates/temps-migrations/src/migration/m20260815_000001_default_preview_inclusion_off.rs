@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Make preview-environment secret propagation opt-in for existing databases.
 
 use sea_orm_migration::prelude::*;

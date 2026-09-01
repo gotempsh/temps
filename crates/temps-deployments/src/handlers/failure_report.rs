@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Deploy-failure report handlers: preview a redacted, editable copy of a
 //! failed job's trace, and send a user-reviewed copy to the Temps team.
 //!

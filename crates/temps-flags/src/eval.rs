@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Flag evaluation: a pure, synchronous, total function.
 //!
 //! No database, no I/O, no `async`. That is what lets the same code run in an

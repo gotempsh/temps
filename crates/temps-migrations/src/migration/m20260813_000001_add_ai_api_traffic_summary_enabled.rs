@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to add `ai_api_traffic_summary_enabled` to the `projects` table.
 //!
 //! Per-project opt-in for AI summarization of API traffic analytics. The column

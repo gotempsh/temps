@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add `health_metadata` JSONB column to `external_services`.
 //!
 //! Engine-agnostic bag for current-state health signals that don't fit the

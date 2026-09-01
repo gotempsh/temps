@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Audit-log lifecycle against a live Temps instance:
  *   1. capture a wall-clock lower bound, then create a real project (a

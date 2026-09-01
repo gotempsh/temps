@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! In-memory map from sandbox internal ID → `SandboxHandle`. Keeps live
 //! container handles for the lifetime of the server process.
 //!

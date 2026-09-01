@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * A throwaway Go app whose ENTIRE response body is a single, build-time-baked
  * version string -- built for the deploy-lifecycle scenario, which needs two

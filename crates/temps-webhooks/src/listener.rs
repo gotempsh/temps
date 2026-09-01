@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Webhook event listener that subscribes to deployment events from the job queue.
 
 use crate::events::{DeploymentPayload, WebhookEvent, WebhookEventType, WebhookPayload};

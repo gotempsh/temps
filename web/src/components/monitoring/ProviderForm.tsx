@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import { Button } from '@/components/ui/button'
@@ -504,12 +507,13 @@ export function ProviderForm({
               name="config.channel"
               render={({ field }) => (
                 <FormItem>
-                  <FormLabel>Channel (Optional)</FormLabel>
+                  <FormLabel>Channel label (Optional)</FormLabel>
                   <FormControl>
                     <Input {...field} placeholder="#notifications" />
                   </FormControl>
                   <FormDescription>
-                    Override the default channel from the webhook
+                    Identifies this destination in routes. Slack incoming
+                    webhooks remain bound to the channel configured in Slack.
                   </FormDescription>
                   <FormMessage />
                 </FormItem>

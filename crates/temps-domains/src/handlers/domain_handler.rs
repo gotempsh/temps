@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::types::{
     AcmeOrderResponse, CertStatusResponse, ChallengeError, ChallengeValidationStatus,
     CreateDomainRequest, DnsChallengeRecordResult, DnsCompletionResponse, DomainAppState,
@@ -8,9 +11,10 @@ use super::types::{
 };
 use crate::tls::{ProviderError, RepositoryError, TlsError};
 use crate::DomainServiceError;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::problemdetails::Problem;
+use temps_core::SensitiveAction;
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 
 use axum::{
@@ -1007,6 +1011,14 @@ async fn delete_domain(
     Path(domain): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DomainsDelete);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteDomain {
+            domain: domain.clone(),
+        },
+    )
+    .await?;
 
     info!("Deleting domain: {} for user: {}", domain, auth.user_id());
 

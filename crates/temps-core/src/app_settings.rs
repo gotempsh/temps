@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::ToSchema;
@@ -183,6 +186,11 @@ pub struct AppSettings {
     #[serde(default)]
     pub self_update: Option<SelfUpdateSettings>,
 
+    /// MCP server settings (ADR-039). Off by default — enable via the Settings
+    /// UI to expose the MCP endpoint to the Temps CLI wizard.
+    #[serde(default)]
+    pub mcp_server: McpServerSettings,
+
     /// Binary version tag (e.g. "v0.1.0") of the *console* process
     /// (`temps serve`, role=all or role=console) that last started. Written
     /// on console startup; read by the standalone `temps proxy` to detect
@@ -195,6 +203,25 @@ pub struct AppSettings {
     /// accidentally overwrite the self-recorded value.
     #[serde(default)]
     pub console_version: Option<String>,
+}
+
+/// MCP server settings (ADR-039).
+///
+/// The MCP endpoint lets AI tools (e.g. the Temps CLI wizard) interact with
+/// this Temps instance through the Model Context Protocol.  Disabled by
+/// default so new installs do not expose the endpoint until the operator
+/// explicitly opts in.
+///
+/// `bool` defaults to `false` in Rust and JSON (`#[serde(default)]`), so the
+/// safe-off behaviour is automatic for new installs and legacy settings rows.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
+#[serde(default)]
+pub struct McpServerSettings {
+    /// Master switch. When `false` (default), `GET /mcp/tools` returns `404`
+    /// and all other MCP endpoints return `404` too.  Set to `true` via the
+    /// Settings UI to activate the MCP server.
+    #[schema(example = false)]
+    pub enabled: bool,
 }
 
 /// Cluster-DNS resolver settings (ADR-024, experimental beta).
@@ -1248,6 +1275,7 @@ impl Default for AppSettings {
             monitoring: MonitoringSettings::default(),
             observability_compression: ObservabilityCompressionSettings::default(),
             observability_retention: ObservabilityRetentionSettings::default(),
+            mcp_server: McpServerSettings::default(),
             setup_complete: false,
             require_mfa_for_admins: false,
             self_update: None,

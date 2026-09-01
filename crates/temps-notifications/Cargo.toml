@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-notifications"
 version.workspace = true
@@ -35,3 +38,5 @@ tokio-test = "0.4"
 testcontainers = { workspace = true }
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
+sea-orm-migration = { workspace = true }
+temps-migrations = { path = "../temps-migrations" }

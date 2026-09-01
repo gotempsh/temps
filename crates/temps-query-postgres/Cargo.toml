@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-query-postgres"
 version.workspace = true
@@ -10,7 +13,7 @@ repository.workspace = true
 temps-query = { path = "../temps-query" }
 tokio = { version = "1.40", features = ["full"] }
 tokio-postgres = { version = "0.7", features = ["with-serde_json-1", "with-chrono-0_4", "with-uuid-1"] }
-tokio-postgres-rustls = "0.13"
+tokio-postgres-rustls = "0.14"
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
 async-trait = "0.1"

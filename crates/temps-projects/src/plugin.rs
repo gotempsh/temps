@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -71,6 +74,8 @@ impl TempsPlugin for ProjectsPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let project_service = context.require_service::<ProjectService>();
+        let external_service_manager =
+            context.require_service::<temps_providers::ExternalServiceManager>();
         let deployment_canceller = context.require_service::<dyn temps_core::DeploymentCanceller>();
         let deployment_container_cleaner =
             context.require_service::<dyn temps_core::DeploymentContainerCleaner>();
@@ -90,6 +95,7 @@ impl TempsPlugin for ProjectsPlugin {
         let project_access_checker = context.get_service::<dyn temps_core::ProjectAccessChecker>();
         let app_state = Arc::new(crate::handlers::AppState {
             project_service,
+            external_service_manager,
             deployment_canceller,
             deployment_container_cleaner,
             custom_domain_service,

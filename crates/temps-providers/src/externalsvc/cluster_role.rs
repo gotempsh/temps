@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed roles + pg_auto_failover states for cluster members.
 //!
 //! Replaces the dozens of `&str` matches against `"primary"` / `"replica"` /

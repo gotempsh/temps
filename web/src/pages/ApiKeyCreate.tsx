@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { type CreateApiKeyRequest } from '@/api/client'
 import { createApiKeyMutation } from '@/api/client/@tanstack/react-query.gen'
 import { useApiKeyPermissions } from '@/components/api-keys/useApiKeyPermissions'
@@ -33,7 +36,7 @@ import {
   ChevronRight,
   Edit,
 } from 'lucide-react'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { toast } from 'sonner'
 import { usePageTitle } from '@/hooks/usePageTitle'
@@ -64,6 +67,7 @@ export default function ApiKeyCreate() {
   const [copiedKey, setCopiedKey] = useState(false)
   const [openCategories, setOpenCategories] = useState<Set<string>>(new Set())
   const [createdKeyId, setCreatedKeyId] = useState<number | null>(null)
+  const isSubmittingRef = useRef(false)
 
   const { data: permissionsData, isLoading: isLoadingPermissions } =
     useApiKeyPermissions()
@@ -156,17 +160,30 @@ export default function ApiKeyCreate() {
   }
 
   const handleSubmit = () => {
+    const trimmedName = keyName.trim()
+    if (!trimmedName || isSubmittingRef.current || createMutation.isPending) {
+      return
+    }
+    isSubmittingRef.current = true
+
     const data: CreateApiKeyRequest = {
-      name: keyName,
+      name: trimmedName,
       role_type: useCustomPermissions ? 'custom' : selectedRole,
       permissions: useCustomPermissions
         ? Array.from(selectedPermissions)
         : undefined,
       expires_at: expiresAt ? new Date(expiresAt).toISOString() : undefined,
     }
-    createMutation.mutate({
-      body: data,
-    })
+    createMutation.mutate(
+      {
+        body: data,
+      },
+      {
+        onSettled: () => {
+          isSubmittingRef.current = false
+        },
+      }
+    )
   }
 
   const canProceed = () => {
@@ -239,7 +256,7 @@ export default function ApiKeyCreate() {
 
             <div className="space-y-4 p-4 bg-muted rounded-lg">
               <div className="text-sm">
-                <strong>Name:</strong> {keyName}
+                <strong>Name:</strong> {keyName.trim()}
               </div>
               <div className="text-sm">
                 <strong>Access Level:</strong>{' '}
@@ -631,7 +648,7 @@ export default function ApiKeyCreate() {
             <div className="space-y-4">
               <div>
                 <Label className="text-muted-foreground">Name</Label>
-                <p className="font-medium">{keyName}</p>
+                <p className="font-medium">{keyName.trim()}</p>
               </div>
 
               <Separator />

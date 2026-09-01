@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { render, renderHook, waitFor } from "@testing-library/react";
 import React from "react";

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Join table linking a backup schedule to the external services it targets.
 //!
 //! See migration `m20260519_000001_create_backup_schedule_services` for the

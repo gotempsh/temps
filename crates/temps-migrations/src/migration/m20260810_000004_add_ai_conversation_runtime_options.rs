@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Persist the immutable runtime options selected for each AI conversation.
 
 use sea_orm_migration::prelude::*;

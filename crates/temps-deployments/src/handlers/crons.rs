@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Cron Jobs API Handlers
 //!
 //! API endpoints for managing scheduled tasks and cron jobs

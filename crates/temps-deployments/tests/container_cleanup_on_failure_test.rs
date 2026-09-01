@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration test for container cleanup when deployment fails
 //!
 //! This test verifies that when a deployment job fails (e.g., health check timeout),

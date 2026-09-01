@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Redis implementation of the temps-query DataSource trait
 //!
 //! This crate provides Redis key-value store access through the generic query interface.

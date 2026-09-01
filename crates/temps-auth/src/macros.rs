@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Note: This will be a procedural macro crate, but for now we'll create
 // a simpler function-based approach that can be used similarly
 

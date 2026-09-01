@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Spawns the REAL @temps-sdk/cli binary as a subprocess against a live
  * instance, so cli-scenario.ts proves what a unit test never can: that argv

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -73,6 +76,15 @@ pub enum AgentError {
         run_id: i32,
         sandbox_id: String,
         reason: String,
+    },
+
+    #[error(
+        "Sandbox snapshot for {sandbox_id} exceeded the {max_size_bytes} byte limit while {stage}"
+    )]
+    SnapshotSizeLimitExceeded {
+        sandbox_id: String,
+        stage: String,
+        max_size_bytes: u64,
     },
 
     #[error("Sandbox provider '{provider}' unavailable: {reason}")]

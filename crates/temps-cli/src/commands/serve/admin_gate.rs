@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Axum middleware for the admin console listener.
 //!
 //! The data types — `AdminGateConfig`, `AdminGateHandle`, `AdminGateSource`
@@ -19,7 +22,7 @@ use std::net::{IpAddr, SocketAddr};
 
 use axum::{
     extract::{ConnectInfo, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderMap, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
 };
@@ -31,23 +34,43 @@ pub use temps_core::admin_gate::{
 
 /// Resolve the effective client IP for gating purposes. When
 /// `trust_forwarded_for` is true and the immediate peer is loopback, the
-/// leftmost address in `X-Forwarded-For` wins; otherwise the peer's address
-/// is used directly.
-fn effective_client_ip(req: &Request, peer: IpAddr, trust_forwarded_for: bool) -> IpAddr {
+/// rightmost address in `X-Forwarded-For` wins; otherwise the peer's address
+/// is used directly. Temps' trusted proxy replaces inbound XFF with that
+/// canonical address, so client-supplied entries cannot influence the gate.
+pub(crate) fn effective_client_ip(
+    headers: &HeaderMap,
+    peer: IpAddr,
+    trust_forwarded_for: bool,
+) -> Result<IpAddr, InvalidForwardedFor> {
     if !trust_forwarded_for || !peer.is_loopback() {
-        return peer;
+        return Ok(peer);
     }
-    let Some(value) = req.headers().get("x-forwarded-for") else {
-        return peer;
+    Ok(trusted_forwarded_client_ip(headers, peer)?.unwrap_or(peer))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InvalidForwardedFor;
+
+/// Return the client address supplied by a trusted loopback proxy. A present
+/// but invalid header is an error rather than a fallback to loopback: treating
+/// malformed proxy metadata as localhost would widen an allowlist on failure.
+pub(crate) fn trusted_forwarded_client_ip(
+    headers: &HeaderMap,
+    peer: IpAddr,
+) -> Result<Option<IpAddr>, InvalidForwardedFor> {
+    if !peer.is_loopback() {
+        return Ok(None);
+    }
+    let Some(value) = headers.get("x-forwarded-for") else {
+        return Ok(None);
     };
-    let Ok(value) = value.to_str() else {
-        return peer;
-    };
-    value
-        .split(',')
+    let value = value.to_str().map_err(|_| InvalidForwardedFor)?;
+    let ip = value
+        .rsplit(',')
         .next()
         .and_then(|s| s.trim().parse::<IpAddr>().ok())
-        .unwrap_or(peer)
+        .ok_or(InvalidForwardedFor)?;
+    Ok(Some(ip))
 }
 
 fn host_header(req: &Request) -> Option<String> {
@@ -70,7 +93,19 @@ pub async fn admin_gate(
         return next.run(req).await;
     }
 
-    let client_ip = effective_client_ip(&req, peer.ip(), config.trust_forwarded_for);
+    let client_ip = match effective_client_ip(req.headers(), peer.ip(), config.trust_forwarded_for)
+    {
+        Ok(client_ip) => client_ip,
+        Err(InvalidForwardedFor) => {
+            warn!(
+                peer = %peer,
+                host = host_header(&req).as_deref().unwrap_or(""),
+                path = %req.uri().path(),
+                "admin gate denied request with invalid trusted X-Forwarded-For header"
+            );
+            return StatusCode::NOT_FOUND.into_response();
+        }
+    };
     let host = host_header(&req);
 
     if !config.would_allow(client_ip, host.as_deref()) {
@@ -95,29 +130,61 @@ mod tests {
 
     #[test]
     fn forwarded_for_only_trusted_from_loopback() {
-        let req = Request::builder()
-            .uri("/")
-            .header("x-forwarded-for", "203.0.113.5")
-            .body(axum::body::Body::empty())
-            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "x-forwarded-for",
+            "198.51.100.99, 203.0.113.5".parse().unwrap(),
+        );
 
         let peer_loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let peer_external = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
 
-        // Loopback + trust → use header
+        // Loopback + trust → use the rightmost proxy-appended address.
         assert_eq!(
-            effective_client_ip(&req, peer_loopback, true),
-            IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5))
+            effective_client_ip(&headers, peer_loopback, true),
+            Ok(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 5)))
         );
         // External + trust → ignore header (anti-spoofing)
         assert_eq!(
-            effective_client_ip(&req, peer_external, true),
-            peer_external
+            effective_client_ip(&headers, peer_external, true),
+            Ok(peer_external)
         );
         // Loopback + no trust → ignore header
         assert_eq!(
-            effective_client_ip(&req, peer_loopback, false),
-            peer_loopback
+            effective_client_ip(&headers, peer_loopback, false),
+            Ok(peer_loopback)
+        );
+    }
+
+    #[test]
+    fn malformed_forwarded_for_is_rejected() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "not-an-ip".parse().unwrap());
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        assert_eq!(
+            effective_client_ip(&headers, peer, true),
+            Err(InvalidForwardedFor)
+        );
+    }
+
+    #[test]
+    fn missing_forwarded_for_falls_back_to_loopback_peer() {
+        let headers = HeaderMap::new();
+        let peer = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+        assert_eq!(effective_client_ip(&headers, peer, true), Ok(peer));
+    }
+
+    #[test]
+    fn ipv6_loopback_trusts_forwarded_ipv6_client() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-forwarded-for", "fd7a:115c:a1e0::123".parse().unwrap());
+        let peer = "::1".parse::<IpAddr>().unwrap();
+
+        assert_eq!(
+            effective_client_ip(&headers, peer, true),
+            Ok("fd7a:115c:a1e0::123".parse::<IpAddr>().unwrap())
         );
     }
 }

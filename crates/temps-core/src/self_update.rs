@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Contract for applying a release update to the running binary from the API.
 //!
 //! Lives in temps-core because the two crates involved must not depend on each

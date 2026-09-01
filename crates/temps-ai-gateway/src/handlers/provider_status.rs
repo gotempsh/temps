@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Capability and preference endpoints for the ADR-037 provider switching seam.
 //!
 //! `GET /api/ai/provider-status`  — returns the current routing preference and

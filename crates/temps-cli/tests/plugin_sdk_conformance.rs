@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The plugin SDK's endpoint table must describe endpoints that exist.
 //!
 //! `temps-plugin-sdk` declares the platform endpoints it calls as a static

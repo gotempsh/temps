@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-node applied-state for the worker-side internal route store.
 //!
 //! Mirror of `node_dns_state`. Each row tracks the highest in-memory

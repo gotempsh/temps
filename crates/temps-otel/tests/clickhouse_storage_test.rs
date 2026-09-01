@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Real-ClickHouse integration test for the OTel metrics storage path.
 //!
 //! Spins up a `clickhouse/clickhouse-server` testcontainer, runs the OTel CH

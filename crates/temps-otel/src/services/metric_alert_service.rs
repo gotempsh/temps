@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service for first-class, metric-centric alert rules.
 //!
 //! An alert rule is defined on a *signal* (project + metric + aggregation +

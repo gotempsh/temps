@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Deployment Token Validation Service
 //!
 //! Validates deployment tokens for authentication in the middleware.

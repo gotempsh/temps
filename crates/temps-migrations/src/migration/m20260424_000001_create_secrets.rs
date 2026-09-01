@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to create the `secrets` and `secret_environments` tables.
 //!
 //! Secrets are exposed to containers as files mounted under `/run/secrets/<KEY>`

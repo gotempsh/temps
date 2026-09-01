@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed access to the platform's HTTP API from a plugin.
 //!
 //! [`crate::client::TempsClient::api_call`] can reach any endpoint, but it

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -11,12 +14,62 @@ import {
   updateNotificationProvider as updateProvider2,
   updateSlackProvider,
   updateNotificationEmailProvider,
+  listNotificationRoutes,
+  createNotificationRoute,
+  getNotificationRoute,
+  updateNotificationRoute,
+  deleteNotificationRoute,
 } from '../../api/sdk.gen.js'
-import type { NotificationProviderResponse } from '../../api/types.gen.js'
+import type { NotificationProviderResponse, NotificationRoute } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
-import { promptText, promptPassword, promptSelect, promptConfirm, promptNumber } from '../../ui/prompts.js'
+import { promptText, promptPassword, promptSelect, promptConfirm, promptNumber, promptCheckbox } from '../../ui/prompts.js'
 import { newline, header, icons, json, colors, success, info, warning, keyValue } from '../../ui/output.js'
+
+const SEVERITIES = ['debug', 'info', 'warning', 'error', 'critical', 'emergency'] as const
+
+interface RouteListOptions {
+  json?: boolean
+}
+
+interface RouteShowOptions {
+  id: string
+  json?: boolean
+}
+
+interface RouteCreateOptions {
+  name?: string
+  minSeverity?: string
+  maxSeverity?: string
+  providerIds?: string
+  enabled?: string
+  json?: boolean
+  yes?: boolean
+}
+
+interface RouteUpdateOptions {
+  id: string
+  name?: string
+  minSeverity?: string
+  maxSeverity?: string
+  providerIds?: string
+  enabled?: string
+  json?: boolean
+}
+
+interface RouteRemoveOptions {
+  id: string
+  force?: boolean
+  yes?: boolean
+}
+
+export function parseProviderIds(value: string): number[] {
+  return value
+    .split(',')
+    .map((id) => id.trim())
+    .filter((id) => id.length > 0)
+    .map((id) => parseInt(id, 10))
+}
 
 interface AddOptions {
   type?: string
@@ -285,6 +338,57 @@ export function registerNotificationsCommands(program: Command): void {
     .description('Send a test notification')
     .requiredOption('--id <id>', 'Provider ID')
     .action(testProviderAction)
+
+  const routes = notifications
+    .command('routes')
+    .description('Manage severity-based notification routes (which providers receive which severities)')
+
+  routes
+    .command('list')
+    .alias('ls')
+    .description('List notification routes')
+    .option('--json', 'Output in JSON format')
+    .action(listRoutes)
+
+  routes
+    .command('show')
+    .description('Show notification route details')
+    .requiredOption('--id <id>', 'Route ID')
+    .option('--json', 'Output in JSON format')
+    .action(showRoute)
+
+  routes
+    .command('create')
+    .description('Create a notification route')
+    .option('-n, --name <name>', 'Route name')
+    .option('--min-severity <severity>', `Minimum severity: ${SEVERITIES.join(', ')}`)
+    .option('--max-severity <severity>', `Maximum severity: ${SEVERITIES.join(', ')}`)
+    .option('--provider-ids <ids>', 'Comma-separated notification provider IDs')
+    .option('--enabled <enabled>', 'Enable or disable (true/false, default: true)')
+    .option('--json', 'Output in JSON format')
+    .option('-y, --yes', 'Skip confirmation prompts (for automation)')
+    .action(createRoute)
+
+  routes
+    .command('update')
+    .description('Update a notification route')
+    .requiredOption('--id <id>', 'Route ID')
+    .option('-n, --name <name>', 'New route name')
+    .option('--min-severity <severity>', `Minimum severity: ${SEVERITIES.join(', ')}`)
+    .option('--max-severity <severity>', `Maximum severity: ${SEVERITIES.join(', ')}`)
+    .option('--provider-ids <ids>', 'Comma-separated notification provider IDs (replaces the current set)')
+    .option('--enabled <enabled>', 'Enable or disable (true/false)')
+    .option('--json', 'Output in JSON format')
+    .action(updateRoute)
+
+  routes
+    .command('remove')
+    .alias('rm')
+    .description('Remove a notification route')
+    .requiredOption('--id <id>', 'Route ID')
+    .option('-f, --force', 'Skip confirmation')
+    .option('-y, --yes', 'Skip confirmation prompts (alias for --force)')
+    .action(removeRoute)
 }
 
 async function listProviders(options: { json?: boolean }): Promise<void> {
@@ -903,4 +1007,253 @@ async function testProviderAction(options: TestOptions): Promise<void> {
 
   success('Test notification sent successfully!')
   info('Check your notification channel for the test message')
+}
+
+function routeColumns(): TableColumn<NotificationRoute>[] {
+  return [
+    { header: 'ID', key: 'id', width: 6 },
+    { header: 'Name', key: 'name', color: (v) => colors.bold(v) },
+    { header: 'Range', accessor: (r) => `${r.min_severity} → ${r.max_severity}` },
+    { header: 'Providers', accessor: (r) => r.provider_ids.join(', ') || '(none)' },
+    { header: 'Status', accessor: (r) => r.enabled ? 'enabled' : 'disabled', color: (v) => statusBadge(v === 'enabled' ? 'active' : 'inactive') },
+  ]
+}
+
+async function listRoutes(options: RouteListOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const routesPage = await withSpinner('Fetching notification routes...', async () => {
+    const { data, error } = await listNotificationRoutes({ client, query: { page: 1, page_size: 100 } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+  const items = routesPage?.items ?? []
+
+  if (options.json) {
+    json(items)
+    return
+  }
+
+  newline()
+  header(`${icons.info} Notification Routes (${items.length})`)
+
+  if (items.length === 0) {
+    info('No notification routes configured')
+    info('Run: temps notifications routes create --name "Critical alerts" --min-severity critical --max-severity emergency --provider-ids <id> -y')
+    newline()
+    return
+  }
+
+  printTable(items, routeColumns(), { style: 'minimal' })
+  newline()
+}
+
+async function showRoute(options: RouteShowOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid route ID')
+    return
+  }
+
+  const route = await withSpinner('Fetching route...', async () => {
+    const { data, error } = await getNotificationRoute({ client, path: { id } })
+    if (error || !data) {
+      throw new Error(getErrorMessage(error) ?? `Route ${options.id} not found`)
+    }
+    return data
+  })
+
+  if (options.json) {
+    json(route)
+    return
+  }
+
+  newline()
+  header(`${icons.info} ${route.name}`)
+  keyValue('ID', route.id)
+  keyValue('Severity range', `${route.min_severity} → ${route.max_severity}`)
+  keyValue('Providers', route.provider_ids.join(', ') || '(none)')
+  keyValue('Status', route.enabled ? colors.success('enabled') : colors.muted('disabled'))
+  keyValue('Created', new Date(route.created_at * 1000).toLocaleString())
+  keyValue('Updated', new Date(route.updated_at * 1000).toLocaleString())
+  newline()
+}
+
+/** Resolves --provider-ids, or interactively prompts using the currently configured providers. */
+async function resolveProviderIds(options: { providerIds?: string; yes?: boolean }): Promise<number[]> {
+  if (options.providerIds) {
+    return parseProviderIds(options.providerIds)
+  }
+  if (options.yes) {
+    throw new Error('--provider-ids is required with -y/--yes')
+  }
+
+  const { data: providers, error } = await listNotificationProviders({ client })
+  if (error) {
+    throw new Error(getErrorMessage(error))
+  }
+  if (!providers || providers.length === 0) {
+    throw new Error('No notification providers configured. Run: temps notifications add')
+  }
+
+  const selected = await promptCheckbox<number>({
+    message: 'Providers to deliver to this route',
+    choices: providers.map((p) => ({
+      name: `${p.name} (${p.provider_type}, ${p.enabled ? 'enabled' : 'disabled'})`,
+      value: p.id,
+    })),
+    required: true,
+  })
+  return selected
+}
+
+async function createRoute(options: RouteCreateOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const isAutomation = options.yes && options.name && options.minSeverity && options.maxSeverity && options.providerIds
+
+  const name = options.name || await promptText({
+    message: 'Route name',
+    required: true,
+  })
+
+  const minSeverity = options.minSeverity || (isAutomation ? undefined : await promptSelect({
+    message: 'Minimum severity',
+    choices: SEVERITIES.map((s) => ({ name: s, value: s })),
+    default: 'debug',
+  }))
+  if (!minSeverity) {
+    warning('--min-severity is required with -y/--yes')
+    return
+  }
+
+  const maxSeverity = options.maxSeverity || (isAutomation ? undefined : await promptSelect({
+    message: 'Maximum severity',
+    choices: SEVERITIES.map((s) => ({ name: s, value: s })),
+    default: 'emergency',
+  }))
+  if (!maxSeverity) {
+    warning('--max-severity is required with -y/--yes')
+    return
+  }
+
+  const providerIds = await resolveProviderIds(options)
+
+  const parsedEnabled = parseEnabledFlag(options.enabled)
+  if (parsedEnabled === 'invalid') {
+    warning('Invalid value for --enabled. Use "true" or "false"')
+    return
+  }
+
+  const created = await withSpinner('Creating notification route...', async () => {
+    const { data, error } = await createNotificationRoute({
+      client,
+      body: {
+        name,
+        min_severity: minSeverity,
+        max_severity: maxSeverity,
+        provider_ids: providerIds,
+        enabled: parsedEnabled ?? true,
+      },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json && created) {
+    json(created)
+    return
+  }
+
+  success(`Notification route "${created?.name ?? name}" created successfully`)
+}
+
+async function updateRoute(options: RouteUpdateOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid route ID')
+    return
+  }
+
+  const parsedEnabled = parseEnabledFlag(options.enabled)
+  if (parsedEnabled === 'invalid') {
+    warning('Invalid value for --enabled. Use "true" or "false"')
+    return
+  }
+
+  const updated = await withSpinner('Updating notification route...', async () => {
+    const { data, error } = await updateNotificationRoute({
+      client,
+      path: { id },
+      body: {
+        name: options.name ?? undefined,
+        min_severity: options.minSeverity ?? undefined,
+        max_severity: options.maxSeverity ?? undefined,
+        provider_ids: options.providerIds ? parseProviderIds(options.providerIds) : undefined,
+        enabled: parsedEnabled ?? undefined,
+      },
+    })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+    return data
+  })
+
+  if (options.json && updated) {
+    json(updated)
+    return
+  }
+
+  success(`Notification route "${updated?.name ?? options.id}" updated successfully`)
+}
+
+async function removeRoute(options: RouteRemoveOptions): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const id = parseInt(options.id, 10)
+  if (isNaN(id)) {
+    warning('Invalid route ID')
+    return
+  }
+
+  const { data: route, error: getError } = await getNotificationRoute({ client, path: { id } })
+  if (getError || !route) {
+    warning(`Route ${options.id} not found`)
+    return
+  }
+
+  const skipConfirmation = options.force || options.yes
+
+  if (!skipConfirmation) {
+    const confirmed = await promptConfirm({
+      message: `Remove notification route "${route.name}"?`,
+      default: false,
+    })
+    if (!confirmed) {
+      info('Cancelled')
+      return
+    }
+  }
+
+  await withSpinner('Removing route...', async () => {
+    const { error } = await deleteNotificationRoute({ client, path: { id } })
+    if (error) {
+      throw new Error(getErrorMessage(error))
+    }
+  })
+
+  success('Notification route removed')
 }

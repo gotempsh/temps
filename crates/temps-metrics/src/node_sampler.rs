@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Background sampler that periodically runs [`NodeMetricsCollector`] and
 //! persists its points to the metrics store as control-plane node metrics.
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 export type ProxyRangePreset = '1h' | '6h' | '24h' | '7d'
 export type ProxyRangeValue = ProxyRangePreset | 'custom'
 

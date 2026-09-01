@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { subDays } from 'date-fns'
 import type { DateRange } from 'react-day-picker'
 

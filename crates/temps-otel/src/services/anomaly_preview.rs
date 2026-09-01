@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Backtest / band preview for alert rules.
 //!
 //! Replays a metric over a time range against the SAME detector logic the

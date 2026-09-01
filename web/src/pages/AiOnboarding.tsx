@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useEffect, useState, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { useMutation, useQuery } from '@tanstack/react-query'

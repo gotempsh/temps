@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Periodic sweeper that stops sandboxes whose `expires_at` has passed.
 //!
 //! Sandboxes are created with a bounded `timeout_secs` window (default 1h,

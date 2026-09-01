@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! S3-compatible storage backend for log chunks
 //!
 //! Works with AWS S3, MinIO, Tigris, Cloudflare R2, and any S3-compatible API.

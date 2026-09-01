@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::health_monitor::ExternalServiceHealthMonitor;
 use crate::{ExternalServiceManager, QueryService};
 
@@ -101,6 +104,34 @@ pub enum ServiceTypeRoute {
     Minio,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum CreatableServiceTypeRoute {
+    Mariadb,
+    Mongodb,
+    Postgres,
+    Redis,
+    S3,
+    Kv,
+    Blob,
+    Rustfs,
+}
+
+impl From<CreatableServiceTypeRoute> for crate::externalsvc::ServiceType {
+    fn from(service_type: CreatableServiceTypeRoute) -> Self {
+        match service_type {
+            CreatableServiceTypeRoute::Mariadb => Self::Mariadb,
+            CreatableServiceTypeRoute::Mongodb => Self::Mongodb,
+            CreatableServiceTypeRoute::Postgres => Self::Postgres,
+            CreatableServiceTypeRoute::Redis => Self::Redis,
+            CreatableServiceTypeRoute::S3 => Self::S3,
+            CreatableServiceTypeRoute::Kv => Self::Kv,
+            CreatableServiceTypeRoute::Blob => Self::Blob,
+            CreatableServiceTypeRoute::Rustfs => Self::Rustfs,
+        }
+    }
+}
+
 impl ServiceTypeRoute {
     #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> anyhow::Result<Self> {
@@ -129,7 +160,6 @@ impl ServiceTypeRoute {
             ServiceTypeRoute::Kv,
             ServiceTypeRoute::Blob,
             ServiceTypeRoute::Rustfs,
-            ServiceTypeRoute::Minio,
         ]
     }
 
@@ -321,6 +351,17 @@ pub struct ProviderMetadata {
 }
 
 impl ProviderMetadata {
+    /// Providers offered by new-service creation surfaces.
+    ///
+    /// Deprecated providers remain in `get_all` so existing services can
+    /// still resolve their metadata through `get_by_type`.
+    pub fn get_creatable() -> Vec<Self> {
+        Self::get_all()
+            .into_iter()
+            .filter(|provider| ServiceTypeRoute::get_all().contains(&provider.service_type))
+            .collect()
+    }
+
     pub fn get_all() -> Vec<Self> {
         vec![
             Self {
@@ -376,6 +417,38 @@ impl ProviderMetadata {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{CreatableServiceTypeRoute, ProviderMetadata, ServiceTypeRoute};
+
+    #[test]
+    fn deprecated_minio_is_not_advertised_for_creation() {
+        assert!(!ServiceTypeRoute::get_all().contains(&ServiceTypeRoute::Minio));
+        assert!(ProviderMetadata::get_creatable()
+            .iter()
+            .all(|provider| provider.service_type != ServiceTypeRoute::Minio));
+    }
+
+    #[test]
+    fn deprecated_minio_still_parses_and_has_metadata_for_existing_services() {
+        assert_eq!(
+            ServiceTypeRoute::from_str("minio").expect("legacy MinIO type should remain readable"),
+            ServiceTypeRoute::Minio
+        );
+        assert!(ProviderMetadata::get_by_type(&ServiceTypeRoute::Minio).is_some());
+    }
+
+    #[test]
+    fn deprecated_minio_is_rejected_by_creation_request_type() {
+        assert!(serde_json::from_str::<CreatableServiceTypeRoute>("\"minio\"").is_err());
+        assert_eq!(
+            serde_json::from_str::<CreatableServiceTypeRoute>("\"s3\"")
+                .expect("S3 should remain creatable"),
+            CreatableServiceTypeRoute::S3
+        );
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct ExternalServiceDetails {
     pub service: ExternalServiceInfo,
@@ -389,7 +462,7 @@ pub struct ExternalServiceDetails {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct CreateExternalServiceRequest {
     pub name: String,
-    pub service_type: ServiceTypeRoute,
+    pub service_type: CreatableServiceTypeRoute,
     pub version: Option<String>,
     pub parameters: HashMap<String, serde_json::Value>,
     /// Target node ID for the service. Omit or null to run on the control plane.

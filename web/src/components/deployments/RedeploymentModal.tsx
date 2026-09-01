@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   checkCommitExistsOptions,
   getEnvironmentsOptions,
@@ -122,6 +125,7 @@ interface RedeploymentModalProps {
     commit?: string
     tag?: string
     environmentId: number
+    imageRef?: string
   }) => Promise<void>
   defaultBranch?: string
   defaultType?: 'branch' | 'commit' | 'tag'
@@ -201,6 +205,10 @@ export function RedeploymentModal({
   >([])
   const [commitToCheck, setCommitToCheck] = useState('')
   const [tagToCheck, setTagToCheck] = useState('')
+  // Editable image reference for docker_image projects — defaults to the
+  // previous deployment's image but the user can change it (e.g. deploy a
+  // new tag) instead of always re-pulling the same one.
+  const [imageRefInput, setImageRefInput] = useState(imageRef || '')
 
   // Derive effective values (either user-selected or initial/default)
   const effectiveBranch = selectedBranch !== '' ? selectedBranch : initialBranch
@@ -341,8 +349,9 @@ export function RedeploymentModal({
       setSelectedCommit(defaultCommit || '')
       setSelectedTag(defaultTag || '')
       setDeploymentType(defaultType || 'branch')
+      setImageRefInput(imageRef || '')
     }
-  }, [isOpen, defaultCommit, defaultTag, defaultType])
+  }, [isOpen, defaultCommit, defaultTag, defaultType, imageRef])
 
   const handleEnvironmentChange = (value: string) => {
     const environmentId = value ? parseInt(value) : null
@@ -427,7 +436,12 @@ export function RedeploymentModal({
         toast.error('No environment specified for deployment')
         return
       }
-      await onConfirm({ environmentId: envId })
+      const ref = imageRefInput.trim()
+      if (!ref) {
+        toast.error('Enter an image reference')
+        return
+      }
+      await onConfirm({ environmentId: envId, imageRef: ref })
       return
     }
 
@@ -526,28 +540,26 @@ export function RedeploymentModal({
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">
               {mode === 'redeploy'
-                ? 'This will re-pull and run the prebuilt image:'
-                : 'Deploy the prebuilt image:'}
+                ? 'Re-pull and run an image. Defaults to the one currently deployed — change it to deploy a different image or tag.'
+                : 'Pull and deploy a prebuilt image.'}
             </p>
-            <div className="space-y-3 rounded-md border bg-muted/50 p-4">
-              <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2">
-                <div className="text-sm font-medium">Image:</div>
-                <div
-                  className="truncate text-sm font-mono"
-                  title={imageRef || ''}
-                >
-                  {imageRef || 'N/A'}
-                </div>
-                {mode === 'redeploy' ? (
-                  <>
-                    <div className="text-sm font-medium">Environment:</div>
-                    <div className="text-sm">
-                      {environmentName || 'Loading...'}
-                    </div>
-                  </>
-                ) : null}
-              </div>
+            <div className="space-y-2">
+              <Label htmlFor="redeploy-image-ref">Image reference</Label>
+              <Input
+                id="redeploy-image-ref"
+                placeholder="ghcr.io/org/app:v1.2.3"
+                value={imageRefInput}
+                disabled={isLoading}
+                onChange={(e) => setImageRefInput(e.target.value)}
+                className="font-mono text-sm"
+              />
             </div>
+            {mode === 'redeploy' ? (
+              <div className="grid grid-cols-[auto_1fr] gap-x-3 gap-y-2 rounded-md border bg-muted/50 p-4">
+                <div className="text-sm font-medium">Environment:</div>
+                <div className="text-sm">{environmentName || 'Loading...'}</div>
+              </div>
+            ) : null}
             {mode !== 'redeploy' && (
               <div className="space-y-2">
                 <Label htmlFor="image-environment">Environment</Label>
@@ -583,7 +595,7 @@ export function RedeploymentModal({
                 onClick={handleConfirm}
                 disabled={
                   isLoading ||
-                  !imageRef ||
+                  !imageRefInput.trim() ||
                   (mode === 'redeploy'
                     ? !defaultEnvironment
                     : !effectiveEnvironment)

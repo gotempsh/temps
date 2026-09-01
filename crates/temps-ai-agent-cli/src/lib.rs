@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ADR-037: subscription-backed agent CLI providers for the Temps AI foundation.
 //!
 //! This crate introduces two types:

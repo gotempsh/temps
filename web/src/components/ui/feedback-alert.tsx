@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { CheckCircle2, AlertCircle, Info, AlertTriangle } from 'lucide-react'
 import { useEffect } from 'react'

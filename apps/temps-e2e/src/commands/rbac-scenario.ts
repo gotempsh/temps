@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * RBAC / project-team-access lifecycle against a live Temps instance --
  * proving the actual permission BOUNDARY, not just that team/access CRUD

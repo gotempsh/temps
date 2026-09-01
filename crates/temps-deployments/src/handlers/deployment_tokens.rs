@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Deployment Token Handlers
 //!
 //! REST API endpoints for managing deployment tokens that provide
@@ -13,8 +16,8 @@ use axum::{
     Extension, Json, Router,
 };
 use temps_auth::RequireAuth;
-use temps_auth::{permission_guard, project_access_guard};
-use temps_core::{AuditContext, RequestMetadata};
+use temps_auth::{permission_guard, project_access_guard, require_sensitive_action};
+use temps_core::{AuditContext, RequestMetadata, SensitiveAction};
 use tracing::error;
 use utoipa::OpenApi;
 
@@ -40,6 +43,10 @@ pub struct DeploymentTokenAppState {
     /// case. Resolved once in `configure_routes` via
     /// `context.get_service::<dyn temps_core::ProjectAccessChecker>()`.
     pub project_access_checker: Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Central sensitive-action policy (MFA step-up), used to gate destructive
+    /// token operations (rotate, delete). Resolved once in `configure_routes`
+    /// via `context.require_service::<dyn temps_core::SensitiveActionAuthorizer>()`.
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -285,6 +292,15 @@ async fn delete_deployment_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, DeploymentTokensDelete);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteDeploymentToken {
+            project_id,
+            token_id,
+        },
+    )
+    .await?;
 
     app_state
         .deployment_token_service
@@ -325,6 +341,15 @@ async fn rotate_deployment_token(
     permission_guard!(auth, DeploymentTokensWrite);
     permission_guard!(auth, DeploymentTokensCreate);
     project_access_guard!(auth, project_id, app_state.project_access_checker);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::RotateDeploymentToken {
+            project_id,
+            token_id,
+        },
+    )
+    .await?;
 
     let rotated = app_state
         .deployment_token_service

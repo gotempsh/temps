@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Entity for the `cli_login_sessions` table — the OAuth-2.0-style device
 //! authorization flow used by the Temps CLI. See the migration
 //! `m20260511_000001_create_cli_login_sessions.rs` for the flow overview.

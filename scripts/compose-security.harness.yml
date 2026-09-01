@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Always applied by scripts/test-compose-security.sh (local and CI). The
 # security harness must never report product telemetry: without this, every
 # test run boots temps with telemetry enabled by default, mints a fresh

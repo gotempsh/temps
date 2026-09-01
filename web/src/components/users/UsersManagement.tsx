@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import {
@@ -38,6 +41,7 @@ import {
 import { EmptyState } from '@/components/ui/empty-state'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Label } from '@/components/ui/label'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 import {
   Edit2,
@@ -83,6 +87,8 @@ export function UsersManagement({
     useState<RouteUserWithRoles | null>(null)
   const queryClient = useQueryClient()
   const navigate = useNavigate()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
 
   const deleteUser = useMutation({
     ...deleteUserMutation(),
@@ -122,6 +128,13 @@ export function UsersManagement({
       }
       queryClient.invalidateQueries({ queryKey: ['listUsers'] })
       reloadUsers()
+    },
+    onError: (error, variables) => {
+      if (handleSensitiveActionError(error, () => assignRole.mutate(variables))) {
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(problem.detail || problem.message || 'Failed to assign role')
     },
   })
 
@@ -195,6 +208,7 @@ export function UsersManagement({
 
   return (
     <div className="space-y-4">
+      {verificationDialog}
       <div className="flex items-center justify-between">
         <div>
           <h2 className="text-lg font-semibold">Users</h2>

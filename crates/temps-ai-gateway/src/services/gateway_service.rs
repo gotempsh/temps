@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use bytes::Bytes;
 use futures_util::StreamExt as FuturesStreamExt;
 use std::collections::HashMap;

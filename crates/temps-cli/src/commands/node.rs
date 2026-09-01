@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `temps node` subcommand — manage cluster worker nodes via the HTTP API.
 //!
 //! Provides CLI commands for listing, draining, and removing worker nodes.

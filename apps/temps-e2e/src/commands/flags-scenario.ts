@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Feature flags lifecycle against a live Temps instance, driven through the
  * real `@temps-sdk/node-sdk` `FlagsClient` (not just the raw HTTP API) for

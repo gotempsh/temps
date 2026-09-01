@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-network"
 version.workspace = true
@@ -30,9 +33,9 @@ chrono = { workspace = true, optional = true }
 # Linux-only kernel data-plane control. We gate every use behind cfg(target_os = "linux")
 # so the crate still compiles on macOS/Windows for type-checking and shared logic tests.
 [target.'cfg(target_os = "linux")'.dependencies]
-rtnetlink = "0.21"
-netlink-packet-route = "0.30"
-netlink-packet-core = "0.8"
+rtnetlink = "0.23"
+netlink-packet-route = "0.33"
+netlink-packet-core = "0.9"
 nix = { version = "0.31", features = ["net", "sched", "fs"] }
 libc = "0.2"
 

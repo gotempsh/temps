@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Command } from 'commander'
 import chalk from 'chalk'
 import { colors } from './ui/output.js'
@@ -28,6 +31,7 @@ import { registerTeamsCommands } from './commands/teams/index.js'
 import { registerMonitorsCommands } from './commands/monitors/index.js'
 import { registerWebhooksCommands } from './commands/webhooks/index.js'
 import { registerContainersCommands } from './commands/containers/index.js'
+import { registerClusterCommands } from './commands/cluster/index.js'
 import { registerDocsCommand } from './commands/docs.js'
 import { registerTokensCommands } from './commands/tokens/index.js'
 import { registerErrorsCommands } from './commands/errors/index.js'
@@ -35,6 +39,7 @@ import { registerMetricsCommands } from './commands/metrics/index.js'
 import { registerTracesCommands } from './commands/traces/index.js'
 import { registerFacetsCommands } from './commands/facets/index.js'
 import { registerOtelForwardCommands } from './commands/otel-forward/index.js'
+import { registerOtelCommands } from './commands/otel/index.js'
 import { registerKvCommands } from './commands/kv/index.js'
 import { registerFlagsCommands } from './commands/flags/index.js'
 import { registerDataCommands } from './commands/data/index.js'
@@ -60,6 +65,7 @@ import { registerFunnelsCommands } from './commands/funnels/index.js'
 import { registerNotificationPreferencesCommands } from './commands/notification-preferences/index.js'
 import { registerSkillsCommands } from './commands/skills/index.js'
 import { registerMcpServersCommands } from './commands/mcp-servers/index.js'
+import { registerMcpCommands } from './commands/mcp/index.js'
 import { registerSecretsCommands } from './commands/secrets/index.js'
 import { registerSandboxCommands } from './commands/sandbox/index.js'
 import { registerWorkflowCommands } from './commands/workflow/index.js'
@@ -178,12 +184,14 @@ export function createProgram(): Command {
   registerMonitorsCommands(program)
   registerWebhooksCommands(program)
   registerContainersCommands(program)
+  registerClusterCommands(program)
   registerTokensCommands(program)
   registerErrorsCommands(program)
   registerMetricsCommands(program)
   registerTracesCommands(program)
   registerFacetsCommands(program)
   registerOtelForwardCommands(program)
+  registerOtelCommands(program)
   registerKvCommands(program)
   registerFlagsCommands(program)
   registerDataCommands(program)
@@ -209,6 +217,7 @@ export function createProgram(): Command {
   registerNotificationPreferencesCommands(program)
   registerSkillsCommands(program)
   registerMcpServersCommands(program)
+  registerMcpCommands(program)
   registerSecretsCommands(program)
   registerSandboxCommands(program)
   registerWorkflowCommands(program)

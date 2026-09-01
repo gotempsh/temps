@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `PostgresClusterEngine`: WAL-G–based backup of a Postgres cluster
 //! (pg_auto_failover topology), implemented against `engine_v2::BackupEngine`.
 //!

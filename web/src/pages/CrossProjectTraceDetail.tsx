@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useMemo, useState } from 'react'
 import { Link, useParams } from 'react-router'
 import { useGoBack } from '@/hooks/useGoBack'

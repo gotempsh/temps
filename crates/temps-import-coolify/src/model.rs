@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed models for the Coolify REST API (`/api/v1`).
 //!
 //! Field sets were captured from a live Coolify v4 instance (July 2026) —

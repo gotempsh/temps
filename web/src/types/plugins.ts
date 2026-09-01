@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * TypeScript types for the external plugin manifest.
  * Must match the Rust types in temps-core::external_plugin::manifest.

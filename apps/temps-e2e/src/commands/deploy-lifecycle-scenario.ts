@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Deployment lifecycle (rollback / pause / resume / promote) against a live
  * Temps instance -- the primary safety valve for a bad deploy on live

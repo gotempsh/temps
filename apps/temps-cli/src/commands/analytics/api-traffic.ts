@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import chalk from 'chalk'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
@@ -40,7 +43,7 @@ interface ApiTrafficLimitOptions extends ApiTrafficOptions {
 export interface ApiTrafficQueryOptions extends ApiTrafficOptions {
   groupBy?: string
   metrics: string
-  filters?: string[]
+  filter?: string[]
   sortBy?: string
   order?: string
   page?: string
@@ -232,6 +235,7 @@ export const formatPercentForTest = formatPercent
 export const parseNonNegativeIntegerForTest = parseNonNegativeInteger
 export const parsePageSizeForTest = parsePageSize
 export const parseTrafficFilterForTest = parseFilter
+export const resolveApiQueryFiltersForTest = resolveApiQueryFilters
 export const parseTrafficMetricsForTest = (raw: string): TrafficMetric[] =>
   parseCsv(raw, TRAFFIC_METRICS, 'metric')
 
@@ -683,6 +687,12 @@ export async function apiPath(
   )
 }
 
+function resolveApiQueryFilters(
+  options: Pick<ApiTrafficQueryOptions, 'filter'>,
+): TrafficFilter[] {
+  return (options.filter ?? []).map(parseFilter)
+}
+
 export async function apiQuery(options: ApiTrafficQueryOptions): Promise<void> {
   const dimensions = parseCsv(
     options.groupBy ?? '',
@@ -709,7 +719,7 @@ export async function apiQuery(options: ApiTrafficQueryOptions): Promise<void> {
     options,
     dimensions,
     metrics,
-    (options.filters ?? []).map(parseFilter),
+    resolveApiQueryFilters(options),
     sortBy,
     options.order,
     'API traffic query:',

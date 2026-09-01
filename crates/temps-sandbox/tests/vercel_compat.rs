@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Vercel `@vercel/sandbox` SDK compatibility test suite.
 //!
 //! This file pins the `/v1/sandboxes/*` contract to what the

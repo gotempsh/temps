@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 export type TracesTimeRange = '1h' | '6h' | '24h' | '7d' | '30d'
 
 export type TracesTimeWindow = {

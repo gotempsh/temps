@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Detection and parsing of `.env.example`-style scaffolding files.
 //!
 //! Many repositories ship a template listing every environment variable the

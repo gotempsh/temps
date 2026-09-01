@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! A single turn in an AI debugging conversation (ADR-023).
 //!
 //! Append-only; ordered by `(conversation_id, created_at)`. The full set is

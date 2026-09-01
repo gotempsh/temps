@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Package manager detection for Node.js projects
 //!
 //! Detects package manager based on (in priority order):

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The agent's socket server. One task per accepted connection. Shared state
 //! (`Tabs`) holds the living map of tab_id → PTY + subscribers.
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Verified authentication context for external-plugin handlers.
 //!
 //! Temps authenticates the original request and forwards a resolved caller

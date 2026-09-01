@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Mirror of the backend AI-agent taxonomy (`temps-proxy::ai_agent_detector`).
  * Keep in sync when adding providers there. We hardcode here so dropdowns and

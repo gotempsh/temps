@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Input } from '@/components/ui/input'
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { useCanViewAuditLogs } from '@/hooks/useAuditAccess'

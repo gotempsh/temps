@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for [`DnsRegistry`] (ADR-011).
 //!
 //! These run against a real TimescaleDB container — the schema invariants
@@ -150,6 +153,25 @@ async fn replace_endpoints_for_owner_handles_ip_churn() {
     assert_eq!(mine.len(), 1, "exactly one record for owner after replace");
     assert_eq!(mine[0].target_ip.as_deref(), Some("172.20.5.99"));
     assert_eq!(mine[0].generation, g2);
+
+    // `list_by_owner` is what callers use to answer "is this name actually
+    // resolvable?" before handing an address to a workload, so it must see
+    // exactly the same single, current record.
+    let owned = registry
+        .list_by_owner(OwnerKind::ServiceMember, 42)
+        .await
+        .expect("list_by_owner");
+    assert_eq!(owned.len(), 1);
+    assert_eq!(owned[0].fqdn, "pg-orders-0.pg-orders.temps.local");
+    assert_eq!(owned[0].target_ip.as_deref(), Some("172.20.5.99"));
+
+    // An owner that never published anything reports nothing published,
+    // rather than erroring — that's the "record missing" signal.
+    let none = registry
+        .list_by_owner(OwnerKind::ServiceRole, 42)
+        .await
+        .expect("list_by_owner for an owner with no records");
+    assert!(none.is_empty());
 }
 
 #[tokio::test]

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-deployments"
 version.workspace = true
@@ -14,6 +17,8 @@ temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
+temps-dns = { path = "../temps-dns" }
+temps-monitoring = { path = "../temps-monitoring" }
 temps-entities = { path = "../temps-entities" }
 temps-log-aggregator = { path = "../temps-log-aggregator" }
 temps-error-tracking = { path = "../temps-error-tracking" }

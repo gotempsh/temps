@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! External plugin system for loading standalone binary plugins.
 //!
 //! External plugins are standalone binaries that Temps discovers, spawns, and

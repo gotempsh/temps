@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Extension point for per-project/environment IP allow/restrict rules on
 //! the proxy hot path.
 //!
@@ -45,6 +48,26 @@ pub trait ProjectIpGate: Send + Sync {
     /// this is an opt-in restriction, so "no rule configured" must mean
     /// "unrestricted", the same as no gate being registered at all.
     fn is_allowed(&self, project_id: i32, environment_id: i32, ip: IpAddr) -> bool;
+
+    /// Return `true` if `project_id`/`environment_id` has an active IP
+    /// restriction policy at all (i.e. some IP would be denied by
+    /// [`Self::is_allowed`] for this project/environment).
+    ///
+    /// This exists for exactly one caller: the proxy's client-IP resolution
+    /// can fail (e.g. a non-INET socket, an unparsable forwarded-for value),
+    /// leaving no `IpAddr` to hand to `is_allowed` at all. In that situation
+    /// the proxy must fail closed (deny) only when this project/environment
+    /// actually has a restriction configured — denying every request with an
+    /// unresolvable IP on every unrestricted project (the common case) would
+    /// be a much bigger behavior change than this method exists to avoid.
+    ///
+    /// Must be synchronous and must not perform I/O, same contract as
+    /// `is_allowed`. Default implementation returns `false` (no policy),
+    /// matching [`OpenIpGate`] and preserving today's fail-open behavior for
+    /// any gate that hasn't been updated to answer this precisely.
+    fn has_active_policy(&self, _project_id: i32, _environment_id: i32) -> bool {
+        false
+    }
 }
 
 /// Default [`ProjectIpGate`] that allows every IP unconditionally.
@@ -116,6 +139,12 @@ impl ProjectIpGate for ProjectIpGateSlot {
     fn is_allowed(&self, project_id: i32, environment_id: i32, ip: IpAddr) -> bool {
         self.gate.load().is_allowed(project_id, environment_id, ip)
     }
+
+    fn has_active_policy(&self, project_id: i32, environment_id: i32) -> bool {
+        self.gate
+            .load()
+            .has_active_policy(project_id, environment_id)
+    }
 }
 
 #[cfg(test)]
@@ -141,6 +170,10 @@ mod tests {
         fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
             false
         }
+
+        fn has_active_policy(&self, _project_id: i32, _environment_id: i32) -> bool {
+            true
+        }
     }
 
     #[test]
@@ -149,6 +182,20 @@ mod tests {
         let claimed = slot.set(std::sync::Arc::new(DenyAll));
         assert!(claimed);
         assert!(!slot.is_allowed(1, 1, IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1))));
+    }
+
+    #[test]
+    fn open_gate_has_no_active_policy() {
+        let g = OpenIpGate;
+        assert!(!g.has_active_policy(1, 1));
+    }
+
+    #[test]
+    fn slot_delegates_has_active_policy_to_the_installed_gate() {
+        let slot = ProjectIpGateSlot::new_default();
+        assert!(!slot.has_active_policy(1, 1));
+        assert!(slot.set(std::sync::Arc::new(DenyAll)));
+        assert!(slot.has_active_policy(1, 1));
     }
 
     #[test]

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Platform-side channel connector.
 //!
 //! After a plugin completes its handshake, Temps opens a WebSocket to the

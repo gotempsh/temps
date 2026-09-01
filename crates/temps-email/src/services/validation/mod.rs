@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Native email-address validation engine.
 //!
 //! Replaces the former `check-if-email-exists` dependency (AGPL-licensed, and

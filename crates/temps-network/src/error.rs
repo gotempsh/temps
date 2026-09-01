@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Error type for `temps-network`.
 //!
 //! Following the project-wide error-handling rules: every variant carries

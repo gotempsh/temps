@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! GitLab API implementation of ProjectSource
 //!
 //! This implementation fetches files directly from GitLab API on-demand

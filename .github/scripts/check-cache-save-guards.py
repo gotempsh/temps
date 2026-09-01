@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Fail when PR or release workflows can write unusable cache entries.
 
 Why this exists: an unguarded Swatinem/rust-cache step in a workflow that

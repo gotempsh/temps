@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 #
 # DinD entrypoint. Starts dockerd in the background (so the inner Docker
 # daemon is available for temps deployments), waits for the socket, then

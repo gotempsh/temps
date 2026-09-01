@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 set -euo pipefail
 
 project="temps-compose-security-${GITHUB_RUN_ID:-local}-$$"

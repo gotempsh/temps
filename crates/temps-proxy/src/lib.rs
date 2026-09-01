@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps Proxy - Pingora-based reverse proxy with advanced features
 //!
 //! This crate provides a high-performance reverse proxy built on Pingora
@@ -25,6 +28,7 @@ pub mod redaction;
 pub mod server;
 pub mod service;
 pub mod services;
+mod static_file_serving;
 pub mod storage;
 pub mod tls_cert_loader;
 pub mod tls_fingerprint;

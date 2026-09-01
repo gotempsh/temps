@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * OTel ingestion + storage-quota enforcement against a live Temps instance --
  * proves real OTLP/HTTP protobuf payloads (traces/metrics/logs) actually land

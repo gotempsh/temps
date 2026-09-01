@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Docker workload importer implementation
 
 use async_trait::async_trait;
@@ -668,6 +671,8 @@ impl WorkloadImporter for DockerImporter {
             ),
             automatic_deploy: true,
             storage_service_ids: vec![],
+            storage_service_claim_ids: vec![],
+            storage_service_claim_user_id: None,
             is_public_repo: None,
             git_url: None,
             git_provider_connection_id: context.git_provider_connection_id,

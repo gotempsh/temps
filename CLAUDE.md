@@ -9,6 +9,7 @@ Guidance for Claude Code when working with the Temps codebase.
 - Put a real user's, customer's, or third party's identity into anything that leaves this machine. This repository is **public**. Company names, product names, internal hostnames, account names, contract/method names, real trace/span/request IDs, and any other detail that identifies whose system produced a payload must never appear in code, comments, test fixtures, commit messages, branch names, file names, PR titles, PR descriptions, PR comments, or issue text. This applies with full force to bug reports: a customer sends you a captured payload to get it fixed, not to have it published, and "it is just a fixture" is exactly how it gets published
   - **Reproducing a reported bug**: keep the *shape* that makes the payload valuable (timings, ordering, precision, nesting, sizes, edge cases) and replace everything that names anyone. Rename services, operations, and hosts to generic equivalents, and regenerate every identifier. A fixture that reproduces the bug and identifies nobody is strictly better -- it is also readable by someone who has never heard of the reporter
   - **Describing the bug**: say "a reported cross-project trace", never who reported it. The fix is reviewed on its merits; the reporter's identity adds nothing to a reviewer and cannot be taken back once pushed
+  - **A live task example is the same rule, not an exception**: when a user hands you a real URL, repo, or account to work against (e.g. "deploy this: github.com/someone/their-repo"), that target is scratch input for the task, not something to cite as evidence. It must not end up in test comments, fixture data, commit messages, or PR descriptions as an illustrative example -- write the test/PR against a generic case ("a repo with no build manifest, just an `index.html`") instead of naming the real one, even though the user themselves supplied it and it feels like harmless context
   - **Before pushing**: grep the diff for the reporter's names and identifiers. Once it reaches GitHub it is effectively permanent -- force-pushing does not remove a pull request's recorded commits or its Files-changed diff, pull requests cannot be deleted, and forks may retain the objects. Removal at that point requires GitHub Support
 - Commit `.env` files, credentials, or secrets -- this includes local dev-instance artifacts (encryption keys, auth secrets, generated tokens, `temps_data`-style data directories) created while running a local server for manual testing/verification. Before staging changes, run `git status` and scrutinize every path outside the files you intentionally edited -- a broad `git add` after spinning up a local test instance is the most common way this happens. If a secret is committed, treat it as compromised: remove it from tracking going forward at minimum, and flag to the user whether history needs rewriting (don't force-push without asking)
 - Access database directly from HTTP handlers -- ALWAYS use services
@@ -31,6 +32,16 @@ Guidance for Claude Code when working with the Temps codebase.
 - Add new runtime configuration as environment variables -- environment variables for configuration are forbidden. ALWAYS model it as a column on the relevant entity row (e.g. `oidc_providers.trust_idp_email`, not `TEMPS_OIDC_SKIP_EMAIL_VERIFIED`) so the admin can change it per-record at runtime via the API/UI, gets audit logging for free, and operators don't have to restart the binary to change a single tenant's behaviour. If the value is sensitive (credentials, tokens, private keys), the column MUST be encrypted at rest via `EncryptionService`, never stored as plaintext -- this applies even where env vars might otherwise seem tempting for secrets (e.g. a Vault CA bundle or auth token: store it encrypted on the provider row, not as `TEMPS_VAULT_CA_BUNDLE`). The only legitimate exception is bootstrap-time config needed before a database connection exists (e.g. `DATABASE_URL`, `TEMPS_DATA_DIR`, `--license-path`)
 
 ### ALWAYS
+- Add the Temps SPDX attribution header to every new first-party source or
+  commentable configuration file, using the file's comment syntax:
+  `SPDX-FileCopyrightText: 2024-2026 Temps Contributors` and
+  `SPDX-License-Identifier: MIT OR Apache-2.0`. Run
+  `python3 scripts/source_attribution.py annotate path/to/file` to apply it.
+  Before every commit that adds or regenerates source files, run
+  `python3 scripts/source_attribution.py check`; attribution failures are
+  blocking and must be fixed before committing.
+  Generated files must receive the header from their generator or generation
+  command. Never replace or misattribute third-party copyright notices.
 - Run `cargo check --lib` after every modification
 - New functionality must compile without warnings
 - Write tests for all new functionality AND verify they run successfully
@@ -922,6 +933,15 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `perf`, `test`, `build`, `ci`
 
 `git revert` defaults to a non-conventional subject (`Revert "original message"`). Never accept that default — always pass an explicit conventional message, e.g. `git revert --no-edit` then `git commit --amend -m "test: drop temporary failing test"`, or better, pass `-m` directly on the revert itself.
 
+### DCO Sign-off
+
+**Every commit must be signed off** (`Signed-off-by: Name <email>` trailer) —
+this is the Developer Certificate of Origin required on this OSS repo. Always
+commit with `git commit -s` (or `-s` on `git commit --amend`/`git revert`).
+A PR with an unsigned commit fails the DCO check regardless of how many
+commits are on the branch — every commit in `base..HEAD` needs its own
+trailer, not just the final one.
+
 ---
 
 ## Workspace Structure
@@ -1043,7 +1063,7 @@ if (isLoading) return <Spinner />
 - **Filter bars**: `flex flex-col gap-2 sm:flex-row sm:flex-wrap`; selects use `w-full sm:w-[Npx]`
 - **Grids**: `grid-cols-1` → `md:grid-cols-2` → `lg:grid-cols-3` (or `grid-cols-2 md:grid-cols-4` for stat cards)
 - **Side panels**: `flex-col lg:flex-row`; panel uses `w-full lg:w-[Npx]`
-- **Pagination**: compact `{page} / {totalPages}` on mobile; full "Showing X–Y of Z" `hidden sm:inline`
+- **Pagination**: use the shared `ResponsivePagination` component. Below `sm`, show one row with labeled Previous and Next buttons around compact `{page} / {totalPages}` context; hide page-size, first/last, and direct-page controls. At `sm` and above, show the full "Showing X–Y of Z" and advanced controls.
 - **Headers**: `flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between`
 - **Button text**: `hidden sm:inline` for labels next to icons; icon-only on mobile
 - **Min-width**: add `min-w-[Npx]` on scrollable containers so content doesn't collapse

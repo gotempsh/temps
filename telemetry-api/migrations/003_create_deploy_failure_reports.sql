@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Deploy-failure reports: a user-reviewed, user-editable copy of a failed
 -- deployment's build trace, sent only when a self-hoster explicitly clicks
 -- "Send failure report" (see crates/temps-deployments/src/services/failure_report_service.rs).

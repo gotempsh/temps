@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! DNS service for Temps
 //!
 //! This crate provides DNS provider management capabilities for automatic DNS record configuration.

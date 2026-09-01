@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ClickHouse storage backend for OTel spans.
 //!
 //! This module provides the ClickHouse client wrapper and the [`ChSpanRow`]
@@ -59,17 +62,17 @@ use tracing::debug;
 
 use temps_metrics::validate_metric_name;
 
-use crate::error::OtelError;
+use crate::error::{OtelError, StorageErrorKind};
 use crate::storage::timescaledb::TimescaleDbStorage;
 use crate::storage::{
     merge_trace_ref_projects, BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage,
     StorageResult, TraceRefProject,
 };
 use crate::types::{
-    GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, HistogramSummary, Insight,
-    InsightStatus, LogQuery, LogRecord, MetricAggregation, MetricBucket, MetricPoint, MetricQuery,
-    SpanEvent, SpanKind, SpanRecord, SpanStats, SpanStatsQuery, SpanStatusCode, StorageQuota,
-    TraceQuery, TraceSummary,
+    GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, HistogramSummary,
+    IngestErrorSummary, Insight, InsightStatus, LogQuery, LogRecord, MetricAggregation,
+    MetricBucket, MetricPoint, MetricQuery, SpanEvent, SpanKind, SpanRecord, SpanStats,
+    SpanStatsQuery, SpanStatusCode, StorageQuota, TraceQuery, TraceSummary,
 };
 
 // ── Client configuration ────────────────────────────────────────────────────
@@ -190,6 +193,7 @@ impl ClickHouseOtelClient {
             .fetch_one::<u8>()
             .await
             .map_err(|e| OtelError::Storage {
+                kind: ch_err_kind(&e),
                 message: format!("ClickHouse health check failed: {e}"),
             })?;
         Ok(())
@@ -1190,20 +1194,76 @@ pub(crate) fn interval_seconds(interval_sql: &str) -> i64 {
 
 // ── OtelError helpers ───────────────────────────────────────────────────────
 
+/// Classify a [`::clickhouse::error::Error`] into a [`StorageErrorKind`].
+///
+/// This must happen *before* the error is rendered into
+/// [`OtelError::Storage`]'s message, because that rendering is lossy — once
+/// it is a `String` the only way back would be substring matching on the
+/// crate's `Display` text, which is not a stable contract.
+///
+/// The split is transport vs. payload:
+/// - **Transport** (`Network`, `TimedOut`) — a socket blip, a restarting
+///   server, a pool timeout. The same bytes written a moment later usually
+///   land, so these are worth a bounded retry.
+/// - **Payload/schema** (compression, serialization, column-header, schema and
+///   parameter errors) — the batch itself, or our understanding of the table,
+///   is wrong. Every retry reproduces it exactly while holding an ingest
+///   permit, so we fail fast instead.
+///
+/// Unclassified errors (`BadResponse`, `Custom`, `Other`, plus any variant a
+/// future `clickhouse` release adds — the enum is `#[non_exhaustive]`) map to
+/// [`StorageErrorKind::ClickHouseOther`], which is treated as transient. That
+/// is deliberately the safe side here: the behaviour being replaced dropped
+/// every failed batch unconditionally, so the worst case of a wrong guess is a
+/// couple of wasted sub-second retries, while the worst case of the opposite
+/// guess is permanent, silent data loss.
+pub(crate) fn ch_err_kind(err: &::clickhouse::error::Error) -> StorageErrorKind {
+    use ::clickhouse::error::Error as ChError;
+    match err {
+        // Transport-level: worth another attempt.
+        ChError::Network(_) => StorageErrorKind::ClickHouseNetwork,
+        ChError::TimedOut => StorageErrorKind::ClickHouseTimeout,
+
+        // Row/table shape disagreement.
+        ChError::SchemaMismatch(_)
+        | ChError::InvalidColumnsHeader(_)
+        | ChError::NotEnoughData
+        | ChError::RowNotFound
+        | ChError::Unsupported(_) => StorageErrorKind::ClickHouseSchema,
+
+        // Encoding the batch went wrong before the server ever saw it.
+        ChError::Compression(_)
+        | ChError::Decompression(_)
+        | ChError::SequenceMustHaveLength
+        | ChError::DeserializeAnyNotSupported
+        | ChError::InvalidUtf8Encoding(_)
+        | ChError::InvalidTagEncoding(_)
+        | ChError::VariantDiscriminatorIsOutOfBound(_)
+        | ChError::InvalidParams(_) => StorageErrorKind::ClickHouseSerialization,
+
+        // `BadResponse`, `Custom`, `Other`, and any future variant.
+        _ => StorageErrorKind::ClickHouseOther,
+    }
+}
+
 /// Wrap a ClickHouse ingest error into an [`OtelError::Storage`] with context.
 ///
 /// All span-domain write methods use this helper so error messages
 /// consistently identify the operation and the CH error.
 pub(crate) fn ch_ingest_err(operation: &str, err: ::clickhouse::error::Error) -> OtelError {
+    let kind = ch_err_kind(&err);
     OtelError::Storage {
         message: format!("ClickHouse {operation} failed: {err}"),
+        kind,
     }
 }
 
 /// Wrap a ClickHouse query error into an [`OtelError::Storage`] with context.
 pub(crate) fn ch_query_err(operation: &str, err: ::clickhouse::error::Error) -> OtelError {
+    let kind = ch_err_kind(&err);
     OtelError::Storage {
         message: format!("ClickHouse query {operation} failed: {err}"),
+        kind,
     }
 }
 
@@ -2881,6 +2941,8 @@ impl OtelStorage for ClickHouseOtelStorage {
                     message: format!(
                         "query_metrics: label key '{key}' is outside the allowed character set [a-zA-Z0-9_.:-]"
                     ),
+                    // Caller-supplied key rejected before any backend call.
+                    kind: StorageErrorKind::Precondition,
                 });
             }
         }
@@ -3249,6 +3311,28 @@ impl OtelStorage for ClickHouseOtelStorage {
         self.inner.archive_logs(records).await
     }
 
+    /// Delegated to Postgres on purpose — see the trait's own comment.
+    ///
+    /// The overwhelmingly common reason an ingest batch is dropped on this
+    /// backend is that ClickHouse itself is unreachable. Recording that fact
+    /// *into* ClickHouse would fail for the same reason, so the report would
+    /// be empty exactly when the operator needs it. The inner TimescaleDB
+    /// store is always present and always Postgres-backed.
+    async fn record_ingest_error(
+        &self,
+        signal_type: &str,
+        error_class: &str,
+        message: &str,
+    ) -> StorageResult<()> {
+        self.inner
+            .record_ingest_error(signal_type, error_class, message)
+            .await
+    }
+
+    async fn recent_ingest_errors(&self, limit: u32) -> StorageResult<Vec<IngestErrorSummary>> {
+        self.inner.recent_ingest_errors(limit).await
+    }
+
     async fn query_logs(&self, query: LogQuery) -> StorageResult<Vec<LogRecord>> {
         self.inner.query_logs(query).await
     }
@@ -3278,6 +3362,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             .insert::<ChTraceRefRow>("cross_project_trace_refs")
             .await
             .map_err(|e| OtelError::Storage {
+                kind: ch_err_kind(&e),
                 message: format!("ClickHouse cross_project_trace_refs inserter setup failed: {e}"),
             })?;
         for trace_id in trace_ids {
@@ -3291,10 +3376,12 @@ impl OtelStorage for ClickHouseOtelStorage {
                 })
                 .await
                 .map_err(|e| OtelError::Storage {
+                    kind: ch_err_kind(&e),
                     message: format!("ClickHouse cross_project_trace_refs write failed: {e}"),
                 })?;
         }
         inserter.end().await.map_err(|e| OtelError::Storage {
+            kind: ch_err_kind(&e),
             message: format!("ClickHouse cross_project_trace_refs insert failed: {e}"),
         })?;
 
@@ -3328,6 +3415,7 @@ impl OtelStorage for ClickHouseOtelStorage {
             .fetch_all::<RefRow>()
             .await
             .map_err(|e| OtelError::Storage {
+                kind: ch_err_kind(&e),
                 message: format!("ClickHouse cross_project_trace_refs query failed: {e}"),
             })?;
 
@@ -3692,6 +3780,94 @@ mod tests {
     use crate::types::{ResourceInfo, SpanKind, SpanRecord, SpanStatusCode};
     use chrono::Utc;
     use std::collections::BTreeMap;
+
+    // ── ClickHouse error classification ─────────────────────────────────
+
+    #[test]
+    fn ch_transport_errors_are_transient() {
+        use ::clickhouse::error::Error as ChError;
+        assert_eq!(
+            ch_err_kind(&ChError::TimedOut),
+            StorageErrorKind::ClickHouseTimeout
+        );
+        assert_eq!(
+            ch_err_kind(&ChError::Network(Box::new(std::io::Error::new(
+                std::io::ErrorKind::ConnectionReset,
+                "reset by peer"
+            )))),
+            StorageErrorKind::ClickHouseNetwork
+        );
+        assert!(ch_err_kind(&ChError::TimedOut).is_transient());
+    }
+
+    #[test]
+    fn ch_payload_and_schema_errors_are_terminal() {
+        use ::clickhouse::error::Error as ChError;
+        let terminal: Vec<ChError> = vec![
+            ChError::SchemaMismatch("column `foo` is missing".into()),
+            ChError::NotEnoughData,
+            ChError::RowNotFound,
+            ChError::SequenceMustHaveLength,
+            ChError::DeserializeAnyNotSupported,
+            ChError::InvalidTagEncoding(3),
+            ChError::VariantDiscriminatorIsOutOfBound(300),
+            ChError::Unsupported("LowCardinality(Nullable)".into()),
+            ChError::Compression(Box::new(std::io::Error::other("lz4 failed"))),
+            ChError::Decompression(Box::new(std::io::Error::other("bad frame"))),
+            ChError::InvalidColumnsHeader(Box::new(std::io::Error::other("bad header"))),
+            ChError::InvalidParams(Box::new(std::io::Error::other("bad param"))),
+        ];
+        for err in &terminal {
+            assert!(!ch_err_kind(err).is_transient(), "expected terminal: {err}");
+        }
+    }
+
+    /// Schema-shaped and serialization-shaped failures get distinct classes so
+    /// an operator can tell "our DDL is wrong" from "our encoder is wrong".
+    #[test]
+    fn ch_schema_and_serialization_get_distinct_classes() {
+        use ::clickhouse::error::Error as ChError;
+        assert_eq!(
+            ch_err_kind(&ChError::SchemaMismatch("nope".into())).as_class(),
+            "clickhouse_schema"
+        );
+        assert_eq!(
+            ch_err_kind(&ChError::SequenceMustHaveLength).as_class(),
+            "clickhouse_serialization"
+        );
+    }
+
+    /// Unclassified errors default to transient — see `ch_err_kind`'s doc
+    /// comment for why that is the safe direction here.
+    #[test]
+    fn ch_unclassified_errors_default_to_transient() {
+        use ::clickhouse::error::Error as ChError;
+        for err in [
+            ChError::BadResponse("500".into()),
+            ChError::Custom("serde".into()),
+            ChError::Other(Box::new(std::io::Error::other("unknown"))),
+        ] {
+            let kind = ch_err_kind(&err);
+            assert_eq!(kind, StorageErrorKind::ClickHouseOther);
+            assert!(kind.is_transient(), "expected transient: {err}");
+        }
+    }
+
+    #[test]
+    fn ch_ingest_err_propagates_classification_into_otel_error() {
+        use ::clickhouse::error::Error as ChError;
+
+        let transient = ch_ingest_err("store_spans", ChError::TimedOut);
+        assert!(transient.is_transient());
+        assert!(transient.to_string().contains("store_spans"));
+
+        let terminal = ch_ingest_err("store_spans", ChError::SchemaMismatch("nope".into()));
+        assert!(!terminal.is_transient());
+
+        let query = ch_query_err("get_trace", ChError::NotEnoughData);
+        assert!(!query.is_transient());
+        assert!(query.to_string().contains("get_trace"));
+    }
 
     /// The inverted version must give the EARLIEST observation the HIGHEST
     /// version, so ReplacingMergeTree merges keep first-write-wins semantics.

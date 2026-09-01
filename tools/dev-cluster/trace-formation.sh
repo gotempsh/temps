@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # e2e trace: what happens behind the scenes when a node joins the cluster.
 # Drives a real enrollment + mTLS CSR handshake (a controlled `temps join` from
 # worker-1 with an isolated data dir, so the real workers are untouched), and

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Opaque public IDs for sandboxes. Format: `sbx_` + 16 hex chars (8 bytes
 //! of randomness). Chosen to be short enough to type in a URL but large
 //! enough that guessing is infeasible.

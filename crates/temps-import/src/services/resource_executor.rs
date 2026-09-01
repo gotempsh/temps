@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Resource execution phase for platform imports.
 //!
 //! Importers describe *what* exists on the source platform; this module makes

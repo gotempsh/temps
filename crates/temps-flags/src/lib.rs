@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! temps-flags: feature flags for the Temps platform (ADR-034, Phase 1).
 //!
 //! A flag is defined once per project and its value is overridden per

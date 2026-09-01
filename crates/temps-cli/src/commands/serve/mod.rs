@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub(crate) mod admin_gate;
 mod admin_gate_handler;
 pub(crate) mod admin_gate_service;

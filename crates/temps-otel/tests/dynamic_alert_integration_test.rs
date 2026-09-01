@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for ADR-026 per-series ("dynamic") metric alerting, driving
 //! the real fire -> resolve loop against a Docker-backed TimescaleDB.
 //!

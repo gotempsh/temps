@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Worker-side mirror of the CP's internal-zone route table.
 //!
 //! Holds the current `*.temps.local` host → backends map in memory and

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared handling for AI tool payloads that may contain credentials.
 
 use std::sync::OnceLock;

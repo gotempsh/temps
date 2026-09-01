@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /** Raw session IDs include browser-like automation and are not human KPIs. */
 export const PROJECT_OVERVIEW_ANALYTICS_METRICS = [
   'visitors',

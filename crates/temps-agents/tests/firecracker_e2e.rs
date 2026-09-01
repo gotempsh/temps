@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! End-to-end lifecycle test for the Firecracker sandbox backend (ADR-029).
 //!
 //! Boots real microVMs, so it needs a provisioned host: KVM access,

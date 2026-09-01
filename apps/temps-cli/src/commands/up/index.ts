@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth, config } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'

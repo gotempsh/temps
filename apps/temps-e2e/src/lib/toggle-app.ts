@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * A throwaway Go app whose health can be flipped on demand over HTTP -- built
  * for the monitoring scenario, which needs to make a REAL deployed app start

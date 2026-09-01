@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Short-lived platform-session handoffs for sandbox previews.
 //!
 //! A sandbox preview can be protected by a password. Sharing such a preview

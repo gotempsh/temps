@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Unified `GET /projects/{project_id}/observe/events` endpoint.
 //!
 //! Returns the merged `ObservabilityEvent[]` page with each row
@@ -286,6 +289,7 @@ mod tests {
                 project_id: 1,
                 source: temps_otel::error::OtelError::Storage {
                     message: "x".into(),
+                    kind: temps_otel::error::StorageErrorKind::PostgresQuery,
                 },
             },
         ];

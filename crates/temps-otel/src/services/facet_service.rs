@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service for managing OTel span attribute facets.
 //!
 //! A "facet" is an arbitrary OTel attribute key (e.g. `enduser.id`,

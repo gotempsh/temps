@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   createNotificationEmailProviderMutation,
   createNotificationProviderMutation,
@@ -39,12 +42,7 @@ import {
 import { cn } from '@/lib/utils'
 
 type Step = 'provider-type' | 'configuration' | 'complete'
-type ProviderType =
-  | 'email'
-  | 'slack'
-  | 'webhook'
-  | 'cloudflare'
-  | 'coming-soon'
+type ProviderType = 'email' | 'slack' | 'webhook' | 'cloudflare' | 'coming-soon'
 
 interface ProviderOption {
   id: ProviderType
@@ -79,7 +77,8 @@ const providerOptions: ProviderOption[] = [
   {
     id: 'webhook',
     name: 'Webhook',
-    description: 'Send JSON payloads to any HTTP endpoint for custom integrations',
+    description:
+      'Send JSON payloads to any HTTP endpoint for custom integrations',
     icon: <Webhook className="h-6 w-6" />,
     available: true,
   },
@@ -155,9 +154,9 @@ export function AddNotificationProvider() {
     },
     onSuccess: () => {
       setCurrentStep('complete')
-      toast.success('Email provider added successfully')
+      toast.success('Email provider added with a route for all notifications.')
       setTimeout(() => {
-        navigate('/settings/notifications')
+        navigate('/settings/notifications?tab=routes')
       }, 2000)
     },
   })
@@ -169,9 +168,9 @@ export function AddNotificationProvider() {
     },
     onSuccess: () => {
       setCurrentStep('complete')
-      toast.success('Slack provider added successfully')
+      toast.success('Slack provider added with a route for all notifications.')
       setTimeout(() => {
-        navigate('/settings/notifications')
+        navigate('/settings/notifications?tab=routes')
       }, 2000)
     },
   })
@@ -183,9 +182,11 @@ export function AddNotificationProvider() {
     },
     onSuccess: () => {
       setCurrentStep('complete')
-      toast.success('Webhook provider added successfully')
+      toast.success(
+        'Webhook provider added with a route for all notifications.'
+      )
       setTimeout(() => {
-        navigate('/settings/notifications')
+        navigate('/settings/notifications?tab=routes')
       }, 2000)
     },
   })
@@ -199,9 +200,11 @@ export function AddNotificationProvider() {
     },
     onSuccess: () => {
       setCurrentStep('complete')
-      toast.success('Cloudflare provider added successfully')
+      toast.success(
+        'Cloudflare provider added with a route for all notifications.'
+      )
       setTimeout(() => {
-        navigate('/settings/notifications')
+        navigate('/settings/notifications?tab=routes')
       }, 2000)
     },
   })
@@ -337,6 +340,26 @@ export function AddNotificationProvider() {
   return (
     <div className="flex-1 overflow-auto">
       <div className="container max-w-5xl mx-auto py-6">
+        <div className="mb-8 space-y-4">
+          <Button
+            variant="ghost"
+            className="-ml-3"
+            onClick={() => navigate('/settings/notifications')}
+          >
+            <ArrowLeft className="mr-2 h-4 w-4" />
+            Back to Notifications
+          </Button>
+          <div>
+            <h1 className="text-3xl font-bold tracking-tight">
+              Add Notification Provider
+            </h1>
+            <p className="mt-1 text-muted-foreground">
+              Choose a delivery method and configure where Temps should send
+              notifications.
+            </p>
+          </div>
+        </div>
+
         {renderStepIndicator()}
 
         {currentStep === 'provider-type' && (
@@ -404,8 +427,8 @@ export function AddNotificationProvider() {
               </CardTitle>
               <CardDescription>
                 Enter the configuration details for your{' '}
-                {providerLabels[selectedProvider] ?? 'notification'} notification
-                provider
+                {providerLabels[selectedProvider] ?? 'notification'}{' '}
+                notification provider
               </CardDescription>
             </CardHeader>
             <CardContent>

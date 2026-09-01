@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Inject per-peer routes into a container's network namespace so that
 //! traffic destined for *another* worker's overlay `/24` leaves through
 //! the local overlay interface (eth1) instead of falling through the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Builds and runs every temps-examples starter through the real preset.
 //!
 //! The unit tests in `temps-presets` assert on the *text* of a generated

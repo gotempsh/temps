@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Single source of truth for AI provider metadata + brand icons. Consumed
 // by `/ai-gateway`, `AiQuickstart`, the agent-sandbox providers list, and
 // anywhere else we need to render a provider identity consistently.

@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # WAL-G configuration for Temps PostgreSQL containers.
 # This script runs as an initdb hook (placed in /docker-entrypoint-initdb.d/).
 # It configures WAL archiving when WALG_S3_PREFIX is set.

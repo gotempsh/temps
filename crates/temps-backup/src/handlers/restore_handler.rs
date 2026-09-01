@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP routes for the generic restore framework.
 //!
 //! - `GET  /external-services/{id}/restore-capabilities`
@@ -12,13 +15,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, require_sensitive_action, Permission, RequireAuth};
 use temps_core::problemdetails::{self, Problem, ProblemDetails};
 use temps_core::RequestMetadata;
+use temps_core::SensitiveAction;
 use tracing::{error, warn};
 use utoipa::{OpenApi, ToSchema};
 
@@ -47,13 +50,14 @@ impl From<RestoreError> for Problem {
             | RestoreError::UnsupportedMode { .. } => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(error.to_string()),
-            RestoreError::Database(_)
+            internal_error @ (RestoreError::Database(_)
             | RestoreError::Encryption { .. }
             | RestoreError::ExternalService { .. }
-            | RestoreError::Internal { .. } => {
+            | RestoreError::Internal { .. }) => {
+                error!(error = %internal_error, "restore request failed internally");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(error.to_string())
+                    .with_detail("The restore operation could not be completed")
             }
         }
     }
@@ -136,6 +140,8 @@ pub struct RestoreCapabilitiesResponse {
     params(("id" = i32, Path, description = "External service id")),
     responses(
         (status = 200, description = "Capabilities declared by the service", body = RestoreCapabilitiesResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Service not found", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
@@ -146,19 +152,21 @@ async fn get_restore_capabilities(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_service_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsRead,
+        "external service",
+        "restore capability lookup",
+    )
+    .await?;
 
-    let caps = app_state
+    let (caps, service) = app_state
         .restore_service
-        .get_capabilities(id)
+        .get_capabilities_with_identity(id)
         .await
         .map_err(Problem::from)?;
-
-    // Look up the source service name for the auto-suggested new name.
-    let service = temps_entities::external_services::Entity::find_by_id(id)
-        .one(app_state.db.as_ref())
-        .await
-        .map_err(|e| Problem::from(RestoreError::Database(e)))?
-        .ok_or_else(|| Problem::from(RestoreError::ServiceNotFound { service_id: id }))?;
 
     let suggested = RestoreService::suggest_new_service_name(&service.name);
 
@@ -175,6 +183,9 @@ async fn get_restore_capabilities(
     params(("id" = i32, Path, description = "External service id")),
     responses(
         (status = 200, description = "Recent restore runs for the service", body = Vec<RestoreRunView>),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 404, description = "Service not found", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
 )]
@@ -184,14 +195,100 @@ async fn list_restore_runs_for_service(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_service_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsRead,
+        "external service",
+        "restore history lookup",
+    )
+    .await?;
 
     let runs = app_state
         .restore_service
         .list_restore_runs_for_service(id)
         .await
         .map_err(Problem::from)?;
+    let runs = filter_accessible_restore_runs(&app_state, &auth, runs).await?;
 
     Ok(Json(runs))
+}
+
+/// Filter restore history without disclosing runs whose backup producer or
+/// completed clone target is outside the caller's project permission scope.
+/// Database/checker failures abort the full request rather than returning a
+/// potentially incomplete authorization result.
+async fn filter_accessible_restore_runs(
+    app_state: &BackupAppState,
+    auth: &temps_auth::AuthContext,
+    runs: Vec<RestoreRunView>,
+) -> Result<Vec<RestoreRunView>, Problem> {
+    if runs.is_empty() {
+        return Ok(runs);
+    }
+
+    let positive_backup_ids: Vec<i32> = runs
+        .iter()
+        .filter_map(|run| (run.source_backup_id > 0).then_some(run.source_backup_id))
+        .collect();
+    let producer_mappings = app_state
+        .restore_service
+        .backup_source_services_for_backups(&positive_backup_ids)
+        .await
+        .map_err(Problem::from)?;
+    let producers_by_backup: BTreeMap<i32, Vec<i32>> = producer_mappings
+        .into_iter()
+        .map(|mapping| (mapping.backup_id, mapping.service_ids))
+        .collect();
+
+    let mut related_service_ids = BTreeSet::new();
+    for producer_service_ids in producers_by_backup.values() {
+        related_service_ids.extend(producer_service_ids.iter().copied());
+    }
+    for run in &runs {
+        if let Some(target_service_id) = run.target_service_id {
+            if target_service_id != run.source_service_id {
+                related_service_ids.insert(target_service_id);
+            }
+        }
+    }
+    let requested_service_ids: Vec<i32> = related_service_ids.into_iter().collect();
+    let accessible_services = accessible_service_ids(
+        app_state,
+        auth,
+        &requested_service_ids,
+        Permission::BackupsRead,
+        "restore history",
+        "list restore runs",
+    )
+    .await?;
+
+    let caller_is_admin = auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin);
+    let project_aware = auth.project_id().is_some() || app_state.project_access_checker.is_some();
+
+    Ok(runs
+        .into_iter()
+        .filter(|run| {
+            let source_allowed = if run.source_backup_id > 0 {
+                match producers_by_backup.get(&run.source_backup_id) {
+                    Some(producer_service_ids) if !producer_service_ids.is_empty() => {
+                        producer_service_ids
+                            .iter()
+                            .all(|service_id| accessible_services.contains(service_id))
+                    }
+                    Some(_) | None => caller_is_admin,
+                }
+            } else {
+                caller_is_admin || !project_aware
+            };
+            let target_allowed = run.target_service_id.is_none_or(|target_service_id| {
+                target_service_id == run.source_service_id
+                    || accessible_services.contains(&target_service_id)
+            });
+            source_allowed && target_allowed
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -204,114 +301,15 @@ async fn list_restore_runs_for_service(
 // deliberate disaster-recovery feature (see `services::restore`), so the fix
 // for "any caller can restore any backup into any service" is authorization on
 // *both* endpoints of the copy, not a block on the copy itself.
-
-/// Projects an external service is linked to, via the `project_services`
-/// join table. An empty result means the service is linked to no project.
-async fn linked_project_ids(
-    db: &sea_orm::DatabaseConnection,
-    service_id: i32,
-) -> Result<Vec<i32>, Problem> {
-    let links = temps_entities::project_services::Entity::find()
-        .filter(temps_entities::project_services::Column::ServiceId.eq(service_id))
-        .all(db)
-        .await
-        .map_err(|e| {
-            error!(service_id, error = %e, "restore authz: failed to resolve linked projects");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Internal Server Error")
-                .with_detail("Failed to verify service access")
-        })?;
-    Ok(links.into_iter().map(|link| link.project_id).collect())
-}
-
-/// Services that produced `backup_id`, via `external_service_backups`.
-async fn backup_source_service_ids(
-    db: &sea_orm::DatabaseConnection,
-    backup_id: i32,
-) -> Result<Vec<i32>, Problem> {
-    let rows = temps_entities::external_service_backups::Entity::find()
-        .filter(temps_entities::external_service_backups::Column::BackupId.eq(backup_id))
-        .all(db)
-        .await
-        .map_err(|e| {
-            error!(backup_id, error = %e, "restore authz: failed to resolve backup source services");
-            problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-                .with_title("Internal Server Error")
-                .with_detail("Failed to verify backup access")
-        })?;
-    Ok(rows.into_iter().map(|row| row.service_id).collect())
-}
-
-/// A deployment token is minted for exactly one project, so it may only reach
-/// services linked to that project. Pure so the rule is testable without a
-/// database; a service linked to no project is reachable by no token.
-fn deployment_token_may_access(token_project_id: i32, project_ids: &[i32]) -> bool {
-    project_ids.contains(&token_project_id)
-}
-
-fn restore_access_denied(what: &str, id: i32) -> Problem {
-    problemdetails::new(StatusCode::FORBIDDEN)
-        .with_title("Insufficient Permissions")
-        .with_detail(format!(
-            "You do not have access to the {} ({}) involved in this restore",
-            what, id
-        ))
-}
-
-/// Deny unless the caller may act on `service_id`.
-///
-/// * Instance-wide Admin/PlatformAdmin bypass, matching the documented
-///   contract of [`temps_core::ProjectAccessChecker`].
-/// * A deployment token is confined to its own project — enforced here even
-///   when no checker is registered, since it needs no external policy.
-/// * Otherwise, if a checker is registered, the caller must be able to reach
-///   at least one project the service is linked to. With no checker (plain
-///   OSS) this is a no-op, which is the documented fail-open-when-unconfigured
-///   behaviour of the extension point.
-async fn require_service_access(
-    app_state: &BackupAppState,
-    auth: &temps_auth::AuthContext,
-    service_id: i32,
-    what: &str,
-) -> Result<(), Problem> {
-    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
-        return Ok(());
-    }
-
-    if let Some(token_project_id) = auth.project_id() {
-        let project_ids = linked_project_ids(app_state.db.as_ref(), service_id).await?;
-        if !deployment_token_may_access(token_project_id, &project_ids) {
-            return Err(restore_access_denied(what, service_id));
-        }
-        return Ok(());
-    }
-
-    let Some(checker) = app_state.project_access_checker.as_deref() else {
-        return Ok(());
-    };
-
-    let project_ids = linked_project_ids(app_state.db.as_ref(), service_id).await?;
-    let mut infrastructure_error = None;
-    for project_id in &project_ids {
-        match checker
-            .user_can_access_project(auth.user_id(), *project_id)
-            .await
-        {
-            Ok(true) => return Ok(()),
-            Ok(false) => {}
-            Err(error) => infrastructure_error = Some(error),
-        }
-    }
-
-    if let Some(error) = infrastructure_error {
-        error!(service_id, error = %error, "restore authz: project access check failed");
-        return Err(problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Project Access Check Failed")
-            .with_detail("Could not verify project access; please try again"));
-    }
-
-    Err(restore_access_denied(what, service_id))
-}
+//
+// `require_service_access` (and the `linked_project_ids` /
+// `deployment_token_may_access` helpers it depends on) live in
+// `crate::handlers::authz` — shared with `backup_handler` and
+// `pg_upgrade_handler`, which have the identical "keyed by a bare
+// `service_id`, no project scoping" gap.
+use crate::handlers::authz::{
+    accessible_service_ids, require_service_access, require_services_access,
+};
 
 #[utoipa::path(
     tag = "Restore",
@@ -322,6 +320,8 @@ async fn require_service_access(
     responses(
         (status = 202, description = "Restore run started", body = RestoreRunView),
         (status = 400, description = "Validation error", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup or service not found", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
@@ -346,10 +346,6 @@ async fn start_restore(
             }
         }
     }
-
-    // The target service is where the data lands — and where whatever is
-    // there now gets overwritten.
-    require_service_access(&app_state, &auth, id, "target service").await?;
 
     // Resolve which backup the caller is pointing at. The URL's `{id}`
     // is the TARGET service — where the data will land. The backup
@@ -389,7 +385,50 @@ async fn start_restore(
         }
     };
 
-    require_restore_source_access(&app_state, &auth, &selector).await?;
+    // Authorize both ends before step-up verification so an unauthorized
+    // cross-project caller cannot use MFA responses to distinguish restore
+    // targets or backup sources they cannot access.
+    let target_permission = match &request.mode {
+        RestoreRequestMode::InPlace => Permission::ExternalServicesWrite,
+        RestoreRequestMode::NewService { .. } => Permission::ExternalServicesCreate,
+        RestoreRequestMode::Pitr { to_new_service, .. } => {
+            if *to_new_service {
+                Permission::ExternalServicesCreate
+            } else {
+                Permission::ExternalServicesWrite
+            }
+        }
+    };
+    require_service_access(
+        &app_state,
+        &auth,
+        id,
+        target_permission,
+        "target service",
+        "restore",
+    )
+    .await?;
+    require_restore_source_access(&app_state, &auth, &selector, Permission::BackupsWrite).await?;
+
+    // Destructive restore modes overwrite the live service — require step-up
+    // verification only after project authorization, but before any service
+    // mutation or audit-identity lookup. Non-destructive modes provision a
+    // fresh service and do not destroy existing data.
+    if matches!(
+        &request.mode,
+        RestoreRequestMode::InPlace
+            | RestoreRequestMode::Pitr {
+                to_new_service: false,
+                ..
+            }
+    ) {
+        require_sensitive_action(
+            app_state.sensitive_action_authorizer.as_ref(),
+            &auth,
+            SensitiveAction::RestoreExternalService { service_id: id },
+        )
+        .await?;
+    }
 
     let mode_str = match &request.mode {
         RestoreRequestMode::InPlace => "in_place".to_string(),
@@ -408,6 +447,15 @@ async fn start_restore(
         RestoreRequestMode::Pitr { .. } => None,
     };
 
+    // Load audit identity through the service before mutation. The service is
+    // already authorized above, and a lookup failure must not create a
+    // restore run that cannot be attributed in the audit trail.
+    let target_service = app_state
+        .restore_service
+        .get_service_identity(id)
+        .await
+        .map_err(Problem::from)?;
+
     let run = app_state
         .restore_service
         .start_restore(id, selector, request.mode.clone(), auth.user_id())
@@ -424,33 +472,26 @@ async fn start_restore(
     }
 
     // Audit — the URL id is the TARGET service.
-    let target_service = temps_entities::external_services::Entity::find_by_id(id)
-        .one(app_state.db.as_ref())
-        .await
-        .ok()
-        .flatten();
-    if let Some(target_service) = target_service {
-        let audit = RestoreRunAudit {
-            context: AuditContext {
-                user_id: auth.user_id(),
-                ip_address: Some(metadata.ip_address.clone()),
-                user_agent: metadata.user_agent.clone(),
-            },
-            restore_run_id: run.id,
-            source_service_id: id,
-            source_service_name: target_service.name.clone(),
-            service_type: target_service.service_type.clone(),
-            source_backup_id: request.backup_id.unwrap_or(0),
-            mode: mode_str,
-            target_service_name: target_name,
-        };
+    let audit = RestoreRunAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        restore_run_id: run.id,
+        source_service_id: id,
+        source_service_name: target_service.name,
+        service_type: target_service.service_type,
+        source_backup_id: request.backup_id.unwrap_or(0),
+        mode: mode_str,
+        target_service_name: target_name,
+    };
 
-        if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
-            error!(
-                "Failed to create audit log for restore run {}: {}",
-                run.id, e
-            );
-        }
+    if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
+        error!(
+            "Failed to create audit log for restore run {}: {}",
+            run.id, e
+        );
     }
 
     Ok((StatusCode::ACCEPTED, Json(run)))
@@ -463,6 +504,8 @@ async fn start_restore(
     params(("id" = i32, Path, description = "Restore run id")),
     responses(
         (status = 200, description = "Restore run progress", body = RestoreRunView),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Restore run not found", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
@@ -480,6 +523,44 @@ async fn get_restore_run(
         .await
         .map_err(Problem::from)?;
 
+    if run.source_backup_id <= 0 {
+        require_ownerless_restore_admin(&app_state, &auth, "read a raw-location restore run")?;
+    }
+
+    let mut related_service_ids = vec![run.source_service_id];
+    if let Some(target_service_id) = run.target_service_id {
+        if target_service_id != run.source_service_id {
+            related_service_ids.push(target_service_id);
+        }
+    }
+    if run.source_backup_id > 0 {
+        let producer_service_ids = app_state
+            .restore_service
+            .backup_source_service_ids(run.source_backup_id)
+            .await
+            .map_err(Problem::from)?;
+        if producer_service_ids.is_empty()
+            && !auth.is_admin()
+            && !auth.has_role(&temps_auth::Role::PlatformAdmin)
+        {
+            return Err(problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Forbidden")
+                .with_detail(
+                    "This restore run uses a backup that is not owned by an external service and can only be read by an administrator",
+                ));
+        }
+        related_service_ids.extend(producer_service_ids);
+    }
+    require_services_access(
+        &app_state,
+        &auth,
+        &related_service_ids,
+        Permission::BackupsRead,
+        "restore run services",
+        "read restore run",
+    )
+    .await?;
+
     Ok(Json(run))
 }
 
@@ -493,13 +574,17 @@ async fn require_restore_source_access(
     app_state: &BackupAppState,
     auth: &temps_auth::AuthContext,
     selector: &crate::services::BackupSelector,
+    required_permission: Permission,
 ) -> Result<(), Problem> {
     match selector {
         crate::services::BackupSelector::Id(backup_id) => {
             // Every service that produced this backup must be reachable by the
             // caller — reading it anywhere else discloses its contents.
-            let source_service_ids =
-                backup_source_service_ids(app_state.db.as_ref(), *backup_id).await?;
+            let source_service_ids = app_state
+                .restore_service
+                .backup_source_service_ids(*backup_id)
+                .await
+                .map_err(Problem::from)?;
 
             // Fail closed on an empty set. A backup with no
             // `external_service_backups` rows is not "a backup nobody owns, so
@@ -509,7 +594,10 @@ async fn require_restore_source_access(
             // authorize nothing at all and let any BackupsRead/Write holder
             // read or restore the platform database into a service they
             // control.
-            if source_service_ids.is_empty() && !auth.is_admin() {
+            if source_service_ids.is_empty()
+                && !auth.is_admin()
+                && !auth.has_role(&temps_auth::Role::PlatformAdmin)
+            {
                 warn!(
                     backup_id = *backup_id,
                     user_id = ?auth.user_id(),
@@ -523,28 +611,45 @@ async fn require_restore_source_access(
                     ));
             }
 
-            for source_service_id in source_service_ids {
-                require_service_access(app_state, auth, source_service_id, "source service")
-                    .await?;
-            }
+            require_services_access(
+                app_state,
+                auth,
+                &source_service_ids,
+                required_permission,
+                "source services",
+                "restore",
+            )
+            .await?;
         }
         crate::services::BackupSelector::Location { .. } => {
             // Orphan restore reads a caller-supplied key out of a configured
-            // S3 source, so there is no source service to authorize against.
-            // A deployment token is a machine credential scoped to a single
-            // project and has no business naming arbitrary bucket keys.
-            if auth.project_id().is_some() {
-                return Err(problemdetails::new(StatusCode::FORBIDDEN)
-                    .with_title("Insufficient Permissions")
-                    .with_detail(
-                        "Deployment tokens cannot restore from a raw backup location; \
-                         reference a backup by id instead",
-                    ));
-            }
+            // S3 source, so there is no project-confined source service to
+            // authorize against. Under Teams this is global instance data and
+            // therefore administrators-only. Plain OSS keeps its historical
+            // behavior because no project boundary is configured there.
+            require_ownerless_restore_admin(app_state, auth, "restore from a raw backup location")?;
         }
     }
 
     Ok(())
+}
+
+fn require_ownerless_restore_admin(
+    app_state: &BackupAppState,
+    auth: &temps_auth::AuthContext,
+    operation: &str,
+) -> Result<(), Problem> {
+    if auth.is_admin() || auth.has_role(&temps_auth::Role::PlatformAdmin) {
+        return Ok(());
+    }
+    if auth.project_id().is_none() && app_state.project_access_checker.is_none() {
+        return Ok(());
+    }
+    Err(problemdetails::new(StatusCode::FORBIDDEN)
+        .with_title("Insufficient Permissions")
+        .with_detail(format!(
+            "Only an administrator can {operation}; project-scoped callers must reference an owned backup by id"
+        )))
 }
 
 #[utoipa::path(
@@ -556,6 +661,8 @@ async fn require_restore_source_access(
     responses(
         (status = 200, description = "Preview of what the restore will do", body = RestorePlan),
         (status = 400, description = "Validation error", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup or service not found", body = ProblemDetails),
     ),
     security(("bearer_auth" = []))
@@ -600,8 +707,16 @@ async fn plan_restore(
     // Same disclosure as the restore itself — the plan names the source's
     // location, engine and size, and confirms target compatibility — so it
     // gets the same authorization on both ends.
-    require_service_access(&app_state, &auth, id, "target service").await?;
-    require_restore_source_access(&app_state, &auth, &selector).await?;
+    require_service_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsRead,
+        "target service",
+        "restore plan",
+    )
+    .await?;
+    require_restore_source_access(&app_state, &auth, &selector, Permission::BackupsRead).await?;
 
     let plan = app_state
         .restore_service
@@ -630,6 +745,7 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::handlers::authz::deployment_token_may_access;
     use axum::http::StatusCode;
 
     /// A deployment token is minted for one project; a restore that touches a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed models for the Portainer REST API.
 //!
 //! Field sets captured from a live Portainer CE 2.39 instance (July 2026).

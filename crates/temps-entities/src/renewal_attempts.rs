@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Append-only audit log for the standard (non-on-demand) certificate
 //! issuance/renewal flow — `DomainService::request_challenge` and
 //! `DomainService::complete_challenge`. Every attempt at either stage,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Tie resumable AI CLI sessions to the effective provider/tool contract.
 
 use sea_orm_migration::prelude::*;

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Shared formatting helpers for OTel metric alert rules.
 //
 // Keeps the list rows, the form header, and any future surfaces rendering the

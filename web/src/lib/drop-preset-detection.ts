@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { DropInspectionResponse, DropPresetCandidate } from '@/api/client'
 import { prepareDrop, type DropFile } from '@/lib/drop-archive'
 

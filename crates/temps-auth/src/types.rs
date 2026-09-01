@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::avatar::generate_avatar_data_url;
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
@@ -151,6 +154,14 @@ pub struct ChangePasswordRequest {
 }
 
 // Add new request/response types
+#[derive(Deserialize, utoipa::ToSchema)]
+pub struct SetupMfaRequest {
+    /// Required to enroll MFA on an account that has a password set.
+    /// Omit (or leave empty) for SSO-only accounts with no local password.
+    #[schema(example = "current_password_value")]
+    pub current_password: Option<String>,
+}
+
 #[derive(Deserialize, utoipa::ToSchema)]
 pub struct VerifyMfaRequest {
     pub code: String,

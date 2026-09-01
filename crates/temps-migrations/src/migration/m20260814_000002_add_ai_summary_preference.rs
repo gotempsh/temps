@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add an instance-wide routing profile for server-authored AI summaries.
 
 use sea_orm_migration::prelude::*;

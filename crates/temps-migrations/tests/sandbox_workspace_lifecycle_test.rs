@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Schema-level coverage for the ADR-036 workspace lifecycle migration.
 //!
 //! Three things this pins that a unit test cannot:

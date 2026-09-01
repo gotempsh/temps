@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 // REGEN: bun run openapi-ts — these option/mutation builders are generated from
 // the new /otel/dashboards endpoints (operationIds list_dashboards /

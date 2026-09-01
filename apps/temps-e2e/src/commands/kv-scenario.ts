@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * kv-storage lifecycle against a live Temps instance:
  *   1. ensure the platform-wide KV (Redis) service is enabled + healthy --

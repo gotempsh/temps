@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Session-replay lifecycle against a live Temps instance -- proves the whole
  * ingest-then-playback chain a real rrweb-based recorder depends on, not

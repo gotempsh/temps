@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Standalone sandbox API backed by the same `SandboxProvider` primitive
 //! used by agent runs and workspace sessions.
 //!

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { getPool } from "./db/pool.js";
 import { createEventsRoutes } from "./routes/events.js";
 import { createStatsRoutes } from "./routes/stats.js";

@@ -15,6 +15,7 @@ Manage project containers in environments
 - `start` - Start a stopped container
 - `stop` - Stop a running container
 - `restart` - Restart a container
+- `history` - List every container that has ever run in an environment, including ones replaced by a later redeploy
 - `metrics` - Get container resource metrics (all containers if no container ID specified)
 
 ### `containers list` (alias: `ls`)
@@ -78,6 +79,18 @@ Restart a container
 | `-p, --project-id <id>` | Project ID | - | Yes |
 | `-e, --environment-id <id>` | Environment ID | - | Yes |
 | `-c, --container-id <id>` | Container ID | - | Yes |
+
+### `containers history`
+
+List every container that has ever run in an environment, including ones replaced by a later redeploy
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project-id <id>` | Project ID | - | Yes |
+| `-e, --environment-id <id>` | Environment ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
 
 ### `containers metrics`
 

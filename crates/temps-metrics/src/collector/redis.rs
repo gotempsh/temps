@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Redis metrics collector.
 //!
 //! Opens a fresh connection to a Redis instance on every [`collect`] call,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Control-plane DNS resolver bootstrap (ADR-024).
 //!
 //! On a worker node, `temps-agent` runs the per-node `*.temps.local` Hickory

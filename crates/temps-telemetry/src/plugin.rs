@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Plugin that registers the anonymous telemetry reporter.
 //!
 //! Registers an `Arc<dyn TelemetryReporter>` in the service registry so any

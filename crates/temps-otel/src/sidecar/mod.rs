@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! OTel collector sidecar injection for deployed containers.
 //!
 //! Automatically injects an OTel collector sidecar into every deployed stack.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Adds `service_members.compute_ip` — the per-container overlay IP that
 //! the deployer/lifecycle hook writes after `docker create` returns, and
 //! that the proxy + DNS registry both read.

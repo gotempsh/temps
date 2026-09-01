@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to add `allow_alternate_sources` to the `projects` table.
 //!
 //! Per-project opt-in that lets a project accept deployments from a source

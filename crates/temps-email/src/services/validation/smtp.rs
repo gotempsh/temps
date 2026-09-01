@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! SMTP-level mailbox probing.
 //!
 //! We open a plain TCP connection to a domain's mail exchanger and run the

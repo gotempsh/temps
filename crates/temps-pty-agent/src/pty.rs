@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! PTY spawning + ioctl wrappers. Runs the child under a pseudo-terminal
 //! whose master end we own (read/write + TIOCSWINSZ for resize). The slave
 //! end becomes the child's stdin/stdout/stderr/controlling-tty.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Makes the proxy dashboard aggregate distinguish user traffic from Temps'
 //! own status-monitor requests.
 //!

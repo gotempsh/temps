@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-backup"
 version.workspace = true
@@ -9,6 +12,7 @@ homepage.workspace = true
 
 [dependencies]
 temps-backup-core = { path = "../temps-backup-core" }
+temps-monitoring = { path = "../temps-monitoring" }
 temps-auth = { path = "../temps-auth" }
 temps-config = { path = "../temps-config" }
 temps-core = { path = "../temps-core" }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Chunk writer service: buffers log lines and flushes to storage as compressed NDJSON chunks
 //!
 //! Flush triggers:

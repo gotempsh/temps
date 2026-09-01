@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Google service account authentication via JWT.
 //!
 //! Implements the OAuth 2.0 JWT Bearer flow for service accounts:

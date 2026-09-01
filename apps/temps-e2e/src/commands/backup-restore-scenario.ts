@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Backup + restore lifecycle against a live Temps instance, using MinIO as
  * the local S3-compatible target (the same image + credentials already

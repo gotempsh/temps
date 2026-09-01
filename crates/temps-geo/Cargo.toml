@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-geo"
 version.workspace = true
@@ -12,7 +15,7 @@ anyhow = "1.0"
 axum = { workspace = true }
 chrono = { version = "0.4", features = ["serde"] }
 log = "0.4"
-maxminddb = "0.30.0"
+maxminddb = { version = "0.30.0", features = ["mmap"] }
 moka = { version = "0.12", features = ["future"] }
 rand = { workspace = true }
 sea-orm = { version = "1.0", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros"] }
@@ -25,6 +28,7 @@ temps-auth = { path = "../temps-auth" }
 utoipa = "5.1"
 tracing = { workspace = true }
 tokio = { version = "1.0", features = ["time"] }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tokio = { version = "1.0", features = ["full"] }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Renders an `ExecuteImportResponse` — the real per-step outcome of running
  * an import (create services, populate data, deploy, verify the app

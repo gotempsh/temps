@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add `environment_id` (nullable FK) to `metric_alert_rules`.
 //!
 //! Config-as-code metric alert rules (declared in `.temps.yaml`) are

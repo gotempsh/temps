@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service layer for the standalone sandbox API. All business logic lives
 //! here; HTTP handlers are thin wrappers that call into these services.
 

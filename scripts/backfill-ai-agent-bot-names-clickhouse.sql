@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- ClickHouse counterpart of backfill-ai-agent-bot-names.sql.
 --
 -- WHY A SEPARATE SCRIPT

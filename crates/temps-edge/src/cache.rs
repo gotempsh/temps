@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! LRU cache layer wrapping `FsFileStore`.
 //!
 //! Files are keyed by `{domain}/{url_path}` to prevent collisions between

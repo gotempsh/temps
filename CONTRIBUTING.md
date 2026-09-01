@@ -291,3 +291,15 @@ This project follows a Code of Conduct to ensure a welcoming and inclusive commu
 ## License
 
 Temps is dual-licensed under the [MIT License](LICENSE-MIT) and [Apache License 2.0](LICENSE). By contributing, you agree that your contributions will be licensed under the same terms, and you certify their origin under the [Developer Certificate of Origin](DCO) by signing off each commit.
+
+Forks may rename, rebrand, modify, and redistribute Temps under either license.
+When redistributing Temps code, retain its SPDX copyright and license headers
+and the notices required by the license you choose. You may add a copyright
+notice for your own modifications alongside the existing notices.
+
+CI verifies attribution on first-party source files. If you add a supported
+source file without a header, apply it with:
+
+```bash
+python3 scripts/source_attribution.py annotate path/to/file
+```

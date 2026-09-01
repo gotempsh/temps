@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { DeploymentResponse, ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
@@ -920,7 +923,6 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       errorTitle: 'Failed to create deployment',
     },
     onSuccess: () => {
-      toast.success('Deployment created successfully')
       setIsRedeployModalOpen(false)
     },
   })
@@ -932,7 +934,6 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
       errorTitle: 'Failed to redeploy image',
     },
     onSuccess: () => {
-      toast.success('Deployment created successfully')
       setIsRedeployModalOpen(false)
     },
   })
@@ -986,14 +987,17 @@ export function DeploymentDetails({ project }: DeploymentDetailsProps) {
     commit,
     tag,
     environmentId,
+    imageRef: editedImageRef,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
+    imageRef?: string
   }) => {
     if (project.source_type === 'docker_image') {
-      const ref = deployment?.metadata?.externalImageRef
+      const ref =
+        editedImageRef?.trim() || deployment?.metadata?.externalImageRef
       if (!ref) {
         toast.error('No image reference found for this deployment')
         return

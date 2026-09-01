@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Workflow Execution Service
 //!
 //! Executes deployment jobs as workflows using the WorkflowExecutor
@@ -19,9 +22,9 @@ use tracing::{debug, error, info, warn};
 use crate::jobs::{
     AgentSyncService, BuildImageJobBuilder, ConfigureAgentsJobBuilder, ConfigureCronsJobBuilder,
     ConfigureMetricAlertsJobBuilder, CronConfigService, DeployImageJobBuilder,
-    DeployStaticBundleJob, DeployStaticJob, DeploymentTarget, DownloadRepoBuilder,
-    MetricAlertConfigService, PrepareSourceBundleJob, PullExternalImageJob, ResourceUsage,
-    VerifyLocalImageJob,
+    DeployStaticBundleJob, DeployStaticFromSourceJob, DeployStaticJob, DeploymentTarget,
+    DownloadRepoBuilder, MetricAlertConfigService, PrepareSourceBundleJob, PullExternalImageJob,
+    ResourceUsage, VerifyLocalImageJob,
 };
 use crate::services::DeploymentJobTracker;
 use temps_screenshots::ScreenshotService;
@@ -1480,6 +1483,9 @@ impl WorkflowExecutionService {
                     .replicas(replicas)
                     .environment_variables(env_variables)
                     .remote_environment_variables(remote_env_variables)
+                    .cross_node_service_blockers(
+                        crate::services::workflow_planner::read_cross_node_blockers(config),
+                    )
                     .secrets(secrets)
                     .resources(resources)
                     .log_id(db_job.log_id.clone())
@@ -2148,6 +2154,50 @@ impl WorkflowExecutionService {
                     deployment.slug.clone(),
                     self.static_deployer.clone(),
                     self.image_builder.clone(),
+                )
+                .with_log_id(db_job.log_id.clone())
+                .with_log_service(self.log_service.clone());
+
+                Ok(Arc::new(job))
+            }
+
+            "DeployStaticFromSourceJob" => {
+                let config = db_job.job_config.as_ref().ok_or_else(|| {
+                    WorkflowExecutionError::MissingJobConfig(db_job.job_id.clone())
+                })?;
+
+                let dependencies: Vec<String> = db_job
+                    .dependencies
+                    .as_ref()
+                    .and_then(|v| serde_json::from_value(v.clone()).ok())
+                    .unwrap_or_default();
+
+                let download_job_id = dependencies
+                    .first()
+                    .cloned()
+                    .unwrap_or_else(|| "download_repo".to_string());
+
+                let directory = config
+                    .get("directory")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(".")
+                    .to_string();
+
+                let deployment = deployments::Entity::find_by_id(db_job.deployment_id)
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or_else(|| {
+                        WorkflowExecutionError::DeploymentNotFound(db_job.deployment_id)
+                    })?;
+
+                let job = DeployStaticFromSourceJob::new(
+                    db_job.job_id.clone(),
+                    download_job_id,
+                    directory,
+                    project.slug.clone(),
+                    environment.slug.clone(),
+                    deployment.slug.clone(),
+                    self.static_deployer.clone(),
                 )
                 .with_log_id(db_job.log_id.clone())
                 .with_log_service(self.log_service.clone());

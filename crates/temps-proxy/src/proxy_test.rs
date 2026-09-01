@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 #[cfg(test)]
 pub mod proxy_tests {
     use crate::config::ProxyConfig;
@@ -488,6 +491,7 @@ pub mod proxy_tests {
 
         let browser_accept = Some("text/html,application/xhtml+xml");
         let document = Some("document");
+        let uir = Some("1");
 
         // Browser HTML navigation → track
         assert!(LoadBalancer::should_track_page(
@@ -496,6 +500,7 @@ pub mod proxy_tests {
             "GET",
             browser_accept,
             document,
+            None,
         ));
 
         // Internal API → do not track
@@ -505,6 +510,7 @@ pub mod proxy_tests {
             "GET",
             browser_accept,
             document,
+            None,
         ));
 
         // CSS static asset → do not track
@@ -514,6 +520,7 @@ pub mod proxy_tests {
             "GET",
             Some("text/css,*/*;q=0.1"),
             Some("style"),
+            None,
         ));
 
         // HTML error page (404) → track
@@ -523,6 +530,7 @@ pub mod proxy_tests {
             "GET",
             browser_accept,
             document,
+            None,
         ));
 
         // API-style errors outside /api must not create visitor sessions.
@@ -532,6 +540,7 @@ pub mod proxy_tests {
             "POST",
             Some("application/json"),
             Some("empty"),
+            None,
         ));
         assert!(!LoadBalancer::should_track_page(
             "/v1/users",
@@ -539,6 +548,7 @@ pub mod proxy_tests {
             "GET",
             Some("application/json"),
             Some("empty"),
+            None,
         ));
         assert!(!LoadBalancer::should_track_page(
             "/missing-content-type",
@@ -546,6 +556,7 @@ pub mod proxy_tests {
             "GET",
             browser_accept,
             document,
+            None,
         ));
 
         // API-prefixed routes are never browser pages, even if misconfigured
@@ -556,6 +567,7 @@ pub mod proxy_tests {
             "GET",
             browser_accept,
             document,
+            None,
         ));
 
         // A generic HTTP client receiving HTML is not a browser page view.
@@ -565,17 +577,42 @@ pub mod proxy_tests {
             "GET",
             Some("*/*"),
             None,
+            None,
         ));
 
-        // Absent Fetch Metadata falls back to Accept + an HTML response.
-        // Browsers omit Sec-Fetch-* on non-trustworthy (plain HTTP) origins,
-        // so requiring it would zero out analytics for every operator serving
-        // an app over HTTP. See is_browser_document_request.
+        // HTTP-origin navigation: no Fetch Metadata (plain-HTTP origins never
+        // get Sec-Fetch-*), browser Accept, and Upgrade-Insecure-Requests: 1
+        // (which browsers send on top-level navigations to HTTP origins) →
+        // track. See is_browser_document_request.
         assert!(LoadBalancer::should_track_page(
             "/docs",
             Some("text/html"),
             "GET",
             browser_accept,
+            None,
+            uir,
+        ));
+
+        // HTTP-origin scraper: browser-shaped Accept but no
+        // Upgrade-Insecure-Requests (curl/wget/scrapers don't send it) → not
+        // tracked, even though it evades the UA-based crawler detector.
+        assert!(!LoadBalancer::should_track_page(
+            "/docs",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            None,
+            None,
+        ));
+
+        // HTTPS behaviour unchanged: when Fetch Metadata is present,
+        // Sec-Fetch-Dest decides regardless of Upgrade-Insecure-Requests.
+        assert!(LoadBalancer::should_track_page(
+            "/docs",
+            Some("text/html"),
+            "GET",
+            browser_accept,
+            document,
             None,
         ));
 
@@ -587,6 +624,7 @@ pub mod proxy_tests {
             "GET",
             browser_accept,
             None,
+            uir,
         ));
 
         // A JS fetch() on an HTTP origin sends no Fetch Metadata either, but
@@ -597,6 +635,7 @@ pub mod proxy_tests {
             "GET",
             Some("*/*"),
             None,
+            uir,
         ));
 
         // The GET-only rule still holds on the no-Fetch-Metadata path: a form
@@ -608,6 +647,7 @@ pub mod proxy_tests {
             "POST",
             browser_accept,
             None,
+            uir,
         ));
 
         // Browser background fetches must not create sessions even if an
@@ -618,6 +658,7 @@ pub mod proxy_tests {
             "GET",
             browser_accept,
             Some("empty"),
+            None,
         ));
 
         // PNG image → do not track
@@ -627,6 +668,7 @@ pub mod proxy_tests {
             "GET",
             Some("image/avif,image/webp,*/*"),
             Some("image"),
+            None,
         ));
 
         Ok(())

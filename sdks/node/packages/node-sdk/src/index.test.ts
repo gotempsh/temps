@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 import { TempsClient } from "./index";
 import * as clientModule from "./client/client";

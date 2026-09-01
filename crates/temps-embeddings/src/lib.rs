@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! # Temps Embeddings
 //!
 //! Pure tokenization library with no external dependencies beyond optional tokenization libraries.

@@ -1,7 +1,10 @@
-import type { ServiceTypeRoute } from '@/api/client'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import type { CreatableServiceTypeRoute } from '@/api/client'
 
 export interface AddServiceTypeOption {
-  id: ServiceTypeRoute
+  id: CreatableServiceTypeRoute
   name: string
   description: string
 }

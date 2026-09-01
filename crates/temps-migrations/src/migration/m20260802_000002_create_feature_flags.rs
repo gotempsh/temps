@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Creates the feature-flag tables (ADR-034, Phase 1).
 //!
 //! Two tables, mirroring the `env_vars` / `env_var_environments` split: the

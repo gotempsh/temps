@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Sample Go app demonstrating Temps error tracking with source context.
 //
 // Deploy this to Temps, enable "Error Tracking Source Context" in the project

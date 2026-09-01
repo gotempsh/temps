@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! [`AgentCliAiService`]: an [`AiService`] implementation that delegates
 //! eligible workloads to a subscription-backed agent CLI.
 

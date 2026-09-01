@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! GitHub Actions-style workflow system
 //!
 //! This module provides a builder-based API for creating deployment pipelines
@@ -53,6 +56,26 @@ pub enum WorkflowError {
     /// Maps to HTTP 400.
     #[error("Invalid bundle path '{path}': {reason}")]
     InvalidBundlePath { path: String, reason: String },
+
+    /// A replica was scheduled onto a node from which one or more of the
+    /// project's linked external services cannot be reached.
+    ///
+    /// This exists so the failure is *loud*. Managed service ports bind to
+    /// `127.0.0.1` on their own host, so there is no address a container on
+    /// another node can dial unless the service has a resolvable
+    /// `*.temps.local` name. Emitting a plausible-looking address instead
+    /// produced containers that started fine and then failed to connect
+    /// forever, with nothing in any log explaining why.
+    #[error(
+        "Replica scheduled on node '{node_name}' cannot reach {blocker_count} linked \
+         service(s) of this project: {details}"
+    )]
+    CrossNodeServiceUnreachable {
+        node_name: String,
+        blocker_count: usize,
+        /// One `describe()`d blocker per line: what is wrong and how to fix it.
+        details: String,
+    },
 }
 
 /// Trait for writing logs in real-time during workflow execution

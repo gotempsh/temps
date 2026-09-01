@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node enrollment token service (ADR-020 WS-1.1).
 //!
 //! Mints short-lived, single-use (or bounded-use), optionally node-scoped

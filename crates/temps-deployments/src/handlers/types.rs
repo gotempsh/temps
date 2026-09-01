@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::sync::Arc;
 
 use crate::services::database_cron_service::DatabaseCronConfigService;
@@ -64,10 +67,15 @@ pub struct AppState {
     /// Builds and sends deploy-failure reports (redacted trace, user-edited,
     /// sent on request) -- see [`crate::services::failure_report_service`].
     pub failure_report_service: Arc<crate::services::FailureReportService>,
+    /// Central policy evaluator for sensitive mutations (e.g. draining a
+    /// node) -- challenges with MFA step-up when the acting user has one
+    /// enrolled. See [`temps_core::SensitiveActionAuthorizer`].
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
 }
 
 use crate::services::types::Deployment;
 use serde::{Deserialize, Serialize};
+use utoipa::IntoParams;
 use utoipa::ToSchema;
 
 #[derive(Deserialize, ToSchema)]
@@ -75,6 +83,12 @@ pub struct GetDeploymentsParams {
     pub page: Option<i64>,
     pub per_page: Option<i64>,
     pub environment_id: Option<i32>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ManagedEnvironmentVariablesQuery {
+    /// Framework preset used to select public browser variable names.
+    pub preset: String,
 }
 
 #[derive(Serialize, Deserialize, ToSchema)]
@@ -946,6 +960,53 @@ pub struct ContainerMetricHistoryPoint {
     pub time: String,
     /// Averaged metric value for the bucket.
     pub value: f64,
+}
+
+/// One container that has ever run for an environment — current or replaced
+/// by a later redeploy. `id` is the internal row ID to pass as the
+/// `container_id` path segment when calling the metrics/history endpoint for
+/// this specific container generation (its docker `container_id` also works
+/// since the history handler now resolves either).
+#[derive(Serialize, ToSchema)]
+pub struct ContainerHistoryEntry {
+    pub id: i32,
+    pub container_id: String,
+    pub container_name: String,
+    #[schema(nullable = true)]
+    pub service_name: Option<String>,
+    pub deployment_id: i32,
+    #[schema(example = "2025-10-12T12:15:47.609192Z")]
+    pub deployed_at: String,
+    #[schema(nullable = true, example = "2025-10-12T12:15:47.609192Z")]
+    pub finished_at: Option<String>,
+    #[schema(nullable = true, example = "2025-10-12T12:15:47.609192Z")]
+    pub deleted_at: Option<String>,
+    /// True if this row is the environment's currently-active container
+    /// (deleted_at is null) — false for containers replaced by a later
+    /// redeploy.
+    pub is_current: bool,
+}
+
+/// Query parameters for the environment container-history endpoint.
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+pub struct ContainerHistoryQuery {
+    /// Only return containers belonging to this deployment. Omit to list
+    /// containers across every deployment the environment has ever had.
+    pub deployment_id: Option<i32>,
+    /// Maximum number of *replaced* container rows to return, most recently
+    /// replaced first (default 20, max 100). Every currently-running
+    /// container is always included and does not count against this limit —
+    /// it only bounds how much historical (replaced-by-redeploy) context
+    /// comes back alongside them.
+    pub limit: Option<u64>,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ContainerHistoryListResponse {
+    pub containers: Vec<ContainerHistoryEntry>,
+    /// Total number of container rows matching the filter, before `limit`
+    /// was applied — lets the client show "20 of 627".
+    pub total_count: u64,
 }
 
 /// Response indicating success of container state change

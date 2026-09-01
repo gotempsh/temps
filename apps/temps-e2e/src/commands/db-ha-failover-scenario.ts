@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Postgres HA cluster (pg_auto_failover) automatic-failover proof against a
  * live Temps instance -- closing a real gap: `PostgresClusterService`

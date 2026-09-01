@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `temps network` — operator visibility into the multi-host overlay.
 //!
 //! This command is purely additive. `temps join` is unchanged; the only

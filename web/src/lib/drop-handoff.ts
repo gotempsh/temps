@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { DropFile } from './drop-archive'
 
 // File objects cannot be encoded into a URL and large folders should not be

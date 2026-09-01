@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Projection giving `spans` a second physical ordering by (project_id, start_time),
 -- so "most recent N spans for this project" stops being a full-table scan.
 --

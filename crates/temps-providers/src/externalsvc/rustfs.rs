@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! RustFS Service implementation
 //!
 //! RustFS is a high-performance, distributed object storage system built in Rust.
@@ -493,24 +496,9 @@ impl RustfsService {
     async fn pull_mc_image(&self, docker: &Docker) -> Result<()> {
         info!("Pulling MinIO Client image {}", Self::MC_IMAGE);
 
-        let (image_name, tag) = if let Some((name, tag)) = Self::MC_IMAGE.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (Self::MC_IMAGE.to_string(), "latest".to_string())
-        };
-
-        docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await?;
+        crate::utils::pull_image_with_retry(docker, Self::MC_IMAGE, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
         Ok(())
     }
 
@@ -575,25 +563,9 @@ impl RustfsService {
         // Pull the image first
         info!("Pulling RustFS image {}", config.docker_image);
 
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = config.docker_image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (config.docker_image.to_string(), "latest".to_string())
-        };
-
-        docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name),
-                    tag: Some(tag),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await?;
+        crate::utils::pull_image_with_retry(docker, &config.docker_image, None)
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
 
         let container_name = self.get_container_name();
         // Add volume names for data and logs

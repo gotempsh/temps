@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useState, useEffect, useCallback } from 'react'
 import { render, Box, Text, Newline } from 'ink'
 import Spinner from 'ink-spinner'

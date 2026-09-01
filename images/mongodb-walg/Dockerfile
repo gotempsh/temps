@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # MongoDB + WAL-G image for Temps MongoDB backup/restore
 # Based on mongo:X (Debian-based), adds WAL-G binary for S3-native backups.
 #

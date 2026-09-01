@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! TimescaleDB storage backend for OTel data.
 //!
 //! Stores metrics, traces, and logs in TimescaleDB hypertables with
@@ -10,8 +13,11 @@ use sea_orm::{ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryRes
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-use super::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageResult};
-use crate::error::OtelError;
+use super::{
+    clamp_ingest_error_limit, truncate_sample_message, BaselinePoint, DeployEvent, MinuteAggregate,
+    OtelStorage, StorageResult, INGEST_ERROR_WINDOW_DAYS,
+};
+use crate::error::{OtelError, StorageErrorKind};
 use crate::types::*;
 
 // ── Interval / aggregation helpers ─────────────────────────────────────────
@@ -272,6 +278,9 @@ impl TimescaleDbStorage {
     /// all nullable so the INSERT is safe on instances that have not yet run
     /// the migration — Postgres will error with "column does not exist" but
     /// the migration is always applied before ingest in production.
+    /// Not idempotent — see [`TimescaleDbStorage::batch_insert_spans`] for why
+    /// these tables cannot currently carry a unique key, and why retry safety
+    /// is enforced by the error classification instead.
     async fn batch_insert_metrics(&self, points: &[MetricPoint]) -> StorageResult<u64> {
         if points.is_empty() {
             return Ok(0);
@@ -404,6 +413,34 @@ impl TimescaleDbStorage {
         Ok(result.rows_affected())
     }
 
+    /// # Not idempotent — callers must not retry on an unknown outcome
+    ///
+    /// This is a plain multi-row `INSERT` with no `ON CONFLICT` clause, so
+    /// re-sending the same batch inserts every row a second time. There is no
+    /// unique key to conflict on, and adding one is not currently possible:
+    /// `otel_spans` is a hypertable with a **space partition on `id`**
+    /// (`create_hypertable('otel_spans', 'start_time', partitioning_column =>
+    /// 'id', number_partitions => 4)`), and TimescaleDB refuses any unique
+    /// index that omits a partitioning column:
+    ///
+    /// ```text
+    /// ERROR: cannot create a unique index without the column "id" (used in partitioning)
+    /// ```
+    ///
+    /// Including `id` would defeat the purpose — it is `BIGSERIAL`, so each
+    /// attempt draws a fresh value and `ON CONFLICT` would never fire. The
+    /// natural key we would want, `(project_id, trace_id, span_id,
+    /// start_time)`, is therefore unavailable until the `id` space dimension
+    /// is removed, which means rebuilding the hypertable (TimescaleDB has no
+    /// "drop dimension") and copying up to 90 days of spans. That is its own
+    /// migration, not a line in this function.
+    ///
+    /// Until then, safety lives in the *retry classification* instead: see
+    /// [`crate::error::StorageErrorKind::is_transient`], which only lets the
+    /// Postgres path retry a failure that proves nothing was ever sent.
+    /// `timescaledb_storage_test.rs::duplicate_batch_insert_duplicates_rows`
+    /// pins the current non-idempotent behaviour so this comment cannot go
+    /// stale silently.
     async fn batch_insert_spans(&self, spans: &[SpanRecord]) -> StorageResult<u64> {
         if spans.is_empty() {
             return Ok(0);
@@ -616,6 +653,9 @@ impl TimescaleDbStorage {
         Ok(result.rows_affected())
     }
 
+    /// Not idempotent — see [`TimescaleDbStorage::batch_insert_spans`] for why
+    /// these tables cannot currently carry a unique key, and why retry safety
+    /// is enforced by the error classification instead.
     async fn batch_insert_logs(&self, records: &[LogRecord]) -> StorageResult<u64> {
         if records.is_empty() {
             return Ok(0);
@@ -828,6 +868,88 @@ impl OtelStorage for TimescaleDbStorage {
                 Ok(0)
             }
         }
+    }
+
+    /// Upsert the `(signal_type, error_class)` group, bumping its count and
+    /// refreshing `last_seen` and the sample message.
+    ///
+    /// A real upsert (rather than an append + read-time aggregate) is the
+    /// reason this lives in Postgres: the unique constraint keeps the table
+    /// bounded at (signals x classes) rows forever, so it needs no partition,
+    /// no TTL and no prune job. Contrast ClickHouse, whose merge-based
+    /// deduplication is not read-your-writes consistent and would force an
+    /// append-only table plus a `GROUP BY` on every read.
+    ///
+    /// `sample_message` is deliberately overwritten by the newest occurrence:
+    /// when a failure mode is ongoing, the most recent message is the most
+    /// useful one to show, and keeping the first would pin the report to a
+    /// stale detail.
+    async fn record_ingest_error(
+        &self,
+        signal_type: &str,
+        error_class: &str,
+        message: &str,
+    ) -> StorageResult<()> {
+        // Bound the stored sample so one pathological backend error cannot
+        // write an unbounded blob into a control table.
+        let sample = truncate_sample_message(message);
+
+        self.db
+            .execute(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                "INSERT INTO otel_ingest_errors \
+                     (signal_type, error_class, sample_message, count, first_seen, last_seen) \
+                 VALUES ($1, $2, $3, 1, NOW(), NOW()) \
+                 ON CONFLICT (signal_type, error_class) DO UPDATE SET \
+                     count = otel_ingest_errors.count + 1, \
+                     last_seen = NOW(), \
+                     sample_message = EXCLUDED.sample_message",
+                [signal_type.into(), error_class.into(), sample.into()],
+            ))
+            .await?;
+
+        Ok(())
+    }
+
+    async fn recent_ingest_errors(&self, limit: u32) -> StorageResult<Vec<IngestErrorSummary>> {
+        let limit = clamp_ingest_error_limit(limit);
+
+        let rows = self
+            .db
+            .query_all(Statement::from_sql_and_values(
+                DatabaseBackend::Postgres,
+                // Read-time window instead of a prune job: the table is
+                // already bounded by its unique constraint, so the only thing
+                // a background sweep would buy is hiding stale groups — which
+                // this WHERE clause does directly, without a timer.
+                format!(
+                    "SELECT signal_type, error_class, sample_message, count, first_seen, last_seen \
+                     FROM otel_ingest_errors \
+                     WHERE last_seen > NOW() - INTERVAL '{INGEST_ERROR_WINDOW_DAYS} days' \
+                     ORDER BY last_seen DESC \
+                     LIMIT $1"
+                ),
+                [i64::from(limit).into()],
+            ))
+            .await?;
+
+        Ok(rows
+            .iter()
+            .filter_map(|row| {
+                // `count` is BIGINT; read it as i64 and clamp, never as u64 —
+                // sea-orm cannot `try_get` an unsigned integer from a Postgres
+                // bigint column.
+                let count: i64 = row.try_get("", "count").ok()?;
+                Some(IngestErrorSummary {
+                    signal_type: row.try_get("", "signal_type").ok()?,
+                    error_class: row.try_get("", "error_class").ok()?,
+                    sample_message: row.try_get("", "sample_message").ok()?,
+                    count: count.max(0) as u64,
+                    first_seen: row.try_get("", "first_seen").ok()?,
+                    last_seen: row.try_get("", "last_seen").ok()?,
+                })
+            })
+            .collect())
     }
 
     /// Query bucketed metric aggregates — full-fidelity port of the ClickHouse
@@ -2332,11 +2454,15 @@ impl OtelStorage for TimescaleDbStorage {
             Some(row) => {
                 let id: i64 = row.try_get("", "id").map_err(|e| OtelError::Storage {
                     message: format!("Failed to get insight id: {}", e),
+                    // Column/type mismatch on a returned row — deterministic.
+                    kind: StorageErrorKind::PostgresQuery,
                 })?;
                 Ok(id)
             }
             None => Err(OtelError::Storage {
                 message: "Insight upsert returned no rows".into(),
+                // The statement ran; it just matched nothing.
+                kind: StorageErrorKind::PostgresQuery,
             }),
         }
     }

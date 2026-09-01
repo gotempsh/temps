@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed model of Kamal's `config/deploy.yml`.
 //!
 //! Modelled against Kamal 2.12 (`kamal init` template + `kamal config`

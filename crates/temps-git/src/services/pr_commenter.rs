@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pull request preview-deployment commenter.
 //!
 //! Vercel-style: when a deployment starts or finishes, look up the open PR

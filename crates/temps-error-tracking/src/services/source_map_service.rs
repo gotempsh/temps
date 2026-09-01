@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use chrono::Utc;
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, FromQueryResult, QueryFilter,
@@ -10,6 +13,28 @@ use thiserror::Error;
 use tracing::{debug, warn};
 
 use super::types::CreateErrorEventData;
+
+/// Maximum accepted size for one source map across HTTP uploads, deployment
+/// capture, parsing, and persistence.
+pub const MAX_SOURCE_MAP_BYTES: usize = 50 * 1024 * 1024;
+
+fn validate_source_map_size(
+    project_id: i32,
+    release: &str,
+    file_path: &str,
+    size_bytes: usize,
+) -> Result<(), SourceMapError> {
+    if size_bytes > MAX_SOURCE_MAP_BYTES {
+        return Err(SourceMapError::TooLarge {
+            project_id,
+            release: release.to_string(),
+            file_path: file_path.to_string(),
+            size_bytes,
+            limit_bytes: MAX_SOURCE_MAP_BYTES,
+        });
+    }
+    Ok(())
+}
 
 #[derive(Error, Debug)]
 pub enum SourceMapError {
@@ -24,6 +49,17 @@ pub enum SourceMapError {
 
     #[error("Validation error: {0}")]
     Validation(String),
+
+    #[error(
+        "Source map for project {project_id}, release '{release}', file '{file_path}' is {size_bytes} bytes, exceeding the {limit_bytes} byte limit"
+    )]
+    TooLarge {
+        project_id: i32,
+        release: String,
+        file_path: String,
+        size_bytes: usize,
+        limit_bytes: usize,
+    },
 }
 
 /// Response type for listing source maps (without the binary data)
@@ -115,6 +151,7 @@ impl SourceMapService {
                 "Source map data cannot be empty".to_string(),
             ));
         }
+        validate_source_map_size(project_id, release, file_path, source_map_data.len())?;
 
         // Validate that the data is a valid source map
         sourcemap::SourceMap::from_slice(&source_map_data)
@@ -1414,6 +1451,23 @@ mod tests {
     use std::sync::Arc;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::projects;
+
+    #[test]
+    fn source_map_size_limit_accepts_boundary_and_rejects_next_byte() {
+        assert!(validate_source_map_size(7, "v1", "~/app.js", MAX_SOURCE_MAP_BYTES).is_ok());
+
+        let error = validate_source_map_size(7, "v1", "~/app.js", MAX_SOURCE_MAP_BYTES + 1)
+            .expect_err("one byte over the limit must be rejected before parsing or storage");
+        assert!(matches!(
+            error,
+            SourceMapError::TooLarge {
+                project_id: 7,
+                size_bytes,
+                limit_bytes: MAX_SOURCE_MAP_BYTES,
+                ..
+            } if size_bytes == MAX_SOURCE_MAP_BYTES + 1
+        ));
+    }
 
     #[test]
     fn build_native_resolved_slices_context_around_line() {

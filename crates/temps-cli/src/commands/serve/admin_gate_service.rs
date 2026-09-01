@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Runtime configuration service for the admin gate.
 //!
 //! The gate itself (see `admin_gate.rs`) holds an atomic `AdminGateHandle`
@@ -82,6 +85,11 @@ pub enum AdminGateServiceError {
         caller_host: Option<String>,
     },
 
+    #[error(
+        "Refusing to save: the trusted X-Forwarded-For header from loopback peer {peer_ip} does not contain a valid client IP"
+    )]
+    InvalidCallerForwardedFor { peer_ip: IpAddr },
+
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
 
@@ -97,6 +105,24 @@ pub struct AdminGateService {
     /// True when env vars dictate the active config. Set once at construction
     /// time and never changes — the process must restart to flip modes.
     env_overridden: bool,
+}
+
+/// The caller identities seen by the two admin-gate enforcement points.
+/// Pingora evaluates the original edge client while the Axum listener may
+/// evaluate either that forwarded client or its loopback peer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AdminGateCallerIps {
+    pub edge_client_ip: IpAddr,
+    pub console_client_ip: IpAddr,
+}
+
+impl AdminGateCallerIps {
+    pub fn direct(client_ip: IpAddr) -> Self {
+        Self {
+            edge_client_ip: client_ip,
+            console_client_ip: client_ip,
+        }
+    }
 }
 
 impl AdminGateService {
@@ -189,12 +215,13 @@ impl AdminGateService {
 
     /// Persist a new config and swap the live handle.
     ///
-    /// `caller_ip` / `caller_host` are used for a lockout pre-flight: if the
-    /// new rules would deny the caller, the write is rejected.
+    /// `caller_ips` / `caller_host` are used for a lockout pre-flight. The
+    /// candidate must allow the identity seen by both Pingora and Axum or the
+    /// write is rejected.
     pub async fn update(
         &self,
         new_settings: AdminGateSettings,
-        caller_ip: IpAddr,
+        caller_ips: AdminGateCallerIps,
         caller_host: Option<&str>,
     ) -> Result<Arc<AdminGateConfig>, AdminGateServiceError> {
         if self.env_overridden {
@@ -211,11 +238,15 @@ impl AdminGateService {
 
         // Lockout pre-flight: only meaningful when the new config is *not*
         // a noop. A noop config allows everyone, so it can never lock out.
-        if !candidate.is_noop() && !candidate.would_allow(caller_ip, caller_host) {
-            return Err(AdminGateServiceError::WouldLockOut {
-                caller_ip,
-                caller_host: caller_host.map(|s| s.to_string()),
-            });
+        if !candidate.is_noop() {
+            for caller_ip in [caller_ips.edge_client_ip, caller_ips.console_client_ip] {
+                if !candidate.would_allow(caller_ip, caller_host) {
+                    return Err(AdminGateServiceError::WouldLockOut {
+                        caller_ip,
+                        caller_host: caller_host.map(|s| s.to_string()),
+                    });
+                }
+            }
         }
 
         persist_to_db(self.db.as_ref(), &new_settings).await?;
@@ -649,7 +680,7 @@ mod tests {
         let result = svc
             .update(
                 AdminGateSettings::default(),
-                IpAddr::V4(Ipv4Addr::LOCALHOST),
+                AdminGateCallerIps::direct(IpAddr::V4(Ipv4Addr::LOCALHOST)),
                 None,
             )
             .await;
@@ -676,13 +707,61 @@ mod tests {
                     allowed_ips: vec!["10.0.0.0/8".to_string()],
                     ..Default::default()
                 },
-                IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5)),
+                AdminGateCallerIps::direct(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 5))),
                 Some("anywhere"),
             )
             .await;
         assert!(matches!(
             result.unwrap_err(),
             AdminGateServiceError::WouldLockOut { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn update_refuses_when_either_enforcement_point_would_deny_caller() {
+        let db = MockDatabase::new(DatabaseBackend::Postgres)
+            .append_query_results(vec![Vec::<temps_entities::settings::Model>::new()])
+            .into_connection();
+        let (svc, _handle) = AdminGateService::new(Arc::new(db), &[], &[], false)
+            .await
+            .unwrap();
+        let caller_ips = AdminGateCallerIps {
+            edge_client_ip: "100.100.1.2".parse().unwrap(),
+            console_client_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+        };
+
+        let edge_denied = svc
+            .update(
+                AdminGateSettings {
+                    allowed_ips: vec!["127.0.0.1/32".to_string()],
+                    ..Default::default()
+                },
+                caller_ips,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            edge_denied,
+            AdminGateServiceError::WouldLockOut { caller_ip, .. }
+                if caller_ip == caller_ips.edge_client_ip
+        ));
+
+        let console_denied = svc
+            .update(
+                AdminGateSettings {
+                    allowed_ips: vec!["100.64.0.0/10".to_string()],
+                    ..Default::default()
+                },
+                caller_ips,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            console_denied,
+            AdminGateServiceError::WouldLockOut { caller_ip, .. }
+                if caller_ip == caller_ips.console_client_ip
         ));
     }
 
@@ -933,7 +1012,7 @@ mod tests {
                 allowed_hosts: vec!["admin.example.com".to_string()],
                 trust_forwarded_for: false,
             },
-            caller,
+            AdminGateCallerIps::direct(caller),
             Some("admin.example.com"),
         )
         .await

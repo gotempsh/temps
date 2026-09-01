@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Cross-project trace ref index (ADR-027 Phase 0) — ClickHouse edition.
 --
 -- Answers "which projects hold spans for this trace_id?" WITHOUT knowing the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! nftables baseline rules.
 //!
 //! We install one dedicated nftables table named `temps_network` so we can

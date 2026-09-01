@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! End-to-end OTLP decode -> native ClickHouse store fidelity test.
 //!
 //! This proves the full claim "metrics are being stored": it feeds a *real*

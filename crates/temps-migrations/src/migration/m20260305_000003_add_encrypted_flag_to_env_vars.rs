@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to add is_encrypted column to env_vars table
 //!
 //! Adds a boolean flag to track whether the value is stored encrypted.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { CommandPalette } from '@/components/command/CommandPalette'
 import {
   CompactErrorFallback,
@@ -45,6 +48,7 @@ import './globals.css'
 import { MonitoringSettings } from './components/monitoring/MonitoringSettings'
 import { AddNotificationProvider } from './pages/AddNotificationProvider'
 import { EditNotificationProvider } from './pages/EditNotificationProvider'
+import { NotificationRouteForm } from './pages/NotificationRouteForm'
 import { Monitoring } from './pages/Monitoring'
 import { PluginPage } from './pages/plugins/PluginPage'
 // Lazy load all pages
@@ -326,6 +330,11 @@ const PluginsPage = lazy(() =>
 const NodesPage = lazy(() =>
   import('./pages/settings/NodesPage').then((m) => ({
     default: m.NodesPage,
+  }))
+)
+const McpServerPage = lazy(() =>
+  import('./pages/settings/McpServerPage').then((m) => ({
+    default: m.McpServerPage,
   }))
 )
 const NodeDetailPage = lazy(() =>
@@ -621,6 +630,14 @@ const FullAppRoutes = () => {
                         element={<AddNotificationProvider />}
                       />
                       <Route
+                        path="notifications/routes/new"
+                        element={<NotificationRouteForm />}
+                      />
+                      <Route
+                        path="notifications/routes/:id"
+                        element={<NotificationRouteForm />}
+                      />
+                      <Route
                         path="notifications/:id"
                         element={<EditNotificationProvider />}
                       />
@@ -684,6 +701,7 @@ const FullAppRoutes = () => {
                         path="otel-pipeline"
                         element={<OtelPipelineStatusPage />}
                       />
+                      <Route path="mcp-server" element={<McpServerPage />} />
                     </Route>
                     {/* Top-level resources surfaced in the main sidebar */}
                     <Route path="/domains" element={<Domains />} />

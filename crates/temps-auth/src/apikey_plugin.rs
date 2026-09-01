@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! API Key Plugin implementation for the Temps plugin system
 //!
 //! This plugin provides API key management functionality including:

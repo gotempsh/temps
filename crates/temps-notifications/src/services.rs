@@ -1,4 +1,8 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::types::{Notification, NotificationPriority, NotificationSeverity, NotificationType};
+use crate::NotificationRoutingService;
 use anyhow::Result;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
@@ -9,7 +13,7 @@ use lettre::{
 };
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, JoinType, ModelTrait,
-    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -20,7 +24,8 @@ use temps_core::notifications::{
 use temps_core::url_validation::{resolve_and_validate_domain, validate_external_url};
 use temps_entities::types::RoleType;
 use temps_entities::{
-    notification_preferences, notification_providers, notifications, roles, user_roles, users,
+    notification_preferences, notification_providers, notification_routes, notifications, roles,
+    user_roles, users,
 };
 use tracing::{error, info};
 use utoipa::ToSchema;
@@ -65,6 +70,42 @@ pub enum NotificationProviderConfigMergeError {
         "Masked notification provider values inside array '{path}' cannot be safely matched after an edit"
     )]
     AmbiguousMaskedArray { path: String },
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum NotificationProviderCreateError {
+    #[error(
+        "Failed to serialize configuration for notification provider '{provider_name}': {source}"
+    )]
+    Serialization {
+        provider_name: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error(
+        "Failed to encrypt configuration for notification provider '{provider_name}': {reason}"
+    )]
+    Encryption {
+        provider_name: String,
+        reason: String,
+    },
+    #[error(
+        "Failed to {operation} notification provider '{provider_name}' ({provider_id:?}): {source}"
+    )]
+    Database {
+        provider_id: Option<i32>,
+        provider_name: String,
+        operation: &'static str,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error("Failed to create the catch-all route for notification provider '{provider_name}' ({provider_id}): {source}")]
+    CatchAllRoute {
+        provider_id: i32,
+        provider_name: String,
+        #[source]
+        source: crate::routing::NotificationRouteError,
+    },
 }
 
 const MASKED_CONFIG_VALUE: &str = "***";
@@ -207,7 +248,8 @@ pub struct EmailProvider {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SlackProvider {
     pub webhook_url: String,
-    pub channel: String,
+    #[serde(default)]
+    pub channel: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -502,7 +544,10 @@ impl NotificationProvider for CloudflareProvider {
         match client.get(url).bearer_auth(&self.api_token).send().await {
             Ok(response) => Ok(response.status().is_success()),
             Err(e) => {
-                error!("Cloudflare provider health check failed: {}", e);
+                error!(
+                    "Cloudflare provider health check failed: {}",
+                    e.without_url()
+                );
                 Ok(false)
             }
         }
@@ -524,6 +569,16 @@ fn html_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Drop the request URL from a reqwest error before it is logged or
+/// propagated. `reqwest::Error`'s `Display` embeds the full request URL
+/// (`" for url (...)"`) whenever one is attached — for webhook-style
+/// destinations (Slack incoming webhooks, Discord-style webhook URLs) that
+/// URL IS the credential, so leaving it in triggers CWE-532 (secrets in
+/// logs) the moment a delivery or health check fails.
+fn webhook_request_error(prefix: &str, error: reqwest::Error) -> anyhow::Error {
+    anyhow::anyhow!("{prefix}: {}", error.without_url())
 }
 
 /// Escape Slack mrkdwn special characters so user-controlled text cannot inject
@@ -1223,7 +1278,6 @@ impl NotificationProvider for SlackProvider {
         let safe_title = slack_escape(&notification.title);
         let safe_message = slack_escape(&notification.message);
         let payload = serde_json::json!({
-            "channel": self.channel,
             "attachments": [{
                 "color": color,
                 "title": safe_title,
@@ -1232,8 +1286,14 @@ impl NotificationProvider for SlackProvider {
                 "footer": format!("Priority: {:?} | Type: {:?}", notification.priority, notification.notification_type)
             }]
         });
-
-        client.post(&self.webhook_url).json(&payload).send().await?;
+        client
+            .post(&self.webhook_url)
+            .json(&payload)
+            .send()
+            .await
+            .map_err(|e| webhook_request_error("Slack webhook request failed", e))?
+            .error_for_status()
+            .map_err(|e| webhook_request_error("Slack webhook rejected the request", e))?;
 
         Ok(())
     }
@@ -1241,10 +1301,7 @@ impl NotificationProvider for SlackProvider {
     async fn health_check(&self) -> Result<bool> {
         let client = reqwest::Client::new();
 
-        let test_payload = serde_json::json!({
-            "channel": self.channel,
-            "text": "Health check"
-        });
+        let test_payload = serde_json::json!({ "text": "Health check" });
 
         match client
             .post(&self.webhook_url)
@@ -1254,7 +1311,7 @@ impl NotificationProvider for SlackProvider {
         {
             Ok(response) => Ok(response.status().is_success()),
             Err(e) => {
-                error!("Slack provider health check failed: {}", e);
+                error!("Slack provider health check failed: {}", e.without_url());
                 Ok(false)
             }
         }
@@ -1318,7 +1375,10 @@ impl NotificationProvider for WebhookProvider {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        let response = request.send().await?;
+        let response = request
+            .send()
+            .await
+            .map_err(|e| webhook_request_error("Webhook request failed", e))?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -1363,7 +1423,7 @@ impl NotificationProvider for WebhookProvider {
         match request.send().await {
             Ok(response) => Ok(response.status().is_success()),
             Err(e) => {
-                error!("Webhook provider health check failed: {}", e);
+                error!("Webhook provider health check failed: {}", e.without_url());
                 Ok(false)
             }
         }
@@ -1373,6 +1433,7 @@ impl NotificationProvider for WebhookProvider {
 pub struct NotificationService {
     db: Arc<DatabaseConnection>,
     encryption_service: Arc<temps_core::EncryptionService>,
+    routing_service: NotificationRoutingService,
 }
 
 impl NotificationService {
@@ -1381,6 +1442,7 @@ impl NotificationService {
         encryption_service: Arc<temps_core::EncryptionService>,
     ) -> Self {
         Self {
+            routing_service: NotificationRoutingService::new(db.clone()),
             db,
             encryption_service,
         }
@@ -1393,19 +1455,22 @@ impl NotificationService {
         )
     }
 
-    async fn get_enabled_providers(&self) -> Result<Vec<Box<dyn NotificationProvider>>> {
-        let db_providers = notification_providers::Entity::find()
-            .filter(notification_providers::Column::Enabled.eq(true))
-            .all(self.db.as_ref())
+    async fn get_enabled_providers(
+        &self,
+        notification: &Notification,
+    ) -> Result<Vec<Box<dyn NotificationProvider>>> {
+        let db_providers = self
+            .routing_service
+            .resolve_provider_models(notification.effective_severity())
             .await?;
         let mut providers = vec![];
-        for provider_record in db_providers {
-            match self.load_provider(&provider_record).await {
+        for db_provider in db_providers {
+            match self.load_provider(&db_provider).await {
                 Ok(provider) => {
                     providers.push(provider);
                 }
                 Err(e) => {
-                    error!("Failed to load provider {}: {}", provider_record.name, e);
+                    error!("Failed to load provider {}: {}", db_provider.name, e);
                 }
             }
         }
@@ -1580,9 +1645,9 @@ impl NotificationService {
             );
         }
 
-        // Send through all configured providers
+        // Resolve routes and deliver once to each matching provider.
         let providers = self
-            .get_enabled_providers()
+            .get_enabled_providers(&notification)
             .await
             .map_err(|e| anyhow::anyhow!("Failed to get providers {}", e))?;
         for provider in &providers {
@@ -1595,17 +1660,10 @@ impl NotificationService {
     }
 
     pub async fn is_configured(&self) -> Result<bool> {
-        let count = notification_providers::Entity::find()
-            .filter(notification_providers::Column::Enabled.eq(true))
-            .paginate(self.db.as_ref(), 1)
-            .num_items()
+        self.routing_service
+            .has_routable_provider()
             .await
-            .map_err(|e| {
-                error!("Failed to check notification providers: {}", e);
-                anyhow::anyhow!("Failed to check notification providers: {}", e)
-            })?;
-
-        Ok(count > 0)
+            .map_err(|error| anyhow::anyhow!(error))
     }
 
     pub async fn list_providers(&self) -> Result<Vec<notification_providers::Model>> {
@@ -1848,26 +1906,75 @@ impl NotificationService {
         p_name: String,
         p_provider_type: String,
         p_config: T,
-    ) -> Result<notification_providers::Model> {
-        let config_json = serde_json::to_string(&p_config)?;
+        p_enabled: bool,
+    ) -> std::result::Result<notification_providers::Model, NotificationProviderCreateError> {
+        let config_json = serde_json::to_string(&p_config).map_err(|source| {
+            NotificationProviderCreateError::Serialization {
+                provider_name: p_name.clone(),
+                source,
+            }
+        })?;
 
         // Encrypt the config before storing
         let encrypted_config = self
             .encryption_service
             .encrypt_string(&config_json)
-            .map_err(|e| anyhow::anyhow!("Failed to encrypt config: {}", e))?;
+            .map_err(|error| NotificationProviderCreateError::Encryption {
+                provider_name: p_name.clone(),
+                reason: error.to_string(),
+            })?;
+
+        let transaction =
+            self.db
+                .begin()
+                .await
+                .map_err(|source| NotificationProviderCreateError::Database {
+                    provider_id: None,
+                    provider_name: p_name.clone(),
+                    operation: "begin creating",
+                    source,
+                })?;
 
         let new_provider = notification_providers::ActiveModel {
-            name: Set(p_name),
+            name: Set(p_name.clone()),
             provider_type: Set(p_provider_type),
             config: Set(encrypted_config),
-            enabled: Set(true),
+            enabled: Set(p_enabled),
             created_at: Set(Utc::now()),
             updated_at: Set(Utc::now()),
             ..Default::default()
         };
 
-        let provider = new_provider.insert(self.db.as_ref()).await?;
+        let provider = new_provider.insert(&transaction).await.map_err(|source| {
+            NotificationProviderCreateError::Database {
+                provider_id: None,
+                provider_name: p_name.clone(),
+                operation: "insert",
+                source,
+            }
+        })?;
+
+        NotificationRoutingService::create_catch_all_route_for_provider(
+            &transaction,
+            provider.id,
+            &provider.name,
+        )
+        .await
+        .map_err(|source| NotificationProviderCreateError::CatchAllRoute {
+            provider_id: provider.id,
+            provider_name: provider.name.clone(),
+            source,
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| NotificationProviderCreateError::Database {
+                provider_id: Some(provider.id),
+                provider_name: provider.name.clone(),
+                operation: "commit with catch-all route for",
+                source,
+            })?;
 
         Ok(provider)
     }
@@ -1884,6 +1991,11 @@ impl NotificationService {
 
         if let Some(provider) = provider {
             let existing_config = provider.config.clone();
+            let renamed_to = update
+                .name
+                .as_ref()
+                .filter(|new_name| *new_name != &provider.name)
+                .cloned();
             let mut active_model: notification_providers::ActiveModel = provider.into();
 
             // Update fields if provided
@@ -1906,8 +2018,36 @@ impl NotificationService {
             }
             active_model.updated_at = Set(Utc::now());
 
+            let transaction = self.db.begin().await?;
+
             // Update the provider in the database
-            let updated_provider = active_model.update(self.db.as_ref()).await?;
+            let updated_provider = active_model.update(&transaction).await?;
+
+            // Keep the auto-generated catch-all route's display name (baked
+            // in at creation time from the provider's name) in sync with a
+            // rename, so the Routes list doesn't keep showing a stale name
+            // for the provider it belongs to.
+            if let Some(new_name) = renamed_to {
+                notification_routes::Entity::update_many()
+                    .col_expr(
+                        notification_routes::Column::Name,
+                        sea_orm::sea_query::Expr::value(
+                            NotificationRoutingService::catch_all_route_name(
+                                provider_id,
+                                &new_name,
+                            ),
+                        ),
+                    )
+                    .col_expr(
+                        notification_routes::Column::UpdatedAt,
+                        sea_orm::sea_query::Expr::value(Utc::now()),
+                    )
+                    .filter(notification_routes::Column::CatchAllProviderId.eq(provider_id))
+                    .exec(&transaction)
+                    .await?;
+            }
+
+            transaction.commit().await?;
 
             Ok(Some(updated_provider))
         } else {
@@ -1921,6 +2061,10 @@ impl NotificationService {
             .await?;
 
         if let Some(provider) = provider {
+            // The provider's auto-generated catch-all route (if any) is
+            // removed automatically via the `catch_all_provider_id` FK's
+            // ON DELETE CASCADE — no orphaned "All notifications - <name>
+            // (provider <id>)" route is left behind.
             provider.delete(self.db.as_ref()).await?;
             Ok(true)
         } else {
@@ -3634,6 +3778,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_slack_send_uses_webhook_default_when_channel_is_absent() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: None,
+        };
+        provider
+            .send(&Notification::new("Default route", "Use webhook channel"))
+            .await
+            .expect("Slack delivery should succeed");
+
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request capture should succeed");
+        assert_eq!(requests.len(), 1);
+        let payload: serde_json::Value =
+            serde_json::from_slice(&requests[0].body).expect("Slack payload should be JSON");
+        assert!(
+            payload.get("channel").is_none(),
+            "an absent channel must let Slack use the webhook default"
+        );
+    }
+
+    #[tokio::test]
     async fn test_slack_send_excludes_action_url_metadata_and_html() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -3648,7 +3826,7 @@ mod tests {
 
         let provider = SlackProvider {
             webhook_url: server.uri(),
-            channel: "#alerts".to_string(),
+            channel: Some("#alerts".to_string()),
         };
 
         // Mirrors what the error-tracking plugin attaches for the email's CTA
@@ -3671,6 +3849,11 @@ mod tests {
         let body = String::from_utf8(requests[0].body.clone()).unwrap();
 
         assert!(
+            !body.contains("\"channel\"") && !body.contains("#alerts"),
+            "incoming webhooks must use their Slack-configured channel: {body}"
+        );
+
+        assert!(
             !body.contains("_action_url") && !body.contains("temps.example"),
             "reserved _action_url metadata must never be sent to Slack: {body}"
         );
@@ -3690,6 +3873,30 @@ mod tests {
             body.contains("&lt;!channel&gt;"),
             "mrkdwn @channel mention must be escaped to literal entities: {body}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_slack_send_returns_an_error_for_rejected_webhooks() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(410).set_body_string("invalid_token"))
+            .mount(&server)
+            .await;
+
+        let provider = SlackProvider {
+            webhook_url: server.uri(),
+            channel: Some("#incidents".to_string()),
+        };
+        let error = provider
+            .send(&Notification::new("Critical", "Webhook rejected"))
+            .await
+            .expect_err("Slack HTTP failures must not be reported as successful deliveries");
+
+        assert!(error.to_string().contains("410 Gone"));
     }
 
     #[test]
@@ -3962,5 +4169,322 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn add_provider_atomically_creates_a_catch_all_route() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-route-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+
+        let provider = service
+            .add_provider(
+                "Slack team alerts".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/TEST",
+                    "channel": "#alerts"
+                }),
+                true,
+            )
+            .await
+            .expect("provider and its catch-all route should be created");
+        let disabled_provider = service
+            .add_provider(
+                "Disabled Slack".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/DISABLED",
+                    "channel": "#disabled"
+                }),
+                false,
+            )
+            .await
+            .expect("disabled provider should still receive a catch-all route");
+
+        let routing = NotificationRoutingService::new(test_db.connection_arc());
+        let routes = routing
+            .list(1, 20)
+            .await
+            .expect("catch-all route should be readable");
+        assert_eq!(routes.total, 2);
+        for created_provider in [&provider, &disabled_provider] {
+            let route = routes
+                .items
+                .iter()
+                .find(|route| route.provider_ids == vec![created_provider.id])
+                .expect("each provider should have its own catch-all route");
+            assert_eq!(
+                route.name,
+                NotificationRoutingService::catch_all_route_name(
+                    created_provider.id,
+                    &created_provider.name
+                )
+            );
+            assert_eq!(route.min_severity, "debug");
+            assert_eq!(route.max_severity, "emergency");
+            assert!(
+                route.enabled,
+                "catch-all routes must be ready for later enabling"
+            );
+        }
+
+        for severity in [NotificationSeverity::Debug, NotificationSeverity::Emergency] {
+            let resolved = routing
+                .resolve_provider_models(severity)
+                .await
+                .expect("catch-all route should resolve at both severity bounds");
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(resolved[0].id, provider.id);
+        }
+
+        service
+            .update_provider(
+                disabled_provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: None,
+                    enabled: Some(true),
+                },
+            )
+            .await
+            .expect("disabled provider should be enableable")
+            .expect("disabled provider should still exist");
+        let resolved = routing
+            .resolve_provider_models(NotificationSeverity::Debug)
+            .await
+            .expect("the existing catch-all route should activate with its provider");
+        assert_eq!(
+            resolved
+                .into_iter()
+                .map(|resolved_provider| resolved_provider.id)
+                .collect::<std::collections::HashSet<_>>(),
+            std::collections::HashSet::from([provider.id, disabled_provider.id])
+        );
+
+        test_db
+            .cleanup_all_tables()
+            .await
+            .expect("notification route test data should clean up");
+    }
+
+    #[tokio::test]
+    async fn provider_rename_and_delete_keep_the_catch_all_route_in_sync() {
+        let test_db = test_database_or_skip!();
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-lifecycle-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let routing = NotificationRoutingService::new(test_db.connection_arc());
+
+        let provider = service
+            .add_provider(
+                "Slack team alerts".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/TEST",
+                    "channel": "#alerts"
+                }),
+                true,
+            )
+            .await
+            .expect("provider and its catch-all route should be created");
+
+        // Renaming the provider must rename its catch-all route to match,
+        // not leave the route showing the provider's old name.
+        service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: Some("Slack team alerts (renamed)".to_string()),
+                    config: None,
+                    enabled: None,
+                },
+            )
+            .await
+            .expect("provider rename should succeed")
+            .expect("renamed provider should still exist");
+        let routes_after_rename = routing
+            .list(1, 20)
+            .await
+            .expect("routes should list after rename");
+        assert_eq!(routes_after_rename.total, 1);
+        assert_eq!(
+            routes_after_rename.items[0].name,
+            NotificationRoutingService::catch_all_route_name(
+                provider.id,
+                "Slack team alerts (renamed)"
+            ),
+            "the catch-all route's name must track the provider rename"
+        );
+
+        // An unrelated update (no name change) must not touch the route.
+        service
+            .update_provider(
+                provider.id,
+                UpdateProviderRequest {
+                    name: None,
+                    config: None,
+                    enabled: Some(false),
+                },
+            )
+            .await
+            .expect("disabling the provider should succeed")
+            .expect("provider should still exist");
+        let routes_after_unrelated_update = routing
+            .list(1, 20)
+            .await
+            .expect("routes should list after an unrelated update");
+        assert_eq!(
+            routes_after_unrelated_update.items[0].name, routes_after_rename.items[0].name,
+            "a config/enabled-only update must not rename the catch-all route"
+        );
+
+        // Deleting the provider must remove its catch-all route too — no
+        // orphaned, permanently-empty route left behind.
+        let deleted = service
+            .delete_provider(provider.id)
+            .await
+            .expect("provider delete should succeed");
+        assert!(deleted);
+        let routes_after_delete = routing
+            .list(1, 20)
+            .await
+            .expect("routes should list after delete");
+        assert_eq!(
+            routes_after_delete.total, 0,
+            "the catch-all route must be cascade-deleted with its provider"
+        );
+
+        test_db
+            .cleanup_all_tables()
+            .await
+            .expect("notification provider lifecycle test data should clean up");
+    }
+
+    #[tokio::test]
+    async fn add_provider_rolls_back_when_catch_all_route_creation_fails() {
+        let test_db = test_database_or_skip!();
+        let now = Utc::now();
+        temps_entities::notification_routes::ActiveModel {
+            name: Set(NotificationRoutingService::catch_all_route_name(
+                1,
+                "Slack team alerts",
+            )),
+            enabled: Set(true),
+            min_severity: Set("debug".to_string()),
+            max_severity: Set("emergency".to_string()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(test_db.db.as_ref())
+        .await
+        .expect("conflicting route should be seeded");
+
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-route-rollback-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let error = service
+            .add_provider(
+                "Slack team alerts".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/TEST",
+                    "channel": "#alerts"
+                }),
+                true,
+            )
+            .await
+            .expect_err("route name conflict should fail provider creation");
+        assert!(matches!(
+            error,
+            NotificationProviderCreateError::CatchAllRoute { provider_id: 1, .. }
+        ));
+
+        assert_eq!(
+            notification_providers::Entity::find()
+                .count(test_db.db.as_ref())
+                .await
+                .expect("provider count should be readable"),
+            0,
+            "provider insert must roll back when its route cannot be created"
+        );
+
+        test_db
+            .cleanup_all_tables()
+            .await
+            .expect("notification rollback test data should clean up");
+    }
+
+    #[tokio::test]
+    async fn add_provider_rolls_back_provider_and_route_when_assignment_fails() {
+        let mut test_db = test_database_or_skip!();
+        test_db
+            .execute_sql(
+                r#"
+CREATE FUNCTION reject_notification_route_assignment()
+RETURNS trigger
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    RAISE EXCEPTION 'forced assignment failure';
+END;
+$$
+"#,
+            )
+            .await
+            .expect("assignment rejection function should create");
+        test_db
+            .execute_sql(
+                r#"
+CREATE TRIGGER reject_notification_route_assignment
+BEFORE INSERT ON notification_route_providers
+FOR EACH ROW EXECUTE FUNCTION reject_notification_route_assignment()
+"#,
+            )
+            .await
+            .expect("assignment rejection trigger should create");
+
+        let encryption_service = Arc::new(temps_core::EncryptionService::new_from_password(
+            "notification-provider-assignment-rollback-test",
+        ));
+        let service = NotificationService::new(test_db.connection_arc(), encryption_service);
+        let error = service
+            .add_provider(
+                "Slack team alerts".to_string(),
+                "slack".to_string(),
+                serde_json::json!({
+                    "webhook_url": "https://hooks.slack.com/services/TEST/TEST/TEST",
+                    "channel": "#alerts"
+                }),
+                true,
+            )
+            .await
+            .expect_err("assignment failure should abort provider creation");
+        assert!(matches!(
+            error,
+            NotificationProviderCreateError::CatchAllRoute { provider_id: 1, .. }
+        ));
+        assert_eq!(
+            notification_providers::Entity::find()
+                .count(test_db.db.as_ref())
+                .await
+                .expect("provider count should be readable"),
+            0
+        );
+        assert_eq!(
+            temps_entities::notification_routes::Entity::find()
+                .count(test_db.db.as_ref())
+                .await
+                .expect("route count should be readable"),
+            0,
+            "route insert must roll back with its provider when assignment fails"
+        );
+
+        test_db.cleanup().await;
     }
 }

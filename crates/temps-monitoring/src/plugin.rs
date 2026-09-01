@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `MonitoringPlugin` — registers `AlarmService` in the shared service
 //! registry and wires the alarms HTTP routes (ADR-025 Phase 1).
 //!

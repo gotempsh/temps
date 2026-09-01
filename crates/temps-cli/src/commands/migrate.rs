@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Database migration command.
 //!
 //! Applies pending schema migrations explicitly, decoupled from `temps serve`.

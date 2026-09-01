@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { readFileSync, statSync, existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs'
 import { execFileSync, execSync } from 'node:child_process'

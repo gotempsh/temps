@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Indexes managed DNS zones by the canonical form used for authoritative
 //! suffix lookup. Existing rows may contain mixed case, surrounding whitespace,
 //! a wildcard prefix, or a trailing root dot, so canonicalization stays in the

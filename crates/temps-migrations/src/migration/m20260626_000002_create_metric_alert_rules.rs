@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to create the `metric_alert_rules` table.
 //!
 //! Backs the first-class, metric-centric alert rules feature. Each row defines a

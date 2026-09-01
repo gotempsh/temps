@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Container platform strings (`linux/amd64`, `linux/arm64`) and their
 //! normalization.
 //!

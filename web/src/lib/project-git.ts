@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /** Whether a project actually deploys from a Git repository.
  *
  * `repo_owner`/`repo_name` are NOT NULL columns, and project creation fills

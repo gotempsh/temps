@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use sea_orm_migration::prelude::*;
 
 /// Creates `service_metrics_status` — a tiny one-row-per-source table tracking

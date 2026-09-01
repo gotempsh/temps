@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Deploy and verify the repo's source-based example projects against a live
  * Temps instance. For each selected example this:

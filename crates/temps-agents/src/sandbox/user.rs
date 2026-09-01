@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Single source of truth for the sandbox container's user, home, and
 //! work directory. Keep every `/home/...`, `temps:temps`, and `/workspace`
 //! literal funneled through these constants — a future image with a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { test, expect, describe, beforeEach, afterEach } from 'bun:test'
 import { credentials } from '../../config/store.js'
 import { computeExpiryIso, resolveProjectId } from './index.js'

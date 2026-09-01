@@ -1,4 +1,7 @@
 #!/usr/bin/env bun
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Command } from 'commander'
 import { getProjects } from '@temps-sdk/api'
 import { makeClient, resolveConfig, unwrap } from './lib/client.ts'

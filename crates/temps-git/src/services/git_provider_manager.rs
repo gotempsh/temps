@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter,
     QueryOrder, QuerySelect, Set,
@@ -7,7 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::RwLock;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use super::git_provider::{
     AuthMethod, GitProviderError, GitProviderFactory, GitProviderService, GitProviderType,
@@ -18,6 +21,7 @@ use temps_entities::{git_provider_connections, git_providers, projects, reposito
 
 // OAuth scope constants
 const GITLAB_OAUTH_SCOPES: &str = "api read_api read_repository";
+const MAX_DOCKERFILES_TO_SCAN: usize = 16;
 // Create JWT token for authentication
 use octocrab::models::{AppId, InstallationId, InstallationToken};
 use octocrab::params::apps::CreateInstallationAccessToken;
@@ -1926,43 +1930,6 @@ impl GitProviderManager {
         }
     }
 
-    /// Classify a failed provider HTTP response into a typed error.
-    ///
-    /// Provider 401/403 responses MUST become
-    /// [`GitProviderError::AuthenticationFailed`] rather than a generic
-    /// `ApiError`, for two reasons:
-    ///
-    /// 1. [`Self::is_authentication_error`] drives the token
-    ///    force-refresh-and-retry path. A 401 flattened into `ApiError`
-    ///    silently skips that retry, so an expired-but-refreshable token
-    ///    hard-fails instead of recovering.
-    /// 2. The HTTP layer maps `AuthenticationFailed` to a distinct problem
-    ///    type, so clients can tell "reconnect this git account" apart from
-    ///    "the provider is having a bad day" and say so to the user.
-    ///
-    /// `operation` names what was being fetched, so the message stays
-    /// greppable and specific (e.g. "get tree for owner/repo@main").
-    fn classify_provider_response_error(
-        status: reqwest::StatusCode,
-        operation: &str,
-    ) -> GitProviderError {
-        if status == reqwest::StatusCode::UNAUTHORIZED {
-            GitProviderError::AuthenticationFailed(format!(
-                "provider rejected the stored credential while trying to {}: HTTP {}",
-                operation, status
-            ))
-        } else if status == reqwest::StatusCode::FORBIDDEN {
-            GitProviderError::PermissionDenied {
-                operation: operation.to_string(),
-                required_permission:
-                    "repository access with the permission required by this operation".to_string(),
-                provider_message: format!("HTTP {}", status),
-            }
-        } else {
-            GitProviderError::ApiError(format!("Failed to {}: HTTP {}", operation, status))
-        }
-    }
-
     /// Check if a GitProviderError is an authentication error (401)
     fn is_authentication_error(&self, error: &super::git_provider::GitProviderError) -> bool {
         matches!(
@@ -3250,98 +3217,11 @@ impl GitProviderManager {
         repo: &str,
         branch: &str,
     ) -> Result<Vec<String>, GitProviderError> {
-        // For GitHub, we can use the tree API to get file list
-        // For other providers, we may need different approaches
-
-        // Try to get file list from the root of the repository
-        // This is a simplified approach - in production you might want to be more thorough
-
-        let client = reqwest::Client::new();
-
         match provider_service.provider_type() {
-            GitProviderType::GitHub => {
-                // Use GitHub API to get tree
-                let url = format!(
-                    "https://api.github.com/repos/{}/{}/git/trees/{}?recursive=1",
-                    owner, repo, branch
-                );
-
-                let response = client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", access_token))
-                    .header("User-Agent", "Temps-Engine")
-                    .send()
+            GitProviderType::GitHub | GitProviderType::GitLab => {
+                provider_service
+                    .list_repository_files(access_token, owner, repo, branch)
                     .await
-                    .map_err(|e| {
-                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
-                    })?;
-
-                if !response.status().is_success() {
-                    return Err(Self::classify_provider_response_error(
-                        response.status(),
-                        &format!("get tree for {}/{}@{}", owner, repo, branch),
-                    ));
-                }
-
-                let tree_data: serde_json::Value = response.json().await.map_err(|e| {
-                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
-                })?;
-
-                let files = tree_data["tree"]
-                    .as_array()
-                    .ok_or_else(|| GitProviderError::ApiError("No tree in response".to_string()))?
-                    .iter()
-                    .filter_map(|item| {
-                        if item["type"].as_str() == Some("blob") {
-                            item["path"].as_str().map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                Ok(files)
-            }
-            GitProviderType::GitLab => {
-                // GitLab tree API
-                let url = format!(
-                    "https://gitlab.com/api/v4/projects/{}/repository/tree?ref={}&recursive=true&per_page=100",
-                    urlencoding::encode(&format!("{}/{}", owner, repo)),
-                    branch
-                );
-
-                let response = client
-                    .get(&url)
-                    .header("Authorization", format!("Bearer {}", access_token))
-                    .send()
-                    .await
-                    .map_err(|e| {
-                        GitProviderError::ApiError(format!("Failed to get tree: {}", e))
-                    })?;
-
-                if !response.status().is_success() {
-                    return Err(Self::classify_provider_response_error(
-                        response.status(),
-                        &format!("get tree for {}/{}@{}", owner, repo, branch),
-                    ));
-                }
-
-                let tree_data: Vec<serde_json::Value> = response.json().await.map_err(|e| {
-                    GitProviderError::ApiError(format!("Failed to parse tree response: {}", e))
-                })?;
-
-                let files = tree_data
-                    .iter()
-                    .filter_map(|item| {
-                        if item["type"].as_str() == Some("blob") {
-                            item["path"].as_str().map(|s| s.to_string())
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-
-                Ok(files)
             }
             _ => {
                 // For other providers, return empty list for now
@@ -3415,9 +3295,8 @@ impl GitProviderManager {
         // the user. This previously decrypted the token inline and called
         // directly, so preset detection was the one provider path that never
         // got the refresh treatment — and because a provider 401 was also
-        // flattened into a generic `ApiError`, the retry could not have fired
-        // even if it had been wrapped (see
-        // `classify_provider_response_error`).
+        // flattened into a generic `ApiError`, the retry could not fire. The
+        // provider implementation now preserves typed authentication errors.
         let files = self
             .execute_with_refresh(connection_id, |access_token| {
                 let provider_service = provider_service.clone();
@@ -3438,7 +3317,16 @@ impl GitProviderManager {
             .await?;
 
         // Detect presets in root and subdirectories
-        let presets = self.detect_presets_in_directories(&files).await;
+        let mut presets = self.detect_presets_in_directories(&files).await;
+        self.enrich_dockerfile_exposed_ports(
+            &mut presets,
+            connection_id,
+            &provider_service,
+            &repository.owner,
+            &repository.name,
+            &target_branch,
+        )
+        .await;
 
         // Cache presets in repositories.preset as HashMap<branch, preset_data>
         let calculated_at = chrono::Utc::now();
@@ -3750,6 +3638,74 @@ impl GitProviderManager {
                 }
             })
             .collect()
+    }
+
+    /// Read a bounded number of detected Dockerfiles and attach their final
+    /// stage's primary `EXPOSE` port to preset metadata. Detection remains
+    /// best-effort: a provider read failure must not hide an otherwise valid
+    /// preset or prevent project creation.
+    async fn enrich_dockerfile_exposed_ports(
+        &self,
+        presets: &mut [ProjectPresetDomain],
+        connection_id: i32,
+        provider_service: &Arc<dyn GitProviderService>,
+        owner: &str,
+        repository_name: &str,
+        target_branch: &str,
+    ) {
+        let dockerfiles: Vec<(usize, String)> = presets
+            .iter()
+            .enumerate()
+            .filter(|(_, preset)| preset.preset == "dockerfile")
+            .take(MAX_DOCKERFILES_TO_SCAN)
+            .map(|(index, preset)| {
+                let path = if preset.path == "./" || preset.path.is_empty() {
+                    "Dockerfile".to_string()
+                } else {
+                    format!("{}/Dockerfile", preset.path.trim_end_matches('/'))
+                };
+                (index, path)
+            })
+            .collect();
+
+        for (preset_index, dockerfile_path) in dockerfiles {
+            let file = self
+                .execute_with_refresh(connection_id, |access_token| {
+                    let provider_service = provider_service.clone();
+                    let owner = owner.to_string();
+                    let repository_name = repository_name.to_string();
+                    let target_branch = target_branch.to_string();
+                    let dockerfile_path = dockerfile_path.clone();
+                    async move {
+                        provider_service
+                            .get_file_content(
+                                &access_token,
+                                &owner,
+                                &repository_name,
+                                &dockerfile_path,
+                                Some(&target_branch),
+                            )
+                            .await
+                    }
+                })
+                .await;
+
+            match file {
+                Ok(file) => {
+                    let content = decode_file_content(&file.content, &file.encoding);
+                    presets[preset_index].exposed_port =
+                        temps_presets::detect_primary_exposed_port(&content);
+                }
+                Err(error) => warn!(
+                    owner,
+                    repository = repository_name,
+                    branch = target_branch,
+                    dockerfile = dockerfile_path,
+                    error = %error,
+                    "Could not inspect Dockerfile EXPOSE metadata during preset detection"
+                ),
+            }
+        }
     }
 
     /// Update access token for a connection (for when tokens expire or are rotated)
@@ -5795,86 +5751,6 @@ impl GitProviderManagerTrait for GitProviderManager {
 }
 
 #[cfg(test)]
-mod classify_provider_response_error_tests {
-    use super::*;
-
-    /// A provider 401 MUST become `AuthenticationFailed`, not `ApiError`.
-    /// `is_authentication_error` keys off this variant to drive the token
-    /// force-refresh-and-retry, and the HTTP layer maps it to 401 +
-    /// `errors/authentication_failed` so clients can say "reconnect this
-    /// account" instead of "the provider is down".
-    #[test]
-    fn unauthorized_is_classified_as_authentication_failure() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::UNAUTHORIZED,
-            "get tree for owner/repo@main",
-        );
-        assert!(
-            matches!(err, GitProviderError::AuthenticationFailed(_)),
-            "401 must map to AuthenticationFailed, got {err:?}"
-        );
-    }
-
-    /// A valid credential that lacks a repository capability is not an
-    /// authentication failure: clients must tell the operator which grant to
-    /// add instead of asking them to reconnect the same credential.
-    #[test]
-    fn forbidden_is_classified_as_permission_denied() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::FORBIDDEN,
-            "get tree for owner/repo@main",
-        );
-        assert!(
-            matches!(err, GitProviderError::PermissionDenied { .. }),
-            "403 must map to PermissionDenied, got {err:?}"
-        );
-        assert!(err.to_string().contains("owner/repo@main"));
-    }
-
-    /// Everything else stays a generic API error — a provider outage is not
-    /// a credential problem and must not tell the user to reconnect.
-    #[test]
-    fn server_error_stays_a_generic_api_error() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
-            "get tree for owner/repo@main",
-        );
-        assert!(
-            matches!(err, GitProviderError::ApiError(_)),
-            "500 must stay ApiError, got {err:?}"
-        );
-    }
-
-    #[test]
-    fn not_found_stays_a_generic_api_error() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::NOT_FOUND,
-            "get tree for owner/repo@main",
-        );
-        assert!(matches!(err, GitProviderError::ApiError(_)));
-    }
-
-    /// The operation and status must survive into the message — these errors
-    /// are the only breadcrumb when a self-hosted user debugs alone.
-    #[test]
-    fn message_names_the_operation_and_status() {
-        let err = GitProviderManager::classify_provider_response_error(
-            reqwest::StatusCode::UNAUTHORIZED,
-            "get tree for gotempsh/temps-examples@main",
-        );
-        let msg = err.to_string();
-        assert!(
-            msg.contains("gotempsh/temps-examples@main"),
-            "message should name the operation: {msg}"
-        );
-        assert!(
-            msg.contains("401"),
-            "message should carry the status: {msg}"
-        );
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use temps_entities::source_type::SourceType;
 
@@ -6550,6 +6426,140 @@ services:
         assert!(message.contains("could not be rendered"), "{message}");
         validate_token.assert_async().await;
         file_content.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn connected_preset_detection_uses_selected_branch_and_preserves_read_failures() {
+        use crate::services::git_provider::{AuthMethod, GitProviderService};
+        use crate::services::github_provider::GitHubProvider;
+        use base64::Engine;
+        use sea_orm::{DatabaseBackend, MockDatabase};
+
+        let mut server = mockito::Server::new_async().await;
+        let validate_token = server
+            .mock("GET", "/rate_limit")
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"resources":{"core":{"remaining":4999}}}"#)
+            .expect(3)
+            .create_async()
+            .await;
+        let tree = server
+            .mock(
+                "GET",
+                "/repos/example-owner/example-repository/git/trees/release-port",
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "recursive".to_string(),
+                "1".to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                r#"{"tree":[{"path":"Dockerfile","type":"blob"},{"path":"apps/api/Dockerfile","type":"blob"}]}"#,
+            )
+            .create_async()
+            .await;
+        let missing_nested_dockerfile = server
+            .mock(
+                "GET",
+                "/repos/example-owner/example-repository/contents/apps/api/Dockerfile",
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "ref".to_string(),
+                "release-port".to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(404)
+            .with_header("content-type", "application/json")
+            .with_body(r#"{"message":"simulated missing file"}"#)
+            .create_async()
+            .await;
+        let dockerfile = server
+            .mock(
+                "GET",
+                "/repos/example-owner/example-repository/contents/Dockerfile",
+            )
+            .match_query(mockito::Matcher::UrlEncoded(
+                "ref".to_string(),
+                "release-port".to_string(),
+            ))
+            .match_header("authorization", "Bearer test-access-token")
+            .with_status(200)
+            .with_header("content-type", "application/json")
+            .with_body(
+                serde_json::json!({
+                    "path": "Dockerfile",
+                    "content": base64::engine::general_purpose::STANDARD
+                        .encode("FROM alpine\nEXPOSE 4321\n"),
+                    "encoding": "base64"
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+
+        let encryption_service = Arc::new(
+            temps_core::EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test encryption key should be valid"),
+        );
+        let mut connection = connection_fixture(11, Some(5));
+        connection.access_token = Some(
+            encryption_service
+                .encrypt_string("test-access-token")
+                .expect("test access token should encrypt"),
+        );
+        let repository = repository_fixture(connection.id);
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([[repository.clone()]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection.clone()]])
+                .append_query_results([[connection]])
+                .append_query_results([[repository]])
+                .into_connection(),
+        );
+        let manager = GitProviderManager::new(
+            db.clone(),
+            encryption_service,
+            Arc::new(MockJobQueue) as Arc<dyn JobQueue>,
+            create_test_config_service(db),
+        );
+        let provider: Arc<dyn GitProviderService> = Arc::new(GitHubProvider::new(
+            Some(server.url()),
+            AuthMethod::PersonalAccessToken {
+                token: "unused-constructor-token".to_string(),
+            },
+        ));
+        manager.providers_cache.write().await.insert(7, provider);
+
+        let result = manager
+            .calculate_repository_preset_live(42, Some("release-port".to_string()))
+            .await
+            .expect("connected preset detection should succeed");
+
+        assert_eq!(result.presets.len(), 2);
+        let root = result
+            .presets
+            .iter()
+            .find(|preset| preset.path == "./")
+            .expect("root Dockerfile preset should remain available");
+        let nested = result
+            .presets
+            .iter()
+            .find(|preset| preset.path == "apps/api")
+            .expect("unreadable nested Dockerfile preset should remain available");
+        assert_eq!(root.exposed_port, Some(4321));
+        assert_eq!(nested.exposed_port, None);
+        validate_token.assert_async().await;
+        tree.assert_async().await;
+        dockerfile.assert_async().await;
+        missing_nested_dockerfile.assert_async().await;
     }
 
     // Helper function to create a test ConfigService

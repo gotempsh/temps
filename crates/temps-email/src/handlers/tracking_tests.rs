@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for email tracking HTTP endpoints
 //!
 //! Tests the actual HTTP routes using tower::ServiceExt::oneshot.

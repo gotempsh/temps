@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Screenshot Service
 //!
 //! Main service that manages screenshot providers and configuration
@@ -84,13 +87,24 @@ impl ScreenshotService {
             }
         };
 
-        // Check if provider is available
-        if let Err(e) = provider.check_availability().await {
-            warn!(
-                "Screenshot provider '{}' may not be available: {}",
-                provider.provider_name(),
-                e
-            );
+        // Spawn a background task so the availability check never blocks plugin
+        // registration. The check is purely diagnostic — the provider was already
+        // selected above — so delaying the warning until shortly after startup is
+        // indistinguishable from surfacing it inline, except that it no longer
+        // stalls `initialize_plugins()` (and therefore the proxy's ready signal)
+        // when the check is slow (e.g. headless Chrome is absent and the 10 s
+        // launch timeout fires).
+        {
+            let provider_check = Arc::clone(&provider);
+            tokio::spawn(async move {
+                if let Err(e) = provider_check.check_availability().await {
+                    warn!(
+                        "Screenshot provider '{}' may not be available: {}",
+                        provider_check.provider_name(),
+                        e
+                    );
+                }
+            });
         }
 
         Ok(Self {

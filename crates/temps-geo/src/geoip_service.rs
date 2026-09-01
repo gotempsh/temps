@@ -1,4 +1,8 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use maxminddb::geoip2;
+use maxminddb::Mmap;
 use rand::prelude::IndexedRandom;
 use serde::Serialize;
 use std::collections::HashMap;
@@ -258,6 +262,92 @@ fn resolve_mmdb_path_from(
     data_dir.map(|path| path.join(filename)).unwrap_or(cwd_path)
 }
 
+/// Open an `.mmdb` database as a read-only memory map.
+///
+/// Backing store for a MaxMind reader.
+///
+/// Normally a read-only mapping of a *private* copy of the database (see
+/// [`open_mmdb`]); falls back to the database read into the heap when a
+/// private copy cannot be made, so a read-only data directory still works.
+enum MmdbSource {
+    Mapped(Mmap),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for MmdbSource {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Mapped(mapping) => mapping.as_ref(),
+            Self::Owned(bytes) => bytes.as_slice(),
+        }
+    }
+}
+
+/// Copy `path` into an anonymous temporary file and map that.
+///
+/// # Safety
+///
+/// `Mmap::map` is unsafe because a mapped file modified *in place* under the
+/// process yields torn reads or `SIGBUS`. These databases are operator-managed:
+/// the setup flow tells operators to `cp` the file into the data directory, and
+/// `docker-compose.yml` shows them bind-mounted from the host. A `cp` over an
+/// existing destination truncates and rewrites that inode, so mapping the
+/// operator's file directly would let a routine database refresh crash a running
+/// server.
+///
+/// `tempfile_in` creates a file with no name in the filesystem, so nothing
+/// outside this process can reach the inode this maps. The copy costs one pass
+/// over the file at startup and the space is released when the reader drops.
+fn private_mapping(path: &std::path::Path) -> std::io::Result<Mmap> {
+    use std::io::Write;
+
+    let mut source = std::fs::File::open(path)?;
+    // Alongside the database, not `std::env::temp_dir()`, which is a tmpfs on
+    // many hosts -- that would put the copy straight back into RAM and undo the
+    // point of mapping it.
+    let directory = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut copy = tempfile::tempfile_in(directory)?;
+    std::io::copy(&mut source, &mut copy)?;
+    copy.flush()?;
+
+    // SAFETY: `copy` is an anonymous inode with no directory entry, so no other
+    // process can truncate or rewrite it, and this process only reads it.
+    unsafe { Mmap::map(&copy) }
+}
+
+/// Open a MaxMind database, mapping a private copy when possible.
+///
+/// The GeoLite2 City database is ~58 MB and the ASN database ~10 MB.
+/// `Reader::open_readfile` reads both into `Vec<u8>`, i.e. ~70 MB of anonymous
+/// heap (`RssAnon`) that the kernel can only reclaim through swap. A mapping
+/// puts those pages in `RssFile` (clean page cache) instead, which the kernel
+/// evicts and re-faults on demand -- the working set of a lookup is a handful
+/// of pages along one search tree path, so resident usage tracks traffic rather
+/// than file size.
+///
+/// Falls back to reading into the heap if the private copy cannot be made, for
+/// example when the data directory is mounted read-only. That is the previous
+/// behaviour, so the fallback is a footprint regression and never a failure.
+fn open_mmdb(
+    path: &std::path::Path,
+) -> Result<maxminddb::Reader<MmdbSource>, maxminddb::MaxMindDbError> {
+    match private_mapping(path) {
+        Ok(mapping) => maxminddb::Reader::from_source(MmdbSource::Mapped(mapping)),
+        Err(e) => {
+            // Only reachable if the database itself is unreadable (reported by
+            // the caller with the path) or the directory is not writable.
+            if path.exists() {
+                warn!(
+                    "Could not stage a private copy of '{}' ({}); reading it into memory instead",
+                    path.display(),
+                    e
+                );
+            }
+            maxminddb::Reader::from_source(MmdbSource::Owned(std::fs::read(path)?))
+        }
+    }
+}
+
 impl GeoIpService {
     pub fn new() -> Result<Self, GeoIpError> {
         // Check if we should use mock service for local development
@@ -273,7 +363,7 @@ impl GeoIpService {
         let db_path = resolve_mmdb_path("GeoLite2-City.mmdb");
         let service = get_or_load(&LOADED_DATABASES, db_path.clone(), || {
             debug!("Loading MaxMind database from: {:?}", db_path);
-            let reader = maxminddb::Reader::open_readfile(&db_path).map_err(|e| {
+            let reader = open_mmdb(&db_path).map_err(|e| {
                 GeoIpError::Other(format!(
                     "Failed to open MaxMind database at '{}': {}",
                     db_path.display(),
@@ -286,7 +376,7 @@ impl GeoIpService {
             // the operator hasn't provisioned it, same as the City database's own
             // optional-file convention in Dockerfile/docker-compose.
             let asn_db_path = resolve_mmdb_path("GeoLite2-ASN.mmdb");
-            let asn_reader = match maxminddb::Reader::open_readfile(&asn_db_path) {
+            let asn_reader = match open_mmdb(&asn_db_path) {
                 Ok(reader) => {
                     info!("Loaded MaxMind ASN database from: {:?}", asn_db_path);
                     Some(reader)
@@ -316,8 +406,8 @@ impl GeoIpService {
 }
 
 pub struct MaxMindGeoIpService {
-    reader: maxminddb::Reader<Vec<u8>>,
-    asn_reader: Option<maxminddb::Reader<Vec<u8>>>,
+    reader: maxminddb::Reader<MmdbSource>,
+    asn_reader: Option<maxminddb::Reader<MmdbSource>>,
 }
 
 impl MaxMindGeoIpService {
@@ -544,6 +634,54 @@ mod tests {
         let recovered = get_or_load(&cache, path.clone(), || Ok("now present".to_string()))
             .expect("retry after a failed load should succeed");
         assert_eq!(*recovered, "now present");
+    }
+
+    /// The case the mapping has to survive: an operator refreshing the database
+    /// with `cp`, which truncates and rewrites the *existing* inode. Mapping the
+    /// operator's file directly would give torn reads or SIGBUS here.
+    #[test]
+    fn private_mapping_survives_the_source_being_rewritten_in_place() {
+        use std::io::Write;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("GeoLite2-City.mmdb");
+        let original = vec![b'A'; 256 * 1024];
+        std::fs::write(&path, &original).expect("seed database");
+
+        let mapping = private_mapping(&path).expect("stage a private copy");
+        assert_eq!(mapping.len(), original.len());
+
+        // Exactly what `cp src dest` does to an existing dest: same inode,
+        // truncated and rewritten shorter.
+        let mut handle = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("reopen for truncation");
+        handle.write_all(b"replaced").expect("rewrite in place");
+        handle.sync_all().expect("flush");
+        drop(handle);
+
+        // The mapping is of a private inode, so it is unchanged and safe to read.
+        assert_eq!(mapping.len(), original.len());
+        assert!(mapping.iter().all(|byte| *byte == b'A'));
+    }
+
+    #[test]
+    fn private_mapping_reports_a_missing_source_instead_of_panicking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("absent.mmdb");
+        assert!(private_mapping(&missing).is_err());
+    }
+
+    #[test]
+    fn test_open_mmdb_missing_file_is_a_recoverable_error() {
+        // The ASN database is optional and its absence must stay a plain
+        // `Err` the caller can degrade on, not a panic. `open_mmap` is
+        // `unsafe`, so this also pins that a missing path is rejected before
+        // any mapping is attempted.
+        let missing = std::path::Path::new("/nonexistent/definitely-not-here.mmdb");
+        assert!(open_mmdb(missing).is_err());
     }
 
     #[test]

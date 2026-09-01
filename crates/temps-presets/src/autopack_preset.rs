@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Autopack preset — auto-detecting builds via the autopack crates.
 //!
 //! Autopack is a library, so unlike the builder it replaced nothing is written

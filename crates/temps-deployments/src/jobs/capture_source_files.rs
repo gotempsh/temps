@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Capture Source Files Job
 //!
 //! Uploads raw application source from the git checkout so native (Go, Rust,

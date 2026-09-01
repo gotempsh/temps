@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Domain types for the OTel subsystem.
 //!
 //! These types are the internal representation of OTel data after it has been
@@ -604,6 +607,13 @@ impl std::fmt::Display for HealthStatus {
 // ── Pipeline Stats ──────────────────────────────────────────────────
 
 /// Internal pipeline statistics for self-observability.
+///
+/// All fields are cumulative process-lifetime counters. Every one of them is
+/// also sampled every 60 seconds by the plugin's stats sampler and written to
+/// the unified metrics store as a **delta** counter named `otel.<field>`
+/// (`SourceKind::Node`, node_id 0) — see `pipeline_stat_deltas` in
+/// `plugin.rs`. Adding a field here means adding it there too, otherwise the
+/// new counter is only ever visible through the API response.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, ToSchema)]
 pub struct PipelineStats {
     pub metrics_received: u64,
@@ -1448,6 +1458,35 @@ pub struct StorageQuota {
     pub total_bytes: u64,
     pub limit_bytes: u64,
     pub usage_pct: f64,
+}
+
+// ── Ingest error reporting ──────────────────────────────────────────
+
+/// One aggregated ingest-failure group: "this signal failed this way N times".
+///
+/// The pipeline-stats counters say *how many* records were dropped;
+/// this says *why*. Rows are grouped by `(signal_type, error_class)` rather
+/// than stored per-event, so a sustained outage collapses into one row with a
+/// rising `count` instead of flooding the table.
+///
+/// `sample_message` is one representative backend error string, kept for the
+/// detail a class name cannot carry (the failing column, the refused address).
+/// It is a sample, not a guarantee: which occurrence it came from is
+/// unspecified.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
+pub struct IngestErrorSummary {
+    /// Which signal was being written: `metrics`, `spans`, or `logs`.
+    pub signal_type: String,
+    /// Stable, low-cardinality failure class — see `OtelError::error_class`.
+    pub error_class: String,
+    /// A representative backend error message for this group.
+    pub sample_message: String,
+    /// How many times this `(signal_type, error_class)` pair has failed.
+    pub count: u64,
+    #[schema(value_type = String, format = DateTime)]
+    pub first_seen: DateTime<Utc>,
+    #[schema(value_type = String, format = DateTime)]
+    pub last_seen: DateTime<Utc>,
 }
 
 #[cfg(test)]

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 'use client'
 
 import {
@@ -336,7 +339,8 @@ export function ProvidersManagement() {
             Notification Providers
           </h2>
           <p className="text-muted-foreground">
-            Manage your notification providers for alerts and updates.
+            Configure where notifications can be delivered. Routes decide which
+            alerts reach each destination.
           </p>
         </div>
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Lighthouse CLI runner.
 //!
 //! Spawns the `lighthouse` CLI as a child process, captures JSON output,

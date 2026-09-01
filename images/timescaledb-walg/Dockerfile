@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # TimescaleDB + WAL-G image for Temps internal database backup/restore
 # Based on timescale/timescaledb-ha:pgXX (Debian-based), adds WAL-G binary.
 #

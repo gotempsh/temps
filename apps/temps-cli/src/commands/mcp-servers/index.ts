@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { readFileSync } from 'node:fs'
 import { requireAuth } from '../../config/store.js'
@@ -107,7 +110,6 @@ interface DeleteOptions {
 export function registerMcpServersCommands(program: Command): void {
   const mcp = program
     .command('mcp-servers')
-    .alias('mcp')
     .description('Manage MCP server definitions (global or project-scoped)')
 
   mcp

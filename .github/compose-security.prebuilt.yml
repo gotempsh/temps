@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # CI-only override for scripts/test-compose-security.sh: point the temps
 # service at the image pre-built (with layer caching) by the Compose Security
 # job instead of rebuilding it from source inside docker compose.

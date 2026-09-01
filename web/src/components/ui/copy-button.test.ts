@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { afterEach, describe, expect, mock, test } from 'bun:test'
 
 import { writeToClipboard } from '@/lib/clipboard'

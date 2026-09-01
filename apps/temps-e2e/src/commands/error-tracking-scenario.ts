@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Error-tracking (Sentry-compatible) lifecycle against a live Temps instance --
  * proves real error events get authenticated, ingested, fingerprint-grouped,

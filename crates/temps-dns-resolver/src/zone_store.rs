@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! In-memory zone state with on-disk snapshot persistence.
 //!
 //! The store is designed for one writer (the [`SyncClient`] task) and many

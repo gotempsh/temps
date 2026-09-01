@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Keep audit history when a user account is deleted.
 //!
 //! `audit_logs.user_id` previously referenced `users(id)` with `ON DELETE

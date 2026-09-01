@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Project route change listener
 //!
 //! Listens to PostgreSQL `project_route_change` channel for notifications when:

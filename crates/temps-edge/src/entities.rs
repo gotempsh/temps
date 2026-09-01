@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sea-ORM entity for the edge_requests table (local SQLite).
 
 use sea_orm::entity::prelude::*;

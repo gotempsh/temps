@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Genuine CLI end-to-end test: every step below spawns the REAL
  * @temps-sdk/cli binary as a subprocess (see lib/cli-exec.ts) against a live

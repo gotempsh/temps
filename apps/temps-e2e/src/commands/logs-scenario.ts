@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Log-aggregation lifecycle against a live Temps instance -- proves REAL
  * container stdout/stderr flows through the actual Docker log collector

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Interactive terminal for a sandbox: `GET /v1/sandboxes/{id}/terminal`.
 //!
 //! Bridges a browser/CLI WebSocket to the in-sandbox `temps-pty-agent`

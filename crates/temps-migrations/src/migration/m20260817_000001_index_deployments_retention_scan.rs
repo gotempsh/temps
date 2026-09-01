@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Indexes `deployments` by the columns the nightly image-retention scan
 //! filters and sorts on (`recently_protected_image_names`'s window function
 //! partitions by `(project_id, environment_id)` and orders by `created_at`).

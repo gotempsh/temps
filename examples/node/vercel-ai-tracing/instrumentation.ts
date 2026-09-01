@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * OpenTelemetry instrumentation setup for exporting Vercel AI SDK
  * traces to a Temps instance.

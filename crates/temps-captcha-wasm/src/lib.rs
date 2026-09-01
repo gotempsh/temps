@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! WebAssembly proof-of-work CAPTCHA solver
 //!
 //! This module provides high-performance proof-of-work challenge solving

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to create the `metric_dashboards` table.
 //!
 //! Backs the per-project saved metric dashboards feature. Each row holds a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps Agent — lightweight HTTP server wrapping the local Docker runtime.
 //!
 //! Runs on worker nodes. Exposes a small bearer-token–authenticated API that
@@ -5,9 +8,11 @@
 //! and external services.
 
 pub mod auth;
+mod exec_timeout;
 pub mod handlers;
 pub mod internal_proxy;
 pub mod network_sync;
+mod output_buffer;
 pub mod route_store;
 pub mod route_sync_client;
 pub mod server;

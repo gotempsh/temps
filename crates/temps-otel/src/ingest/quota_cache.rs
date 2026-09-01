@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-project storage quota cache for OTel ingest.
 //!
 //! `get_storage_quota` runs exact `COUNT(*)` scans over three hypertables

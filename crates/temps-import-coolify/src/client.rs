@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Minimal typed client for the Coolify REST API.
 //!
 //! Built per-request from [`temps_import_types::ImportCredentials`] — the

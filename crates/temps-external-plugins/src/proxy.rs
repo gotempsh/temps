@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP reverse proxy from Temps to external plugin processes over Unix socket.
 
 use std::path::PathBuf;

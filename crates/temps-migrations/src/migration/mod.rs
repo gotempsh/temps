@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub use sea_orm_migration::prelude::*;
 
 mod m20250101_000001_initial_schema;
@@ -199,6 +202,13 @@ mod m20260817_000002_create_secret_compose_services;
 mod m20260818_000001_add_allow_alternate_sources;
 mod m20260819_000001_create_session_replay_ingest_batches;
 mod m20260821_000001_add_email_retry_tracking;
+mod m20260824_000001_create_otel_ingest_errors;
+mod m20260825_000001_add_dns_resolver_health_to_nodes;
+mod m20260827_000001_create_notification_routes;
+mod m20260828_000001_alarms_nullable_project;
+mod m20260828_000002_add_alarms_silenced_until;
+mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
+mod m20260830_000001_add_external_service_creator;
 
 pub struct Migrator;
 
@@ -435,6 +445,13 @@ impl MigratorTrait for Migrator {
             Box::new(m20260818_000001_add_allow_alternate_sources::Migration),
             Box::new(m20260819_000001_create_session_replay_ingest_batches::Migration),
             Box::new(m20260821_000001_add_email_retry_tracking::Migration),
+            Box::new(m20260824_000001_create_otel_ingest_errors::Migration),
+            Box::new(m20260825_000001_add_dns_resolver_health_to_nodes::Migration),
+            Box::new(m20260827_000001_create_notification_routes::Migration),
+            Box::new(m20260828_000001_alarms_nullable_project::Migration),
+            Box::new(m20260828_000002_add_alarms_silenced_until::Migration),
+            Box::new(m20260829_000001_allow_duplicate_ready_snapshot_digests::Migration),
+            Box::new(m20260830_000001_add_external_service_creator::Migration),
         ]
     }
 }

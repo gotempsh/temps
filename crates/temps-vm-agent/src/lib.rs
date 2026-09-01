@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Wire protocol between the host-side Firecracker sandbox provider and the
 //! in-guest `temps-vm-agent` (ADR-029 §5).
 //!

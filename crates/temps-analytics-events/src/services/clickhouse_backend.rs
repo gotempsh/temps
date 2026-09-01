@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ClickHouse implementation of [`crate::services::traits::AnalyticsEvents`].
 //!
 //! Always compiled. Operators activate it by setting `TEMPS_CLICKHOUSE_*`

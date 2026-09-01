@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! WireGuard mesh networking for Temps multi-node deployments.
 //!
 //! Uses `defguard_wireguard_rs` for embedded userspace WireGuard — no external

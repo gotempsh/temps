@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node management service — CRUD operations for the `nodes` table.
 
 use sea_orm::{
@@ -66,6 +69,9 @@ pub enum NodeError {
 
     #[error("Database error: {0}")]
     Database(#[from] sea_orm::DbErr),
+
+    #[error("Failed to read DNS registry: {0}")]
+    DnsRegistry(#[from] temps_dns::DnsRegistryError),
 }
 
 /// Request to register a new worker node.
@@ -114,6 +120,25 @@ pub struct HeartbeatRequest {
     /// `None` from a pre-multi-arch agent; in that case the stored value is
     /// left untouched rather than cleared, so an operator-set value survives.
     pub architecture: Option<String>,
+    /// DNS resolver health reported by the agent (ADR-024). `None` from an
+    /// agent binary older than this feature, or a tick that raced before the
+    /// agent's network-sync loop first ran — in both cases the stored
+    /// columns are left untouched rather than cleared, same treatment as
+    /// `architecture` above.
+    pub dns_resolver: Option<DnsResolverHeartbeatUpdate>,
+}
+
+/// Service-layer view of the agent-reported DNS resolver health, decoupled
+/// from the wire DTO (`handlers::nodes::DnsResolverHeartbeat`) per the
+/// three-layer architecture — handlers convert one to the other.
+#[derive(Debug, Clone)]
+pub struct DnsResolverHeartbeatUpdate {
+    pub running: bool,
+    pub tasks_alive: bool,
+    pub last_sync_success_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub consecutive_sync_failures: i32,
+    pub last_sync_error: Option<String>,
+    pub record_count: i32,
 }
 
 /// A node whose last heartbeat is within this window (and still marked
@@ -156,6 +181,24 @@ fn identity_conflict_value(
                 || matches(value, owner_private_address)
         })
         .cloned()
+}
+
+/// Cap for `nodes.dns_resolver_last_error`, mirrored from
+/// `temps_dns_resolver::sync_client::SYNC_ERROR_REASON_MAX_BYTES` — the
+/// agent should already send a short reason, but the control plane must not
+/// trust that unconditionally.
+const DNS_ERROR_MAX_BYTES: usize = 512;
+
+/// Truncate to a char boundary at or before `DNS_ERROR_MAX_BYTES`.
+fn truncate_dns_error(reason: &str) -> String {
+    if reason.len() <= DNS_ERROR_MAX_BYTES {
+        return reason.to_string();
+    }
+    let mut end = DNS_ERROR_MAX_BYTES;
+    while end > 0 && !reason.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}... (truncated)", &reason[..end])
 }
 
 pub struct NodeService {
@@ -464,6 +507,35 @@ impl NodeService {
             }
             active.architecture = Set(Some(architecture));
         }
+        // Same rule as architecture: absent means "not reported this beat",
+        // not "resolver is down" — an older agent binary, or a heartbeat
+        // that raced ahead of the agent's own network-sync loop, must not
+        // wipe out the last known resolver state.
+        if let Some(dns) = request.dns_resolver {
+            active.dns_resolver_running = Set(Some(dns.running));
+            active.dns_resolver_tasks_alive = Set(Some(dns.tasks_alive));
+            // A resolver that just self-healed after a crash is `running`
+            // but hasn't completed its first sync yet, so this heartbeat's
+            // `last_sync_success_at` is `None` even though the DB already
+            // holds a good prior timestamp. Only overwrite when there's a
+            // real newer timestamp, or when the resolver isn't running at
+            // all (in which case the old timestamp is genuinely stale) —
+            // never regress a known-good sync time to NULL just because
+            // the resolver is mid-recovery, which downstream consumers
+            // (the CLI's health classifier) would misread as "healthy".
+            if dns.last_sync_success_at.is_some() || !dns.running {
+                active.dns_resolver_last_sync_at = Set(dns.last_sync_success_at);
+            }
+            active.dns_resolver_consecutive_failures = Set(dns.consecutive_sync_failures);
+            // Defensive clamp on top of the agent's own truncation
+            // (`temps_dns_resolver::sync_client::truncate_reason`) — an
+            // older or buggy agent binary shouldn't be able to write an
+            // unbounded string into this column just because it skipped
+            // that step.
+            active.dns_resolver_last_error =
+                Set(dns.last_sync_error.map(|e| truncate_dns_error(&e)));
+            active.dns_resolver_record_count = Set(Some(dns.record_count));
+        }
         active.update(self.db.as_ref()).await?;
 
         Ok(architecture_change)
@@ -534,6 +606,17 @@ impl NodeService {
             .all(self.db.as_ref())
             .await?;
         Ok(nodes)
+    }
+
+    /// Total DNS records currently registered in the cluster zone (ADR-024).
+    /// Thin delegation to `temps_dns::DnsRegistry` — kept here so the
+    /// `cluster_dns_status` handler goes through this service like it
+    /// already does for `list_all`, rather than constructing the
+    /// data-access-layer `DnsRegistry` type directly.
+    pub async fn total_dns_record_count(&self) -> Result<i64, NodeError> {
+        let dns_registry = temps_dns::DnsRegistry::new(self.db.clone());
+        let count = dns_registry.total_record_count().await?;
+        Ok(count)
     }
 
     /// List only active nodes (heartbeat within the threshold).
@@ -1019,6 +1102,12 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -1452,6 +1541,7 @@ mod tests {
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
+                    dns_resolver: None,
                 },
             )
             .await;
@@ -1479,10 +1569,210 @@ mod tests {
                     architecture: None,
                     capacity: serde_json::json!({"cpu": 50}),
                     labels: None,
+                    dns_resolver: None,
                 },
             )
             .await;
         assert!(result.is_ok());
+    }
+
+    // ── Heartbeat DNS resolver health persistence ──────────────────
+
+    /// A heartbeat carrying `dns_resolver: Some(..)` must write every one of
+    /// its fields onto the node row.
+    #[tokio::test]
+    async fn test_heartbeat_persists_dns_resolver_fields_when_present() {
+        let node = sample_node();
+        let updated = sample_node();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+
+        let result = service
+            .heartbeat(
+                1,
+                HeartbeatRequest {
+                    architecture: None,
+                    capacity: serde_json::json!({"cpu": 50}),
+                    labels: None,
+                    dns_resolver: Some(DnsResolverHeartbeatUpdate {
+                        running: true,
+                        tasks_alive: false,
+                        last_sync_success_at: None,
+                        consecutive_sync_failures: 4,
+                        last_sync_error: Some("resolver crashed: too many open files".into()),
+                        record_count: 37,
+                    }),
+                },
+            )
+            .await;
+        assert!(result.is_ok());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let update = log
+            .last()
+            .expect("heartbeat must issue at least one statement");
+        let sql = &update.statements()[0].sql;
+        for column in [
+            "\"dns_resolver_running\" =",
+            "\"dns_resolver_tasks_alive\" =",
+            "\"dns_resolver_consecutive_failures\" =",
+            "\"dns_resolver_last_error\" =",
+            "\"dns_resolver_record_count\" =",
+        ] {
+            assert!(sql.contains(column), "UPDATE must assign {column}: {sql}");
+        }
+        // The SET clause only carries bound placeholders ($N); the actual
+        // reported values live in `Statement::values`, so check those
+        // (bare, no quoting concerns — unlike the SQL text above).
+        let rendered = format!("{:?}", update.statements()[0]);
+        assert!(
+            rendered.contains("resolver crashed: too many open files"),
+            "UPDATE must carry the reported error text: {rendered}"
+        );
+        assert!(
+            rendered.contains("37"),
+            "UPDATE must carry the reported record count: {rendered}"
+        );
+    }
+
+    /// A heartbeat with `dns_resolver: None` (older agent, or a tick that
+    /// raced ahead of the agent's own network-sync loop) must NOT blank out
+    /// previously reported resolver health. Sea-ORM's `Model -> ActiveModel`
+    /// conversion marks every column `Unchanged` by default, so a column we
+    /// never call `.set()` on is dropped from the `UPDATE ... SET` clause
+    /// entirely — the strongest form of "leave unchanged": the existing DB
+    /// value is never even sent, let alone overwritten.
+    #[tokio::test]
+    async fn test_heartbeat_preserves_dns_resolver_fields_when_absent() {
+        let mut node = sample_node();
+        node.dns_resolver_running = Some(true);
+        node.dns_resolver_tasks_alive = Some(true);
+        node.dns_resolver_consecutive_failures = 2;
+        node.dns_resolver_last_error = Some("stale error from three beats ago".into());
+        node.dns_resolver_record_count = Some(9);
+        let updated = node.clone();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+
+        let result = service
+            .heartbeat(
+                1,
+                HeartbeatRequest {
+                    architecture: None,
+                    capacity: serde_json::json!({"cpu": 50}),
+                    labels: None,
+                    dns_resolver: None,
+                },
+            )
+            .await;
+        assert!(result.is_ok());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let update = log
+            .last()
+            .expect("heartbeat must issue at least one statement");
+        // Raw `sql` (not the Debug-formatted `Statement`, whose embedded
+        // double-quoted identifiers get backslash-escaped by `String`'s
+        // `Debug` impl and would make a literal `"col" =` pattern never
+        // match) so the SET-clause check below compares real characters.
+        let sql = &update.statements()[0].sql;
+        assert!(
+            sql.contains("SET \"capacity\""),
+            "sanity check: the UPDATE must still exist and set capacity: {sql}"
+        );
+        for column in [
+            "\"dns_resolver_running\" =",
+            "\"dns_resolver_tasks_alive\" =",
+            "\"dns_resolver_last_sync_at\" =",
+            "\"dns_resolver_consecutive_failures\" =",
+            "\"dns_resolver_last_error\" =",
+            "\"dns_resolver_record_count\" =",
+        ] {
+            assert!(
+                !sql.contains(column),
+                "a None dns_resolver must not assign {column} at all: {sql}"
+            );
+        }
+    }
+
+    /// A resolver that just self-healed after a crash reports `running:
+    /// true` but `last_sync_success_at: None` (it hasn't completed its
+    /// first sync tick yet). This must NOT regress a previously stored,
+    /// known-good `dns_resolver_last_sync_at` to NULL — that would make
+    /// the CLI's health classifier misreport the mid-recovery window as
+    /// "healthy" instead of showing the resolver is still catching up.
+    #[tokio::test]
+    async fn test_heartbeat_does_not_wipe_last_sync_at_when_restarted_resolver_has_not_synced_yet()
+    {
+        let mut node = sample_node();
+        node.dns_resolver_running = Some(true);
+        node.dns_resolver_last_sync_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let updated = node.clone();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![node]])
+                .append_query_results(vec![vec![updated]])
+                .into_connection(),
+        );
+        let service = NodeService::new(db.clone());
+
+        let result = service
+            .heartbeat(
+                1,
+                HeartbeatRequest {
+                    architecture: None,
+                    capacity: serde_json::json!({"cpu": 50}),
+                    labels: None,
+                    dns_resolver: Some(DnsResolverHeartbeatUpdate {
+                        running: true,
+                        tasks_alive: true,
+                        last_sync_success_at: None,
+                        consecutive_sync_failures: 0,
+                        last_sync_error: None,
+                        record_count: 0,
+                    }),
+                },
+            )
+            .await;
+        assert!(result.is_ok());
+
+        drop(service);
+        let db = Arc::try_unwrap(db).unwrap_or_else(|_| panic!("db still has owners"));
+        let log = db.into_transaction_log();
+        let update = log
+            .last()
+            .expect("heartbeat must issue at least one statement");
+        let sql = &update.statements()[0].sql;
+        // The resolver is still `running`, so the "just went down" escape
+        // hatch doesn't apply — `last_sync_success_at` being `None` must
+        // NOT be assigned onto the row, leaving the previously stored
+        // timestamp untouched.
+        assert!(
+            !sql.contains("\"dns_resolver_last_sync_at\" ="),
+            "a restarted-but-not-yet-synced resolver must not wipe the \
+             existing dns_resolver_last_sync_at: {sql}"
+        );
+        // Other DNS fields on a real heartbeat still update normally.
+        assert!(
+            sql.contains("\"dns_resolver_running\" ="),
+            "dns_resolver_running must still be assigned: {sql}"
+        );
     }
 
     // ── AffectedDeployment unit tests ──────────────────────────────

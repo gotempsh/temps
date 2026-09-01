@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { ComponentProps } from 'react'
 import { GripVertical } from 'lucide-react'
 import { Group, Panel, Separator } from 'react-resizable-panels'

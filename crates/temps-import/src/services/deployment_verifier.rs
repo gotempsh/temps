@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Deploy-and-verify phase for imports.
 //!
 //! Creating a project is not a migration. Until the application has actually

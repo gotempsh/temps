@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use axum::http::StatusCode;
 use temps_core::error_builder::{
     bad_request, conflict, forbidden, internal_server_error, not_found, unauthorized, ErrorBuilder,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP surface for AI debugging conversations (ADR-023).
 //!
 //! `GET/POST /projects/{project_id}/ai/conversations` (find / get-or-create),

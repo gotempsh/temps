@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Framework detection for Node.js projects
 //!
 //! This module detects the framework used in a Node.js project by analyzing

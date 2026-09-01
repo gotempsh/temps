@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   getPublicComposePreview,
   getRepositoryComposePreview,
@@ -25,6 +28,7 @@ export type ComposePreviewRepository =
       provider: string
       owner: string
       repo: string
+      baseUrl?: string
     }
 
 export function composePreviewEndpoint(repository: ComposePreviewRepository): {
@@ -65,6 +69,7 @@ export async function fetchComposePreview(
             owner: repository.owner,
             repo: repository.repo,
           },
+          query: { base_url: repository.baseUrl },
           body: request,
           signal,
           throwOnError: false,

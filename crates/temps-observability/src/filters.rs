@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Query filters and merge utilities used by the unified Observe service.
 //!
 //! Kept in its own module so the merge logic (k-way merge, kind-set

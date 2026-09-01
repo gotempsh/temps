@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Communication protocol between Temps and external plugins.
 //!
 //! The protocol uses simple JSON-over-stdout for the initial handshake,

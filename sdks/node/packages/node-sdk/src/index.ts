@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { createClient, createConfig } from './client/client';
 import type { Client } from './client/client';
 import * as sdk from './client/sdk.gen';

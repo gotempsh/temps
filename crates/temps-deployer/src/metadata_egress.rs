@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Atomic cloud-metadata egress protection for container traffic.
 //!
 //! A dedicated nftables base chain runs before Docker's forwarding rules and

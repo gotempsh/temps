@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useState, useMemo } from 'react'
 import { Folder, AlertCircle, Check, Grid3x3, RefreshCw } from 'lucide-react'
 import { Button } from '@/components/ui/button'

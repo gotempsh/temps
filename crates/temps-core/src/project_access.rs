@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Extension point for team-based project access enforcement.
 //!
 //! See ADR 028 for the full design rationale.
@@ -50,6 +53,34 @@ pub trait ProjectAccessChecker: Send + Sync {
         project_id: i32,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>;
 
+    /// Batch form of [`Self::user_can_access_project`] for callers checking
+    /// many projects in one authorization decision.
+    ///
+    /// The returned map contains exactly one entry per unique requested id,
+    /// sorted by project id. Any error fails the whole batch. The
+    /// compatibility default resolves each unique id sequentially;
+    /// database-backed implementations should override this to batch reads.
+    async fn user_can_access_projects(
+        &self,
+        user_id: i32,
+        project_ids: &[i32],
+    ) -> Result<std::collections::BTreeMap<i32, bool>, Box<dyn std::error::Error + Send + Sync>>
+    {
+        let mut unique_project_ids = project_ids.to_vec();
+        unique_project_ids.sort_unstable();
+        unique_project_ids.dedup();
+
+        let mut access = std::collections::BTreeMap::new();
+        for project_id in unique_project_ids {
+            access.insert(
+                project_id,
+                self.user_can_access_project(user_id, project_id).await?,
+            );
+        }
+
+        Ok(access)
+    }
+
     /// Returns the set of permission strings (matching
     /// `temps_auth::permissions::Permission::to_string()`, e.g.
     /// `"deployments:create"`) `user_id` holds *within* `project_id`, for
@@ -82,6 +113,46 @@ pub trait ProjectAccessChecker: Send + Sync {
         _project_id: i32,
     ) -> Result<Option<Vec<String>>, Box<dyn std::error::Error + Send + Sync>> {
         Ok(None)
+    }
+
+    /// Batch form of [`Self::effective_project_permissions`] for callers
+    /// authorizing one action across many projects.
+    ///
+    /// Implementations must return exactly one entry for every unique
+    /// requested project id. Keys are sorted by the returned
+    /// [`BTreeMap`](std::collections::BTreeMap), and duplicate input ids are
+    /// resolved only once. Each value retains the single-project method's
+    /// semantics: `None` means this checker has no permission-specific
+    /// opinion, while `Some(perms)` is the exact project-scoped permission
+    /// set and an empty vec denies every action. Any error fails the whole
+    /// batch so callers never authorize a partial result.
+    ///
+    /// The compatibility default calls the single-project method
+    /// sequentially. Database-backed implementations should override this
+    /// method to batch their reads and avoid one query sequence per project.
+    async fn effective_project_permissions_batch(
+        &self,
+        user_id: i32,
+        project_ids: &[i32],
+    ) -> Result<
+        std::collections::BTreeMap<i32, Option<Vec<String>>>,
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
+        use std::collections::BTreeMap;
+
+        let mut unique_project_ids = project_ids.to_vec();
+        unique_project_ids.sort_unstable();
+        unique_project_ids.dedup();
+
+        let mut permissions = BTreeMap::new();
+        for project_id in unique_project_ids {
+            let resolved = self
+                .effective_project_permissions(user_id, project_id)
+                .await?;
+            permissions.insert(project_id, resolved);
+        }
+
+        Ok(permissions)
     }
 
     /// Returns the project ids `user_id` must **not** see in listings —

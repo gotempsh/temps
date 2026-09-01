@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ClickHouse migration runner for the resource-metrics storage backend.
 //!
 //! Mirrors `temps-otel/src/storage/clickhouse/migrations.rs`:

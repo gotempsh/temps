@@ -1,4 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { useDashboardAnalytics } from '@/hooks/useDashboardAnalytics'
 import { useDashboardHealth } from '@/hooks/useDashboardHealth'
@@ -13,6 +16,7 @@ import { ProjectCardSkeleton } from '@/components/skeletons/ProjectCardSkeleton'
 import { Button } from '@/components/ui/button'
 import { CreateActionButton } from '@/components/ui/create-action-button'
 import { Input } from '@/components/ui/input'
+import { ResponsivePagination } from '@/components/ui/responsive-pagination'
 import {
   getProjectsOptions,
   listGitProvidersOptions,
@@ -20,20 +24,26 @@ import {
 import { useQuery } from '@tanstack/react-query'
 import { subDays } from 'date-fns'
 import { ArrowRight, Search, X } from 'lucide-react'
-import { Link } from 'react-router'
+import { Link, useSearchParams } from 'react-router'
 import { SourceLogo } from '@/components/imports/SourceLogo'
 import {
   TOP_MIGRATION_SOURCES,
   importHref,
 } from '@/components/imports/migration-sources'
+import {
+  PROJECT_PAGE_SIZE_OPTIONS,
+  projectPageCount,
+  readProjectPagination,
+  withProjectPagination,
+} from '@/lib/project-list-pagination'
 
-const ITEMS_PER_PAGE = 9
 const SEARCH_CATALOG_LIMIT = 50
 const SEARCH_RESULTS_LIMIT = 18
 
 export function Projects() {
   const { setBreadcrumbs } = useBreadcrumbs()
-  const [page, setPage] = useState(1)
+  const [searchParams, setSearchParams] = useSearchParams()
+  const { page, pageSize } = readProjectPagination(searchParams)
   const [projectSearch, setProjectSearch] = useState('')
   const normalizedProjectSearch = projectSearch.trim().toLowerCase()
 
@@ -43,9 +53,7 @@ export function Projects() {
         page: normalizedProjectSearch ? 1 : page,
         // The list endpoint has no text filter, so search a deliberately
         // bounded catalogue and cap rendered cards below.
-        per_page: normalizedProjectSearch
-          ? SEARCH_CATALOG_LIMIT
-          : ITEMS_PER_PAGE,
+        per_page: normalizedProjectSearch ? SEARCH_CATALOG_LIMIT : pageSize,
       },
     }),
   })
@@ -61,6 +69,40 @@ export function Projects() {
     ? ({ ...rawProjectsData, projects: [], total: 0 } as typeof rawProjectsData)
     : rawProjectsData
   const gitProviders = SIMULATE_EMPTY_INSTALL ? [] : rawGitProviders
+  const totalPages = projectPageCount(projectsData?.total ?? 0, pageSize)
+  const isPageOutOfRange =
+    !normalizedProjectSearch &&
+    Boolean(projectsData?.total) &&
+    page > totalPages
+
+  const setPagination = useCallback(
+    (nextPage: number, nextPageSize = pageSize, replace = false) => {
+      setSearchParams(
+        (current) =>
+          withProjectPagination(current, {
+            page: nextPage,
+            pageSize: nextPageSize,
+          }),
+        { replace }
+      )
+    },
+    [pageSize, setSearchParams]
+  )
+
+  useEffect(() => {
+    const hasCanonicalPage = searchParams.get('page') === String(page)
+    const hasCanonicalPageSize =
+      searchParams.get('page_size') === String(pageSize)
+
+    if (!hasCanonicalPage || !hasCanonicalPageSize) {
+      setPagination(page, pageSize, true)
+    }
+  }, [page, pageSize, searchParams, setPagination])
+
+  useEffect(() => {
+    if (isPageOutOfRange) setPagination(totalPages, pageSize, true)
+  }, [isPageOutOfRange, pageSize, setPagination, totalPages])
+
   const visibleProjects = useMemo(() => {
     const projects = projectsData?.projects ?? []
     if (!normalizedProjectSearch) return projects
@@ -129,7 +171,7 @@ export function Projects() {
       <ProjectsHeader
         actions={
           <>
-            {(projectsData?.projects.length ?? 0) > 0 && (
+            {(projectsData?.total ?? 0) > 0 && (
               <ProjectSearch
                 value={projectSearch}
                 onChange={setProjectSearch}
@@ -141,15 +183,15 @@ export function Projects() {
         }
       />
 
-      {(projectsData?.projects.length ?? 0) > 0 && <OnboardingNextStepCard />}
+      {(projectsData?.total ?? 0) > 0 && <OnboardingNextStepCard />}
 
-      {isLoading || gitProvidersLoading ? (
+      {isLoading || gitProvidersLoading || isPageOutOfRange ? (
         <div className="overflow-hidden rounded-xl border bg-card divide-y">
           {Array.from({ length: 4 }).map((_, i) => (
             <ProjectCardSkeleton key={i} />
           ))}
         </div>
-      ) : projectsData?.projects.length === 0 ? (
+      ) : projectsData?.total === 0 ? (
         // First-run onboarding. The component is context-aware: when a Git
         // provider is already connected it routes straight into the import
         // wizard (skipping the connect step), and it always surfaces the
@@ -180,29 +222,21 @@ export function Projects() {
 
       {/* Pagination - Only show if there are projects */}
       {projectsData &&
-        projectsData.projects.length > 0 &&
-        !normalizedProjectSearch && (
-          <div className="flex items-center justify-center gap-2 pt-2">
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPage((p) => Math.max(1, p - 1))}
-              disabled={page === 1}
-            >
-              Previous
-            </Button>
-            <span className="text-sm text-muted-foreground">
-              Page {page} of {Math.ceil(projectsData.total / ITEMS_PER_PAGE)}
-            </span>
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => setPage((p) => p + 1)}
-              disabled={page >= Math.ceil(projectsData.total / ITEMS_PER_PAGE)}
-            >
-              Next
-            </Button>
-          </div>
+        projectsData.total > 0 &&
+        !normalizedProjectSearch &&
+        !isPageOutOfRange && (
+          <ResponsivePagination
+            page={page}
+            pageSize={pageSize}
+            total={projectsData.total}
+            totalPages={totalPages}
+            pageSizeOptions={PROJECT_PAGE_SIZE_OPTIONS}
+            ariaLabel="Project list pagination"
+            pageSizeAriaLabel="Projects per page"
+            className="pt-2"
+            onPageChange={(nextPage) => setPagination(nextPage)}
+            onPageSizeChange={(nextPageSize) => setPagination(1, nextPageSize)}
+          />
         )}
     </div>
   )

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for OTLP ingest and query endpoints.
 
 pub mod audit;
@@ -48,6 +51,8 @@ pub const INGEST_BODY_LIMIT: usize = MAX_DECOMPRESSED_SIZE + 2 * 1024 * 1024;
 ///   GET /otel/quota
 ///   GET /otel/has-traces/{project_id}
 ///   GET /otel/pipeline-stats
+///   GET /otel/ingest-errors
+///   GET /otel/pipeline-history
 pub fn configure_routes() -> Router<OtelAppState> {
     // OTLP ingest endpoints are split into their own sub-router so
     // `DefaultBodyLimit` applies only to them, not to the query/dashboard
@@ -113,6 +118,11 @@ pub fn configure_routes() -> Router<OtelAppState> {
         .route(
             "/otel/pipeline-stats",
             get(query_handler::get_pipeline_stats),
+        )
+        .route("/otel/ingest-errors", get(query_handler::get_ingest_errors))
+        .route(
+            "/otel/pipeline-history",
+            get(query_handler::get_pipeline_history),
         )
         // GenAI agent activity endpoints
         .route("/otel/genai/traces", get(query_handler::query_genai_traces))

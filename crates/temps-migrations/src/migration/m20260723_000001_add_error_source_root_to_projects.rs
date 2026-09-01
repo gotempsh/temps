@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Configurable source root for error-tracking native source capture.
 //!
 //! Adds `projects.error_source_root` (nullable). When set, the auto-capture job

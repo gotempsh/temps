@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Deploy the first-party echo example (examples/echo-server) with 3 replicas
 # spread across the dev cluster (control-plane + worker-1 + worker-2), demoing
 # multi-node scheduling + the node-identity env vars

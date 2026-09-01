@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Query handlers for the monitoring UI.
 //!
 //! These endpoints are authenticated via the standard RequireAuth flow
@@ -255,6 +258,69 @@ pub struct HasTracesResponse {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PipelineStatsResponse {
     pub stats: PipelineStats,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IngestErrorsResponse {
+    /// Failure groups, most recently seen first.
+    pub errors: Vec<IngestErrorSummary>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IngestErrorsQuery {
+    /// Max groups to return. Defaults to 20, capped at 100.
+    pub limit: Option<u32>,
+}
+
+/// One `(timestamp, value)` sample in a pipeline series.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct PipelineHistoryPoint {
+    /// ISO 8601 timestamp with `Z` suffix (bucket start).
+    pub time: String,
+    /// Bucket value — the mean per-sample delta, see [`PipelineSeries`].
+    pub value: f64,
+}
+
+/// One charted counter over the requested window.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct PipelineSeries {
+    /// Metric name, e.g. `otel.spans_dropped`.
+    pub name: String,
+    /// Buckets in ascending time order. Empty when the window predates the
+    /// first sample (a freshly started server has no history yet).
+    pub points: Vec<PipelineHistoryPoint>,
+}
+
+/// Time-series history for every counter the pipeline-stats sampler publishes.
+#[derive(Debug, Clone, PartialEq, Serialize, ToSchema)]
+pub struct PipelineHistoryResponse {
+    /// One entry per sampled counter, always the full set in a stable order —
+    /// a counter with no data yet is present with an empty `points`, never
+    /// omitted, so the client can render an empty chart instead of dropping
+    /// the panel.
+    pub series: Vec<PipelineSeries>,
+    /// Resolved window start (ISO 8601, `Z`).
+    pub start_time: String,
+    /// Resolved window end (ISO 8601, `Z`).
+    pub end_time: String,
+    /// Bucket width actually used, in seconds. Server-derived from the window
+    /// so a caller cannot request 1-minute buckets over 7 days.
+    pub step_seconds: i64,
+    /// Interval the sampler writes at, in seconds. The client needs this to
+    /// label values honestly: a bucket is the *mean delta per sample*, so
+    /// "events per `sample_interval_seconds`", not a bucket total.
+    pub sample_interval_seconds: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PipelineHistoryQuery {
+    /// Preset window: `1h` | `6h` | `24h` | `7d`. Ignored when both
+    /// `start_time` and `end_time` are given.
+    pub range: Option<String>,
+    /// Explicit window start (RFC 3339). Must be paired with `end_time`.
+    pub start_time: Option<DateTime<Utc>>,
+    /// Explicit window end (RFC 3339). Must be paired with `start_time`.
+    pub end_time: Option<DateTime<Utc>>,
 }
 
 // ── GenAI-specific DTOs ─────────────────────────────────────────────
@@ -1235,6 +1301,208 @@ pub async fn get_pipeline_stats(
     Ok(Json(PipelineStatsResponse { stats }))
 }
 
+/// Resolve `(from, to, step)` from either an explicit `[start_time, end_time]`
+/// pair or a preset `range`.
+///
+/// Mirrors `resolve_range_window` in `temps-providers`' node-metrics handler
+/// (same presets, same `duration_to_step` derivation, same width cap) so both
+/// time-series endpoints answer identically to the same query string. It is
+/// duplicated rather than shared because that helper is private to a crate
+/// this one does not — and should not — depend on.
+///
+/// `step` is always server-derived: a caller cannot ask for 1-minute buckets
+/// over a 7-day window and pull 10,080 points onto a 4 GB box.
+fn resolve_pipeline_window(
+    params: &PipelineHistoryQuery,
+) -> Result<(DateTime<Utc>, DateTime<Utc>, chrono::Duration), Problem> {
+    match (params.start_time, params.end_time) {
+        (Some(start), Some(end)) => {
+            if start >= end {
+                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Invalid Time Range")
+                    .with_detail("start_time must be before end_time"));
+            }
+            let span = end - start;
+            let max = chrono::Duration::days(temps_core::time_window::MAX_WINDOW_DAYS);
+            if span > max {
+                return Err(problemdetails::new(StatusCode::BAD_REQUEST)
+                    .with_title("Time Range Too Wide")
+                    .with_detail(format!(
+                        "Requested time range spans {} days, which exceeds the {}-day \
+                         maximum for this endpoint. Older data is still available — \
+                         request it {} days at a time by moving start_time/end_time back.",
+                        span.num_days().max(1),
+                        temps_core::time_window::MAX_WINDOW_DAYS,
+                        temps_core::time_window::MAX_WINDOW_DAYS
+                    )));
+            }
+            Ok((start, end, temps_metrics::duration_to_step(span)))
+        }
+        (None, None) => {
+            let (window, step) = temps_metrics::range_to_step(
+                params.range.as_deref().unwrap_or(DEFAULT_HISTORY_RANGE),
+            );
+            let now = Utc::now();
+            Ok((now - window, now, step))
+        }
+        _ => Err(problemdetails::new(StatusCode::BAD_REQUEST)
+            .with_title("Invalid Time Range")
+            .with_detail("start_time and end_time must both be provided")),
+    }
+}
+
+/// Default window for `/otel/pipeline-history`.
+///
+/// 24h rather than the node endpoint's 1h: the sampler writes one point per
+/// minute, so an hour is only 60 samples — enough to see a spike in progress
+/// but not enough to tell whether it is unusual.
+const DEFAULT_HISTORY_RANGE: &str = "24h";
+
+/// Chart the OTel pipeline counters over time.
+///
+/// `/otel/pipeline-stats` gives lifetime totals and `/otel/ingest-errors`
+/// gives failure reasons; this gives the shape over time — whether drops are a
+/// past incident that already recovered or an ongoing bleed, which a
+/// cumulative counter can never show.
+///
+/// Reads the delta series the background sampler writes to the shared metrics
+/// store (`SourceKind::Node`, node 0). Values are **mean deltas per sample
+/// interval**, not bucket totals — `sample_interval_seconds` in the response
+/// carries the unit so the client can label them.
+///
+/// System-scoped like the other two pipeline endpoints: these counters are
+/// process-wide, so there is no project parameter to scope by.
+#[utoipa::path(
+    tag = "OTel",
+    get,
+    path = "/otel/pipeline-history",
+    params(
+        ("range" = Option<String>, Query, description = "Preset window: 1h | 6h | 24h | 7d (default 24h). Ignored when start_time and end_time are both set."),
+        ("start_time" = Option<String>, Query, description = "Explicit window start (RFC 3339); must be paired with end_time"),
+        ("end_time" = Option<String>, Query, description = "Explicit window end (RFC 3339); must be paired with start_time"),
+    ),
+    responses(
+        (status = 200, description = "Pipeline counter history", body = PipelineHistoryResponse),
+        (status = 400, description = "Invalid time range", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 503, description = "Metrics store not available", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_pipeline_history(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<PipelineHistoryQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+
+    // Validate the caller's own input BEFORE checking server capability.
+    // Reversing these hides a fixable mistake behind an unrelated one: on a
+    // server without metric collection, a malformed range would answer
+    // "Metrics Unavailable" and the caller would never learn their start_time
+    // was after their end_time.
+    let (from, to, step) = resolve_pipeline_window(&params)?;
+
+    // Metric collection is optional. Say so explicitly rather than returning
+    // an empty chart, which would read as "nothing was dropped".
+    let store = state.metrics_store.as_ref().ok_or_else(|| {
+        problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+            .with_title("Metrics Unavailable")
+            .with_detail(
+                "Metric collection is not enabled on this server, so pipeline history \
+                 is not being recorded. Live counters are still available at \
+                 /otel/pipeline-stats.",
+            )
+    })?;
+
+    let mut series = Vec::with_capacity(crate::plugin::OTEL_PIPELINE_STAT_COUNT);
+    for name in crate::plugin::OTEL_PIPELINE_METRIC_NAMES {
+        let query = temps_metrics::RangeQuery {
+            source_kind: temps_metrics::SourceKind::Node,
+            source_id: crate::plugin::CONTROL_PLANE_NODE_ID,
+            name: name.to_string(),
+            from,
+            to,
+            step,
+            // The sampler already writes per-cycle deltas, so there is nothing
+            // to LAG-difference at read time. Treating these as cumulative
+            // would subtract successive deltas and render mostly zeros.
+            monotonic: false,
+        };
+
+        // Queried sequentially rather than with a join_all fan-out: 13
+        // concurrent connections from one dashboard poll is a meaningful
+        // fraction of the pool on the small boxes this targets, and each
+        // query is a bounded aggregate over at most MAX_SERIES_POINTS rows.
+        let points = store.query_range(query).await.map_err(|e| {
+            warn!(metric = %name, error = %e, "Failed to query OTel pipeline history");
+            problemdetails::new(StatusCode::SERVICE_UNAVAILABLE)
+                .with_title("Metrics Unavailable")
+                .with_detail(format!("Failed to query pipeline history for '{name}'"))
+        })?;
+
+        series.push(PipelineSeries {
+            name: name.to_string(),
+            points: points
+                .into_iter()
+                .map(|(time, value)| PipelineHistoryPoint {
+                    time: time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    value,
+                })
+                .collect(),
+        });
+    }
+
+    Ok(Json(PipelineHistoryResponse {
+        series,
+        start_time: from.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        end_time: to.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        step_seconds: step.num_seconds(),
+        sample_interval_seconds: crate::plugin::OTEL_STATS_SAMPLE_INTERVAL_SECS as i64,
+    }))
+}
+
+/// List recent OTel ingest failures, grouped by signal and error class.
+///
+/// The companion to `/otel/pipeline-stats`: that endpoint reports *how many*
+/// records were dropped, this one reports *why*, so an operator can tell a
+/// ClickHouse outage from a schema mismatch without reading server logs.
+///
+/// Read-only and system-scoped (no project parameter), matching
+/// `get_pipeline_stats` — the counters it explains are process-wide.
+#[utoipa::path(
+    tag = "OTel",
+    get,
+    path = "/otel/ingest-errors",
+    params(
+        ("limit" = Option<u32>, Query, description = "Max groups to return (default 20, max 100)")
+    ),
+    responses(
+        (status = 200, description = "Recent ingest failure groups", body = IngestErrorsResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
+        (status = 500, description = "Internal server error", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+pub async fn get_ingest_errors(
+    RequireAuth(auth): RequireAuth,
+    State(state): State<OtelAppState>,
+    Query(params): Query<IngestErrorsQuery>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, OtelRead);
+
+    // `0`/absent both mean "unspecified"; the storage layer clamps into
+    // 1..=100 so an oversized limit can't turn into an unbounded scan.
+    let errors = state
+        .otel_service
+        .recent_ingest_errors(params.limit.unwrap_or(0))
+        .await?;
+
+    Ok(Json(IngestErrorsResponse { errors }))
+}
+
 // ── GenAI Agent Activity Handlers ──────────────────────────────────
 
 /// Query GenAI trace summaries — traces containing spans with `gen_ai.*` attributes.
@@ -1792,6 +2060,239 @@ mod tests {
             truncated: false,
             truncated_projects: vec![2],
         }
+    }
+
+    // ── Pipeline history endpoint ───────────────────────────────────────
+
+    fn history_query(
+        range: Option<&str>,
+        start: Option<DateTime<Utc>>,
+        end: Option<DateTime<Utc>>,
+    ) -> PipelineHistoryQuery {
+        PipelineHistoryQuery {
+            range: range.map(str::to_string),
+            start_time: start,
+            end_time: end,
+        }
+    }
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        DateTime::<Utc>::from_timestamp(secs, 0).expect("valid timestamp")
+    }
+
+    /// An absent range must resolve to the documented 24h default, not the
+    /// node endpoint's 1h — 60 samples is too few to judge a spike.
+    #[test]
+    fn pipeline_window_defaults_to_24h() {
+        let (from, to, step) =
+            resolve_pipeline_window(&history_query(None, None, None)).expect("resolves");
+        let span = to - from;
+        assert_eq!(span.num_hours(), 24);
+        // 24h → 15m buckets per the shared duration_to_step presets.
+        assert_eq!(step.num_minutes(), 15);
+    }
+
+    #[test]
+    fn pipeline_window_honours_presets() {
+        for (range, hours) in [("1h", 1), ("6h", 6), ("24h", 24), ("7d", 168)] {
+            let (from, to, _) = resolve_pipeline_window(&history_query(Some(range), None, None))
+                .expect("preset resolves");
+            assert_eq!((to - from).num_hours(), hours, "range {range}");
+        }
+    }
+
+    /// Explicit bounds win over the preset, and the step is derived from the
+    /// actual span rather than the ignored `range`.
+    #[test]
+    fn pipeline_window_explicit_bounds_override_range() {
+        let start = at(1_700_000_000);
+        let end = start + chrono::Duration::hours(6);
+        let (from, to, step) =
+            resolve_pipeline_window(&history_query(Some("7d"), Some(start), Some(end)))
+                .expect("resolves");
+        assert_eq!(from, start);
+        assert_eq!(to, end);
+        assert_eq!(step.num_minutes(), 5, "6h span → 5m buckets");
+    }
+
+    #[test]
+    fn pipeline_window_rejects_inverted_bounds() {
+        let start = at(1_700_000_000);
+        let end = start - chrono::Duration::hours(1);
+        let err = resolve_pipeline_window(&history_query(None, Some(start), Some(end)))
+            .expect_err("inverted range must be rejected");
+        assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    /// One bound without the other is ambiguous — reject rather than silently
+    /// substituting "now" for the missing side.
+    #[test]
+    fn pipeline_window_rejects_a_half_specified_range() {
+        let start = at(1_700_000_000);
+        assert_eq!(
+            resolve_pipeline_window(&history_query(None, Some(start), None))
+                .expect_err("start alone must be rejected")
+                .status_code,
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            resolve_pipeline_window(&history_query(None, None, Some(start)))
+                .expect_err("end alone must be rejected")
+                .status_code,
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    /// The width cap protects a 4 GB box from an unbounded scan; it must be
+    /// enforced on explicit bounds, which are the only way to exceed it.
+    #[test]
+    fn pipeline_window_rejects_a_span_wider_than_the_cap() {
+        let start = at(1_700_000_000);
+        let end = start
+            + chrono::Duration::days(temps_core::time_window::MAX_WINDOW_DAYS)
+            + chrono::Duration::hours(1);
+        let err = resolve_pipeline_window(&history_query(None, Some(start), Some(end)))
+            .expect_err("over-wide range must be rejected");
+        assert_eq!(err.status_code, StatusCode::BAD_REQUEST);
+    }
+
+    /// Every preset must stay under the series-point cap, so no preset can
+    /// ever return an unbounded number of buckets.
+    #[test]
+    fn every_preset_stays_under_the_series_point_cap() {
+        for range in ["1h", "6h", "24h", "7d"] {
+            let (from, to, step) = resolve_pipeline_window(&history_query(Some(range), None, None))
+                .expect("preset resolves");
+            let buckets = temps_core::time_window::bucket_count(
+                (to - from).num_seconds(),
+                step.num_seconds(),
+            );
+            assert!(
+                buckets <= temps_core::time_window::MAX_SERIES_POINTS,
+                "range {range} would emit {buckets} buckets"
+            );
+        }
+    }
+
+    /// An unknown range must fall back to a valid window rather than erroring
+    /// or producing a zero-width span.
+    #[test]
+    fn pipeline_window_unknown_range_falls_back() {
+        let (from, to, _) = resolve_pipeline_window(&history_query(Some("nonsense"), None, None))
+            .expect("unknown range falls back rather than failing");
+        assert!(to > from);
+    }
+
+    /// The response must carry the sample interval: a bucket is a mean delta
+    /// per sample, so a value is meaningless without its unit.
+    #[test]
+    fn pipeline_history_response_serializes_with_units_and_iso_timestamps() {
+        let json = serde_json::to_value(PipelineHistoryResponse {
+            series: vec![PipelineSeries {
+                name: "otel.spans_dropped".to_string(),
+                points: vec![PipelineHistoryPoint {
+                    time: at(1_700_000_000).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    value: 12.0,
+                }],
+            }],
+            start_time: at(1_700_000_000).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            end_time: at(1_700_003_600).to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            step_seconds: 900,
+            sample_interval_seconds: 60,
+        })
+        .expect("serializes");
+
+        assert_eq!(json["series"][0]["name"], "otel.spans_dropped");
+        assert_eq!(json["series"][0]["points"][0]["value"], 12.0);
+        assert_eq!(json["step_seconds"], 900);
+        assert_eq!(json["sample_interval_seconds"], 60);
+        for field in ["start_time", "end_time"] {
+            let ts = json[field].as_str().unwrap_or_default();
+            assert!(
+                ts.ends_with('Z'),
+                "{field} must be ISO-8601 UTC, got {ts:?}"
+            );
+        }
+        let point_ts = json["series"][0]["points"][0]["time"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(point_ts.ends_with('Z'), "point time must be UTC");
+    }
+
+    /// A counter with no samples yet must serialize as an empty array, so the
+    /// client renders an empty chart rather than dropping the panel.
+    #[test]
+    fn pipeline_history_empty_series_serializes_as_array() {
+        let json = serde_json::to_value(PipelineSeries {
+            name: "otel.logs_dropped".to_string(),
+            points: vec![],
+        })
+        .expect("serializes");
+        assert!(json["points"].is_array());
+        assert_eq!(json["points"].as_array().map(Vec::len), Some(0));
+    }
+
+    // ── Ingest errors endpoint ──────────────────────────────────────────
+
+    fn ingest_error_fixture() -> IngestErrorSummary {
+        let ts = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("valid timestamp");
+        IngestErrorSummary {
+            signal_type: "spans".to_string(),
+            error_class: "clickhouse_network".to_string(),
+            sample_message: "ClickHouse store_spans failed: network error".to_string(),
+            count: 7,
+            first_seen: ts,
+            last_seen: ts + chrono::Duration::seconds(60),
+        }
+    }
+
+    /// The response must expose the fields the dashboard needs, with ISO-8601
+    /// `Z` timestamps per the workspace date convention.
+    #[test]
+    fn ingest_errors_response_serializes_the_expected_shape() {
+        let json = serde_json::to_value(IngestErrorsResponse {
+            errors: vec![ingest_error_fixture()],
+        })
+        .expect("serializes");
+
+        let entry = &json["errors"][0];
+        assert_eq!(entry["signal_type"], "spans");
+        assert_eq!(entry["error_class"], "clickhouse_network");
+        assert_eq!(entry["count"], 7);
+        assert!(entry["sample_message"]
+            .as_str()
+            .is_some_and(|m| m.contains("network error")));
+
+        for field in ["first_seen", "last_seen"] {
+            let ts = entry[field].as_str().unwrap_or_default();
+            assert!(
+                ts.ends_with('Z'),
+                "{field} must be ISO-8601 UTC, got {ts:?}"
+            );
+        }
+    }
+
+    /// An empty report must serialize as `[]`, never `null` — a client doing
+    /// `errors.map(...)` should not have to null-guard a healthy pipeline.
+    #[test]
+    fn ingest_errors_response_serializes_empty_as_array() {
+        let json =
+            serde_json::to_value(IngestErrorsResponse { errors: vec![] }).expect("serializes");
+        assert!(json["errors"].is_array());
+        assert_eq!(json["errors"].as_array().map(Vec::len), Some(0));
+    }
+
+    /// An absent `limit` must deserialize to `None`, which the handler maps to
+    /// "unspecified" (→ default page) rather than zero results.
+    #[test]
+    fn ingest_errors_query_limit_is_optional() {
+        let empty: IngestErrorsQuery = serde_json::from_str("{}").expect("absent limit is valid");
+        assert_eq!(empty.limit, None);
+
+        let explicit: IngestErrorsQuery =
+            serde_json::from_str(r#"{"limit":50}"#).expect("valid query");
+        assert_eq!(explicit.limit, Some(50));
     }
 
     /// A trace id is not an authorization boundary — it travels in

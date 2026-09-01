@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Coolify importer — WorkloadImporter implementation
 //!
 //! The Coolify *environment* (inside a Coolify project) is the project
@@ -1250,6 +1253,8 @@ async fn execute_plan(
         ),
         automatic_deploy: true,
         storage_service_ids: vec![],
+        storage_service_claim_ids: vec![],
+        storage_service_claim_user_id: None,
         is_public_repo,
         git_url,
         git_provider_connection_id: context.git_provider_connection_id,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Upstream configuration for environment routing
 //!
 //! This module defines type-safe structures for managing backend upstreams

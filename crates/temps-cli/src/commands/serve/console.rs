@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use argon2::password_hash::{rand_core::OsRng, SaltString};
 use argon2::{Argon2, PasswordHasher};
 use axum::body::Body;
@@ -49,6 +52,7 @@ use temps_infra::InfraPlugin;
 use temps_kv::KvPlugin;
 use temps_log_aggregator::{LogAggregatorPlugin, StorageConfig};
 use temps_logs::LogsPlugin;
+use temps_mcp_server::{McpHandlerState, McpServerPlugin};
 use temps_monitoring::{
     AlarmService, ContainerHealthConfig, ContainerHealthMonitor, DiskSpaceMonitor,
     MonitoringPlugin, OutageDetectionService,
@@ -2215,6 +2219,16 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     service_context.register_service(encryption_service.clone());
     service_context.register_service(cookie_crypto.clone());
     service_context.register_service(docker.clone());
+    // Pre-registered here (rather than left solely to AuthPlugin, which also
+    // registers an equivalent instance) because TeamsPlugin, GitPlugin,
+    // DomainsPlugin, and DeploymentsPlugin all gate sensitive mutations via
+    // `require_sensitive_action` and are registered before AuthPlugin in the
+    // ordered list below. Only depends on `db`, so it's safe to construct
+    // this early.
+    let sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer> = Arc::new(
+        temps_auth::DefaultSensitiveActionAuthorizer::new(db.clone()),
+    );
+    service_context.register_service(sensitive_action_authorizer);
     // Background DNS mutation is fail-closed until an optional policy plugin
     // claims this slot. DomainsPlugin captures the slot before later plugins
     // register, so the indirection must exist before plugin initialization.
@@ -2455,6 +2469,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     debug!("Registering DeploymentsPlugin");
     let deployments_plugin = Box::new(DeploymentsPlugin::new());
     plugin_manager.register_plugin(deployments_plugin);
+
+    // 9.0. McpServerPlugin (ADR-039) - MCP server for AI tool integration.
+    // Depends on ProjectsPlugin and DeploymentsPlugin (services registered above).
+    // Routes are at root level (not under /api); assembled below after plugin init.
+    debug!("Registering McpServerPlugin");
+    let mcp_plugin = Box::new(McpServerPlugin::new());
+    plugin_manager.register_plugin(mcp_plugin);
 
     // 8.8. SandboxPlugin - Vercel-compatible `/v1/sandbox/*` API.
     // Consumes the shared SandboxProvider registered by AgentsPlugin.
@@ -2746,15 +2767,12 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         );
     }
 
-    // Start disk space monitoring if ConfigService and NotificationService are available
-    if let (Some(config_service), Some(notification_service)) = (
+    // Start disk space monitoring if ConfigService and AlarmService are available
+    if let (Some(config_service), Some(alarm_service)) = (
         service_context.get_service::<temps_config::ConfigService>(),
-        service_context.get_service::<dyn temps_core::notifications::NotificationService>(),
+        service_context.get_service::<AlarmService>(),
     ) {
-        let monitor = Arc::new(DiskSpaceMonitor::new(
-            config_service.clone(),
-            notification_service,
-        ));
+        let monitor = Arc::new(DiskSpaceMonitor::new(config_service.clone(), alarm_service));
 
         tokio::spawn(async move {
             monitor.start_monitoring().await;
@@ -2763,7 +2781,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("Disk space monitoring started in background");
     } else {
         tracing::warn!(
-            "ConfigService or NotificationService not available - disk space monitoring disabled."
+            "ConfigService or AlarmService not available - disk space monitoring disabled."
         );
     }
 
@@ -2999,8 +3017,8 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     }
 
     // Start external service health monitoring (Postgres/Redis/MongoDB/RustFS TCP probes)
-    if let (Some(notification_service), Some(external_service_manager)) = (
-        service_context.get_service::<dyn temps_core::notifications::NotificationService>(),
+    if let (Some(alarm_service), Some(external_service_manager)) = (
+        service_context.get_service::<AlarmService>(),
         service_context.get_service::<temps_providers::ExternalServiceManager>(),
     ) {
         use temps_providers::health_monitor::{
@@ -3009,7 +3027,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let mut health_monitor = ExternalServiceHealthMonitor::new(
             db.clone(),
             external_service_manager,
-            notification_service,
+            alarm_service,
             ExternalServiceHealthConfig::default(),
             docker.clone(),
             service_context.require_service::<temps_core::EncryptionService>(),
@@ -3038,7 +3056,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         debug!("External service health monitor started (poll interval: 30s)");
     } else {
         tracing::warn!(
-            "NotificationService or ExternalServiceManager not available - external service health monitoring disabled."
+            "AlarmService or ExternalServiceManager not available - external service health monitoring disabled."
         );
     }
 
@@ -3068,8 +3086,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         telemetry: node_telemetry,
         rate_limiter: Arc::new(temps_deployments::handlers::nodes::RegistrationRateLimiter::new()),
         enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(db.clone())),
-        notification_service: service_context
-            .get_service::<dyn temps_core::notifications::NotificationService>(),
+        alarm_service: service_context.get_service::<AlarmService>(),
         audit_service: service_context.require_service::<dyn temps_core::AuditLogger>(),
     });
     let node_routes =
@@ -3081,8 +3098,7 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
         let health_db = db.clone();
         let deployment_service_for_failover =
             service_context.get_service::<temps_deployments::DeploymentService>();
-        let health_notification_service =
-            service_context.get_service::<dyn temps_core::notifications::NotificationService>();
+        let health_alarm_service = service_context.get_service::<AlarmService>();
         let health_config_service = service_context.get_service::<temps_config::ConfigService>();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
@@ -3099,13 +3115,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
                         offline_ids.len()
                     );
                     // Alert operators that worker node(s) went down (best-effort).
-                    if let Some(ref notification_service) = health_notification_service {
-                        notify_nodes_offline(
-                            &offline_ids,
-                            &health_node_service,
-                            notification_service,
-                        )
-                        .await;
+                    if let Some(ref alarm_service) = health_alarm_service {
+                        notify_nodes_offline(&offline_ids, &health_node_service, alarm_service)
+                            .await;
                     }
                     // Trigger failover redeployment for affected environments
                     if let Some(ref deployment_service) = deployment_service_for_failover {
@@ -3120,14 +3132,13 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
                 // Alert on node resource pressure (CPU/mem/disk) against the
                 // operator-configurable thresholds in settings.multi_node.
-                if let (Some(ref notification_service), Some(ref config_service)) =
-                    (&health_notification_service, &health_config_service)
+                if let (Some(ref alarm_service), Some(ref config_service)) =
+                    (&health_alarm_service, &health_config_service)
                 {
-                    check_node_resources(health_db.as_ref(), config_service, notification_service)
-                        .await;
+                    check_node_resources(health_db.as_ref(), config_service, alarm_service).await;
                     // The control plane isn't a `nodes` row, so it's excluded
                     // from the query above — alert on its own metrics separately.
-                    check_control_plane_resources(config_service, notification_service).await;
+                    check_control_plane_resources(config_service, alarm_service).await;
                 }
 
                 // Transition fully-drained nodes from "draining" to "drained".
@@ -3348,8 +3359,28 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let plugin_api_router =
         Router::new().nest("/api", public_router.clone().merge(admin_router.clone()));
 
+    // Build root-level MCP routes (ADR-039). These live outside /api so the
+    // CLI wizard's unauthenticated probe (GET /mcp/tools) works without a key.
+    // The authenticated sub-router gets the full plugin middleware stack (auth,
+    // request metadata) applied so RequireAuth works just like any /api handler.
+    let mcp_root_router = {
+        let service_context = plugin_manager.service_context();
+        if let Some(mcp_state) = service_context.get_service::<McpHandlerState>() {
+            let mcp_routers = temps_mcp_server::build_mcp_routers(mcp_state);
+            let auth_mcp = plugin_manager.apply_middleware_to_router(
+                mcp_routers.authenticated,
+                plugin_manager.get_middleware(),
+            );
+            Router::new().merge(mcp_routers.public).merge(auth_mcp)
+        } else {
+            debug!("McpHandlerState not registered; MCP routes skipped");
+            Router::new()
+        }
+    };
+
     let public_app = Router::new()
         .merge(health_router(ready_flag.clone()))
+        .merge(mcp_root_router)
         .nest("/api", public_router)
         .layer(axum::middleware::from_fn(track_server_errors));
 
@@ -4033,6 +4064,41 @@ mod ai_tool_allowlist_tests {
         };
         let catalog = caller.run_cli("projects --help", &scope).await;
         assert!(catalog.contains("get_projects"), "catalog: {catalog}");
+    }
+
+    /// Reproduces the page-country chat failure against the real analytics
+    /// OpenAPI document and the production AI read allowlist. This catches a
+    /// renamed/removed handler, missing allowlist entry, or parameter drift in
+    /// addition to the virtual CLI's unknown-operation recovery behavior.
+    #[tokio::test]
+    async fn page_country_analytics_recovers_through_real_api_contract() {
+        use temps_ai_api_tools::{ApiCallScope, InternalApiCaller};
+
+        let openapi = temps_analytics::handler::AnalyticsApiDoc::openapi();
+        let caller =
+            InternalApiCaller::new_allowlisted(axum::Router::new(), &openapi, ai_read_allowlist());
+        let scope = ApiCallScope {
+            auth: admin_auth(),
+            project_ids: vec![1],
+        };
+
+        let recovery = caller
+            .run_cli("analytics get_analytics --path /managed", &scope)
+            .await;
+        assert!(
+            recovery.contains("get_page_path_detail"),
+            "page-level aggregate missing from recovery help: {recovery}"
+        );
+
+        let help = caller
+            .run_cli("analytics get_page_path_detail --help", &scope)
+            .await;
+        for flag in ["--page_path", "--start_date", "--end_date"] {
+            assert!(
+                help.contains(flag),
+                "real page-detail contract is missing `{flag}`: {help}"
+            );
+        }
     }
 
     #[test]

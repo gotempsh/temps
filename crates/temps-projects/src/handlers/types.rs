@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use serde::{Deserialize, Serialize};
 use temps_core::templates::TemplateService;
 use temps_core::UtcDateTime;
@@ -17,6 +20,7 @@ use temps_presets::preset_config_schema::PresetConfigSchema;
 
 pub struct AppState {
     pub project_service: Arc<ProjectService>,
+    pub external_service_manager: Arc<temps_providers::ExternalServiceManager>,
     pub deployment_canceller: Arc<dyn temps_core::DeploymentCanceller>,
     pub deployment_container_cleaner: Arc<dyn temps_core::DeploymentContainerCleaner>,
     pub custom_domain_service: Arc<CustomDomainService>,
@@ -1081,7 +1085,7 @@ impl From<ProjectError> for Problem {
 
             err @ (ProjectError::EnvironmentCreationFailed { .. }
             | ProjectError::EnvVarCreationFailed { .. }
-            | ProjectError::StorageLinkFailed { .. }) => {
+            | ProjectError::StorageLinksFailed { .. }) => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Project Creation Failed")
                     .with_detail(err.to_string())

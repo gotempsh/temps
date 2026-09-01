@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # End-to-end validation of the HA DNS path (ADR-011) against the
 # 3-worker dev cluster.
 #

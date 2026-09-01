@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Project Templates Configuration
 //!
 //! Curated project templates that users can use to quickly create new projects.
@@ -809,6 +812,10 @@ templates:
         assert!(
             starter.services.iter().any(|s| s == "postgres"),
             "observability-starter must depend on postgres"
+        );
+        assert!(
+            starter.env_vars.is_empty(),
+            "observability-starter must not ask for platform-managed observability variables"
         );
     }
 

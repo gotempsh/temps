@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! MongoDB metric collector.
 //!
 //! Connects to a MongoDB instance and runs `db.adminCommand({serverStatus: 1})`

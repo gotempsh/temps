@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Resolver runtime configuration.
 //!
 //! Built by `temps-agent` at startup from: the node's [`NodeAlloc`]

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Test support: MockOtelStorage and helper builders.
 //!
 //! Provides an in-memory storage backend for unit and integration tests,
@@ -7,7 +10,7 @@ use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use crate::error::OtelError;
+use crate::error::{OtelError, StorageErrorKind};
 use crate::storage::{BaselinePoint, DeployEvent, MinuteAggregate, OtelStorage, StorageResult};
 use crate::types::*;
 
@@ -32,6 +35,41 @@ pub struct MockOtelStorage {
     pub next_insight_id: Arc<Mutex<i64>>,
     /// If set, store_spans will return this error instead.
     pub fail_store_spans: Arc<Mutex<Option<String>>>,
+    /// [`StorageErrorKind`] stamped onto the injected `fail_store_spans`
+    /// error. `None` defaults to a terminal kind, so a test that only sets
+    /// `fail_store_spans` gets a fail-fast, no-sleep failure.
+    pub fail_store_spans_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// How many *leading* `store_spans` calls the injected failure applies to.
+    /// `None` means "every call" — the original behaviour. `Some(n)` fails the
+    /// first `n` calls and then succeeds, which is how a transient blip that
+    /// heals on retry is simulated.
+    pub fail_store_spans_times: Arc<Mutex<Option<u32>>>,
+    /// Total number of `store_spans` invocations, including failed ones, so
+    /// tests can assert how many retry attempts actually happened.
+    pub store_spans_calls: Arc<Mutex<u32>>,
+    /// If set, `store_metrics` will return this error instead. Mirrors
+    /// `fail_store_spans` for the metrics ingest retry-failure-injection tests.
+    pub fail_store_metrics: Arc<Mutex<Option<String>>>,
+    /// [`StorageErrorKind`] stamped onto the injected `fail_store_metrics`
+    /// error. `None` defaults to a terminal kind, mirroring
+    /// `fail_store_spans_kind`.
+    pub fail_store_metrics_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// How many *leading* `store_metrics` calls the injected failure applies
+    /// to. `None` means "every call". Mirrors `fail_store_spans_times`.
+    pub fail_store_metrics_times: Arc<Mutex<Option<u32>>>,
+    /// Total number of `store_metrics` invocations, including failed ones.
+    /// Mirrors `store_spans_calls`.
+    pub store_metrics_calls: Arc<Mutex<u32>>,
+    /// If set, `store_logs` will return this error instead. Used to exercise
+    /// `ingest_logs`'s non-fatal-DB-failure contract: even a terminal DB
+    /// error must not fail the overall `ingest_logs` call, because the S3
+    /// archive path is attempted regardless.
+    pub fail_store_logs: Arc<Mutex<Option<String>>>,
+    /// [`StorageErrorKind`] stamped onto the injected `fail_store_logs` error.
+    pub fail_store_logs_kind: Arc<Mutex<Option<StorageErrorKind>>>,
+    /// Total number of `store_logs` invocations, including failed ones.
+    /// Mirrors `store_spans_calls`.
+    pub store_logs_calls: Arc<Mutex<u32>>,
     /// If set, archive_logs will return this error.
     pub fail_archive_logs: Arc<Mutex<Option<String>>>,
     /// Counts calls to `get_storage_quota`, so tests can assert on
@@ -40,6 +78,14 @@ pub struct MockOtelStorage {
     /// Overrides `get_storage_quota`'s `usage_pct`/`total_bytes`/`limit_bytes`
     /// for tests that need to simulate a project over its quota.
     pub quota_override: Arc<Mutex<Option<StorageQuota>>>,
+    /// Recorded ingest-failure groups, keyed `(signal_type, error_class)` —
+    /// mirrors the real backend's unique constraint so the mock aggregates
+    /// the same way rather than appending duplicates.
+    pub ingest_errors: Arc<Mutex<Vec<IngestErrorSummary>>>,
+    /// If set, `record_ingest_error` returns this error. Models the realistic
+    /// case where the backend recording the failure is itself the thing that
+    /// is down.
+    pub fail_record_ingest_error: Arc<Mutex<Option<String>>>,
 }
 
 impl MockOtelStorage {
@@ -70,6 +116,79 @@ impl MockOtelStorage {
     /// Number of times `get_storage_quota` has been called.
     pub fn get_storage_quota_call_count(&self) -> u32 {
         *self.get_storage_quota_calls.lock().unwrap()
+    }
+
+    /// Number of times `store_spans` has been called (failures included).
+    pub fn store_spans_call_count(&self) -> u32 {
+        *self.store_spans_calls.lock().unwrap()
+    }
+
+    /// Number of times `store_metrics` has been called (failures included).
+    /// Mirrors `store_spans_call_count`.
+    pub fn store_metrics_call_count(&self) -> u32 {
+        *self.store_metrics_calls.lock().unwrap()
+    }
+
+    /// Number of times `store_logs` has been called (failures included).
+    /// Mirrors `store_spans_call_count`.
+    pub fn store_logs_call_count(&self) -> u32 {
+        *self.store_logs_calls.lock().unwrap()
+    }
+
+    /// Ingest-failure groups recorded so far.
+    pub fn recorded_ingest_errors(&self) -> Vec<IngestErrorSummary> {
+        self.ingest_errors.lock().unwrap().clone()
+    }
+
+    /// Make `store_spans` fail with a **transient** storage error on its first
+    /// `times` calls, then succeed. `times: None` fails every call forever.
+    pub fn fail_store_spans_transiently(&self, message: &str, times: Option<u32>) {
+        *self.fail_store_spans.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_spans_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseNetwork);
+        *self.fail_store_spans_times.lock().unwrap() = times;
+    }
+
+    /// Make `store_spans` fail with a specific [`StorageErrorKind`] on its
+    /// first `times` calls (`None` = every call), for tests that assert on the
+    /// retry decision for one particular kind.
+    pub fn fail_store_spans_with(&self, message: &str, kind: StorageErrorKind, times: Option<u32>) {
+        *self.fail_store_spans.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_spans_kind.lock().unwrap() = Some(kind);
+        *self.fail_store_spans_times.lock().unwrap() = times;
+    }
+
+    /// Make `store_spans` fail with a **terminal** storage error on every call.
+    pub fn fail_store_spans_fatally(&self, message: &str) {
+        *self.fail_store_spans.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_spans_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
+        *self.fail_store_spans_times.lock().unwrap() = None;
+    }
+
+    /// Make `store_metrics` fail with a **transient** storage error on its
+    /// first `times` calls, then succeed. `times: None` fails every call
+    /// forever. Mirrors `fail_store_spans_transiently`.
+    pub fn fail_store_metrics_transiently(&self, message: &str, times: Option<u32>) {
+        *self.fail_store_metrics.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_metrics_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseNetwork);
+        *self.fail_store_metrics_times.lock().unwrap() = times;
+    }
+
+    /// Make `store_metrics` fail with a **terminal** storage error on every
+    /// call. Mirrors `fail_store_spans_fatally`.
+    pub fn fail_store_metrics_fatally(&self, message: &str) {
+        *self.fail_store_metrics.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_metrics_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
+        *self.fail_store_metrics_times.lock().unwrap() = None;
+    }
+
+    /// Make `store_logs` fail with a **terminal** storage error on every
+    /// call. Mirrors `fail_store_spans_fatally`. Used to exercise
+    /// `ingest_logs`'s non-fatal-DB-failure contract: `ingest_logs` must
+    /// still return `Ok(count)` even when this fires, because the S3 archive
+    /// path is attempted regardless of the DB write's outcome.
+    pub fn fail_store_logs_fatally(&self, message: &str) {
+        *self.fail_store_logs.lock().unwrap() = Some(message.to_string());
+        *self.fail_store_logs_kind.lock().unwrap() = Some(StorageErrorKind::ClickHouseSchema);
     }
 
     /// Aggregate the stored spans exactly as a real backend would: filter,
@@ -233,16 +352,62 @@ fn percentile(sorted: &[f64], q: f64) -> f64 {
 #[async_trait]
 impl OtelStorage for MockOtelStorage {
     async fn store_metrics(&self, points: Vec<MetricPoint>) -> StorageResult<u64> {
+        let call_index = {
+            let mut calls = self.store_metrics_calls.lock().unwrap();
+            let index = *calls;
+            *calls += 1;
+            index
+        };
+
+        if let Some(msg) = self.fail_store_metrics.lock().unwrap().as_ref() {
+            // `fail_store_metrics_times = Some(n)` fails only the first n
+            // calls, letting a test model a blip that heals on retry —
+            // mirrors `store_spans`.
+            let still_failing = match *self.fail_store_metrics_times.lock().unwrap() {
+                Some(times) => call_index < times,
+                None => true,
+            };
+            if still_failing {
+                return Err(OtelError::Storage {
+                    message: msg.clone(),
+                    kind: self
+                        .fail_store_metrics_kind
+                        .lock()
+                        .unwrap()
+                        .unwrap_or(StorageErrorKind::ClickHouseSchema),
+                });
+            }
+        }
         let count = points.len() as u64;
         self.metrics.lock().unwrap().extend(points);
         Ok(count)
     }
 
     async fn store_spans(&self, spans: Vec<SpanRecord>) -> StorageResult<u64> {
+        let call_index = {
+            let mut calls = self.store_spans_calls.lock().unwrap();
+            let index = *calls;
+            *calls += 1;
+            index
+        };
+
         if let Some(msg) = self.fail_store_spans.lock().unwrap().as_ref() {
-            return Err(OtelError::Storage {
-                message: msg.clone(),
-            });
+            // `fail_store_spans_times = Some(n)` fails only the first n calls,
+            // letting a test model a blip that heals on retry.
+            let still_failing = match *self.fail_store_spans_times.lock().unwrap() {
+                Some(times) => call_index < times,
+                None => true,
+            };
+            if still_failing {
+                return Err(OtelError::Storage {
+                    message: msg.clone(),
+                    kind: self
+                        .fail_store_spans_kind
+                        .lock()
+                        .unwrap()
+                        .unwrap_or(StorageErrorKind::ClickHouseSchema),
+                });
+            }
         }
         let count = spans.len() as u64;
         self.spans.lock().unwrap().extend(spans);
@@ -250,9 +415,85 @@ impl OtelStorage for MockOtelStorage {
     }
 
     async fn store_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {
+        *self.store_logs_calls.lock().unwrap() += 1;
+
+        if let Some(msg) = self.fail_store_logs.lock().unwrap().as_ref() {
+            return Err(OtelError::Storage {
+                message: msg.clone(),
+                kind: self
+                    .fail_store_logs_kind
+                    .lock()
+                    .unwrap()
+                    .unwrap_or(StorageErrorKind::ClickHouseSchema),
+            });
+        }
         let count = records.len() as u64;
         self.logs.lock().unwrap().extend(records);
         Ok(count)
+    }
+
+    async fn record_ingest_error(
+        &self,
+        signal_type: &str,
+        error_class: &str,
+        message: &str,
+    ) -> StorageResult<()> {
+        if let Some(msg) = self.fail_record_ingest_error.lock().unwrap().as_ref() {
+            return Err(OtelError::Storage {
+                message: msg.clone(),
+                kind: StorageErrorKind::PostgresConn,
+            });
+        }
+
+        let sample = crate::storage::truncate_sample_message(message);
+        let now = chrono::Utc::now();
+        let mut groups = self.ingest_errors.lock().unwrap();
+
+        // Same upsert semantics as the Postgres implementation: bump the
+        // existing group rather than appending a second row for the same pair.
+        match groups
+            .iter_mut()
+            .find(|g| g.signal_type == signal_type && g.error_class == error_class)
+        {
+            Some(existing) => {
+                existing.count += 1;
+                existing.last_seen = now;
+                existing.sample_message = sample;
+            }
+            None => groups.push(IngestErrorSummary {
+                signal_type: signal_type.to_string(),
+                error_class: error_class.to_string(),
+                sample_message: sample,
+                count: 1,
+                first_seen: now,
+                last_seen: now,
+            }),
+        }
+
+        Ok(())
+    }
+
+    async fn recent_ingest_errors(&self, limit: u32) -> StorageResult<Vec<IngestErrorSummary>> {
+        let limit = crate::storage::clamp_ingest_error_limit(limit);
+        // Match the real TimescaleDB backend's `WHERE last_seen > NOW() -
+        // INTERVAL '{INGEST_ERROR_WINDOW_DAYS} days'` filter (see
+        // `timescaledb::record_ingest_error`'s doc comment) — without this, a
+        // unit test built on this mock would get a false-green on window
+        // filtering, since the real backend excludes stale groups and this
+        // one didn't.
+        let cutoff = chrono::Utc::now()
+            - chrono::Duration::days(crate::storage::INGEST_ERROR_WINDOW_DAYS as i64);
+        let mut groups: Vec<IngestErrorSummary> = self
+            .ingest_errors
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|g| g.last_seen > cutoff)
+            .cloned()
+            .collect();
+        groups.sort_by_key(|g| std::cmp::Reverse(g.last_seen));
+        groups.truncate(limit as usize);
+        Ok(groups)
     }
 
     async fn archive_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64> {

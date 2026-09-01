@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Patterns that indicate a value should be masked based on the KEY name.
 const SENSITIVE_PATTERNS = [
   /secret/i,

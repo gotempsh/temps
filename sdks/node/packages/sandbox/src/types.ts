@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Public types. Names and shapes mirror the HTTP request/response DTOs
 // defined in `temps-sandbox::handlers::sandboxes`. Keep this file in
 // lock-step with the Rust definitions — clients rely on these being the

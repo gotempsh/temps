@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The alert-suggestion context provider — the inverse of [`crate::providers::alert`].
 //!
 //! [`crate::providers::alert::AlertChatProvider`] starts from a rule that already

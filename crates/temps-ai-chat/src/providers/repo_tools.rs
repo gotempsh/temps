@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sentinel provider that exposes Git-repository exploration tools in **every**
 //! project chat when the project has a Git provider connection — regardless of
 //! context type (project, alert, deployment, error-group, …).

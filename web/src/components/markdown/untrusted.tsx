@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ExternalLink, ImageOff } from 'lucide-react'
 import type { Components } from 'react-markdown'
 import { cn } from '@/lib/utils'

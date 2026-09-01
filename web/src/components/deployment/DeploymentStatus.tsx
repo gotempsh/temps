@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { DeploymentResponse } from '@/api/client'
 import { Loader2 } from 'lucide-react'
 import { useState, useEffect } from 'react'

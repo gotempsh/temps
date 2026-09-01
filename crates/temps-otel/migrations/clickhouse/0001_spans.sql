@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- OTel spans table: system-of-record for trace telemetry when ClickHouse is enabled.
 --
 -- Design decisions (ADR-016, Phase 0):

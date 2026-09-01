@@ -35,7 +35,7 @@ Create a new IP access control rule
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
-| `--ip <ip_or_cidr>` | IP address or CIDR range (e.g., "192.168.1.1" or "10.0.0.0/24") | - | No |
+| `--ip <ip_or_cidr>` | IPv4 or IPv6 address or CIDR range (e.g., "192.168.1.1", "10.0.0.0/24", or "2001:db8::/32") | - | No |
 | `--action <action>` | Action to take: "allow" or "deny" | - | No |
 | `--description <desc>` | Optional description/reason for the rule | - | No |
 | `-y, --yes` | Skip confirmation prompts (for automation) | - | No |

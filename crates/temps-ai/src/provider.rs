@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Provider-neutral discovery and runtime capability contracts.
 //!
 //! Provider adapters translate their native model, reasoning, permission, and

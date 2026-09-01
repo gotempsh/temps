@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Example usage of the tokenization abstraction with error groups
 //!
 //! Run with: cargo run --example tokenization_usage

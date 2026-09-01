@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Shared schedule preset options used by both CreateBackupSchedule and
  * EditBackupSchedule pages. Extracted here so the constant and its type are

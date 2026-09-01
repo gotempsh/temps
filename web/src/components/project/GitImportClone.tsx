@@ -1,13 +1,14 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useEffect, useState, useCallback } from 'react'
 import { useNavigate, useSearchParams } from 'react-router'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   listConnectionsOptions,
   getRepositoryBranchesOptions,
-  getRepositoryPresetLiveOptions,
   createProjectMutation,
   getPublicBranchesOptions,
-  detectPublicPresetsOptions,
   listProjectTemplatesOptions,
   listGitProvidersOptions,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -48,6 +49,8 @@ import {
 import { Drop } from '@/pages/Drop'
 import { toast } from 'sonner'
 import { Badge } from '@/components/ui/badge'
+import { parsePublicRepositoryUrl } from '@/lib/public-repository'
+import { getPublicRepository } from '@/api/client/sdk.gen'
 
 const SOURCE_VALUES: ProjectSource[] = [
   'templates',
@@ -66,6 +69,7 @@ interface ParsedGitUrl {
   provider: 'github' | 'gitlab'
   owner: string
   repo: string
+  instanceUrl?: string
 }
 
 /**
@@ -73,50 +77,15 @@ interface ParsedGitUrl {
  * Supports: https://github.com/owner/repo, https://gitlab.com/owner/repo, etc.
  */
 function parseGitUrl(url: string): ParsedGitUrl | null {
-  try {
-    // Clean up the URL
-    const cleanUrl = url.trim().replace(/\.git$/, '')
-
-    // Try to parse as URL
-    let hostname: string
-    let pathname: string
-
-    if (cleanUrl.startsWith('http://') || cleanUrl.startsWith('https://')) {
-      const parsed = new URL(cleanUrl)
-      hostname = parsed.hostname.toLowerCase()
-      pathname = parsed.pathname
-    } else if (cleanUrl.includes('@') && cleanUrl.includes(':')) {
-      // SSH URL format: git@github.com:owner/repo
-      const match = cleanUrl.match(/@([^:]+):(.+)/)
-      if (!match) return null
-      hostname = match[1].toLowerCase()
-      pathname = '/' + match[2]
-    } else {
-      return null
-    }
-
-    // Determine provider
-    let provider: 'github' | 'gitlab'
-    if (hostname.includes('github')) {
-      provider = 'github'
-    } else if (hostname.includes('gitlab')) {
-      provider = 'gitlab'
-    } else {
-      return null
-    }
-
-    // Extract owner and repo from pathname
-    const parts = pathname.split('/').filter(Boolean)
-    if (parts.length < 2) return null
-
-    return {
-      provider,
-      owner: parts[0],
-      repo: parts[1],
-    }
-  } catch {
-    return null
-  }
+  const parsed = parsePublicRepositoryUrl(url)
+  return parsed
+    ? {
+        provider: parsed.provider,
+        owner: parsed.owner,
+        repo: parsed.name,
+        instanceUrl: parsed.instanceUrl,
+      }
+    : null
 }
 
 interface GitImportCloneProps {
@@ -395,56 +364,13 @@ export function GitImportClone({
         owner: parsedPublicRepo?.owner || '',
         repo: parsedPublicRepo?.repo || '',
       },
+      query: { base_url: parsedPublicRepo?.instanceUrl },
     }),
     enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
   })
 
   // Use the appropriate branches based on whether it's a public repo
   const branches = useGitUrl ? publicBranches : authenticatedBranches
-
-  // Query for presets from authenticated connection
-  const {
-    data: authenticatedPresetData,
-    refetch: refetchAuthenticatedPresetData,
-  } = useQuery({
-    ...getRepositoryPresetLiveOptions({
-      path: {
-        repository_id: selectedRepository?.id || 0,
-      },
-    }),
-    enabled: !useGitUrl && !!selectedRepository && !!selectedRepository?.id,
-  })
-
-  // Query for presets from public repository
-  const { data: publicPresetData, refetch: refetchPublicPresetData } = useQuery(
-    {
-      ...detectPublicPresetsOptions({
-        path: {
-          provider: parsedPublicRepo?.provider || 'github',
-          owner: parsedPublicRepo?.owner || '',
-          repo: parsedPublicRepo?.repo || '',
-        },
-        query: {
-          branch: selectedRepository?.default_branch,
-        },
-      }),
-      enabled: useGitUrl && !!parsedPublicRepo && !!selectedRepository,
-    }
-  )
-
-  // Transform public preset data to match ProjectPresetResponse format (camelCase)
-  const presetData = useGitUrl
-    ? publicPresetData?.presets?.map((p) => ({
-        preset: p.preset,
-        presetLabel: p.preset_label,
-        exposedPort: p.exposed_port,
-        iconUrl: p.icon_url,
-        projectType: p.project_type,
-        path: p.path,
-        composeFiles: (p as any).compose_files as string[] | undefined,
-        dockerfilePath: p.dockerfile_path,
-      }))
-    : authenticatedPresetData?.presets
 
   const createProjectMutationM = useMutation({
     ...createProjectMutation(),
@@ -491,14 +417,20 @@ export function GitImportClone({
       setIsValidatingUrl(true)
 
       try {
-        const response = await fetch(
-          `/api/git/public/${parsed.provider}/${parsed.owner}/${parsed.repo}`
-        )
+        const result = await getPublicRepository({
+          path: {
+            provider: parsed.provider,
+            owner: parsed.owner,
+            repo: parsed.repo,
+          },
+          query: { base_url: parsed.instanceUrl },
+          throwOnError: false,
+        })
 
-        if (!response.ok) {
-          if (response.status === 404) {
+        if (!result.data) {
+          if (result.response?.status === 404) {
             toast.error('Repository not found or is not public')
-          } else if (response.status === 429) {
+          } else if (result.response?.status === 429) {
             toast.error('Rate limit exceeded. Please try again later.')
           } else {
             toast.error('Failed to fetch repository information')
@@ -507,7 +439,7 @@ export function GitImportClone({
           return
         }
 
-        const repoInfo = await response.json()
+        const repoInfo = result.data
 
         const repoFromApi: RepositoryResponse = {
           id: 0,
@@ -667,14 +599,9 @@ export function GitImportClone({
                     provider: parsedPublicRepo.provider || 'github',
                     owner: parsedPublicRepo.owner,
                     repo: parsedPublicRepo.repo,
+                    baseUrl: parsedPublicRepo.instanceUrl,
                   }
                 : null
-            }
-            presetData={presetData}
-            onRefreshPresets={() =>
-              useGitUrl
-                ? refetchPublicPresetData()
-                : refetchAuthenticatedPresetData()
             }
             branches={branches?.branches}
             mode="wizard"

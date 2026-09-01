@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Lazy per-cluster CA provisioning for multi-node mTLS (ADR-020 WS-2.1).
 //!
 //! The control plane mints ONE per-cluster CA the first time it needs to sign a

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Deploy Image Job
 //!
 //! Deploys built container images to target environments
@@ -225,6 +228,31 @@ pub(crate) fn parse_memory_mb(s: &str) -> Option<u64> {
     }
 }
 
+/// Turn the planner's cross-node blockers into the failure a remotely
+/// scheduled replica must report, or `None` when there is nothing blocking.
+///
+/// Pure so the exact operator-facing message — which is the entire point of
+/// this code path — can be asserted in tests. Only ever called for a
+/// non-local assignment: a replica staying on the control plane reaches its
+/// linked services by container name and is unaffected.
+fn cross_node_unreachable_error(
+    node_name: &str,
+    blockers: &[crate::services::CrossNodeServiceBlocker],
+) -> Option<WorkflowError> {
+    if blockers.is_empty() {
+        return None;
+    }
+    Some(WorkflowError::CrossNodeServiceUnreachable {
+        node_name: node_name.to_string(),
+        blocker_count: blockers.len(),
+        details: blockers
+            .iter()
+            .map(|blocker| blocker.describe())
+            .collect::<Vec<_>>()
+            .join("; "),
+    })
+}
+
 /// Configuration for deployment job execution
 /// This is built from the entity's DeploymentConfig + runtime values
 #[derive(Debug, Clone)]
@@ -262,8 +290,18 @@ pub struct DeploymentJobConfig {
     pub target_labels: Option<serde_json::Value>,
     /// Environment variables with connection strings rewritten for remote nodes.
     /// Used instead of `environment_variables` when a replica deploys to a worker node
-    /// (container names are replaced with the control plane's private address + host port).
+    /// (linked-service container names are replaced with their internal
+    /// `*.temps.local` DNS names, which resolve to overlay IPs on every node).
     pub remote_environment_variables: Option<HashMap<String, String>>,
+    /// Linked external services that have no working address from any node
+    /// other than their own. Empty in the normal case.
+    ///
+    /// A replica scheduled remotely with a non-empty list is failed instead
+    /// of being handed a connection string that can never connect — see
+    /// [`temps_core::WorkflowError::CrossNodeServiceUnreachable`]. Local
+    /// replicas ignore it entirely: they reach the service by container name
+    /// over the shared bridge network exactly as before.
+    pub cross_node_service_blockers: Vec<crate::services::CrossNodeServiceBlocker>,
     /// Anti-affinity: avoid placing two replicas on the same node.
     /// When true, the scheduler spreads replicas across different nodes.
     pub anti_affinity: bool,
@@ -301,6 +339,7 @@ impl Default for DeploymentJobConfig {
             target_nodes: None,
             target_labels: None,
             remote_environment_variables: None,
+            cross_node_service_blockers: Vec::new(),
             anti_affinity: true,
             exclude_node_ids: Vec::new(),
         }
@@ -1492,9 +1531,28 @@ impl DeployImageJob {
             disk_limit_mb: None,
         };
 
-        // Use remote environment variables for remote deployments (connection strings
-        // rewritten with control plane's private address), fall back to local env vars.
+        // Use remote environment variables for remote deployments (linked-service
+        // container names rewritten to their internal `*.temps.local` DNS names),
+        // fall back to local env vars.
         let mut environment_vars = if !assignment.is_local() {
+            // Refuse to start a container that has been handed a connection
+            // string which cannot possibly connect. Managed service ports
+            // bind to 127.0.0.1 on their own host, so when the planner could
+            // not produce a resolvable name there is no working address at
+            // all — and a container that boots and then fails to reach its
+            // database forever is the exact silent failure this guards.
+            let node_name = match assignment {
+                crate::services::NodeAssignment::Remote { node_name, .. } => node_name.as_str(),
+                crate::services::NodeAssignment::Local => "control-plane",
+            };
+            if let Some(error) =
+                cross_node_unreachable_error(node_name, &self.config.cross_node_service_blockers)
+            {
+                tracing::error!("{}", error);
+                self.log(context, format!("❌ {}", error)).await?;
+                return Err(error);
+            }
+
             if let Some(ref remote_vars) = self.config.remote_environment_variables {
                 tracing::info!(
                     "Using REMOTE environment variables for non-local assignment (has {} remote vars)",
@@ -2436,6 +2494,17 @@ impl DeployImageJobBuilder {
         self
     }
 
+    /// Set the linked services that cannot be reached from another node.
+    /// A remotely-scheduled replica fails with these rather than silently
+    /// receiving an unusable connection string.
+    pub fn cross_node_service_blockers(
+        mut self,
+        blockers: Vec<crate::services::CrossNodeServiceBlocker>,
+    ) -> Self {
+        self.config.cross_node_service_blockers = blockers;
+        self
+    }
+
     /// Set the encryption service for decrypting node tokens during remote deployments
     pub fn encryption_service(mut self, service: Arc<temps_core::EncryptionService>) -> Self {
         self.encryption_service = Some(service);
@@ -2521,6 +2590,78 @@ mod tests {
                 .map(|(p, t)| (p.to_string(), t.to_string()))
                 .collect(),
         }
+    }
+
+    fn blocker(
+        reason: temps_providers::CrossNodeBlockReason,
+    ) -> crate::services::CrossNodeServiceBlocker {
+        crate::services::CrossNodeServiceBlocker {
+            service_id: 7,
+            service_name: "orders-db".to_string(),
+            fqdn: Some("orders-db.temps.local".to_string()),
+            detail: reason.detail("orders-db"),
+            remedy: reason.remedy().to_string(),
+            setup_path: reason.setup_path(7),
+        }
+    }
+
+    /// Default (and overwhelmingly common) case: nothing blocks the replica,
+    /// so a remote deployment proceeds exactly as before.
+    #[test]
+    fn no_blockers_never_fails_a_remote_replica() {
+        assert!(cross_node_unreachable_error("worker-1", &[]).is_none());
+        assert!(DeploymentJobConfig::default()
+            .cross_node_service_blockers
+            .is_empty());
+    }
+
+    /// The whole point of the guard: the operator gets the node, the
+    /// service, the reason, and the fix — not a container that silently
+    /// cannot reach its database.
+    #[test]
+    fn blocked_remote_replica_fails_with_an_actionable_message() {
+        let error = cross_node_unreachable_error(
+            "worker-1",
+            &[blocker(
+                temps_providers::CrossNodeBlockReason::ClusterDnsDisabled,
+            )],
+        )
+        .expect("a blocker must produce an error");
+
+        assert!(matches!(
+            error,
+            WorkflowError::CrossNodeServiceUnreachable {
+                blocker_count: 1,
+                ..
+            }
+        ));
+
+        let message = error.to_string();
+        assert!(message.contains("worker-1"), "{message}");
+        assert!(message.contains("orders-db"), "{message}");
+        assert!(message.contains("Cluster DNS is disabled"), "{message}");
+        assert!(message.contains("Enable cluster DNS"), "{message}");
+    }
+
+    #[test]
+    fn every_blocked_service_is_named_in_the_failure() {
+        let error = cross_node_unreachable_error(
+            "worker-2",
+            &[
+                blocker(temps_providers::CrossNodeBlockReason::ClusterDnsDisabled),
+                crate::services::CrossNodeServiceBlocker {
+                    service_id: 9,
+                    service_name: "cache".to_string(),
+                    ..blocker(temps_providers::CrossNodeBlockReason::DnsRecordMissing)
+                },
+            ],
+        )
+        .expect("blockers must produce an error");
+
+        let message = error.to_string();
+        assert!(message.contains("2 linked service(s)"), "{message}");
+        assert!(message.contains("orders-db"), "{message}");
+        assert!(message.contains("cache"), "{message}");
     }
 
     /// Single-arch build: every node gets the one tag, whatever it reports.
@@ -3427,6 +3568,12 @@ mod tests {
                 edge_public_key: None,
                 compute_cidr: None,
                 underlay_address: None,
+                dns_resolver_running: None,
+                dns_resolver_tasks_alive: None,
+                dns_resolver_last_sync_at: None,
+                dns_resolver_consecutive_failures: 0,
+                dns_resolver_last_error: None,
+                dns_resolver_record_count: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             }
@@ -3491,6 +3638,12 @@ mod tests {
                 edge_public_key: None,
                 compute_cidr: None,
                 underlay_address: None,
+                dns_resolver_running: None,
+                dns_resolver_tasks_alive: None,
+                dns_resolver_last_sync_at: None,
+                dns_resolver_consecutive_failures: 0,
+                dns_resolver_last_error: None,
+                dns_resolver_record_count: None,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             }
@@ -3556,6 +3709,12 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -3727,6 +3886,12 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -3790,6 +3955,12 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };

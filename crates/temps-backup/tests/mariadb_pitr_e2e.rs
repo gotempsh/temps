@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Full-chain MariaDB point-in-time-recovery (PITR) end-to-end integration test.
 //!
 //! This drives the **real** engine + provider code paths against **real**

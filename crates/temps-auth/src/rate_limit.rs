@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! IP-based rate limiting middleware for authentication endpoints.
 //!
 //! Provides a simple sliding-window rate limiter to prevent brute force attacks

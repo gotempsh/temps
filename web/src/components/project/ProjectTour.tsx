@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Button } from '@/components/ui/button'
 import { cn } from '@/lib/utils'
 import { Sparkles, X } from 'lucide-react'
@@ -131,7 +134,14 @@ export function ProjectTour() {
         return true
       }
     })()
-    const timer = seen ? undefined : window.setTimeout(start, 800)
+    // Only auto-start from the project's home page. A deep link straight into a
+    // specific sub-page — a shared deployment URL, a bookmark, browser back —
+    // must never be hijacked by the tour's own forced navigation to "project".
+    const path = window.location.pathname
+    const onHomePage =
+      !!slug &&
+      (path === `/projects/${slug}` || path === `/projects/${slug}/project`)
+    const timer = seen || !onHomePage ? undefined : window.setTimeout(start, 800)
 
     return () => {
       window.removeEventListener(PROJECT_TOUR_EVENT, onStart)

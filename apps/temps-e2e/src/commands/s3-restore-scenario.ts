@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * S3/MinIO managed-service restore scenario — proves the newly added
  * `restore_in_place` capability is genuinely functional, not just a 2xx.

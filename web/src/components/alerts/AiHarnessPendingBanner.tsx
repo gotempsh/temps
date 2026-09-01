@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useQuery } from '@tanstack/react-query'
 import { ArrowRight, Terminal } from 'lucide-react'
 import { Link, useLocation } from 'react-router'

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # pgvector + WAL-G image for Temps backup/restore
 # Based on pgvector/pgvector:pgXX (Debian Bookworm), adds WAL-G binary for S3-native backups.
 # WAL-G binaries are dynamically linked against glibc, so Debian is required (not Alpine).

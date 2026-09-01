@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Compression CODECs for the service_metrics table.
 --
 -- The original table declared no CODECs (default LZ4). These ALTERs apply the

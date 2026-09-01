@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { onCLS, onFID, onLCP, onTTFB, onFCP, onINP, type Metric } from "web-vitals";
 import { sendAnalytics } from "./utils";
 import type { JsonValue, WebVitalMetric } from "./types";

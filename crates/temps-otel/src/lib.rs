@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! OpenTelemetry data collection, storage, and analysis for Temps.
 //!
 //! This crate implements:

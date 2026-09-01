@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * High-level Temps control-plane flows used by the e2e commands: create a
  * project, provision a database service, deploy a prebuilt image, poll for

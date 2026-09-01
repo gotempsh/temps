@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 pub mod acme_accounts;
 pub mod acme_orders;
 pub mod ai_conversations;
@@ -72,6 +75,8 @@ pub mod node_route_state;
 pub mod nodes;
 pub mod notification_preferences;
 pub mod notification_providers;
+pub mod notification_route_providers;
+pub mod notification_routes;
 pub mod notifications;
 pub mod oauth_states;
 pub mod oidc_login_states;

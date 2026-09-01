@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Boxes } from 'lucide-react'
 import { useState } from 'react'
 import { cn } from '@/lib/utils'

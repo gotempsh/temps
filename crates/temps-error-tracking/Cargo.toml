@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-error-tracking"
 version.workspace = true
@@ -14,6 +17,7 @@ temps-database = { path = "../temps-database" }
 temps-embeddings = { path = "../temps-embeddings" }
 temps-entities = { path = "../temps-entities" }
 temps-geo = { path = "../temps-geo" }
+temps-monitoring = { path = "../temps-monitoring" }
 temps-notifications = { path = "../temps-notifications" }
 temps-projects = { path = "../temps-projects" }
 temps-config = { path = "../temps-config" }

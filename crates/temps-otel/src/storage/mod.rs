@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pluggable storage backend for OTel data.
 //!
 //! The [`OtelStorage`] trait defines the contract for storing and querying
@@ -12,13 +15,65 @@ use async_trait::async_trait;
 
 use crate::error::OtelError;
 use crate::types::{
-    GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, Insight, InsightStatus,
-    LogQuery, LogRecord, MetricBucket, MetricPoint, MetricQuery, SpanRecord, SpanStats,
-    SpanStatsQuery, StorageQuota, TraceQuery, TraceSummary,
+    GenAiEvent, GenAiSpanDetail, GenAiTraceSummary, HealthSummary, IngestErrorSummary, Insight,
+    InsightStatus, LogQuery, LogRecord, MetricBucket, MetricPoint, MetricQuery, SpanRecord,
+    SpanStats, SpanStatsQuery, StorageQuota, TraceQuery, TraceSummary,
 };
 
 /// Result type for storage operations.
 pub type StorageResult<T> = Result<T, OtelError>;
+
+// ── Ingest error reporting: shared bounds ───────────────────────────
+
+/// How far back [`OtelStorage::recent_ingest_errors`] looks.
+///
+/// A group whose `last_seen` is older than this is treated as resolved and
+/// hidden, so a failure mode that was fixed last month does not sit on the
+/// dashboard forever. The row itself is left in place — the table is bounded
+/// by its unique constraint, so there is nothing to reclaim.
+pub(crate) const INGEST_ERROR_WINDOW_DAYS: u32 = 7;
+
+/// Default number of ingest-error groups returned when the caller does not
+/// specify one. Matches the workspace pagination convention.
+pub(crate) const INGEST_ERROR_DEFAULT_LIMIT: u32 = 20;
+
+/// Hard ceiling on ingest-error groups per request. Matches the workspace
+/// pagination convention.
+pub(crate) const INGEST_ERROR_MAX_LIMIT: u32 = 100;
+
+/// Longest `sample_message` persisted per group.
+///
+/// A backend can return a very large error body (a full DDL statement, a
+/// serialized row). Truncating keeps one pathological failure from writing an
+/// unbounded blob into a control table that is otherwise a few dozen tiny rows.
+pub(crate) const INGEST_ERROR_MESSAGE_MAX_CHARS: usize = 500;
+
+/// Clamp a caller-supplied limit into `1..=INGEST_ERROR_MAX_LIMIT`, mapping
+/// `0` to the default so a missing/zero query param behaves as "unspecified"
+/// rather than returning nothing.
+pub(crate) fn clamp_ingest_error_limit(limit: u32) -> u32 {
+    if limit == 0 {
+        INGEST_ERROR_DEFAULT_LIMIT
+    } else {
+        limit.min(INGEST_ERROR_MAX_LIMIT)
+    }
+}
+
+/// Truncate an error message to [`INGEST_ERROR_MESSAGE_MAX_CHARS`], appending
+/// an ellipsis when it was cut.
+///
+/// Counts *characters*, not bytes, so a multi-byte message can never be split
+/// mid-codepoint (which would make the column invalid UTF-8).
+pub(crate) fn truncate_sample_message(message: &str) -> String {
+    let mut out: String = message
+        .chars()
+        .take(INGEST_ERROR_MESSAGE_MAX_CHARS)
+        .collect();
+    if message.chars().count() > INGEST_ERROR_MESSAGE_MAX_CHARS {
+        out.push('…');
+    }
+    out
+}
 
 /// The pluggable storage backend trait for OTel data.
 ///
@@ -59,6 +114,44 @@ pub trait OtelStorage: Send + Sync {
     /// All severity levels are archived.
     /// Returns the number of records archived.
     async fn archive_logs(&self, records: Vec<LogRecord>) -> StorageResult<u64>;
+
+    // ── Ingest error reporting ──────────────────────────────────────
+    //
+    // Both methods are backed by Postgres on *every* backend — the
+    // ClickHouse implementation delegates to its inner TimescaleDB store,
+    // exactly as it already does for logs, insights and health summaries.
+    //
+    // That is a deliberate choice, not an oversight: the failure being
+    // recorded is most often "ClickHouse is unreachable". Writing the record
+    // to ClickHouse would lose it in precisely the case it exists to explain,
+    // leaving the operator with a rising `dropped` counter and no reason. If
+    // Postgres is unreachable the control plane is down anyway, so there is no
+    // equivalent blind spot.
+
+    /// Record that an ingest batch was dropped after its retries were
+    /// exhausted, grouped by `(signal_type, error_class)`.
+    ///
+    /// Callers must treat this as **best-effort**: it is invoked on a path
+    /// that is already failing, so implementations should expect it to
+    /// sometimes fail too, and callers must not let that change the outcome of
+    /// the ingest request. See `OtelService::record_ingest_failure`.
+    ///
+    /// `error_class` must be a stable, low-cardinality label
+    /// (`OtelError::error_class`) — never a raw error message, which would
+    /// make the group set unbounded.
+    async fn record_ingest_error(
+        &self,
+        signal_type: &str,
+        error_class: &str,
+        message: &str,
+    ) -> StorageResult<()>;
+
+    /// Recent ingest-failure groups, most recently seen first.
+    ///
+    /// Implementations bound the result by `limit` and exclude groups whose
+    /// `last_seen` is outside the reporting window, so a failure mode that was
+    /// fixed weeks ago does not linger on the dashboard.
+    async fn recent_ingest_errors(&self, limit: u32) -> StorageResult<Vec<IngestErrorSummary>>;
 
     // ── Read operations ─────────────────────────────────────────────
 
@@ -333,6 +426,75 @@ mod tests {
     fn merge_unions_disjoint_projects() {
         let merged = merge_trace_ref_projects(vec![r(1, 100)], vec![r(2, 200)]);
         assert_eq!(merged.len(), 2);
+    }
+
+    // ── Ingest error reporting bounds ───────────────────────────────
+
+    /// Zero/absent means "unspecified" and must yield the default page, not an
+    /// empty result — a client that omits `limit` should still see data.
+    #[test]
+    fn ingest_error_limit_zero_becomes_the_default() {
+        assert_eq!(
+            clamp_ingest_error_limit(0),
+            INGEST_ERROR_DEFAULT_LIMIT,
+            "0 must mean 'unspecified', never 'return nothing'"
+        );
+    }
+
+    #[test]
+    fn ingest_error_limit_is_capped_at_the_max() {
+        assert_eq!(clamp_ingest_error_limit(101), INGEST_ERROR_MAX_LIMIT);
+        assert_eq!(clamp_ingest_error_limit(u32::MAX), INGEST_ERROR_MAX_LIMIT);
+    }
+
+    #[test]
+    fn ingest_error_limit_passes_through_in_range_values() {
+        assert_eq!(clamp_ingest_error_limit(1), 1);
+        assert_eq!(clamp_ingest_error_limit(50), 50);
+        assert_eq!(
+            clamp_ingest_error_limit(INGEST_ERROR_MAX_LIMIT),
+            INGEST_ERROR_MAX_LIMIT
+        );
+    }
+
+    /// Matches the workspace pagination convention (default 20, max 100).
+    #[test]
+    fn ingest_error_limits_match_the_pagination_convention() {
+        assert_eq!(INGEST_ERROR_DEFAULT_LIMIT, 20);
+        assert_eq!(INGEST_ERROR_MAX_LIMIT, 100);
+    }
+
+    #[test]
+    fn short_sample_messages_are_left_alone() {
+        let msg = "ClickHouse store_spans failed: timeout expired";
+        assert_eq!(truncate_sample_message(msg), msg);
+    }
+
+    #[test]
+    fn long_sample_messages_are_truncated_with_an_ellipsis() {
+        let msg = "x".repeat(INGEST_ERROR_MESSAGE_MAX_CHARS + 50);
+        let out = truncate_sample_message(&msg);
+        assert_eq!(out.chars().count(), INGEST_ERROR_MESSAGE_MAX_CHARS + 1);
+        assert!(out.ends_with('…'));
+    }
+
+    /// Truncation counts characters, not bytes, so a multi-byte message can
+    /// never be split mid-codepoint into invalid UTF-8.
+    #[test]
+    fn truncation_never_splits_a_multibyte_character() {
+        let msg = "é".repeat(INGEST_ERROR_MESSAGE_MAX_CHARS + 10);
+        let out = truncate_sample_message(&msg);
+        assert_eq!(out.chars().count(), INGEST_ERROR_MESSAGE_MAX_CHARS + 1);
+        assert!(out.starts_with('é'));
+    }
+
+    #[test]
+    fn truncation_boundary_is_exact() {
+        let exact = "y".repeat(INGEST_ERROR_MESSAGE_MAX_CHARS);
+        assert_eq!(truncate_sample_message(&exact), exact, "no ellipsis at N");
+
+        let over = "y".repeat(INGEST_ERROR_MESSAGE_MAX_CHARS + 1);
+        assert!(truncate_sample_message(&over).ends_with('…'));
     }
 
     #[test]

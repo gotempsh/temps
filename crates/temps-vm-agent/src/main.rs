@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! In-guest agent for Firecracker sandboxes (ADR-029 §5).
 //!
 //! Runs as PID 1 inside the microVM: mounts the pseudo-filesystems, then

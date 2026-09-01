@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * A throwaway Go app that emits a distinctive, structured JSON log line to
  * stdout or stderr on demand over HTTP -- built for the logs scenario, which

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Build-time registry for the compatibility promise of user-facing features.
 //!
 //! Stable features intentionally render without a badge. Beta and

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Cross-signal "what changed" strip for a drilled-in metric.
 //
 // The correlation moat: Temps owns metrics, deploys, traces, and errors, so when

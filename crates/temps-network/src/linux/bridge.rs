@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Linux bridge management via rtnetlink.
 
 use crate::config::{NetworkConfig, NodeAlloc};
@@ -97,7 +100,7 @@ pub async fn remove(handle: &Handle, name: &str) -> crate::Result<()> {
 /// Look up a link's interface index by name. Returns `Ok(None)` when the
 /// link does not exist.
 pub async fn link_index_by_name(handle: &Handle, name: &str) -> crate::Result<Option<u32>> {
-    let mut links = handle.link().get().match_name(name.into()).execute();
+    let mut links = handle.link().get().match_name(name).execute();
     match links.try_next().await {
         Ok(Some(msg)) => Ok(Some(msg.header.index)),
         Ok(None) => Ok(None),

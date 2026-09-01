@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * `temps sandbox shell` — an interactive terminal in a sandbox, in your own
  * terminal.

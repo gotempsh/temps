@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! On-demand environment wake/sleep traits
 //!
 //! These traits avoid circular dependencies between temps-environments (handlers)

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Append-only audit log of on-demand TLS issuance attempts (ADR-018 §5).
 //!
 //! Every on-demand HTTP-01 issuance attempt — successful, failed, or skipped —

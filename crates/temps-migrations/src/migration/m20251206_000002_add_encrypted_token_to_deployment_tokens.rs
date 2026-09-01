@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to add encrypted_token column to deployment_tokens table
 //!
 //! This allows the platform to store the encrypted token value so it can be

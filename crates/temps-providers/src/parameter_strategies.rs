@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::externalsvc::{mariadb::MariaDbSizeProfile, ServiceResourceLimits};
 use serde_json::{json, Value as JsonValue};
 use std::collections::HashMap;
@@ -247,6 +250,34 @@ fn reject_internal_only_keys(
     Ok(())
 }
 
+fn reject_non_loopback_host(params: &HashMap<String, JsonValue>) -> Result<(), String> {
+    let Some(host) = params.get("host").and_then(JsonValue::as_str) else {
+        return Ok(());
+    };
+    if matches!(host, "localhost" | "127.0.0.1" | "::1" | "[::1]") {
+        return Ok(());
+    }
+    Err(format!(
+        "'host' must target the managed service on loopback, got '{host}'"
+    ))
+}
+
+fn reject_known_cross_engine_image(
+    params: &HashMap<String, JsonValue>,
+    incompatible_marker: &str,
+    expected_engine: &str,
+) -> Result<(), String> {
+    let Some(image) = params.get("docker_image").and_then(JsonValue::as_str) else {
+        return Ok(());
+    };
+    if image.to_ascii_lowercase().contains(incompatible_marker) {
+        return Err(format!(
+            "Docker image '{image}' is incompatible with {expected_engine}; choose an image that implements the {expected_engine} server command contract"
+        ));
+    }
+    Ok(())
+}
+
 /// Strategy for validating and managing parameters for a specific service type
 pub trait ParameterStrategy: Send + Sync {
     /// Validate parameters for service creation - ensures all required parameters are present
@@ -284,6 +315,7 @@ pub struct PostgresParameterStrategy;
 impl ParameterStrategy for PostgresParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for PostgreSQL".to_string());
         }
@@ -416,6 +448,7 @@ pub struct MariaDbParameterStrategy;
 impl ParameterStrategy for MariaDbParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
         validate_mariadb_credentials(params)?;
         mariadb_size_profile_from_params(params)?;
         validate_service_resource_limits(params)?;
@@ -587,6 +620,7 @@ pub struct RedisParameterStrategy;
 impl ParameterStrategy for RedisParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
         // Redis doesn't require parameters for creation
         Ok(())
     }
@@ -690,6 +724,8 @@ impl ParameterStrategy for S3ParameterStrategy {
             params,
             &["container_name", "metrics_ingest_key", "metrics_ingest_url"],
         )?;
+        reject_non_loopback_host(params)?;
+        reject_known_cross_engine_image(params, "minio/minio", "RustFS")?;
         Ok(())
     }
 
@@ -804,8 +840,8 @@ impl ParameterStrategy for S3ParameterStrategy {
             "properties": {
                 "backend": {
                     "type": "string",
-                    "description": "Managed S3-compatible backend to provision. RustFS is the default; Garage and MinIO are available backend selectors.",
-                    "enum": ["rustfs", "garage", "minio"],
+                    "description": "Managed S3-compatible backend to provision. RustFS is the default; Garage is reserved for external provider support.",
+                    "enum": ["rustfs", "garage"],
                     "default": "rustfs"
                 },
                 "access_key": {
@@ -859,6 +895,8 @@ pub struct MinioParameterStrategy;
 impl ParameterStrategy for MinioParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
+        reject_known_cross_engine_image(params, "rustfs", "MinIO")?;
         // MinIO doesn't require parameters for creation
         Ok(())
     }
@@ -977,6 +1015,8 @@ impl ParameterStrategy for RustfsParameterStrategy {
             params,
             &["container_name", "metrics_ingest_key", "metrics_ingest_url"],
         )?;
+        reject_non_loopback_host(params)?;
+        reject_known_cross_engine_image(params, "minio/minio", "RustFS")?;
         Ok(())
     }
 
@@ -1140,6 +1180,7 @@ pub struct MongodbParameterStrategy;
 impl ParameterStrategy for MongodbParameterStrategy {
     fn validate_for_creation(&self, params: &HashMap<String, JsonValue>) -> Result<(), String> {
         reject_internal_only_keys(params, &["container_name"])?;
+        reject_non_loopback_host(params)?;
         if !params.contains_key("database") || is_empty_value(params.get("database")) {
             return Err("'database' is required for MongoDB".to_string());
         }
@@ -1772,6 +1813,49 @@ mod tests {
             err.contains("container_name"),
             "error should mention 'container_name', got: {err}"
         );
+    }
+
+    #[test]
+    fn storage_engines_reject_known_cross_engine_images() {
+        let rustfs_image = HashMap::from([(
+            "docker_image".to_string(),
+            JsonValue::String("rustfs/rustfs:1.0.0-alpha.98".to_string()),
+        )]);
+        let minio_image = HashMap::from([(
+            "docker_image".to_string(),
+            JsonValue::String("minio/minio:latest".to_string()),
+        )]);
+
+        assert!(MinioParameterStrategy
+            .validate_for_creation(&rustfs_image)
+            .is_err());
+        assert!(RustfsParameterStrategy
+            .validate_for_creation(&minio_image)
+            .is_err());
+        assert!(S3ParameterStrategy
+            .validate_for_creation(&minio_image)
+            .is_err());
+        assert!(MinioParameterStrategy
+            .validate_for_creation(&minio_image)
+            .is_ok());
+        assert!(RustfsParameterStrategy
+            .validate_for_creation(&rustfs_image)
+            .is_ok());
+    }
+
+    #[test]
+    fn managed_creation_accepts_loopback_host_and_rejects_remote_targets() {
+        for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+            let parameters =
+                HashMap::from([("host".to_string(), JsonValue::String(host.to_string()))]);
+            assert!(reject_non_loopback_host(&parameters).is_ok());
+        }
+
+        let parameters = HashMap::from([(
+            "host".to_string(),
+            JsonValue::String("169.254.169.254".to_string()),
+        )]);
+        assert!(reject_non_loopback_host(&parameters).is_err());
     }
 
     #[test]

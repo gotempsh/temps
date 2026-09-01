@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Query value-types for the analytics read surface.
 //!
 //! Each `*Spec` struct captures the parameter space of one trait method on

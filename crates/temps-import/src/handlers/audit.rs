@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Audit events for import operations.
 //!
 //! `create_plan` only reads from the source platform, but `execute_import`

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use temps_core::utils::{generate_id, generate_slug, mask_sensitive};
 
 #[test]

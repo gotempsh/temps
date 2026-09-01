@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Adds short-lived step-up authorization to authenticated sessions.
 //!
 //! The nullable timestamp is intentionally session-scoped: verifying one

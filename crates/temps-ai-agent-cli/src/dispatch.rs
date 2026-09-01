@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Provider-neutral runtime registry. It selects an adapter, then delegates the
 //! complete normalized [`AiService`] contract without owning chat, tool,
 //! persistence, permission, or transport behavior.

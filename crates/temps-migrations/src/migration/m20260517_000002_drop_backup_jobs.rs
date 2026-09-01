@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Drop `backup_jobs` + `backup_job_steps` tables and their dependent FKs.
 //!
 //! The queue-based runner that owned these tables was deleted in the

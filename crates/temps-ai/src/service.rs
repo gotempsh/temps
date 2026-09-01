@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The object-safe [`AiService`] seam and its request/response types.
 
 use async_trait::async_trait;

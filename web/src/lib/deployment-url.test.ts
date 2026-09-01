@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { describe, expect, test } from 'bun:test'
 import type { DeploymentResponse } from '@/api/client'
 import { resolvePrimaryUrl, resolveStableUrl } from './deployment-url'
@@ -148,6 +151,7 @@ describe('resolvePrimaryUrl', () => {
     `${String.fromCharCode(9)}//evil.com`,
     `${String.fromCharCode(10)}//evil.com`,
     `${String.fromCharCode(13)}//evil.com`,
+    `${String.fromCharCode(0)}//evil.com`,
     `${String.fromCharCode(9)}/\\evil.com`,
     ` //evil.com`,
   ]

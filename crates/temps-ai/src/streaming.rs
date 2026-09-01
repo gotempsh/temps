@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Multi-turn, streaming chat types for the AI foundation (ADR-023).
 //!
 //! Where [`crate::AiService::complete`] is a single request→response,

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service for per-project saved metric dashboards.
 //!
 //! Dashboards are Postgres config/metadata (the `metric_dashboards` table), so

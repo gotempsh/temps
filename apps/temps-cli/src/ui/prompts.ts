@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   input,
   password,
@@ -208,6 +211,13 @@ export interface SearchOption<T = string> {
   name: string
   value: T
   description?: string
+  /**
+   * Stays in the filtered results no matter what the user has typed --
+   * for a "type your own" escape hatch (or similar) at the end of a
+   * searchable list, which would otherwise disappear as soon as it no
+   * longer matches the search term.
+   */
+  alwaysShow?: boolean
 }
 
 export interface SearchPromptOptions<T = string> {
@@ -225,13 +235,17 @@ export async function promptSearch<T = string>(options: SearchPromptOptions<T>):
     pageSize: options.pageSize ?? 10,
     source: async (term) => {
       if (!term) {
-        // Show first items when no search term
-        return options.choices.slice(0, options.pageSize ?? 10)
+        // Show first items when no search term, plus any pinned choices
+        // further down the list that the initial page would otherwise cut off.
+        const head = options.choices.slice(0, options.pageSize ?? 10)
+        const pinned = options.choices.filter((c) => c.alwaysShow && !head.includes(c))
+        return [...head, ...pinned]
       }
 
       const searchTerm = term.toLowerCase()
       return options.choices.filter(
         (choice) =>
+          choice.alwaysShow ||
           choice.name.toLowerCase().includes(searchTerm) ||
           (choice.description?.toLowerCase() || '').includes(searchTerm)
       )

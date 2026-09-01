@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps Presets - Stateless project detection and Dockerfile generation
 //!
 //! This crate provides utilities for:
@@ -16,6 +19,7 @@ pub use mod_rs::docker_compose::{
     list_compose_services, list_compose_services_with_override, render_effective_compose_preview,
     ComposeParseError, ComposeServicePreview, EffectiveComposePreview,
 };
+pub use mod_rs::dockerfile_expose::detect_primary_exposed_port;
 pub use mod_rs::env_example::{
     detect_env_example_files, detect_env_example_files_in_directory, parse_env_example,
     EnvExampleVariable, ENV_EXAMPLE_FILE_NAMES,
@@ -109,6 +113,36 @@ mod tests {
 
         assert!(preset.is_some());
         assert_eq!(preset.unwrap().slug(), "rsbuild");
+    }
+
+    #[test]
+    fn test_detect_static_site_preset() {
+        // A plain HTML/CSS/JS repo with no build system should fall back to
+        // the static-file preset instead of failing to auto-detect.
+        let files = vec![
+            "index.html".to_string(),
+            "README.md".to_string(),
+            ".gitignore".to_string(),
+        ];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "nixpacks-static");
+    }
+
+    #[test]
+    fn test_static_site_is_not_detected_when_a_framework_matches() {
+        // index.html alone must never outrank a real framework/build-system
+        // match — it is the last-resort fallback, not an additional option.
+        let files = vec![
+            "vite.config.ts".to_string(),
+            "package.json".to_string(),
+            "index.html".to_string(),
+        ];
+        let preset = detect_preset_from_files(&files);
+
+        assert!(preset.is_some());
+        assert_eq!(preset.unwrap().slug(), "vite");
     }
 
     #[test]
@@ -339,6 +373,25 @@ mod tests {
 
         assert_eq!(presets.len(), 1);
         assert_eq!(presets[0].slug, "nixpacks");
+    }
+
+    #[test]
+    fn test_detect_presets_from_file_tree_static_site() {
+        // Same shape as a plain HTML/CSS/JS repo connected via a git URL:
+        // no framework manifest, just files to serve. The repository-connect
+        // UI (`calculate_repository_preset_live`) calls this function, so an
+        // empty result here is what previously made static repos look
+        // unsupported when connecting via git.
+        let files = vec![
+            "index.html".to_string(),
+            "README.md".to_string(),
+            ".gitignore".to_string(),
+        ];
+        let presets = detect_presets_from_file_tree(&files);
+
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].path, "./");
+        assert_eq!(presets[0].slug, "nixpacks-static");
     }
 
     #[test]

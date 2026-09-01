@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -62,8 +65,8 @@ impl TempsPlugin for BackupPlugin {
             let db = context.require_service::<sea_orm::DatabaseConnection>();
             let external_service_manager =
                 context.require_service::<temps_providers::ExternalServiceManager>();
-            let notification_service =
-                context.require_service::<temps_notifications::NotificationService>();
+            let alarm_service =
+                context.require_service::<temps_monitoring::alarm_service::AlarmService>();
             let config_service = context.require_service::<temps_config::ConfigService>();
             let encryption_service = context.require_service::<temps_core::EncryptionService>();
 
@@ -71,7 +74,7 @@ impl TempsPlugin for BackupPlugin {
             let backup_service = Arc::new(BackupService::new(
                 db.clone(),
                 external_service_manager.clone(),
-                notification_service.clone(),
+                alarm_service.clone(),
                 config_service.clone(),
                 encryption_service.clone(),
             ));
@@ -114,13 +117,9 @@ impl TempsPlugin for BackupPlugin {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(4);
 
-            // Cast Arc<temps_notifications::NotificationService> to
-            // Arc<dyn temps_core::notifications::NotificationService> so the
-            // adapter accepts it.
-            let core_notif_svc: Arc<dyn temps_core::notifications::NotificationService> =
-                notification_service.clone();
-            let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> =
-                Arc::new(BackupNotificationAdapter::new(core_notif_svc, db.clone()));
+            let executor_notifier: Arc<dyn temps_backup_core::BackupFailureNotifier> = Arc::new(
+                BackupNotificationAdapter::new(alarm_service.clone(), db.clone()),
+            );
 
             // Shared workspace JobQueue. Producers (BackupService) publish
             // Job::BackupRequested here; the BackupJobProcessor subscribes
@@ -214,6 +213,9 @@ impl TempsPlugin for BackupPlugin {
             // orchestrators it spawns can emit PgMajorUpgradeCompleted.
             pg_upgrade_service.set_telemetry(Arc::clone(&telemetry));
 
+            let sensitive_action_authorizer =
+                context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
             let backup_app_state_inner = create_backup_app_state(
                 backup_service,
                 restore_service,
@@ -223,6 +225,7 @@ impl TempsPlugin for BackupPlugin {
                 Arc::clone(&executor),
                 telemetry,
                 context.get_service::<dyn temps_core::ProjectAccessChecker>(),
+                sensitive_action_authorizer,
             );
 
             context.register_service(backup_app_state_inner);
@@ -403,6 +406,21 @@ impl TempsPlugin for BackupPlugin {
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
         let backup_app_state = context.require_service::<BackupAppState>();
+
+        // Rebind the authorizer here rather than trust the one captured in
+        // `register_services`: an EE/custom `SensitiveActionAuthorizer` may
+        // be registered by a plugin later in registration order, and
+        // last-write-wins service registration means the earliest-registered
+        // instance otherwise wins silently. `configure_routes` runs only
+        // after every plugin's `register_services` has completed, so
+        // re-resolving here always sees the final policy — same pattern as
+        // AuthPlugin's `with_sensitive_action_authorizer`.
+        let backup_app_state = Arc::new(BackupAppState {
+            sensitive_action_authorizer: context
+                .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+            ..(*backup_app_state).clone()
+        });
+
         let routes = handlers::configure_routes()
             .merge(handlers::pg_upgrade_handler::configure_routes())
             .merge(handlers::restore_handler::configure_routes())

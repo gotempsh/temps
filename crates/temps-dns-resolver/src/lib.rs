@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-node DNS resolver for the internal `*.temps.local` zone (ADR-011).
 //!
 //! Embedded in `temps-agent`. Listens on the bridge gateway IP (so every
@@ -29,9 +32,9 @@ pub mod zone_store;
 
 pub use config::ResolverConfig;
 pub use error::ResolverError;
-pub use handle::ResolverHandle;
+pub use handle::{ResolverHandle, ResolverStatus};
 pub use record::{OwnerKind, RecordKind, ZoneRecord};
-pub use sync_client::SyncClient;
+pub use sync_client::{SyncClient, SyncStatus};
 pub use zone_store::ZoneStore;
 
 pub type Result<T> = std::result::Result<T, ResolverError>;

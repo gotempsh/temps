@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Mark Deployment Complete Job
 //!
 //! A synthetic job that marks the deployment as complete and updates the environment.
@@ -799,9 +802,36 @@ impl MarkDeploymentCompleteJob {
         // while an active worker can still return a stale route/502 violates
         // the user-visible readiness contract.
         const WORKER_APPLY_TIMEOUT_SECS: u64 = 10;
+        // Only gate on DNS-generation ACKs when cluster DNS is actually
+        // enabled. When it's off (the default — see network_sync.rs's
+        // ADR-024 comment), no node ever spawns a per-node resolver or its
+        // sync client, so no node EVER writes a `node_dns_state` row. The
+        // gate below requires exactly one row per active node, so without
+        // this check it would wait for an ACK that can structurally never
+        // arrive and revert every single deployment after the full 10s,
+        // regardless of whether routing actually propagated fine.
+        let cluster_dns_enabled = match self.config_service.as_ref() {
+            Some(config_service) => config_service
+                .get_settings()
+                .await
+                .map(|settings| settings.cluster_dns.enabled)
+                .unwrap_or(false),
+            None => false,
+        };
+        if !cluster_dns_enabled {
+            self.log(
+                "Cluster DNS is disabled — skipping the DNS-generation propagation check \
+                 (only route propagation is verified). Enable it under Settings > Nodes if \
+                 deployed containers need to resolve *.temps.local hostnames."
+                    .to_string(),
+            )
+            .await
+            .ok();
+        }
         if let Err(reason) = Self::wait_for_worker_apply(
             self.db.as_ref(),
             std::time::Duration::from_secs(WORKER_APPLY_TIMEOUT_SECS),
+            cluster_dns_enabled,
         )
         .await
         {
@@ -1301,6 +1331,7 @@ WHERE project.id = $2
     async fn wait_for_worker_apply(
         db: &DbConnection,
         timeout: std::time::Duration,
+        cluster_dns_enabled: bool,
     ) -> Result<(), String> {
         use sea_orm::{FromQueryResult, Statement};
         use temps_entities::{node_dns_state, node_route_state, nodes};
@@ -1326,7 +1357,11 @@ WHERE project.id = $2
             .unwrap_or(0)
         };
         let route_gen: i64 = load_singleton("route_generation").await;
-        let dns_gen: i64 = load_singleton("dns_generation").await;
+        let dns_gen: i64 = if cluster_dns_enabled {
+            load_singleton("dns_generation").await
+        } else {
+            0
+        };
 
         let active_nodes: Vec<i32> = nodes::Entity::find()
             .filter(nodes::Column::Status.eq("active"))
@@ -1346,36 +1381,70 @@ WHERE project.id = $2
 
         loop {
             interval.tick().await;
-            if tokio::time::Instant::now() >= deadline {
-                return Err(format!(
-                    "timed out waiting for {} node(s) to ACK \
-                     (target route_gen={}, dns_gen={})",
-                    active_nodes.len(),
-                    route_gen,
-                    dns_gen
-                ));
-            }
 
             let route_states = node_route_state::Entity::find()
                 .filter(node_route_state::Column::NodeId.is_in(active_nodes.clone()))
                 .all(db)
                 .await
                 .map_err(|e| format!("reading node_route_state: {e}"))?;
-            let dns_states = node_dns_state::Entity::find()
-                .filter(node_dns_state::Column::NodeId.is_in(active_nodes.clone()))
-                .all(db)
-                .await
-                .map_err(|e| format!("reading node_dns_state: {e}"))?;
 
             let route_ok = route_states.len() == active_nodes.len()
                 && route_states
                     .iter()
                     .all(|s| s.applied_generation >= route_gen);
-            let dns_ok = dns_states.len() == active_nodes.len()
-                && dns_states.iter().all(|s| s.applied_generation >= dns_gen);
+            // No node runs a DNS resolver/sync client when cluster DNS is
+            // disabled, so no node ever ACKs a DNS generation — nothing to
+            // wait for.
+            let dns_states = if cluster_dns_enabled {
+                node_dns_state::Entity::find()
+                    .filter(node_dns_state::Column::NodeId.is_in(active_nodes.clone()))
+                    .all(db)
+                    .await
+                    .map_err(|e| format!("reading node_dns_state: {e}"))?
+            } else {
+                Vec::new()
+            };
+            let dns_ok = !cluster_dns_enabled
+                || (dns_states.len() == active_nodes.len()
+                    && dns_states.iter().all(|s| s.applied_generation >= dns_gen));
 
             if route_ok && dns_ok {
                 return Ok(());
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                let mut reason = format!(
+                    "timed out waiting for {} node(s) to ACK (target route_gen={route_gen}, dns_gen={dns_gen})",
+                    active_nodes.len(),
+                );
+                if !route_ok {
+                    let lagging = active_nodes.len() - route_states.len()
+                        + route_states
+                            .iter()
+                            .filter(|s| s.applied_generation < route_gen)
+                            .count();
+                    reason.push_str(&format!(" — {lagging} node(s) behind on route_gen"));
+                }
+                if cluster_dns_enabled && !dns_ok {
+                    let never_acked = active_nodes.len() - dns_states.len();
+                    if never_acked > 0 {
+                        reason.push_str(&format!(
+                            " — {never_acked} active node(s) have never ACKed a DNS generation \
+                             at all. Cluster DNS was likely enabled after these nodes' agents \
+                             last started: the per-node resolver is only spawned once, during \
+                             initial overlay bootstrap, so an already-running agent won't pick up \
+                             a newly-enabled cluster_dns.enabled until its `temps agent` process \
+                             is restarted."
+                        ));
+                    } else {
+                        let lagging = dns_states
+                            .iter()
+                            .filter(|s| s.applied_generation < dns_gen)
+                            .count();
+                        reason.push_str(&format!(" — {lagging} node(s) behind on dns_gen"));
+                    }
+                }
+                return Err(reason);
             }
         }
     }

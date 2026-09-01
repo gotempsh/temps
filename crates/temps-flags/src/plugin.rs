@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Feature-flag plugin registration.
 //!
 //! No containers, no background tasks, no external service: flags are rows in

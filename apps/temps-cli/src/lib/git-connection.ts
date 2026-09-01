@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Shared git connection utilities for project creation and setup wizard.
  * Extracted from commands/projects/create.ts to avoid duplication.

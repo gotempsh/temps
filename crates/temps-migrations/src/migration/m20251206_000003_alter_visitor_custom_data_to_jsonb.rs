@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to alter visitor custom_data column from TEXT to JSONB
 //!
 //! This enables proper JSON querying and indexing capabilities for visitor custom data.

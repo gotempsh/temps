@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # `add` makes the following delete valid on both first install and refresh.
 # nft applies the complete batch atomically at COMMIT.
 add table inet temps_metadata

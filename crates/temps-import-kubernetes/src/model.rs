@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Minimal Kubernetes API object model
 //!
 //! Hand-rolled serde structs for exactly the fields the importer reads —

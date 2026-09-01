@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { client } from '../api/client.gen.js'
 import { config, credentials } from '../config/store.js'
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   adminListNodesOptions,
   createServiceMutation,
@@ -7,6 +10,7 @@ import {
 } from '@/api/client/@tanstack/react-query.gen'
 import {
   ClusterMemberRequest,
+  CreatableServiceTypeRoute,
   NodeInfoResponse,
   ServiceTypeRoute,
 } from '@/api/client/types.gen'
@@ -36,6 +40,16 @@ const generateId = customAlphabet('0123456789abcdefghijklmnopqrstuvwxyz', 4)
 
 /** Service types that support HA cluster topology */
 const CLUSTER_SERVICE_TYPES: ServiceTypeRoute[] = ['postgres']
+const CREATABLE_SERVICE_TYPES: CreatableServiceTypeRoute[] = [
+  'mariadb',
+  'mongodb',
+  'postgres',
+  'redis',
+  's3',
+  'kv',
+  'blob',
+  'rustfs',
+]
 
 /** Cluster roles the operator chooses at provisioning time.
  *
@@ -258,7 +272,12 @@ export function CreateService() {
   usePageTitle('Create Service')
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
-  const serviceType = searchParams.get('type') as ServiceTypeRoute | null
+  const requestedServiceType = searchParams.get('type')
+  const serviceType = CREATABLE_SERVICE_TYPES.includes(
+    requestedServiceType as CreatableServiceTypeRoute
+  )
+    ? (requestedServiceType as CreatableServiceTypeRoute)
+    : null
   const { setBreadcrumbs } = useBreadcrumbs()
 
   const defaultName = useMemo(
@@ -276,21 +295,24 @@ export function CreateService() {
   const [topology, setTopology] = useState<'standalone' | 'cluster'>(
     'standalone'
   )
+  const [standaloneNodeId, setStandaloneNodeId] =
+    useState<string>('control-plane')
   const [clusterMembers, setClusterMembers] = useState<ClusterMemberRequest[]>(
     []
   )
 
   const preset = useServiceTypePreset(serviceType)
 
-  // Fetch available nodes to determine if cluster topology can be offered
+  // Standalone services can be placed on any active worker. PostgreSQL also
+  // uses this list to configure its optional HA topology.
   const { data: nodesResponse } = useQuery({
     ...adminListNodesOptions(),
-    enabled: supportsCluster,
+    enabled: !!serviceType,
   })
   const nodes = useMemo(
     () =>
       (nodesResponse?.nodes ?? []).filter(
-        (n: NodeInfoResponse) => n.status === 'active'
+        (n: NodeInfoResponse) => n.status === 'active' && n.role === 'worker'
       ),
     [nodesResponse]
   )
@@ -371,6 +393,10 @@ export function CreateService() {
       toast.error('Service name is required')
       return
     }
+    if (!serviceType) {
+      toast.error('Select a supported service type')
+      return
+    }
 
     // Keep numbers as numbers, convert null to empty strings
     const cleanedParameters: Record<string, any> = {}
@@ -392,9 +418,15 @@ export function CreateService() {
 
     await createServiceMut.mutateAsync({
       body: {
-        service_type: serviceType as ServiceTypeRoute,
+        service_type: serviceType,
         name: serviceName,
         parameters: cleanedParameters,
+        ...(topology === 'standalone' && {
+          node_id:
+            standaloneNodeId === 'control-plane'
+              ? null
+              : Number(standaloneNodeId),
+        }),
         ...(topology === 'cluster' && {
           topology: 'cluster',
           members: clusterMembers,
@@ -609,6 +641,42 @@ export function CreateService() {
                 />
               </>
             )}
+          </div>
+        )}
+
+        {topology === 'standalone' && (
+          <div className="space-y-2">
+            <Label>Deployment node</Label>
+            <p className="text-sm text-muted-foreground">
+              Choose the machine whose Docker daemon will run this service.
+            </p>
+            <Select
+              value={standaloneNodeId}
+              onValueChange={setStandaloneNodeId}
+            >
+              <SelectTrigger>
+                <SelectValue placeholder="Select node..." />
+              </SelectTrigger>
+              <SelectContent>
+                <SelectItem value="control-plane">
+                  <div className="flex items-center gap-2">
+                    <Server className="h-3 w-3" />
+                    Control Plane
+                  </div>
+                </SelectItem>
+                {nodes.map((node) => (
+                  <SelectItem key={node.id} value={String(node.id)}>
+                    <div className="flex items-center gap-2">
+                      <Server className="h-3 w-3" />
+                      {node.name}
+                      <span className="text-muted-foreground text-xs">
+                        ({node.private_address})
+                      </span>
+                    </div>
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
           </div>
         )}
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service layer for PostgreSQL major-version upgrades.
 //!
 //! Entry point is `start_major_upgrade`, which validates the request,
@@ -11,7 +14,8 @@ use std::sync::{Arc, OnceLock};
 
 use bollard::Docker;
 use sea_orm::{
-    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter,
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DatabaseBackend, DatabaseConnection,
+    EntityTrait, FromQueryResult, QueryFilter, Statement, Value,
 };
 use temps_core::telemetry::{NoopTelemetryReporter, TelemetryReporter};
 use temps_entities::{external_services, postgres_major_upgrades};
@@ -213,6 +217,42 @@ impl PostgresUpgradeService {
         Ok(inserted)
     }
 
+    /// List the newest upgrade records for one external service. Query
+    /// ownership belongs here rather than in the HTTP layer.
+    pub async fn list_upgrades_for_service(
+        &self,
+        service_id: i32,
+    ) -> Result<Vec<postgres_major_upgrades::Model>, PostgresUpgradeError> {
+        postgres_major_upgrades::Model::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT * FROM postgres_major_upgrades WHERE service_id = $1 ORDER BY created_at DESC LIMIT 50",
+            vec![Value::Int(Some(service_id))],
+        ))
+            .all(self.db.as_ref())
+            .await
+            .map_err(PostgresUpgradeError::Database)
+    }
+
+    /// Load an upgrade and verify it belongs to the requested service. A
+    /// mismatch is deliberately indistinguishable from a missing row so an
+    /// upgrade id cannot disclose another service's state.
+    pub async fn get_upgrade_for_service(
+        &self,
+        service_id: i32,
+        upgrade_id: i32,
+    ) -> Result<postgres_major_upgrades::Model, PostgresUpgradeError> {
+        let row = postgres_major_upgrades::Entity::find_by_id(upgrade_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(PostgresUpgradeError::NotFound { upgrade_id })?;
+
+        if row.service_id != service_id {
+            return Err(PostgresUpgradeError::NotFound { upgrade_id });
+        }
+
+        Ok(row)
+    }
+
     /// Read the accumulated log content for an upgrade.
     ///
     /// The orchestrator writes via `LogService::log_info/warning/error` which
@@ -222,8 +262,42 @@ impl PostgresUpgradeService {
     /// Render each JSONL entry as a timestamped text line for display.
     /// Missing files surface as an empty string so the UI doesn't have to
     /// special-case a 404.
-    pub async fn read_log(&self, log_id: &str) -> Result<String, std::io::Error> {
-        let entries = self.log_service.get_structured_logs(log_id).await?;
+    pub async fn read_log(
+        &self,
+        upgrade_id: i32,
+        log_id: &str,
+    ) -> Result<String, PostgresUpgradeError> {
+        match tokio::fs::metadata(self.log_service.base_path()).await {
+            Ok(metadata) if !metadata.is_dir() => {
+                return Err(PostgresUpgradeError::Log {
+                    upgrade_id,
+                    reason: format!(
+                        "log base path '{}' is not a directory",
+                        self.log_service.base_path().display()
+                    ),
+                });
+            }
+            Ok(_) => {}
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                // An instance with no log directory yet has no entries.
+                return Ok(String::new());
+            }
+            Err(source) => {
+                return Err(PostgresUpgradeError::Log {
+                    upgrade_id,
+                    reason: source.to_string(),
+                });
+            }
+        }
+
+        let entries = self
+            .log_service
+            .get_structured_logs(log_id)
+            .await
+            .map_err(|source| PostgresUpgradeError::Log {
+                upgrade_id,
+                reason: source.to_string(),
+            })?;
         let mut out = String::new();
         for entry in entries {
             let level = match entry.level {
@@ -491,8 +565,11 @@ impl PostgresUpgradeService {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::externalsvc::postgres_upgrade::PreUpgradeBackupProvider;
+    use crate::externalsvc::postgres_upgrade::{
+        PostgresConnection, PostgresContainerLifecycle, PreUpgradeBackupProvider,
+    };
     use async_trait::async_trait;
+    use sea_orm::{DatabaseBackend, MockDatabase};
 
     struct StubProvider;
 
@@ -510,6 +587,244 @@ mod tests {
         ) -> Result<i32, String> {
             Ok(42)
         }
+    }
+
+    struct StubLifecycle;
+
+    #[async_trait]
+    impl PostgresContainerLifecycle for StubLifecycle {
+        async fn container_name(&self, service_id: i32) -> Result<String, String> {
+            Ok(format!("postgres-{service_id}"))
+        }
+
+        async fn connection_params(&self, _service_id: i32) -> Result<PostgresConnection, String> {
+            Ok(PostgresConnection {
+                username: "postgres".to_string(),
+                password: "secret".to_string(),
+                database: "postgres".to_string(),
+                port: "5432".to_string(),
+            })
+        }
+
+        async fn docker_image(&self, _service_id: i32) -> Result<String, String> {
+            Ok("gotempsh/postgres-walg:16-bookworm".to_string())
+        }
+
+        async fn stop_and_remove(&self, _service_id: i32) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn create_and_start(&self, _service_id: i32, _image: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        async fn set_docker_image(&self, _service_id: i32, _image: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    fn build_read_service(
+        db: Arc<DatabaseConnection>,
+        log_base_path: std::path::PathBuf,
+    ) -> PostgresUpgradeService {
+        PostgresUpgradeService::new(
+            db,
+            Arc::new(
+                Docker::connect_with_local_defaults()
+                    .expect("construct Docker client without contacting daemon"),
+            ),
+            Arc::new(StubProvider),
+            Arc::new(StubLifecycle),
+            Arc::new(LogService::new(log_base_path)),
+        )
+    }
+
+    fn sample_upgrade(
+        id: i32,
+        service_id: i32,
+        created_at: chrono::DateTime<chrono::Utc>,
+    ) -> postgres_major_upgrades::Model {
+        postgres_major_upgrades::Model {
+            id,
+            service_id,
+            from_version: "16".to_string(),
+            to_version: "17".to_string(),
+            from_image: "gotempsh/postgres-walg:16-bookworm".to_string(),
+            to_image: "gotempsh/postgres-walg:17-bookworm".to_string(),
+            status: status::COMPLETED.to_string(),
+            phase: phase::COMPLETED.to_string(),
+            pre_upgrade_backup_id: Some(1),
+            log_id: format!("upgrade-{id}"),
+            rollback_volume_name: None,
+            rollback_volume_expires_at: None,
+            error_message: None,
+            attempt: 1,
+            started_at: Some(created_at),
+            finished_at: Some(created_at),
+            created_by: 1,
+            created_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_list_upgrades_for_service_orders_newest_and_scopes_query() {
+        // Arrange.
+        let now = chrono::Utc::now();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    sample_upgrade(2, 7, now),
+                    sample_upgrade(1, 7, now - chrono::Duration::hours(1)),
+                ]])
+                .into_connection(),
+        );
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = build_read_service(db.clone(), logs.path().to_path_buf());
+
+        // Act.
+        let upgrades = service
+            .list_upgrades_for_service(7)
+            .await
+            .expect("list upgrades");
+
+        // Assert.
+        assert_eq!(
+            upgrades.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![2, 1]
+        );
+        assert!(upgrades.iter().all(|row| row.service_id == 7));
+        drop(service);
+        let statements = Arc::try_unwrap(db)
+            .expect("service dropped, leaving one DB reference")
+            .into_transaction_log();
+        let sql = format!("{statements:?}");
+        assert!(sql.contains("service_id") && sql.contains("ORDER BY"));
+        assert!(sql.contains("created_at") && sql.contains("DESC"));
+        assert_eq!(
+            statements.len(),
+            1,
+            "list must remain a single scoped query"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_list_upgrades_for_service_database_error_is_typed() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom("list failed".to_string())])
+                .into_connection(),
+        );
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = build_read_service(db, logs.path().to_path_buf());
+
+        let error = service
+            .list_upgrades_for_service(7)
+            .await
+            .expect_err("DB failure must remain typed");
+
+        assert!(matches!(error, PostgresUpgradeError::Database(_)));
+        assert!(error.to_string().contains("list failed"));
+    }
+
+    #[tokio::test]
+    async fn test_get_upgrade_for_service_success() {
+        let row = sample_upgrade(11, 7, chrono::Utc::now());
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![row.clone()]])
+                .into_connection(),
+        );
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = build_read_service(db, logs.path().to_path_buf());
+
+        let found = service
+            .get_upgrade_for_service(7, 11)
+            .await
+            .expect("matching service owns upgrade");
+
+        assert_eq!(found, row);
+    }
+
+    #[tokio::test]
+    async fn test_get_upgrade_for_service_missing_returns_not_found() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<postgres_major_upgrades::Model>::new()])
+                .into_connection(),
+        );
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = build_read_service(db, logs.path().to_path_buf());
+
+        let error = service
+            .get_upgrade_for_service(7, 404)
+            .await
+            .expect_err("missing upgrade must be not found");
+
+        assert!(matches!(
+            error,
+            PostgresUpgradeError::NotFound { upgrade_id: 404 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_upgrade_for_service_cross_service_is_not_found() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![sample_upgrade(11, 99, chrono::Utc::now())]])
+                .into_connection(),
+        );
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = build_read_service(db, logs.path().to_path_buf());
+
+        let error = service
+            .get_upgrade_for_service(7, 11)
+            .await
+            .expect_err("foreign service upgrade must be indistinguishable from missing");
+
+        assert!(matches!(
+            error,
+            PostgresUpgradeError::NotFound { upgrade_id: 11 }
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_get_upgrade_for_service_database_error_is_typed() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom("get failed".to_string())])
+                .into_connection(),
+        );
+        let logs = tempfile::tempdir().expect("create log tempdir");
+        let service = build_read_service(db, logs.path().to_path_buf());
+
+        let error = service
+            .get_upgrade_for_service(7, 11)
+            .await
+            .expect_err("DB failure must remain typed");
+
+        assert!(matches!(error, PostgresUpgradeError::Database(_)));
+        assert!(error.to_string().contains("get failed"));
+    }
+
+    #[tokio::test]
+    async fn test_read_log_io_failure_is_typed() {
+        // Arrange: use a regular file as the log base directory, forcing the
+        // structured log reader to hit ENOTDIR without relying on permissions.
+        let invalid_base = tempfile::NamedTempFile::new().expect("create invalid log base");
+        let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
+        let service = build_read_service(db, invalid_base.path().to_path_buf());
+
+        // Act.
+        let error = service
+            .read_log(11, "upgrade-11")
+            .await
+            .expect_err("log IO failure must remain typed");
+
+        // Assert.
+        assert!(matches!(
+            error,
+            PostgresUpgradeError::Log { upgrade_id: 11, .. }
+        ));
     }
 
     #[test]

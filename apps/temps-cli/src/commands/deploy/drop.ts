@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { existsSync, statSync } from 'node:fs'
 import { lstat, mkdtemp, readFile, readdir, rm } from 'node:fs/promises'
 import { basename, join, resolve } from 'node:path'

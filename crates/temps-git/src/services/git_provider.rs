@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::DatabaseConnection;
 use serde::{Deserialize, Serialize};
@@ -611,6 +614,21 @@ pub trait GitProviderService: Send + Sync {
         path: &str,
         reference: Option<&str>,
     ) -> Result<Vec<RepoDirEntry>, GitProviderError>;
+
+    /// List every file in a repository recursively at `reference`.
+    ///
+    /// Providers with a recursive tree API should override this so callers do
+    /// not need to reconstruct provider URLs or authentication headers. That
+    /// distinction matters for self-hosted instances and PAT-specific headers.
+    async fn list_repository_files(
+        &self,
+        _access_token: &str,
+        _owner: &str,
+        _repo: &str,
+        _reference: &str,
+    ) -> Result<Vec<String>, GitProviderError> {
+        Err(GitProviderError::NotImplemented)
+    }
 
     /// Get latest commit for a branch
     async fn get_latest_commit(

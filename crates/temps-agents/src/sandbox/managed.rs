@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Seam that lets agent runs create their sandboxes through the standalone
 //! sandbox service (`temps-sandbox`) instead of the raw [`SandboxProvider`].
 //!

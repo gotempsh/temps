@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::types::AppState;
 use crate::services::service::{
     GroupBy, GroupedPageMetric, GroupedPageMetricsResponse, MetricsOverTimeResponse,
@@ -15,7 +18,8 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use temps_auth::{AuthContext, Permission, RequireAuth};
+use temps_auth::{project_access_guard, AuthContext, Permission, RequireAuth};
+use temps_core::problemdetails::Problem;
 use temps_core::DateTime;
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -25,10 +29,14 @@ use utoipa::{OpenApi, ToSchema};
 /// These handlers predate the `Result<impl IntoResponse, Problem>` convention
 /// used elsewhere and return `(StatusCode, Json<ErrorResponse>)` instead, so
 /// they can't use the `permission_guard!`/`project_scope_guard!` macros
-/// directly (those return `Problem`). This mirrors the same two checks.
-fn require_analytics_read(
+/// directly (those return `Problem`). This mirrors the same two checks, plus
+/// the team-membership project access check via `project_access_guard!`
+/// (bridged to `Problem` internally by `require_project_access` and then
+/// converted back to this crate's `ErrorResponse` shape).
+async fn require_analytics_read(
     auth: &AuthContext,
     project_id: i32,
+    project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
 ) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
     if !auth.has_permission(&Permission::AnalyticsRead) {
         return Err((
@@ -51,7 +59,42 @@ fn require_analytics_read(
             }),
         ));
     }
+    require_project_access(auth, project_id, project_access_checker)
+        .await
+        .map_err(problem_to_error_response)?;
     Ok(())
+}
+
+/// Confines a human session to the projects/teams they belong to. No-op when
+/// no `ProjectAccessChecker` is registered (plain OSS); enforced when EE
+/// Teams installs one. Isolated in its own `async fn` returning `Problem`
+/// because `project_access_guard!` does a bare `return Err(problem)` and so
+/// requires that exact return type.
+async fn require_project_access(
+    auth: &AuthContext,
+    project_id: i32,
+    project_access_checker: &Option<Arc<dyn temps_core::ProjectAccessChecker>>,
+) -> Result<(), Problem> {
+    project_access_guard!(auth, project_id, project_access_checker);
+    Ok(())
+}
+
+/// Converts a `Problem` (RFC 7807) produced by `project_access_guard!` into
+/// this crate's pre-existing `(StatusCode, Json<ErrorResponse>)` error shape.
+fn problem_to_error_response(problem: Problem) -> (StatusCode, Json<ErrorResponse>) {
+    let status = problem.status_code;
+    let error = problem
+        .body
+        .get("title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Forbidden")
+        .to_string();
+    let details = problem
+        .body
+        .get("detail")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    (status, Json(ErrorResponse { error, details }))
 }
 
 #[derive(Deserialize, Clone, ToSchema)]
@@ -230,7 +273,7 @@ async fn get_performance_metrics(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<PerformanceMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_analytics_read(&auth, query.project_id)?;
+    require_analytics_read(&auth, query.project_id, &state.project_access_checker).await?;
 
     match state
         .performance_service
@@ -294,7 +337,7 @@ async fn get_metrics_over_time(
     State(state): State<Arc<AppState>>,
     Query(query): Query<PerformanceMetricsQuery>,
 ) -> Result<Json<MetricsOverTimeResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_analytics_read(&auth, query.project_id)?;
+    require_analytics_read(&auth, query.project_id, &state.project_access_checker).await?;
 
     match state
         .performance_service
@@ -359,7 +402,7 @@ async fn get_grouped_page_metrics(
     State(state): State<Arc<AppState>>,
     Query(query): Query<GroupedPageMetricsQuery>,
 ) -> Result<Json<GroupedPageMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_analytics_read(&auth, query.project_id)?;
+    require_analytics_read(&auth, query.project_id, &state.project_access_checker).await?;
 
     let group_by = match query.group_by.as_str() {
         "path" => GroupBy::Path,
@@ -433,7 +476,7 @@ async fn has_performance_metrics(
     State(state): State<Arc<AppState>>,
     Query(query): Query<HasMetricsQuery>,
 ) -> Result<Json<HasMetricsResponse>, (StatusCode, Json<ErrorResponse>)> {
-    require_analytics_read(&auth, query.project_id)?;
+    require_analytics_read(&auth, query.project_id, &state.project_access_checker).await?;
 
     match state
         .performance_service
@@ -714,5 +757,139 @@ pub async fn update_speed_metrics(
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use temps_auth::Role;
+    use temps_core::ProjectAccessChecker;
+
+    fn test_user_auth(role: Role) -> AuthContext {
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Test User".to_string(),
+            email: "test@example.com".to_string(),
+            password_hash: Some("hashed".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        AuthContext::new_session(user, role)
+    }
+
+    /// A mock [`ProjectAccessChecker`] that returns a fixed outcome, mirroring
+    /// `temps_auth::permission_guard::tests::MockChecker`.
+    struct MockChecker {
+        allow: bool,
+    }
+
+    #[async_trait]
+    impl ProjectAccessChecker for MockChecker {
+        async fn user_can_access_project(
+            &self,
+            _user_id: i32,
+            _project_id: i32,
+        ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(self.allow)
+        }
+    }
+
+    /// Regression test for the cross-tenant IDOR this crate previously had:
+    /// a plain `Role::User` holds `AnalyticsRead` instance-wide, so before
+    /// wiring `project_access_guard!` in, this call would have returned `Ok`
+    /// for ANY `project_id`, letting a user read another team's performance
+    /// data just by passing its `project_id`.
+    #[tokio::test]
+    async fn require_analytics_read_denies_user_without_project_access() {
+        let auth = test_user_auth(Role::User);
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(MockChecker { allow: false }));
+
+        let result = require_analytics_read(&auth, 42, &checker).await;
+
+        let (status, body) = result.expect_err("user without project access must be denied");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0.error, "Project Access Denied");
+    }
+
+    #[tokio::test]
+    async fn require_analytics_read_allows_user_with_project_access() {
+        let auth = test_user_auth(Role::User);
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(MockChecker { allow: true }));
+
+        let result = require_analytics_read(&auth, 42, &checker).await;
+
+        assert!(result.is_ok());
+    }
+
+    /// Plain OSS: no `ProjectAccessChecker` registered — must reduce to the
+    /// instance-wide permission check only (no-op for the project narrowing).
+    #[tokio::test]
+    async fn require_analytics_read_no_checker_registered_is_no_op() {
+        let auth = test_user_auth(Role::User);
+
+        let result = require_analytics_read(&auth, 42, &None).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn require_analytics_read_admin_bypasses_project_narrowing() {
+        let auth = test_user_auth(Role::Admin);
+        // Even a deny-everything checker must not block an instance admin.
+        let checker: Option<Arc<dyn temps_core::ProjectAccessChecker>> =
+            Some(Arc::new(MockChecker { allow: false }));
+
+        let result = require_analytics_read(&auth, 42, &checker).await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn require_analytics_read_denies_missing_permission() {
+        // A role with no AnalyticsRead permission at all must be denied
+        // outright, before the project-access check ever runs.
+        let user = temps_entities::users::Model {
+            id: 1,
+            name: "Restricted User".to_string(),
+            email: "restricted@example.com".to_string(),
+            password_hash: Some("hashed".to_string()),
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: None,
+            mfa_enabled: false,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        };
+        let auth = AuthContext::new_session(user, Role::MetricsIngest);
+
+        let result = require_analytics_read(&auth, 42, &None).await;
+
+        let (status, body) = result.expect_err("role without AnalyticsRead must be denied");
+        assert_eq!(status, StatusCode::FORBIDDEN);
+        assert_eq!(body.0.error, "Insufficient permissions");
     }
 }

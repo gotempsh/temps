@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Live OIDC discovery tests against real IdPs.
 //!
 //! These hit the public internet, so they only run when

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration that creates the `backup_jobs` and `backup_job_steps` tables,
 //! and amends `backup_schedules` with a `last_job_id` column.
 //!

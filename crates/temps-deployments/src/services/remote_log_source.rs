@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Remote container log source — the `temps-deployments` adapter for the
 //! log-aggregator's [`RemoteContainerLogSource`] port.
 //!

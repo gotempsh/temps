@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Postgres-backed integration tests for `crate::allocator::PostgresAllocator`.
 //!
 //! Same skip-when-Docker-unavailable convention as the migration test

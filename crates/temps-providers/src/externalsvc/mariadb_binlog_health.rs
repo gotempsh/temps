@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! MariaDB binary-log (binlog) health probe.
 //!
 //! Mirrors the Postgres WAL/archive health probe: it detects the MariaDB-side

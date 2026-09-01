@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { type ComponentType, type ReactNode } from 'react'
 import { Link } from 'react-router'
 import { useQuery } from '@tanstack/react-query'

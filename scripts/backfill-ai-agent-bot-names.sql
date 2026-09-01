@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Backfill proxy_logs.bot_name with canonical AI-agent names.
 --
 -- This is the TimescaleDB (Postgres) path only. Deployments running the

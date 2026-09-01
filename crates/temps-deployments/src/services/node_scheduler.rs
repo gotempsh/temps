@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node scheduler — selects which nodes each replica deploys to.
 //!
 //! **Single-node invariant:** if `nodes` table has zero active rows,
@@ -1013,6 +1016,12 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }

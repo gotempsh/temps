@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Adds `provisioning_step` and `provisioning_error` columns to
 //! `service_members` so the UI can render a live timeline while a new
 //! cluster member is being created in the background.

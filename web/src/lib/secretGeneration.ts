@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Well-known env vars that need a random locally-generated secret (auth
 // session/signing keys, encryption keys) rather than a value copied from
 // somewhere else. Encoded as hex by default — that's what standalone

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! On-demand HTTP-01 TLS certificate manager (ADR-018).
 //!
 //! When on-demand TLS is enabled, the proxy's `certificate_callback` finds no

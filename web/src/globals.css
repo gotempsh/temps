@@ -1,3 +1,6 @@
+/* SPDX-FileCopyrightText: 2024-2026 Temps Contributors */
+/* SPDX-License-Identifier: MIT OR Apache-2.0 */
+
 @import 'tailwindcss';
 @plugin '@tailwindcss/typography';
 
@@ -123,9 +126,12 @@
   --success-foreground: oklch(0.985 0 0);
   --warning: oklch(0.773 0.1776 69.61); /* amber */
   --warning-foreground: oklch(0.145 0 0);
-  /* gray-200 borders (#2e2e2e) */
-  --border: oklch(0.269 0 0);
-  --input: oklch(0.269 0 0);
+  /* gray-300 (#3a3a3a) — matches --accent; restores the pre-Geist-palette
+     border/input contrast against --card (0.205) that the Vercel rewrite
+     (6b4859637) collapsed from a 0.144 lightness delta down to 0.064,
+     washing out unchecked switches and outlined/disabled buttons */
+  --border: oklch(0.322 0 0);
+  --input: oklch(0.322 0 0);
   /* Vercel blue ring (#0070f3) */
   --ring: oklch(0.59 0.2032 256.82);
   /* Vercel signature accent colors for charts */

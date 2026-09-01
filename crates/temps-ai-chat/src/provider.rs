@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-context seeding for conversations.
 //!
 //! A `ConversationContextProvider` turns an entity reference (`context_type` +

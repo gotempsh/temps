@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Miscellaneous email signals: disposable-provider, role-account, and
 //! B2C-provider detection, plus the Gravatar profile-image URL.
 //!

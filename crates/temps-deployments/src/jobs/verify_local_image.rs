@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Verify Local Image Job
 //!
 //! Verifies that a locally uploaded Docker image exists and is accessible.

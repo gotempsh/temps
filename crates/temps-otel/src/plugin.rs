@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Plugin registration for the OTel subsystem.
 
 use std::future::Future;
@@ -184,6 +187,126 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
     (limit > 0 && limit <= tokio::sync::Semaphore::MAX_PERMITS).then_some(limit)
 }
 
+/// Number of counters the OTel pipeline-stats sampler publishes each cycle —
+/// one per [`crate::types::PipelineStats`] field.
+pub const OTEL_PIPELINE_STAT_COUNT: usize = 13;
+
+/// How often the pipeline-stats sampler snapshots the counters, in seconds.
+///
+/// Public because a stored point is a *delta over this interval*, so any
+/// reader charting the series has to state the unit — see
+/// `PipelineHistoryResponse::sample_interval_seconds`. A chart that says
+/// "12 dropped spans" without saying "per minute" is not interpretable.
+pub const OTEL_STATS_SAMPLE_INTERVAL_SECS: u64 = 60;
+
+/// Synthetic node ID of the control plane (mirrors the proxy metrics sampler).
+///
+/// The pipeline counters are process-wide, not per-node and not per-project,
+/// so they are written against `SourceKind::Node` / id 0 — the same synthetic
+/// source the `proxy.*` metrics use.
+pub const CONTROL_PLANE_NODE_ID: i32 = 0;
+
+/// Every metric name the pipeline-stats sampler writes, in display order.
+///
+/// The **single source of truth** shared by the writer
+/// ([`pipeline_stat_deltas`]) and the reader
+/// (`GET /otel/pipeline-history`). Without this, adding a counter to
+/// [`crate::types::PipelineStats`] would mean editing the sampler, the query
+/// handler and the UI separately — and the failure mode of forgetting one is
+/// silent: a metric that is written but never charted, or charted but never
+/// written. `pipeline_stat_deltas_match_metric_names` pins the two together.
+///
+/// Order is deliberate — received/stored/dropped triplets stay adjacent so the
+/// UI can render them as one panel per signal.
+pub const OTEL_PIPELINE_METRIC_NAMES: [&str; OTEL_PIPELINE_STAT_COUNT] = [
+    "otel.rate_limited_requests",
+    "otel.quota_exceeded_requests",
+    "otel.metrics_received",
+    "otel.metrics_stored",
+    "otel.metrics_dropped",
+    "otel.spans_received",
+    "otel.spans_stored",
+    "otel.spans_dropped",
+    "otel.logs_received",
+    "otel.logs_stored_db",
+    "otel.logs_stored_s3",
+    "otel.logs_dropped",
+    "otel.ingest_errors",
+];
+
+/// Turn a pipeline-stats snapshot plus the previous cycle's checkpoint into the
+/// `(metric name, delta)` pairs the sampler writes to the metrics store.
+///
+/// Deltas rather than cumulative values, so a point reads as "events in the
+/// last sample window" and an alert threshold like `> 10` means what an
+/// operator expects. `saturating_sub` guards the one case where the sequence
+/// is not monotonic: a process restart zeroes every atomic, which would
+/// otherwise underflow into a nonsense value.
+///
+/// A free function so the naming and the arithmetic are unit-testable without
+/// standing up the sampler task, a metrics store, or a 60-second timer.
+fn pipeline_stat_deltas(
+    snap: &crate::types::PipelineStats,
+    prev: &crate::types::PipelineStats,
+) -> [(&'static str, u64); OTEL_PIPELINE_STAT_COUNT] {
+    [
+        (
+            "otel.rate_limited_requests",
+            snap.rate_limited_requests
+                .saturating_sub(prev.rate_limited_requests),
+        ),
+        (
+            "otel.quota_exceeded_requests",
+            snap.quota_exceeded_requests
+                .saturating_sub(prev.quota_exceeded_requests),
+        ),
+        (
+            "otel.metrics_received",
+            snap.metrics_received.saturating_sub(prev.metrics_received),
+        ),
+        (
+            "otel.metrics_stored",
+            snap.metrics_stored.saturating_sub(prev.metrics_stored),
+        ),
+        (
+            "otel.metrics_dropped",
+            snap.metrics_dropped.saturating_sub(prev.metrics_dropped),
+        ),
+        (
+            "otel.spans_received",
+            snap.spans_received.saturating_sub(prev.spans_received),
+        ),
+        (
+            "otel.spans_stored",
+            snap.spans_stored.saturating_sub(prev.spans_stored),
+        ),
+        (
+            "otel.spans_dropped",
+            snap.spans_dropped.saturating_sub(prev.spans_dropped),
+        ),
+        (
+            "otel.logs_received",
+            snap.logs_received.saturating_sub(prev.logs_received),
+        ),
+        (
+            "otel.logs_stored_db",
+            snap.logs_stored_db.saturating_sub(prev.logs_stored_db),
+        ),
+        (
+            "otel.logs_stored_s3",
+            snap.logs_stored_s3.saturating_sub(prev.logs_stored_s3),
+        ),
+        (
+            "otel.logs_dropped",
+            snap.logs_dropped.saturating_sub(prev.logs_dropped),
+        ),
+        (
+            "otel.ingest_errors",
+            snap.ingest_errors.saturating_sub(prev.ingest_errors),
+        ),
+    ]
+}
+
 // ── OpenAPI Schema ──────────────────────────────────────────────────
 
 #[derive(OpenApiTrait)]
@@ -209,6 +332,8 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
         query_handler::get_quota,
         query_handler::has_traces,
         query_handler::get_pipeline_stats,
+        query_handler::get_ingest_errors,
+        query_handler::get_pipeline_history,
         query_handler::query_genai_traces,
         query_handler::get_genai_trace,
         query_handler::get_cross_project_trace_siblings,
@@ -246,6 +371,11 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
             query_handler::QuotaResponse,
             query_handler::HasTracesResponse,
             query_handler::PipelineStatsResponse,
+        query_handler::IngestErrorsResponse,
+        crate::types::IngestErrorSummary,
+        query_handler::PipelineHistoryResponse,
+        query_handler::PipelineSeries,
+        query_handler::PipelineHistoryPoint,
             crate::types::MetricBucket,
             crate::types::HistogramSummary,
             crate::types::MetricAggregation,
@@ -797,39 +927,44 @@ impl TempsPlugin for OtelPlugin {
                 });
             }
 
-            // 1c-stats. Background sampler: OTel pipeline rejection stats → MetricsStore.
+            // 1c-stats. Background sampler: OTel pipeline stats → MetricsStore.
             //
             // Reads `otel_service.pipeline_stats()` every 60 seconds, computes
-            // the delta since the previous sample, and writes two counter points
-            // to the unified MetricsStore (SourceKind::Node, node_id 0):
+            // the delta since the previous sample, and writes one counter point
+            // per field to the unified MetricsStore (SourceKind::Node, node_id 0):
             //
-            //   otel.rate_limited_requests  — ingest rejections from the rate limiter
+            //   otel.rate_limited_requests   — ingest rejections from the rate limiter
             //   otel.quota_exceeded_requests — ingest rejections from quota enforcement
+            //   otel.metrics_received / _stored / _dropped
+            //   otel.spans_received   / _stored / _dropped
+            //   otel.logs_received    / _stored_db / _stored_s3 / _dropped
+            //   otel.ingest_errors    — storage writes that failed after retries
+            //
+            // The received/stored/dropped triplets are what make a data-loss
+            // incident visible: `dropped > 0` (or `received - stored` drifting)
+            // is the signal that batches are being thrown away, which was
+            // previously only observable by reading the process's own logs.
             //
             // Using delta values (not cumulative) matches the proxy metrics sampler
-            // pattern: each store point represents "rejections in the last N seconds"
+            // pattern: each store point represents "events in the last N seconds"
             // so the AlertEvaluator threshold (e.g. "> 10") is intuitive to an
-            // operator ("more than 10 rejections this sample window").
+            // operator ("more than 10 dropped spans this sample window").
             //
             // The 60-second interval is independent of `monitoring.scrape_interval_secs`
             // because the pipeline stats are process-internal counters rather than
             // externally-scraped ones; re-reading the config each cycle would add an
             // unnecessary DB round-trip on an ingest-hot path.
             //
-            // Every cycle writes both points, even when the delta is zero. The
+            // Every cycle writes every point, even when the delta is zero. The
             // AlertEvaluator's `query_latest` only looks back 15 minutes
-            // (`LATEST_WINDOW`), so if a burst of rejections is followed by
+            // (`LATEST_WINDOW`), so if a burst of drops is followed by
             // silence, skipping the zero-delta write would leave that burst's
             // non-zero point as the "latest" value for up to 15 minutes,
             // keeping the alarm falsely active. Always writing — including
             // zeros — lets the metric self-resolve on the next cycle, exactly
             // like the proxy sampler's fixed-size point set does. The storage
-            // cost is two rows per minute regardless of ingest volume.
+            // cost is a fixed 13 rows per minute regardless of ingest volume.
             {
-                const OTEL_STATS_SAMPLE_INTERVAL_SECS: u64 = 60;
-                /// Synthetic node ID of the control plane (mirrors proxy metrics sampler).
-                const CONTROL_PLANE_NODE_ID: i32 = 0;
-
                 let stats_otel_service = otel_service.clone();
                 let stats_metrics_store = metrics_store.clone();
                 tokio::spawn(async move {
@@ -845,48 +980,33 @@ impl TempsPlugin for OtelPlugin {
                         tokio::time::interval(Duration::from_secs(OTEL_STATS_SAMPLE_INTERVAL_SECS));
                     interval.tick().await; // discard the immediate first tick
 
-                    let mut prev_rate_limited: u64 = 0;
-                    let mut prev_quota_exceeded: u64 = 0;
+                    // Previous-cycle checkpoint for every sampled counter. Held
+                    // in one struct so `PipelineStats` and the checkpoints can
+                    // never drift apart field-by-field.
+                    let mut prev = crate::types::PipelineStats::default();
 
                     loop {
                         interval.tick().await;
                         let snap = stats_otel_service.pipeline_stats();
 
-                        // Compute monotonic deltas; saturating_sub guards against a
-                        // counter reset (process restart resets all atomics to 0).
-                        let delta_rate_limited =
-                            snap.rate_limited_requests.saturating_sub(prev_rate_limited);
-                        let delta_quota_exceeded = snap
-                            .quota_exceeded_requests
-                            .saturating_sub(prev_quota_exceeded);
+                        let deltas = pipeline_stat_deltas(&snap, &prev);
 
                         let now = Utc::now();
-                        let points = vec![
-                            MetricPoint {
+                        let points: Vec<MetricPoint> = deltas
+                            .iter()
+                            .map(|(name, delta)| MetricPoint {
                                 time: now,
                                 source_kind: SourceKind::Node,
                                 source_id: CONTROL_PLANE_NODE_ID,
-                                name: "otel.rate_limited_requests".to_string(),
-                                value: delta_rate_limited as f64,
+                                name: (*name).to_string(),
+                                value: *delta as f64,
                                 kind: MetricKind::Counter,
                                 engine: Some("otel".to_string()),
                                 environment: None,
                                 node_id: Some(CONTROL_PLANE_NODE_ID),
                                 labels: HashMap::new(),
-                            },
-                            MetricPoint {
-                                time: now,
-                                source_kind: SourceKind::Node,
-                                source_id: CONTROL_PLANE_NODE_ID,
-                                name: "otel.quota_exceeded_requests".to_string(),
-                                value: delta_quota_exceeded as f64,
-                                kind: MetricKind::Counter,
-                                engine: Some("otel".to_string()),
-                                environment: None,
-                                node_id: Some(CONTROL_PLANE_NODE_ID),
-                                labels: HashMap::new(),
-                            },
-                        ];
+                            })
+                            .collect();
 
                         // Only advance the checkpoints once the write actually lands.
                         // Advancing them unconditionally would discard this cycle's
@@ -902,11 +1022,16 @@ impl TempsPlugin for OtelPlugin {
                                  includes this cycle's deltas"
                             );
                         } else {
-                            prev_rate_limited = snap.rate_limited_requests;
-                            prev_quota_exceeded = snap.quota_exceeded_requests;
+                            let spans_dropped =
+                                snap.spans_dropped.saturating_sub(prev.spans_dropped);
+                            let ingest_errors =
+                                snap.ingest_errors.saturating_sub(prev.ingest_errors);
+                            prev = snap;
                             debug!(
-                                delta_rate_limited,
-                                delta_quota_exceeded, "OTel pipeline stats sampled and written"
+                                points = deltas.len(),
+                                spans_dropped,
+                                ingest_errors,
+                                "OTel pipeline stats sampled and written"
                             );
                         }
                     }
@@ -1106,6 +1231,125 @@ mod tests {
     fn test_otel_plugin_name() {
         let plugin = OtelPlugin::new();
         assert_eq!(plugin.name(), "otel");
+    }
+
+    // ── Pipeline-stats sampler ──────────────────────────────────────────
+
+    /// Every counter in `PipelineStats` must get a series; a field added to
+    /// the struct without a matching entry here is a metric that silently
+    /// never gets published.
+    #[test]
+    fn test_pipeline_stat_deltas_covers_every_counter() {
+        let zero = crate::types::PipelineStats::default();
+        let snap = crate::types::PipelineStats {
+            metrics_received: 1,
+            metrics_stored: 2,
+            metrics_dropped: 3,
+            spans_received: 4,
+            spans_stored: 5,
+            spans_dropped: 6,
+            logs_received: 7,
+            logs_stored_db: 8,
+            logs_stored_s3: 9,
+            logs_dropped: 10,
+            ingest_errors: 11,
+            rate_limited_requests: 12,
+            quota_exceeded_requests: 13,
+        };
+
+        let deltas = pipeline_stat_deltas(&snap, &zero);
+        assert_eq!(deltas.len(), OTEL_PIPELINE_STAT_COUNT);
+
+        let by_name: std::collections::HashMap<&str, u64> = deltas.iter().copied().collect();
+        assert_eq!(by_name.len(), OTEL_PIPELINE_STAT_COUNT, "duplicate names");
+        assert_eq!(by_name["otel.metrics_received"], 1);
+        assert_eq!(by_name["otel.metrics_stored"], 2);
+        assert_eq!(by_name["otel.metrics_dropped"], 3);
+        assert_eq!(by_name["otel.spans_received"], 4);
+        assert_eq!(by_name["otel.spans_stored"], 5);
+        assert_eq!(by_name["otel.spans_dropped"], 6);
+        assert_eq!(by_name["otel.logs_received"], 7);
+        assert_eq!(by_name["otel.logs_stored_db"], 8);
+        assert_eq!(by_name["otel.logs_stored_s3"], 9);
+        assert_eq!(by_name["otel.logs_dropped"], 10);
+        assert_eq!(by_name["otel.ingest_errors"], 11);
+        assert_eq!(by_name["otel.rate_limited_requests"], 12);
+        assert_eq!(by_name["otel.quota_exceeded_requests"], 13);
+    }
+
+    /// The writer's names and the reader's published list must be identical,
+    /// in the same order. If this fails, the sampler is writing a series the
+    /// history endpoint will never chart (or vice versa) — silently.
+    #[test]
+    fn test_pipeline_stat_deltas_match_metric_names() {
+        let zero = crate::types::PipelineStats::default();
+        let written: Vec<&str> = pipeline_stat_deltas(&zero, &zero)
+            .iter()
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(written, OTEL_PIPELINE_METRIC_NAMES.to_vec());
+    }
+
+    /// Names must all share the existing `otel.` prefix so the series sit
+    /// together in the metric picker alongside the two originals.
+    #[test]
+    fn test_pipeline_stat_delta_names_share_the_otel_prefix() {
+        let zero = crate::types::PipelineStats::default();
+        for (name, _) in pipeline_stat_deltas(&zero, &zero) {
+            assert!(name.starts_with("otel."), "unprefixed metric name: {name}");
+        }
+    }
+
+    /// Deltas are relative to the previous checkpoint, not cumulative.
+    #[test]
+    fn test_pipeline_stat_deltas_are_relative_to_checkpoint() {
+        let prev = crate::types::PipelineStats {
+            spans_received: 100,
+            spans_dropped: 10,
+            ..Default::default()
+        };
+        let snap = crate::types::PipelineStats {
+            spans_received: 175,
+            spans_dropped: 12,
+            ..Default::default()
+        };
+
+        let by_name: std::collections::HashMap<&str, u64> =
+            pipeline_stat_deltas(&snap, &prev).iter().copied().collect();
+        assert_eq!(by_name["otel.spans_received"], 75);
+        assert_eq!(by_name["otel.spans_dropped"], 2);
+    }
+
+    /// A quiet window must still produce a full set of zero-valued points so
+    /// the AlertEvaluator's 15-minute lookback can self-resolve rather than
+    /// keeping a stale burst as the "latest" value.
+    #[test]
+    fn test_pipeline_stat_deltas_emit_zeros_when_idle() {
+        let snap = crate::types::PipelineStats {
+            spans_received: 500,
+            spans_stored: 500,
+            ..Default::default()
+        };
+        let deltas = pipeline_stat_deltas(&snap, &snap);
+        assert_eq!(deltas.len(), OTEL_PIPELINE_STAT_COUNT);
+        assert!(deltas.iter().all(|(_, delta)| *delta == 0));
+    }
+
+    /// A process restart zeroes the atomics while the checkpoint still holds
+    /// the pre-restart totals; that must clamp to 0, never underflow.
+    #[test]
+    fn test_pipeline_stat_deltas_clamp_on_counter_reset() {
+        let prev = crate::types::PipelineStats {
+            spans_received: 9_000,
+            ingest_errors: 42,
+            ..Default::default()
+        };
+        let snap = crate::types::PipelineStats::default();
+
+        let by_name: std::collections::HashMap<&str, u64> =
+            pipeline_stat_deltas(&snap, &prev).iter().copied().collect();
+        assert_eq!(by_name["otel.spans_received"], 0);
+        assert_eq!(by_name["otel.ingest_errors"], 0);
     }
 
     #[test]

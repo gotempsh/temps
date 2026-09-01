@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Background sampler that persists proxy hot-path metrics.
 //!
 //! Owns the only I/O in the proxy metrics pipeline: every interval it

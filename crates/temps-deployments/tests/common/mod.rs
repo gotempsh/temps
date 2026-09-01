@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Common test utilities shared across nixpacks integration tests
 //!
 //! This module provides reusable test infrastructure including:

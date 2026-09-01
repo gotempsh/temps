@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   changePasswordSelfMutation,
   disableMfaMutation,
@@ -35,6 +38,7 @@ import {
   DialogDescription,
 } from '@/components/ui/dialog'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { zodResolver } from '@hookform/resolvers/zod'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
@@ -100,6 +104,15 @@ const mfaDisableSchema = z.object({
 
 type MfaDisableValues = z.infer<typeof mfaDisableSchema>
 
+// Current-password confirmation gate for MFA enrollment.
+// Accounts with no password set (SSO-only) may leave this blank;
+// the server skips the check for those accounts.
+const mfaSetupPasswordSchema = z.object({
+  current_password: z.string().optional(),
+})
+
+type MfaSetupPasswordValues = z.infer<typeof mfaSetupPasswordSchema>
+
 export function Account() {
   const { setBreadcrumbs } = useBreadcrumbs()
   const queryClient = useQueryClient()
@@ -108,11 +121,14 @@ export function Account() {
     ...getCurrentUserOptions(),
   })
   const { refetch } = useAuth()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const [showMfaDialog, setShowMfaDialog] = useState(false)
   const [mfaSetupData, setMfaSetupData] = useState<MfaSetupResponse | null>(
     null
   )
   const [showDisableMfaDialog, setShowDisableMfaDialog] = useState(false)
+  const [showMfaPasswordDialog, setShowMfaPasswordDialog] = useState(false)
 
   const form = useForm<FormValues>({
     resolver: zodResolver(formSchema),
@@ -135,6 +151,17 @@ export function Account() {
     onSuccess: () => {
       toast.success('Account updated successfully')
       refetch()
+    },
+    onError: (error, variables) => {
+      // Only email changes are step-up gated server-side, but it's safe to
+      // intercept unconditionally — this only fires on an actual 428.
+      if (handleSensitiveActionError(error, () => updateUser(variables))) {
+        return
+      }
+      const problem = error as { detail?: string; message?: string }
+      toast.error(
+        problem.detail || problem.message || 'Failed to update account'
+      )
     },
   })
 
@@ -183,9 +210,19 @@ export function Account() {
     },
     onSuccess: (data) => {
       setMfaSetupData(data)
+      setShowMfaPasswordDialog(false)
+      mfaSetupPasswordForm.reset()
       setShowMfaDialog(true)
     },
   })
+
+  const onStartMfaSetup = (data: MfaSetupPasswordValues) => {
+    setupMfa({
+      body: {
+        current_password: data.current_password || null,
+      },
+    })
+  }
 
   const { mutate: verifyMfa, isPending: isVerifyingMfa } = useMutation({
     ...verifyAndEnableMfaMutation(),
@@ -203,6 +240,13 @@ export function Account() {
     resolver: zodResolver(mfaDisableSchema),
     defaultValues: {
       code: '',
+    },
+  })
+
+  const mfaSetupPasswordForm = useForm<MfaSetupPasswordValues>({
+    resolver: zodResolver(mfaSetupPasswordSchema),
+    defaultValues: {
+      current_password: '',
     },
   })
 
@@ -266,6 +310,7 @@ export function Account() {
 
   return (
     <div className="max-w-2xl mx-auto space-y-6">
+      {verificationDialog}
       <Card>
         <CardHeader>
           <CardTitle>Account Settings</CardTitle>
@@ -517,7 +562,10 @@ export function Account() {
               </Button>
             </div>
           ) : (
-            <Button onClick={() => setupMfa({})} disabled={isSettingUpMfa}>
+            <Button
+              onClick={() => setShowMfaPasswordDialog(true)}
+              disabled={isSettingUpMfa}
+            >
               {isSettingUpMfa && (
                 <Loader2 className="mr-2 h-4 w-4 animate-spin" />
               )}
@@ -526,6 +574,71 @@ export function Account() {
           )}
         </CardContent>
       </Card>
+
+      {/* Current-password confirmation before generating a new MFA secret.
+          SSO-only accounts (no local password) may leave the field empty;
+          the server skips the check when no password hash is set. */}
+      <Dialog
+        open={showMfaPasswordDialog}
+        onOpenChange={(open) => {
+          setShowMfaPasswordDialog(open)
+          if (!open) mfaSetupPasswordForm.reset()
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Confirm Identity to Setup 2FA</DialogTitle>
+            <DialogDescription>
+              Enter your current password to begin two-factor authentication
+              setup. If your account uses SSO and has no local password, leave
+              this field empty.
+            </DialogDescription>
+          </DialogHeader>
+          <Form {...mfaSetupPasswordForm}>
+            <form
+              onSubmit={mfaSetupPasswordForm.handleSubmit(onStartMfaSetup)}
+              className="space-y-4"
+            >
+              <FormField
+                control={mfaSetupPasswordForm.control}
+                name="current_password"
+                render={({ field }) => (
+                  <FormItem>
+                    <FormLabel>Current Password</FormLabel>
+                    <FormControl>
+                      <Input
+                        {...field}
+                        type="password"
+                        placeholder="Enter current password"
+                        autoComplete="current-password"
+                      />
+                    </FormControl>
+                    <FormMessage />
+                  </FormItem>
+                )}
+              />
+              <div className="flex justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => {
+                    setShowMfaPasswordDialog(false)
+                    mfaSetupPasswordForm.reset()
+                  }}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={isSettingUpMfa}>
+                  {isSettingUpMfa && (
+                    <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  )}
+                  Continue
+                </Button>
+              </div>
+            </form>
+          </Form>
+        </DialogContent>
+      </Dialog>
 
       <Dialog open={showMfaDialog} onOpenChange={setShowMfaDialog}>
         <DialogContent>

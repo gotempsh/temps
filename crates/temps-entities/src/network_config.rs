@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Cluster-wide network configuration. Single-row table (`id = 1` enforced
 //! by CHECK constraint) owned by the control plane. Drives the
 //! `temps-network` data plane on every worker via the per-node allocator.

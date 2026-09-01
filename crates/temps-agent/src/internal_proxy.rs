@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Internal edge proxy bound to the worker's overlay bridge gateway.
 //!
 //! Containers on this worker resolve `<env>.<project>.temps.local` to

@@ -114,6 +114,7 @@ Get error time series data
 | `--project-id <id>` | Project ID | - | Yes |
 | `--days <days>` | Number of days to show | `7` | No |
 | `--bucket <bucket>` | Time bucket size (e.g., "1h", "15m", "1d") | `1h` | No |
+| `--environment-id <id>` | Filter chart data to a specific environment ID | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `errors dashboard`

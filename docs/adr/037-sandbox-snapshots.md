@@ -1,7 +1,8 @@
 # ADR-037: Sandbox Snapshots
 
-**Status:** Proposed
+**Status:** Accepted
 **Date:** 2026-08-10
+**Updated:** 2026-08-29
 **Author:** David Viejo
 **Related:** ADR-010 (provider boundary traits), ADR-029 (Firecracker backend), ADR-036 (persistent workspace sandboxes), ADR-013 (egress credential proxy)
 
@@ -23,17 +24,17 @@ The current `pause_sandbox`/`resume_sandbox` pair (`crates/temps-sandbox/src/ser
 
 ## Decision
 
-Add sandbox snapshots as a first-class, provider-bounded feature. v1 supports the Docker backend only. Firecracker snapshot/restore is deferred to v2. Local and managed backends return an explicit "not supported" error rather than silently failing or degrading.
+Add sandbox snapshots as a first-class, provider-bounded feature. Docker and Firecracker both support persistent filesystem snapshots. Local and managed backends return an explicit "not supported" error rather than silently failing or degrading.
 
 ### 1. What "snapshot" means per backend
 
 **Docker (`DockerSandboxProvider`).**
-A snapshot is a committed image layer derived from a **running** container, produced by `docker commit` against the container filesystem. (v1 requires a running sandbox; snapshotting stopped sandboxes is a deferred v2 feature. If the sandbox is paused or stopped, resume it first.) The result is stored as a tagged image in the local Docker daemon under `temps-snapshot/<public_snapshot_id>:latest`, and simultaneously exported as a tarball to the content-addressed store under `$TEMPS_DATA_DIR/snapshots/<sha256-of-content>.tar`. The sha256 becomes the `content_digest` column on the `sandbox_snapshots` entity. Creating a sandbox from a Docker snapshot passes this image name as the `image` field of `SandboxCreateConfig`, which the existing `DockerSandboxProvider::create` path already handles. No new container-creation logic is needed for the restore side.
+A snapshot is a committed image layer derived from a **running** container, produced by `docker commit` against the container filesystem. (v1 requires a running sandbox; snapshotting stopped sandboxes is a deferred v2 feature. If the sandbox is paused or stopped, resume it first.) The result is stored as a content-addressed tag in the local Docker daemon under `temps-snapshot/<logical_digest>:latest`, and simultaneously exported as a tarball under `$TEMPS_DATA_DIR/snapshots/<logical_digest>.tar`. The logical digest combines the primary image-tar digest with the companion workspace digest and becomes the `content_digest` column. Restore verifies both artifacts and the immutable Docker image ID, imports the image tar when necessary, restores the workspace, and then delegates container creation to the normal Docker path.
 
-The Docker snapshot captures the container's writable layer only, not the mounted named volumes (`/home/temps`). The home volume contains user credentials and AI CLI state — these must not be snapshotted (see §4 Security). The work dir (`/workspace`) is part of the container writable layer and is captured. This is the intended division: workspace content is preserved, credentials are not.
+The Docker image snapshot captures the container's writable layer but excludes mounts. The home volume (`/home/temps`) contains user credentials and AI CLI state and remains excluded. The workspace is a separate bind mount, so the provider creates a companion workspace tarball, stores its digest/path in snapshot metadata, and restores it into the new sandbox work directory before container creation.
 
 **Firecracker (`FirecrackerSandboxProvider`).**
-Firecracker has native snapshot/restore via its API (`/snapshot/create`, `/snapshot/load`). A Firecracker snapshot captures the full VM memory state plus disk states. This is significantly more powerful than Docker commit (it preserves in-flight processes, open file descriptors, and kernel state) but also more fragile: snapshot compatibility is pinned to the exact Firecracker version that produced it, and restoring requires re-seeding guest entropy and re-attaching network devices. ADR-029 §7 deferred this behind `firecracker.enable_snapshots`. **This ADR keeps that deferral.** Firecracker backends return `SandboxSnapshotError::NotSupported` from all snapshot trait methods until `enable_snapshots` is on and the restore safety work (entropy, clock, network re-attach, version pinning for portability) ships in a separate ADR.
+Firecracker snapshots capture persistent filesystem state, not live VM memory. The service stops the VM, then `debugfs` exports live directory entries from the ext4 root disk inside a networkless minimal bubblewrap mount namespace. Only system binaries/libraries are mounted read-only; procfs is absent, `/dev` and `/run` are empty directories on an otherwise read-only root, and the dedicated staging directory is the sole host-writable mount. That staging directory is an unprivileged `fuse2fs` mount of a private ext4 scratch image whose total capacity equals the caller's remaining snapshot quota, so sparse guest files and hard-link amplification fail with `ENOSPC` before they can exceed the host-write budget. The narrow `fusermount3` helper handles teardown; the Temps daemon does not require root or `CAP_SYS_ADMIN`. Extraction also has a 15-minute timeout with forced child termination and cleanup. Parser-controlled stdin, stdout, and stderr are discarded rather than buffered. Host configuration, home directories, sysfs, runtime sockets/devices, and temps data are absent, containing malicious guest dirent traversal (e2fsprogs#272) and limiting parser compromise. Runtime-secret locations (`/root`, `/etc/temps`, `/tmp`, `/run`, `/var/tmp`) are removed, and `mkfs.ext4` builds a fresh sparse filesystem artifact. Rebuilding rather than copying the raw block device excludes deleted credential blocks and avoids Firecracker memory-snapshot compatibility, entropy, clock, and network-state hazards. `/workspace` is part of this sanitized filesystem and is restored with it.
 
 **Local (`LocalSandboxProvider`).**
 Local is a fork-exec dev-only fallback with no container primitives. It returns `SandboxSnapshotError::NotSupported` unconditionally. No snapshot concept applies.
@@ -50,10 +51,11 @@ async fn take_snapshot(
     &self,
     handle: &SandboxHandle,
     label: Option<String>,
+    max_size_bytes: u64,
 ) -> Result<SnapshotArtifact, AgentError>
 ```
 
-Captures the current state of `handle` as a reusable artifact. The sandbox may be running or stopped; the caller is responsible for any quiescing it needs (the service layer handles stopping-before-snapshot for Docker). Returns a `SnapshotArtifact` describing the on-disk location and content digest. `label` is a human-readable annotation stored on the DB row.
+Captures the current state of `handle` as a reusable artifact. The service layer quiesces the sandbox first. `max_size_bytes` is the caller's remaining quota and is a hard streaming/capture limit; crossing it aborts and cleans up the attempt.
 
 ```
 async fn create_from_snapshot(
@@ -71,15 +73,23 @@ pub struct SnapshotArtifact {
     /// The provider puts the artifact here; the service layer records it
     /// and manages lifecycle.
     pub content_path: std::path::PathBuf,
-    /// SHA-256 of the tarball. The canonical store key — collisions among
-    /// identical images are deduplicated on this field.
+    /// Logical SHA-256 store key. Docker combines its image and workspace
+    /// digests; Firecracker uses the rootfs digest directly.
     pub content_digest: String,
-    /// Approximate size in bytes.
+    /// SHA-256 of the primary artifact file (the logical digest may combine
+    /// primary and companion digests).
+    pub primary_digest: String,
+    /// Total artifact size in bytes.
     pub size_bytes: u64,
     /// Which backend produced this artifact — needed to reject
     /// cross-backend restore attempts (a Docker tar cannot boot as a
     /// Firecracker rootfs).
     pub backend: SandboxBackend,
+    /// Docker's mutable tag and immutable image ID.
+    pub image_ref: Option<String>,
+    pub image_id: Option<String>,
+    /// Docker workspace companion; Firecracker stores workspace in ext4.
+    pub workspace: Option<SnapshotCompanionArtifact>,
 }
 ```
 
@@ -87,13 +97,13 @@ pub struct SnapshotArtifact {
 
 ### 3. Storage: content-addressed artifacts under TEMPS_DATA_DIR
 
-Snapshot tarballs land in `$TEMPS_DATA_DIR/snapshots/` as content-addressed files: `<sha256-hex>.tar`. The sha256 is computed by the provider as it streams out the export; the file is written atomically (write to a temp path, rename on close).
+Snapshot artifacts land in `$TEMPS_DATA_DIR/snapshots/` as content-addressed files. Docker writes an image tarball plus a workspace companion; Firecracker writes a sanitized `.ext4` artifact. Files publish without replacing an existing digest path.
 
-**Deduplication.** Two snapshots with the same content digest share one tarball on disk. The `sandbox_snapshots` entity has a `content_digest` column; the service checks for an existing row with the same digest before writing a new file. When a match is found, the new row points at the existing file and the write is skipped.
+**Deduplication.** Two snapshots with the same logical content digest share the same artifact set on disk: one ext4 file for Firecracker, or the primary image tar plus workspace companion for Docker. The `sandbox_snapshots` entity has a `content_digest` column; the service checks for an existing ready row with the same digest and reuses its persisted paths and integrity metadata.
 
-**Lifecycle and GC.** Snapshots are user-managed; there is no automatic GC. The `DELETE /v1/sandbox-snapshots/{snapshot_id}` endpoint removes the DB row and, if no other row references the same `content_digest`, deletes the tarball from disk. Operators running low on space can list snapshots sorted by size (`GET /v1/sandbox-snapshots?sort=size_bytes:desc`) and delete manually. A `GET /v1/sandbox-snapshots/storage-summary` endpoint reports total snapshot bytes on disk vs available disk, so the UI can show a warning before space runs out. Automatic GC (e.g. LRU eviction after N days unused) is explicitly left for a follow-up; the risk of silently destroying a user's checkpoint outweighs the operational tidiness. This mirrors the deliberate non-GC posture in the sandbox volume comment in `SandboxProvider` (`mod.rs:456-470`).
+**Lifecycle and GC.** Snapshots are user-managed; there is no automatic GC. The `DELETE /v1/sandbox-snapshots/{snapshot_id}` endpoint removes the DB row and, if no other row references the same `content_digest`, deletes all associated artifacts from disk. Capture publication/finalization, restore consumption, and delete reference counting/removal share a process-wide lifecycle mutex so a shared artifact cannot be removed or orphaned by concurrent requests. This is correct for temps' single-binary deployment model; a future multi-process deployment must replace it with a database advisory lock or transactional artifact-reference table. Operators running low on space can use the storage-summary endpoint and delete snapshots manually. Automatic GC (for example LRU eviction) is explicitly deferred because silently destroying a user's checkpoint is worse than requiring operator cleanup.
 
-**Size concerns.** A snapshot of a Docker container writable layer is comparable in size to the filesystem changes the container has made on top of the base image — commonly 100 MB–2 GB for a development environment with compilers and node_modules. The `sandbox_snapshots` entity has a `size_bytes` column populated at create time. ADR-036 identified disk as the unbounded resource for persistent workspaces; snapshots compound that. **Quota enforcement is a hard requirement before Temps Cloud ships the snapshot feature.** v1 enforces a per-user soft cap as a config value on `AgentSandboxSettings` (`max_snapshot_bytes_per_user: u64`, defaulting to 10 GiB); exceeding it returns 422 with a descriptive error. A per-project cap is a natural follow-up once project-scoped quotas exist elsewhere.
+**Size concerns.** The service computes each user's remaining quota (default 10 GiB) before capture and passes it into the provider. Docker bounds both the image export stream and workspace tar writer; Firecracker extracts into a scratch ext4 filesystem capped to that remaining quota, then also validates allocated source bytes, exported live files, filesystem sizing, and final allocated bytes. Exceeding the limit aborts before publication and returns 422. The service rechecks the reported total before finalizing the row.
 
 The content store is local only in v1. Exporting snapshots to S3 / R2 for portability or off-host backup is explicitly deferred; the API shape (`content_digest` as the canonical key) is compatible with a remote store without migration.
 
@@ -108,15 +118,19 @@ The content store is local only in v1. Exporting snapshots to S3 / R2 for portab
 
 **Scrubbing protocol for Docker (v1):**
 
-Before calling `docker commit`, `DockerSandboxProvider::take_snapshot` executes three scrubbing steps:
+Before and during `docker commit`, the snapshot flow executes three scrubbing steps:
 
-1. `exec_as_root` to shred and remove `/etc/temps/credential-daemon.env`.
+1. `SnapshotService` calls `exec_as_root` to shred and remove `/etc/temps/credential-daemon.env` before stopping the sandbox.
 2. Zero every known-sensitive env-var value in the committed image config by passing `ENV KEY=` Dockerfile instructions via Docker's `changes` query parameter (`docker commit --change 'ENV KEY='` for each sensitive key). This **zeroes** each value to an empty string — it is the only mechanism the Docker commit API actually supports. The Docker Engine silently ignores the `ContainerConfig` body's `env` field (verified against a real Docker daemon: passing `ContainerConfig { env: ... }` to the commit API has zero effect on the committed image's `Config.Env`). Each sensitive key remains present in the committed image with an empty value (`KEY=`); the Docker commit API has no mechanism to delete an env entry entirely.
 3. Verify scrubbing by inspecting the committed image's `Config.Env` and rejecting the snapshot if any known-sensitive key has a **non-empty** value (reject, not silently proceed). A key present with an empty value (`KEY=`) is considered successfully scrubbed.
 
 The credential daemon env file scrubbing leaves a window between the scrub exec and the commit during which the file is gone but the running credential daemon may still hold the token in memory. This is acceptable for snapshot purposes — the window affects only the next git operation inside that sandbox, not the snapshot artifact. If the sandbox continues running after snapshot, the injector must re-write the credential file (the service layer handles this by re-running the credential injection step after snapshot completes, if the sandbox was left running).
 
 **The home volume is not snapshotted.** `docker commit` captures only the container's own writable layer — named volumes mounted at `/home/temps` are excluded. This is the correct behaviour for AI CLI credentials, shell history, and Claude auth tokens. The ADR documents this explicitly so no future refactor quietly changes the behaviour (e.g., switching to `docker export` which *does* include mount points of `/proc`, though not bind mounts — the distinction is subtle and must be guarded by a test).
+
+**Firecracker does not copy the raw root disk.** Unlinking or shredding a file on ext4 is not proof that its blocks are unrecoverable. Firecracker snapshot capture therefore exports only live filesystem entries, removes runtime credential directories, and creates a fresh ext4 artifact. User-authored files under `/workspace` are intentionally preserved; platform-injected `/root` and `/etc/temps` state is not.
+
+**Restore integrity.** Every primary and companion artifact is SHA-256 verified before restore. Docker additionally records the immutable image ID and refuses to trust a mutable daemon tag without an exact ID match. Missing integrity metadata fails closed.
 
 **Security sign-off.** The scrubbing logic and the test that verifies no known-credential-key appears in a committed snapshot image must be reviewed by the `security-auditor` agent before this ADR is marked Accepted and the PR is merged.
 
@@ -134,11 +148,11 @@ sandbox_snapshots
   label           VARCHAR  -- user-supplied human label
   status          VARCHAR NOT NULL  -- 'creating' | 'ready' | 'failed' | 'deleted'
   backend         VARCHAR NOT NULL  -- 'docker' | 'firecracker' -- cross-backend restore is rejected
-  content_digest  VARCHAR NOT NULL  -- sha256 of the artifact tarball, the dedup key
+  content_digest  VARCHAR NOT NULL  -- sha256 logical snapshot key, used for dedup
   content_path    VARCHAR NOT NULL  -- absolute path on the host filesystem
   size_bytes      BIGINT NOT NULL DEFAULT 0
-  image_ref       VARCHAR  -- for Docker: the daemon image tag temps-snapshot/<public_id>:latest
-  metadata        JSONB  -- reserved for backend-specific fields without migrations
+  image_ref       VARCHAR  -- for Docker: the daemon image tag temps-snapshot/<logical_digest>:latest
+  metadata        JSONB  -- primary digest, immutable image ID, companion metadata
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
   updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 ```
@@ -153,7 +167,7 @@ Wait — actually, to simplify: the source_sandbox_id nullable column with no FK
 - `failed` — the operation failed; the row is kept for audit; artifact may be absent.
 - `deleted` — soft-deleted; artifact removed from disk. Hard deletes are not used for audit safety.
 
-**Index:** `(user_id, status, created_at DESC)` — the primary list query pattern. `(content_digest)` unique partial index over `status = 'ready'` for dedup lookups.
+**Index:** `(user_id, status, created_at DESC)` — the primary list query pattern. `(content_digest)` non-unique partial index over `status = 'ready'` accelerates dedup lookups while allowing separate user-owned rows to share one artifact.
 
 **Relation to `sandboxes`:** "create sandbox from snapshot" does not add a FK from `sandboxes` to `sandbox_snapshots`. A sandbox created from a snapshot is thereafter indistinguishable from one created from a plain image — it does not "belong" to the snapshot in any ongoing sense. The snapshot's `public_id` may be recorded in `sandboxes.metadata` for display, but without a referential constraint (destroying the snapshot must not affect an already-running sandbox that was created from it).
 
@@ -179,8 +193,8 @@ POST   /v1/sandboxes          (existing — gains optional `from_snapshot` field
 **`POST /v1/sandboxes/{sandbox_id}/snapshots`** — takes a snapshot of the sandbox identified by `sandbox_id`. Request body: `{ "label": "optional human name" }`. The handler:
 1. Verifies the caller owns the sandbox.
 2. Creates a `sandbox_snapshots` row in `creating` status.
-3. Calls `SnapshotService::take_snapshot` which: stops the sandbox if running (to quiesce the filesystem), calls `provider.take_snapshot(handle, label)`, scrubs credentials (see §4), writes the artifact, verifies the digest, transitions the row to `ready`.
-4. Returns `202 Accepted` with the snapshot row (status `creating`) immediately. The snapshot operation is long — potentially minutes for a large container. The actual work runs in a background task (using the existing `JobTracker` pattern) and the caller polls the snapshot row for status. The response includes a `Location` header pointing at the snapshot resource.
+3. Calls `SnapshotService::create_snapshot`, which stops the sandbox, scrubs credentials, calls `provider.take_snapshot(handle, label, remaining_quota)`, persists verified artifact metadata, and transitions the row to `ready`.
+4. Returns the completed snapshot row. Capture currently runs in the request lifecycle; moving it to a durable background job remains future work.
 
 The sandbox must be running when the snapshot is requested (v1 constraint — stopped-sandbox snapshots are deferred to v2). The sandbox is stopped for the duration of the snapshot operation (for Docker commit consistency) and restarted when the snapshot completes. The caller sees the sandbox status flip to `stopped` and back to `running` as a normal lifecycle event.
 
@@ -188,9 +202,9 @@ The sandbox must be running when the snapshot is requested (v1 constraint — st
 
 **`GET /v1/sandbox-snapshots/{snapshot_id}`** — fetch a single snapshot row.
 
-**`DELETE /v1/sandbox-snapshots/{snapshot_id}`** — soft-deletes the snapshot row (sets `status = 'deleted'`) and, if no other `ready` row shares the `content_digest`, removes the tarball from disk. Idempotent.
+**`DELETE /v1/sandbox-snapshots/{snapshot_id}`** — soft-deletes the snapshot row (sets `status = 'deleted'`) and, if no other `ready` row shares the `content_digest`, removes its primary/companion artifact set and content-addressed Docker tag. Idempotent.
 
-**`GET /v1/sandbox-snapshots/storage-summary`** — returns `{ total_bytes: u64, snapshot_count: u32, quota_bytes: u64, available_disk_bytes: u64 }`. Used by the UI to show a storage warning and by the service to enforce the per-user quota.
+**`GET /v1/sandbox-snapshots/storage-summary`** — returns `{ total_bytes: u64, snapshot_count: u32, quota_bytes: u64, available_disk_bytes: Option<u64> }`. `null` currently means host availability is unknown. The response is used by the UI to show storage usage; the service enforces the per-user quota from persisted ready-snapshot sizes.
 
 **`POST /v1/sandboxes` gains `from_snapshot`:**
 
@@ -205,7 +219,7 @@ The sandbox must be running when the snapshot is requested (v1 constraint — st
 
 When `from_snapshot` is set:
 - `image` must be absent (error 400 if both are set).
-- `source` may still be set to re-seed the work dir from a git repo *after* the snapshot boots, but this is unusual and the documentation should discourage it.
+- `source` must be absent because the snapshot already owns workspace contents. `project_id` remains valid attribution but does not implicitly clone over the restored workspace.
 - The service resolves the snapshot row, verifies the caller owns it (or it is project-scoped and the caller has project access), verifies `status == 'ready'` and `backend` matches the target backend, calls `provider.create_from_snapshot(artifact, config)`, and proceeds as a normal sandbox create from there.
 - Cross-backend restore is rejected with 422: a Docker snapshot artifact cannot be used with a Firecracker backend.
 
@@ -272,9 +286,9 @@ A future ADR could optionally make workspace sandbox suspension (ADR-036 §2, th
 
 ### 9. Phasing
 
-**v1 (this ADR, first PR):** Docker backend only. Snapshot via `docker commit` + tarball export. Storage in `$TEMPS_DATA_DIR/snapshots/`. Credential scrubbing for env vars and `/etc/temps/credential-daemon.env`. Per-user quota enforcement. Full API surface (create, list, show, delete, storage-summary, create-from-snapshot). CLI parity. Security auditor sign-off on scrubbing logic and test coverage. No Firecracker snapshot, no S3/R2 export, no automatic GC, no cross-host portability.
+**v1:** Docker snapshot via committed image export plus an explicit workspace companion. Storage in `$TEMPS_DATA_DIR/snapshots/`, credential scrubbing, hard per-capture quota enforcement, and restore-time integrity verification.
 
-**v2 (separate ADR, after Firecracker v1 is in production):** Firecracker snapshot/restore via the Firecracker snapshot API. Requires restore-safety work: guest entropy re-seed on restore, clock skew handling, network device re-attach, Firecracker version pin enforcement (snapshot format is not portable across Firecracker major versions). The `SnapshotArtifact` struct already carries `backend` to distinguish Docker vs Firecracker artifacts; no DB migration needed for v2 if `metadata` JSONB carries the Firecracker-specific fields (memory snapshot path, VM state path, disk diff paths).
+**v2 (current):** Firecracker persistent filesystem snapshot/restore via sanitized ext4 reconstruction. This deliberately does not use Firecracker's live memory snapshot API; memory-state pause remains deferred.
 
 **v3 (future):** Remote artifact store (S3 / R2) for off-host backup and cross-host restore. The content-addressed design (`content_digest` as canonical key) is compatible with a remote store without schema migration. Automatic GC with per-user retention policies. Sharing snapshots across a team (project-scoped snapshots visible to all project members).
 
@@ -297,17 +311,17 @@ A future ADR could optionally make workspace sandbox suspension (ADR-036 §2, th
 
 ### Negative
 
-- Disk consumption is the primary operational risk. A single large snapshot (a workspace with build outputs) can be 5–10 GB. The per-user quota is a soft cap enforced at API level, not a hard block at the filesystem level. An operator on a small host (cpx22, 40 GB disk) can exhaust disk with a handful of unmanaged snapshots. The storage-summary endpoint and UI warning are the only guards in v1.
+- Disk consumption remains the primary operational risk. Capture uses a hard remaining-quota limit and cleanup on failure, but operators still need enough headroom for temporary files during capture.
 - Snapshot creates a stop-restart cycle visible to the sandbox user. For a workspace with a live terminal session, the terminal connection drops during snapshot and must be re-established after restart. ADR-036's heartbeat mechanism (`touch` every 20s on attached terminal) means the sandbox was not being swept while in use, but the snapshot-induced stop looks like a sweep to the terminal client. The API response must communicate this clearly.
 - The scrubbing step adds latency before commit. For a container with many env vars, inspecting and rewriting the committed image config takes seconds. This is bounded and acceptable for an async operation.
-- Docker image tags (`temps-snapshot/<public_id>:latest`) accumulate in the local daemon. The `DELETE` endpoint must also call `docker rmi` on the image tag. The `storage-summary` endpoint should report daemon image size separately from tarball size to give operators a complete picture.
+- Docker image tags (`temps-snapshot/<logical_digest>:latest`) accumulate in the local daemon. The final shared-reference `DELETE` also removes the tag. A future storage summary should report daemon image size separately from file-artifact size to give operators a complete picture.
 - Cross-backend restore rejection (Docker snapshot → Firecracker backend) is a UX friction point for operators who mix backends. The error message must explain the incompatibility and suggest re-snapping from a sandbox on the target backend.
 
 ### Risks
 
 - **Credential leakage into snapshot.** The scrubbing protocol covers known credential paths. Unknown paths (e.g., a user's own `.netrc`, ssh keys written to `/root/.ssh` inside the container by a user script) are not scrubbed. The documentation must make clear that user-written secrets outside the known paths are the user's responsibility to remove before snapshotting. A pre-snapshot warning in the UI ("review that no secrets are stored in the container filesystem before creating a snapshot") is the minimum mitigation.
 - **Digest collision.** SHA-256 collision is effectively impossible in practice, but the dedup logic must handle the case where two different content byte streams produce the same digest hash (the test should verify this path returns an error rather than silently corrupting a stored artifact).
-- **Partial artifact.** If the server crashes between writing the tarball and updating the `sandbox_snapshots` row to `ready`, a dangling tarball is left on disk. A startup sweep that removes tarballs with no corresponding `ready` row (scoped to files older than 1 hour, to avoid racing with in-progress creates) handles this. The `snapshot_id` is embedded in the temp path until rename, so the sweep can identify orphans.
+- **Partial artifact.** Provider artifacts publish before the database row becomes `ready`. Ordinary post-capture errors mark the row failed and remove the artifact set only after proving that no ready row references its digest. If that reference query fails—or the process crashes in the publication window—the immutable artifact is retained rather than risking deletion of shared data. A grace-period startup reconciler for such crash orphans remains future work.
 - **`docker commit` on a paused container.** Docker allows commit on a stopped container cleanly. On a running container, there is a TOCTOU window. v1 requires the sandbox to be stopped before commit; the service enforces this.
 
 ## Alternatives Considered
@@ -330,12 +344,12 @@ Replace the current container stop/start with Firecracker-style memory snapshots
 
 ## Implementation Notes
 
-- **Affected crates:** `crates/temps-entities` (new entity + migration), `crates/temps-sandbox` (new service, new handler, error type extension), `crates/temps-agents` (two new default-impl methods on `SandboxProvider`, `SnapshotArtifact` struct, concrete impl in `docker.rs`), `apps/temps-cli` (new subcommands), `crates/temps-migrations` (new migration).
+- **Affected crates:** `crates/temps-entities`, `crates/temps-sandbox`, `crates/temps-agents`, and `crates/temps-migrations`.
 - **Migration needed:** yes — new `sandbox_snapshots` table and index.
-- **Breaking changes:** no — new methods on `SandboxProvider` have default implementations returning `NotSupported`; existing backends compile unchanged. The new `from_snapshot` field on `CreateSandboxRequest` is optional and `#[serde(default)]`.
-- **Provider boundary check:** `scripts/check-provider-boundary.sh` must continue to pass — `temps-sandbox` must not import `bollard` directly. The snapshot logic that calls `docker commit` lives in `crates/temps-agents/src/sandbox/docker.rs` behind the `SandboxProvider::take_snapshot` method. The service in `temps-sandbox` calls the trait method only.
+- **Compatibility:** the API and provider trait additions are backward-compatible. Docker snapshots created before this revision lack the immutable image ID and workspace companion metadata required for safe, complete restore. They remain listable and deletable, but restore returns an explicit 422 `LegacyArtifactUnsupported`; users must create a new snapshot from the source sandbox after upgrading. Temps deliberately does not trust a legacy mutable Docker tag or silently restore without the old workspace.
+- **Provider boundary:** `temps-sandbox` does not depend on or import `bollard`. The snapshot logic that calls `docker commit` lives in `crates/temps-agents/src/sandbox/docker.rs` behind `SandboxProvider`; the service crate calls trait methods only.
 - **Security auditor sign-off required** on the credential scrubbing logic and the test that verifies no known-sensitive env key survives a snapshot commit.
-- **Eval harness** in `temps-agents/tests/` must gain snapshot test cases (take snapshot, delete original sandbox, create from snapshot, verify exec works) gated on Docker availability, following the existing pattern.
+- **Docker integration coverage** extends the provider lifecycle test with take snapshot → delete original sandbox/image tag → import and create from snapshot → verify container-layer and workspace files through exec, gated on Docker availability. Firecracker capture is exercised with real ext4 tools; boot/exec restore remains gated to Linux KVM CI.
 
 ## References
 
@@ -343,7 +357,7 @@ Replace the current container stop/start with Firecracker-style memory snapshots
 - ADR-009 — sandbox API versioning (optional `from_snapshot` field is non-breaking)
 - ADR-010 — provider boundary traits (why snapshot logic lives in `docker.rs` not `temps-sandbox`)
 - ADR-013 — sandbox egress credential proxy (threat model for credential scrubbing)
-- ADR-029 — Firecracker sandbox backend (why Firecracker snapshot is deferred; §7 "Pause/resume v2")
+- ADR-029 — Firecracker sandbox backend (persistent disk format and deferred memory-state pause)
 - ADR-036 — persistent workspace sandboxes (disk as unbounded resource; workspace lifecycle context)
 - `crates/temps-agents/src/sandbox/mod.rs` — `SandboxProvider` trait (object-safety constraint; default-impl pattern)
 - `crates/temps-agents/src/sandbox/docker.rs` — reference backend implementation

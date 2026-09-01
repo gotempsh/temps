@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Weekly digest scheduler
 //!
 //! This module implements the background scheduler for weekly digest emails.

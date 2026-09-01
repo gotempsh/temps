@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Mock provider servers for integration testing.
 //!
 //! Provides lightweight axum-based HTTP servers that simulate:

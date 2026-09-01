@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Protobuf decoding and decompression for OTLP payloads.
 //!
 //! Handles gzip and zstd decompression, then decodes protobuf

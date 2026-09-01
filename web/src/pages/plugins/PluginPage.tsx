@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { usePluginsContext } from '@/contexts/PluginsContext'
 import { resolvePluginIcon } from '@/lib/pluginIcons'
 import { Loader2 } from 'lucide-react'

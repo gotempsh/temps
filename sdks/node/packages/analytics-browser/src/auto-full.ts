@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Full build entry: force bun to inline rrweb + @rrweb/packer into this single-file IIFE.
 //
 // `@temps-sdk/analytics-core`'s barrel (index.ts) statically re-exports SessionRecorder, so

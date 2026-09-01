@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Redacts secrets from deployment logs before they're shown to a user as a
 //! starting draft for a failure report (see [`super::failure_report_service`]),
 //! or forwarded anywhere.

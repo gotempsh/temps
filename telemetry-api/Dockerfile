@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Bun telemetry-api — anonymous product-telemetry ingest for Temps.
 # Multi-stage: install deps with a cached layer, then a slim runtime.
 FROM oven/bun:1.3-alpine AS deps

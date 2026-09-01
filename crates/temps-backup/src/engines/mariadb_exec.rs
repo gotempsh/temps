@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared docker-exec helpers for the MariaDB backup engines
 //! (`mariadb_physical`, `mariadb_dump`).
 //!
@@ -153,7 +156,7 @@ pub struct BinlogCoord {
 /// Older builds omit the GTID clause. Returns `None` if no position line is
 /// present (e.g. binary logging disabled on the source).
 pub fn parse_binlog_position(stderr: &str) -> Option<BinlogCoord> {
-    // Anchor on "binlog position:" so we don't mis-match the bare word
+    // Anchor on "binlog position:" so we don't mismatch the bare word
     // "position" elsewhere in the log.
     let anchor = stderr.find("binlog position:")?;
     let tail = &stderr[anchor..];

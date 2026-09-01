@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /** Human-readable, non-secret description of an ambient host CLI login. */
 export function hostAuthLabel(authMethod?: string | null): string {
   switch (authMethod) {

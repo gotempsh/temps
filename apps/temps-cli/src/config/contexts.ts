@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * CLI contexts — one set of credentials per Temps server the user has
  * logged into. Lets the same workstation stay authenticated against

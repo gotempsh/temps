@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! MCP Proxy for Custom Tools
 //!
 //! Provides a lightweight MCP stdio server (written in JavaScript) that runs

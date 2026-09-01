@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use std::sync::Arc;
 
 use axum::{
@@ -8,10 +11,11 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use temps_auth::permission_guard;
 use temps_auth::permissions::Role;
 use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, require_sensitive_action};
 use temps_core::problemdetails::Problem;
+use temps_core::SensitiveAction;
 use temps_core::{AuditContext, AuditOperation, RequestMetadata};
 use temps_entities::teams;
 use utoipa::ToSchema;
@@ -409,6 +413,12 @@ pub async fn delete_team(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, UsersDelete);
+    require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteTeam { team_id },
+    )
+    .await?;
     // Deleting a team cascades away its project grants. The service refuses
     // when that would strip a project's last grant and silently re-open it,
     // unless the caller is an instance admin — the same bar `revoke` sets.

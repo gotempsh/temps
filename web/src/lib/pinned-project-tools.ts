@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 const PINNED_PROJECT_TOOLS_PREFIX = 'temps:pinned-project-tools:'
 
 export const PINNED_PROJECT_TOOLS_CHANGED = 'temps:pinned-project-tools-changed'

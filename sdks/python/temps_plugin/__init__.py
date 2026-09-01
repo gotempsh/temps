@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Temps Plugin SDK for Python.
 
 Build external plugins for the Temps platform that compile into

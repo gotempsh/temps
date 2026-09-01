@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { EnvironmentResponse, ProjectResponse } from '@/api/client'
 import {
   cancelDeploymentMutation,
@@ -128,7 +131,6 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
         }
         setSearchParams({}, { replace: true })
         initialDeploymentCountRef.current = null
-        toast.success('New deployment detected!')
       } else {
         // No new deployment yet, set up refresh interval
         if (!refreshIntervalRef.current) {
@@ -297,15 +299,17 @@ export function ProjectDeployments({ project }: { project: ProjectResponse }) {
     commit,
     tag,
     environmentId,
+    imageRef: editedImageRef,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
+    imageRef?: string
   }) => {
-    // docker_image projects re-pull the prebuilt image; git projects run the pipeline.
+    // docker_image projects re-pull the given image; git projects run the pipeline.
     if (project.source_type === 'docker_image') {
-      const ref = resolveImageRef()
+      const ref = editedImageRef?.trim() || resolveImageRef()
       if (!ref) {
         toast.error('No image reference found for this project')
         return

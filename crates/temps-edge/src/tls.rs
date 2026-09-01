@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Edge TLS: in-memory certificate store and Pingora TLS callback.
 //!
 //! Certificates are decrypted from ECIES bundles received during route sync

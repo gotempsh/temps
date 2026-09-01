@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * TEMPORARY dev-only switch to simulate a brand-new installation — no
  * projects, no Git connections, nothing set up — so we can build and fix the

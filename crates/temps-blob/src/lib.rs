@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! temps-blob: Blob storage service for Temps platform
 //!
 //! Provides S3-compatible blob storage with project isolation.

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Temps installer script - inspired by Bun's installation approach
 set -euo pipefail
 
@@ -277,7 +280,7 @@ verify_checksum "$tarball" "$temps_uri.sha256"
 
 info "Extracting temps..."
 
-tar -xzf "$tarball" -C "$bin_dir" ||
+tar -xzf "$tarball" -C "$bin_dir" temps ||
     error "Failed to extract temps"
 
 rm "$tarball" ||

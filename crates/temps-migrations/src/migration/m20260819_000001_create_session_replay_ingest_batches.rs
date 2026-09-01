@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to create the `session_replay_ingest_batches` table.
 //!
 //! Deduplication marker for session-replay event ingest. The browser SDK holds

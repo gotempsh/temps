@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * The first-ever e2e test for temps's direct-underlay multi-node clustering
  * feature. Nothing tests this today — only Rust unit tests with

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use arc_swap::ArcSwap;
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::collections::HashSet;

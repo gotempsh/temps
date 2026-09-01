@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Re-exports and service aggregation for the monitoring crate.
 //!
 //! The monitoring crate provides three main services:

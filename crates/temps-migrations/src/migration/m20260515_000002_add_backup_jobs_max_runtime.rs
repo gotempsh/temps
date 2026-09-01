@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration that adds `max_runtime_secs` to `backup_jobs`.
 //!
 //! Before this migration the runner used a single hard-coded constant

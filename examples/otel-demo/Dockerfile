@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # OpenTelemetry + error-tracking demo for Temps multi-node.
 # Same image runs as gateway or backend via the ROLE env var.
 FROM node:20-slim

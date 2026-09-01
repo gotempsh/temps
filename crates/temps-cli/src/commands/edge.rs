@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `temps edge` subcommand — starts a lightweight edge CDN proxy node.
 //!
 //! Connects to a Temps control plane, caches static assets locally, and

@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # One-shot mTLS verification harness (ADR-020 WS-2.1). Brings up CP, enables
 # require_mtls BEFORE the worker joins, joins the worker (which then gets a
 # signed cert + serves mTLS), and verifies the agent's mutual TLS positively

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Git operations using libgit2 (git2 crate).
 //!
 //! Provides safe, typed wrappers around common git operations

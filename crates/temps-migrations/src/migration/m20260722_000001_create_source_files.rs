@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to add raw source-file storage for error-tracking source context.
 //!
 //! Source maps (the `source_maps` table) only cover JavaScript/TypeScript: the

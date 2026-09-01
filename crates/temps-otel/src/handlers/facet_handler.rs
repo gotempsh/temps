@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for OTel span attribute facet management.
 //!
 //! Facets allow admins to mark any OTel attribute key as "faceted", which pre-populates

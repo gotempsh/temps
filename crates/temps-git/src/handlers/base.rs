@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use super::repositories::{
     check_commit_exists, get_branches_by_repository_id, get_repository_branches,
     get_repository_tags, get_tags_by_repository_id, list_commits_by_repository_id,
@@ -20,7 +23,8 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_auth::{permission_check, Permission, RequireAuth};
+use temps_auth::{permission_check, require_sensitive_action, Permission, RequireAuth};
+use temps_core::SensitiveAction;
 use tracing::info;
 
 use temps_core::problemdetails::{new as problem_new, Problem};
@@ -2887,6 +2891,12 @@ pub async fn delete_git_provider(
     Path(provider_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitProvidersDelete);
+    require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteGitProvider { provider_id },
+    )
+    .await?;
 
     state
         .git_provider_manager
@@ -3048,6 +3058,12 @@ pub async fn delete_connection(
     Path(connection_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_check!(auth, Permission::GitConnectionsDelete);
+    require_sensitive_action(
+        state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteGitConnection { connection_id },
+    )
+    .await?;
 
     state
         .git_provider_manager

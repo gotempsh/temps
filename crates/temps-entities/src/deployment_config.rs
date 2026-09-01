@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared deployment configuration for projects and environments
 //!
 //! This module defines configuration structures that can be shared between

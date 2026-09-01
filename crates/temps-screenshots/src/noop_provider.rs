@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! No-op Screenshot Provider
 //!
 //! A provider that does nothing - useful for environments where screenshots

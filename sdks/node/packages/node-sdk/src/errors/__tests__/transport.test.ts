@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { describe, it, expect, beforeEach, vi, afterEach } from 'vitest';
 import { HttpTransport, ConsoleTransport, parseDsn, createTransportFromDsn } from '../transport';
 import type { Event } from '../types';

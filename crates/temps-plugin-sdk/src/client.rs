@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed client for querying the Temps platform over the channel.
 //!
 //! [`TempsClient`] is available on [`PluginContext`] and provides

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for the SEO Analyzer plugin.
 //!
 //! All business logic lives in [`SeoStore`] and [`crawl`] — handlers are thin

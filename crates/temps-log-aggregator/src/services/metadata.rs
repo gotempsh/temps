@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Log metadata service: manages log_chunks and log_events in the database
 //!
 //! Provides CRUD operations for chunk metadata and bulk insert for indexable log events.

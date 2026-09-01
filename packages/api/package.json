@@ -27,7 +27,7 @@
   },
   "sideEffects": false,
   "scripts": {
-    "generate": "openapi-ts",
+    "generate": "openapi-ts && python3 ../../scripts/source_attribution.py annotate packages/api/src",
     "build": "tsc -p tsconfig.build.json",
     "prepublishOnly": "bun run generate && bun run build",
     "typecheck": "tsc --noEmit"

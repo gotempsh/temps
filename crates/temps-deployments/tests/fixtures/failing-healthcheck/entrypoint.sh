@@ -1,4 +1,7 @@
 #!/bin/bash
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 
 # This script simulates an application that starts but fails to serve HTTP requests
 # It will cause health check timeouts in the deployment job

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Remote node deployer — implements `ContainerDeployer` and `ImageBuilder`
 //! by calling the agent's HTTP API on a remote worker node.
 //!
@@ -15,6 +18,10 @@ use crate::{
     ContainerInfo, ContainerStats, DeployRequest, DeployResult, DeployerError, ImageBuilder,
     ImageInfo,
 };
+
+/// Slightly exceeds the worker's 30-minute queue-and-import deadline so the
+/// control plane receives the worker's contextual timeout response.
+const IMAGE_IMPORT_REQUEST_TIMEOUT: Duration = Duration::from_secs(31 * 60);
 
 /// Response envelope from the agent API.
 #[derive(Deserialize)]
@@ -481,7 +488,19 @@ impl ImageBuilder for RemoteNodeDeployer {
             ))
         })?;
 
-        let file_size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+        let file_size = file
+            .metadata()
+            .await
+            .map_err(|source| {
+                BuilderError::IoError(std::io::Error::new(
+                    source.kind(),
+                    format!(
+                        "Failed to read image archive metadata for {:?}: {source}",
+                        image_path
+                    ),
+                ))
+            })?
+            .len();
 
         let stream = tokio_util::codec::FramedRead::new(file, tokio_util::codec::BytesCodec::new());
         let body = reqwest::Body::wrap_stream(stream.map_ok(|b| b.freeze()));
@@ -491,7 +510,9 @@ impl ImageBuilder for RemoteNodeDeployer {
             .client
             .post(&url)
             .bearer_auth(&self.token)
+            .timeout(IMAGE_IMPORT_REQUEST_TIMEOUT)
             .header("content-type", "application/x-tar")
+            .header(reqwest::header::CONTENT_LENGTH, file_size)
             .header("x-image-tag", tag)
             .body(body)
             .send()

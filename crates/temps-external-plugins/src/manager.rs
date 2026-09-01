@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! External plugin process manager.
 //!
 //! Handles discovering, spawning, handshaking, health-checking, and

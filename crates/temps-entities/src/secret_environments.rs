@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Junction table linking secrets to specific environments.
 //!
 //! Mirrors `env_var_environments`: when a secret is scoped to multiple

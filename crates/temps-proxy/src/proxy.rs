@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Proxy request pipeline for the Temps reverse proxy.
 //!
 //! # Hot-path invariant
@@ -39,14 +42,17 @@ use crate::service::proxy_log_batch_writer::{
     ProxyLogBatchHandle, TrackingBatchHandle, TrackingEvent,
 };
 use crate::service::proxy_log_service::CreateProxyLogRequest;
+use crate::static_file_serving::{
+    bounded_cas_etag, bounded_log_value, cap_static_chunk, if_none_match_matches, metadata_etag,
+    open_static_file, opened_cas_size_matches, read_static_chunk, static_not_found_contract,
+    unavailable_outcome, StaticFileServeOutcome, STATIC_NOT_FOUND_BODY,
+};
 use crate::tls_fingerprint;
 use crate::traits::*;
 use async_trait::async_trait;
 use axum::http::header;
 use bytes::Bytes;
 use cookie::Cookie;
-use flate2::write::GzEncoder;
-use flate2::Compression;
 use pingora::http::StatusCode;
 use pingora::Error;
 use pingora_core::{
@@ -57,9 +63,9 @@ use pingora_http::ResponseHeader;
 use pingora_proxy::{FailToProxy, ProxyHttp, Session as PingoraSession};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
 use std::collections::HashMap;
-use std::io::Write;
 use std::sync::Arc;
 use std::time::Instant;
+use temps_core::static_files::{normalize_static_request_path, MAX_PUBLIC_STATIC_ASSET_BYTES};
 use temps_database::DbConnection;
 use temps_entities::{deployments, domains, environments, projects};
 use tracing::{debug, error, info, warn};
@@ -438,11 +444,32 @@ fn should_redirect_to_https(
     env_force_https.unwrap_or_else(host_has_cert)
 }
 
-fn deployment_asset_path_matches(
-    current_deployment_slug: Option<&str>,
+fn deployment_asset_scope(
+    current_deployment_slug: &str,
+    current_environment_id: i32,
+    current_deployment_id: i32,
+    source_deployment_slug: Option<&str>,
+    source_environment_id: Option<i32>,
+    source_deployment_id: Option<i32>,
     requested_deployment_slug: &str,
-) -> bool {
-    current_deployment_slug == Some(requested_deployment_slug)
+) -> Option<(i32, i32)> {
+    if current_deployment_slug == requested_deployment_slug {
+        return Some((current_environment_id, current_deployment_id));
+    }
+
+    (source_deployment_slug == Some(requested_deployment_slug))
+        .then(|| Some((source_environment_id?, source_deployment_id?)))
+        .flatten()
+}
+
+fn legacy_deployment_asset_scope(
+    current_deployment_slug: &str,
+    origin: &crate::service::static_asset_lookup::LegacyAssetOrigin,
+    requested_deployment_slug: &str,
+) -> Option<(i32, i32)> {
+    (requested_deployment_slug == current_deployment_slug
+        || requested_deployment_slug == origin.slug)
+        .then_some((origin.environment_id, origin.deployment_id))
 }
 
 fn inherited_https_policy(production_https: bool, host_has_cert: bool) -> bool {
@@ -485,15 +512,63 @@ fn should_apply_production_https_default(
 #[cfg(test)]
 mod deployment_asset_scope_tests {
     use super::{
-        deployment_asset_path_matches, inherited_https_policy,
+        deployment_asset_scope, inherited_https_policy, legacy_deployment_asset_scope,
         should_apply_production_https_default, should_redirect_to_https,
     };
+    use crate::service::static_asset_lookup::LegacyAssetOrigin;
 
     #[test]
-    fn prefixed_asset_must_name_the_current_deployment() {
-        assert!(deployment_asset_path_matches(Some("deploy-a"), "deploy-a"));
-        assert!(!deployment_asset_path_matches(Some("deploy-a"), "deploy-b"));
-        assert!(!deployment_asset_path_matches(None, "deploy-a"));
+    fn prefixed_asset_resolves_current_or_reused_source_artifact() {
+        assert_eq!(
+            deployment_asset_scope("deploy-a", 10, 20, None, None, None, "deploy-a"),
+            Some((10, 20))
+        );
+        assert_eq!(
+            deployment_asset_scope(
+                "promoted-b",
+                11,
+                21,
+                Some("deploy-a"),
+                Some(10),
+                Some(20),
+                "deploy-a",
+            ),
+            Some((10, 20))
+        );
+        assert_eq!(
+            deployment_asset_scope(
+                "promoted-b",
+                11,
+                21,
+                Some("deploy-a"),
+                Some(10),
+                Some(20),
+                "unknown",
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn legacy_prefixed_asset_maps_both_old_current_and_original_slugs_to_origin() {
+        let origin = LegacyAssetOrigin {
+            deployment_id: 10,
+            environment_id: 20,
+            slug: "original-build".to_string(),
+        };
+
+        assert_eq!(
+            legacy_deployment_asset_scope("legacy-promotion", &origin, "legacy-promotion"),
+            Some((20, 10))
+        );
+        assert_eq!(
+            legacy_deployment_asset_scope("legacy-promotion", &origin, "original-build"),
+            Some((20, 10))
+        );
+        assert_eq!(
+            legacy_deployment_asset_scope("legacy-promotion", &origin, "unrelated"),
+            None
+        );
     }
 
     #[test]
@@ -1197,6 +1272,7 @@ impl LoadBalancer {
         method: &str,
         accept: Option<&str>,
         fetch_destination: Option<&str>,
+        upgrade_insecure_requests: Option<&str>,
     ) -> bool {
         // API responses never represent a browser page, even when a framework
         // returns an HTML error document for an API-prefixed route.
@@ -1214,7 +1290,12 @@ impl LoadBalancer {
         // navigation with both an HTML Accept value and Fetch Metadata that
         // identifies a top-level document. Requiring both excludes generic
         // HTTP clients, framework data fetches, and embedded resources.
-        if !is_browser_document_request(method, accept, fetch_destination) {
+        if !is_browser_document_request(
+            method,
+            accept,
+            fetch_destination,
+            upgrade_insecure_requests,
+        ) {
             return false;
         }
 
@@ -1254,6 +1335,11 @@ impl LoadBalancer {
             .headers
             .get("sec-fetch-dest")
             .and_then(|value| value.to_str().ok());
+        let upgrade_insecure_requests = session
+            .req_header()
+            .headers
+            .get("upgrade-insecure-requests")
+            .and_then(|value| value.to_str().ok());
 
         if Self::should_track_page(
             &ctx.path,
@@ -1261,6 +1347,7 @@ impl LoadBalancer {
             &ctx.method,
             request_accept,
             fetch_destination,
+            upgrade_insecure_requests,
         ) {
             self.ensure_visitor_session(ctx).await;
         }
@@ -2060,101 +2147,50 @@ impl LoadBalancer {
         builder.build().to_string()
     }
 
-    /// Serve a static file from the filesystem
-    /// Returns Ok(true) if file was served, Ok(false) if file not found, Err on error
+    /// Serve a static file from the filesystem using fixed-size response chunks.
+    ///
+    /// Filesystem/path failures are deliberately returned as a uniform not-found
+    /// outcome. Only response-protocol and mid-stream IO failures become Pingora
+    /// errors after a response has started.
     async fn serve_static_file(
         &self,
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         static_dir: &str,
-    ) -> Result<bool> {
-        use std::path::PathBuf;
-        use tokio::fs;
-
-        let mut requested_path = ctx.path.trim_start_matches('/').to_owned();
-
-        // Handle root path -> index.html
-        if requested_path.is_empty() {
-            requested_path = "index.html".to_owned();
-        }
-
-        // Security: ALWAYS join with base static directory
-        // Never trust absolute paths from database - always enforce that static files
-        // must be within the configured static directory to prevent path traversal
-        let static_dir_path = PathBuf::from(static_dir);
-
-        // Strip leading slash if present (treat all paths as relative)
-        let relative_static_dir = static_dir_path
-            .strip_prefix("/")
-            .unwrap_or(&static_dir_path);
-
-        // Always join with base static directory from config
-        let absolute_static_dir = self.config_service.static_dir().join(relative_static_dir);
-
-        let file_path = absolute_static_dir.join(&requested_path);
-
-        // Security check: ensure the resolved path is still within static_dir
-        let canonical_static_dir = fs::canonicalize(&absolute_static_dir).await.map_err(|e| {
-            Error::because(
-                pingora::ErrorType::FileOpenError,
-                format!("Failed to canonicalize static dir: {}", e),
-                e,
-            )
-        })?;
-
-        // Try to canonicalize the file path, but handle the case where it doesn't exist
-        let canonical_file_path = match fs::canonicalize(&file_path).await {
-            Ok(path) => path,
-            Err(_) => {
-                // File doesn't exist - try with index.html for SPA routing
-                if !requested_path.contains('.') {
-                    // Likely a SPA route, serve index.html
-                    let index_path = absolute_static_dir.join("index.html");
-                    match fs::canonicalize(&index_path).await {
-                        Ok(path) => path,
-                        Err(_) => return Ok(false), // No index.html, file not found
-                    }
-                } else {
-                    return Ok(false); // File not found
-                }
+    ) -> Result<StaticFileServeOutcome> {
+        let mut opened = match open_static_file(
+            &self.config_service.static_dir(),
+            static_dir,
+            &ctx.path,
+        )
+        .await
+        {
+            Ok(opened) => opened,
+            Err(error) => {
+                debug!(
+                    request_path = %bounded_log_value(&ctx.path),
+                    stored_static_dir = %bounded_log_value(static_dir),
+                    failure = error.category(),
+                    "Static file request resolved to the uniform not-found response"
+                );
+                return Ok(unavailable_outcome(&error));
             }
         };
-
-        // Ensure the file is within the static directory (prevent path traversal)
-        if !canonical_file_path.starts_with(&canonical_static_dir) {
-            warn!(
-                "Path traversal attempt detected: {} -> {}",
-                requested_path,
-                canonical_file_path.display()
-            );
-            return Ok(false);
-        }
-
-        // Check if it's a directory -> serve index.html
-        let final_path = if canonical_file_path.is_dir() {
-            canonical_file_path.join("index.html")
-        } else {
-            canonical_file_path
-        };
-
-        // Read the file
-        let file_content = fs::read(&final_path).await.map_err(|e| {
-            Error::because(
-                pingora::ErrorType::FileOpenError,
-                format!("Failed to read file: {}", e),
-                e,
-            )
-        })?;
 
         // Resolve the actual response MIME before creating analytics state.
         // Static SPA fallbacks and extensionless paths otherwise look like
         // pages from the request path alone, including /api-style requests.
-        let content_type = Self::infer_content_type(final_path.to_str().unwrap_or("index.html"));
+        let content_type = opened
+            .canonical_path
+            .to_str()
+            .map(Self::infer_content_type)
+            .unwrap_or("application/octet-stream");
         self.ensure_static_visitor_session(session, ctx, content_type)
             .await;
 
-        // Generate ETag for cache validation
-        let etag = Self::generate_etag(&file_content);
+        // Metadata + immutable deployment identity produce the validator before
+        // body IO. Conditional requests therefore never read the file body.
+        let etag = metadata_etag(&opened.canonical_path, &opened.metadata);
 
         // Check If-None-Match header for 304 Not Modified response
         if let Some(if_none_match) = session
@@ -2163,14 +2199,14 @@ impl LoadBalancer {
             .get("if-none-match")
             .and_then(|v| v.to_str().ok())
         {
-            if if_none_match == etag {
+            if if_none_match_matches(if_none_match, &etag) {
                 debug!("ETag match - returning 304 Not Modified for: {}", ctx.path);
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
                 // Add cache headers
-                if Self::is_cacheable_static_asset(&requested_path) {
+                if Self::is_cacheable_static_asset(&ctx.path) {
                     resp.insert_header(
                         header::CACHE_CONTROL,
                         "public, max-age=31536000, immutable",
@@ -2188,63 +2224,19 @@ impl LoadBalancer {
 
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
-                return Ok(true);
+                return Ok(StaticFileServeOutcome::Served);
             }
         }
-
-        // Check if we should compress the content
-        let client_accepts_gzip = Self::accepts_gzip(session);
-        let should_compress =
-            client_accepts_gzip && Self::should_compress_content(content_type, file_content.len());
-
-        // Compress content if appropriate
-        let (final_content, is_compressed) = if should_compress {
-            match Self::compress_gzip(&file_content) {
-                Ok(compressed) => {
-                    // Only use compression if it actually reduces size
-                    if compressed.len() < file_content.len() {
-                        debug!(
-                            "Compressed {} from {} to {} bytes ({:.1}% reduction)",
-                            ctx.path,
-                            file_content.len(),
-                            compressed.len(),
-                            (1.0 - (compressed.len() as f64 / file_content.len() as f64)) * 100.0
-                        );
-                        (compressed, true)
-                    } else {
-                        debug!(
-                            "Skipping compression for {} - compressed size ({}) >= original ({})",
-                            ctx.path,
-                            compressed.len(),
-                            file_content.len()
-                        );
-                        (file_content, false)
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to compress {}: {:?}", ctx.path, e);
-                    (file_content, false)
-                }
-            }
-        } else {
-            (file_content, false)
-        };
 
         // Build response
         let mut resp = ResponseHeader::build(200, None)?;
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
-        resp.insert_header(header::CONTENT_LENGTH, final_content.len().to_string())?;
+        resp.insert_header(header::CONTENT_LENGTH, opened.metadata.len().to_string())?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
         resp.insert_header("ETag", &etag)?;
 
-        // Add compression header if compressed
-        if is_compressed {
-            resp.insert_header("Content-Encoding", "gzip")?;
-            resp.insert_header("Vary", "Accept-Encoding")?;
-        }
-
         // Add cache headers for static assets
-        if Self::is_cacheable_static_asset(&requested_path) {
+        if Self::is_cacheable_static_asset(&ctx.path) {
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
         } else {
             resp.insert_header(header::CACHE_CONTROL, "public, max-age=0, must-revalidate")?;
@@ -2253,13 +2245,46 @@ impl LoadBalancer {
         // Set visitor and session tracking cookies for static file responses
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
-        // Write response
+        // HEAD has the same metadata as GET and intentionally never reads a body.
         session.write_response_header(Box::new(resp), false).await?;
-        session
-            .write_response_body(Some(Bytes::from(final_content)), true)
-            .await?;
+        if ctx.method == "HEAD" {
+            session.write_response_body(None, true).await?;
+            return Ok(StaticFileServeOutcome::Served);
+        }
 
-        Ok(true)
+        let mut remaining = opened.metadata.len();
+        while remaining > 0 {
+            let mut chunk = read_static_chunk(&mut opened.file).await.map_err(|error| {
+                Error::because(
+                    pingora::ErrorType::FileOpenError,
+                    format!(
+                        "Failed to stream static file '{}' for request '{}'",
+                        opened.canonical_path.display(),
+                        ctx.path
+                    ),
+                    error,
+                )
+            })?;
+            if chunk.is_empty() {
+                return Err(Error::because(
+                    pingora::ErrorType::FileOpenError,
+                    format!(
+                        "Static file '{}' ended before its opened length for request '{}'",
+                        opened.canonical_path.display(),
+                        bounded_log_value(&ctx.path)
+                    ),
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "static file shrank while streaming",
+                    ),
+                ));
+            }
+            remaining -= cap_static_chunk(&mut chunk, remaining);
+            session.write_response_body(Some(chunk), false).await?;
+        }
+        session.write_response_body(None, true).await?;
+
+        Ok(StaticFileServeOutcome::Served)
     }
 
     /// Serve embedded WASM files for CAPTCHA solver
@@ -2350,7 +2375,14 @@ impl LoadBalancer {
         session: &mut PingoraSession,
         ctx: &mut ProxyContext,
         url_path: &str,
+        source_scope: Option<(i32, i32)>,
     ) -> Result<bool> {
+        // Apply the static-file publication policy only to CAS serving. Invalid
+        // container routes still fall through to their upstream unchanged.
+        if normalize_static_request_path(url_path).is_err() {
+            return Ok(false);
+        }
+
         let file_store = match &self.file_store {
             Some(fs) => fs,
             None => return Ok(false),
@@ -2358,50 +2390,76 @@ impl LoadBalancer {
 
         let scope = match (&ctx.project, &ctx.environment, &ctx.deployment) {
             (Some(project), Some(environment), Some(deployment)) => {
-                (project.id, environment.id, deployment.id)
+                let (environment_id, deployment_id) =
+                    source_scope.unwrap_or((environment.id, deployment.id));
+                (project.id, environment_id, deployment_id)
             }
             _ => return Ok(false),
         };
-        let content_hash = match self
+        let asset = match self
             .static_asset_lookup
-            .get_content_hash(scope.0, scope.1, scope.2, url_path)
+            .get_asset_metadata(scope.0, scope.1, scope.2, url_path)
             .await
         {
-            Some(hash) => hash,
+            Some(asset) => asset,
             None => return Ok(false),
         };
 
-        // Read blob from CAS by content hash
-        let data = match file_store.get_blob(&content_hash).await {
-            Ok(d) => d,
+        let Some(etag) = bounded_cas_etag(&asset.content_hash, asset.size_bytes) else {
+            warn!(
+                path = %url_path,
+                declared_size_bytes = asset.size_bytes,
+                maximum_size_bytes = MAX_PUBLIC_STATIC_ASSET_BYTES,
+                "CAS static asset has invalid or oversized metadata"
+            );
+            return Ok(false);
+        };
+
+        // Open first so 304/HEAD validate the actual blob size without reading
+        // body bytes or trusting stale/corrupt database metadata.
+        let mut opened = match file_store.open_blob(&asset.content_hash).await {
+            Ok(opened) => opened,
             Err(temps_file_store::FileStoreError::NotFound { .. }) => {
-                warn!(
-                    "CAS blob missing for hash {} (path: {})",
-                    &content_hash[..8],
-                    url_path
+                debug!(
+                    hash_prefix = asset.content_hash.get(..8).unwrap_or("<invalid>"),
+                    path = %bounded_log_value(url_path),
+                    "CAS blob is missing"
                 );
                 return Ok(false);
             }
-            Err(e) => {
-                debug!("CAS blob read failed for {}: {}", &content_hash[..8], e);
+            Err(error) => {
+                debug!(
+                    hash_prefix = asset.content_hash.get(..8).unwrap_or("<invalid>"),
+                    path = %bounded_log_value(url_path),
+                    reason = %error,
+                    "CAS blob open failed"
+                );
                 return Ok(false);
             }
         };
+        if !opened_cas_size_matches(asset.size_bytes, opened.size_bytes) {
+            warn!(
+                path = %bounded_log_value(url_path),
+                declared_size_bytes = asset.size_bytes,
+                actual_size_bytes = opened.size_bytes,
+                maximum_size_bytes = MAX_PUBLIC_STATIC_ASSET_BYTES,
+                "CAS static asset opened size violates bounded metadata"
+            );
+            return Ok(false);
+        }
 
         let content_type = Self::infer_content_type(url_path);
-
-        // ETag from content hash (fast, stable for immutable assets)
-        let etag = Self::generate_etag(&data);
         if let Some(if_none_match) = session
             .req_header()
             .headers
             .get("if-none-match")
-            .and_then(|v| v.to_str().ok())
+            .and_then(|value| value.to_str().ok())
         {
-            if if_none_match == etag {
+            if if_none_match_matches(if_none_match, &etag) {
                 let mut resp = ResponseHeader::build(StatusCode::NOT_MODIFIED, None)?;
                 resp.insert_header("ETag", &etag)?;
                 resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
+                resp.insert_header("X-Request-ID", &ctx.request_id)?;
                 self.set_tracking_cookies(session, &mut resp, ctx).await?;
                 session.write_response_header(Box::new(resp), false).await?;
                 session.write_response_body(None, true).await?;
@@ -2409,36 +2467,60 @@ impl LoadBalancer {
             }
         }
 
-        // Check if we should compress
-        let client_accepts_gzip = Self::accepts_gzip(session);
-        let should_compress =
-            client_accepts_gzip && Self::should_compress_content(content_type, data.len());
-
-        let (final_content, is_compressed) = if should_compress {
-            match Self::compress_gzip(&data) {
-                Ok(compressed) if compressed.len() < data.len() => (compressed, true),
-                _ => (data.to_vec(), false),
-            }
-        } else {
-            (data.to_vec(), false)
-        };
+        // HEAD uses opened-file metadata but performs no body read.
+        if ctx.method == "HEAD" {
+            let mut resp = ResponseHeader::build(StatusCode::OK, None)?;
+            resp.insert_header(header::CONTENT_TYPE, content_type)?;
+            resp.insert_header(header::CONTENT_LENGTH, asset.size_bytes.to_string())?;
+            resp.insert_header("ETag", &etag)?;
+            resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
+            resp.insert_header("X-Request-ID", &ctx.request_id)?;
+            self.set_tracking_cookies(session, &mut resp, ctx).await?;
+            session.write_response_header(Box::new(resp), false).await?;
+            session.write_response_body(None, true).await?;
+            return Ok(true);
+        }
 
         let mut resp = ResponseHeader::build(200, None)?;
         resp.insert_header(header::CONTENT_TYPE, content_type)?;
-        resp.insert_header(header::CONTENT_LENGTH, final_content.len().to_string())?;
+        resp.insert_header(header::CONTENT_LENGTH, opened.size_bytes.to_string())?;
         resp.insert_header("ETag", &etag)?;
         resp.insert_header(header::CACHE_CONTROL, "public, max-age=31536000, immutable")?;
         resp.insert_header("X-Request-ID", &ctx.request_id)?;
-        if is_compressed {
-            resp.insert_header("Content-Encoding", "gzip")?;
-            resp.insert_header("Vary", "Accept-Encoding")?;
-        }
         self.set_tracking_cookies(session, &mut resp, ctx).await?;
 
         session.write_response_header(Box::new(resp), false).await?;
-        session
-            .write_response_body(Some(Bytes::from(final_content)), true)
-            .await?;
+        let mut remaining = opened.size_bytes;
+        while remaining > 0 {
+            let mut chunk = read_static_chunk(opened.reader.as_mut())
+                .await
+                .map_err(|error| {
+                    Error::because(
+                        pingora::ErrorType::FileOpenError,
+                        format!(
+                            "Failed to stream CAS static asset for request '{}'",
+                            bounded_log_value(url_path)
+                        ),
+                        error,
+                    )
+                })?;
+            if chunk.is_empty() {
+                return Err(Error::because(
+                    pingora::ErrorType::FileOpenError,
+                    format!(
+                        "CAS static asset ended before its opened length for request '{}'",
+                        bounded_log_value(url_path)
+                    ),
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "CAS static asset shrank while streaming",
+                    ),
+                ));
+            }
+            remaining -= cap_static_chunk(&mut chunk, remaining);
+            session.write_response_body(Some(chunk), false).await?;
+        }
+        session.write_response_body(None, true).await?;
 
         Ok(true)
     }
@@ -2456,65 +2538,6 @@ impl LoadBalancer {
         cacheable_patterns
             .iter()
             .any(|pattern| path.contains(pattern))
-    }
-
-    /// Generate ETag from file content using SHA-256 hash
-    fn generate_etag(content: &[u8]) -> String {
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
-
-        let mut hasher = DefaultHasher::new();
-        content.hash(&mut hasher);
-        let hash = hasher.finish();
-        format!("W/\"{:x}\"", hash)
-    }
-
-    /// Check if content should be compressed based on Content-Type
-    fn should_compress_content(content_type: &str, content_length: usize) -> bool {
-        // Don't compress if content is too small (overhead not worth it)
-        if content_length < 1024 {
-            return false;
-        }
-
-        // Compress text-based content types
-        let compressible_types = [
-            "text/html",
-            "text/css",
-            "text/javascript",
-            "text/plain",
-            "text/xml",
-            "application/javascript",
-            "application/json",
-            "application/xml",
-            "application/x-javascript",
-            "image/svg+xml",
-        ];
-
-        compressible_types
-            .iter()
-            .any(|ct| content_type.starts_with(ct))
-    }
-
-    /// Compress content using gzip
-    fn compress_gzip(content: &[u8]) -> Result<Vec<u8>> {
-        let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-        encoder
-            .write_all(content)
-            .map_err(|_| Error::new_str("Failed to compress content"))?;
-        encoder
-            .finish()
-            .map_err(|_| Error::new_str("Failed to finish compression"))
-    }
-
-    /// Check if client accepts gzip encoding
-    fn accepts_gzip(session: &PingoraSession) -> bool {
-        session
-            .req_header()
-            .headers
-            .get("accept-encoding")
-            .and_then(|v| v.to_str().ok())
-            .map(|ae| ae.contains("gzip"))
-            .unwrap_or(false)
     }
 }
 
@@ -2718,6 +2741,27 @@ fn resolve_session_client_ip(session: &PingoraSession) -> Option<String> {
 /// connection" bug this timeout extension exists to fix.
 const CONSOLE_IO_TIMEOUT_SECS: u64 = 3600;
 
+/// Decide whether a request should be denied by per-project/environment IP
+/// restriction, given the client IP the proxy managed to resolve (if any).
+///
+/// Pulled out of `early_request_filter` as a pure function so the two cases
+/// that matter — resolved IP denied by an active policy, and *unresolvable*
+/// IP under an active policy — are unit-testable without a full pingora
+/// session. See the call site's comment for why an unresolvable IP must fail
+/// closed only when this project/environment actually has a policy
+/// configured (`ProjectIpGate::has_active_policy`), not unconditionally.
+fn ip_restriction_denies(
+    gate: &dyn temps_core::ProjectIpGate,
+    project_id: i32,
+    environment_id: i32,
+    parsed_ip: Option<std::net::IpAddr>,
+) -> bool {
+    match parsed_ip {
+        Some(ip) => !gate.is_allowed(project_id, environment_id, ip),
+        None => gate.has_active_policy(project_id, environment_id),
+    }
+}
+
 /// Whether a `Content-Type` value's media type — its "essence", the part
 /// before any `;` parameters — is exactly `text/event-stream`.
 ///
@@ -2774,6 +2818,7 @@ fn is_browser_document_request(
     method: &str,
     accept: Option<&str>,
     fetch_destination: Option<&str>,
+    upgrade_insecure_requests: Option<&str>,
 ) -> bool {
     if method != "GET" {
         return false;
@@ -2792,7 +2837,16 @@ fn is_browser_document_request(
 
     match fetch_destination {
         Some(destination) => destination.eq_ignore_ascii_case("document"),
-        None => true,
+        // Fetch Metadata is browser-sent only to potentially trustworthy
+        // origins (HTTPS, localhost), so it never arrives on a plain-HTTP
+        // deployment. On that path, Accept alone doesn't exclude non-browser
+        // clients (curl/wget/scrapers all send a browser-shaped Accept).
+        // Upgrade-Insecure-Requests is sent by browsers on top-level
+        // navigations to HTTP origins and essentially never by non-browser
+        // clients, so require it here. This still doesn't distinguish an
+        // <iframe> load from a top-level navigation — both send the header —
+        // which Fetch Metadata alone can't fix either.
+        None => upgrade_insecure_requests.is_some_and(|value| value.trim() == "1"),
     }
 }
 
@@ -4310,35 +4364,48 @@ impl ProxyHttp for LoadBalancer {
             // must not be able to distinguish "this project doesn't exist"
             // from "this project is restricted and you're not on the
             // allowlist" by response shape.
-            if let Some(ip) = ctx
+            //
+            // `ctx.ip_address` can fail to resolve to a parseable `IpAddr`
+            // (non-INET socket, missing/garbled forwarded-for value —
+            // resolve_session_client_ip falls back to the literal
+            // "unknown"). We must not silently skip enforcement in that
+            // case: fail closed (deny) when this project/environment
+            // actually has an active restriction policy, since an
+            // unresolvable IP under an active policy is exactly what an
+            // attacker (or a misconfigured proxy) would produce. When there
+            // is no policy at all for this project/environment — the common
+            // case — an unresolvable IP must NOT deny, matching today's
+            // behavior; this feature is opt-in and most traffic has nothing
+            // to do with it.
+            let parsed_ip = ctx
                 .ip_address
                 .as_deref()
-                .and_then(|s| s.parse::<std::net::IpAddr>().ok())
-            {
-                if !self.project_ip_gate.is_allowed(
-                    project_ctx.project.id,
-                    project_ctx.environment.id,
-                    ip,
-                ) {
-                    warn!(
-                        environment_id = project_ctx.environment.id,
-                        project_id = project_ctx.project.id,
-                        ip = %ip,
-                        "Request denied by project IP restriction"
-                    );
-                    let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
-                    response.insert_header("Cache-Control", "no-store")?;
-                    response.insert_header("X-Request-ID", &ctx.request_id)?;
-                    response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
-                    session
-                        .write_response_header(Box::new(response), false)
-                        .await?;
-                    session
-                        .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
-                        .await?;
-                    ctx.routing_status = "project_ip_restricted".to_string();
-                    return Ok(true);
-                }
+                .and_then(|s| s.parse::<std::net::IpAddr>().ok());
+            let ip_restricted = ip_restriction_denies(
+                self.project_ip_gate.as_ref(),
+                project_ctx.project.id,
+                project_ctx.environment.id,
+                parsed_ip,
+            );
+            if ip_restricted {
+                warn!(
+                    environment_id = project_ctx.environment.id,
+                    project_id = project_ctx.project.id,
+                    ip = %parsed_ip.map(|ip| ip.to_string()).unwrap_or_else(|| "unresolved".to_string()),
+                    "Request denied by project IP restriction"
+                );
+                let mut response = ResponseHeader::build(StatusCode::FORBIDDEN, None)?;
+                response.insert_header("Cache-Control", "no-store")?;
+                response.insert_header("X-Request-ID", &ctx.request_id)?;
+                response.insert_header("Content-Type", "text/plain; charset=utf-8")?;
+                session
+                    .write_response_header(Box::new(response), false)
+                    .await?;
+                session
+                    .write_response_body(Some(Bytes::from_static(b"Forbidden\n")), true)
+                    .await?;
+                ctx.routing_status = "project_ip_restricted".to_string();
+                return Ok(true);
             }
 
             // Check if this is a CAPTCHA endpoint - allow these to bypass attack mode
@@ -4970,119 +5037,54 @@ impl ProxyHttp for LoadBalancer {
             if !ctx.path.starts_with("/api/_temps/") {
                 // Serve static file
                 match self.serve_static_file(session, ctx, &static_dir).await {
-                    Ok(served) => {
-                        if served {
-                            debug!("Served static file: {}", ctx.path);
-                            ctx.routing_status = "static_file".to_string();
+                    Ok(StaticFileServeOutcome::Served) => {
+                        debug!("Served static file: {}", ctx.path);
+                        ctx.routing_status = "static_file".to_string();
+                        self.log_static_request(ctx, 200, "static_file", &static_dir, None, None);
+                        return Ok(true);
+                    }
+                    Ok(StaticFileServeOutcome::NotFound) => {
+                        debug!(
+                            request_path = %bounded_log_value(&ctx.path),
+                            stored_static_dir = %bounded_log_value(&static_dir),
+                            "Static file request returned the uniform not-found response"
+                        );
+                        let contract = static_not_found_contract(&ctx.method);
+                        let mut resp = ResponseHeader::build(contract.status, None)?;
+                        resp.insert_header(header::CONTENT_TYPE, contract.content_type)?;
+                        resp.insert_header(
+                            header::CONTENT_LENGTH,
+                            contract.content_length.to_string(),
+                        )?;
+                        resp.insert_header(header::CACHE_CONTROL, contract.cache_control)?;
+                        resp.insert_header("X-Request-ID", &ctx.request_id)?;
 
-                            // Log successful static file serving (HTML only)
-                            self.log_static_request(
-                                ctx,
-                                200,
-                                "static_file",
-                                &static_dir,
-                                None,
-                                None,
-                            );
-
-                            return Ok(true); // Request handled
-                        } else {
-                            // Static file not found in current deployment.
-                            // Try path-keyed file store (stale-chunk fallback, no DB).
-                            if Self::is_cacheable_static_asset(&ctx.path) {
-                                let url_path = ctx.path.trim_start_matches('/').to_string();
-                                if let Ok(true) =
-                                    self.serve_asset_from_store(session, ctx, &url_path).await
-                                {
-                                    ctx.routing_status = "stale_chunk_fallback".to_string();
-                                    return Ok(true);
-                                }
-                            }
-
-                            // Static file not found - return 404
-                            error!(
-                                "Static file not found: {} (static dir: {})",
-                                ctx.path, static_dir
-                            );
-                            let mut resp = ResponseHeader::build(StatusCode::NOT_FOUND, None)?;
-                            resp.insert_header(header::CONTENT_TYPE, "text/html")?;
-
-                            self.ensure_static_visitor_session(session, ctx, "text/html")
-                                .await;
-
-                            // Set tracking cookies for 404 response
-                            self.set_tracking_cookies(session, &mut resp, ctx).await?;
-
-                            session.write_response_header(Box::new(resp), false).await?;
+                        self.ensure_static_visitor_session(session, ctx, contract.content_type)
+                            .await;
+                        self.set_tracking_cookies(session, &mut resp, ctx).await?;
+                        session.write_response_header(Box::new(resp), false).await?;
+                        if contract.send_body {
                             session
                                 .write_response_body(
-                                    Some(bytes::Bytes::from(
-                                        b"<html><body><h1>404 - File Not Found</h1></body></html>"
-                                            .to_vec(),
-                                    )),
+                                    Some(Bytes::from_static(STATIC_NOT_FOUND_BODY)),
                                     true,
                                 )
                                 .await?;
-
-                            // Log 404 static file not found (HTML only)
-                            self.log_static_request(
-                                ctx,
-                                404,
-                                "static_file_not_found",
-                                &static_dir,
-                                Some("Static file not found".to_string()),
-                                Some(
-                                    b"<html><body><h1>404 - File Not Found</h1></body></html>".len()
-                                        as i64,
-                                ),
-                            );
-
-                            return Ok(true); // Request handled with 404
+                        } else {
+                            session.write_response_body(None, true).await?;
                         }
-                    }
-                    Err(e) => {
-                        // Static directory error (doesn't exist, permissions, etc.) - return 500
-                        error!(
-                            "Failed to serve static file {} from {}: {}",
-                            ctx.path, static_dir, e
-                        );
-                        let mut resp =
-                            ResponseHeader::build(StatusCode::INTERNAL_SERVER_ERROR, None)?;
-                        resp.insert_header(header::CONTENT_TYPE, "text/html")?;
 
-                        self.ensure_static_visitor_session(session, ctx, "text/html")
-                            .await;
-
-                        // Set tracking cookies for 500 response
-                        self.set_tracking_cookies(session, &mut resp, ctx).await?;
-
-                        session.write_response_header(Box::new(resp), false).await?;
-                        session
-                        .write_response_body(
-                            Some(bytes::Bytes::from(
-                                b"<html><body><h1>500 - Static Directory Error</h1><p>The static files directory could not be accessed.</p></body></html>"
-                                    .to_vec(),
-                            )),
-                            true,
-                        )
-                        .await?;
-
-                        // Log 500 static directory error (HTML only)
-                        let error_msg = format!("Static directory error: {}", e);
                         self.log_static_request(
-                        ctx,
-                        500,
-                        "static_directory_error",
-                        &static_dir,
-                        Some(error_msg),
-                        Some(
-                            b"<html><body><h1>500 - Static Directory Error</h1><p>The static files directory could not be accessed.</p></body></html>"
-                                .len() as i64,
-                        ),
-                    );
-
-                        return Ok(true); // Request handled with error response
+                            ctx,
+                            404,
+                            "static_file_not_found",
+                            &static_dir,
+                            Some("Static file not found".to_string()),
+                            Some(contract.content_length as i64),
+                        );
+                        return Ok(true);
                     }
+                    Err(error) => return Err(error),
                 }
             }
             // If we reach here and path starts with /api/_temps/,
@@ -5096,16 +5098,59 @@ impl ProxyHttp for LoadBalancer {
             if let Some(slash_pos) = after_prefix.find('/') {
                 let deployment_slug = &after_prefix[..slash_pos];
                 let asset_path = after_prefix[slash_pos + 1..].to_string();
-                if deployment_asset_path_matches(
-                    ctx.deployment
-                        .as_ref()
-                        .map(|deployment| deployment.slug.as_str()),
-                    deployment_slug,
-                ) && Self::is_cacheable_static_asset(&asset_path)
-                {
-                    if let Ok(true) = self.serve_asset_from_store(session, ctx, &asset_path).await {
-                        ctx.routing_status = "prefixed_asset".to_string();
-                        return Ok(true);
+                let mut legacy_source = None;
+                let mut legacy_current_slug = None;
+                let mut asset_scope = ctx.deployment.as_ref().and_then(|deployment| {
+                    let context = deployment.context_vars.as_ref();
+                    let source_slug = context
+                        .and_then(|value| value.get("source_deployment_slug"))
+                        .and_then(serde_json::Value::as_str);
+                    let source_deployment_id = context
+                        .and_then(|value| value.get("source_deployment_id"))
+                        .and_then(serde_json::Value::as_i64)
+                        .and_then(|value| i32::try_from(value).ok());
+                    if source_slug.is_none() {
+                        legacy_source = source_deployment_id;
+                        legacy_current_slug = Some(deployment.slug.clone());
+                    }
+                    deployment_asset_scope(
+                        &deployment.slug,
+                        deployment.environment_id,
+                        deployment.id,
+                        source_slug,
+                        context
+                            .and_then(|value| value.get("source_environment_id"))
+                            .and_then(serde_json::Value::as_i64)
+                            .and_then(|value| i32::try_from(value).ok()),
+                        source_deployment_id,
+                        deployment_slug,
+                    )
+                });
+                if let (Some(project_id), Some(source_deployment_id)) = (
+                    ctx.project.as_ref().map(|project| project.id),
+                    legacy_source,
+                ) {
+                    if let Some(origin) = self
+                        .static_asset_lookup
+                        .resolve_legacy_asset_origin(project_id, source_deployment_id)
+                        .await
+                    {
+                        asset_scope = legacy_deployment_asset_scope(
+                            legacy_current_slug.as_deref().unwrap_or_default(),
+                            &origin,
+                            deployment_slug,
+                        );
+                    }
+                }
+                if Self::is_cacheable_static_asset(&asset_path) {
+                    if let Some(asset_scope) = asset_scope {
+                        if let Ok(true) = self
+                            .serve_asset_from_store(session, ctx, &asset_path, Some(asset_scope))
+                            .await
+                        {
+                            ctx.routing_status = "prefixed_asset".to_string();
+                            return Ok(true);
+                        }
                     }
                 }
             }
@@ -5121,7 +5166,10 @@ impl ProxyHttp for LoadBalancer {
                 .await
         {
             let url_path = ctx.path.trim_start_matches('/').to_string();
-            if let Ok(true) = self.serve_asset_from_store(session, ctx, &url_path).await {
+            if let Ok(true) = self
+                .serve_asset_from_store(session, ctx, &url_path, None)
+                .await
+            {
                 ctx.routing_status = "stale_chunk_fallback".to_string();
                 return Ok(true);
             }
@@ -5388,6 +5436,11 @@ impl ProxyHttp for LoadBalancer {
             .as_ref()
             .and_then(|headers| headers.get("sec-fetch-dest"))
             .map(String::as_str);
+        let upgrade_insecure_requests = ctx
+            .request_headers
+            .as_ref()
+            .and_then(|headers| headers.get("upgrade-insecure-requests"))
+            .map(String::as_str);
 
         // Check if we should track this page view
         let should_track = Self::should_track_page(
@@ -5396,6 +5449,7 @@ impl ProxyHttp for LoadBalancer {
             &ctx.method,
             request_accept,
             fetch_destination,
+            upgrade_insecure_requests,
         );
 
         // Only browser HTML documents create visitor/session state (skip SSE,
@@ -7355,6 +7409,64 @@ mod content_type_tests {
         assert!(!is_event_stream_content_type(""));
         // A prefix match must not count either.
         assert!(!is_event_stream_content_type("text/event-stream-x"));
+    }
+}
+
+#[cfg(test)]
+mod ip_restriction_fail_closed_tests {
+    use super::ip_restriction_denies;
+    use std::net::IpAddr;
+    use temps_core::ProjectIpGate;
+
+    /// Stands in for `temps-ee-ip-access`'s `CachedIpAccessGate` when a
+    /// project/environment is on a closed/restricted mode: `is_allowed`
+    /// denies (baring an explicit allowlist match, irrelevant here since we
+    /// never reach it — the IP is unresolvable) and `has_active_policy`
+    /// truthfully reports the restriction exists.
+    struct RestrictedGate;
+    impl ProjectIpGate for RestrictedGate {
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
+            false
+        }
+        fn has_active_policy(&self, _project_id: i32, _environment_id: i32) -> bool {
+            true
+        }
+    }
+
+    /// Stands in for the common case: no restriction configured for this
+    /// project/environment at all (also what `temps_core::OpenIpGate`,
+    /// the OSS default, always reports).
+    struct UnrestrictedGate;
+    impl ProjectIpGate for UnrestrictedGate {
+        fn is_allowed(&self, _project_id: i32, _environment_id: i32, _ip: IpAddr) -> bool {
+            true
+        }
+        // has_active_policy uses the trait default (`false`).
+    }
+
+    #[test]
+    fn unresolvable_ip_under_an_active_policy_is_denied() {
+        // Regression: an unparseable/absent client IP must fail closed when
+        // the project/environment actually has an IP restriction policy —
+        // silently skipping enforcement here is exactly the gap an attacker
+        // (or a proxy misconfiguration) would exploit.
+        assert!(ip_restriction_denies(&RestrictedGate, 1, 1, None));
+    }
+
+    #[test]
+    fn unresolvable_ip_under_no_policy_is_not_denied() {
+        // Matches today's behavior for the common case: most projects have
+        // no IP restriction configured, so a resolution failure (e.g. a
+        // non-INET socket in local/test environments) must not start
+        // denying that traffic.
+        assert!(!ip_restriction_denies(&UnrestrictedGate, 1, 1, None));
+    }
+
+    #[test]
+    fn resolved_ip_still_goes_through_is_allowed_as_before() {
+        let ip: IpAddr = "203.0.113.7".parse().unwrap();
+        assert!(ip_restriction_denies(&RestrictedGate, 1, 1, Some(ip)));
+        assert!(!ip_restriction_denies(&UnrestrictedGate, 1, 1, Some(ip)));
     }
 }
 

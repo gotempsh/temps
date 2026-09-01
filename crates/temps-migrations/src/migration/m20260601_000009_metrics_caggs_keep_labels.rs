@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Recreate the metrics continuous aggregates with `labels` in the GROUP BY.
 //!
 //! The original `service_metrics_hourly` / `service_metrics_daily` aggregates

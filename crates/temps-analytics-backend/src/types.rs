@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared DTOs used by every analytics backend implementation.
 //!
 //! These types describe the *contract*, not the storage layout. Both the

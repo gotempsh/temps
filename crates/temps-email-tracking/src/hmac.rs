@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HMAC generation and verification for click tracking URLs
 //!
 //! Prevents open redirects by cryptographically binding each redirect URL

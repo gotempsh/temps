@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * End-to-end check for the proxy's `Accept: text/markdown` content negotiation
  * ("Markdown for Agents") against a real deployed app:

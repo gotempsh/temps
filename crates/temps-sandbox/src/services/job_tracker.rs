@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Tracks background jobs spawned via `exec_detached`. Each job owns a
 //! `tokio::task::JoinHandle` and an `Arc<Mutex<JobState>>` that the task
 //! mutates as output arrives and when the command exits.

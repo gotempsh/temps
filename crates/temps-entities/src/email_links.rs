@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Email links entity for mapping tracked link indices to original URLs
 
 use sea_orm::entity::prelude::*;

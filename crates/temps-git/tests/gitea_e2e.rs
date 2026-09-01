@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! End-to-end integration tests for GiteaProvider and GenericProvider.
 //!
 //! These tests boot a real Gitea 1.22 container via Bollard, seed it with

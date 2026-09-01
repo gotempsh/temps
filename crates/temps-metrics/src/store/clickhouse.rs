@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ClickHouse-backed implementation of [`MetricsStore`] for resource metrics.
 //!
 //! Active only when the monitoring store is set to ClickHouse AND all four

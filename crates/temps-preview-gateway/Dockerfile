@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 ## Multi-stage build for temps-preview-gateway.
 ##
 ## Builds the crate standalone (outside the temps workspace) so the image

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use axum::extract::Request;
 use axum::http::HeaderMap;
 use axum::middleware::Next;

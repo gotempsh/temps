@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Internal route-sync endpoint — per-node agents long-poll this for the
 //! `*.temps.local` routing table their internal edge proxy will serve.
 //!

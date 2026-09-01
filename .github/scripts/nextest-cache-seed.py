@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Find a trusted main-branch Cargo target seed for nextest archive builds."""
 
 from __future__ import annotations

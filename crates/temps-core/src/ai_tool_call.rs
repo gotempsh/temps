@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Marker for requests originating from the AI agent's `call_api` tool.
 //!
 //! The agent does not call the HTTP API over the network — `InternalApiCaller`

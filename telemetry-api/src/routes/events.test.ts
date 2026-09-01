@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { describe, it, expect, mock } from "bun:test";
 import { createEventsRoutes, KNOWN_EVENT_TYPES } from "./events.js";
 import type { Pool } from "pg";

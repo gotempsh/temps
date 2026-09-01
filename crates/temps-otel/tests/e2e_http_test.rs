@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! End-to-end HTTP integration tests.
 //!
 //! These tests simulate the full user flow:
@@ -24,6 +27,7 @@ use temps_otel::ingest::auth::OtelAuthService;
 use temps_otel::ingest::rate_limit::RateLimiter;
 use temps_otel::services::OtelService;
 use temps_otel::storage::timescaledb::TimescaleDbStorage;
+use temps_otel::storage::OtelStorage;
 use temps_otel::OtelAppState;
 
 /// No-op audit logger so the handler app state can be built without a real
@@ -91,23 +95,84 @@ impl temps_core::jobs::JobReceiver for NoOpJobReceiver {
 /// Known API key for testing.
 const TEST_API_KEY: &str = "tk_test_e2e_integration_key_12345";
 
-/// Create a test AuthContext that satisfies RequireAuth + permission_guard!(auth, OtelRead).
-/// Uses Role::Admin which has all permissions including OtelRead.
-fn create_test_auth_context(user: &temps_entities::users::Model) -> temps_auth::AuthContext {
-    temps_auth::AuthContext::new_session(user.clone(), temps_auth::Role::Admin)
-}
-
 /// Set up the full E2E test environment:
 /// - TimescaleDB with all migrations
 /// - A test user, project, and API key in the database
 /// - An axum Router wired with the real OtelService + TimescaleDB storage
-/// - Auth middleware that injects AuthContext for query endpoints
+/// - Auth middleware that injects an `AuthContext` for query endpoints
 ///
 /// Returns None if Docker is unavailable.
 async fn setup_e2e() -> Option<(
     temps_database::test_utils::TestDatabase,
     axum::Router,
     i32, // project_id
+)> {
+    setup_e2e_as(Some(temps_auth::Role::Admin)).await
+}
+
+/// [`setup_e2e`] with control over the caller's identity, for testing the
+/// authorization edges of the query endpoints:
+///
+/// * `Some(Role::Admin)` — the default; has `OtelRead`.
+/// * `Some(Role::MetricsIngest)` — authenticated but holds an **empty**
+///   permission set, so `permission_guard!(auth, OtelRead)` rejects it. This
+///   is what distinguishes a 403 from a 401.
+/// * `None` — no `AuthContext` is injected at all, so `RequireAuth` rejects
+///   the request before any handler body runs.
+///
+/// Always builds the app with `metrics_store: None` — see
+/// [`setup_e2e_with_metrics_store`] for the variant that wires a real one in.
+async fn setup_e2e_as(
+    role: Option<temps_auth::Role>,
+) -> Option<(
+    temps_database::test_utils::TestDatabase,
+    axum::Router,
+    i32, // project_id
+)> {
+    setup_e2e_as_full(role, false)
+        .await
+        .map(|(db, router, project_id, _store)| (db, router, project_id))
+}
+
+/// [`setup_e2e`] with a real [`temps_metrics::MetricsStore`] wired into
+/// `OtelAppState::metrics_store`, for testing `GET /otel/pipeline-history`'s
+/// 200 success path. `setup_e2e`/`setup_e2e_as` always build with
+/// `metrics_store: None`, which makes that path structurally unreachable —
+/// the handler returns 503 before it ever queries or serializes a series.
+///
+/// Returns the store handle alongside the router so a test can write points
+/// directly, standing in for one tick of the real background pipeline-stats
+/// sampler (`plugin.rs`'s 60-second `tokio::spawn` loop, which this manually
+/// wired test harness — unlike the full plugin registration path — never
+/// starts).
+async fn setup_e2e_with_metrics_store() -> Option<(
+    temps_database::test_utils::TestDatabase,
+    axum::Router,
+    i32, // project_id
+    std::sync::Arc<dyn temps_metrics::MetricsStore>,
+)> {
+    let (db, router, project_id, store) =
+        setup_e2e_as_full(Some(temps_auth::Role::Admin), true).await?;
+    Some((
+        db,
+        router,
+        project_id,
+        store.expect("metrics store was requested"),
+    ))
+}
+
+/// Shared implementation behind [`setup_e2e_as`] and
+/// [`setup_e2e_with_metrics_store`]. `with_metrics_store` controls whether
+/// `OtelAppState::metrics_store` is `Some(..)` (backed by a real
+/// `TimescaleMetricsStore` on the same test database) or `None`.
+async fn setup_e2e_as_full(
+    role: Option<temps_auth::Role>,
+    with_metrics_store: bool,
+) -> Option<(
+    temps_database::test_utils::TestDatabase,
+    axum::Router,
+    i32, // project_id
+    Option<std::sync::Arc<dyn temps_metrics::MetricsStore>>,
 )> {
     let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
@@ -228,9 +293,22 @@ async fn setup_e2e() -> Option<(
         None,
         facet_cache,
     ));
+    // Build a MetricsStore pointing at the same TimescaleDB connection only
+    // when requested — mirrors how `plugin.rs` builds `TimescaleMetricsStore`
+    // for the real app, but this harness never spawns the background
+    // pipeline-stats sampler, so tests that need history data write points
+    // directly via the returned handle.
+    let metrics_store: Option<Arc<dyn temps_metrics::MetricsStore>> = if with_metrics_store {
+        Some(Arc::new(temps_metrics::TimescaleMetricsStore::new(
+            db.clone(),
+        )))
+    } else {
+        None
+    };
+
     let app_state = OtelAppState {
         otel_service,
-        metrics_store: None,
+        metrics_store: metrics_store.clone(),
         metrics_write_tx: None,
         dashboard_service,
         metric_alert_service,
@@ -246,12 +324,17 @@ async fn setup_e2e() -> Option<(
     // Create auth middleware that injects AuthContext into request extensions.
     // Query handlers use RequireAuth which reads AuthContext from extensions.
     // Ingest handlers use their own API key auth (not RequireAuth), so this doesn't affect them.
-    let auth_context = create_test_auth_context(&user);
+    //
+    // `role: None` injects nothing, which is how the unauthenticated case is
+    // reproduced — RequireAuth then finds no AuthContext and returns 401.
+    let auth_context = role.map(|r| temps_auth::AuthContext::new_session(user.clone(), r));
     let auth_middleware = middleware::from_fn(
         move |mut req: axum::extract::Request, next: middleware::Next| {
             let auth_ctx = auth_context.clone();
             async move {
-                req.extensions_mut().insert(auth_ctx);
+                if let Some(ctx) = auth_ctx {
+                    req.extensions_mut().insert(ctx);
+                }
                 next.run(req).await
             }
         },
@@ -261,7 +344,7 @@ async fn setup_e2e() -> Option<(
         .layer(auth_middleware)
         .with_state(app_state);
 
-    Some((test_db, router, project_id))
+    Some((test_db, router, project_id, metrics_store))
 }
 
 /// Helper: build a protobuf ExportTraceServiceRequest with a trace tree.
@@ -793,6 +876,382 @@ async fn test_e2e_invalid_api_key_returns_401() {
         response.status(),
         StatusCode::UNAUTHORIZED,
         "Invalid API key should return 401"
+    );
+}
+
+// ── Route tests for the ingest-errors + pipeline-history endpoints ──
+//
+// Both are read-only, system-scoped (no project parameter) and guarded by
+// `RequireAuth` + `permission_guard!(auth, OtelRead)`, so they share one set
+// of authorization cases. `setup_e2e` builds the app with
+// `metrics_store: None`, which also makes it the natural place to pin
+// pipeline-history's "metrics collection not enabled" degradation.
+
+/// Both endpoints must reject an unauthenticated caller before running any
+/// handler logic.
+#[tokio::test]
+async fn test_e2e_otel_reports_require_authentication() {
+    let Some((_db, router, _project_id)) = setup_e2e_as(None).await else {
+        return;
+    };
+
+    for uri in ["/otel/ingest-errors", "/otel/pipeline-history"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{uri} must return 401 without an AuthContext"
+        );
+    }
+}
+
+/// Authenticated but without `OtelRead` must be 403, not 401 — the two mean
+/// different things to a caller ("log in" vs "ask for access").
+#[tokio::test]
+async fn test_e2e_otel_reports_require_otel_read_permission() {
+    let Some((_db, router, _project_id)) =
+        setup_e2e_as(Some(temps_auth::Role::MetricsIngest)).await
+    else {
+        return;
+    };
+
+    for uri in ["/otel/ingest-errors", "/otel/pipeline-history"] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::FORBIDDEN,
+            "{uri} must return 403 for an authenticated caller lacking OtelRead"
+        );
+    }
+}
+
+/// A healthy pipeline returns 200 with an empty *array*, never `null` and
+/// never a 404 — a client mapping over `errors` must not have to null-guard.
+#[tokio::test]
+async fn test_e2e_ingest_errors_returns_empty_array_when_healthy() {
+    let Some((_db, router, _project_id)) = setup_e2e().await else {
+        return;
+    };
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/otel/ingest-errors")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    assert!(
+        json["errors"].is_array(),
+        "errors must be an array, got {}",
+        json["errors"]
+    );
+    assert_eq!(json["errors"].as_array().map(Vec::len), Some(0));
+}
+
+/// The recorded failure reason must survive a full round trip through the
+/// real Postgres table and come back grouped, with the count aggregated.
+#[tokio::test]
+async fn test_e2e_ingest_errors_returns_recorded_failures() {
+    let Some((test_db, router, _project_id)) = setup_e2e().await else {
+        return;
+    };
+
+    // Record the same (signal, class) twice plus one distinct group, going
+    // through the storage layer rather than raw SQL so the upsert under test
+    // is the one that actually runs in production.
+    let storage = TimescaleDbStorage::new(test_db.db.clone(), None);
+    for _ in 0..2 {
+        storage
+            .record_ingest_error("spans", "clickhouse_network", "connection refused")
+            .await
+            .expect("recording an ingest error succeeds");
+    }
+    storage
+        .record_ingest_error("logs", "postgres_conn", "connection reset")
+        .await
+        .expect("recording an ingest error succeeds");
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/otel/ingest-errors?limit=50")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    let errors = json["errors"].as_array().expect("errors array");
+
+    assert_eq!(errors.len(), 2, "two distinct (signal, class) groups");
+
+    let spans_group = errors
+        .iter()
+        .find(|e| e["signal_type"] == "spans")
+        .expect("spans group present");
+    assert_eq!(spans_group["error_class"], "clickhouse_network");
+    assert_eq!(
+        spans_group["count"], 2,
+        "repeat failures aggregate into one group rather than appending rows"
+    );
+    assert!(
+        spans_group["sample_message"]
+            .as_str()
+            .is_some_and(|m| m.contains("connection refused")),
+        "the sample message must carry the backend detail"
+    );
+    // ISO 8601 with Z, per the workspace date convention.
+    for field in ["first_seen", "last_seen"] {
+        let ts = spans_group[field].as_str().unwrap_or_default();
+        assert!(
+            ts.ends_with('Z'),
+            "{field} must be ISO-8601 UTC, got {ts:?}"
+        );
+    }
+}
+
+/// `metrics_store: None` is a real deployment state (metric collection
+/// disabled), and it must produce an explicit, actionable 503 rather than an
+/// empty chart that reads as "nothing was dropped".
+#[tokio::test]
+async fn test_e2e_pipeline_history_reports_metrics_store_unavailable() {
+    let Some((_db, router, _project_id)) = setup_e2e().await else {
+        return;
+    };
+
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/otel/pipeline-history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "history must not silently report zeros when nothing is recording it"
+    );
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(problem["title"], "Metrics Unavailable");
+    let detail = problem["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("/otel/pipeline-stats"),
+        "the 503 must point at the endpoint that still works, got {detail:?}"
+    );
+}
+
+/// The window validation runs before the metrics-store lookup, so a bad range
+/// is a 400 Problem Details even on a server with collection disabled.
+#[tokio::test]
+async fn test_e2e_pipeline_history_rejects_invalid_windows() {
+    let Some((_db, router, _project_id)) = setup_e2e().await else {
+        return;
+    };
+
+    // The "too-wide window" case is computed from `Utc::now()` rather than
+    // hardcoded, so it keeps exceeding the 7-day cap (`MAX_WINDOW_DAYS`)
+    // indefinitely instead of silently becoming a fixed historical range that
+    // stops testing anything as time passes.
+    //
+    // Uses `to_rfc3339_opts(.., true)` (forces a `Z` suffix) rather than the
+    // plain `to_rfc3339()`, which renders the UTC offset as `+00:00` — the
+    // unescaped `+` is interpreted as a literal space once it lands in a URL
+    // query string, corrupting the timestamp before it ever reaches the
+    // handler's parser.
+    let now = chrono::Utc::now();
+    let too_wide_start =
+        (now - chrono::Duration::days(80)).to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let too_wide_end = now.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let too_wide_uri =
+        format!("/otel/pipeline-history?start_time={too_wide_start}&end_time={too_wide_end}");
+
+    let cases = [
+        (
+            "/otel/pipeline-history?start_time=2026-08-20T00:00:00Z&end_time=2026-08-19T00:00:00Z",
+            "Invalid Time Range",
+        ),
+        (
+            "/otel/pipeline-history?start_time=2026-08-20T00:00:00Z",
+            "Invalid Time Range",
+        ),
+        (too_wide_uri.as_str(), "Time Range Too Wide"),
+    ];
+
+    for (uri, expected_title) in cases {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(uri)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_REQUEST,
+            "{uri} must be rejected"
+        );
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(problem["title"], expected_title, "for {uri}");
+        assert!(
+            problem["detail"].as_str().is_some_and(|d| !d.is_empty()),
+            "a Problem Details response must carry an actionable detail for {uri}"
+        );
+    }
+}
+
+/// The 200 success path, structurally unreachable via `setup_e2e` because it
+/// hardcodes `metrics_store: None` (see `test_e2e_pipeline_history_reports_metrics_store_unavailable`
+/// above) — the handler returns 503 before it ever reaches the
+/// query/serialize logic. `setup_e2e_with_metrics_store` wires a real
+/// `TimescaleMetricsStore` in instead.
+///
+/// Ingests one trace (so the pipeline has something to report) and then
+/// writes one round of `otel.*` counter points directly to the metrics store
+/// to stand in for a single tick of the real background pipeline-stats
+/// sampler — `plugin.rs` spawns that sampler on a 60-second interval as part
+/// of full plugin registration, which this manually-wired test harness does
+/// not build, so a real 60s wait is neither necessary nor practical here.
+#[tokio::test]
+async fn test_e2e_pipeline_history_returns_series_when_metrics_store_available() {
+    let Some((_db, router, project_id, metrics_store)) = setup_e2e_with_metrics_store().await
+    else {
+        return;
+    };
+
+    // 1. At least one ingest.
+    let trace_id: [u8; 16] = [0x77; 16];
+    let request = build_trace_request(&trace_id, "pipeline-history-e2e");
+    let body = request.encode_to_vec();
+    let ingest_response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/otel/v1/traces")
+                .header("content-type", "application/x-protobuf")
+                .header("authorization", format!("Bearer {TEST_API_KEY}"))
+                .header("x-temps-project-id", project_id.to_string())
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ingest_response.status(), StatusCode::OK);
+
+    // 2. One simulated sampler tick — same shape the real sampler writes:
+    //    one Counter point per name in `OTEL_PIPELINE_METRIC_NAMES`, against
+    //    `SourceKind::Node` / `CONTROL_PLANE_NODE_ID`.
+    let now = chrono::Utc::now();
+    let points: Vec<temps_metrics::MetricPoint> = temps_otel::plugin::OTEL_PIPELINE_METRIC_NAMES
+        .iter()
+        .map(|name| temps_metrics::MetricPoint {
+            time: now,
+            source_kind: temps_metrics::SourceKind::Node,
+            source_id: temps_otel::plugin::CONTROL_PLANE_NODE_ID,
+            name: name.to_string(),
+            value: 1.0,
+            kind: temps_metrics::MetricKind::Counter,
+            engine: Some("otel".to_string()),
+            environment: None,
+            node_id: Some(temps_otel::plugin::CONTROL_PLANE_NODE_ID),
+            labels: std::collections::HashMap::new(),
+        })
+        .collect();
+    metrics_store
+        .write_batch(points)
+        .await
+        .expect("simulated sampler-tick write succeeds");
+
+    // 3. Query the default window and assert the response carries real data.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/otel/pipeline-history")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+
+    let series = json["series"].as_array().expect("series must be an array");
+    assert!(
+        !series.is_empty(),
+        "expected non-empty series once ingest happened and a sampler tick was recorded, \
+         got: {json}"
+    );
+
+    for entry in series {
+        let name = entry["name"].as_str().unwrap_or_default();
+        assert!(
+            name.starts_with("otel."),
+            "every series name must be an otel.* pipeline counter, got {name:?}"
+        );
+        assert!(
+            entry["points"].is_array(),
+            "every series must carry a non-null points array, got {entry}"
+        );
+    }
+
+    // Proves the query round-trips real data rather than 13 always-present
+    // but permanently-empty series shells.
+    let has_data_point = series
+        .iter()
+        .any(|s| s["points"].as_array().is_some_and(|p| !p.is_empty()));
+    assert!(
+        has_data_point,
+        "expected at least one series to contain the point written by the simulated \
+         sampler tick, got: {json}"
     );
 }
 

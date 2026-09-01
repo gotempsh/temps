@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The Temps AI foundation (ADR-022).
 //!
 //! A single, governed, provider-agnostic way for any crate to ask the configured

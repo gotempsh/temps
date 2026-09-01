@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Builds and sends a deploy-failure report: a redacted, user-editable copy
 //! of a failed deployment's build trace, either forwarded to the Temps team
 //! or handed to the user to paste into a GitHub issue.

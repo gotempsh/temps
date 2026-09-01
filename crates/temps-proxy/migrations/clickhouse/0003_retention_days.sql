@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Add retention_days to proxy_logs so each row carries its own TTL value.
 -- The DEFAULT (30) equals the prior hardcoded INTERVAL, so existing rows
 -- are unaffected: their effective expiry does not change until the TTL

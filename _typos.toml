@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [files]
 # Translated READMEs (README.es.md, README.de.md, ...) are not English —
 # the checker "corrects" valid foreign words (oder→order, Cliente→Client).
@@ -21,6 +24,8 @@ AIMD = "AIMD"
 # MongoDB query operator `$nin` ("not in"), in the data browser's filter
 # allowlist. typos reads it as a misspelling of "nine"/"min".
 nin = "nin"
+# Expected last four characters of "properly" in a masking regression test.
+erly = "erly"
 
 [default.extend-identifiers]
 # W3C traceparent spec example span-id used in test fixtures

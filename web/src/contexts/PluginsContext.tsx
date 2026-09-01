@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { createContext, useContext, useMemo, type ReactNode } from 'react'
 import { usePlugins } from '@/hooks/usePlugins'
 import type { PluginManifest, ResolvedNavEntry } from '@/types/plugins'

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ECIES (Elliptic Curve Integrated Encryption Scheme) for edge certificate distribution.
 //!
 //! Uses X25519 ECDH + HKDF-SHA256 + AES-256-GCM to encrypt TLS certificate bundles

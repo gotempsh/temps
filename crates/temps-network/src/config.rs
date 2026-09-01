@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Configuration types — pure data, no kernel calls.
 //!
 //! These types are shared between the control plane (which allocates them

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Workflow Planner
 //!
 //! Determines which jobs to create for a deployment based on project configuration
@@ -10,6 +13,9 @@ use temps_entities::{deployment_jobs, deployments, environments, projects, types
 use temps_logs::LogService;
 use thiserror::Error;
 use tracing::{debug, info, warn};
+
+use super::env_resolver::merge_environment_variable_layers;
+use super::managed_environment_variables::{public_sentry_dsn_var, public_sentry_tunnel_var};
 
 #[derive(Debug, Error)]
 pub enum WorkflowPlanningError {
@@ -24,6 +30,155 @@ pub enum WorkflowPlanningError {
         #[source]
         source: crate::services::sensitive_envelope::SensitiveEnvelopeError,
     },
+
+    #[error("Failed to serialize {count} cross-node service blocker(s) into the deploy job config: {source}")]
+    SerializeCrossNodeBlockers {
+        count: usize,
+        #[source]
+        source: serde_json::Error,
+    },
+}
+
+/// One linked external service that a replica scheduled onto another node
+/// would not be able to reach, and what to do about it.
+///
+/// Travels in the deploy job's config (it carries no credentials — service
+/// name, DNS name, and operator guidance only) so the failure is raised by
+/// the replica that would actually have been broken, not by every
+/// deployment of a project that merely *has* a linked service.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct CrossNodeServiceBlocker {
+    pub service_id: i32,
+    pub service_name: String,
+    /// Name that would have to resolve. `None` when the service name yields
+    /// no legal DNS label at all.
+    pub fqdn: Option<String>,
+    /// What is wrong, naming the concrete setting or missing state.
+    pub detail: String,
+    /// The next action that fixes it.
+    pub remedy: String,
+    /// Console path that configures the missing piece.
+    pub setup_path: String,
+}
+
+impl CrossNodeServiceBlocker {
+    fn new(
+        link: &temps_providers::ServiceCrossNodeLink,
+        reason: temps_providers::CrossNodeBlockReason,
+    ) -> Self {
+        Self {
+            service_id: link.service_id,
+            service_name: link.service_name.clone(),
+            fqdn: link.fqdn.clone(),
+            detail: reason.detail(&link.service_name),
+            remedy: reason.remedy().to_string(),
+            setup_path: reason.setup_path(link.service_id),
+        }
+    }
+
+    /// Single-line, self-contained explanation for logs and job failures.
+    pub fn describe(&self) -> String {
+        format!(
+            "linked service '{}' (id {}): {} {}",
+            self.service_name, self.service_id, self.detail, self.remedy
+        )
+    }
+}
+
+/// Result of planning the connection strings for a remotely-scheduled
+/// replica: the rewritten variables, plus anything that could not be made
+/// to work.
+#[derive(Debug, Default, Clone)]
+pub struct RemoteEnvironmentPlan {
+    /// `None` in single-node mode / when there is nothing remote to plan for.
+    pub variables: Option<std::collections::HashMap<String, String>>,
+    /// Non-empty when at least one linked service has no working cross-node
+    /// address. Those variables are deliberately left pointing at the
+    /// same-host container name rather than at a plausible-looking address
+    /// that can never connect.
+    pub blockers: Vec<CrossNodeServiceBlocker>,
+}
+
+/// Job-config key holding the [`CrossNodeServiceBlocker`] list. Read back by
+/// `WorkflowExecutionService` when it builds the deploy job.
+pub const CROSS_NODE_BLOCKERS_KEY: &str = "cross_node_service_blockers";
+
+/// Write the blocker list into a deploy job's config. Omitted entirely when
+/// empty so existing job configs are byte-identical to before.
+fn insert_cross_node_blockers(
+    config: &mut serde_json::Map<String, serde_json::Value>,
+    blockers: &[CrossNodeServiceBlocker],
+) -> Result<(), WorkflowPlanningError> {
+    if blockers.is_empty() {
+        return Ok(());
+    }
+    let value = serde_json::to_value(blockers).map_err(|source| {
+        WorkflowPlanningError::SerializeCrossNodeBlockers {
+            count: blockers.len(),
+            source,
+        }
+    })?;
+    config.insert(CROSS_NODE_BLOCKERS_KEY.to_string(), value);
+    Ok(())
+}
+
+/// Read the blocker list back out of a deploy job's config. Unknown or
+/// malformed values degrade to "no blockers" rather than failing the
+/// deployment: a stale job config must not become an outage.
+pub fn read_cross_node_blockers(config: &serde_json::Value) -> Vec<CrossNodeServiceBlocker> {
+    config
+        .get(CROSS_NODE_BLOCKERS_KEY)
+        .and_then(|v| serde_json::from_value::<Vec<CrossNodeServiceBlocker>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+/// Swap every occurrence of a linked service's Docker container name for the
+/// address a container on another node must use, in place.
+///
+/// Only the host part changes: the port inside the connection string is the
+/// container port, which is identical on every node, so services exposing
+/// several ports (S3/RustFS) keep working without special-casing.
+///
+/// Returns the keys that changed, so callers can log *which* variables were
+/// touched without ever logging a value (they contain credentials).
+fn rewrite_service_host(
+    env_vars: &mut std::collections::HashMap<String, String>,
+    container_name: &str,
+    replacement_host: &str,
+) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (key, value) in env_vars.iter_mut() {
+        if value.contains(container_name) {
+            *value = value.replace(container_name, replacement_host);
+            changed.push(key.clone());
+        }
+    }
+    changed.sort();
+    changed
+}
+
+/// Decide what a linked service's container name should be rewritten to for
+/// a container on another node — or why nothing valid exists.
+///
+/// Pure: the whole cross-node addressing decision is exercised in unit tests
+/// without Docker, a cluster, or a database.
+fn cross_node_rewrite_target(
+    link: &temps_providers::ServiceCrossNodeLink,
+    cluster_dns_enabled: bool,
+) -> Result<String, temps_providers::CrossNodeBlockReason> {
+    let Some(fqdn) = link.fqdn.as_deref() else {
+        return Err(temps_providers::CrossNodeBlockReason::NoDnsName);
+    };
+    if !cluster_dns_enabled {
+        // Without the per-node resolver in the container's resolv.conf the
+        // FQDN is just an unresolvable string. There is no fallback: the
+        // service's host port is bound to loopback on its own node.
+        return Err(temps_providers::CrossNodeBlockReason::ClusterDnsDisabled);
+    }
+    if !link.dns_record_published {
+        return Err(temps_providers::CrossNodeBlockReason::DnsRecordMissing);
+    }
+    Ok(fqdn.to_string())
 }
 
 /// Shared slot type for the optional [`temps_core::SecretsManagerResolver`].
@@ -193,7 +348,7 @@ impl WorkflowPlanner {
     /// 1. Environment variables from the env_vars table for the specific environment (via env_var_environments junction table)
     /// 2. Runtime environment variables from external services linked to the project
     /// 3. Sentry DSN environment variables - auto-generated per project/environment:
-    ///    - `SENTRY_DSN` is always added (server-side / generic).
+    ///    - `SENTRY_DSN` and `SENTRY_TUNNEL` are always added (server-side / generic).
     ///    - A framework-specific public-DSN var is added so client bundlers expose it.
     ///      The exact name follows each framework's public-prefix convention so
     ///      `import.meta.env.<VAR>` / `process.env.<VAR>` resolves at build time:
@@ -228,6 +383,7 @@ impl WorkflowPlanner {
         use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
+        let mut explicit_project_vars = HashMap::new();
 
         // Add default HOST environment variable
         // This ensures containers bind to all network interfaces (0.0.0.0)
@@ -268,13 +424,13 @@ impl WorkflowPlanner {
                 } else {
                     env_var.value
                 };
-                env_vars_map.insert(env_var.key, value);
+                explicit_project_vars.insert(env_var.key, value);
             }
         }
 
         debug!(
             "📦 Loaded {} environment variables from env_vars table via env_var_environments",
-            env_vars_map.len()
+            explicit_project_vars.len()
         );
 
         // 2. Get runtime environment variables from external services
@@ -292,6 +448,7 @@ impl WorkflowPlanner {
 
         // Track failed services to provide detailed error messages
         let mut failed_services: Vec<(i32, String)> = Vec::new();
+        let mut linked_service_vars = HashMap::new();
 
         // Get runtime environment variables from each external service
         for project_service in project_services_list {
@@ -316,8 +473,7 @@ impl WorkflowPlanner {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    // Merge service env vars into the main map
-                    env_vars_map.extend(service_env_vars);
+                    linked_service_vars.extend(service_env_vars);
                 }
                 Err(e) => {
                     // Collect the error - we'll fail the entire deployment if any service fails
@@ -350,6 +506,14 @@ impl WorkflowPlanner {
 
             return Err(anyhow::anyhow!(error_message));
         }
+
+        // Linked-service variables are defaults. Explicit project variables
+        // express user intent and therefore take precedence on collisions.
+        merge_environment_variable_layers(
+            &mut env_vars_map,
+            linked_service_vars,
+            explicit_project_vars,
+        );
 
         // 2b. Secrets-manager bindings (EE only — strict no-op when resolver is absent).
         //
@@ -445,6 +609,10 @@ impl WorkflowPlanner {
                         // Always add SENTRY_DSN for server-side usage
                         env_vars_map.insert("SENTRY_DSN".to_string(), project_dsn.dsn.clone());
 
+                        let sentry_tunnel =
+                            format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH);
+                        env_vars_map.insert("SENTRY_TUNNEL".to_string(), sentry_tunnel.clone());
+
                         // Add framework-specific public DSN env var based on preset.
                         // Each client bundler only exposes vars matching its own prefix
                         // convention to the browser bundle, so we mirror that mapping.
@@ -459,10 +627,7 @@ impl WorkflowPlanner {
                         // the path can change in one place (here) without touching
                         // deployed apps' source or docs.
                         if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
-                            env_vars_map.insert(
-                                tunnel_var.to_string(),
-                                format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH),
-                            );
+                            env_vars_map.insert(tunnel_var.to_string(), sentry_tunnel);
                         }
                     }
                     Err(e) => {
@@ -581,7 +746,9 @@ impl WorkflowPlanner {
 
             // Use commit SHA as service version when available
             if let Some(ref commit_sha) = deployment.commit_sha {
-                env_vars_map.insert("OTEL_SERVICE_VERSION".to_string(), commit_sha.clone());
+                env_vars_map
+                    .entry("OTEL_SERVICE_VERSION".to_string())
+                    .or_insert_with(|| commit_sha.clone());
             }
 
             debug!(
@@ -692,64 +859,61 @@ impl WorkflowPlanner {
         Ok(out)
     }
 
-    /// Build remote environment variables by rewriting connection strings for cross-node access.
+    /// Build the environment variables a replica receives when it is
+    /// scheduled onto a node **other than** the control plane.
     ///
-    /// When `private_address` is set in multi-node settings, this method:
-    /// 1. Copies the local environment variables
-    /// 2. For each linked external service, replaces Docker container names and internal ports
-    ///    with the control plane's private address and host port
-    /// 3. Rewrites TEMPS_API_URL if it references localhost/127.0.0.1
+    /// ## Why the address has to be a DNS name
     ///
-    /// Returns `None` if `private_address` is not configured (single-node mode).
+    /// A managed service container publishes its port to `127.0.0.1` on its
+    /// own host and nowhere else — enforced by
+    /// `temps_providers::utils::local_port_binding`, which is a deliberate
+    /// security property. So `<node private address>:<host port>`, the form
+    /// this method used to emit, is unreachable from every other node: the
+    /// port is simply not bound on that interface. Apps linked to a database
+    /// that happened to land on a different node were handed a connection
+    /// string that could never connect, and nothing anywhere said so.
+    ///
+    /// The address that does work across nodes is the container's IP on the
+    /// multi-host overlay, reached by name through the internal
+    /// `*.temps.local` zone (ADR-011) — the same mechanism cluster members
+    /// already use. So the rewrite is now purely `container name -> FQDN`,
+    /// leaving the port untouched (the container port is the same on every
+    /// node, and services that expose several ports keep working).
+    ///
+    /// ## When it can't work
+    ///
+    /// Cross-node resolution needs `AppSettings.cluster_dns.enabled` **and**
+    /// a published A record. When either is missing there is no address that
+    /// can work, so this method emits a [`CrossNodeServiceBlocker`] instead
+    /// of a plausible-looking broken one. The deploy job fails loudly with
+    /// that blocker if — and only if — the replica really is scheduled
+    /// remotely; a deployment that stays on the control plane is unaffected.
+    ///
+    /// Returns an empty plan (no variables, no blockers) in single-node mode
+    /// or when the project has no cross-node exposure at all.
     async fn build_remote_environment_variables(
         &self,
         project: &projects::Model,
         local_env_vars: &std::collections::HashMap<String, String>,
-    ) -> Option<std::collections::HashMap<String, String>> {
+    ) -> RemoteEnvironmentPlan {
         use temps_entities::project_services;
 
-        // Get the private address for cross-node service connectivity.
-        // Priority: multi_node.private_address > host from external_url
-        let private_address = match self.config_service.get_settings().await {
-            Ok(settings) => {
-                if let Some(addr) = settings.multi_node.private_address {
-                    addr
-                } else {
-                    // Fall back to extracting host from external URL
-                    match self.config_service.get_external_url_or_default().await {
-                        Ok(url) => {
-                            if let Ok(parsed) = url::Url::parse(&url) {
-                                match parsed.host_str() {
-                                    Some(host)
-                                        if host != "localhost"
-                                            && host != "127.0.0.1"
-                                            && host != "localho.st" =>
-                                    {
-                                        info!(
-                                            "No private_address configured, falling back to external URL host: {}",
-                                            host
-                                        );
-                                        host.to_string()
-                                    }
-                                    _ => return None,
-                                }
-                            } else {
-                                return None;
-                            }
-                        }
-                        Err(_) => return None,
-                    }
-                }
+        let settings = match self.config_service.get_settings().await {
+            Ok(settings) => settings,
+            Err(e) => {
+                warn!(
+                    project_id = project.id,
+                    error = %e,
+                    "Could not read settings while planning cross-node env vars; \
+                     falling back to single-node behaviour"
+                );
+                return RemoteEnvironmentPlan::default();
             }
-            Err(_) => return None,
         };
+        let cluster_dns_enabled = settings.cluster_dns.enabled;
 
-        info!(
-            "build_remote_environment_variables: resolved private_address={}",
-            private_address
-        );
-
-        // Only build remote env vars if there are active worker nodes
+        // Only build remote env vars when there is somewhere remote to
+        // schedule to. Single-node installs never use them.
         use temps_entities::nodes;
         let has_active_nodes = matches!(
             nodes::Entity::find()
@@ -759,12 +923,17 @@ impl WorkflowPlanner {
             Ok(Some(_))
         );
         if !has_active_nodes {
-            return None;
+            return RemoteEnvironmentPlan::default();
         }
 
-        let mut remote_vars = local_env_vars.clone();
+        // Private address is only used to rewrite the control-plane API URL
+        // (which *is* bound on that interface). It is deliberately no longer
+        // used for managed services — see the doc comment.
+        let private_address = self.resolve_control_plane_private_address(&settings).await;
 
-        // Get all services linked to this project
+        let mut remote_vars = local_env_vars.clone();
+        let mut blockers: Vec<CrossNodeServiceBlocker> = Vec::new();
+
         let project_services_list = match project_services::Entity::find()
             .filter(project_services::Column::ProjectId.eq(project.id))
             .all(self.db.as_ref())
@@ -772,91 +941,143 @@ impl WorkflowPlanner {
         {
             Ok(services) => services,
             Err(e) => {
-                tracing::warn!(
-                    "Failed to query project services for remote env var rewriting: {}",
-                    e
+                warn!(
+                    project_id = project.id,
+                    error = %e,
+                    "Failed to query linked services for cross-node env vars"
                 );
-                return None;
+                return RemoteEnvironmentPlan::default();
             }
         };
 
         info!(
-            "Building remote env vars for project {}: {} linked services, private_address={}",
+            "Planning cross-node env vars for project {}: {} linked service(s), cluster_dns_enabled={}",
             project.id,
             project_services_list.len(),
-            private_address
+            cluster_dns_enabled
         );
 
-        // For each service, get its address mapping and do replacements
         for project_service in &project_services_list {
-            match self
+            let link = match self
                 .external_service_manager
-                .get_service_effective_address(project_service.service_id)
+                .get_service_cross_node_link(project_service.service_id)
                 .await
             {
-                Ok((container_name, internal_port, host_port)) => {
-                    info!(
-                        "Service {}: container_name={}, internal_port={}, host_port={} — rewriting to {}:{}",
-                        project_service.service_id, container_name, internal_port, host_port,
-                        private_address, host_port
-                    );
-                    let mut rewritten_count = 0;
-                    for (key, value) in remote_vars.iter_mut() {
-                        // Replace container_name:internal_port → private_address:host_port
-                        if value.contains(&container_name) {
-                            *value = value
-                                .replace(
-                                    &format!("{}:{}", container_name, internal_port),
-                                    &format!("{}:{}", private_address, host_port),
-                                )
-                                .replace(&container_name, &private_address);
-                            // Connection strings contain credentials. Log the
-                            // affected key, never either secret-bearing value.
-                            info!("Rewrote environment variable {} for remote deployment", key);
-                            rewritten_count += 1;
-                        }
-                    }
-                    if rewritten_count == 0 {
-                        tracing::warn!(
-                            "Service {} container_name='{}' not found in any env var value",
-                            project_service.service_id,
-                            container_name
-                        );
-                    }
-                }
+                Ok(link) => link,
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to get effective address for service {} (skipping rewrite): {}",
-                        project_service.service_id,
-                        e
+                    warn!(
+                        service_id = project_service.service_id,
+                        error = %e,
+                        "Failed to resolve cross-node link for linked service"
+                    );
+                    continue;
+                }
+            };
+
+            // Only services actually referenced by a variable matter. A
+            // linked-but-unused service can't break anything, so it must not
+            // be able to block a deployment either.
+            let referenced = remote_vars
+                .values()
+                .any(|value| value.contains(&link.container_name));
+            if !referenced {
+                debug!(
+                    service_id = link.service_id,
+                    container = %link.container_name,
+                    "Linked service is not referenced by any environment variable; \
+                     nothing to rewrite"
+                );
+                continue;
+            }
+
+            match cross_node_rewrite_target(&link, cluster_dns_enabled) {
+                Ok(fqdn) => {
+                    let rewritten_keys =
+                        rewrite_service_host(&mut remote_vars, &link.container_name, &fqdn);
+                    // Connection strings carry credentials. Log the affected
+                    // keys only — never any value.
+                    info!(
+                        service_id = link.service_id,
+                        fqdn = %fqdn,
+                        keys = %rewritten_keys.join(", "),
+                        "Rewrote environment variables to the service's internal DNS name"
                     );
                 }
-            }
-        }
-
-        // Rewrite TEMPS_API_URL if it references localhost/127.0.0.1
-        if let Some(api_url) = remote_vars.get("TEMPS_API_URL").cloned() {
-            if api_url.contains("localhost") || api_url.contains("127.0.0.1") {
-                let rewritten = api_url
-                    .replace("localhost", &private_address)
-                    .replace("127.0.0.1", &private_address);
-                remote_vars.insert("TEMPS_API_URL".to_string(), rewritten.clone());
-
-                // Also rewrite OTEL endpoint which is derived from TEMPS_API_URL
-                if let Some(otel_url) = remote_vars.get("OTEL_EXPORTER_OTLP_ENDPOINT").cloned() {
-                    let rewritten_otel = otel_url
-                        .replace("localhost", &private_address)
-                        .replace("127.0.0.1", &private_address);
-                    remote_vars.insert("OTEL_EXPORTER_OTLP_ENDPOINT".to_string(), rewritten_otel);
+                Err(reason) => {
+                    warn!(
+                        service_id = link.service_id,
+                        service_name = %link.service_name,
+                        "No cross-node address exists for linked service: {}",
+                        reason.detail(&link.service_name)
+                    );
+                    blockers.push(CrossNodeServiceBlocker::new(&link, reason));
                 }
             }
         }
 
-        debug!(
-            "Built remote environment variables with private_address={}",
-            private_address
+        // The control-plane API listens on a real interface, so the private
+        // address is the right substitution here (unlike managed services).
+        if let Some(private_address) = private_address.as_deref() {
+            if let Some(api_url) = remote_vars.get("TEMPS_API_URL").cloned() {
+                if api_url.contains("localhost") || api_url.contains("127.0.0.1") {
+                    let rewritten = api_url
+                        .replace("localhost", private_address)
+                        .replace("127.0.0.1", private_address);
+                    remote_vars.insert("TEMPS_API_URL".to_string(), rewritten);
+
+                    // OTEL endpoint is derived from TEMPS_API_URL.
+                    if let Some(otel_url) = remote_vars.get("OTEL_EXPORTER_OTLP_ENDPOINT").cloned()
+                    {
+                        let rewritten_otel = otel_url
+                            .replace("localhost", private_address)
+                            .replace("127.0.0.1", private_address);
+                        remote_vars
+                            .insert("OTEL_EXPORTER_OTLP_ENDPOINT".to_string(), rewritten_otel);
+                    }
+                }
+            }
+        } else {
+            debug!(
+                project_id = project.id,
+                "No control-plane private address configured; leaving TEMPS_API_URL as-is"
+            );
+        }
+
+        RemoteEnvironmentPlan {
+            variables: Some(remote_vars),
+            blockers,
+        }
+    }
+
+    /// Address a worker node uses to reach the control-plane API.
+    ///
+    /// `multi_node.private_address` when set, else the host of the external
+    /// URL when that host is not a loopback alias. `None` when neither is
+    /// usable — callers then leave API URLs untouched rather than
+    /// substituting something that cannot be right.
+    async fn resolve_control_plane_private_address(
+        &self,
+        settings: &temps_core::AppSettings,
+    ) -> Option<String> {
+        if let Some(addr) = settings.multi_node.private_address.as_deref() {
+            return Some(addr.to_string());
+        }
+
+        let url = self
+            .config_service
+            .get_external_url_or_default()
+            .await
+            .ok()?;
+        let parsed = url::Url::parse(&url).ok()?;
+        let host = parsed.host_str()?;
+        if host == "localhost" || host == "127.0.0.1" || host == "localho.st" {
+            return None;
+        }
+        info!(
+            "No private_address configured, falling back to external URL host: {}",
+            host
         );
-        Some(remote_vars)
+        Some(host.to_string())
     }
 
     /// Create all jobs for a deployment based on project configuration
@@ -1116,29 +1337,49 @@ impl WorkflowPlanner {
             );
         }
 
-        // Inject TEMPS_ASSET_PREFIX for stale-chunk prevention.
+        // Inject deployment-owned runtime variables for stale-chunk prevention
+        // and a deterministic default port. Source-specific planners may
+        // replace PORT later after inspecting an external image.
         // Frameworks can use this to namespace static assets per deployment:
         //   Next.js: assetPrefix: process.env.NEXT_PUBLIC_TEMPS_ASSET_PREFIX || ''
         //   Vite:    base: process.env.TEMPS_ASSET_PREFIX || '/'
         // The value is the deployment slug, which is unique and URL-safe.
-        let asset_prefix = format!("/_temps/assets/{}", deployment.slug);
-        env_vars.insert("TEMPS_ASSET_PREFIX".to_string(), asset_prefix.clone());
-        // NEXT_PUBLIC_ prefix makes it available at build time in Next.js client bundles
-        if project.preset == temps_entities::preset::Preset::NextJs {
-            env_vars.insert("NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string(), asset_prefix);
-        }
+        let default_port = if project.preset == temps_entities::preset::Preset::DockerCompose {
+            None
+        } else {
+            Some(
+                self.resolve_exposed_port(environment, project, None)
+                    .await
+                    .into(),
+            )
+        };
+        super::env_resolver::apply_deployment_owned_variables(
+            &mut env_vars,
+            project.preset,
+            &deployment.slug,
+            default_port,
+        );
 
         debug!(
             "📦 Gathered {} environment variables for deployment",
             env_vars.len()
         );
 
-        // Build remote environment variables (connection strings rewritten for worker nodes)
-        let remote_env_vars = self
+        // Build remote environment variables (connection strings rewritten
+        // to the linked services' internal DNS names for worker nodes).
+        let remote_env_plan = self
             .build_remote_environment_variables(project, &env_vars)
             .await;
-        if remote_env_vars.is_some() {
+        if remote_env_plan.variables.is_some() {
             debug!("📦 Built remote environment variables for cross-node deployments");
+        }
+        for blocker in &remote_env_plan.blockers {
+            warn!(
+                project_id = project.id,
+                environment_id = environment.id,
+                "Cross-node deployment blocked: {}",
+                blocker.describe()
+            );
         }
 
         // Gather secrets — decrypted plaintext values, mounted as files at
@@ -1174,7 +1415,7 @@ impl WorkflowPlanner {
                     environment,
                     deployment,
                     env_vars,
-                    remote_env_vars,
+                    remote_env_plan,
                     secrets,
                 )
                 .await
@@ -1189,7 +1430,7 @@ impl WorkflowPlanner {
                     environment,
                     deployment,
                     env_vars,
-                    remote_env_vars,
+                    remote_env_plan,
                     secrets,
                 )
                 .await
@@ -1200,7 +1441,7 @@ impl WorkflowPlanner {
                     environment,
                     deployment,
                     env_vars,
-                    remote_env_vars,
+                    remote_env_plan,
                     secrets,
                 )
                 .await
@@ -1233,7 +1474,7 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         mut env_vars: std::collections::HashMap<String, String>,
-        remote_env_vars: Option<std::collections::HashMap<String, String>>,
+        remote_env_plan: RemoteEnvironmentPlan,
         secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
@@ -1360,8 +1601,44 @@ impl WorkflowPlanner {
             vec![]
         };
 
-        // Determine deployment strategy: Static or Container
-        let deploy_job_id = if let Some(output_dir) = static_output_dir {
+        // Presets that have nothing to build (a plain static site: no
+        // package.json, no build tool) skip Docker/autopack entirely — a
+        // single job deploys straight from the downloaded checkout. Building
+        // an image just to immediately discard it (or, worse, run it as a
+        // long-lived container purely to serve files) is pure overhead for
+        // content with zero compile step.
+        let needs_container_build = preset_instance
+            .as_ref()
+            .map(|preset| preset.needs_container_build())
+            .unwrap_or(true);
+
+        // Determine deployment strategy: source-only, static (build + extract), or Container
+        let deploy_job_id = if !needs_container_build {
+            debug!(
+                "📄 Using source-only static deployment for preset {} (no build step)",
+                project.preset
+            );
+
+            jobs.push(JobDefinition {
+                job_id: "deploy_static".to_string(),
+                job_type: "DeployStaticFromSourceJob".to_string(),
+                name: "Deploy Static Files".to_string(),
+                description: Some(
+                    "Deploy static files directly from the repository — no build, no container"
+                        .to_string(),
+                ),
+                dependencies: build_dependencies.clone(),
+                job_config: Some(serde_json::json!({
+                    "directory": project.directory,
+                    "project_slug": project.slug,
+                    "environment_slug": environment.slug,
+                    "deployment_slug": deployment.slug
+                })),
+                required_for_completion: true,
+            });
+
+            "deploy_static".to_string()
+        } else if let Some(output_dir) = static_output_dir {
             // Static deployment path: BuildImageJob + DeployStaticJob
             debug!("📦 Using static deployment for preset {}", project.preset);
             debug!("📂 Static output directory: {}", output_dir);
@@ -1533,7 +1810,7 @@ impl WorkflowPlanner {
             let mut deploy_env_vars = env_vars.clone();
             deploy_env_vars.insert("PORT".to_string(), exposed_port.to_string());
 
-            let remote_deploy_env_vars = remote_env_vars.as_ref().map(|rv| {
+            let remote_deploy_env_vars = remote_env_plan.variables.as_ref().map(|rv| {
                 let mut remote = rv.clone();
                 remote.insert("PORT".to_string(), exposed_port.to_string());
                 remote
@@ -1586,6 +1863,12 @@ impl WorkflowPlanner {
                     );
                     self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
                 }
+
+                // Carries no credentials — service names and operator
+                // guidance only — so it rides in plaintext. The deploy job
+                // raises it as a hard failure iff a replica really lands on
+                // a node that cannot reach these services.
+                insert_cross_node_blockers(obj, &remote_env_plan.blockers)?;
             }
 
             jobs.push(JobDefinition {
@@ -1763,10 +2046,12 @@ impl WorkflowPlanner {
             debug!("Skipping screenshot job - screenshots are disabled in config");
         }
 
-        // Job 7: Scan for vulnerabilities (only if git info is available)
+        // Job 7: Scan for vulnerabilities (only if git info is available AND a
+        // container image was actually built — a source-only static deployment
+        // has no image to scan)
         // This runs in parallel with other post-deployment jobs AFTER deployment is marked complete
         // NOT required for deployment completion - if it fails, deployment still succeeds
-        if has_git_info {
+        if has_git_info && needs_container_build {
             jobs.push(JobDefinition {
                 job_id: "scan_vulnerabilities".to_string(),
                 job_type: "ScanVulnerabilitiesJob".to_string(),
@@ -1794,8 +2079,9 @@ impl WorkflowPlanner {
         }
 
         // Job 8: Capture source maps (only for JS-based presets with git info)
-        // Extracts .map files from the built image for error symbolication
-        if has_git_info {
+        // Extracts .map files from the built image for error symbolication —
+        // a source-only static deployment has no build output to extract from
+        if has_git_info && needs_container_build {
             // Search paths are relative to the image's WORKDIR (detected at runtime).
             // The CaptureSourceMapsJob inspects the image to find the WORKDIR and
             // prepends it to these relative paths.
@@ -2065,7 +2351,7 @@ impl WorkflowPlanner {
         environment: &environments::Model,
         deployment: &deployments::Model,
         env_vars: std::collections::HashMap<String, String>,
-        remote_env_vars: Option<std::collections::HashMap<String, String>>,
+        remote_env_plan: RemoteEnvironmentPlan,
         secrets: std::collections::HashMap<String, String>,
     ) -> anyhow::Result<Vec<JobDefinition>> {
         let mut jobs = Vec::new();
@@ -2173,7 +2459,7 @@ impl WorkflowPlanner {
             .entry("OTEL_SERVICE_VERSION".to_string())
             .or_insert_with(|| release_id.clone());
 
-        let remote_deploy_env_vars = remote_env_vars.as_ref().map(|rv| {
+        let remote_deploy_env_vars = remote_env_plan.variables.as_ref().map(|rv| {
             let mut remote = rv.clone();
             remote.insert("PORT".to_string(), exposed_port.to_string());
             remote
@@ -2223,6 +2509,10 @@ impl WorkflowPlanner {
                 );
                 self.seal_sensitive_field(obj, deployment, "secrets", &secrets)?;
             }
+
+            // See the git-deploy path: plaintext by design, enforced by the
+            // deploy job only when the replica is actually scheduled remotely.
+            insert_cross_node_blockers(obj, &remote_env_plan.blockers)?;
         }
 
         jobs.push(JobDefinition {
@@ -2370,91 +2660,6 @@ impl WorkflowPlanner {
     }
 }
 
-/// Returns the framework-specific public-DSN env var name for a preset, or
-/// `None` if the preset has no client bundler (backend-only) or has no
-/// build-time public-prefix convention (Angular reads from `environment.ts`,
-/// generic Docker/Nixpacks/Static presets don't know the framework).
-///
-/// Each entry follows the bundler's own public-prefix rule — that's the only
-/// prefix the bundler will inline into the browser bundle.
-pub(crate) fn public_sentry_dsn_var(
-    preset: temps_entities::preset::Preset,
-) -> Option<&'static str> {
-    use temps_entities::preset::Preset;
-    match preset {
-        // Next.js: `NEXT_PUBLIC_*` is inlined into the client bundle.
-        Preset::NextJs => Some("NEXT_PUBLIC_SENTRY_DSN"),
-        // Nuxt 3+: `NUXT_PUBLIC_*` is exposed via `useRuntimeConfig().public`.
-        Preset::Nuxt => Some("NUXT_PUBLIC_SENTRY_DSN"),
-        // Vite-based frameworks (Remix uses Vite since v2.5; SolidStart is Vinxi/Vite).
-        Preset::Vite | Preset::React | Preset::Vue | Preset::SolidStart | Preset::Remix => {
-            Some("VITE_SENTRY_DSN")
-        }
-        // SvelteKit / Astro / Rsbuild all use `PUBLIC_*` as their public prefix.
-        Preset::SvelteKit | Preset::Astro | Preset::Rsbuild => Some("PUBLIC_SENTRY_DSN"),
-        // Docusaurus is webpack-based and exposes `REACT_APP_*` via DefinePlugin.
-        Preset::Docusaurus => Some("REACT_APP_SENTRY_DSN"),
-        // Angular has no build-time public prefix; users wire `SENTRY_DSN` into
-        // `environment.ts` themselves. Backend / generic presets only need
-        // server-side `SENTRY_DSN`, which is always added.
-        Preset::Angular
-        | Preset::Python
-        | Preset::FastApi
-        | Preset::Flask
-        | Preset::Django
-        | Preset::Rails
-        | Preset::Go
-        | Preset::Rust
-        | Preset::Java
-        | Preset::Laravel
-        | Preset::NodeJs
-        | Preset::Dockerfile
-        | Preset::DockerCompose
-        | Preset::Nixpacks
-        | Preset::Autopack
-        | Preset::Static => None,
-    }
-}
-
-/// Public-prefix env var carrying the same-origin Sentry tunnel path for
-/// browser presets (see `temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH` for
-/// what it points at and why). Mirrors `public_sentry_dsn_var`'s preset
-/// groups exactly — a browser bundle that gets the DSN gets the tunnel path
-/// too, under the same public prefix, so both env vars land in the same
-/// `Sentry.init({ dsn, tunnel })` call. `None` for the same presets that get
-/// no public DSN var (server-only, or no build-time public-prefix
-/// convention).
-pub(crate) fn public_sentry_tunnel_var(
-    preset: temps_entities::preset::Preset,
-) -> Option<&'static str> {
-    use temps_entities::preset::Preset;
-    match preset {
-        Preset::NextJs => Some("NEXT_PUBLIC_SENTRY_TUNNEL"),
-        Preset::Nuxt => Some("NUXT_PUBLIC_SENTRY_TUNNEL"),
-        Preset::Vite | Preset::React | Preset::Vue | Preset::SolidStart | Preset::Remix => {
-            Some("VITE_SENTRY_TUNNEL")
-        }
-        Preset::SvelteKit | Preset::Astro | Preset::Rsbuild => Some("PUBLIC_SENTRY_TUNNEL"),
-        Preset::Docusaurus => Some("REACT_APP_SENTRY_TUNNEL"),
-        Preset::Angular
-        | Preset::Python
-        | Preset::FastApi
-        | Preset::Flask
-        | Preset::Django
-        | Preset::Rails
-        | Preset::Go
-        | Preset::Rust
-        | Preset::Java
-        | Preset::Laravel
-        | Preset::NodeJs
-        | Preset::Dockerfile
-        | Preset::DockerCompose
-        | Preset::Nixpacks
-        | Preset::Autopack
-        | Preset::Static => None,
-    }
-}
-
 /// Extract a release identifier (tag or digest) from a container image
 /// reference. This is the deployed artifact's identity for image deploys —
 /// used as SENTRY_RELEASE / OTEL_SERVICE_VERSION.
@@ -2494,6 +2699,174 @@ mod tests {
     use temps_core::EncryptionService;
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{preset::Preset, upstream_config::UpstreamList};
+
+    // ── Cross-node linking of external services ────────────────────────
+    //
+    // Regression cover for: an app on node A linked to a database on node B
+    // used to be handed `<node B private address>:<host port>`, which can
+    // never connect because managed service ports bind to 127.0.0.1 on
+    // their own host. These tests pin the three outcomes: same-node keeps
+    // the container name, cross-node with DNS uses the FQDN, and cross-node
+    // without DNS produces a typed blocker instead of a broken address.
+
+    fn link(fqdn: Option<&str>, published: bool) -> temps_providers::ServiceCrossNodeLink {
+        temps_providers::ServiceCrossNodeLink {
+            service_id: 7,
+            service_name: "orders-db".to_string(),
+            container_name: "postgres-orders-db".to_string(),
+            node_id: Some(3),
+            fqdn: fqdn.map(str::to_string),
+            dns_record_published: published,
+        }
+    }
+
+    fn linked_env_vars() -> std::collections::HashMap<String, String> {
+        std::collections::HashMap::from([
+            (
+                "POSTGRES_URL".to_string(),
+                "postgresql://app:pw@postgres-orders-db:5432/orders".to_string(),
+            ),
+            (
+                "POSTGRES_HOST".to_string(),
+                "postgres-orders-db".to_string(),
+            ),
+            ("POSTGRES_PORT".to_string(), "5432".to_string()),
+            ("LOG_LEVEL".to_string(), "debug".to_string()),
+        ])
+    }
+
+    #[test]
+    fn same_node_env_vars_keep_the_container_name() {
+        // The local map is what a same-node container receives. Nothing in
+        // the cross-node path may mutate it, so linking over the shared
+        // bridge network keeps working exactly as before.
+        let local = linked_env_vars();
+        let mut remote = local.clone();
+
+        rewrite_service_host(&mut remote, "postgres-orders-db", "orders-db.temps.local");
+
+        assert_eq!(
+            local["POSTGRES_URL"], "postgresql://app:pw@postgres-orders-db:5432/orders",
+            "the same-node map must be untouched"
+        );
+        assert_ne!(local["POSTGRES_URL"], remote["POSTGRES_URL"]);
+    }
+
+    #[test]
+    fn cross_node_with_dns_rewrites_host_to_fqdn_and_keeps_the_port() {
+        let mut vars = linked_env_vars();
+
+        let changed =
+            rewrite_service_host(&mut vars, "postgres-orders-db", "orders-db.temps.local");
+
+        assert_eq!(
+            vars["POSTGRES_URL"],
+            "postgresql://app:pw@orders-db.temps.local:5432/orders"
+        );
+        assert_eq!(vars["POSTGRES_HOST"], "orders-db.temps.local");
+        // Port and unrelated variables are untouched.
+        assert_eq!(vars["POSTGRES_PORT"], "5432");
+        assert_eq!(vars["LOG_LEVEL"], "debug");
+        assert_eq!(changed, vec!["POSTGRES_HOST", "POSTGRES_URL"]);
+    }
+
+    #[test]
+    fn cross_node_never_emits_a_private_address_and_host_port() {
+        let mut vars = linked_env_vars();
+        rewrite_service_host(&mut vars, "postgres-orders-db", "orders-db.temps.local");
+
+        // The old, permanently-broken form. Managed service ports bind to
+        // loopback on their own host, so this must never be produced again.
+        for value in vars.values() {
+            assert!(
+                !value.contains("10.100."),
+                "cross-node values must not contain a node underlay address: {value}"
+            );
+        }
+    }
+
+    #[test]
+    fn rewrite_target_is_the_fqdn_when_dns_is_enabled_and_published() {
+        assert_eq!(
+            cross_node_rewrite_target(&link(Some("orders-db.temps.local"), true), true),
+            Ok("orders-db.temps.local".to_string())
+        );
+    }
+
+    #[test]
+    fn rewrite_target_is_blocked_when_cluster_dns_is_disabled() {
+        assert_eq!(
+            cross_node_rewrite_target(&link(Some("orders-db.temps.local"), true), false),
+            Err(temps_providers::CrossNodeBlockReason::ClusterDnsDisabled)
+        );
+    }
+
+    #[test]
+    fn rewrite_target_is_blocked_when_no_record_is_published() {
+        assert_eq!(
+            cross_node_rewrite_target(&link(Some("orders-db.temps.local"), false), true),
+            Err(temps_providers::CrossNodeBlockReason::DnsRecordMissing)
+        );
+    }
+
+    #[test]
+    fn rewrite_target_is_blocked_when_the_service_has_no_dns_name() {
+        assert_eq!(
+            cross_node_rewrite_target(&link(None, true), true),
+            Err(temps_providers::CrossNodeBlockReason::NoDnsName)
+        );
+    }
+
+    #[test]
+    fn blocker_names_the_service_the_setting_and_the_fix() {
+        let blocker = CrossNodeServiceBlocker::new(
+            &link(Some("orders-db.temps.local"), true),
+            temps_providers::CrossNodeBlockReason::ClusterDnsDisabled,
+        );
+
+        assert_eq!(blocker.service_id, 7);
+        assert_eq!(blocker.fqdn.as_deref(), Some("orders-db.temps.local"));
+
+        let described = blocker.describe();
+        assert!(described.contains("orders-db"), "{described}");
+        assert!(described.contains("id 7"), "{described}");
+        assert!(described.contains("Cluster DNS is disabled"), "{described}");
+        assert!(described.contains("Enable cluster DNS"), "{described}");
+        assert_eq!(blocker.setup_path, "/settings/nodes");
+    }
+
+    #[test]
+    fn blockers_round_trip_through_the_job_config() {
+        let blockers = vec![CrossNodeServiceBlocker::new(
+            &link(Some("orders-db.temps.local"), false),
+            temps_providers::CrossNodeBlockReason::DnsRecordMissing,
+        )];
+
+        let mut config = serde_json::Map::new();
+        insert_cross_node_blockers(&mut config, &blockers).expect("serialize");
+
+        let value = serde_json::Value::Object(config);
+        assert_eq!(read_cross_node_blockers(&value), blockers);
+    }
+
+    #[test]
+    fn no_blockers_means_no_job_config_key() {
+        let mut config = serde_json::Map::new();
+        insert_cross_node_blockers(&mut config, &[]).expect("serialize");
+
+        assert!(
+            !config.contains_key(CROSS_NODE_BLOCKERS_KEY),
+            "an unblocked deployment's job config must be unchanged"
+        );
+        assert!(read_cross_node_blockers(&serde_json::json!({})).is_empty());
+    }
+
+    #[test]
+    fn malformed_blocker_config_degrades_to_no_blockers() {
+        // A stale or hand-edited job config must not become an outage.
+        let value = serde_json::json!({ CROSS_NODE_BLOCKERS_KEY: "not-a-list" });
+        assert!(read_cross_node_blockers(&value).is_empty());
+    }
 
     #[test]
     fn buildkit_cache_namespace_is_stable_and_opaque() {

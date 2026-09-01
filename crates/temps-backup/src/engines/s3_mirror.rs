@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `S3MirrorEngine`: bucket-to-bucket mirror using `mc mirror --overwrite`,
 //! implemented against `engine_v2::BackupEngine`.
 //!

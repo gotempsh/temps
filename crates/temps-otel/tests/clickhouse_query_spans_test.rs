@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Real-ClickHouse integration test for `ClickHouseOtelStorage::query_spans`.
 //!
 //! `query_spans` is assembled by hand: predicates are accumulated into a string

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::disk_status::DiskSpaceCheckResult;
 use crate::{ConfigService, EffectiveTelemetryPolicies};
 use axum::{
@@ -239,6 +242,9 @@ pub struct AppSettingsResponse {
     /// Deployment-image retention policy. No sensitive content, passed through
     /// as-is so the settings UI can show and edit the system-wide default.
     pub image_retention: ImageRetentionSettings,
+    /// MCP (Model Context Protocol) server toggle (ADR-039). No sensitive
+    /// content — passed through as-is so the settings UI can show and edit it.
+    pub mcp_server: temps_core::McpServerSettings,
 }
 
 /// Monitoring settings with the ClickHouse DSN masked.
@@ -466,6 +472,7 @@ impl From<AppSettings> for AppSettingsResponse {
             tenant_resource_ceilings: settings.tenant_resource_ceilings,
             self_update,
             image_retention: settings.image_retention,
+            mcp_server: settings.mcp_server,
         }
     }
 }

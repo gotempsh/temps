@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! CLI device-authorization flow (OAuth 2.0 RFC 8628-style).
 //!
 //! This is the only interactive login path the CLI exposes — credentials are
@@ -49,6 +52,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::apikey_service::{ApiKeyServiceError, CreateApiKeyRequest};
 use crate::audit::LoginAudit;
+use crate::permission_guard;
 use crate::permissions::Role;
 use crate::state::AuthState;
 use crate::RequireAuth;
@@ -415,6 +419,16 @@ pub async fn cli_device_approve(
     Extension(metadata): Extension<RequestMetadata>,
     Json(request): Json<CliDeviceApproveRequest>,
 ) -> Result<Json<CliDeviceApproveResponse>, Problem> {
+    // Approving a device login mints a fresh API key carrying the approver's
+    // primary role. This must be an interactive, in-person consent action —
+    // never delegable to a machine credential — independent of whatever
+    // step-up policy is installed. Machine credentials (API keys, CLI
+    // tokens, deployment tokens) deliberately bypass step-up (see
+    // DefaultSensitiveActionAuthorizer), so this endpoint cannot rely on
+    // `require_cli_device_approval` below for that guarantee.
+    require_browser_session(&auth)?;
+    permission_guard!(auth, ApiKeysCreate);
+
     require_cli_device_approval(state.sensitive_action_authorizer.as_ref(), &auth).await?;
 
     let user = auth.require_user().map_err(|msg| {
@@ -454,6 +468,11 @@ pub async fn cli_device_approve(
 
     let role_name = pick_primary_role(&user_with_roles)
         .ok_or(CliDeviceFlowError::NoRoleAssigned { user_id: user.id })?;
+
+    // Same ceiling create_api_key/rotate_api_key enforce: the minted key must
+    // never grant more than the approver's own effective permissions, even
+    // though the approver is authenticating this device as themselves.
+    crate::apikey_handler::enforce_permission_ceiling_for_role(&auth, &role_name, None)?;
 
     let device_label = session
         .client_name
@@ -528,6 +547,24 @@ pub async fn cli_device_approve(
         user_code: session.user_code,
         status: status::APPROVED.to_string(),
     }))
+}
+
+/// Device-login approval is an interactive consent action. Machine
+/// credentials (API keys, CLI tokens, deployment tokens) deliberately bypass
+/// the step-up check below by policy, so this endpoint's own authorization
+/// cannot rest on that check alone — it must independently refuse anything
+/// that is not a live browser session, the same way it did before machine
+/// credentials were allowed to bypass step-up.
+fn require_browser_session(auth: &crate::AuthContext) -> Result<(), Problem> {
+    if !auth.is_session() {
+        return Err(problem_new(StatusCode::FORBIDDEN)
+            .with_title("Browser Session Required")
+            .with_detail(
+                "Approving a device login requires an interactive browser session; \
+                 API keys, CLI tokens, and deployment tokens cannot approve device logins.",
+            ));
+    }
+    Ok(())
 }
 
 async fn require_cli_device_approval(
@@ -846,8 +883,52 @@ mod tests {
         }
     }
 
+    #[test]
+    fn browser_session_required_rejects_machine_credentials() {
+        // require_browser_session is the endpoint's own authorization check,
+        // independent of step-up policy — it must reject every non-session
+        // principal even though require_cli_device_approval (the step-up
+        // layer) now allows machine credentials through by policy.
+        let api_key_auth = crate::AuthContext::new_api_key(
+            test_user(),
+            Some(Role::Admin),
+            None,
+            "automation".to_string(),
+            9,
+        );
+        require_browser_session(&api_key_auth)
+            .expect_err("API keys must not approve device logins");
+
+        let cli_token_auth = crate::AuthContext::new_cli_token(test_user(), Role::Admin);
+        require_browser_session(&cli_token_auth)
+            .expect_err("CLI tokens must not approve device logins");
+
+        let deployment_token_auth = crate::AuthContext::new_deployment_token(
+            1,
+            None,
+            None,
+            2,
+            "deploy-token".to_string(),
+            vec![],
+        );
+        require_browser_session(&deployment_token_auth)
+            .expect_err("deployment tokens must not approve device logins");
+    }
+
+    #[test]
+    fn browser_session_required_allows_session() {
+        let session_auth = crate::AuthContext::new_persisted_session(test_user(), Role::Admin, 11);
+        require_browser_session(&session_auth).expect("browser sessions may approve");
+    }
+
     #[tokio::test]
-    async fn api_key_cannot_approve_device_session_or_mint_cli_key() {
+    async fn api_key_bypasses_step_up_for_device_session_approval() {
+        // Machine credentials (API keys, CLI tokens, deployment tokens) skip
+        // step-up entirely rather than being denied — see the doc comment on
+        // DefaultSensitiveActionAuthorizer for the full rationale. This test
+        // verifies that an API key is allowed through (not blocked with
+        // FORBIDDEN) so that automation workflows are not silently broken when
+        // new gated endpoints are added.
         let db = Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection());
         let authorizer = crate::DefaultSensitiveActionAuthorizer::new(db);
         let auth = crate::AuthContext::new_api_key(
@@ -858,15 +939,9 @@ mod tests {
             9,
         );
 
-        let error = require_cli_device_approval(&authorizer, &auth)
+        require_cli_device_approval(&authorizer, &auth)
             .await
-            .expect_err("machine credentials must not approve an interactive device login");
-
-        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
-        assert_eq!(
-            error.body.get("action"),
-            Some(&serde_json::json!("create_api_key"))
-        );
+            .expect("machine credentials must bypass step-up, not be denied");
     }
 
     #[test]

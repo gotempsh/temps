@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::{
     apikey_service::ApiKeyService, auth_service::AuthService,
     deployment_token_service::DeploymentTokenValidationService, user_service::UserService,

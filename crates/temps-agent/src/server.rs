@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Agent HTTP server setup and routing.
 
 use axum::{
@@ -56,6 +59,7 @@ pub fn build_router(
         overlay_peers,
         platform,
     });
+    let resource_limits = Arc::new(handlers::AgentResourceLimits::new());
 
     let auth = Arc::new(AgentAuth::new(&config.token));
 
@@ -121,6 +125,14 @@ pub fn build_router(
         )
         .route("/agent/services/exec", post(service_handlers::service_exec))
         .route(
+            "/agent/services/runtime-env",
+            post(service_handlers::runtime_env),
+        )
+        .route(
+            "/agent/services/health-probe",
+            post(service_handlers::health_probe),
+        )
+        .route(
             "/agent/services/backup",
             post(service_handlers::backup_service),
         )
@@ -130,6 +142,7 @@ pub fn build_router(
         )
         .layer(middleware::from_fn(require_agent_auth))
         .layer(Extension(auth))
+        .layer(Extension(resource_limits))
         .with_state(state);
 
     // Swagger UI — no auth required so it's accessible for documentation
@@ -168,6 +181,7 @@ fn spawn_heartbeat_loop(
     container_deployer: Arc<dyn temps_deployer::ContainerDeployer>,
     platform: SharedPlatform,
     docker: Option<bollard::Docker>,
+    dns_health: crate::network_sync::SharedDnsHealth,
 ) {
     let control_plane_url = config.control_plane_url.clone();
     let node_id = config.node_id;
@@ -264,6 +278,24 @@ fn spawn_heartbeat_loop(
             // control plane leaves the stored value untouched.
             if let Some(platform) = reported_platform {
                 body["architecture"] = serde_json::json!(platform);
+            }
+
+            // DNS resolver health (ADR-024), published by the network-sync
+            // loop on every tick. `None` until that loop has ticked at
+            // least once for this node (startup, or a single-host node
+            // that never gets a compute_cidr allocation and so never
+            // touches cluster DNS at all) — omitted from the body in that
+            // case, same treatment as `architecture` above.
+            let dns_snapshot = dns_health.read().ok().and_then(|guard| guard.clone());
+            if let Some(health) = dns_snapshot {
+                match serde_json::to_value(&health) {
+                    Ok(v) => body["dns_resolver"] = v,
+                    Err(e) => tracing::warn!(
+                        node_id = node_id,
+                        error = %e,
+                        "Failed to serialize DNS resolver health for heartbeat"
+                    ),
+                }
             }
 
             // On the first heartbeat (agent startup/reconnect), include a full
@@ -511,15 +543,32 @@ pub async fn start_agent_server(
         platform.clone(),
     );
 
+    // Shared DNS resolver health slot (ADR-024). Written by the network-sync
+    // loop below on every tick, read by the heartbeat loop so the control
+    // plane learns resolver health without an operator SSHing in to read
+    // logs. Lives for the agent's process lifetime, same as `platform`.
+    let dns_health: crate::network_sync::SharedDnsHealth = Arc::new(std::sync::RwLock::new(None));
+
     // Start heartbeat background loop (with deployer for container inventory on first beat)
-    spawn_heartbeat_loop(&config, container_deployer, platform, docker);
+    spawn_heartbeat_loop(
+        &config,
+        container_deployer,
+        platform,
+        docker,
+        dns_health.clone(),
+    );
 
     // Start the multi-host network sync loop. Failures here NEVER stop the
     // agent — when this node has no compute_cidr allocated (single-host
     // cluster, or simply not yet allocated), the loop is a no-op. When a
     // compute_cidr is allocated, the loop bootstraps the overlay and keeps
     // peers reconciled. `temps join` semantics are unchanged either way.
-    crate::network_sync::spawn(&config, overlay_bridge_address.clone(), overlay_peers);
+    crate::network_sync::spawn(
+        &config,
+        overlay_bridge_address.clone(),
+        overlay_peers,
+        dns_health,
+    );
 
     let listener = tokio::net::TcpListener::bind(&config.listen_address)
         .await

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Provider-neutral structured-output streaming with bounded backend caching.
 //!
 //! Screens provide a prompt and JSON Schema; this service owns provider

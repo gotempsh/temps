@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { PermissionRequest } from './PermissionCard'
 
 /** A tool invocation surfaced over the stream or persisted on the message. */

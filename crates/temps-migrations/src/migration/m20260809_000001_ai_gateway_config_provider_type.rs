@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Phase 2 of ADR-037: extend `ai_gateway_config` with the two columns that
 //! let `DispatchingAiService` route per-scope to either the BYOK gateway or a
 //! subscription-backed agent CLI.

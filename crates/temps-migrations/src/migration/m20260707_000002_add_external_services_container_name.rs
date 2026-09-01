@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add a plaintext `container_name` column to `external_services` so the log
 //! collector can map a running container back to its service.
 //!

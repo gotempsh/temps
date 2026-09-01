@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Project/app environment-variable management against a live Temps
  * instance -- proving the full lifecycle (create / update / delete / scope

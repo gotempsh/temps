@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Screenshot Provider Trait
 //!
 //! Defines the interface for screenshot providers (local, remote, etc.)

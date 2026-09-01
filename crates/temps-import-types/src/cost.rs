@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Cluster cost & rightsizing analysis types
 //!
 //! Produced by cluster-level importers (currently Kubernetes) that can observe

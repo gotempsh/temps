@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Core types and traits for the Temps import system
 //!
 //! This crate provides the foundational abstractions for importing workloads

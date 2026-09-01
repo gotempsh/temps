@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Globe, Lock, Info, CheckCircle2 } from 'lucide-react'
 import { cn } from '@/lib/utils'

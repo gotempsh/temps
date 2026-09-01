@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Compression CODECs for the proxy_logs table.
 --
 -- The original table declared no CODECs (default LZ4 everywhere). These ALTERs

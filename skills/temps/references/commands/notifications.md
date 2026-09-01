@@ -18,6 +18,7 @@ Manage notification providers (Slack, Email, Webhook, etc.)
 - `show` - Show notification provider details
 - `remove` (`rm`) - Remove a notification provider
 - `test` - Send a test notification
+- `routes` - Manage severity-based notification routes (which providers receive which severities)
 
 ### `notifications list` (alias: `ls`)
 
@@ -131,3 +132,80 @@ Send a test notification
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `--id <id>` | Provider ID | - | Yes |
+
+### `notifications routes`
+
+Manage severity-based notification routes (which providers receive which severities)
+
+**Subcommands:**
+
+- `list` (`ls`) - List notification routes
+- `show` - Show notification route details
+- `create` - Create a notification route
+- `update` - Update a notification route
+- `remove` (`rm`) - Remove a notification route
+
+#### `notifications routes list` (alias: `ls`)
+
+List notification routes
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes show`
+
+Show notification route details
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes create`
+
+Create a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-n, --name <name>` | Route name | - | No |
+| `--min-severity <severity>` | Minimum severity: debug, info, warning, error, critical, emergency | - | No |
+| `--max-severity <severity>` | Maximum severity: debug, info, warning, error, critical, emergency | - | No |
+| `--provider-ids <ids>` | Comma-separated notification provider IDs | - | No |
+| `--enabled <enabled>` | Enable or disable (true/false, default: true) | - | No |
+| `--json` | Output in JSON format | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+
+#### `notifications routes update`
+
+Update a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `-n, --name <name>` | New route name | - | No |
+| `--min-severity <severity>` | Minimum severity: debug, info, warning, error, critical, emergency | - | No |
+| `--max-severity <severity>` | Maximum severity: debug, info, warning, error, critical, emergency | - | No |
+| `--provider-ids <ids>` | Comma-separated notification provider IDs (replaces the current set) | - | No |
+| `--enabled <enabled>` | Enable or disable (true/false) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `notifications routes remove` (alias: `rm`)
+
+Remove a notification route
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Route ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |

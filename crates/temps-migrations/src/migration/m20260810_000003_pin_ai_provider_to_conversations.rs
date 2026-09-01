@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pin each AI conversation to the provider selected when it is created.
 
 use sea_orm_migration::prelude::*;

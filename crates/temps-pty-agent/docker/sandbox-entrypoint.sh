@@ -1,4 +1,7 @@
 #!/bin/sh
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # sandbox-entrypoint.sh — start the PTY agent under docker-init, then hand
 # off to whatever command the container was asked to run (typically
 # `sleep infinity`).

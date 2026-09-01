@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { getProjectsMonitorHealthOptions } from '@/api/client/@tanstack/react-query.gen'
 import { useQuery } from '@tanstack/react-query'
 

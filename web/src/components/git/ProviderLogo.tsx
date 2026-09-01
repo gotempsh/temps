@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import GithubIcon from '@/icons/Github'
 import GitlabIcon from '@/icons/Gitlab'
 import GiteaIcon from '@/icons/Gitea'

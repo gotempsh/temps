@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -53,6 +56,37 @@ pub struct Model {
     /// private IP for same-DC clusters, public IP for cross-DC. Parsed to
     /// `std::net::IpAddr` at the application boundary.
     pub underlay_address: Option<String>,
+    /// Whether this node's per-node DNS resolver (ADR-024) is currently
+    /// running, as of the last heartbeat that reported it. `None` means
+    /// "never reported" — either an agent binary older than this feature,
+    /// or a node that has never ticked its network-sync loop (a true
+    /// single-host node with no `compute_cidr` allocation never touches
+    /// cluster DNS at all). That's distinct from `Some(false)`, which means
+    /// a heartbeat arrived and the resolver was confirmed not running
+    /// (cluster DNS disabled, or the resolver failed to start).
+    pub dns_resolver_running: Option<bool>,
+    /// Whether the resolver's background tasks (sync loop, DNS server) were
+    /// alive as of the last heartbeat. Only meaningful when
+    /// `dns_resolver_running == Some(true)`; `None` has the same
+    /// never-reported meaning as `dns_resolver_running`.
+    pub dns_resolver_tasks_alive: Option<bool>,
+    /// Timestamp of the resolver's last successful sync against the control
+    /// plane's DNS change feed, as of the last heartbeat. `None` means
+    /// either never reported, or reported-but-never-synced.
+    pub dns_resolver_last_sync_at: Option<DBDateTime>,
+    /// Consecutive sync-tick failures the resolver's sync loop has recorded,
+    /// as of the last heartbeat. Resets to 0 on every successful sync tick,
+    /// so a growing value means the node has lost contact with the control
+    /// plane's DNS change feed and is serving an increasingly stale zone.
+    pub dns_resolver_consecutive_failures: i32,
+    /// The resolver's most recent error (a sync tick failure, or a startup
+    /// failure if the resolver never came up at all), as of the last
+    /// heartbeat. `None` when the resolver is healthy or has never reported.
+    pub dns_resolver_last_error: Option<String>,
+    /// Number of DNS records the resolver was serving as of the last
+    /// heartbeat (from its last successful sync, or its on-disk snapshot if
+    /// it hasn't synced yet). `None` means never reported.
+    pub dns_resolver_record_count: Option<i32>,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
 }

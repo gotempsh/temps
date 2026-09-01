@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { record, type eventWithTime } from "rrweb";
 import { pack } from "@rrweb/packer";
 import { SESSION_RECORDER_ENDPOINT, DEFAULT_BASE_PATH, DEFAULT_EXCLUDED_PATHS } from "./constants";

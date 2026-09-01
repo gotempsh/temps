@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-proxy"
 version.workspace = true
@@ -28,7 +31,6 @@ bytes = { workspace = true }
 cookie = { workspace = true }
 sea-orm = { workspace = true }
 sea-orm-migration = { workspace = true }
-flate2 = { workspace = true }
 tracing = { workspace = true }
 memchr = "2.7"
 htmd = "0.5"

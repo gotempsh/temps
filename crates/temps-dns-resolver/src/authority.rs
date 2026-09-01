@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Hickory `RequestHandler` backed by [`ZoneStore`].
 //!
 //! Implements the minimal slice of the DNS protocol we actually serve:

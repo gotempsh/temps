@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Request headers Temps attaches when proxying to an external plugin.
 //!
 //! Both ends of the proxy need these names, so they live here rather than in

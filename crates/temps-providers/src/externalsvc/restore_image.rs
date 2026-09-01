@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Validation for the restore-time `docker_image` override.
 //!
 //! Restoring into a *new* service clones the source service's root credentials

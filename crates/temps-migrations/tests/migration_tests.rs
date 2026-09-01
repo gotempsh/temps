@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use sea_orm::{ConnectionTrait, Database, DatabaseConnection};
 use sea_orm_migration::MigratorTrait;
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
@@ -258,6 +261,105 @@ async fn test_step_up_session_expiration_migration_up_and_down() -> anyhow::Resu
 
     Migrator::down(&db, Some(1)).await?;
     assert!(!session_step_up_column_exists(&db).await?);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_snapshot_digest_index_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping test_snapshot_digest_index_migration_up_and_down: external database configured"
+        );
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping test_snapshot_digest_index_migration_up_and_down: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20260829_000001_allow_duplicate_ready_snapshot_digests";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    Migrator::up(&db, Some(1)).await?;
+
+    let index = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT i.indisunique AS is_unique \
+             FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE c.relname = 'idx_sandbox_snapshots_digest_ready'"
+                .to_string(),
+        ))
+        .await?
+        .expect("snapshot digest index exists after migration up");
+    assert!(!index.try_get::<bool>("", "is_unique")?);
+
+    db.execute_unprepared(
+        "SET session_replication_role = replica; \
+         INSERT INTO sandbox_snapshots \
+             (public_id, user_id, status, backend, content_digest, content_path) \
+         VALUES \
+             ('snap_migration_a', 987654, 'ready', 'docker', 'shared-digest', '/tmp/a'), \
+             ('snap_migration_b', 987654, 'ready', 'docker', 'shared-digest', '/tmp/a'); \
+         SET session_replication_role = origin;",
+    )
+    .await?;
+
+    let downgrade_error = Migrator::down(&db, Some(1))
+        .await
+        .expect_err("downgrade must reject duplicate ready digests");
+    assert!(
+        downgrade_error
+            .to_string()
+            .contains("cannot restore unique snapshot digest index"),
+        "unexpected downgrade error: {downgrade_error}"
+    );
+
+    db.execute_unprepared("DELETE FROM sandbox_snapshots WHERE public_id = 'snap_migration_b'")
+        .await?;
+    Migrator::down(&db, Some(1)).await?;
+
+    let duplicate_insert = db
+        .execute_unprepared(
+            "SET session_replication_role = replica; \
+             INSERT INTO sandbox_snapshots \
+                 (public_id, user_id, status, backend, content_digest, content_path) \
+             VALUES \
+                 ('snap_migration_c', 987654, 'ready', 'docker', 'shared-digest', '/tmp/a');",
+        )
+        .await;
+    assert!(
+        duplicate_insert.is_err(),
+        "downgrade must restore the unique ready-digest index"
+    );
 
     Ok(())
 }
@@ -2484,9 +2586,8 @@ async fn feature_flag_table_count(db: &DatabaseConnection) -> anyhow::Result<i32
     Ok(row.try_get("", "n")?)
 }
 
-/// Existing installations must gain both the project opt-in column and the
-/// provider-key model catalog with its ownership constraint after a normal
-/// forward migration.
+/// A normal forward migration must include the latest security-relevant
+/// ownership and AI catalog schema.
 #[tokio::test]
 async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()> {
     if external_db_configured() {
@@ -2534,7 +2635,12 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
                 (SELECT COUNT(*)::int FROM information_schema.columns \
                   WHERE table_schema = 'public' AND table_name = 'ai_gateway_config' \
                     AND column_name IN ('summary_provider_id', 'summary_model', \
-                                        'summary_thinking_level')) AS summary_columns"
+                                        'summary_thinking_level')) AS summary_columns, \
+                EXISTS (SELECT 1 FROM information_schema.columns \
+                  WHERE table_schema = 'public' AND table_name = 'external_services' \
+                    AND column_name = 'created_by_user_id') AS service_creator_column, \
+                EXISTS (SELECT 1 FROM pg_constraint \
+                  WHERE conname = 'fk_external_services_created_by_user') AS service_creator_fk"
                 .to_string(),
         ))
         .await?
@@ -2543,6 +2649,36 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
     assert!(schema.try_get::<bool>("", "model_table")?);
     assert!(schema.try_get::<bool>("", "model_key_fk")?);
     assert_eq!(schema.try_get::<i32>("", "summary_columns")?, 3);
+    assert!(schema.try_get::<bool>("", "service_creator_column")?);
+    assert!(schema.try_get::<bool>("", "service_creator_fk")?);
+
+    // The creator-ownership migration is the latest migration. Exercise its
+    // reversal and re-application so upgrades retain an emergency rollback.
+    Migrator::down(&db, Some(1)).await?;
+    let creator_column_after_down = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+               WHERE table_schema = 'public' AND table_name = 'external_services' \
+                 AND column_name = 'created_by_user_id') AS present"
+                .to_string(),
+        ))
+        .await?
+        .expect("creator column rollback query");
+    assert!(!creator_column_after_down.try_get::<bool>("", "present")?);
+
+    Migrator::up(&db, Some(1)).await?;
+    let creator_column_after_reapply = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT EXISTS (SELECT 1 FROM information_schema.columns \
+               WHERE table_schema = 'public' AND table_name = 'external_services' \
+                 AND column_name = 'created_by_user_id') AS present"
+                .to_string(),
+        ))
+        .await?
+        .expect("creator column reapply query");
+    assert!(creator_column_after_reapply.try_get::<bool>("", "present")?);
 
     Ok(())
 }

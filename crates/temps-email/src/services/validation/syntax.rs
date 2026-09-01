@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Email address syntax validation.
 //!
 //! Pragmatic RFC 5321/5322 parsing — strict enough to reject the addresses

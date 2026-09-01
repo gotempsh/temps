@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Durable idempotency claims for deployment-token email sends.
 
 use sea_orm::entity::prelude::*;

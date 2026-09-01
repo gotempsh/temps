@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Persistent AI debugging conversation (ADR-023).
 //!
 //! One row per resumable chat, scoped to a project and a polymorphic

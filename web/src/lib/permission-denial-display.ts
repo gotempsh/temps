@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 function humanize(value: string): string {
   return value.toLowerCase().replace(/_/g, ' ')
 }

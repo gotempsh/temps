@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use sea_orm::entity::prelude::*;
 use sea_orm::{ActiveValue::Set, ConnectionTrait, DbErr};
@@ -18,7 +21,16 @@ pub struct Model {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
-pub enum Relation {}
+pub enum Relation {
+    #[sea_orm(has_many = "super::notification_route_providers::Entity")]
+    NotificationRouteProviders,
+}
+
+impl Related<super::notification_route_providers::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::NotificationRouteProviders.def()
+    }
+}
 
 #[async_trait]
 impl ActiveModelBehavior for ActiveModel {

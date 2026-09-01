@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Proxy/request logs table: system-of-record for one-row-per-HTTP-request traffic
 -- through the Pingora reverse proxy when ClickHouse is enabled
 -- (ServerConfig::is_clickhouse_enabled()). Mirrors the PostgreSQL/TimescaleDB

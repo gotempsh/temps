@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Build all workspace sandbox Docker images locally.
 //!
 //! This example calls the *real* `dockerfile_for_runtime` function used by

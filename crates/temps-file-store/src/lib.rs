@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Content-addressable file store for temps.sh
 //!
 //! Blobs stored by SHA-256 content hash with git-style sharding:
@@ -11,9 +14,15 @@ pub mod fs_store;
 use async_trait::async_trait;
 use bytes::Bytes;
 use thiserror::Error;
+use tokio::io::AsyncRead;
 
 #[derive(Error, Debug)]
 pub enum FileStoreError {
+    #[error(
+        "Invalid CAS content hash ({length} bytes): expected exactly 64 ASCII hexadecimal characters"
+    )]
+    InvalidHash { length: usize },
+
     #[error("File not found: {path}")]
     NotFound { path: String },
 
@@ -22,6 +31,12 @@ pub enum FileStoreError {
 
     #[error("Backend error: {0}")]
     Backend(String),
+}
+
+/// An opened CAS blob whose body can be consumed with bounded async reads.
+pub struct OpenedBlob {
+    pub reader: Box<dyn AsyncRead + Send + Unpin>,
+    pub size_bytes: u64,
 }
 
 /// Content-addressable blob store.
@@ -35,6 +50,10 @@ pub trait FileStore: Send + Sync {
 
     /// Retrieve a blob by its content hash.
     async fn get_blob(&self, hash: &str) -> Result<Bytes, FileStoreError>;
+
+    /// Open a blob without buffering its body and return metadata from the
+    /// opened file/stream itself.
+    async fn open_blob(&self, hash: &str) -> Result<OpenedBlob, FileStoreError>;
 
     /// Check if a blob exists.
     async fn blob_exists(&self, hash: &str) -> Result<bool, FileStoreError>;

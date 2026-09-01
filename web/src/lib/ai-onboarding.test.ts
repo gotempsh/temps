@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { describe, expect, test } from 'bun:test'
 import {
   AI_HARNESS_KEY_NAME,
@@ -18,7 +21,7 @@ describe('AI harness onboarding', () => {
     const commands = buildAiHarnessCommands('https://temps.example.com/')
 
     expect(commands.connectCli).toContain(
-      'bunx @temps-sdk/cli@0.1.34 login https://temps.example.com'
+      'bunx @temps-sdk/cli@0.1.36 login https://temps.example.com'
     )
     expect(commands.connectCli).toContain('--api-key "$TEMPS_API_KEY"')
     expect(commands.connectCli).toContain('--context temps-example-com')
@@ -29,7 +32,7 @@ describe('AI harness onboarding', () => {
     const commands = buildAiHarnessCommands('http://localhost:3003')
 
     expect(commands.verifyIdentity).toBe(
-      'bunx @temps-sdk/cli@0.1.34 --target-context localhost whoami'
+      'bunx @temps-sdk/cli@0.1.36 --target-context localhost whoami'
     )
     expect(commands.verifyProjects).toContain(
       '--target-context localhost projects list --json'

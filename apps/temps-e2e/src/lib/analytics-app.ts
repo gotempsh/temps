@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * A throwaway Go app that serves a real HTML page at `/` -- built for the
  * analytics scenario, which needs the PROXY's own visitor/session cookie

@@ -1,0 +1,268 @@
+export const metadata = {
+  title: 'Install the Temps MCP Server Locally',
+  description:
+    'Enable MCP on a local Temps instance and connect Claude Code, Claude Desktop, Codex, Cursor, VS Code, Windsurf, or Zed using the bunx @temps-sdk/cli mcp add wizard.',
+  alternates: {
+    canonical: '/docs/set-up-mcp-locally',
+  },
+}
+
+export const sections = [
+  { title: 'Prerequisites', id: 'prerequisites' },
+  { title: 'Step 1: Enable the MCP server', id: 'step-1-enable-the-mcp-server' },
+  { title: 'Step 2: Log in to the CLI', id: 'step-2-log-in-to-the-cli' },
+  { title: 'Step 3: Run the installer wizard', id: 'step-3-run-the-installer-wizard' },
+  { title: 'Step 4: Verify the connection', id: 'step-4-verify-the-connection' },
+  { title: 'Choosing tool groups and write mode', id: 'choosing-tool-groups-and-write-mode' },
+  { title: 'Managing multiple installations', id: 'managing-multiple-installations' },
+  { title: 'Troubleshooting', id: 'troubleshooting' },
+]
+
+# Install the Temps MCP Server Locally
+
+Connect an AI assistant to a local Temps instance using the Model Context Protocol (MCP), so it can list your projects, inspect deployments, and — with your explicit confirmation — trigger new ones. {{ className: 'lead' }}
+
+Temps serves MCP directly from the `temps` binary itself — there's nothing extra to install or update on the server side. The `bunx @temps-sdk/cli mcp add` wizard handles the client side: it writes the right config for whichever AI tool you use.
+
+---
+
+## Prerequisites {{ anchor: true, id: 'prerequisites' }}
+
+- **A running local Temps instance** you can reach over HTTP, e.g. `http://localhost:8080`.
+- **Admin access** to that instance, to flip the MCP setting on (step 1).
+- **One of the supported AI clients** installed: Claude Code, Claude Desktop, OpenAI Codex, Cursor, VS Code, Windsurf, or Zed.
+- **bun** available to run `bunx @temps-sdk/cli` (or install the CLI globally — see [CLI Getting Started](/docs/cli-getting-started)).
+
+---
+
+## Step 1: Enable the MCP server {{ anchor: true, id: 'step-1-enable-the-mcp-server' }}
+
+MCP is off by default on every instance, so a fresh install never exposes it unconfigured. Turn it on once, as an admin:
+
+<CodeGroup title="Enable MCP">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli mcp enable
+```
+
+</CodeGroup>
+
+<Note>
+  Under the hood this fetches the full settings object, flips `mcp_server.enabled`,
+  and writes the whole thing back — `PUT /api/settings` takes the full object, not
+  a partial patch. Masked secrets (like a configured DNS provider key) round-trip
+  safely; the server restores them from the database rather than accepting the
+  masked placeholder value. Run `bunx @temps-sdk/cli mcp disable` to turn it back off.
+  If you're not logged into the CLI yet, this command notices and offers to log
+  you in right there — see [Step 2](#step-2-log-in-to-the-cli).
+</Note>
+
+Confirm it took effect:
+
+<CodeGroup title="Verify">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli mcp status
+```
+
+```bash {{ title: 'curl' }}
+curl -s http://localhost:8080/mcp/tools
+```
+
+</CodeGroup>
+
+A `200` with a list of tool groups means MCP is live. A `404` means the flag is still off, or this instance predates MCP support.
+
+---
+
+## Step 2: Log in to the CLI {{ anchor: true, id: 'step-2-log-in-to-the-cli' }}
+
+`mcp enable`, `mcp add`, and `mcp disable` all need an authenticated CLI session to act on your behalf. You don't have to do this as a separate step — if you run one of those commands while logged out, it detects that and offers to log you in right there (prompting "Log in now?" and then for a server URL, defaulting to the one already configured), rather than erroring out.
+
+If you'd rather log in explicitly first (for example, to pick a specific `--context` name, or before running `mcp add --yes` non-interactively):
+
+<CodeGroup title="Log in">
+
+```bash {{ title: 'bunx' }}
+bunx @temps-sdk/cli login http://localhost:8080
+```
+
+</CodeGroup>
+
+Either way, this is the same browser-based device flow used everywhere else in the CLI — see [Log in to the Temps CLI](/docs/cli-login) for the full walkthrough, MFA/SSO notes, and how to switch between several Temps instances. This step only authenticates *you*; it has nothing to do with how the AI client itself will authenticate later (that's a separate, long-lived API key — see below).
+
+<Note>
+  The inline login offer only appears in interactive use. `mcp add --yes` skips
+  it entirely and expects `--api-key` or an existing logged-in context — it
+  never blocks on a prompt, which matters for scripted or CI use.
+</Note>
+
+---
+
+## Step 3: Run the installer wizard {{ anchor: true, id: 'step-3-run-the-installer-wizard' }}
+
+<CodeGroup title="Add a client">
+
+```bash {{ title: 'Claude Code' }}
+bunx @temps-sdk/cli mcp add claude-code
+```
+
+```bash {{ title: 'Claude Desktop' }}
+bunx @temps-sdk/cli mcp add claude-desktop
+```
+
+```bash {{ title: 'Codex' }}
+bunx @temps-sdk/cli mcp add codex
+```
+
+```bash {{ title: 'Cursor' }}
+bunx @temps-sdk/cli mcp add cursor
+```
+
+```bash {{ title: 'VS Code' }}
+bunx @temps-sdk/cli mcp add vscode
+```
+
+```bash {{ title: 'Windsurf' }}
+bunx @temps-sdk/cli mcp add windsurf
+```
+
+```bash {{ title: 'Zed' }}
+bunx @temps-sdk/cli mcp add zed
+```
+
+</CodeGroup>
+
+The wizard walks you through:
+
+1. **A support probe** — it checks `/mcp/tools` first and stops with a clear message if MCP isn't enabled on the target instance, rather than writing a config that won't work.
+2. **Tool groups** — pick which of the 7 groups to expose (default: all). See [Choosing tool groups and write mode](#choosing-tool-groups-and-write-mode).
+3. **Write mode** — off by default. Turning it on lets write tools *appear*; every write still requires a separate confirmation step (see below), so this isn't a full unsupervised-access toggle.
+4. **API key creation** — the wizard offers to mint a key scoped to this connection rather than reusing an existing one, so you can revoke MCP access independently later.
+5. **Writing the config** — for most clients this edits a JSON(C) config file directly, preserving anything else already in it. For Claude Code and Codex, it shells out to their own `claude mcp add` / `codex mcp add` commands instead of hand-editing their config, so you always get whatever format that client currently expects.
+
+Restart the AI client afterward — most only read MCP configuration at startup.
+
+---
+
+## Step 4: Verify the connection {{ anchor: true, id: 'step-4-verify-the-connection' }}
+
+<CodeGroup title="Check what's configured">
+
+```bash {{ title: 'Status' }}
+bunx @temps-sdk/cli mcp status
+```
+
+</CodeGroup>
+
+Then, in the AI client itself, ask something that requires a real tool call — "list my Temps projects" — and confirm it returns data rather than a hallucinated answer. Most clients show a visible tool-call indicator or an approval prompt you can use to confirm the request actually reached your instance.
+
+If you'd rather verify the server side directly without depending on a particular client, drive the JSON-RPC protocol with `curl`:
+
+<CodeGroup title="Raw protocol check">
+
+```bash {{ title: 'curl' }}
+API=http://localhost:8080
+KEY=tk_your_scoped_key
+
+curl -s "$API/mcp" \
+  -H "Authorization: Bearer $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}'
+```
+
+</CodeGroup>
+
+---
+
+## Choosing tool groups and write mode {{ anchor: true, id: 'choosing-tool-groups-and-write-mode' }}
+
+Tools are organized into 7 groups:
+
+| Group | Contents |
+|---|---|
+| `deployments` | projects, deployments, environments, presets |
+| `infrastructure` | services, containers, load-balancer, scans |
+| `networking` | domains, custom-domains, dns-providers, ip-access |
+| `data` | backups, dsn |
+| `observability` | monitors, incidents, errors, proxy-logs, funnels, analytics |
+| `notifications` | notifications, notification-prefs, webhooks, email-domains, email-providers |
+| `platform` | users, settings, api-keys, audit, tokens, platform |
+
+<Note>
+  Tool coverage is still growing. Today, `platform` (list/get projects) and
+  `deployments` (list deployments, plus the write tools below) have real tools
+  implemented. Other groups appear in the wizard's group picker but currently
+  expose nothing — there's no `create_project` tool yet, for example, so create
+  projects through the dashboard or CLI and use MCP to list, inspect, and deploy
+  them.
+</Note>
+
+**Write tools never execute immediately.** Calling one (like triggering a
+deployment) returns a proposal and a short-lived, single-use token instead of
+performing the action. The AI client shows you the proposal; only a follow-up
+confirmation call — using that token, within 5 minutes — actually runs the
+mutation. Every executed write is audit-logged with the calling user, IP, and
+user agent, exactly like the equivalent dashboard or CLI action.
+
+---
+
+## Managing multiple installations {{ anchor: true, id: 'managing-multiple-installations' }}
+
+You'll often want an AI client talking to more than one Temps instance — a local
+dev instance alongside staging or production, for example. Each is a fully
+independent MCP connection: its own URL and its own API key.
+
+<Note>
+  The wizard currently writes to a single, fixed config entry per client (for
+  example `mcpServers.temps`). Running `mcp add` a second time for the *same*
+  client against a *different* instance overwrites that entry rather than adding
+  a second one. To keep two Temps connections active in the same client at once
+  today, run the wizard once, then open the client's config file and duplicate
+  the `temps` entry under a second key (e.g. `temps-staging`) with that
+  instance's URL and API key.
+</Note>
+
+A few practical guidelines:
+
+- **Mint a separate API key per instance.** Keys don't work across instances
+  anyway (each has its own user and key table), but scoping them separately also
+  keeps revocation clean — pulling access on one instance's dashboard doesn't
+  touch the others.
+- **Treat read-only and write-enabled access as separate connections.** If you
+  want a safe, always-on read-only connection plus a write-enabled one you only
+  use for active deployment work, that's two `mcp add` runs with two keys, not
+  one connection you toggle at runtime.
+- **Use `bunx @temps-sdk/cli mcp status`** to see which clients on this machine
+  currently have a Temps entry — it doesn't yet show which instance a given
+  entry points at, so check the config file directly if you've hand-edited it.
+
+---
+
+## Troubleshooting {{ anchor: true, id: 'troubleshooting' }}
+
+**`mcp add` reports "this instance does not support MCP".**
+The feature flag is off (see [Step 1](#step-1-enable-the-mcp-server)), or the
+wizard is pointed at the wrong URL — check `bunx @temps-sdk/cli status`.
+
+**Tools don't appear in the AI client after `mcp add`.**
+Restart the client completely, then confirm the config was actually written with
+`bunx @temps-sdk/cli mcp status`. For Claude Code or Codex, also check their own
+registry directly (`claude mcp list` / `codex mcp list`).
+
+**A write tool call fails with a permission error even though write mode is on.**
+Write mode only controls whether write tools are *listed*. The API key still
+needs the underlying permission (for example, to trigger a deployment) to
+actually call one — that check happens the same way it would for the equivalent
+dashboard or CLI action.
+
+**A tool call returns "unknown tool".**
+Check which groups are active for this connection — a tool outside the active
+groups isn't registered at all, not just hidden from the list.
+
+**Local requests intermittently return an unrelated "forbidden" error instead of
+your expected response.** If you're running multiple local Temps instances on
+one machine, a shared local proxy component can occasionally claim the same port
+another instance expects. Point requests at a different local interface/IP
+instead of `localhost` to rule this out, or restart the instance you're testing
+against.

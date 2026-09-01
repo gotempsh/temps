@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! One-shot ClickHouse backfill helper.
 //!
 //! Reuses the exact `ChEventRow` shape and `row_to_ch` mapper from the

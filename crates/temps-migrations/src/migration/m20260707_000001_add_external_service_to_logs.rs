@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add an `external_service_id` dimension to the log-aggregator tables so that
 //! logs from **imported/managed external-service containers** (Postgres,
 //! MariaDB, Redis, MongoDB, MinIO, …) can be persisted, retained, and searched

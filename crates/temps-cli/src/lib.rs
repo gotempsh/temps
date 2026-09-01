@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Temps CLI — library entrypoint.
 //!
 //! Exposes the same dispatch as the OSS `temps` binary so an out-of-tree

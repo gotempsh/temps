@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service for API traffic analytics queried from the `proxy_logs` hypertable.
 //!
 //! All queries run against the raw `proxy_logs` table with time-bounded

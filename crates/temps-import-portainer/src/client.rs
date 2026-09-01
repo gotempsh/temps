@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Minimal typed client for the Portainer REST API.
 //!
 //! Portainer exchanges username+password for a JWT (`POST /api/auth`) which

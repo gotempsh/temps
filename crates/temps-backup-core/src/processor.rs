@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `BackupJobProcessor`: consumes backup-related `Job` messages from the
 //! shared `temps_core::JobQueue` and dispatches engine work to the
 //! [`crate::BackupExecutor`].

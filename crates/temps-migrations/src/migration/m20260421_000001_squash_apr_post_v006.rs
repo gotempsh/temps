@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Squashed migration for all changes after prod commit b8d6519 (Apr 1, 2026).
 //!
 //! Collapses 34 individual migrations (m20260403_000001 .. m20260420_000003)

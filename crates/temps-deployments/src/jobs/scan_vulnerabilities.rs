@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Vulnerability Scan Job
 //!
 //! Scans the deployed application for security vulnerabilities using Trivy.

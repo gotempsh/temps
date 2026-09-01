@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   useConsoleExtensions,
   type ConsoleNavItem,
@@ -213,6 +216,7 @@ const settingsGroups: SettingsGroupDef[] = [
         icon: Puzzle,
         featureKey: 'plugin-system',
       },
+      { title: 'MCP Server', url: '/settings/mcp-server', icon: Bot },
     ],
   },
   {

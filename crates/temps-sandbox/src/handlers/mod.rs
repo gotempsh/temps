@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for `/v1/sandboxes/*`. Every handler follows the same
 //! shape: `RequireAuth` + `sandbox_permission_guard` + service call + typed DTO.
 //! No business logic lives here.

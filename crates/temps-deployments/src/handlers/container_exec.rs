@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Container exec and terminal handlers.
 //!
 //! Provides one-shot exec (POST) and persistent terminal (WebSocket) access

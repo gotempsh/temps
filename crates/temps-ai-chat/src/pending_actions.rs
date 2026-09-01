@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Service for AI pending-action lifecycle management (propose → confirm/reject).
 //!
 //! The AI NEVER executes a mutation. When the model proposes a write, this

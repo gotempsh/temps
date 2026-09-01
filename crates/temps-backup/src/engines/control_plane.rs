@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `ControlPlaneEngine`: in-process backup of the Temps control-plane
 //! PostgreSQL database, implemented against `engine_v2::BackupEngine`.
 //!

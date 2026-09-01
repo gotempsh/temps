@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import * as fs from 'node:fs'
 import * as path from 'node:path'

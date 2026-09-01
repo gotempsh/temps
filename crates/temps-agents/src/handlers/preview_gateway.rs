@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! HTTP handlers for managing the preview gateway from the settings UI.
 //!
 //! Mounted under `/api/preview-gateway`. All endpoints require

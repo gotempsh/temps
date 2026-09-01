@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pre-computed health summary service.
 //!
 //! Runs every 60 seconds to compute per-environment health summaries

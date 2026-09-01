@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 # Local ACME (TLS certificate) and email test infrastructure.
 #
 # `tls-scenario` proves the real HTTP-01 issuance path end to end -- it needs

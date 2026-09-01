@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-run AI configuration for autofixer runs.
 //!
 //! Adds `agent_runs.run_config` (nullable JSONB) holding the user-chosen

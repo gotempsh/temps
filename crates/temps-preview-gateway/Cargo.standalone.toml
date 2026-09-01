@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 ## Standalone manifest used inside the Docker build only. The in-tree
 ## Cargo.toml uses workspace inheritance which doesn't work outside the
 ## monorepo. Keep dependency versions roughly aligned with the workspace.

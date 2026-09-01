@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! In-memory sliding-window rate limiter for Sentry ingest, keyed by project id.
 //!
 //! Cardinality is bounded by the number of projects with error tracking

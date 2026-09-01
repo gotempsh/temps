@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Optional per-sandbox preview password.
 //!
 //! Sandboxes default to "URL-only" protection: the 16-hex public_id is the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! OTLP/HTTP ingest handlers.
 //!
 //! Accept protobuf-encoded payloads with gzip/zstd compression.
@@ -1376,6 +1379,7 @@ mod tests {
     fn test_error_storage_maps_to_500() {
         let err = OtelError::Storage {
             message: "disk full".into(),
+            kind: crate::error::StorageErrorKind::PostgresQuery,
         };
         let problem: Problem = err.into();
         assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);

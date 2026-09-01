@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProxyLogDetail } from '@/components/proxy-logs/ProxyLogDetail'
 import { Button } from '@/components/ui/button'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed, polymorphic detector definitions for metric alert rules.
 //!
 //! A rule's detector lives in `metric_alert_rules.detection_config` (jsonb). The

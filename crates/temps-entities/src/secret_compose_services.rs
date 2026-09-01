@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Junction table restricting a secret to specific Docker Compose services.
 //!
 //! Mirrors `secret_environments`: one row per (secret_id, service_name) pair.

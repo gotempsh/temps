@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Wire protocol between the host-side handler and the in-sandbox agent.
 //!
 //! Frame: `u32 length (BE) | u8 type | payload`. The `length` field counts

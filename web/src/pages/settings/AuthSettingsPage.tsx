@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   deleteOidcProviderMutation,
   listOidcProvidersOptions,
@@ -35,6 +38,7 @@ import {
 import { Skeleton } from '@/components/ui/skeleton'
 import { Switch } from '@/components/ui/switch'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
+import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
 import { usePageTitle } from '@/hooks/usePageTitle'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import {
@@ -84,6 +88,8 @@ export function AuthSettingsPage() {
   usePageTitle('Authentication')
   const { setBreadcrumbs } = useBreadcrumbs()
   const queryClient = useQueryClient()
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
   const [deleteTarget, setDeleteTarget] = useState<OidcProviderResponse | null>(
     null,
   )
@@ -97,7 +103,14 @@ export function AuthSettingsPage() {
         queryKey: listOidcProvidersQueryKey(),
       })
     },
-    onError: (error) => {
+    onError: (error, variables) => {
+      if (
+        handleSensitiveActionError(error, () =>
+          updateProvider.mutate(variables)
+        )
+      ) {
+        return
+      }
       toast.error(problemMessage(error, 'Failed to update SSO provider'))
     },
   })
@@ -137,6 +150,7 @@ export function AuthSettingsPage() {
 
   return (
     <div className="space-y-6">
+      {verificationDialog}
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">

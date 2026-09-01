@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-config"
 version.workspace = true
@@ -28,7 +31,7 @@ rand = { workspace = true }
 serde_derive = { workspace = true }
 uuid = { workspace = true }
 utoipa = { workspace = true }
-sysinfo = "0.33"
+sysinfo = "0.39"
 axum = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }

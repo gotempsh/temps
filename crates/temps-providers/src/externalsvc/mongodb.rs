@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use anyhow::Result;
 use async_trait::async_trait;
 use bollard::exec::CreateExecOptions;
@@ -6,7 +9,7 @@ use bollard::query_parameters::{
     StopContainerOptions, WaitContainerOptionsBuilder,
 };
 use bollard::{body_full, Docker};
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use mongodb::bson::doc;
 use mongodb::options::ClientOptions;
 use mongodb::Client as MongoClient;
@@ -119,6 +122,82 @@ fn default_docker_image() -> String {
 /// to whatever repository the source service already runs. See
 /// [`crate::externalsvc::restore_image`] for why the override is constrained.
 const RESTORE_IMAGE_REPOSITORIES: &[&str] = &["mongo", "gotempsh/mongodb-walg"];
+
+/// Environment variable holding the root username, consumed by the official
+/// MongoDB entrypoint at first boot. Every container this provider creates is
+/// given it (see [`MongodbService::create_container_once`]), which is what
+/// lets in-container probes read the credential back out of their own
+/// environment instead of putting it on `mongosh`'s command line.
+const MONGO_ROOT_USER_ENV: &str = "MONGO_INITDB_ROOT_USERNAME";
+
+/// Environment variable holding the root password. See [`MONGO_ROOT_USER_ENV`].
+const MONGO_ROOT_PASSWORD_ENV: &str = "MONGO_INITDB_ROOT_PASSWORD";
+
+/// `CMD-SHELL` script used as the Docker healthcheck for MongoDB containers.
+///
+/// **The credentials are deliberately absent from `mongosh`'s argv.** They are
+/// read inside the `--eval` script from `process.env`, which mongosh exposes to
+/// evaluated JavaScript. This is not a style preference:
+///
+/// `mongosh` is a Node CLI whose argument parser treats *any* token beginning
+/// with `-` as a new flag, including in the value position of a space-separated
+/// `-u`, `-p` or `--password`. Because [`generate_secure_password`] draws from a
+/// charset containing `-`, roughly one in seventy-three auto-generated MongoDB
+/// passwords starts with one. Such a password was quoted perfectly by the shell
+/// and still reached mongosh as a clean argv token that its own parser rejected:
+///
+/// ```text
+/// MongoshUnimplementedError: [COMMON-10001] Error parsing command line: unrecognized option: -<password>
+/// ```
+///
+/// Every probe then failed and service creation stalled for the full 90-second
+/// health-check budget in [`MongodbService::wait_for_container_health`].
+///
+/// Neither shape that keeps the other providers safe helps here, both verified
+/// against a real `gotempsh/mongodb-walg:8.0` container:
+///
+/// * the glued `-p<value>` form that makes `mariadb-admin` immune is **not**
+///   accepted by mongosh — it ignores the glued value, prompts `Enter password:`
+///   on stdin and then fails authentication, which is a worse failure than the
+///   parse error because it looks like a credential problem;
+/// * `--password=<value>` does work, but protects only the password and leaves
+///   `-u <username>` open to the identical parse error.
+///
+/// Keeping both values off argv entirely is the only form immune to *every*
+/// username and password shape, including ones an operator sets by hand through
+/// the API rather than ones this crate generated.
+///
+/// Note the probe must authenticate to be meaningful: `ping` is answerable on an
+/// unauthenticated connection, so a bare `db.adminCommand({ping: 1})` reports
+/// healthy regardless of the credentials. `db.auth()` throwing on rejection is
+/// what makes this check fail closed.
+const HEALTHCHECK_COMMAND: &str = concat!(
+    "mongosh --norc --quiet --eval ",
+    "'db.getSiblingDB(\"admin\").auth(process.env.MONGO_INITDB_ROOT_USERNAME, ",
+    "process.env.MONGO_INITDB_ROOT_PASSWORD); db.adminCommand({ping: 1})'",
+    " || exit 1",
+);
+
+/// Build a `mongodb://` connection URI for an in-container `mongosh` probe
+/// against localhost, percent-encoding both credentials.
+///
+/// In-container probes hand this to `mongosh` as a positional connection
+/// string rather than as `-u <user> -p <pass>`. The reason is the same one
+/// documented on [`HEALTHCHECK_COMMAND`]: mongosh's parser reads any argv token
+/// starting with `-` as a flag, so a username or password beginning with `-`
+/// makes a space-separated `-u`/`-p` value fail with
+/// `unrecognized option: -...` no matter how carefully the shell quoted it. A
+/// URI is always a single token starting with `mongodb://`, so it can never be
+/// mistaken for a flag whatever the credentials look like, and percent-encoding
+/// keeps `:`, `@`, `/` and `?` inside the credentials from reshaping the URI.
+fn local_probe_uri(username: &str, password: &str) -> String {
+    format!(
+        "mongodb://{}:{}@127.0.0.1:{}/admin?authSource=admin",
+        urlencoding::encode(username),
+        urlencoding::encode(password),
+        MONGODB_INTERNAL_PORT
+    )
+}
 
 /// Environment variable an operator sets to allow additional MongoDB
 /// repositories as a restore-time `docker_image` override (comma-separated).
@@ -453,9 +532,12 @@ impl MongodbService {
 
         info!("Created MongoDB volume: {}", volume_name);
 
+        // The root credentials are supplied only as environment variables. The
+        // healthcheck below reads them back from here rather than embedding
+        // them in its command line — see [`HEALTHCHECK_COMMAND`].
         let mut env_vars: Vec<String> = vec![
-            format!("MONGO_INITDB_ROOT_USERNAME={}", config.username),
-            format!("MONGO_INITDB_ROOT_PASSWORD={}", config.password),
+            format!("{}={}", MONGO_ROOT_USER_ENV, config.username),
+            format!("{}={}", MONGO_ROOT_PASSWORD_ENV, config.password),
             format!("MONGO_INITDB_DATABASE={}", config.database),
         ];
 
@@ -478,18 +560,9 @@ impl MongodbService {
 
         // Pull the image first
         info!("Pulling MongoDB image: {}", image_tag);
-        let mut stream = docker.create_image(
-            Some(bollard::query_parameters::CreateImageOptions {
-                from_image: Some(image_tag.clone()),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-
-        while let Some(result) = stream.next().await {
-            result.map_err(|e| anyhow::anyhow!("Failed to pull MongoDB image: {}", e))?;
-        }
+        crate::utils::pull_image_with_retry(docker, &image_tag, None)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to pull MongoDB image: {}", e))?;
 
         let mut host_config = bollard::models::HostConfig {
             port_bindings: Some(crate::utils::local_port_binding("27017/tcp", &config.port)),
@@ -562,16 +635,14 @@ impl MongodbService {
             }),
             networking_config,
             healthcheck: Some(bollard::models::HealthConfig {
-                test: Some(vec!["CMD-SHELL".to_string(), {
-                    // Properly escape credentials for shell execution by wrapping in single quotes
-                    // and escaping any single quotes within the values
-                    let escaped_username = config.username.replace("'", "'\"'\"'");
-                    let escaped_password = config.password.replace("'", "'\"'\"'");
-                    format!(
-                            "mongosh --norc --eval \"db.adminCommand('ping')\" -u '{}' -p '{}' --authenticationDatabase admin || exit 1",
-                            escaped_username, escaped_password
-                        )
-                }]),
+                // Credential-free command line: the probe reads the root
+                // credentials from the container's own environment (set above)
+                // rather than taking them as `mongosh` arguments. See
+                // [`HEALTHCHECK_COMMAND`] for why argv is not usable here.
+                test: Some(vec![
+                    "CMD-SHELL".to_string(),
+                    HEALTHCHECK_COMMAND.to_string(),
+                ]),
                 interval: Some(2000000000), // 2 seconds
                 timeout: Some(10000000000), // 10 seconds
                 retries: Some(5),
@@ -631,18 +702,20 @@ impl MongodbService {
     ) -> Result<()> {
         use bollard::exec::{StartExecOptions, StartExecResults};
 
-        // Pass credentials via env to avoid quoting hazards in the shell
-        // command. The replica-set name is also injected as an env var so it
-        // can't break out of the JSON literal.
+        // Credentials travel as a percent-encoded connection URI in an env var,
+        // never as `-u`/`-p` arguments — see [`local_probe_uri`]. The
+        // replica-set name is also injected as an env var so it can't break out
+        // of the JSON literal.
         let env = [
-            format!("INIT_USER={}", config.username),
-            format!("INIT_PASS={}", config.password),
+            format!(
+                "INIT_URI={}",
+                local_probe_uri(&config.username, &config.password)
+            ),
             format!("INIT_RS={}", rs_name),
         ];
         let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
 
-        let script = "mongosh --quiet --norc \
-             -u \"$INIT_USER\" -p \"$INIT_PASS\" --authenticationDatabase admin \
+        let script = "mongosh --quiet --norc \"$INIT_URI\" \
              --eval 'try { rs.initiate({_id: process.env.INIT_RS, members: [{_id: 0, host: \"127.0.0.1:27017\"}]}); } catch (e) { if (e.codeName !== \"AlreadyInitialized\" && !String(e).includes(\"already initialized\")) { throw e; } print(\"replica set already initialized\"); }' 2>&1";
 
         let exec = docker
@@ -723,13 +796,14 @@ impl MongodbService {
     ) -> Result<()> {
         use bollard::exec::{StartExecOptions, StartExecResults};
 
-        let env = [
-            format!("INIT_USER={}", config.username),
-            format!("INIT_PASS={}", config.password),
-        ];
+        // Credentials travel as a percent-encoded connection URI, not as
+        // `-u`/`-p` arguments — see [`local_probe_uri`].
+        let env = [format!(
+            "INIT_URI={}",
+            local_probe_uri(&config.username, &config.password)
+        )];
         let env_refs: Vec<&str> = env.iter().map(String::as_str).collect();
-        let probe_script = "mongosh --quiet --norc \
-             -u \"$INIT_USER\" -p \"$INIT_PASS\" --authenticationDatabase admin \
+        let probe_script = "mongosh --quiet --norc \"$INIT_URI\" \
              --eval 'const r = db.hello(); if (!r.isWritablePrimary) { quit(2); }' 2>&1";
 
         let max_wait = Duration::from_secs(30);
@@ -778,11 +852,12 @@ impl MongodbService {
 
     /// Render a container's health state as a one-line, log-safe diagnostic.
     ///
-    /// The MongoDB healthcheck embeds the root password in its command line, so
-    /// anything derived from it is treated as credential-bearing: only the
-    /// healthcheck's captured `output` is surfaced (never the command itself),
-    /// it is truncated, and newlines are flattened so a multi-line mongosh
-    /// stack trace cannot smear across the log.
+    /// The healthcheck itself no longer carries the root credentials (see
+    /// [`HEALTHCHECK_COMMAND`]), but anything derived from a probe against a
+    /// credentialed service is still treated as potentially credential-bearing:
+    /// only the healthcheck's captured `output` is surfaced (never the command
+    /// itself), it is truncated, and newlines are flattened so a multi-line
+    /// mongosh stack trace cannot smear across the log.
     fn describe_container_health(state: &bollard::models::ContainerState) -> String {
         const MAX_OUTPUT: usize = 400;
 
@@ -951,32 +1026,13 @@ impl MongodbService {
     /// Attempts to pull the image - fails if it doesn't exist or cannot be accessed
     #[allow(dead_code)]
     async fn verify_image_pullable(&self, image: &str) -> Result<()> {
-        // Parse image name and tag
-        let (image_name, tag) = if let Some((name, tag)) = image.split_once(':') {
-            (name.to_string(), tag.to_string())
-        } else {
-            (image.to_string(), "latest".to_string())
-        };
-
         info!("Attempting to pull Docker image: {}", image);
 
-        // Try to pull the image - this will fail if it doesn't exist
-        let result = self
-            .docker
-            .create_image(
-                Some(bollard::query_parameters::CreateImageOptions {
-                    from_image: Some(image_name.clone()),
-                    tag: Some(tag.clone()),
-                    ..Default::default()
-                }),
-                None,
-                None,
-            )
-            .try_collect::<Vec<_>>()
-            .await;
-
-        match result {
-            Ok(_) => {
+        // Try to pull the image - this will fail if it doesn't exist. Retries
+        // transient stream errors so a dropped connection isn't mistaken for
+        // the image genuinely being unavailable.
+        match crate::utils::pull_image_with_retry(&self.docker, image, None).await {
+            Ok(()) => {
                 info!("Docker image {} is available and pullable", image);
                 Ok(())
             }
@@ -1471,18 +1527,17 @@ impl MongodbService {
         use bollard::exec::{CreateExecOptions, StartExecOptions, StartExecResults};
         use futures::StreamExt;
 
-        // Probe via env var so special chars can't break the shell. mongosh
-        // reads `--password "$P"` literally.
+        // Probe via env var so special chars can't break the shell, and as a
+        // percent-encoded connection URI rather than `-u`/`--password`
+        // arguments so a credential starting with `-` can't be mistaken for a
+        // flag by mongosh's parser — see [`local_probe_uri`].
         let probe_cmd = vec![
             "sh",
             "-c",
-            "mongosh --quiet -u \"$PROBE_USER\" --authenticationDatabase admin --password \"$PROBE_PASS\" --eval 'db.runCommand({ping:1})' mongodb://127.0.0.1:27017/admin 2>&1",
+            "mongosh --quiet --norc \"$PROBE_URI\" --eval 'db.runCommand({ping:1})' 2>&1",
         ];
 
-        let env = [
-            format!("PROBE_USER={}", username),
-            format!("PROBE_PASS={}", password),
-        ];
+        let env = [format!("PROBE_URI={}", local_probe_uri(username, password))];
         let env_refs: Vec<&str> = env.iter().map(|s| s.as_str()).collect();
 
         let exec = self
@@ -1745,23 +1800,15 @@ impl MongodbService {
         password: &str,
     ) -> Result<()> {
         // Pull the sidecar image (no-op if already present).
-        let mut pull_stream = self.docker.create_image(
-            Some(bollard::query_parameters::CreateImageOptions {
-                from_image: Some(MONGO_SIDECAR_IMAGE.to_string()),
-                ..Default::default()
-            }),
-            None,
-            None,
-        );
-        while let Some(result) = pull_stream.next().await {
-            result.map_err(|e| {
+        crate::utils::pull_image_with_retry(&self.docker, MONGO_SIDECAR_IMAGE, None)
+            .await
+            .map_err(|e| {
                 anyhow::anyhow!(
                     "Failed to pull sidecar image {}: {}",
                     MONGO_SIDECAR_IMAGE,
                     e
                 )
             })?;
-        }
 
         let container_archive_path = format!("/backup/{}", archive_filename);
         let sidecar_name = format!(
@@ -3507,6 +3554,172 @@ mod tests {
         );
     }
 
+    // ── Regression: credentials that mongosh's parser mistakes for flags ────
+
+    /// A root password with the shape that broke MongoDB service creation:
+    /// 32 characters drawn from `generate_secure_password()`'s charset, the
+    /// first of which is `-`. Roughly 1 in 73 generated passwords looks like
+    /// this. Synthesised here rather than copied from the incident, but the
+    /// shape (leading `-`, plus `!&=^@*#%+` in the tail) is preserved because
+    /// that shape is the whole point of the test.
+    const DASH_LEADING_PASSWORD: &str = "-Xq!7&Zt=3^w_9@Mr*4#Pv2%Kd+Ln8*Q";
+
+    /// A username with the same hazard. `-u <value>` is exposed to the exact
+    /// same parse error as `-p <value>`, so fixing only the password would
+    /// leave half the bug in place.
+    const DASH_LEADING_USERNAME: &str = "-temps-probe-admin";
+
+    /// Cheap drift guard: the probe must not carry any credential on
+    /// `mongosh`'s command line, and must reference the env vars the container
+    /// is actually created with.
+    ///
+    /// This is deliberately *not* the regression test. The original bug lived
+    /// entirely in how mongosh parses the string, not in the string itself, so
+    /// an assertion on the constructed command would have passed happily while
+    /// production timed out. Its only job is to fail loudly if a later edit
+    /// puts credentials back on argv, without needing Docker to do so.
+    #[test]
+    fn test_healthcheck_command_carries_no_credentials_on_argv() {
+        assert!(
+            !HEALTHCHECK_COMMAND.contains(" -u "),
+            "healthcheck must not pass the username as an argument: {HEALTHCHECK_COMMAND}"
+        );
+        assert!(
+            !HEALTHCHECK_COMMAND.contains(" -p "),
+            "healthcheck must not pass the password as an argument: {HEALTHCHECK_COMMAND}"
+        );
+        assert!(
+            !HEALTHCHECK_COMMAND.contains("--password"),
+            "healthcheck must not pass the password as an argument: {HEALTHCHECK_COMMAND}"
+        );
+        assert!(
+            HEALTHCHECK_COMMAND.contains(MONGO_ROOT_USER_ENV)
+                && HEALTHCHECK_COMMAND.contains(MONGO_ROOT_PASSWORD_ENV),
+            "healthcheck must read both credentials from the env vars the container is created with: {HEALTHCHECK_COMMAND}"
+        );
+    }
+
+    /// The in-container exec probes hand credentials to mongosh as a
+    /// connection URI, which is a single token always starting with
+    /// `mongodb://` and therefore never mistakable for a flag.
+    #[test]
+    fn test_local_probe_uri_is_never_flag_shaped() {
+        let uri = local_probe_uri(DASH_LEADING_USERNAME, DASH_LEADING_PASSWORD);
+        assert!(
+            uri.starts_with("mongodb://"),
+            "probe URI must be a positional connection string, got: {uri}"
+        );
+        // Characters that would otherwise re-shape the URI must be encoded.
+        assert!(uri.contains("%40"), "`@` must be percent-encoded: {uri}");
+        assert!(uri.contains("%21"), "`!` must be percent-encoded: {uri}");
+        assert!(uri.contains("%3D"), "`=` must be percent-encoded: {uri}");
+        assert!(uri.contains("%26"), "`&` must be percent-encoded: {uri}");
+        assert!(
+            uri.ends_with("/admin?authSource=admin"),
+            "probe URI must authenticate against admin: {uri}"
+        );
+    }
+
+    /// Regression test for the 90-second health-check timeout that made every
+    /// MongoDB service with a `-`-leading root password fail to create.
+    ///
+    /// **This has to run against a real container.** The bug was never in the
+    /// string temps built — the shell quoted it correctly and handed `mongosh`
+    /// two clean argv tokens — it was in how mongosh's own Node-based parser
+    /// reads a token beginning with `-` in a value position. So this boots the
+    /// real image, goes through the same `create_container` path the provider
+    /// uses in production (same env vars, same `HealthConfig`), and lets Docker
+    /// execute the health probe for real. `create_container` only returns `Ok`
+    /// once Docker reports the container HEALTHY; before the fix it returned
+    /// `Err("MongoDB container health check timed out after 90s...")`.
+    ///
+    /// Both the username and the password start with `-`, since `-u` was
+    /// exposed to the identical parse error as `-p`.
+    ///
+    /// Skips (does not fail) when Docker is unavailable — Docker tests in this
+    /// repo must never be `#[ignore]`d.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_container_becomes_healthy_with_dash_leading_credentials() {
+        // Bounded so a wedged daemon or an unreachable registry fails with a
+        // diagnostic instead of stalling CI. The health probe itself is already
+        // capped at 90s inside `wait_for_container_health`.
+        const TEST_TIMEOUT: Duration = Duration::from_secs(300);
+
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(d) => Arc::new(d),
+            Err(e) => {
+                println!("Docker not available, skipping test: {e}");
+                return;
+            }
+        };
+        if docker.ping().await.is_err() {
+            println!("Docker daemon not responding, skipping test");
+            return;
+        }
+
+        let service_name = format!("test-dash-pw-{}", chrono::Utc::now().timestamp_millis());
+        let port = match find_available_port(27200) {
+            Some(p) => p,
+            None => {
+                println!("No available port for MongoDB, skipping test");
+                return;
+            }
+        };
+
+        let service = MongodbService::new(service_name.clone(), docker.clone());
+        let mut config = MongodbRuntimeConfig {
+            host: "localhost".to_string(),
+            port: port.to_string(),
+            database: "testdb".to_string(),
+            username: DASH_LEADING_USERNAME.to_string(),
+            password: DASH_LEADING_PASSWORD.to_string(),
+            docker_image: default_docker_image(),
+            replica_set: None,
+            keyfile_content: None,
+            container_name: None,
+        };
+
+        let result = tokio::time::timeout(
+            TEST_TIMEOUT,
+            service.create_container(&docker, &mut config, &ServiceResourceLimits::default()),
+        )
+        .await;
+
+        // Tear down before asserting so a failure never leaks a container or
+        // volume onto the developer's machine or the CI runner.
+        let container_name = service.get_container_name();
+        let _ = docker
+            .remove_container(
+                &container_name,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        let _ = docker
+            .remove_volume(
+                &format!("temps-mongodb-{}-data", service_name),
+                None::<bollard::query_parameters::RemoveVolumeOptions>,
+            )
+            .await;
+
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!(
+                "MongoDB container with a '-'-leading username and password never became healthy. \
+                 This is the regression: mongosh rejects such a value in a space-separated \
+                 -u/-p/--password position with `unrecognized option`, so every probe fails \
+                 and creation times out. Underlying error: {e}"
+            ),
+            Err(_) => panic!(
+                "create_container exceeded {}s — the daemon or the image pull is wedged",
+                TEST_TIMEOUT.as_secs()
+            ),
+        }
+    }
+
     #[test]
     fn test_build_mongodb_url_standalone() {
         let url = build_mongodb_url("root", "p@ss/word", "mongo", "27017", "mydb", None);
@@ -3554,6 +3767,44 @@ mod tests {
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let service = MongodbService::new("test-service".to_string(), docker);
         assert_eq!(service.get_container_name(), "temps-mongodb-test-service");
+    }
+
+    #[tokio::test]
+    async fn init_preserves_a_persisted_port_owned_by_the_running_service() {
+        let held = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .expect("reserve a port as a running MongoDB container would");
+        let persisted_port = held.local_addr().expect("read reserved port").port();
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let service = MongodbService::new("existing-service".to_string(), docker);
+        let config = ServiceConfig {
+            name: "existing-service".to_string(),
+            service_type: ServiceType::Mongodb,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": persisted_port.to_string(),
+                "database": "admin",
+                "username": "root",
+                "password": "persisted-password",
+                "docker_image": "gotempsh/mongodb-walg:8.0"
+            }),
+        };
+
+        let inferred = service
+            .init(config)
+            .await
+            .expect("initializing an existing service must keep its persisted endpoint");
+
+        assert_eq!(inferred.get("port"), Some(&persisted_port.to_string()));
+        assert_eq!(
+            service
+                .config
+                .read()
+                .await
+                .as_ref()
+                .map(|runtime| runtime.port.as_str()),
+            Some(persisted_port.to_string().as_str())
+        );
     }
 
     #[test]
@@ -4239,6 +4490,7 @@ mod tests {
         use super::super::test_utils::{
             create_mock_backup, create_mock_db, create_mock_external_service, MinioTestContainer,
         };
+        use futures::TryStreamExt;
 
         // Check if Docker is available
         let docker = match Docker::connect_with_local_defaults() {

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Normalizes `email_events.event_type` to a single, past-tense convention.
 //!
 //! Two code paths wrote to this shared table with different strings:

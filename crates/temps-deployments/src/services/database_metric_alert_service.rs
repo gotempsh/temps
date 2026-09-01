@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Database-backed implementation of `MetricAlertConfigService`.
 //!
 //! Reconciles metric alert rules declared in `.temps.yaml` with the

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { requireAuth, config, credentials } from '../../config/store.js'
 import { setupClient, client, normalizeApiUrl } from '../../lib/api-client.js'
 import { resolveProjectSlug } from '../../config/resolve-project.js'

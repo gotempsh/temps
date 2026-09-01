@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   getLastDeploymentOptions,
   getProjectBySlugOptions,
@@ -230,16 +233,19 @@ export function ProjectDetail() {
     commit,
     tag,
     environmentId,
+    imageRef: editedImageRef,
   }: {
     branch?: string
     commit?: string
     tag?: string
     environmentId: number
+    imageRef?: string
   }) => {
     if (!project) return
 
     if (project.source_type === 'docker_image') {
-      const imageRef = lastDeployment?.metadata?.externalImageRef
+      const imageRef =
+        editedImageRef?.trim() || lastDeployment?.metadata?.externalImageRef
       if (!imageRef) {
         toast.error('No image reference found for this project')
         return

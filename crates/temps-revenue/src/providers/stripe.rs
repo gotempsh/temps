@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Stripe webhook verification and event normalization.
 //!
 //! We verify the `Stripe-Signature` header (documented format:

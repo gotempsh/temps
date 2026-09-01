@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::engines::dispatch::{resolve_engine_key, ResolveEngineError};
 use crate::handlers::audit::{
     AuditContext, BackupDeletedAudit, BackupRetentionCleanupAudit, BackupRunAudit,
@@ -5,12 +8,18 @@ use crate::handlers::audit::{
     S3SourceCreatedAudit, S3SourceDeletedAudit, S3SourceUpdatedAudit, ScheduleRunNowAudit,
     ScheduleServiceDetachedAudit, ScheduleServicesAttachedAudit,
 };
+use crate::handlers::authz::{
+    accessible_service_ids, filter_accessible_schedules, require_backup_access,
+    require_backup_collection_access, require_backup_collection_scope_access,
+    require_global_backup_admin, require_schedule_access, require_schedule_attach_access,
+    require_service_access,
+};
 use crate::handlers::types::BackupAppState;
 use crate::services::BackupTriggerParams;
 use crate::services::{
-    BackupError, ChildBackupEntry, EnqueuedJob, RetentionCleanupReport, ScheduleRunEntry,
-    ScheduleRunJobEntry, ScheduleRunListResponse, ScheduleRunResponse, ScheduleRunSummary,
-    ScheduleRunSummaryList,
+    BackupAccessScope, BackupError, ChildBackupEntry, EnqueuedJob, RetentionCleanupReport,
+    ScheduleRunEntry, ScheduleRunJobEntry, ScheduleRunListResponse, ScheduleRunResponse,
+    ScheduleRunSummary, ScheduleRunSummaryList,
 };
 use axum::{
     extract::{Extension, Path, State},
@@ -19,15 +28,14 @@ use axum::{
     routing::{get, patch, post},
     Json, Router,
 };
-use sea_orm::{DatabaseBackend, FromQueryResult, Statement};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use temps_auth::permission_guard;
-use temps_auth::RequireAuth;
+use temps_auth::{permission_guard, require_sensitive_action, Permission, RequireAuth};
 use temps_core::problemdetails;
 use temps_core::problemdetails::{Problem, ProblemDetails};
 use temps_core::RequestMetadata;
+use temps_core::SensitiveAction;
 use tracing::error;
 use utoipa::{OpenApi, ToSchema};
 
@@ -95,7 +103,17 @@ impl From<BackupError> for Problem {
                 .with_title("Backup Cannot Be Safely Deleted")
                 .with_detail(error.to_string()),
 
-            BackupError::Database(_)
+            BackupError::Forbidden { .. } => problemdetails::new(StatusCode::FORBIDDEN)
+                .with_title("Insufficient Permissions")
+                .with_detail(error.to_string()),
+
+            BackupError::PartialDeletion { .. } => {
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Backup Was Partially Deleted")
+                    .with_detail(error.to_string())
+            }
+
+            internal_error @ (BackupError::Database(_)
             | BackupError::S3(_)
             | BackupError::Configuration(_)
             | BackupError::ExternalService(_)
@@ -103,10 +121,11 @@ impl From<BackupError> for Problem {
             | BackupError::NotificationError(_)
             | BackupError::Io(_)
             | BackupError::Serialization(_)
-            | BackupError::PartialDeletion { .. } => {
+            | BackupError::Authorization { .. }) => {
+                error!(error = %internal_error, "backup request failed internally");
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Internal Server Error")
-                    .with_detail(error.to_string())
+                    .with_detail("The backup operation could not be completed")
             }
         }
     }
@@ -840,6 +859,7 @@ struct ListSourceBackupsParams {
     responses(
         (status = 200, description = "List of all backups in the source", body = SourceBackupIndexResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "S3 source not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -854,6 +874,7 @@ async fn list_source_backups(
     axum::extract::Query(params): axum::extract::Query<ListSourceBackupsParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_global_backup_admin(&app_state, &auth, "list backups stored in an S3 source")?;
 
     let index = app_state
         .backup_service
@@ -999,6 +1020,7 @@ fn default_page_size() -> i64 {
     responses(
         (status = 200, description = "Paginated list of backups for this service", body = ServiceBackupListResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -1010,6 +1032,15 @@ async fn list_external_service_backups(
     axum::extract::Query(params): axum::extract::Query<ListExternalServiceBackupsParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_service_access(
+        &app_state,
+        &auth,
+        service_id,
+        Permission::BackupsRead,
+        "external service",
+        "backup",
+    )
+    .await?;
 
     let (entries, total) = app_state
         .backup_service
@@ -1048,11 +1079,20 @@ async fn list_schedule_services(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_schedule_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsRead,
+        "list services for",
+    )
+    .await?;
     let services = app_state
         .backup_service
         .list_services_for_schedule(id)
         .await
         .map_err(Problem::from)?;
+
     let body: Vec<ExternalServiceSummary> = services.into_iter().map(Into::into).collect();
     Ok(Json(body))
 }
@@ -1085,6 +1125,14 @@ async fn attach_schedule_services(
     Json(request): Json<AttachScheduleServicesRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+    require_schedule_attach_access(
+        &app_state,
+        &auth,
+        id,
+        &request.service_ids,
+        Permission::BackupsCreate,
+    )
+    .await?;
 
     let inserted = app_state
         .backup_service
@@ -1149,6 +1197,23 @@ async fn detach_schedule_service(
     Path((id, service_id)): Path<(i32, i32)>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsDelete);
+    require_schedule_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsDelete,
+        "detach services from",
+    )
+    .await?;
+    require_service_access(
+        &app_state,
+        &auth,
+        service_id,
+        Permission::BackupsDelete,
+        "external service",
+        "backup",
+    )
+    .await?;
 
     let removed = app_state
         .backup_service
@@ -1198,11 +1263,28 @@ async fn list_service_schedules(
     Path(service_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_service_access(
+        &app_state,
+        &auth,
+        service_id,
+        Permission::BackupsRead,
+        "external service",
+        "backup",
+    )
+    .await?;
     let schedules = app_state
         .backup_service
         .list_schedules_for_service(service_id)
         .await
         .map_err(Problem::from)?;
+    let schedules = filter_accessible_schedules(
+        &app_state,
+        &auth,
+        schedules,
+        Permission::BackupsRead,
+        "list schedules",
+    )
+    .await?;
     let body: Vec<BackupScheduleResponse> = schedules.into_iter().map(Into::into).collect();
     Ok(Json(body))
 }
@@ -1297,6 +1379,7 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
     responses(
         (status = 200, description = "List of S3 sources", body = Vec<S3SourceResponse>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(
@@ -1308,6 +1391,7 @@ async fn list_s3_sources(
     State(app_state): State<Arc<BackupAppState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_global_backup_admin(&app_state, &auth, "list S3 backup sources")?;
     let sources = app_state
         .backup_service
         .list_s3_sources()
@@ -1328,6 +1412,7 @@ async fn list_s3_sources(
         (status = 201, description = "S3 source created", body = S3SourceResponse),
         (status = 400, description = "Invalid request", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(
@@ -1341,6 +1426,7 @@ async fn create_s3_source(
     Json(request): Json<CreateS3SourceRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+    require_global_backup_admin(&app_state, &auth, "create an S3 backup source")?;
     let source = app_state
         .backup_service
         .create_s3_source(request.clone())
@@ -1373,6 +1459,8 @@ async fn create_s3_source(
     path = "/backups/s3-sources/{id}",
     responses(
         (status = 200, description = "S3 source details", body = S3SourceResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "S3 source not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -1386,6 +1474,7 @@ async fn get_s3_source(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_global_backup_admin(&app_state, &auth, "read an S3 backup source")?;
     let source = app_state.backup_service.get_s3_source(id).await?;
 
     Ok(Json(S3SourceResponse::from(source)))
@@ -1399,6 +1488,8 @@ async fn get_s3_source(
     request_body = UpdateS3SourceRequest,
     responses(
         (status = 200, description = "S3 source updated", body = S3SourceResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "S3 source not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -1414,6 +1505,7 @@ async fn update_s3_source(
     Json(request): Json<UpdateS3SourceRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
+    require_global_backup_admin(&app_state, &auth, "update an S3 backup source")?;
     let source = app_state
         .backup_service
         .update_s3_source(id, request.clone())
@@ -1467,6 +1559,8 @@ async fn update_s3_source(
     path = "/backups/s3-sources/{id}",
     responses(
         (status = 204, description = "S3 source deleted"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "S3 source not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -1481,6 +1575,7 @@ async fn delete_s3_source(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsDelete);
+    require_global_backup_admin(&app_state, &auth, "delete an S3 backup source")?;
     // Get source details before deletion for audit log
     let source = app_state.backup_service.get_s3_source(id).await?;
 
@@ -1513,6 +1608,7 @@ async fn delete_s3_source(
     responses(
         (status = 200, description = "S3 source marked as default", body = S3SourceResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "S3 source not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -1524,6 +1620,7 @@ async fn set_default_s3_source(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
+    require_global_backup_admin(&app_state, &auth, "change the default S3 backup source")?;
 
     let source = app_state
         .backup_service
@@ -1542,6 +1639,7 @@ async fn set_default_s3_source(
     responses(
         (status = 200, description = "Connection test result", body = S3ConnectionTestResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "S3 source not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -1553,6 +1651,7 @@ async fn test_s3_source_connection(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_global_backup_admin(&app_state, &auth, "test an S3 backup source")?;
 
     match app_state.backup_service.test_s3_source_connection(id).await {
         Ok(()) => Ok(Json(S3ConnectionTestResponse {
@@ -1580,6 +1679,7 @@ async fn test_s3_source_connection(
     responses(
         (status = 200, description = "Connection test result", body = S3ConnectionTestResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 400, description = "Invalid request", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -1591,6 +1691,7 @@ async fn test_s3_connection_preview(
     Json(request): Json<CreateS3SourceRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+    require_global_backup_admin(&app_state, &auth, "test prospective S3 backup credentials")?;
 
     match app_state
         .backup_service
@@ -1617,6 +1718,7 @@ async fn test_s3_connection_preview(
     responses(
         (status = 200, description = "List of backup schedules", body = Vec<BackupScheduleResponse>),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(
@@ -1629,6 +1731,14 @@ async fn list_backup_schedules(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
     let schedules = app_state.backup_service.list_backup_schedules().await?;
+    let schedules = filter_accessible_schedules(
+        &app_state,
+        &auth,
+        schedules,
+        Permission::BackupsRead,
+        "list schedules",
+    )
+    .await?;
 
     let responses: Vec<BackupScheduleResponse> = schedules.into_iter().map(Into::into).collect();
     Ok(Json(responses))
@@ -1643,6 +1753,7 @@ async fn list_backup_schedules(
     responses(
         (status = 201, description = "Backup schedule created", body = BackupScheduleResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(
@@ -1655,6 +1766,14 @@ async fn create_backup_schedule(
     Json(request): Json<CreateBackupScheduleRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+    // A schedule cannot have project ownership until services are attached
+    // after creation, so every new schedule is initially global or ownerless
+    // under project-aware authorization.
+    require_global_backup_admin(
+        &app_state,
+        &auth,
+        "create an initially ownerless backup schedule",
+    )?;
 
     match app_state
         .backup_service
@@ -1693,6 +1812,8 @@ async fn create_backup_schedule(
     path = "/backups/schedules/{id}",
     responses(
         (status = 200, description = "Backup schedule details", body = BackupScheduleResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup schedule not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1706,6 +1827,7 @@ async fn get_backup_schedule(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_schedule_access(&app_state, &auth, id, Permission::BackupsRead, "read").await?;
     let schedule = app_state.backup_service.get_backup_schedule(id).await?;
     Ok(Json(BackupScheduleResponse::from(schedule)))
 }
@@ -1717,6 +1839,8 @@ async fn get_backup_schedule(
     path = "/backups/schedules/{id}",
     responses(
         (status = 204, description = "Backup schedule deleted"),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup schedule not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -1730,6 +1854,7 @@ async fn delete_backup_schedule(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, temps_core::problemdetails::Problem> {
     permission_guard!(auth, BackupsDelete);
+    require_schedule_access(&app_state, &auth, id, Permission::BackupsDelete, "delete").await?;
     let result = app_state.backup_service.delete_backup_schedule(id).await?;
     if result {
         Ok(StatusCode::NO_CONTENT)
@@ -1747,6 +1872,8 @@ async fn delete_backup_schedule(
     path = "/backups/schedules/{id}/backups",
     responses(
         (status = 200, description = "List of backups for the schedule", body = Vec<BackupResponse>),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup schedule not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -1760,6 +1887,26 @@ async fn list_backups_for_schedule(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_schedule_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsRead,
+        "list backups for",
+    )
+    .await?;
+    let history_scope = app_state
+        .backup_service
+        .backup_history_access_scope_for_schedule(id)
+        .await?;
+    require_backup_collection_scope_access(
+        &app_state,
+        &auth,
+        &history_scope,
+        Permission::BackupsRead,
+        "list historical backups for this schedule",
+    )
+    .await?;
     let backups = app_state
         .backup_service
         .list_backups_for_schedule(id)
@@ -1823,6 +1970,27 @@ async fn list_schedule_runs(
     axum::extract::Query(params): axum::extract::Query<ListScheduleRunsParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_schedule_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsRead,
+        "list run history for",
+    )
+    .await?;
+
+    let history_scope = app_state
+        .backup_service
+        .backup_history_access_scope_for_schedule(id)
+        .await?;
+    require_backup_collection_scope_access(
+        &app_state,
+        &auth,
+        &history_scope,
+        Permission::BackupsRead,
+        "list historical runs for this schedule",
+    )
+    .await?;
 
     let result = app_state
         .backup_service
@@ -1859,6 +2027,28 @@ async fn list_schedule_run_jobs(
     axum::extract::Query(params): axum::extract::Query<ListScheduleRunJobsParams>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    let schedule_id = app_state.backup_service.schedule_id_for_run(id).await?;
+    require_schedule_access(
+        &app_state,
+        &auth,
+        schedule_id,
+        Permission::BackupsRead,
+        "list run jobs for",
+    )
+    .await?;
+
+    let run_backups = app_state
+        .backup_service
+        .backups_with_access_scopes_for_schedule_run(id)
+        .await?;
+    require_backup_collection_access(
+        &app_state,
+        &auth,
+        &run_backups,
+        Permission::BackupsRead,
+        "list historical jobs for this schedule run",
+    )
+    .await?;
 
     let (jobs, _total) = app_state
         .backup_service
@@ -1897,6 +2087,7 @@ async fn run_schedule_now(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+    require_schedule_access(&app_state, &auth, id, Permission::BackupsCreate, "run").await?;
 
     let response = app_state
         .backup_service
@@ -1971,6 +2162,18 @@ async fn cancel_backup(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsDelete);
+    let scoped_backup = app_state
+        .backup_service
+        .backup_with_access_scope_by_id(id)
+        .await?;
+    require_backup_access(
+        &app_state,
+        &auth,
+        &scoped_backup.access_scope,
+        Permission::BackupsDelete,
+        "cancel this backup",
+    )
+    .await?;
 
     let cancelled = app_state
         .backup_service
@@ -2014,6 +2217,28 @@ async fn cancel_schedule_run(
     Path(id): Path<i64>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsDelete);
+    let schedule_id = app_state.backup_service.schedule_id_for_run(id).await?;
+    require_schedule_access(
+        &app_state,
+        &auth,
+        schedule_id,
+        Permission::BackupsDelete,
+        "cancel a run for",
+    )
+    .await?;
+
+    let live_backups = app_state
+        .backup_service
+        .live_backups_with_access_scopes_for_schedule_run(id)
+        .await?;
+    require_backup_collection_access(
+        &app_state,
+        &auth,
+        &live_backups,
+        Permission::BackupsDelete,
+        "cancel live backups in this schedule run",
+    )
+    .await?;
 
     let cancelled = app_state
         .backup_service
@@ -2046,6 +2271,8 @@ async fn cancel_schedule_run(
     responses(
         (status = 202, description = "Backup enqueued for async execution", body = BackupResponse),
         (status = 400, description = "Invalid request", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "S3 source not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -2061,6 +2288,7 @@ async fn run_backup_for_source(
     Json(request): Json<RunBackupRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+    require_global_backup_admin(&app_state, &auth, "run a control-plane backup")?;
 
     // Insert the `backups` row and the `backup_jobs` row atomically: if either
     // insert fails, both are rolled back. This prevents orphan `backups` rows
@@ -2134,18 +2362,28 @@ async fn delete_backup(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsDelete);
-
-    let existing = app_state
+    let scoped_backup = app_state
         .backup_service
-        .get_backup(&id)
-        .await
-        .map_err(Problem::from)?
-        .ok_or_else(|| {
-            Problem::from(BackupError::NotFound {
-                resource: "Backup".to_string(),
-                detail: format!("backup id {}", id),
-            })
-        })?;
+        .backup_with_access_scope_by_uuid(&id)
+        .await?;
+    require_backup_access(
+        &app_state,
+        &auth,
+        &scoped_backup.access_scope,
+        Permission::BackupsDelete,
+        "delete this backup",
+    )
+    .await?;
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DeleteBackup {
+            backup_id: id.clone(),
+        },
+    )
+    .await?;
+
+    let existing = scoped_backup.backup;
     let audit_context = AuditContext {
         user_id: auth.user_id(),
         ip_address: Some(metadata.ip_address.clone()),
@@ -2252,16 +2490,48 @@ async fn cleanup_expired_backups(
     axum::extract::Query(params): axum::extract::Query<CleanupExpiredBackupsParams>,
     request: Option<Json<CleanupExpiredBackupsRequest>>,
 ) -> Result<impl IntoResponse, Problem> {
-    if params.dry_run {
+    let required_permission = if params.dry_run {
         permission_guard!(auth, BackupsRead);
+        Permission::BackupsRead
+    } else {
+        permission_guard!(auth, BackupsDelete);
+        Permission::BackupsDelete
+    };
+
+    if let Some(schedule_id) = params.schedule_id {
+        require_schedule_access(
+            &app_state,
+            &auth,
+            schedule_id,
+            required_permission,
+            "clean up backups for",
+        )
+        .await?;
+    } else {
+        require_global_backup_admin(&app_state, &auth, "run global backup cleanup")?;
+    }
+
+    if params.dry_run {
+        if let Some(schedule_id) = params.schedule_id {
+            let candidate_scope = app_state
+                .backup_service
+                .retention_candidate_access_scope(schedule_id)
+                .await?;
+            require_backup_collection_scope_access(
+                &app_state,
+                &auth,
+                &candidate_scope,
+                Permission::BackupsRead,
+                "preview retention candidates for this schedule",
+            )
+            .await?;
+        }
         let report = app_state
             .backup_service
             .preview_retention(params.schedule_id)
             .await?;
         return Ok(Json(report));
     }
-
-    permission_guard!(auth, BackupsDelete);
 
     let expected_backup_ids = request
         .as_ref()
@@ -2272,6 +2542,21 @@ async fn cleanup_expired_backups(
                     .to_string(),
             ))
         })?;
+
+    if params.schedule_id.is_some() {
+        let expected_candidates = app_state
+            .backup_service
+            .backups_with_access_scopes_by_uuids(expected_backup_ids)
+            .await?;
+        require_backup_collection_access(
+            &app_state,
+            &auth,
+            &expected_candidates,
+            Permission::BackupsDelete,
+            "delete previewed retention candidates for this schedule",
+        )
+        .await?;
+    }
 
     let audit_context = AuditContext {
         user_id: auth.user_id(),
@@ -2365,6 +2650,7 @@ async fn cleanup_expired_backups(
     responses(
         (status = 200, description = "Backup details", body = BackupResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -2378,13 +2664,19 @@ async fn get_backup(
     Path(id): Path<String>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
-
-    let Some(backup) = app_state.backup_service.get_backup(&id).await? else {
-        return Err(temps_core::error_builder::not_found()
-            .title("Backup Not Found")
-            .detail(format!("Backup with ID {} not found", id))
-            .build());
-    };
+    let scoped_backup = app_state
+        .backup_service
+        .backup_with_access_scope_by_uuid(&id)
+        .await?;
+    require_backup_access(
+        &app_state,
+        &auth,
+        &scoped_backup.access_scope,
+        Permission::BackupsRead,
+        "read this backup",
+    )
+    .await?;
+    let backup = scoped_backup.backup;
 
     let backup_id_int = backup.id;
 
@@ -2448,12 +2740,47 @@ async fn list_backup_children(
     Path(id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    let scoped_backup = app_state
+        .backup_service
+        .backup_with_access_scope_by_id(id)
+        .await?;
+    require_backup_access(
+        &app_state,
+        &auth,
+        &scoped_backup.access_scope,
+        Permission::BackupsRead,
+        "list children for this backup",
+    )
+    .await?;
 
-    let children = app_state
+    let mut children = app_state
         .backup_service
         .list_child_backups(id)
         .await
         .map_err(Problem::from)?;
+
+    match &scoped_backup.access_scope {
+        // `ChildBackupEntry::id` identifies an external_service_backups row,
+        // not a row in `backups`. Its authoritative tenant scope is therefore
+        // the producer service. Resolve all child services in one batch and
+        // omit inaccessible children so a mixed-project parent cannot leak
+        // names or backup metadata across projects.
+        BackupAccessScope::Services { .. } => {
+            let child_service_ids: Vec<i32> =
+                children.iter().map(|child| child.service_id).collect();
+            let accessible_children = accessible_service_ids(
+                &app_state,
+                &auth,
+                &child_service_ids,
+                Permission::BackupsRead,
+                "backup children",
+                "list children for this backup",
+            )
+            .await?;
+            children.retain(|child| accessible_children.contains(&child.service_id));
+        }
+        BackupAccessScope::Global { .. } => {}
+    }
 
     let response = ChildBackupListResponse {
         children: children.into_iter().map(Into::into).collect(),
@@ -2469,6 +2796,8 @@ async fn list_backup_children(
     path = "/backups/schedules/{id}/disable",
     responses(
         (status = 200, description = "Backup schedule disabled", body = BackupScheduleResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup schedule not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -2483,6 +2812,7 @@ async fn disable_backup_schedule(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
+    require_schedule_access(&app_state, &auth, id, Permission::BackupsWrite, "disable").await?;
     let schedule = app_state.backup_service.disable_backup_schedule(id).await?;
 
     let audit = BackupScheduleStatusChangedAudit {
@@ -2510,6 +2840,8 @@ async fn disable_backup_schedule(
     path = "/backups/schedules/{id}/enable",
     responses(
         (status = 200, description = "Backup schedule enabled", body = BackupScheduleResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Backup schedule not found"),
         (status = 500, description = "Internal server error")
     ),
@@ -2524,6 +2856,7 @@ async fn enable_backup_schedule(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
+    require_schedule_access(&app_state, &auth, id, Permission::BackupsWrite, "enable").await?;
     let schedule = app_state.backup_service.enable_backup_schedule(id).await?;
     let audit = BackupScheduleStatusChangedAudit {
         context: AuditContext {
@@ -2558,6 +2891,7 @@ async fn enable_backup_schedule(
         (status = 200, description = "Schedule updated", body = BackupScheduleResponse),
         (status = 400, description = "Validation error", body = ProblemDetails),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "Schedule not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -2571,6 +2905,12 @@ async fn update_backup_schedule(
     Json(request): Json<UpdateBackupScheduleRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsWrite);
+    require_schedule_access(&app_state, &auth, id, Permission::BackupsWrite, "update").await?;
+    if matches!(request.target_all_services, Some(true))
+        || matches!(request.include_control_plane, Some(true))
+    {
+        require_global_backup_admin(&app_state, &auth, "make a backup schedule global")?;
+    }
 
     let schedule = app_state
         .backup_service
@@ -2611,6 +2951,8 @@ async fn update_backup_schedule(
     responses(
         (status = 202, description = "Backup enqueued for async execution", body = ExternalServiceBackupResponse),
         (status = 400, description = "Invalid request", body = ProblemDetails),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 404, description = "External service or S3 source not found", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
@@ -2626,6 +2968,15 @@ async fn run_external_service_backup(
     Json(request): Json<RunExternalServiceBackupRequest>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsCreate);
+    require_service_access(
+        &app_state,
+        &auth,
+        id,
+        Permission::BackupsCreate,
+        "external service",
+        "backup",
+    )
+    .await?;
 
     let service = app_state
         .backup_service
@@ -2766,19 +3117,6 @@ pub struct BackupAlertListResponse {
     pub alerts: Vec<BackupAlertResponse>,
 }
 
-/// Internal row type for the alert JOIN query.
-#[derive(Debug, FromQueryResult)]
-struct AlertRow {
-    pub id: i64,
-    pub kind: String,
-    pub severity: String,
-    pub schedule_id: Option<i32>,
-    pub schedule_name: Option<String>,
-    pub schedule_s3_source_id: Option<i32>,
-    pub message: String,
-    pub opened_at: chrono::DateTime<chrono::Utc>,
-}
-
 /// List open backup alerts.
 ///
 /// Returns all alerts that have not yet been resolved, ordered by `opened_at`
@@ -2800,6 +3138,7 @@ struct AlertRow {
     responses(
         (status = 200, description = "List of open backup alerts", body = BackupAlertListResponse),
         (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 403, description = "Insufficient permissions", body = ProblemDetails),
         (status = 500, description = "Internal server error", body = ProblemDetails)
     ),
     security(("bearer_auth" = []))
@@ -2809,40 +3148,9 @@ async fn list_backup_alerts(
     State(app_state): State<Arc<BackupAppState>>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, BackupsRead);
+    require_global_backup_admin(&app_state, &auth, "list global backup alerts")?;
 
-    // LEFT JOIN backup_schedules so overdue_schedule alerts carry the
-    // schedule's `s3_source_id` for UI deep-linking. stalled_job alerts
-    // no longer reference a job row (the FK column was dropped); the
-    // alert message text carries the backup id for display.
-    let sql = r#"
-SELECT
-    a.id,
-    a.kind,
-    a.severity,
-    a.schedule_id,
-    s.name             AS schedule_name,
-    s.s3_source_id     AS schedule_s3_source_id,
-    a.message,
-    a.opened_at
-FROM backup_alerts a
-LEFT JOIN backup_schedules s ON s.id = a.schedule_id
-WHERE a.resolved_at IS NULL
-ORDER BY a.opened_at DESC
-"#;
-
-    let rows = AlertRow::find_by_statement(Statement::from_sql_and_values(
-        DatabaseBackend::Postgres,
-        sql,
-        vec![],
-    ))
-    .all(app_state.db.as_ref())
-    .await
-    .map_err(|e| {
-        error!("Failed to query backup alerts: {}", e);
-        problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .with_title("Internal Server Error")
-            .with_detail(format!("Failed to query backup alerts: {}", e))
-    })?;
+    let rows = app_state.backup_service.list_open_backup_alerts().await?;
 
     let alerts = rows
         .into_iter()

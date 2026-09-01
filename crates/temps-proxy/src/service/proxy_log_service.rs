@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use crate::traffic_aggregation::{
     TrafficAggregationRequest, TrafficAggregationResponse, MAX_TRAFFIC_PAGE_SIZE,
 };

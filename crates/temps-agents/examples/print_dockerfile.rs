@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Print the generated Dockerfile for a given runtime preset to stdout.
 //!
 //! The `scripts/build-sandbox-images.sh` pipeline invokes this helper to

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Error Provider Trait System
 //!
 //! Defines a common interface for error tracking providers (Sentry, Bugsnag, Rollbar, etc.)

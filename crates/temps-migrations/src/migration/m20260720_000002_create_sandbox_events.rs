@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Create `sandbox_events` — the per-sandbox operations timeline.
 //!
 //! Records lifecycle operations (create/stop/resume/restart/extend/resize/

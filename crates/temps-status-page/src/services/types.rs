@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use temps_core::UtcDateTime;
@@ -16,6 +19,31 @@ pub enum StatusPageError {
     InvalidRequest(String),
     #[error("Internal error: {0}")]
     Internal(String),
+    #[error("environment {environment_id} does not belong to project {project_id}")]
+    EnvironmentNotInProject {
+        environment_id: i32,
+        project_id: i32,
+    },
+    #[error("monitor {monitor_id} does not belong to project {project_id}")]
+    MonitorNotInProject { monitor_id: i32, project_id: i32 },
+    #[error(
+        "failed to validate environment {environment_id} ownership for project {project_id}: {source}"
+    )]
+    EnvironmentOwnershipLookup {
+        environment_id: i32,
+        project_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
+    #[error(
+        "failed to validate monitor {monitor_id} ownership for project {project_id}: {source}"
+    )]
+    MonitorOwnershipLookup {
+        monitor_id: i32,
+        project_id: i32,
+        #[source]
+        source: sea_orm::DbErr,
+    },
 }
 
 /// Validate a status-monitor `check_path` to prevent URL/header injection

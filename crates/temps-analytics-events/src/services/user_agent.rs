@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use woothee::parser::{Parser, WootheeResult};
 
 /// Substring patterns (lowercased) identifying bots, crawlers, scrapers, and
@@ -54,7 +57,7 @@ const BOT_UA_PATTERNS: &[&str] = &[
     "go-http-client",
     "node-fetch",
     "axios/",
-    // Generic catch-alls (kept last)
+    // Generic catch-all patterns (kept last)
     "bot",
     "crawler",
     "spider",

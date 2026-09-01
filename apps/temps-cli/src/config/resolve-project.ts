@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { config } from './store.js'
 import { readProjectConfig } from './project-config.js'
 import { getActiveDefaultProjectSync, setActiveDefaultProject } from './contexts.js'

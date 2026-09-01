@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import { latestRunForSourceOptions } from '@/api/client/@tanstack/react-query.gen'
 import { AutofixRunConfigForm } from '@/components/autofixer/AutofixRunConfigForm'

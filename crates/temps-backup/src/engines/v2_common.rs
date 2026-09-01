@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared helpers for `engine_v2`-style backup engines.
 //!
 //! Every engine ported off the queue follows the same shape:

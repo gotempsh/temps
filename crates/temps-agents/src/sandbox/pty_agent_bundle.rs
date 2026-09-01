@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Files for the in-sandbox `temps-pty-agent` binary, embedded at compile
 //! time. The Dockerfile's pty-agent builder stage compiles from these
 //! sources, so bumping the agent requires only a recompile of `temps`

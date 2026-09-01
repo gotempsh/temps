@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { AWSIcon } from '@/components/icons/AWSIcon'
 import { ScalewayIcon } from '@/components/icons/ScalewayIcon'
 import { cn } from '@/lib/utils'

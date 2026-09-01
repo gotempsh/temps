@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Anomaly detection and insight generation.
 //!
 //! Runs every 60 seconds, computing Z-scores per metric per service/environment

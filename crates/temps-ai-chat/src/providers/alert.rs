@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The metric-alert context provider (ADR-023, P2).
 //!
 //! Seeds a chat to investigate a metric alert and make it actionable — turning

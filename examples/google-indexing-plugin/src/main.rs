@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Google Indexing API Plugin for Temps
 //!
 //! Automatically notifies Google when pages are updated or removed via the

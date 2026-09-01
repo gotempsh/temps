@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Read/write the per-scope AI provider preference stored in
 //! `ai_gateway_config`.
 //!

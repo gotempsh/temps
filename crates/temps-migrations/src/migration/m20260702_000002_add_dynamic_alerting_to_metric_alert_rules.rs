@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Add per-series ("dynamic") alerting columns to `metric_alert_rules`.
 //!
 //! Phase 3 of ADR-026:

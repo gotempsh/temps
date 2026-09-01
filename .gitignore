@@ -57,6 +57,7 @@ __pycache__
 # Claude Code / Codex / etc.) live here and are tracked; everything else
 # under .agents (personal marketplace-installed skills) stays ignored.
 !.agents/skills/start-temps
+!.agents/skills/start-temps-cluster
 skills-lock.json
 
 # MaxMind GeoLite2 database — has restrictive license, do not commit.

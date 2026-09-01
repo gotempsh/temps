@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { useState, useEffect, type FormEvent } from "react";
 import type { PluginSettings } from "../types";
 import { getSettings, updateSettings } from "../api";

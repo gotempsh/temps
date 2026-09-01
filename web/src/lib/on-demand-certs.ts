@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Hand-written helpers for the on-demand TLS certificate endpoints (ADR-018 §5)
  * that are not yet reflected in the generated OpenAPI client.

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Trust store for Cloudflare egress IP ranges.
 //!
 //! SECURITY: `CF-Connecting-IP` is honored ONLY when the immediate TCP peer is

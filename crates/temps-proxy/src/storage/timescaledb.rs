@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! TimescaleDB (PostgreSQL) implementation of [`ProxyLogStorage`].
 //!
 //! This is the DEFAULT backend and preserves the exact prior behaviour: every

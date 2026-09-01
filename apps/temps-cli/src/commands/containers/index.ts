@@ -1,8 +1,12 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'
 import {
   listContainers,
+  listContainerHistory,
   getContainerDetail,
   startContainer,
   stopContainer,
@@ -10,7 +14,7 @@ import {
   getContainerMetrics,
   getEnvironments,
 } from '../../api/sdk.gen.js'
-import type { ContainerInfoResponse } from '../../api/types.gen.js'
+import type { ContainerInfoResponse, ContainerHistoryEntry } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, statusBadge, type TableColumn } from '../../ui/table.js'
 import { promptConfirm } from '../../ui/prompts.js'
@@ -64,6 +68,16 @@ export function registerContainersCommands(program: Command): void {
     .requiredOption('-e, --environment-id <id>', 'Environment ID')
     .requiredOption('-c, --container-id <id>', 'Container ID')
     .action(restartContainerAction)
+
+  containers
+    .command('history')
+    .description('List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included')
+    .requiredOption('-p, --project-id <id>', 'Project ID')
+    .requiredOption('-e, --environment-id <id>', 'Environment ID')
+    .option('-d, --deployment-id <id>', 'Only list containers belonging to this deployment')
+    .option('-l, --limit <count>', 'Max REPLACED container rows to return on top of the running ones, newest first (default 20, max 100)')
+    .option('--json', 'Output in JSON format')
+    .action(listContainerHistoryAction)
 
   containers
     .command('metrics')
@@ -173,6 +187,93 @@ async function listContainersAction(
   )
 
   printTable(all, baseColumns, { style: 'minimal' })
+  newline()
+}
+
+async function listContainerHistoryAction(
+  options: {
+    projectId: string
+    environmentId: string
+    deploymentId?: string
+    limit?: string
+    json?: boolean
+  }
+): Promise<void> {
+  await requireAuth()
+  await setupClient()
+
+  const projId = parseInt(options.projectId, 10)
+  const envId = parseInt(options.environmentId, 10)
+  if (isNaN(projId) || isNaN(envId)) {
+    warning('Invalid project or environment ID')
+    return
+  }
+
+  let deploymentId: number | undefined
+  if (options.deploymentId !== undefined) {
+    deploymentId = parseInt(options.deploymentId, 10)
+    if (isNaN(deploymentId)) {
+      warning('Invalid deployment ID')
+      return
+    }
+  }
+
+  let limit: number | undefined
+  if (options.limit !== undefined) {
+    limit = parseInt(options.limit, 10)
+    if (isNaN(limit)) {
+      warning('Invalid limit')
+      return
+    }
+  }
+
+  let totalCount = 0
+  const containers = await withSpinner('Fetching container history...', async () => {
+    const { data, error } = await listContainerHistory({
+      client,
+      path: { project_id: projId, environment_id: envId },
+      query: { deployment_id: deploymentId, limit },
+    })
+    if (error) throw new Error(getErrorMessage(error))
+    totalCount = data?.total_count ?? 0
+    return data?.containers ?? []
+  })
+
+  if (options.json) {
+    json(containers)
+    return
+  }
+
+  newline()
+  const title =
+    totalCount > containers.length
+      ? `${icons.info} Container history (${containers.length} of ${totalCount})`
+      : `${icons.info} Container history (${containers.length})`
+  header(title)
+
+  if (containers.length === 0) {
+    info('No containers have ever run in this environment')
+    newline()
+    return
+  }
+
+  const columns: TableColumn<ContainerHistoryEntry>[] = [
+    { header: 'ID', key: 'container_id', width: 16, color: (v) => colors.muted(v.slice(0, 12) + '...') },
+    { header: 'Name', key: 'container_name', color: (v) => colors.bold(v) },
+    {
+      header: 'Status',
+      accessor: (c) => (c.is_current ? 'current' : 'replaced'),
+      color: (v) => statusBadge(v === 'current' ? 'active' : 'inactive'),
+    },
+    { header: 'Deployed', key: 'deployed_at', color: (v) => colors.muted(new Date(v).toLocaleString()) },
+    {
+      header: 'Removed',
+      accessor: (c) => (c.deleted_at ? new Date(c.deleted_at).toLocaleString() : '—'),
+      color: (v) => colors.muted(v),
+    },
+  ]
+
+  printTable(containers, columns, { style: 'minimal' })
   newline()
 }
 

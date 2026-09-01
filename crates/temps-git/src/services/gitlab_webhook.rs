@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! GitLab Webhook Management Service
 //!
 //! Handles auto-installation and removal of per-project GitLab webhooks.

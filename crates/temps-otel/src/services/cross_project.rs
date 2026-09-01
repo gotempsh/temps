@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Cross-project trace discovery service (ADR-027 Phases 0 and 2).
 //!
 //! `CrossProjectTraceService` owns two responsibilities:

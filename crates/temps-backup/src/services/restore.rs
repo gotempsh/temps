@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Generic restore orchestrator.
 //!
 //! Takes a restore request (backup id + mode), writes a `restore_runs` row,
@@ -13,6 +16,7 @@ use sea_orm::{
     QuerySelect, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use temps_providers::externalsvc::{RecoveryTarget, RestoreContext, ServiceType};
 use temps_providers::{ExternalServiceManager, S3Credentials};
@@ -182,6 +186,24 @@ pub struct RestoreRunView {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub created_at: String,
+}
+
+/// Non-sensitive service identity used by restore handlers for response
+/// labels and audit records. Loading stays in the service layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreServiceIdentity {
+    pub id: i32,
+    pub name: String,
+    pub service_type: String,
+}
+
+/// External services that produced one backup, resolved in a batched service
+/// query for authorization. An empty `service_ids` list is authoritative and
+/// identifies a control-plane/ownerless backup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BackupProducerServices {
+    pub backup_id: i32,
+    pub service_ids: Vec<i32>,
 }
 
 impl From<temps_entities::restore_runs::Model> for RestoreRunView {
@@ -641,6 +663,23 @@ impl RestoreService {
         &self,
         service_id: i32,
     ) -> Result<temps_providers::externalsvc::RestoreCapabilities, RestoreError> {
+        self.get_capabilities_with_identity(service_id)
+            .await
+            .map(|(capabilities, _)| capabilities)
+    }
+
+    /// Read restore capabilities and the already-loaded service identity in
+    /// one service-layer operation so the handler does not repeat the query.
+    pub async fn get_capabilities_with_identity(
+        &self,
+        service_id: i32,
+    ) -> Result<
+        (
+            temps_providers::externalsvc::RestoreCapabilities,
+            RestoreServiceIdentity,
+        ),
+        RestoreError,
+    > {
         let service = self.load_service(service_id).await?;
         let service_type =
             ServiceType::from_str(&service.service_type).map_err(|e| RestoreError::Validation {
@@ -656,12 +695,18 @@ impl RestoreService {
         let instance = self
             .external_service_manager
             .get_service_instance(service.name.clone(), service_type);
-        instance
+        let capabilities = instance
             .restore_capabilities(service_config)
             .await
             .map_err(|e| RestoreError::ExternalService {
                 reason: format!("Failed to read restore capabilities: {}", e),
-            })
+            })?;
+        let identity = RestoreServiceIdentity {
+            id: service.id,
+            name: service.name,
+            service_type: service.service_type,
+        };
+        Ok((capabilities, identity))
     }
 
     /// Validate a restore request, insert a `restore_runs` row, spawn the
@@ -946,6 +991,73 @@ impl RestoreService {
             .all(self.db.as_ref())
             .await?;
         Ok(runs.into_iter().map(RestoreRunView::from).collect())
+    }
+
+    /// Resolve every external service that produced a backup. An empty result
+    /// identifies a control-plane/ownerless backup and must remain
+    /// administrators-only at the authorization layer.
+    pub async fn backup_source_service_ids(
+        &self,
+        backup_id: i32,
+    ) -> Result<Vec<i32>, RestoreError> {
+        Ok(self
+            .backup_source_services_for_backups(&[backup_id])
+            .await?
+            .into_iter()
+            .next()
+            .map(|mapping| mapping.service_ids)
+            .unwrap_or_default())
+    }
+
+    /// Resolve producer services for many backup ids in one database query.
+    /// The result contains one deterministic entry for every requested id,
+    /// including backups with no producer-service rows.
+    pub async fn backup_source_services_for_backups(
+        &self,
+        backup_ids: &[i32],
+    ) -> Result<Vec<BackupProducerServices>, RestoreError> {
+        let unique_backup_ids: BTreeSet<i32> = backup_ids.iter().copied().collect();
+        if unique_backup_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let rows = temps_entities::external_service_backups::Entity::find()
+            .filter(
+                temps_entities::external_service_backups::Column::BackupId
+                    .is_in(unique_backup_ids.iter().copied()),
+            )
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut services_by_backup: BTreeMap<i32, BTreeSet<i32>> = unique_backup_ids
+            .into_iter()
+            .map(|backup_id| (backup_id, BTreeSet::new()))
+            .collect();
+        for row in rows {
+            if let Some(service_ids) = services_by_backup.get_mut(&row.backup_id) {
+                service_ids.insert(row.service_id);
+            }
+        }
+
+        Ok(services_by_backup
+            .into_iter()
+            .map(|(backup_id, service_ids)| BackupProducerServices {
+                backup_id,
+                service_ids: service_ids.into_iter().collect(),
+            })
+            .collect())
+    }
+
+    pub async fn get_service_identity(
+        &self,
+        service_id: i32,
+    ) -> Result<RestoreServiceIdentity, RestoreError> {
+        let service = self.load_service(service_id).await?;
+        Ok(RestoreServiceIdentity {
+            id: service.id,
+            name: service.name,
+            service_type: service.service_type,
+        })
     }
 
     async fn load_service(
@@ -2334,6 +2446,90 @@ mod tests {
             dns_registry,
         ));
         RestoreService::new(db, mgr, enc)
+    }
+
+    fn make_producer_row(
+        id: i32,
+        backup_id: i32,
+        service_id: i32,
+    ) -> temps_entities::external_service_backups::Model {
+        temps_entities::external_service_backups::Model {
+            id,
+            service_id,
+            backup_id,
+            backup_type: "full".to_string(),
+            state: "completed".to_string(),
+            started_at: Utc::now(),
+            finished_at: Some(Utc::now()),
+            size_bytes: Some(1024),
+            s3_location: format!("s3://bucket/{backup_id}/{service_id}"),
+            error_message: None,
+            metadata: serde_json::json!({}),
+            checksum: None,
+            compression_type: "gzip".to_string(),
+            created_by: 1,
+            expires_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_backup_source_services_for_backups_dedupes_and_preserves_ownerless() {
+        // Arrange: backup 10 has two producer services (one duplicate), while
+        // backup 20 is raw/control-plane and therefore ownerless.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![
+                    make_producer_row(1, 10, 8),
+                    make_producer_row(2, 10, 3),
+                    make_producer_row(3, 10, 8),
+                ]])
+                .into_connection(),
+        );
+        let service = build_restore_service(db);
+
+        // Act.
+        let mappings = service
+            .backup_source_services_for_backups(&[20, 10, 20])
+            .await
+            .expect("producer mappings should resolve");
+
+        // Assert.
+        assert_eq!(
+            mappings,
+            vec![
+                BackupProducerServices {
+                    backup_id: 10,
+                    service_ids: vec![3, 8],
+                },
+                BackupProducerServices {
+                    backup_id: 20,
+                    service_ids: vec![],
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_backup_source_services_for_backups_database_error_is_typed() {
+        // Arrange.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_errors(vec![sea_orm::DbErr::Custom(
+                    "restore producer lookup failed".to_string(),
+                )])
+                .into_connection(),
+        );
+        let service = build_restore_service(db);
+
+        // Act.
+        let error = service
+            .backup_source_services_for_backups(&[10])
+            .await
+            .expect_err("producer query error must remain typed");
+
+        // Assert.
+        assert!(matches!(error, RestoreError::Database(_)));
+        assert!(error.to_string().contains("restore producer lookup failed"));
     }
 
     #[tokio::test]

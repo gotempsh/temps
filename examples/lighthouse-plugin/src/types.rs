@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared types for the Lighthouse Performance Audit plugin.
 
 use serde::{Deserialize, Serialize};

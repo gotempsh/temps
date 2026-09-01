@@ -1,9 +1,13 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use futures::Stream;
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, EntityTrait, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set,
+    ActiveModelTrait, ColumnTrait, Condition, ConnectionTrait, DatabaseBackend, EntityTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, Statement, TransactionTrait,
 };
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use temps_entities::{
@@ -91,6 +95,27 @@ pub enum DeploymentError {
     #[error("Invalid bundle path '{path}': {reason}")]
     InvalidBundlePath { path: String, reason: String },
 
+    #[error(
+        "Cannot resolve the build artifact for deployment {deployment_id} in project {project_id}: source deployment {source_deployment_id} was not found"
+    )]
+    AssetOriginNotFound {
+        project_id: i32,
+        deployment_id: i32,
+        source_deployment_id: i32,
+    },
+
+    #[error(
+        "Cannot resolve the build artifact for deployment {deployment_id} in project {project_id}: deployment reuse metadata contains a cycle at deployment {source_deployment_id}"
+    )]
+    AssetOriginCycle {
+        project_id: i32,
+        deployment_id: i32,
+        source_deployment_id: i32,
+    },
+
+    #[error(transparent)]
+    EnvironmentResolution(#[from] super::env_resolver::DeploymentEnvResolutionError),
+
     #[error("Other error: {0}")]
     Other(String),
 }
@@ -136,6 +161,107 @@ pub struct RepoReference {
     pub owner: String,
     pub repo: String,
     pub branch: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DeploymentAssetOrigin {
+    deployment_id: i32,
+    environment_id: i32,
+    slug: String,
+}
+
+/// Resolve the immutable build artifact behind a deployment. Promotion and
+/// rollback rows may already reference an earlier source, so propagating the
+/// immediate row would lose assets after the second hop.
+fn complete_deployment_asset_origin(
+    deployment_id: i32,
+    environment_id: i32,
+    slug: &str,
+    context: Option<&serde_json::Value>,
+) -> Option<DeploymentAssetOrigin> {
+    let source_deployment_id = context
+        .and_then(|value| value.get("source_deployment_id"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let source_environment_id = context
+        .and_then(|value| value.get("source_environment_id"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok());
+    let source_slug = context
+        .and_then(|value| value.get("source_deployment_slug"))
+        .and_then(serde_json::Value::as_str);
+
+    match (source_deployment_id, source_environment_id, source_slug) {
+        (Some(deployment_id), Some(environment_id), Some(slug)) => Some(DeploymentAssetOrigin {
+            deployment_id,
+            environment_id,
+            slug: slug.to_string(),
+        }),
+        (None, None, None) => Some(DeploymentAssetOrigin {
+            deployment_id,
+            environment_id,
+            slug: slug.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+fn source_deployment_id(context: Option<&serde_json::Value>) -> Option<i32> {
+    context
+        .and_then(|value| value.get("source_deployment_id"))
+        .and_then(serde_json::Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+}
+
+/// Resolve both the current complete reuse metadata and the partial metadata
+/// written by Temps before source slugs were persisted. Legacy rows are walked
+/// back to the immutable build deployment so a second promotion/rollback does
+/// not perpetuate an intermediate, asset-less deployment.
+async fn deployment_asset_origin(
+    db: &temps_database::DbConnection,
+    deployment: &deployments::Model,
+) -> Result<DeploymentAssetOrigin, DeploymentError> {
+    let root_deployment_id = deployment.id;
+    let project_id = deployment.project_id;
+    let mut current = deployment.clone();
+    let mut visited = HashSet::from([current.id]);
+
+    loop {
+        if let Some(origin) = complete_deployment_asset_origin(
+            current.id,
+            current.environment_id,
+            &current.slug,
+            current.context_vars.as_ref(),
+        ) {
+            return Ok(origin);
+        }
+
+        let Some(source_id) = source_deployment_id(current.context_vars.as_ref()) else {
+            return Ok(DeploymentAssetOrigin {
+                deployment_id: current.id,
+                environment_id: current.environment_id,
+                slug: current.slug,
+            });
+        };
+
+        if !visited.insert(source_id) {
+            return Err(DeploymentError::AssetOriginCycle {
+                project_id,
+                deployment_id: root_deployment_id,
+                source_deployment_id: source_id,
+            });
+        }
+
+        current = deployments::Entity::find_by_id(source_id)
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(db)
+            .await?
+            .ok_or(DeploymentError::AssetOriginNotFound {
+                project_id,
+                deployment_id: root_deployment_id,
+                source_deployment_id: source_id,
+            })?;
+    }
 }
 
 #[derive(Clone)]
@@ -1343,8 +1469,15 @@ impl DeploymentService {
         per_page: Option<i64>,
         environment_id: Option<i32>,
     ) -> Result<DeploymentListResponse, DeploymentError> {
-        let page = page.unwrap_or(1) as u64;
-        let per_page = per_page.unwrap_or(10) as u64;
+        // Clamp before the `as u64` cast: an out-of-range or negative i64 here
+        // wraps to a huge u64 on cast, and Sea-ORM's OFFSET (page_size * page)
+        // then overflows the i64 bind sea-query-binder sends to Postgres,
+        // panicking with `TryFromIntError(PosOverflow)` and taking down the
+        // whole HTTP listener task -- not just this request. Every caller
+        // (REST and MCP) reaches this cast, so it must be enforced here, not
+        // only at a caller's argument-parsing boundary.
+        let page = page.unwrap_or(1).clamp(1, i64::from(i32::MAX)) as u64;
+        let per_page = per_page.unwrap_or(10).clamp(1, 100) as u64;
 
         // Build base query with project_id filter
         let mut query =
@@ -1991,6 +2124,8 @@ impl DeploymentService {
 
         let rollback_slug = format!("{}-{}", project.slug, deployment_number);
 
+        let rollback_asset_origin =
+            deployment_asset_origin(self.db.as_ref(), &target_deployment).await?;
         let rollback_metadata = DeploymentMetadata {
             is_rollback: true,
             rolled_back_from_id: Some(deployment_id),
@@ -2020,7 +2155,9 @@ impl DeploymentService {
             cancelled_reason: Set(None),
             context_vars: Set(Some(serde_json::json!({
                 "trigger": "rollback",
-                "source_deployment_id": deployment_id,
+                "source_deployment_id": rollback_asset_origin.deployment_id,
+                "source_deployment_slug": rollback_asset_origin.slug.clone(),
+                "source_environment_id": rollback_asset_origin.environment_id,
             }))),
             deployment_config: Set(target_deployment.deployment_config.clone()),
             promoted_from_deployment_id: Set(None),
@@ -2216,6 +2353,17 @@ impl DeploymentService {
 
             // Step 1: Execute DeployImageJob with external image
             // Use the NEW rollback slug as the container name (not the old deployment's slug)
+            let exposed_port = environment
+                .deployment_config
+                .as_ref()
+                .and_then(|config| config.exposed_port)
+                .or_else(|| {
+                    project
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.exposed_port)
+                })
+                .unwrap_or(3000) as u32;
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
@@ -2238,19 +2386,7 @@ impl DeploymentService {
                         })
                         .unwrap_or(1),
                 )
-                .port(
-                    environment
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|c| c.exposed_port)
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|c| c.exposed_port)
-                        })
-                        .unwrap_or(3000) as u32,
-                )
+                .port(exposed_port)
                 .log_id(deploy_log_id.clone())
                 .log_service(self.log_service.clone());
 
@@ -2281,15 +2417,17 @@ impl DeploymentService {
             // CRON_SECRET, OTEL_*) instead of nothing. Without this, a rollback
             // reuses the image but starts it unconfigured.
             let resolved_env = if let Some(resolver) = self.env_resolver.get() {
-                resolver
+                let mut resolved = resolver
                     .resolve(&project, &environment, &rollback_deployment)
-                    .await
-                    .map_err(|e| {
-                        DeploymentError::Other(format!(
-                            "Failed to resolve environment variables for rollback in environment {}: {}",
-                            environment_id, e
-                        ))
-                    })?
+                    .await?;
+                crate::services::env_resolver::apply_deployment_owned_variables(
+                    &mut resolved,
+                    project.preset,
+                    &rollback_asset_origin.slug,
+                    (project.preset != temps_entities::preset::Preset::DockerCompose)
+                        .then_some(exposed_port),
+                );
+                resolved
             } else {
                 tracing::warn!(
                     "Rollback: env resolver not wired — rolled-back container starts with no resolved env vars"
@@ -2686,6 +2824,7 @@ impl DeploymentService {
             )
         });
 
+        let promotion_asset_origin = deployment_asset_origin(self.db.as_ref(), &source).await?;
         let new_deployment = deployments::ActiveModel {
             id: sea_orm::NotSet,
             project_id: Set(project_id),
@@ -2709,8 +2848,9 @@ impl DeploymentService {
             cancelled_reason: Set(None),
             context_vars: Set(Some(serde_json::json!({
                 "trigger": "promotion",
-                "source_deployment_id": source_deployment_id,
-                "source_environment_id": source.environment_id,
+                "source_deployment_id": promotion_asset_origin.deployment_id,
+                "source_deployment_slug": promotion_asset_origin.slug.clone(),
+                "source_environment_id": promotion_asset_origin.environment_id,
             }))),
             deployment_config: Set(deployment_config_snapshot),
             promoted_from_deployment_id: Set(Some(source_deployment_id)),
@@ -2887,6 +3027,17 @@ impl DeploymentService {
             info!("Promotion: Deploying image: {}", image_name);
 
             // Execute DeployImageJob with external image
+            let exposed_port = target_env
+                .deployment_config
+                .as_ref()
+                .and_then(|config| config.exposed_port)
+                .or_else(|| {
+                    project
+                        .deployment_config
+                        .as_ref()
+                        .and_then(|config| config.exposed_port)
+                })
+                .unwrap_or(3000) as u32;
             let mut deploy_builder = crate::jobs::DeployImageJobBuilder::new()
                 .job_id("deploy_container".to_string())
                 .build_job_id("external-image".to_string())
@@ -2909,19 +3060,7 @@ impl DeploymentService {
                         })
                         .unwrap_or(1),
                 )
-                .port(
-                    target_env
-                        .deployment_config
-                        .as_ref()
-                        .and_then(|c| c.exposed_port)
-                        .or_else(|| {
-                            project
-                                .deployment_config
-                                .as_ref()
-                                .and_then(|c| c.exposed_port)
-                        })
-                        .unwrap_or(3000) as u32,
-                )
+                .port(exposed_port)
                 .log_id(deploy_log_id.clone())
                 .log_service(self.log_service.clone());
 
@@ -2948,15 +3087,17 @@ impl DeploymentService {
             // TEMPS_API_TOKEN/URL, CRON_SECRET, OTEL_*) instead of nothing.
             // Without this, promotion reuses the image but starts it unconfigured.
             let resolved_env = if let Some(resolver) = self.env_resolver.get() {
-                resolver
+                let mut resolved = resolver
                     .resolve(&project, &target_env, &promoted_deployment)
-                    .await
-                    .map_err(|e| {
-                        DeploymentError::Other(format!(
-                            "Failed to resolve environment variables for promotion to environment {}: {}",
-                            target_environment_id, e
-                        ))
-                    })?
+                    .await?;
+                crate::services::env_resolver::apply_deployment_owned_variables(
+                    &mut resolved,
+                    project.preset,
+                    &promotion_asset_origin.slug,
+                    (project.preset != temps_entities::preset::Preset::DockerCompose)
+                        .then_some(exposed_port),
+                );
+                resolved
             } else {
                 tracing::warn!(
                     "Promotion: env resolver not wired — promoted container starts with no resolved env vars"
@@ -3219,7 +3360,7 @@ impl DeploymentService {
         deployment_id: i32,
     ) -> Result<(), DeploymentError> {
         use sea_orm::{ActiveModelTrait, Set};
-        use temps_entities::{deployment_containers, deployments};
+        use temps_entities::{deployment_containers, deployments, status_incidents};
 
         // First verify the deployment exists and belongs to the project
         let deployment = deployments::Entity::find_by_id(deployment_id)
@@ -3227,6 +3368,73 @@ impl DeploymentService {
             .one(self.db.as_ref())
             .await?
             .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+
+        let environment_id = deployment.environment_id;
+
+        // Persist "paused" BEFORE touching any container. Monitoring (the
+        // container-health poller and the uptime health checker) treats
+        // `state == "paused"` as "stopped on purpose, don't alert" — if we
+        // stopped containers first and updated this row last, a poll that
+        // lands in between would see an exited container against a
+        // not-yet-paused deployment and fire a false crash/downtime alert.
+        // Flipping the state first closes that window: any concurrent read
+        // of this deployment either sees the old state with all containers
+        // still running (nothing exited yet to alert on) or sees "paused"
+        // once anything might be mid-stop.
+        //
+        // That alone still leaves a plain check-then-write race against a
+        // concurrent outage check in flight: it can read "not paused" a
+        // moment before this write commits, then create an incident for a
+        // deployment that's paused by the time the incident actually lands.
+        // Closing that requires more than moving this write earlier — the
+        // check and the write need to serialize. Take the same Postgres
+        // advisory lock, keyed on the environment, that
+        // `OutageDetectionService::handle_outage_event` takes around its
+        // final live pause re-check + incident insert: whichever side gets
+        // the lock first commits (or observes "paused" and bails) before the
+        // other proceeds, so no unpaused-read can ever precede this write
+        // without the write also being visible to it.
+        let txn = self.db.begin().await?;
+        txn.execute(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT pg_advisory_xact_lock($1)",
+            [sea_orm::Value::BigInt(Some(environment_id as i64))],
+        ))
+        .await?;
+        let mut active_deployment: deployments::ActiveModel = deployment.into();
+        active_deployment.state = Set("paused".to_string());
+        active_deployment.update(&txn).await?;
+
+        // The lock above only serializes the incident *insert* against this
+        // write — `OutageDetectionService` still sends the notification,
+        // fires the alarm, and dispatches the workflow AFTER releasing the
+        // lock, since those are external I/O (webhook/email delivery, job
+        // queue send) that can't reasonably sit inside a DB transaction. A
+        // pause landing in that specific gap would otherwise still produce
+        // an alert for an incident that's already stale by the time it goes
+        // out. Rather than trying to also lock out external I/O (which a DB
+        // lock structurally can't do), make this side of the race
+        // proactive: while still holding the lock, resolve any incident for
+        // this environment that's still open. `handle_outage_event`
+        // re-reads the incident's own status immediately before each side
+        // effect (see its comment), so a resolve that lands here — even a
+        // moment after that incident was created — is what that re-read is
+        // watching for.
+        status_incidents::Entity::update_many()
+            .col_expr(
+                status_incidents::Column::Status,
+                sea_orm::sea_query::Expr::value("resolved"),
+            )
+            .col_expr(
+                status_incidents::Column::ResolvedAt,
+                sea_orm::sea_query::Expr::value(chrono::Utc::now()),
+            )
+            .filter(status_incidents::Column::EnvironmentId.eq(environment_id))
+            .filter(status_incidents::Column::Status.ne("resolved"))
+            .exec(&txn)
+            .await?;
+
+        txn.commit().await?;
 
         // Stop and remove all containers for this deployment
         let containers = deployment_containers::Entity::find()
@@ -3245,25 +3453,50 @@ impl DeploymentService {
         // "running" (see `route_table::load_routes`), so a stopped-but-not-
         // removed container is just as inert from the outside as a removed
         // one, without sacrificing resumability.
+        // Best-effort like the `stop_container` call above: the deployment
+        // row is already committed as "paused", so aborting this loop on a
+        // single container's DB write failure would strand the *remaining*
+        // containers untouched (still "running" in the DB, never even
+        // asked to stop) and skip the route-table reload below, while the
+        // deployment stays paused indefinitely. Warn and keep going so one
+        // failure can't silently drop the rest of the pause.
         for container in containers {
-            if let Err(e) = self.deployer.stop_container(&container.container_id).await {
+            let container_id = container.container_id.clone();
+            if let Err(e) = self.deployer.stop_container(&container_id).await {
                 warn!(
                     "Failed to stop container {} during deployment pause: {}",
-                    container.container_id, e
+                    container_id, e
                 );
             }
 
-            let mut active_container: deployment_containers::ActiveModel = container.into();
-            active_container.status = Set(Some("stopped".to_string()));
-            active_container.update(self.db.as_ref()).await?;
+            // Retry the DB write: a container whose status never makes it to
+            // "stopped" keeps being treated as routable by
+            // `route_table::load_routes` even though we just told Docker to
+            // stop it — retrying absorbs the transient connection blips that
+            // are the realistic cause of a single UPDATE failing right after
+            // the read and the deployment-state write above it both
+            // succeeded, so routes don't go stale on something recoverable.
+            let retry = temps_core::retry::RetryConfig::new(3)
+                .with_base_delay(std::time::Duration::from_millis(100))
+                .with_max_delay(std::time::Duration::from_secs(2));
+            let update_result = retry
+                .retry(|| async {
+                    let active_container = deployment_containers::ActiveModel {
+                        status: Set(Some("stopped".to_string())),
+                        ..deployment_containers::ActiveModel::from(container.clone())
+                    };
+                    active_container.update(self.db.as_ref()).await
+                })
+                .await;
+            if let Err(e) = update_result {
+                warn!(
+                    "Failed to persist stopped status for container {} during deployment pause \
+                     after retrying: {} — the route table may still treat it as routable until \
+                     the next successful status update",
+                    container_id, e
+                );
+            }
         }
-
-        let environment_id = deployment.environment_id;
-
-        // Update deployment state to "paused"
-        let mut active_deployment: deployments::ActiveModel = deployment.into();
-        active_deployment.state = Set("paused".to_string());
-        active_deployment.update(self.db.as_ref()).await?;
 
         // Force an in-process route-table reload (same mechanism
         // `mark_deployment_complete.rs` uses after a normal deploy — see its
@@ -4168,6 +4401,150 @@ impl DeploymentService {
         Ok((container, env_info))
     }
 
+    /// List containers that have run for an environment — current and
+    /// replaced by a later redeploy. Unlike `get_container_detail`, this
+    /// does NOT filter out rows with `deleted_at` set, since a redeploy soft
+    /// deletes the previous container row and we still want its history
+    /// available for metrics lookups.
+    ///
+    /// `deployment_id` narrows the result to one deployment's containers
+    /// (must belong to this environment). `limit` caps how many *replaced*
+    /// rows are returned on top of the currently-running ones — an
+    /// environment can accumulate hundreds of replaced containers over its
+    /// lifetime and returning them all would fan out into that many
+    /// concurrent metrics-history requests on the frontend. Currently
+    /// running containers (`deleted_at IS NULL`) are never subject to this
+    /// cap: a limit truncating a live container would silently drop it from
+    /// both the "running" count and its metrics, the exact debugging
+    /// scenario this endpoint exists for. Returns all current containers
+    /// first (newest first), then the newest `limit` replaced containers,
+    /// plus the total count across both groups before the cap was applied.
+    pub async fn list_environment_container_history(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        deployment_id: Option<i32>,
+        limit: Option<u64>,
+    ) -> Result<(Vec<deployment_containers::Model>, u64), DeploymentError> {
+        // Verify environment exists and belongs to project
+        environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        let deployment_ids: Vec<i32> = if let Some(deployment_id) = deployment_id {
+            deployments::Entity::find_by_id(deployment_id)
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .filter(deployments::Column::ProjectId.eq(project_id))
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| {
+                    DeploymentError::NotFound(format!("Deployment {} not found", deployment_id))
+                })?;
+            vec![deployment_id]
+        } else {
+            deployments::Entity::find()
+                .filter(deployments::Column::EnvironmentId.eq(environment_id))
+                .filter(deployments::Column::ProjectId.eq(project_id))
+                .all(self.db.as_ref())
+                .await?
+                .into_iter()
+                .map(|d| d.id)
+                .collect()
+        };
+
+        if deployment_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+
+        let limit = limit.unwrap_or(20).min(100);
+        let filter = deployment_containers::Column::DeploymentId.is_in(deployment_ids);
+
+        let total_count = deployment_containers::Entity::find()
+            .filter(filter.clone())
+            .count(self.db.as_ref())
+            .await?;
+
+        let mut containers = deployment_containers::Entity::find()
+            .filter(filter.clone())
+            .filter(deployment_containers::Column::DeletedAt.is_null())
+            .order_by_desc(deployment_containers::Column::DeployedAt)
+            .all(self.db.as_ref())
+            .await?;
+
+        // `limit` bounds only the replaced containers -- it is not a shared
+        // budget with the uncapped current ones above, so a small `limit`
+        // can never squeeze out an already-included running container.
+        let replaced = deployment_containers::Entity::find()
+            .filter(filter)
+            .filter(deployment_containers::Column::DeletedAt.is_not_null())
+            .order_by_desc(deployment_containers::Column::DeployedAt)
+            .limit(limit)
+            .all(self.db.as_ref())
+            .await?;
+        containers.extend(replaced);
+
+        Ok((containers, total_count))
+    }
+
+    /// Resolve a container row by docker container_id, including containers
+    /// replaced by a later redeploy (`deleted_at` set). Duplicates the
+    /// lookup logic of `get_container_detail` minus the `DeletedAt.is_null()`
+    /// filters — intended ONLY for read-only historical lookups (e.g.
+    /// persisted metrics history) where the container no longer needs to be
+    /// live-operable. `stop_container`/`start_container` and similar
+    /// operational paths must keep using `get_container_detail`, which
+    /// correctly excludes deleted containers.
+    pub async fn get_container_row_any(
+        &self,
+        project_id: i32,
+        environment_id: i32,
+        container_id: String,
+    ) -> Result<deployment_containers::Model, DeploymentError> {
+        // Verify environment belongs to project
+        environments::Entity::find_by_id(environment_id)
+            .filter(environments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Environment not found".to_string()))?;
+
+        // Find the container — supports both short (12-char) and full (64-char) IDs.
+        // Compose deployments store short IDs from `docker compose ps`, but
+        // `docker inspect` returns full IDs which the frontend may pass back.
+        // Try exact match first, then prefix match in both directions.
+        let container = deployment_containers::Entity::find()
+            .filter(deployment_containers::Column::ContainerId.eq(&container_id))
+            .one(self.db.as_ref())
+            .await?;
+
+        let container = match container {
+            Some(c) => c,
+            None => {
+                // Full ID passed but DB has short ID: query starts with DB value
+                // Short ID passed but DB has full ID: DB value starts with query
+                let short_id = &container_id[..container_id.len().min(12)];
+                deployment_containers::Entity::find()
+                    .filter(deployment_containers::Column::ContainerId.starts_with(short_id))
+                    .one(self.db.as_ref())
+                    .await?
+                    .ok_or_else(|| {
+                        DeploymentError::NotFound(format!("Container {} not found", container_id))
+                    })?
+            }
+        };
+
+        // Verify container belongs to a deployment in this environment
+        deployments::Entity::find_by_id(container.deployment_id)
+            .filter(deployments::Column::EnvironmentId.eq(environment_id))
+            .filter(deployments::Column::ProjectId.eq(project_id))
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| DeploymentError::NotFound("Deployment not found".to_string()))?;
+
+        Ok(container)
+    }
+
     /// Check whether container exec/terminal access is enabled for an
     /// environment after applying project-level defaults and environment-level
     /// overrides.
@@ -4687,6 +5064,42 @@ mod tests {
             ));
         }
     }
+
+    #[test]
+    fn complete_asset_origin_stays_canonical_across_reuse_hops() {
+        let first_reuse_context = serde_json::json!({
+            "source_deployment_id": 10,
+            "source_environment_id": 20,
+            "source_deployment_slug": "original-build",
+        });
+
+        let origin =
+            complete_deployment_asset_origin(30, 40, "first-promotion", Some(&first_reuse_context))
+                .expect("complete reuse metadata should resolve without a database lookup");
+        assert_eq!(
+            origin,
+            DeploymentAssetOrigin {
+                deployment_id: 10,
+                environment_id: 20,
+                slug: "original-build".to_string(),
+            }
+        );
+
+        let second_reuse_context = serde_json::json!({
+            "source_deployment_id": origin.deployment_id,
+            "source_environment_id": origin.environment_id,
+            "source_deployment_slug": origin.slug.clone(),
+        });
+        assert_eq!(
+            complete_deployment_asset_origin(
+                50,
+                60,
+                "second-promotion",
+                Some(&second_reuse_context),
+            ),
+            Some(origin)
+        );
+    }
     use temps_database::test_utils::TestDatabase;
     use temps_entities::{
         deployment_config::DeploymentConfig, deployments, env_vars, environments,
@@ -4823,6 +5236,70 @@ mod tests {
         let deployment = deployment.insert(db.as_ref()).await?;
 
         Ok((project, environment, deployment))
+    }
+
+    #[tokio::test]
+    async fn legacy_asset_origin_walks_partial_reuse_metadata_to_original_build() {
+        let test_db = match TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                println!("Test database not available, skipping: {error}");
+                return;
+            }
+        };
+        let db = test_db.connection_arc().clone();
+        let (project, environment, original) = setup_test_data(&db)
+            .await
+            .expect("create deployment fixtures");
+
+        let first_reuse = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("legacy-promotion".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            context_vars: Set(Some(serde_json::json!({
+                "trigger": "promotion",
+                "source_deployment_id": original.id,
+                "source_environment_id": original.environment_id,
+            }))),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert legacy promotion");
+
+        let second_reuse = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set("legacy-rollback".to_string()),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            context_vars: Set(Some(serde_json::json!({
+                "trigger": "rollback",
+                "source_deployment_id": first_reuse.id,
+            }))),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        }
+        .insert(db.as_ref())
+        .await
+        .expect("insert legacy rollback");
+
+        let origin = deployment_asset_origin(db.as_ref(), &second_reuse)
+            .await
+            .expect("legacy reuse metadata should resolve");
+
+        assert_eq!(origin.deployment_id, original.id);
+        assert_eq!(origin.environment_id, original.environment_id);
+        assert_eq!(origin.slug, original.slug);
     }
 
     #[tokio::test]
@@ -6705,6 +7182,136 @@ mod tests {
             }
             _ => panic!("Expected NotFound error"),
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_list_environment_container_history_filters_by_deployment_and_limits(
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let test_db = TestDatabase::with_migrations().await?;
+        let db = test_db.connection_arc();
+
+        // First deployment/container comes from the shared fixture.
+        let (project, environment, deployment_one, container_one) =
+            setup_test_deployment(&db).await?;
+
+        // A second deployment on the SAME environment, with three containers
+        // that have all since been superseded by a later redeploy (deleted_at
+        // set) — simulates an environment with a lot of replaced history.
+        let deployment_two = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            state: Set("deployed".to_string()),
+            slug: Set("test-deployment-two".to_string()),
+            metadata: Set(Some(Default::default())),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let deployment_two = deployment_two.insert(db.as_ref()).await?;
+
+        let now = Utc::now();
+        for (idx, container_id) in ["container-456", "container-789", "container-999"]
+            .iter()
+            .enumerate()
+        {
+            let container = deployment_containers::ActiveModel {
+                deployment_id: Set(deployment_two.id),
+                container_id: Set(container_id.to_string()),
+                container_name: Set(format!("test-container-{}", idx + 2)),
+                container_port: Set(8080),
+                image_name: Set(Some("nginx:latest".to_string())),
+                status: Set(Some("stopped".to_string())),
+                created_at: Set(now + chrono::Duration::seconds(idx as i64 + 1)),
+                deployed_at: Set(now + chrono::Duration::seconds(idx as i64 + 1)),
+                deleted_at: Set(Some(now + chrono::Duration::seconds(idx as i64 + 10))),
+                ..Default::default()
+            };
+            container.insert(db.as_ref()).await?;
+        }
+
+        let deployment_service = create_deployment_service_for_test(db.clone());
+
+        // No filter, no limit override: sees every container across both
+        // deployments (1 current + 3 replaced), and total_count matches.
+        let (all, all_total) = deployment_service
+            .list_environment_container_history(project.id, environment.id, None, None)
+            .await?;
+        assert_eq!(all.len(), 4);
+        assert_eq!(all_total, 4);
+
+        // Filtered to deployment_two: only its three (replaced) containers
+        // come back, deployment_one's current container is excluded.
+        let (filtered, filtered_total) = deployment_service
+            .list_environment_container_history(
+                project.id,
+                environment.id,
+                Some(deployment_two.id),
+                None,
+            )
+            .await?;
+        assert_eq!(filtered_total, 3);
+        assert!(filtered
+            .iter()
+            .all(|c| c.deployment_id == deployment_two.id));
+        assert!(!filtered.iter().any(|c| c.id == container_one.id));
+
+        // limit=1 across all deployments: the single currently-running
+        // container (container_one) is NEVER subject to the cap -- only
+        // replaced containers are capped, so exactly 1 (of 3) replaced rows
+        // joins it. total_count still reports the unfiltered total (4).
+        let (limited, limited_total) = deployment_service
+            .list_environment_container_history(project.id, environment.id, None, Some(1))
+            .await?;
+        assert_eq!(limited.len(), 2);
+        assert_eq!(limited_total, 4);
+        assert!(
+            limited.iter().any(|c| c.id == container_one.id),
+            "the running container must never be dropped by `limit`"
+        );
+        assert_eq!(
+            limited.iter().filter(|c| c.deleted_at.is_some()).count(),
+            1,
+            "limit=1 should cap replaced containers to exactly 1"
+        );
+
+        // Filtering by a deployment ID from a different environment 404s
+        // rather than silently returning nothing.
+        let other_project = projects::ActiveModel {
+            name: Set("Other Project".to_string()),
+            slug: Set("other-project".to_string()),
+            repo_name: Set("other-repo".to_string()),
+            repo_owner: Set("other-owner".to_string()),
+            preset: Set(Preset::NextJs),
+            main_branch: Set("main".to_string()),
+            directory: Set("/".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let other_project = other_project.insert(db.as_ref()).await?;
+        let other_environment = environments::ActiveModel {
+            project_id: Set(other_project.id),
+            name: Set("Other".to_string()),
+            slug: Set("other".to_string()),
+            host: Set("other.example.com".to_string()),
+            upstreams: Set(UpstreamList::default()),
+            subdomain: Set("other.example.com".to_string()),
+            created_at: Set(Utc::now()),
+            updated_at: Set(Utc::now()),
+            ..Default::default()
+        };
+        let other_environment = other_environment.insert(db.as_ref()).await?;
+        let result = deployment_service
+            .list_environment_container_history(
+                other_project.id,
+                other_environment.id,
+                Some(deployment_one.id),
+                None,
+            )
+            .await;
+        assert!(matches!(result, Err(DeploymentError::NotFound(_))));
 
         Ok(())
     }

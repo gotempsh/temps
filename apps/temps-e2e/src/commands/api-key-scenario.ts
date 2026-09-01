@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * API key management lifecycle against a live Temps instance -- proving the
  * actual HTTP-level round trip (create -> scoped 200/403 -> revoke -> cut

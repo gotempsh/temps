@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-project authentication for OTel ingest.
 //!
 //! Supports two token types:
@@ -14,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::warn;
 
-use crate::error::OtelError;
+use crate::error::{db_err_kind, OtelError, StorageErrorKind};
 
 /// Authenticated project context after token validation.
 #[derive(Debug, Clone)]
@@ -65,7 +68,13 @@ enum CachedAuth {
 enum CachedAuthError {
     InvalidApiKey,
     AuthFailed(String),
-    Storage(String),
+    /// A storage/database failure, carrying the same [`StorageErrorKind`]
+    /// classification as [`OtelError::Storage`] so a cached-and-replayed error
+    /// is indistinguishable from a freshly produced one.
+    Storage {
+        message: String,
+        kind: StorageErrorKind,
+    },
 }
 
 impl From<OtelError> for CachedAuthError {
@@ -78,8 +87,18 @@ impl From<OtelError> for CachedAuthError {
             } => Self::AuthFailed(format!(
                 "Missing token in Authorization or X-Temps-Api-Key header for claimed project '{claimed_project_slug}'"
             )),
-            OtelError::Storage { message } => Self::Storage(message),
-            other => Self::Storage(other.to_string()),
+            OtelError::Storage { message, kind } => Self::Storage { message, kind },
+            // Non-storage errors reaching the auth cache are already terminal
+            // (auth/validation); classify by transience so a genuine
+            // connection failure is not cached as a permanent rejection.
+            other => Self::Storage {
+                kind: if other.is_transient() {
+                    StorageErrorKind::PostgresConn
+                } else {
+                    StorageErrorKind::PostgresQuery
+                },
+                message: other.to_string(),
+            },
         }
     }
 }
@@ -91,8 +110,9 @@ impl From<&CachedAuthError> for OtelError {
             CachedAuthError::AuthFailed(reason) => Self::AuthFailed {
                 reason: reason.clone(),
             },
-            CachedAuthError::Storage(message) => Self::Storage {
+            CachedAuthError::Storage { message, kind } => Self::Storage {
                 message: message.clone(),
+                kind: *kind,
             },
         }
     }
@@ -269,6 +289,7 @@ impl OtelAuthService {
             ))
             .await
             .map_err(|e| OtelError::Storage {
+                kind: db_err_kind(&e),
                 message: format!("Database error during service token auth: {}", e),
             })?;
 
@@ -404,6 +425,7 @@ impl OtelAuthService {
             ))
             .await
             .map_err(|e| OtelError::Storage {
+                kind: db_err_kind(&e),
                 message: format!("Database error during OTel auth: {}", e),
             })?;
 
@@ -562,6 +584,7 @@ impl OtelAuthService {
             ))
             .await
             .map_err(|e| OtelError::Storage {
+                kind: db_err_kind(&e),
                 message: format!("Database error during OTel auth: {}", e),
             })?;
 

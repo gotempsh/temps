@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Explicit authorization for a project to send through a verified email domain.
 
 use sea_orm::entity::prelude::*;

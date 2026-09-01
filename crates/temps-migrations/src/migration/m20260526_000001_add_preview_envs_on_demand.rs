@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Adds project-level defaults that force every newly-created preview
 //! environment to use on-demand mode (scale-to-zero).
 //!

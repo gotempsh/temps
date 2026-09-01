@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
@@ -53,7 +56,7 @@ pub struct ApiKeyState {
 /// requester actually holds the permissions being granted. Unparsable
 /// custom permission strings and unrecognized role names are left to that
 /// existing validation, which returns 400.
-fn enforce_permission_ceiling_for_role(
+pub(crate) fn enforce_permission_ceiling_for_role(
     auth: &crate::context::AuthContext,
     role_type: &str,
     permissions: Option<&[String]>,

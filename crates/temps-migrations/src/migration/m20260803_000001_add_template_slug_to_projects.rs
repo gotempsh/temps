@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Persist curated-template provenance on projects.
 //!
 //! The value is either a reviewed public slug from the bundled catalog or the

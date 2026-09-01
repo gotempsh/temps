@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Integration tests for structured logging
 //!
 //! Demonstrates how existing code can use structured logging with minimal changes

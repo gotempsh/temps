@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Control-plane allocator for compute CIDRs and the per-node `Peer` list.
 //!
 //! Carved out of [`temps_entities::network_config`] + `nodes`:

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Hot-path proxy metrics.
 //!
 //! [`ProxyMetrics`] is a set of lock-free atomic counters updated on every

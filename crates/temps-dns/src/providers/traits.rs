@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! DNS provider trait definitions
 //!
 //! This module defines the core traits and types for DNS provider implementations.

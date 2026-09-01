@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Evergreen eval harness for `WorkflowMemoryProvider`.
 //!
 //! This test suite pins the *behavioral contract* of any memory provider

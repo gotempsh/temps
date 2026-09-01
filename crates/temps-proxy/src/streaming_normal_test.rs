@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /// Tests for normal (non-chunked) streaming scenarios
 /// This verifies that the proxy doesn't buffer regular streaming responses
 #[cfg(test)]

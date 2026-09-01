@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -83,6 +86,11 @@ impl From<AgentError> for Problem {
             AgentError::SandboxExecFailed { .. } => {
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Sandbox Exec Failed")
+                    .with_detail(error.to_string())
+            }
+            AgentError::SnapshotSizeLimitExceeded { .. } => {
+                problemdetails::new(StatusCode::UNPROCESSABLE_ENTITY)
+                    .with_title("Snapshot Storage Limit Exceeded")
                     .with_detail(error.to_string())
             }
             AgentError::SandboxProviderUnavailable { .. } => {

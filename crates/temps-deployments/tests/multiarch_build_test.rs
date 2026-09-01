@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Real cross-architecture build test.
 //!
 //! Runs `BuildImageJob` against a live Docker daemon with two target

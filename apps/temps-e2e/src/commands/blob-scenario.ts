@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Blob storage (RustFS, platform-wide singleton -- same shape as
  * kv-storage's shared Redis) lifecycle against a live Temps instance:

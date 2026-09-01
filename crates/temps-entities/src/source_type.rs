@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Source type definitions for projects
 //!
 //! Defines the source of code/artifacts for a project deployment.

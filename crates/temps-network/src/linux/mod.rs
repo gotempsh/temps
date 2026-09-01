@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Linux kernel data-plane orchestration.
 //!
 //! This module is only compiled on Linux. It composes the lower-level

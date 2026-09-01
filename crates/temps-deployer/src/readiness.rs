@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Container readiness probing.
 //!
 //! "Running" (Docker's container state) is not the same as "able to serve a

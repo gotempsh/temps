@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! S3 / MinIO metrics collector.
 //!
 //! Opens a fresh S3 client on every [`collect`] call and calls `ListBuckets`

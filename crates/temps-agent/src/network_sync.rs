@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Multi-host network sync — polls the control plane for our compute_cidr
 //! allocation and the peer list, then drives `temps_network::NetworkManager`
 //! accordingly.
@@ -18,8 +21,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bollard::Docker;
+use chrono::{DateTime, Utc};
 use ipnet::Ipv4Net;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use temps_dns_resolver::{
     ResolverConfig as DnsResolverConfig, ResolverHandle as DnsResolverHandle,
 };
@@ -28,6 +32,53 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::AgentConfig;
+
+/// Point-in-time DNS resolver health, refreshed by [`reconcile_resolver`] on
+/// every network-sync tick and read by the heartbeat loop (`server.rs`) to
+/// attach to the periodic heartbeat POST as `dns_resolver`.
+///
+/// A `None` in [`SharedDnsHealth`] (rather than this struct) means "network
+/// sync hasn't ticked yet for this node" — either right after agent startup,
+/// or a true single-host node that never receives a `compute_cidr`
+/// allocation and so never touches DNS resolver reconciliation at all (the
+/// resolver binds to the overlay bridge address, which doesn't exist without
+/// one). That's distinct from `running: false` below, which means the tick
+/// ran and found cluster DNS disabled or the resolver down — see the
+/// `dns_resolver_running` column doc on `nodes` for the same null-vs-false
+/// distinction on the control-plane side.
+#[derive(Debug, Clone, Serialize)]
+pub struct DnsResolverHeartbeat {
+    /// `false` when `AppSettings.cluster_dns.enabled` is off on the control
+    /// plane, when the resolver failed to start, or after it was shut down.
+    /// `true` only while a resolver handle currently exists and cluster DNS
+    /// is enabled.
+    #[serde(default)]
+    pub running: bool,
+    /// Mirrors `ResolverStatus::tasks_alive` — `false` means the resolver's
+    /// sync or DNS server task crashed. Only meaningful when `running`.
+    #[serde(default)]
+    pub tasks_alive: bool,
+    #[serde(default)]
+    pub last_sync_success_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub consecutive_sync_failures: u32,
+    /// Most recent resolver-related error. Usually the sync loop's last
+    /// tick failure; when the resolver never started at all, this instead
+    /// carries the startup error (e.g. "address already in use") — there is
+    /// no separate field for that, and an operator needs to see it either
+    /// way.
+    #[serde(default)]
+    pub last_sync_error: Option<String>,
+    #[serde(default)]
+    pub record_count: i64,
+}
+
+/// Shared slot the network-sync loop publishes DNS resolver health into on
+/// every tick. The heartbeat loop (`server.rs::spawn_heartbeat_loop`) reads
+/// it to attach `dns_resolver` to the periodic heartbeat POST. Mirrors the
+/// `overlay_bridge_address` / `SharedPeers` cross-loop state pattern already
+/// used in this module.
+pub type SharedDnsHealth = Arc<std::sync::RwLock<Option<DnsResolverHeartbeat>>>;
 
 /// Wire types — match the server's `handlers::network::PeerListResponse`.
 /// We re-declare them here rather than depending on `temps-deployments`
@@ -93,10 +144,11 @@ pub fn spawn(
     config: &AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
     peers: SharedPeers,
+    dns_health: SharedDnsHealth,
 ) {
     let cfg = config.clone();
     tokio::spawn(async move {
-        if let Err(e) = run(cfg, overlay_bridge_address, peers).await {
+        if let Err(e) = run(cfg, overlay_bridge_address, peers, dns_health).await {
             // The loop is designed to retry forever; reaching this branch
             // means the loop itself unwound, which only happens on
             // unrecoverable invariant violations.
@@ -109,6 +161,7 @@ async fn run(
     config: AgentConfig,
     overlay_bridge_address: Arc<std::sync::RwLock<Option<IpAddr>>>,
     shared_peers: SharedPeers,
+    dns_health: SharedDnsHealth,
 ) -> Result<(), SyncError> {
     info!(
         node_id = config.node_id,
@@ -144,6 +197,12 @@ async fn run(
     // so the resolver tasks stay alive for the lifetime of the agent.
     let mut _resolver_handle: Option<DnsResolverHandle> = None;
 
+    let slots = SharedSlots {
+        overlay_bridge_address: &overlay_bridge_address,
+        shared_peers: &shared_peers,
+        dns_health: &dns_health,
+    };
+
     loop {
         match poll_once(&client, &url, &config.token).await {
             Ok(Some(payload)) => {
@@ -153,8 +212,7 @@ async fn run(
                     &mut bootstrapped,
                     &mut _resolver_handle,
                     &config,
-                    &overlay_bridge_address,
-                    &shared_peers,
+                    &slots,
                 )
                 .await
                 {
@@ -207,14 +265,25 @@ async fn poll_once(
     Ok(Some(payload))
 }
 
+/// The cross-loop shared slots the network-sync loop publishes into on every
+/// tick, bundled purely to keep [`apply`]'s parameter count manageable. Each
+/// field is the same type alias used independently by callers outside this
+/// module (`agent.rs`'s CLI wiring, `service_handlers.rs`'s container-attach
+/// path) — this struct doesn't change their meaning, just groups the
+/// references for one function call.
+struct SharedSlots<'a> {
+    overlay_bridge_address: &'a Arc<std::sync::RwLock<Option<IpAddr>>>,
+    shared_peers: &'a SharedPeers,
+    dns_health: &'a SharedDnsHealth,
+}
+
 async fn apply(
     manager: &NetworkManager,
     payload: WirePeerListResponse,
     bootstrapped: &mut bool,
     resolver: &mut Option<DnsResolverHandle>,
     config: &AgentConfig,
-    overlay_bridge_address: &Arc<std::sync::RwLock<Option<IpAddr>>>,
-    shared_peers: &SharedPeers,
+    slots: &SharedSlots<'_>,
 ) -> Result<(), SyncError> {
     let Some(alloc_wire) = payload.alloc else {
         return Ok(());
@@ -222,6 +291,10 @@ async fn apply(
     let alloc = parse_alloc(&alloc_wire)?;
     let peers: Result<Vec<Peer>, _> = payload.peers.iter().map(parse_peer).collect();
     let peers = peers?;
+    // Captured before `bootstrap()` consumes `alloc` below. Needed every
+    // tick (not just the first) since resolver reconciliation now runs
+    // unconditionally — see the `reconcile_resolver` call at the bottom.
+    let bridge_address = alloc.bridge_address;
 
     // Capture the bridge gateway up front — `bootstrap` consumes
     // `alloc` and the route sweep at the bottom needs the IP after.
@@ -234,7 +307,7 @@ async fn apply(
     // Container-attach handlers read this slot to install per-peer
     // overlay routes inside the container's netns — they need the
     // same view the kernel data plane is about to apply.
-    if let Ok(mut slot) = shared_peers.write() {
+    if let Ok(mut slot) = slots.shared_peers.write() {
         *slot = peers.clone();
     }
 
@@ -244,12 +317,9 @@ async fn apply(
             peers = peers.len(),
             "bringing up multi-host overlay"
         );
-        let bridge_address = alloc.bridge_address;
         // Clone before bootstrap consumes alloc — we need it for the
         // Docker network creation step right after.
         let alloc_for_docker = alloc.clone();
-        // Clone peers too — we need them for the per-container route
-        // sweep at the bottom of this function.
         manager
             .bootstrap(alloc, peers.clone())
             .await
@@ -270,37 +340,6 @@ async fn apply(
                  won't have cross-node IPs (continuing single-host)"
             );
         }
-
-        // Bring up the per-node DNS resolver (ADR-024) and publish the bridge
-        // address **only when the control plane has cluster DNS enabled**
-        // (`AppSettings.cluster_dns.enabled`, received as
-        // `cluster_dns_enabled` in the wire payload).
-        //
-        // When disabled (the default), we leave `overlay_bridge_address` as
-        // `None` so `DockerRuntime` writes NO custom `HostConfig.Dns` to
-        // containers — they fall back to Docker's embedded DNS, exactly as
-        // before ADR-024. This prevents the DNS-timeout-cascade failure mode
-        // (22–27 s TCP delays when the injected resolver is slow for external
-        // hostnames).
-        if payload.cluster_dns_enabled {
-            // Failure here is non-fatal — apps that resolve cluster FQDNs
-            // lose resolution on this node, but heartbeats/deployments/proxy
-            // keep working.
-            spawn_resolver(config, bridge_address, resolver).await;
-
-            // Publish the bridge address so `service_handlers::create_service`
-            // can wire it into every container's `--dns`. Done right after the
-            // resolver is up so the slot is never advertised before the
-            // resolver is actually accepting queries.
-            if let Ok(mut slot) = overlay_bridge_address.write() {
-                *slot = Some(bridge_address);
-            }
-        } else {
-            info!(
-                "cluster DNS resolver disabled (AppSettings.cluster_dns.enabled=false from \
-                 control plane); containers will use Docker's embedded DNS"
-            );
-        }
     } else {
         let changed = manager
             .reconcile_peers(peers.clone())
@@ -310,6 +349,21 @@ async fn apply(
             info!("multi-host peer list updated");
         }
     }
+
+    // Reconcile the per-node DNS resolver (ADR-024) against the control
+    // plane's current `cluster_dns_enabled` setting and the resolver's own
+    // task health. Runs on *every* tick — not just the first bootstrap — so
+    // toggling the setting or a crashed resolver task both self-heal within
+    // one poll interval instead of requiring an agent restart.
+    reconcile_resolver(
+        payload.cluster_dns_enabled,
+        bridge_address,
+        resolver,
+        config,
+        slots.overlay_bridge_address,
+        slots.dns_health,
+    )
+    .await;
 
     // Re-inject per-peer routes inside every overlay-attached
     // container's netns. The routes don't survive a container netns
@@ -421,17 +475,75 @@ async fn sweep_overlay_container_routes(
     Ok(())
 }
 
-/// Boot the per-node DNS resolver after the overlay is up. Idempotent:
-/// once `resolver` is `Some`, this is a no-op (the resolver runs for the
-/// lifetime of the agent process).
-async fn spawn_resolver(
-    config: &AgentConfig,
+/// Reconcile the per-node DNS resolver against the control plane's current
+/// `cluster_dns_enabled` setting and the resolver's own task health. Called
+/// on every sync tick (ADR-024's original design only ran this once, at
+/// first bootstrap — toggling the setting afterward, or the resolver task
+/// crashing, both required a manual agent restart to recover from; this
+/// closes that gap):
+///
+/// - Enabled, no resolver running (first time, or after a crash/shutdown):
+///   start one.
+/// - Enabled, resolver running but one of its background tasks has died
+///   (`status().tasks_alive == false`): drop the stale handle and start a
+///   fresh one. A half-dead resolver (e.g. server task panicked, sync task
+///   still running) is worse than no resolver — it can serve a frozen,
+///   increasingly stale zone without any caller knowing.
+/// - Enabled, resolver running and healthy: no-op.
+/// - Disabled, resolver running: shut it down and clear the published
+///   bridge address so new containers stop getting `--dns=<bridge_ip>` and
+///   fall back to Docker's embedded DNS, matching what a fresh disabled
+///   node would see.
+/// - Disabled, no resolver running: no-op.
+///
+/// Regardless of which branch runs, the final resolver state is always
+/// published to `dns_health` before returning (see [`publish_dns_health`]) —
+/// that's what makes the resolver's health visible to the control plane via
+/// the agent's next heartbeat, closing the "silently fails, operator has to
+/// SSH in and read logs" gap this reconciliation loop was already built to
+/// self-heal but not to report.
+async fn reconcile_resolver(
+    cluster_dns_enabled: bool,
     bridge_address: IpAddr,
     resolver: &mut Option<DnsResolverHandle>,
+    config: &AgentConfig,
+    overlay_bridge_address: &Arc<std::sync::RwLock<Option<IpAddr>>>,
+    dns_health: &SharedDnsHealth,
 ) {
-    if resolver.is_some() {
+    if !cluster_dns_enabled {
+        if let Some(handle) = resolver.take() {
+            info!(
+                "cluster DNS resolver disabled (AppSettings.cluster_dns.enabled=false from \
+                 control plane); shutting down and falling back to Docker's embedded DNS"
+            );
+            handle.shutdown().await;
+            if let Ok(mut slot) = overlay_bridge_address.write() {
+                *slot = None;
+            }
+        }
+        publish_dns_health(dns_health, false, None, None);
         return;
     }
+
+    if let Some(handle) = resolver.as_ref() {
+        let status = handle.status();
+        if status.tasks_alive {
+            publish_dns_health(dns_health, true, Some(&status), None);
+            return;
+        }
+        warn!(
+            bridge = %bridge_address,
+            consecutive_sync_failures = status.sync.consecutive_failures,
+            "DNS resolver task exited unexpectedly; respawning"
+        );
+        // Drop the dead handle. `shutdown()` on an already-exited task just
+        // awaits the (already-finished) JoinHandles, so this is safe even
+        // though one of them is what triggered the respawn.
+        if let Some(handle) = resolver.take() {
+            handle.shutdown().await;
+        }
+    }
+
     let dns_cfg = DnsResolverConfig::new(
         config.node_id,
         config.token.clone(),
@@ -440,6 +552,7 @@ async fn spawn_resolver(
         config.dns_data_dir.clone(),
     );
     let snapshot_path = dns_cfg.snapshot_path();
+    let mut start_error = None;
     match DnsResolverHandle::start(dns_cfg).await {
         Ok(handle) => {
             info!(
@@ -448,6 +561,14 @@ async fn spawn_resolver(
                 "DNS resolver started"
             );
             *resolver = Some(handle);
+
+            // Publish the bridge address so `service_handlers::create_service`
+            // can wire it into every container's `--dns`. Done right after the
+            // resolver is up so the slot is never advertised before the
+            // resolver is actually accepting queries.
+            if let Ok(mut slot) = overlay_bridge_address.write() {
+                *slot = Some(bridge_address);
+            }
         }
         Err(e) => {
             warn!(
@@ -456,11 +577,60 @@ async fn spawn_resolver(
                 "DNS resolver failed to start; this node has no in-cluster DNS \
                  (heartbeats / deployments / proxy continue to work)"
             );
-            // Leave `resolver` as None — next bootstrap (e.g. on agent
-            // restart) will retry. We do NOT retry mid-loop because the
-            // typical failure (port 53 already bound) won't fix itself
-            // by retrying.
+            // `resolver` is already None here (the dead handle, if any, was
+            // dropped above before this respawn attempt). Clear
+            // `overlay_bridge_address` too — otherwise a previous, now-dead
+            // resolver's IP would stay published, and new containers would
+            // get `--dns=<dead IP>` with no listener behind it. The typical
+            // failure (port 53 already bound) won't fix itself by retrying
+            // immediately, but the next sync tick (POLL_INTERVAL later) will
+            // try again rather than waiting for an agent restart.
+            if let Ok(mut slot) = overlay_bridge_address.write() {
+                *slot = None;
+            }
+            start_error = Some(e.to_string());
         }
+    }
+
+    let status = resolver.as_ref().map(|h| h.status());
+    publish_dns_health(dns_health, resolver.is_some(), status.as_ref(), start_error);
+}
+
+/// Build a [`DnsResolverHeartbeat`] snapshot and publish it to `dns_health`.
+///
+/// `running` and `status` should agree (`status.is_some() == running`) for
+/// every call site above except the "start failed" path, where `running` is
+/// `false` and `status` is `None` — `start_error` carries the failure
+/// instead. `status.tasks_alive` is trusted over `running` for the
+/// `tasks_alive` output field so a caller can never observe the
+/// contradictory `running: true, tasks_alive: true` pair for a resolver that
+/// was never actually running.
+fn publish_dns_health(
+    dns_health: &SharedDnsHealth,
+    running: bool,
+    status: Option<&temps_dns_resolver::ResolverStatus>,
+    start_error: Option<String>,
+) {
+    let snapshot = match status {
+        Some(status) if running => DnsResolverHeartbeat {
+            running: true,
+            tasks_alive: status.tasks_alive,
+            last_sync_success_at: status.sync.last_success_at.map(DateTime::<Utc>::from),
+            consecutive_sync_failures: status.sync.consecutive_failures,
+            last_sync_error: status.sync.last_error.clone(),
+            record_count: status.record_count as i64,
+        },
+        _ => DnsResolverHeartbeat {
+            running: false,
+            tasks_alive: false,
+            last_sync_success_at: None,
+            consecutive_sync_failures: 0,
+            last_sync_error: start_error,
+            record_count: 0,
+        },
+    };
+    if let Ok(mut slot) = dns_health.write() {
+        *slot = Some(snapshot);
     }
 }
 
@@ -704,5 +874,120 @@ mod tests {
         //   if payload.cluster_dns_enabled { spawn_resolver(...); slot=Some(...) }
         // is validated by the field value above. Runtime behaviour is covered
         // by the dockerized IT suite.
+    }
+
+    // ── DNS resolver heartbeat publishing ──────────────────────────────
+
+    fn empty_dns_health() -> SharedDnsHealth {
+        Arc::new(std::sync::RwLock::new(None))
+    }
+
+    #[test]
+    fn publish_dns_health_disabled_reports_not_running() {
+        let slot = empty_dns_health();
+        publish_dns_health(&slot, false, None, None);
+
+        let health = slot
+            .read()
+            .unwrap()
+            .clone()
+            .expect("slot must be Some after a tick");
+        assert!(!health.running);
+        assert!(!health.tasks_alive);
+        assert_eq!(health.record_count, 0);
+        assert_eq!(health.consecutive_sync_failures, 0);
+        assert!(health.last_sync_success_at.is_none());
+        assert!(
+            health.last_sync_error.is_none(),
+            "a clean disable carries no error"
+        );
+    }
+
+    #[test]
+    fn publish_dns_health_running_healthy_mirrors_resolver_status() {
+        let slot = empty_dns_health();
+        let now = std::time::SystemTime::now();
+        let status = temps_dns_resolver::ResolverStatus {
+            tasks_alive: true,
+            sync: temps_dns_resolver::SyncStatus {
+                last_success_at: Some(now),
+                consecutive_failures: 0,
+                last_error: None,
+            },
+            record_count: 42,
+            zone_generation: 7,
+        };
+        publish_dns_health(&slot, true, Some(&status), None);
+
+        let health = slot.read().unwrap().clone().expect("slot must be Some");
+        assert!(health.running);
+        assert!(health.tasks_alive);
+        assert_eq!(health.record_count, 42);
+        assert_eq!(
+            health.last_sync_success_at,
+            Some(chrono::DateTime::<chrono::Utc>::from(now))
+        );
+    }
+
+    #[test]
+    fn publish_dns_health_dead_task_reports_tasks_alive_false() {
+        let slot = empty_dns_health();
+        let status = temps_dns_resolver::ResolverStatus {
+            tasks_alive: false,
+            sync: temps_dns_resolver::SyncStatus {
+                last_success_at: None,
+                consecutive_failures: 3,
+                last_error: Some("sync tick failed: connection refused".into()),
+            },
+            record_count: 0,
+            zone_generation: 0,
+        };
+        publish_dns_health(&slot, true, Some(&status), None);
+
+        let health = slot.read().unwrap().clone().expect("slot must be Some");
+        assert!(health.running, "resolver is still enabled/attached");
+        assert!(!health.tasks_alive, "the dead task must be visible");
+        assert_eq!(health.consecutive_sync_failures, 3);
+        assert_eq!(
+            health.last_sync_error.as_deref(),
+            Some("sync tick failed: connection refused")
+        );
+    }
+
+    #[test]
+    fn publish_dns_health_start_failure_surfaces_the_error_as_not_running() {
+        let slot = empty_dns_health();
+        publish_dns_health(
+            &slot,
+            false,
+            None,
+            Some("address already in use".to_string()),
+        );
+
+        let health = slot.read().unwrap().clone().expect("slot must be Some");
+        assert!(!health.running);
+        assert!(!health.tasks_alive);
+        assert_eq!(
+            health.last_sync_error.as_deref(),
+            Some("address already in use"),
+            "a startup failure must be visible to the operator even though it \
+             never reached the sync loop"
+        );
+    }
+
+    #[test]
+    fn dns_resolver_heartbeat_serializes_null_timestamp_when_never_synced() {
+        let health = DnsResolverHeartbeat {
+            running: true,
+            tasks_alive: true,
+            last_sync_success_at: None,
+            consecutive_sync_failures: 0,
+            last_sync_error: None,
+            record_count: 0,
+        };
+        let value = serde_json::to_value(&health).unwrap();
+        assert_eq!(value["running"], serde_json::json!(true));
+        assert_eq!(value["last_sync_success_at"], serde_json::Value::Null);
+        assert_eq!(value["record_count"], serde_json::json!(0));
     }
 }

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Sea-ORM entity for the cross-project trace discovery index (ADR-027 Phase 0).
 //!
 //! Each row records that `project_id` has ingested at least one span belonging

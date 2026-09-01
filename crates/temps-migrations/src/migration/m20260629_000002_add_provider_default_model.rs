@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to add `default_model` to the `ai_provider_keys` table.
 //!
 //! Lets an operator pin which model each connected AI provider serves (e.g. a

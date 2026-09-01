@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { test, expect, describe } from 'bun:test'
 import {
   parseEnabledFlag,
@@ -7,6 +10,7 @@ import {
   buildSlackConfigUpdate,
   buildEmailConfigUpdate,
   buildWebhookConfigUpdate,
+  parseProviderIds,
 } from './index.js'
 
 describe('parseEnabledFlag', () => {
@@ -140,5 +144,23 @@ describe('buildWebhookConfigUpdate', () => {
       headers: {},
       timeout_secs: 30,
     })
+  })
+})
+
+describe('parseProviderIds', () => {
+  test('parses a comma-separated list of IDs', () => {
+    expect(parseProviderIds('1,2,3')).toEqual([1, 2, 3])
+  })
+
+  test('trims whitespace around each ID', () => {
+    expect(parseProviderIds(' 1 , 2 ,3')).toEqual([1, 2, 3])
+  })
+
+  test('ignores empty segments from trailing/duplicate commas', () => {
+    expect(parseProviderIds('1,,2,')).toEqual([1, 2])
+  })
+
+  test('a single ID parses to a one-element array', () => {
+    expect(parseProviderIds('42')).toEqual([42])
   })
 })

@@ -1,4 +1,15 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 FROM alpine:3.22
+
+# `apk add` only installs the packages listed below -- it does not touch
+# packages already present in the base image (busybox, musl, ssl_client),
+# so those stay at whatever patch level was current the day this tag was
+# pulled. Upgrading them explicitly here means a base image security patch
+# (e.g. a musl or busybox CVE fix) lands on the next build, not only on the
+# next manual Alpine version bump.
+RUN apk update && apk upgrade --no-cache
 
 # Install runtime dependencies
 RUN apk add --no-cache \

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-agents"
 version.workspace = true
@@ -43,7 +46,7 @@ http-body-util = { workspace = true }
 tar = "0.4"
 flate2 = { workspace = true }
 walkdir = { workspace = true }
-pulldown-cmark = "0.12"
+pulldown-cmark = "0.13"
 libc = { workspace = true }
 rand = { workspace = true }
 hex = "0.4"

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Typed models for the CapRover REST API (`/api/v2`).
 //!
 //! Field sets captured from a live CapRover instance (July 2026). CapRover

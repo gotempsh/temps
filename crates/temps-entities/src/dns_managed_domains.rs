@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! DNS managed domains entity
 //!
 //! Tracks which domains are managed by which DNS provider.

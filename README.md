@@ -396,6 +396,11 @@ cargo build --release
 
 Dual-licensed under [MIT](LICENSE-MIT) or [Apache 2.0](LICENSE).
 
+Forks and derivative works are welcome, including rebranded and commercial
+distributions. Redistributors must preserve the copyright, license, and
+attribution notices required by the license they choose. See [NOTICE](NOTICE)
+for the project attribution.
+
 [![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE)
 [![GitHub Release](https://img.shields.io/github/v/release/gotempsh/temps)](https://github.com/gotempsh/temps/releases)
 [![Rust](https://img.shields.io/badge/rust-1.70%2B-orange.svg)](https://www.rust-lang.org/)

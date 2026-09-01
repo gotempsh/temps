@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Pipeline validation - demonstrates complete typed workflow without async tests
 //!
 //! This module provides synchronous validation of the complete deployment pipeline

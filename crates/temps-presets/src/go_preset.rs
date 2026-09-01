@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Go preset implementation using autopack
 //!
 //! This preset detects Go projects (go.mod) and uses autopack for building.

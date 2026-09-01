@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Re-export for convenience - consumer modules can just subscribe directly
 pub use temps_core::Job;
 pub use tokio::sync::broadcast;

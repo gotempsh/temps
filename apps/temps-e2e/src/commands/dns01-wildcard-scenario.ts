@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Wildcard-certificate issuance via DNS-01 against a live Temps instance:
  *   1. register a Pebble-backed DNS provider and add + verify a managed zone

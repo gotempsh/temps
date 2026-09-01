@@ -5,6 +5,33 @@ Codex, aider, etc.). The detailed engineering rules live in
 [`CLAUDE.md`](./CLAUDE.md); this file is the short list of process
 conventions that go *around* the code. Read both.
 
+## Add attribution to every new source file
+
+Every new first-party source or commentable configuration file must carry the
+Temps SPDX attribution header, written with the file's comment syntax:
+
+```text
+SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+SPDX-License-Identifier: MIT OR Apache-2.0
+```
+
+Apply it with:
+
+```bash
+python3 scripts/source_attribution.py annotate path/to/file
+```
+
+Before every commit that adds or regenerates source files, run the repository-wide
+check and treat any failure as blocking:
+
+```bash
+python3 scripts/source_attribution.py check
+```
+
+Generated files must receive the same header from their generator or generation
+command so regeneration cannot remove it. Do not replace, remove, or
+misattribute copyright and license notices in third-party files.
+
 ## Do not hand-edit `CHANGELOG.md`
 
 `CHANGELOG.md` is generated from Conventional Commits by
@@ -163,6 +190,32 @@ check. `git revert` defaults to `Revert "original message"`, which is
 not conventional. Never use `git revert --no-edit` and leave it —
 either pass an explicit conventional `-m`, or amend right after.
 
+## DCO Sign-off
+
+Every commit must be signed off (`Signed-off-by: Name <email>` trailer).
+Always use `git commit -s` (and `-s` on `--amend`/`revert`). Like the
+Changelog check, the DCO check validates every commit in `base..HEAD`,
+not just the tip.
+
+This is a mandatory agent pre-commit gate. Never run a plain `git commit`:
+
+```bash
+git commit -s -m "type(scope): description"
+```
+
+If a commit was created without the trailer, repair it before pushing:
+
+```bash
+git commit --amend --no-edit -s
+```
+
+Before opening or updating a PR, verify every commit in the PR range contains
+the trailer. Do not assume the pre-commit hooks add it automatically:
+
+```bash
+git log origin/main..HEAD --format='%h%n%B%n---'
+```
+
 ## Per-record config columns, not env vars
 
 When adding a new runtime knob, default to a column on the relevant
@@ -248,6 +301,32 @@ This applies to the API too: prefer a capability/status endpoint that
 reports `configured: false` with a reason and a setup URL over a 404
 that leaves the client unable to distinguish "not built" from
 "not set up".
+
+## Responsive pagination is a shared UI contract
+
+Use `web/src/components/ui/responsive-pagination.tsx` for paginated web lists
+instead of rebuilding controls at each call site. Below the `sm` breakpoint,
+show one stable row with labeled Previous and Next buttons around compact
+`{page} / {totalPages}` context; hide page-size, first/last, and direct-page
+controls. At `sm` and above, show the full `Showing X–Y of Z` summary and
+advanced controls.
+
+## Never name a real third party in anything that leaves this machine
+
+This repo is **public**. Full rule and examples in
+[`CLAUDE.md` → Critical Rules](./CLAUDE.md#critical-rules); the part agents
+most often miss:
+
+A user handing you a real URL, repo, or account as the **live target of a
+task** ("deploy this: github.com/someone/their-repo") is not permission to
+cite it. It's scratch input, not evidence — it must not end up in test
+comments, fixture data, commit messages, PR titles/descriptions, or issue
+text as an illustrative example. Write the test/PR against a generic
+equivalent ("a repo with no build manifest, just an `index.html`") instead
+of naming the real one, even though the user supplied it themselves and it
+feels like harmless context. Grep your diff and any PR body you write for
+the real name before it leaves this machine — a PR description can't be
+un-published once it reaches GitHub.
 
 ## Don't sweep unrelated dirty files into your commits
 

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Docker Cleanup Service
 //!
 //! Manages nightly cleanup of unused Docker images and build caches to save disk space.
@@ -1090,7 +1093,8 @@ impl DockerCleanupService {
                     }
                     Ok(false) => {} // Already gone
                     Err(e) => {
-                        warn!("Failed to delete orphaned blob {}: {}", &hash[..8], e);
+                        let hash_prefix: String = hash.chars().take(8).collect();
+                        warn!("Failed to delete orphaned blob {}: {}", hash_prefix, e);
                     }
                 }
             }

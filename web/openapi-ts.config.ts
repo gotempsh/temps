@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 // Read TEMPS_API_KEY without depending on @types/node. The openapi-ts
 // CLI runs in node/bun, so `globalThis.process` is always available here;
 // the cast just keeps the editor's TS service happy.

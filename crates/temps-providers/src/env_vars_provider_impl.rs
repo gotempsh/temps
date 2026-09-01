@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! ProjectEnvVarsProvider implementation for ExternalServiceManager.
 //!
 //! Wraps the existing per-project service enumeration and attaches service

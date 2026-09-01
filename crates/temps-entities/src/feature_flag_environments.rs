@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! `SeaORM` Entity for the `feature_flag_environments` table.
 //!
 //! Per-environment override of a [`super::feature_flags`] definition. One row

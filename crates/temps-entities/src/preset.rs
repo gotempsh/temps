@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Preset type definitions and configurations
 //!
 //! Type-safe preset identifiers that map to framework providers

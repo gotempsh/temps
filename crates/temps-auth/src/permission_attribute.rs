@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /// A more elegant solution for permission-based handlers
 ///
 /// Since we can't create true procedural macros without a separate crate,

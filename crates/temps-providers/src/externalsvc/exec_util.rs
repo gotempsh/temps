@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Resilient `docker exec` helpers for backup/restore engines.
 //!
 //! Why this exists: backup engines (WAL-G, pg_dump sidecar, mongodump,

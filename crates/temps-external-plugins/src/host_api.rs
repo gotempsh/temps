@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Serving plugin API calls from the platform's own router.
 //!
 //! A plugin that needs to create a project or start a deployment has two bad

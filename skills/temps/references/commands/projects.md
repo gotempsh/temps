@@ -15,7 +15,7 @@ Manage projects
 - `create` (`new`) - Create a new project (git-based or manual deployment)
 - `show` (`get`) - Show project details
 - `update` (`edit`) - Update project name and description
-- `settings` - Update project settings (slug, attack mode, preview environments, image retention)
+- `settings` - Update project settings (name, slug, attack mode, preview environments, image retention)
 - `git` - Update git repository settings
 - `source` - Show or change how a project is deployed (primary source, and whether it also accepts `drop` uploads)
 - `config` - Update deployment configuration (resources, replicas)
@@ -148,13 +148,14 @@ Update project name and description
 
 ### `projects settings`
 
-Update project settings (slug, attack mode, preview environments, image retention)
+Update project settings (name, slug, attack mode, preview environments, image retention)
 
 **Options:**
 
 | Flag | Description | Default | Required |
 |------|-------------|---------|----------|
 | `-p, --project <project>` | Project slug or ID | - | No |
+| `--name <name>` | Project display name (does not change the URL) | - | No |
 | `--slug <slug>` | Project URL slug | - | No |
 | `--attack-mode` | Enable attack mode (CAPTCHA protection) | - | No |
 | `--no-attack-mode` | Disable attack mode | - | No |

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Docusaurus v2 preset provider
 //!
 //! Detects Docusaurus v2 projects and provides build configuration

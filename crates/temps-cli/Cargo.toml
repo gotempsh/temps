@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 [package]
 name = "temps-cli"
 version.workspace = true
@@ -60,6 +63,7 @@ temps-import = { path = "../temps-import" }
 temps-infra = { path = "../temps-infra" }
 temps-log-aggregator = { path = "../temps-log-aggregator" }
 temps-logs = { path = "../temps-logs" }
+temps-mcp-server = { path = "../temps-mcp-server" }
 temps-migrations = { path = "../temps-migrations" }
 temps-metrics = { path = "../temps-metrics" }
 temps-monitoring = { path = "../temps-monitoring" }
@@ -128,6 +132,7 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 http-body-util = { workspace = true }
 libc = { workspace = true }
+tempfile = { workspace = true }
 
 [target.'cfg(not(target_env = "msvc"))'.dependencies]
 tikv-jemallocator = { workspace = true }
@@ -137,7 +142,6 @@ tikv-jemallocator = { workspace = true }
 # console health router through a single request in unit tests without binding
 # a real listener. Already present transitively; pinned here for test use.
 tower = { workspace = true }
-tempfile = { workspace = true }
 # Only for `tests/plugin_sdk_conformance.rs`: proves the SDK's hand-written
 # endpoint table still matches the handlers this crate assembles into the API.
 temps-plugin-sdk = { path = "../temps-plugin-sdk" }

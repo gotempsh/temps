@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Plugin event listener — subscribes to the job queue and delivers
 //! platform events to external plugins over their Unix domain sockets.
 //!

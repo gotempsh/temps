@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! S3 utilities shared between backup engines and the orchestrator.
 
 use anyhow::{anyhow, Result};

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Real git-triggered deploy against a live Temps instance -- proves the
  * actual git pipeline (clone a public repo, build a subdirectory with a

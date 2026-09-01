@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Mints a bearer API key for an arbitrary user directly from the Rust
  * `temps` binary's own `api-key --database-url=...` subcommand (the same

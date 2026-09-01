@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
 """Protocol types matching the Rust plugin SDK.
 
 Mirrors: crates/temps-core/src/external_plugin/manifest.rs

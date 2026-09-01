@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Partial index on `visitor` scoped to non-crawler rows.
 //!
 //! `idx_visitor_project_last_seen (project_id, last_seen DESC)` (added in

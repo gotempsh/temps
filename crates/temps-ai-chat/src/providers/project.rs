@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! The general project-assistant context provider.
 //!
 //! Unlike the deployment/alert providers (each anchored to one failed entity),

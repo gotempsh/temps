@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Node Registration Handlers
 //!
 //! Internal API endpoints for worker nodes to register with the control plane
@@ -17,7 +20,7 @@ use axum::{
 use sea_orm::{DatabaseConnection, EntityTrait};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
-use temps_auth::{permission_guard, RequireAuth};
+use temps_auth::{permission_guard, require_sensitive_action, RequireAuth};
 use temps_config::ConfigService;
 use tracing::{error, info, warn};
 use utoipa::{OpenApi, ToSchema};
@@ -29,7 +32,7 @@ use crate::services::node_service::{
 };
 use temps_core::problemdetails::{self, Problem};
 use temps_core::AuditContext;
-use temps_core::{AppSettings, PublicHostnameStrategy};
+use temps_core::{AppSettings, PublicHostnameStrategy, SensitiveAction};
 use temps_deployer::ContainerDeployer;
 
 /// App state for node registration handlers
@@ -45,9 +48,10 @@ pub struct NodeAppState {
     pub rate_limiter: Arc<RegistrationRateLimiter>,
     /// Short-lived, single-use node enrollment tokens (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<temps_config::EnrollmentTokenService>,
-    /// Notification pipeline — used to alert operators when a node recovers
-    /// (offline->active on heartbeat). Optional: absent if no provider is wired.
-    pub notification_service: Option<Arc<dyn temps_core::notifications::NotificationService>>,
+    /// Alarm pipeline — used to resolve the node-offline alarm when a node
+    /// recovers (offline->active on heartbeat). Optional: absent if
+    /// `AlarmService` wasn't available when this state was built.
+    pub alarm_service: Option<Arc<temps_monitoring::alarm_service::AlarmService>>,
     /// Audit trail. A node's reported architecture decides where images are
     /// placed, so a change to it is recorded like any other write.
     pub audit_service: Arc<dyn temps_core::AuditLogger>,
@@ -188,6 +192,43 @@ pub struct HeartbeatApiRequest {
     /// `linux/arm64`), read from `docker info` by the agent. Absent from
     /// pre-multi-arch agents; the stored value is then left untouched.
     pub architecture: Option<String>,
+    /// Per-node DNS resolver health (ADR-024), reported by agents new enough
+    /// to have it. `None` means either an older agent binary, or a
+    /// heartbeat that raced before the agent's network-sync loop first
+    /// ran — a true single-host node with no `compute_cidr` allocation
+    /// never touches cluster DNS and always reports `None` here, which is
+    /// expected, not stale data. The stored columns are left untouched when
+    /// `None`, same treatment as `architecture` above.
+    pub dns_resolver: Option<DnsResolverHeartbeat>,
+}
+
+/// Wire DTO for [`HeartbeatApiRequest::dns_resolver`]. Mirrors
+/// `temps_agent::network_sync::DnsResolverHeartbeat` field-for-field, but
+/// declared separately rather than shared: the agent and control-plane
+/// crates don't depend on each other (the agent avoids pulling in
+/// `temps-deployments`' sea-orm dependency tree), matching the existing
+/// `WirePeerListResponse` pattern in `temps-agent::network_sync`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+pub struct DnsResolverHeartbeat {
+    /// `false` when cluster DNS is disabled on the control plane, the
+    /// resolver failed to start, or it was shut down. `true` only while a
+    /// resolver handle currently exists and cluster DNS is enabled.
+    #[serde(default)]
+    pub running: bool,
+    /// `false` means the resolver's sync or DNS server task crashed. Only
+    /// meaningful when `running`.
+    #[serde(default)]
+    pub tasks_alive: bool,
+    #[serde(default)]
+    pub last_sync_success_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default)]
+    pub consecutive_sync_failures: u32,
+    /// Most recent resolver-related error: a sync tick failure, or (when the
+    /// resolver never started at all) the startup error itself.
+    #[serde(default)]
+    pub last_sync_error: Option<String>,
+    #[serde(default)]
+    pub record_count: i64,
 }
 
 /// A container reported by the agent during heartbeat reconciliation.
@@ -344,6 +385,46 @@ pub struct S3CredentialsResponse {
     pub force_path_style: bool,
 }
 
+/// Per-node DNS resolver health, as last reported by that node's heartbeat.
+/// Part of `GET /api/cluster/dns/status`.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct NodeDnsStatusEntry {
+    pub node_id: i32,
+    pub node_name: String,
+    /// The node's own status field (`active`, `offline`, `draining`, …) —
+    /// included so an operator can tell "resolver down" apart from "node
+    /// down" at a glance, without a second request.
+    pub node_status: String,
+    /// `None` = never reported (older agent, or a single-host node that
+    /// never allocates a `compute_cidr` and so never touches cluster DNS).
+    pub dns_resolver_running: Option<bool>,
+    pub dns_resolver_tasks_alive: Option<bool>,
+    pub dns_resolver_last_sync_at: Option<String>,
+    /// Computed from `dns_resolver_last_sync_at` against "now" server-side —
+    /// a raw timestamp makes an operator do the subtraction themselves for
+    /// every node; a staleness age is what actually answers "is this
+    /// healthy right now". `None` when `dns_resolver_last_sync_at` is `None`.
+    pub seconds_since_last_sync: Option<i64>,
+    pub dns_resolver_consecutive_failures: i32,
+    pub dns_resolver_last_error: Option<String>,
+    pub dns_resolver_record_count: Option<i32>,
+}
+
+/// Response from `GET /api/cluster/dns/status`.
+#[derive(Serialize, Deserialize, ToSchema)]
+pub struct ClusterDnsStatusResponse {
+    /// Whether cluster DNS is currently enabled cluster-wide
+    /// (`AppSettings.cluster_dns.enabled`). When `false`, every node's
+    /// per-node values below are expected to show `dns_resolver_running:
+    /// Some(false)` (or `None` if a node has never reported).
+    pub cluster_dns_enabled: bool,
+    /// Total `*.temps.local` records currently registered across the whole
+    /// cluster (`service_endpoints` row count), independent of any single
+    /// node's resolver health.
+    pub total_record_count: i64,
+    pub nodes: Vec<NodeDnsStatusEntry>,
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -358,12 +439,14 @@ pub struct S3CredentialsResponse {
         admin_undrain_node,
         admin_remove_node,
         admin_drain_status,
+        cluster_dns_status,
     ),
     components(schemas(
         RegisterNodeApiRequest,
         RegisterNodeResponse,
         HeartbeatApiRequest,
         HeartbeatResponse,
+        DnsResolverHeartbeat,
         S3CredentialsResponse,
         crate::handlers::network::PeerEntry,
         crate::handlers::network::AllocEntry,
@@ -376,6 +459,8 @@ pub struct S3CredentialsResponse {
         UndrainNodeResponse,
         RemoveNodeResponse,
         DrainStatusResponse,
+        NodeDnsStatusEntry,
+        ClusterDnsStatusResponse,
     )),
     info(
         title = "Node Registration API",
@@ -439,6 +524,7 @@ pub fn configure_admin_routes() -> Router<Arc<AppState>> {
             get(proxy_edge_analytics_timeseries),
         )
         .route("/internal/edge/nodes", get(list_edge_nodes))
+        .route("/cluster/dns/status", get(cluster_dns_status))
 }
 
 /// SHA-256 hash a token string
@@ -489,6 +575,27 @@ fn normalize_reported_platform(reported: Option<&str>) -> Option<String> {
     }
 
     Some(temps_deployer::platform::canonicalize_platform(raw))
+}
+
+/// Convert the wire DTO into the service-layer request, per the three-layer
+/// architecture (handlers never hand their own DTOs to the service layer).
+/// `u32`/`i64` wire counters are clamped rather than rejected when they
+/// exceed the DB's `i32` columns — the counts involved (DNS records on one
+/// node, consecutive sync failures) are nowhere near that range in practice,
+/// and a clamp is a better failure mode for a heartbeat than dropping the
+/// whole report.
+fn dns_resolver_heartbeat_update(
+    wire: DnsResolverHeartbeat,
+) -> crate::services::node_service::DnsResolverHeartbeatUpdate {
+    crate::services::node_service::DnsResolverHeartbeatUpdate {
+        running: wire.running,
+        tasks_alive: wire.tasks_alive,
+        last_sync_success_at: wire.last_sync_success_at,
+        consecutive_sync_failures: i32::try_from(wire.consecutive_sync_failures)
+            .unwrap_or(i32::MAX),
+        last_sync_error: wire.last_sync_error,
+        record_count: i32::try_from(wire.record_count).unwrap_or(i32::MAX),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1182,6 +1289,7 @@ async fn node_heartbeat(
         capacity: request.capacity.unwrap_or(serde_json::json!({})),
         labels: request.labels,
         architecture: normalize_reported_platform(request.architecture.as_deref()),
+        dns_resolver: request.dns_resolver.map(dns_resolver_heartbeat_update),
     };
 
     let architecture_change = app_state
@@ -1223,11 +1331,11 @@ async fn node_heartbeat(
     // active. Alert operators (recovery counterpart to the node-offline alert).
     if was_offline {
         info!(node_id, node_name = %node.name, "Node recovered (offline -> active)");
-        if let Some(ref notification_service) = app_state.notification_service {
+        if let Some(ref alarm_service) = app_state.alarm_service {
             crate::jobs::node_health_check::notify_node_recovered(
                 node_id,
                 &node.name,
-                notification_service,
+                alarm_service,
             )
             .await;
         }
@@ -1865,6 +1973,83 @@ async fn admin_get_node(
     }))
 }
 
+/// Cluster-wide DNS resolver health (ADR-024): whether cluster DNS is
+/// enabled, the total record count, and per-node resolver status as last
+/// reported by each node's heartbeat. Lets an operator answer "is cluster
+/// DNS actually healthy right now" without SSHing into a node to read logs.
+///
+/// Same permission as the other node visibility endpoints in this file
+/// (`admin_list_nodes`, `admin_get_node`) — this is operational/infra
+/// visibility, not a new privilege tier.
+#[utoipa::path(
+    tag = "Nodes",
+    get,
+    path = "/cluster/dns/status",
+    responses(
+        (status = 200, description = "Cluster DNS resolver health", body = ClusterDnsStatusResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn cluster_dns_status(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsRead);
+
+    // Best-effort, matches `list_peers`: a transient settings-read hiccup
+    // must not turn an operational status page into a 500 — default to the
+    // safe-to-display side and let the per-node data (which is unaffected)
+    // still answer the question.
+    let cluster_dns_enabled = match app_state.config_service.get_settings().await {
+        Ok(settings) => settings.cluster_dns.enabled,
+        Err(e) => {
+            warn!(
+                "could not read cluster_dns setting: {}; defaulting to disabled",
+                e
+            );
+            false
+        }
+    };
+
+    let total_record_count = app_state
+        .node_service
+        .total_dns_record_count()
+        .await
+        .map_err(Problem::from)?;
+
+    let nodes = app_state
+        .node_service
+        .list_all()
+        .await
+        .map_err(Problem::from)?;
+
+    let now = chrono::Utc::now();
+    let node_entries = nodes
+        .into_iter()
+        .map(|n| NodeDnsStatusEntry {
+            node_id: n.id,
+            node_name: n.name,
+            node_status: n.status,
+            dns_resolver_running: n.dns_resolver_running,
+            dns_resolver_tasks_alive: n.dns_resolver_tasks_alive,
+            dns_resolver_last_sync_at: n.dns_resolver_last_sync_at.map(|t| t.to_rfc3339()),
+            seconds_since_last_sync: n.dns_resolver_last_sync_at.map(|t| (now - t).num_seconds()),
+            dns_resolver_consecutive_failures: n.dns_resolver_consecutive_failures,
+            dns_resolver_last_error: n.dns_resolver_last_error,
+            dns_resolver_record_count: n.dns_resolver_record_count,
+        })
+        .collect();
+
+    Ok(Json(ClusterDnsStatusResponse {
+        cluster_dns_enabled,
+        total_record_count,
+        nodes: node_entries,
+    }))
+}
+
 /// List all containers running on a specific node
 #[utoipa::path(
     tag = "Nodes",
@@ -2032,6 +2217,13 @@ async fn admin_drain_node(
     Path(node_id): Path<i32>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+    require_sensitive_action(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+        SensitiveAction::DrainNode { node_id },
+    )
+    .await?;
+
     let node = app_state
         .node_service
         .get_by_id(node_id)
@@ -2655,6 +2847,12 @@ impl From<NodeError> for Problem {
                     .with_title("Internal Server Error")
                     .with_detail("An internal error occurred")
             }
+            NodeError::DnsRegistry(ref e) => {
+                error!("DNS registry error in node operation: {}", e);
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Internal Server Error")
+                    .with_detail("An internal error occurred")
+            }
         }
     }
 }
@@ -2687,6 +2885,12 @@ mod tests {
             edge_public_key: None,
             compute_cidr: None,
             underlay_address: None,
+            dns_resolver_running: None,
+            dns_resolver_tasks_alive: None,
+            dns_resolver_last_sync_at: None,
+            dns_resolver_consecutive_failures: 0,
+            dns_resolver_last_error: None,
+            dns_resolver_record_count: None,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         }
@@ -2765,7 +2969,7 @@ mod tests {
             enrollment_token_service: Arc::new(temps_config::EnrollmentTokenService::new(
                 test_db_for_enrollment,
             )),
-            notification_service: None,
+            alarm_service: None,
             audit_service: Arc::new(RecordingAuditLogger::default()),
         });
         // The production router is served with connect info; tests use `oneshot`
@@ -2898,6 +3102,78 @@ mod tests {
             normalize_reported_platform(Some("linux/riscv64")).as_deref(),
             Some("linux/riscv64")
         );
+    }
+
+    #[test]
+    fn test_heartbeat_api_request_deserializes_without_dns_resolver_field() {
+        // Older agent binaries never send `dns_resolver` at all — the field
+        // must default to `None` rather than fail deserialization, same
+        // treatment as every other optional heartbeat field.
+        let json = r#"{"capacity": {"cpu_percent": 10}}"#;
+        let req: HeartbeatApiRequest = serde_json::from_str(json).unwrap();
+        assert!(req.dns_resolver.is_none());
+    }
+
+    #[test]
+    fn test_heartbeat_api_request_deserializes_dns_resolver_field() {
+        let json = r#"{
+            "capacity": {},
+            "dns_resolver": {
+                "running": true,
+                "tasks_alive": false,
+                "last_sync_success_at": null,
+                "consecutive_sync_failures": 3,
+                "last_sync_error": "sync tick failed: connection refused",
+                "record_count": 12
+            }
+        }"#;
+        let req: HeartbeatApiRequest = serde_json::from_str(json).unwrap();
+        let dns = req.dns_resolver.expect("dns_resolver must deserialize");
+        assert!(dns.running);
+        assert!(!dns.tasks_alive);
+        assert!(dns.last_sync_success_at.is_none());
+        assert_eq!(dns.consecutive_sync_failures, 3);
+        assert_eq!(
+            dns.last_sync_error.as_deref(),
+            Some("sync tick failed: connection refused")
+        );
+        assert_eq!(dns.record_count, 12);
+    }
+
+    #[test]
+    fn test_dns_resolver_heartbeat_update_converts_wire_to_service_dto() {
+        let wire = DnsResolverHeartbeat {
+            running: true,
+            tasks_alive: true,
+            last_sync_success_at: None,
+            consecutive_sync_failures: 5,
+            last_sync_error: Some("boom".to_string()),
+            record_count: 100,
+        };
+        let update = dns_resolver_heartbeat_update(wire);
+        assert!(update.running);
+        assert!(update.tasks_alive);
+        assert_eq!(update.consecutive_sync_failures, 5);
+        assert_eq!(update.last_sync_error.as_deref(), Some("boom"));
+        assert_eq!(update.record_count, 100);
+    }
+
+    /// A wire counter that somehow exceeds `i32::MAX` must clamp rather than
+    /// silently wrap or panic — the heartbeat is best-effort telemetry, not
+    /// something worth dropping the whole report over.
+    #[test]
+    fn test_dns_resolver_heartbeat_update_clamps_oversized_counters() {
+        let wire = DnsResolverHeartbeat {
+            running: true,
+            tasks_alive: true,
+            last_sync_success_at: None,
+            consecutive_sync_failures: u32::MAX,
+            last_sync_error: None,
+            record_count: i64::MAX,
+        };
+        let update = dns_resolver_heartbeat_update(wire);
+        assert_eq!(update.consecutive_sync_failures, i32::MAX);
+        assert_eq!(update.record_count, i32::MAX);
     }
 
     #[test]

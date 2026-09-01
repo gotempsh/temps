@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ProjectResponse } from '@/api/client'
 import {
   AlarmClock,
@@ -90,6 +93,12 @@ const settingsGroups: SettingsGroup[] = [
         description: 'Control who can view and change this project.',
         url: 'settings/access',
         icon: Users,
+      },
+      {
+        title: 'Deployment tokens',
+        description: 'Manage API tokens injected into deployed applications.',
+        url: 'settings/deployment-tokens',
+        icon: KeyRound,
       },
     ],
   },

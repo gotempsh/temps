@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! [`TeamProjectAccessChecker`] — the implementation of
 //! [`temps_core::ProjectAccessChecker`] that makes the platform's
 //! project-scoped enforcement seam real.
@@ -74,6 +77,7 @@
 //!   [`MembershipPermissionResolver`] answers, where the set of affected
 //!   `(user, project)` pairs is unbounded.
 
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -123,6 +127,32 @@ pub(crate) enum CheckerError {
         team_member_id: i32,
         user_id: i32,
         project_id: i32,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[error("Failed to query access grants for project batch {project_ids:?}: {source}")]
+    AccessGrantBatchQuery {
+        project_ids: Vec<i32>,
+        source: sea_orm::DbErr,
+    },
+
+    #[error(
+        "Failed to query team memberships for user {user_id} on project batch {project_ids:?}: {source}"
+    )]
+    MembershipBatchQuery {
+        user_id: i32,
+        project_ids: Vec<i32>,
+        source: sea_orm::DbErr,
+    },
+
+    #[error(
+        "A registered MembershipPermissionResolver failed for team member {team_member_id} \
+         (user {user_id}, project batch {project_ids:?}): {source}"
+    )]
+    MembershipBatchResolution {
+        team_member_id: i32,
+        user_id: i32,
+        project_ids: Vec<i32>,
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
@@ -295,6 +325,95 @@ impl TeamProjectAccessChecker {
         Ok(any_membership.is_some())
     }
 
+    /// Batch form of the binary access check for cache misses.
+    ///
+    /// Like the permission batch, this uses at most two database queries:
+    /// one for every missed project's grants and one for the user's live
+    /// memberships on the union of granted teams.
+    async fn check_access_batch(
+        &self,
+        user_id: i32,
+        project_ids: &[i32],
+    ) -> Result<BTreeMap<i32, bool>, CheckerError> {
+        let mut unique_project_ids = project_ids.to_vec();
+        unique_project_ids.sort_unstable();
+        unique_project_ids.dedup();
+
+        let mut access = BTreeMap::new();
+        let mut misses = Vec::new();
+        for project_id in unique_project_ids {
+            let cache_key = (user_id, project_id);
+            if let Some(cached) = self.cache.get(&cache_key).await {
+                access.insert(project_id, cached);
+            } else {
+                misses.push(project_id);
+            }
+        }
+
+        if misses.is_empty() {
+            return Ok(access);
+        }
+
+        let grants = project_team_access::Entity::find()
+            .filter(project_team_access::Column::ProjectId.is_in(misses.clone()))
+            .all(self.db.as_ref())
+            .await
+            .map_err(|source| CheckerError::AccessGrantBatchQuery {
+                project_ids: misses.clone(),
+                source,
+            })?;
+
+        let mut grants_by_project: BTreeMap<i32, Vec<project_team_access::Model>> = BTreeMap::new();
+        let mut granted_team_ids = Vec::new();
+        for grant in grants {
+            granted_team_ids.push(grant.team_id);
+            grants_by_project
+                .entry(grant.project_id)
+                .or_default()
+                .push(grant);
+        }
+        granted_team_ids.sort_unstable();
+        granted_team_ids.dedup();
+
+        let member_team_ids: HashSet<i32> = if granted_team_ids.is_empty() {
+            HashSet::new()
+        } else {
+            team_members::Entity::find()
+                .filter(team_members::Column::UserId.eq(user_id))
+                .filter(team_members::Column::TeamId.is_in(granted_team_ids))
+                .inner_join(users::Entity)
+                .filter(users::Column::DeletedAt.is_null())
+                .all(self.db.as_ref())
+                .await
+                .map_err(|source| CheckerError::MembershipBatchQuery {
+                    user_id,
+                    project_ids: misses.clone(),
+                    source,
+                })?
+                .into_iter()
+                .map(|membership| membership.team_id)
+                .collect()
+        };
+
+        for project_id in &misses {
+            let allowed = match grants_by_project.get(project_id) {
+                Some(project_grants) => project_grants
+                    .iter()
+                    .any(|grant| member_team_ids.contains(&grant.team_id)),
+                None => true,
+            };
+            access.insert(*project_id, allowed);
+        }
+
+        for project_id in misses {
+            if let Some(allowed) = access.get(&project_id) {
+                self.cache.insert((user_id, project_id), *allowed).await;
+            }
+        }
+
+        Ok(access)
+    }
+
     /// Gated projects `user_id` is not a member of any granted team for.
     ///
     /// Deliberately uncached: it runs once per project-list request (not
@@ -410,6 +529,150 @@ impl TeamProjectAccessChecker {
         .await
         .map(Some)
     }
+
+    /// Batch permission resolution for cache misses.
+    ///
+    /// The database cost is bounded at two queries regardless of project
+    /// count: one grant query, followed (when at least one grant exists) by
+    /// one live-membership query covering every relevant team. Resolver
+    /// calls remain per unique membership because that extension point is
+    /// intentionally membership-scoped.
+    async fn check_permissions_batch(
+        &self,
+        user_id: i32,
+        project_ids: &[i32],
+    ) -> Result<BTreeMap<i32, Option<Vec<String>>>, CheckerError> {
+        let mut unique_project_ids = project_ids.to_vec();
+        unique_project_ids.sort_unstable();
+        unique_project_ids.dedup();
+
+        let mut permissions = BTreeMap::new();
+        let mut misses = Vec::new();
+
+        for project_id in unique_project_ids {
+            let cache_key = (user_id, project_id);
+            if let Some(cached) = self.permissions_cache.get(&cache_key).await {
+                permissions.insert(project_id, cached);
+            } else {
+                misses.push(project_id);
+            }
+        }
+
+        if misses.is_empty() {
+            return Ok(permissions);
+        }
+
+        let grants = project_team_access::Entity::find()
+            .filter(project_team_access::Column::ProjectId.is_in(misses.clone()))
+            .all(self.db.as_ref())
+            .await
+            .map_err(|source| CheckerError::AccessGrantBatchQuery {
+                project_ids: misses.clone(),
+                source,
+            })?;
+
+        let mut grants_by_project: BTreeMap<i32, Vec<project_team_access::Model>> = BTreeMap::new();
+        let mut granted_team_ids = Vec::new();
+        for grant in grants {
+            granted_team_ids.push(grant.team_id);
+            grants_by_project
+                .entry(grant.project_id)
+                .or_default()
+                .push(grant);
+        }
+        granted_team_ids.sort_unstable();
+        granted_team_ids.dedup();
+
+        let memberships = if granted_team_ids.is_empty() {
+            Vec::new()
+        } else {
+            team_members::Entity::find()
+                .filter(team_members::Column::UserId.eq(user_id))
+                .filter(team_members::Column::TeamId.is_in(granted_team_ids))
+                .inner_join(users::Entity)
+                .filter(users::Column::DeletedAt.is_null())
+                .all(self.db.as_ref())
+                .await
+                .map_err(|source| CheckerError::MembershipBatchQuery {
+                    user_id,
+                    project_ids: misses.clone(),
+                    source,
+                })?
+        };
+
+        let mut resolved_member_sides = HashMap::new();
+        let mut resolved_membership_ids = HashSet::new();
+        for membership in &memberships {
+            if !resolved_membership_ids.insert(membership.id) {
+                continue;
+            }
+
+            let member_side =
+                match resolve_member_side(self.membership_resolver(), membership).await {
+                    Ok(Some(perms)) => perms,
+                    Ok(None) => fixed_role_permissions_or_empty(&membership.role),
+                    Err(source) => {
+                        let affected_project_ids = grants_by_project
+                            .iter()
+                            .filter_map(|(project_id, project_grants)| {
+                                project_grants
+                                    .iter()
+                                    .any(|grant| grant.team_id == membership.team_id)
+                                    .then_some(*project_id)
+                            })
+                            .collect();
+                        return Err(CheckerError::MembershipBatchResolution {
+                            team_member_id: membership.id,
+                            user_id,
+                            project_ids: affected_project_ids,
+                            source,
+                        });
+                    }
+                };
+
+            resolved_member_sides.insert(membership.id, member_side);
+        }
+
+        let member_team_ids: HashSet<i32> = memberships
+            .iter()
+            .map(|membership| membership.team_id)
+            .collect();
+        let mut coarse_access = BTreeMap::new();
+
+        // Resolve every miss before populating the cache. An infrastructure
+        // or resolver error above therefore fails the whole batch without
+        // leaving a partially refreshed set of entries behind.
+        for project_id in &misses {
+            let (resolved, allowed) = match grants_by_project.get(project_id) {
+                Some(project_grants) => (
+                    Some(permissions_from_resolved_memberships(
+                        project_grants,
+                        &memberships,
+                        &resolved_member_sides,
+                    )),
+                    project_grants
+                        .iter()
+                        .any(|grant| member_team_ids.contains(&grant.team_id)),
+                ),
+                None => (None, true),
+            };
+            permissions.insert(*project_id, resolved);
+            coarse_access.insert(*project_id, allowed);
+        }
+
+        for project_id in misses {
+            if let Some(resolved) = permissions.get(&project_id) {
+                self.permissions_cache
+                    .insert((user_id, project_id), resolved.clone())
+                    .await;
+            }
+            if let Some(allowed) = coarse_access.get(&project_id) {
+                self.cache.insert((user_id, project_id), *allowed).await;
+            }
+        }
+
+        Ok(permissions)
+    }
 }
 
 /// Resolves what `user_id` may do on `project_id`, given that project's
@@ -465,16 +728,9 @@ pub(crate) async fn permissions_from_grants<C: ConnectionTrait>(
         return Ok(Vec::new());
     }
 
-    let mut effective: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut resolved_member_sides = HashMap::new();
 
     for membership in &memberships {
-        // Every membership.team_id came from granted_team_ids, which was
-        // built from these exact grants, so a missing match is impossible
-        // — but resolve it without panicking anyway.
-        let Some(grant) = grants.iter().find(|g| g.team_id == membership.team_id) else {
-            continue;
-        };
-
         // What the member's own role contributes. A registered resolver
         // may replace this half; the grant half below still applies.
         let member_side: Vec<Permission> = match resolve_member_side(resolver, membership).await {
@@ -490,23 +746,56 @@ pub(crate) async fn permissions_from_grants<C: ConnectionTrait>(
             }
         };
 
+        resolved_member_sides.insert(membership.id, member_side);
+    }
+
+    Ok(permissions_from_resolved_memberships(
+        grants,
+        &memberships,
+        &resolved_member_sides,
+    ))
+}
+
+/// Applies each project's grant ceiling to already-resolved membership
+/// permissions, then unions the surviving permissions across teams.
+///
+/// Keeping this calculation shared ensures the single-project and batch
+/// paths have identical narrowing semantics. The member-side map is keyed
+/// by membership id because an optional resolver answers per membership,
+/// not per team or project.
+fn permissions_from_resolved_memberships(
+    grants: &[project_team_access::Model],
+    memberships: &[team_members::Model],
+    resolved_member_sides: &HashMap<i32, Vec<Permission>>,
+) -> Vec<String> {
+    let mut effective = HashSet::new();
+
+    for membership in memberships {
+        // Every relevant membership.team_id should have come from these
+        // grants. Treat any mismatch or missing resolution as contributing
+        // nothing rather than widening access.
+        let Some(grant) = grants.iter().find(|g| g.team_id == membership.team_id) else {
+            continue;
+        };
+        let Some(member_side) = resolved_member_sides.get(&membership.id) else {
+            continue;
+        };
+
         // The team's grant on this project is a hard ceiling: whatever the
         // member's side says, they cannot exceed what their team was
         // actually granted here.
-        let grant_side: std::collections::HashSet<Permission> =
-            fixed_role_permissions_or_empty(&grant.role)
-                .into_iter()
-                .collect();
+        let grant_side: HashSet<Permission> = fixed_role_permissions_or_empty(&grant.role)
+            .into_iter()
+            .collect();
 
-        effective.extend(
-            member_side
-                .into_iter()
-                .filter(|p| grant_side.contains(p))
-                .map(|p| p.to_string()),
-        );
+        effective.extend(member_side.iter().filter_map(|permission| {
+            grant_side
+                .contains(permission)
+                .then_some(permission.to_string())
+        }));
     }
 
-    Ok(effective.into_iter().collect())
+    effective.into_iter().collect()
 }
 
 /// Asks a registered [`MembershipPermissionResolver`], if any, what this
@@ -591,6 +880,16 @@ impl ProjectAccessChecker for TeamProjectAccessChecker {
         Ok(allowed)
     }
 
+    async fn user_can_access_projects(
+        &self,
+        user_id: i32,
+        project_ids: &[i32],
+    ) -> Result<BTreeMap<i32, bool>, Box<dyn std::error::Error + Send + Sync>> {
+        self.check_access_batch(user_id, project_ids)
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
+    }
+
     async fn hidden_project_ids(
         &self,
         user_id: i32,
@@ -624,6 +923,16 @@ impl ProjectAccessChecker for TeamProjectAccessChecker {
             .await;
 
         Ok(resolved)
+    }
+
+    async fn effective_project_permissions_batch(
+        &self,
+        user_id: i32,
+        project_ids: &[i32],
+    ) -> Result<BTreeMap<i32, Option<Vec<String>>>, Box<dyn std::error::Error + Send + Sync>> {
+        self.check_permissions_batch(user_id, project_ids)
+            .await
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync>)
     }
 
     fn invalidate_permissions_cache(&self) {
@@ -1123,6 +1432,81 @@ mod tests {
         let checker = new_checker(db);
 
         assert!(checker.effective_project_permissions(1, 42).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_effective_permissions_batch_cold_dedupes_uses_two_queries_and_caches() {
+        // Arrange: project 1 is unrestricted, project 2 grants viewer access
+        // to the caller, and project 3 is gated to another team.
+        let grants = vec![
+            grant_with_role(2, 10, "viewer"),
+            grant_with_role(3, 20, "admin"),
+        ];
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![grants])
+                .append_query_results(vec![vec![member_with_role(10, 1, "viewer")]])
+                .into_connection(),
+        );
+        let checker = TeamProjectAccessChecker::new(db.clone());
+
+        // Act: duplicate, unsorted ids must be resolved once. The second call
+        // has no queued DB results and therefore proves the batch cache hit.
+        let first = checker
+            .effective_project_permissions_batch(1, &[3, 1, 2, 3, 2])
+            .await
+            .expect("cold batch should resolve");
+        let second = checker
+            .effective_project_permissions_batch(1, &[1, 2, 3])
+            .await
+            .expect("warm batch should use cache");
+
+        // Assert.
+        assert_eq!(first, second);
+        assert_eq!(first.keys().copied().collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert_eq!(first.get(&1), Some(&None));
+        let project_two = first
+            .get(&2)
+            .and_then(Option::as_ref)
+            .expect("project 2 must have explicit permissions");
+        assert!(project_two.contains(&Permission::BackupsRead.to_string()));
+        assert!(!project_two.contains(&Permission::BackupsCreate.to_string()));
+        assert_eq!(first.get(&3), Some(&Some(Vec::new())));
+
+        drop(checker);
+        let statements = Arc::try_unwrap(db)
+            .expect("checker dropped, leaving one DB reference")
+            .into_transaction_log();
+        assert_eq!(
+            statements.len(),
+            2,
+            "cold permission batch is bounded to two queries"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_effective_permissions_batch_no_grants_uses_one_query() {
+        // Arrange.
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![Vec::<project_team_access::Model>::new()])
+                .into_connection(),
+        );
+        let checker = TeamProjectAccessChecker::new(db.clone());
+
+        // Act.
+        let permissions = checker
+            .effective_project_permissions_batch(1, &[9, 7, 9])
+            .await
+            .expect("unrestricted batch should resolve");
+
+        // Assert.
+        assert_eq!(permissions, BTreeMap::from([(7, None), (9, None)]));
+        drop(checker);
+        let statements = Arc::try_unwrap(db)
+            .expect("checker dropped, leaving one DB reference")
+            .into_transaction_log();
+        assert_eq!(statements.len(), 1, "no grants must skip membership lookup");
     }
 
     /// A registered resolver replaces the *membership* half of the

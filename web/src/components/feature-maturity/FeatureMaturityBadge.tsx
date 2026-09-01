@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import { ExternalLink } from 'lucide-react'
 import { useFeatureMaturity } from '@/hooks/useFeatureMaturity'
 import { BETA_TOOLTIP, EXPERIMENTAL_TOOLTIP } from '@/lib/feature-maturity'

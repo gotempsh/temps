@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Setup command for initial Temps configuration
 //!
 //! This command provisions the necessary components to run Temps:
@@ -16,9 +19,10 @@ use rustls::crypto::CryptoProvider;
 use sea_orm::{ActiveModelTrait, ColumnTrait, EntityTrait, QueryFilter, Set};
 use std::fs;
 use std::io::{self, Write};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use temps_auth::UserService;
-use temps_core::{AppSettings, EncryptionService};
+use temps_core::{url_validation::validate_ipv4, AppSettings, EncryptionService};
 use temps_dns::providers::credentials::{
     AzureCredentials, CloudflareCredentials, DigitalOceanCredentials, GcpCredentials,
     ProviderCredentials, Route53Credentials,
@@ -92,7 +96,10 @@ pub struct SetupCommand {
     pub admin_password: Option<String>,
 
     /// Wildcard domain pattern for SSL certificate (e.g., "*.app.example.com")
-    /// Auto-generated from public IP via sslip.io when --auto is used
+    /// When omitted, defaults to a sslip.io domain generated from the
+    /// detected server IP (e.g. "*.203-0-113-42.sslip.io"), with no DNS
+    /// provider required. Public IPs use on-demand Let's Encrypt TLS when a
+    /// deliverable admin or --letsencrypt-email contact is available.
     #[arg(long)]
     pub wildcard_domain: Option<String>,
 
@@ -227,9 +234,10 @@ pub struct SetupCommand {
     #[arg(long, default_value = "false")]
     pub skip_geolite2_download: bool,
 
-    /// Fully automatic setup: auto-detect public IP, use sslip.io for instant DNS,
-    /// skip SSL/DNS, generate admin credentials. Zero prompts required.
-    /// Use this for quick setup without a custom domain — add a real domain later.
+    /// Fully automatic setup: skip all prompts, generate admin credentials,
+    /// and (like the sslip.io domain default above) skip SSL/DNS-provider
+    /// setup even if --wildcard-domain is explicitly given. Zero prompts
+    /// required. Use this for unattended/scripted installs.
     #[arg(long, default_value = "false")]
     pub auto: bool,
 }
@@ -1357,20 +1365,7 @@ async fn update_app_settings(
         }
     }
 
-    // ADR-018 §6: auto-enable on-demand HTTP-01 TLS for any publicly-reachable
-    // install. Every app/console host under the base domain
-    // (`<app>.<preview_domain>`) then gets HTTPS via per-host HTTP-01 issued
-    // lazily on first request, with the base domain as the allowlist zone. This
-    // is not specific to sslip.io — it applies equally to a real wildcard domain
-    // (e.g. `apps.example.com`). The only case we skip is loopback / local mode
-    // (`127.0.0.1.sslip.io`, `localhost`), where Let's Encrypt cannot reach the
-    // box for the challenge so issuance could never succeed. The proxy applies
-    // its own authoritative loopback guard at startup regardless; this just
-    // avoids advertising a feature that can never fire in local mode.
-    if !preview_domain.trim().is_empty() && !is_loopback_zone(preview_domain) {
-        app_settings.on_demand_tls.enabled = true;
-        app_settings.on_demand_tls.zone = Some(preview_domain.trim().to_ascii_lowercase());
-    }
+    configure_on_demand_tls(&mut app_settings, preview_domain);
 
     // Mark setup as complete so the web onboarding wizard knows to skip
     // itself — prevents the "Configure Base Domain" wall from appearing
@@ -1405,8 +1400,95 @@ async fn update_app_settings(
     Ok(())
 }
 
+fn completed_preview_domain(app_settings: &AppSettings) -> Option<String> {
+    let preview_domain = app_settings.preview_domain.trim();
+    if preview_domain.is_empty() {
+        return None;
+    }
+
+    // `setup_complete` was added after preview-domain setup already shipped.
+    // A legacy row therefore has `false` from serde(default) even though a
+    // non-default domain is active and must not be overwritten implicitly.
+    let is_legacy_default =
+        !app_settings.setup_complete && preview_domain == AppSettings::default().preview_domain;
+    (!is_legacy_default).then(|| preview_domain.to_string())
+}
+
+async fn load_existing_app_settings(
+    db: &sea_orm::DatabaseConnection,
+) -> anyhow::Result<Option<AppSettings>> {
+    let Some(existing) = settings::Entity::find_by_id(1).one(db).await? else {
+        return Ok(None);
+    };
+    Ok(Some(AppSettings::from_json(existing.data)))
+}
+
+fn normalize_acme_contact_email(email: &str) -> Option<String> {
+    let normalized = email.trim().to_ascii_lowercase();
+    if normalized.is_empty()
+        || normalized.len() > 254
+        || normalized.chars().any(char::is_whitespace)
+        || normalized.chars().any(char::is_control)
+    {
+        return None;
+    }
+
+    let (local, domain) = normalized.split_once('@')?;
+    if local.is_empty()
+        || local.len() > 64
+        || local.starts_with('.')
+        || local.ends_with('.')
+        || local.contains("..")
+        || domain.is_empty()
+        || domain.contains('@')
+        || domain.starts_with('.')
+        || domain.ends_with('.')
+    {
+        return None;
+    }
+
+    let labels: Vec<_> = domain.split('.').collect();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        })
+    {
+        return None;
+    }
+
+    Some(normalized)
+}
+
+/// Configure on-demand HTTP-01 TLS only when certificate issuance can work.
+///
+/// A public zone without an ACME contact is not a partially configured state:
+/// every issuance is guaranteed to fail. Keep the feature disabled until setup
+/// has persisted a contact, and clear stale state when setup is re-run in local
+/// mode or without one.
+fn configure_on_demand_tls(app_settings: &mut AppSettings, preview_domain: &str) {
+    let zone = preview_domain.trim();
+    let has_acme_contact = app_settings
+        .letsencrypt
+        .email
+        .as_deref()
+        .and_then(normalize_acme_contact_email)
+        .is_some();
+    let sslip_ip_is_public =
+        sslip_ipv4_from_zone(zone).is_none_or(|address| validate_ipv4(&address).is_ok());
+    let can_issue =
+        !zone.is_empty() && !is_loopback_zone(zone) && sslip_ip_is_public && has_acme_contact;
+
+    app_settings.on_demand_tls.enabled = can_issue;
+    app_settings.on_demand_tls.zone = can_issue.then(|| zone.to_ascii_lowercase());
+}
+
 /// Extract preview domain (base domain) from wildcard domain
-/// e.g., "*.davidviejo.kfs.es" -> "davidviejo.kfs.es"
+/// e.g., "*.apps.example.com" -> "apps.example.com"
 fn extract_preview_domain(wildcard_domain: &str) -> String {
     wildcard_domain.trim_start_matches("*.").to_string()
 }
@@ -1439,8 +1521,32 @@ fn extract_preview_domain(wildcard_domain: &str) -> String {
 ///
 /// Note: IPv4 only. sslip.io spells IPv6 with dashes for `:` and this does not
 /// handle that — pre-existing, and `--wildcard-domain` remains the escape hatch.
-fn sslip_domain_for(ip: &str) -> String {
-    format!("{}.sslip.io", ip.replace('.', "-"))
+fn sslip_domain_for(ip: &str) -> anyhow::Result<String> {
+    let address = ip.parse::<Ipv4Addr>().map_err(|error| {
+        anyhow::anyhow!(
+            "Cannot generate a sslip.io domain from server IP '{ip}': {error}. \
+             Automatic domains currently require IPv4; provide --server-ip with a valid IPv4 \
+             address or use an explicit --wildcard-domain."
+        )
+    })?;
+    Ok(format!(
+        "{}.sslip.io",
+        address.to_string().replace('.', "-")
+    ))
+}
+
+fn sslip_ipv4_from_zone(zone: &str) -> Option<Ipv4Addr> {
+    let encoded = zone
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+        .strip_suffix(".sslip.io")?
+        .to_string();
+
+    encoded
+        .parse()
+        .ok()
+        .or_else(|| encoded.replace('-', ".").parse().ok())
 }
 
 fn is_loopback_zone(zone: &str) -> bool {
@@ -1463,6 +1569,52 @@ fn is_loopback_zone(zone: &str) -> bool {
 }
 
 impl SetupCommand {
+    fn apply_auto_defaults(&mut self) {
+        self.non_interactive = true;
+        self.skip_ssl = true;
+        self.skip_dns_records = true;
+        self.skip_git = true;
+
+        if self.admin_email.is_none() {
+            self.admin_email = Some("admin@localhost".to_string());
+        }
+    }
+
+    fn apply_sslip_domain_defaults(&mut self, ip: String, sslip_domain: &str) {
+        self.wildcard_domain = Some(format!("*.{sslip_domain}"));
+        self.server_ip = Some(ip);
+        self.skip_ssl = true;
+        self.skip_dns_records = true;
+
+        if self.external_url.is_none() {
+            self.external_url = Some(format!("http://{sslip_domain}"));
+        }
+    }
+
+    fn resolve_acme_contact(
+        &mut self,
+        admin_email: &str,
+        existing_email: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if let Some(explicit_email) = self.letsencrypt_email.as_deref() {
+            self.letsencrypt_email = Some(
+                normalize_acme_contact_email(explicit_email).ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--letsencrypt-email must be a deliverable email address with a public domain"
+                    )
+                })?,
+            );
+            return Ok(());
+        }
+
+        // Preserve a previously configured contact on reruns. Only infer from
+        // the admin identity for a fresh/legacy install that has none.
+        self.letsencrypt_email = existing_email
+            .and_then(normalize_acme_contact_email)
+            .or_else(|| normalize_acme_contact_email(admin_email));
+        Ok(())
+    }
+
     pub fn execute(mut self) -> anyhow::Result<()> {
         print_header();
 
@@ -1474,62 +1626,26 @@ impl SetupCommand {
             print_success("Auto mode enabled - detecting configuration...");
 
             // Auto implies non-interactive, skip-ssl, skip-dns-records, skip-git
-            self.non_interactive = true;
-            self.skip_ssl = true;
-            self.skip_dns_records = true;
-            self.skip_git = true;
-
-            // Auto-detect public IP and generate sslip.io domain
-            if self.wildcard_domain.is_none() {
-                let rt_tmp = tokio::runtime::Runtime::new()?;
-                let ip = match rt_tmp.block_on(detect_public_ip()) {
-                    Ok(ip) => {
-                        print_success(&format!("Detected public IP: {}", ip.bright_cyan()));
-                        ip
-                    }
-                    Err(_) => {
-                        // Fallback to private IP or localhost
-                        let ip = detect_private_ip().unwrap_or_else(|| "127.0.0.1".to_string());
-                        print_success(&format!(
-                            "Using IP: {} (public IP detection failed)",
-                            ip.bright_cyan()
-                        ));
-                        ip
-                    }
-                };
-                let sslip_domain = sslip_domain_for(&ip);
-                print_success(&format!(
-                    "Using sslip.io domain: {}",
-                    format!("*.{}", sslip_domain).bright_cyan()
-                ));
-                self.wildcard_domain = Some(format!("*.{}", sslip_domain));
-                self.server_ip = Some(ip.clone());
-
-                // Set external URL for HTTP access
-                if self.external_url.is_none() {
-                    self.external_url = Some(format!("http://{}", sslip_domain));
-                }
-            }
-
-            // Default admin email
-            if self.admin_email.is_none() {
-                self.admin_email = Some("admin@localhost".to_string());
-            }
+            // regardless of domain — even `--auto --wildcard-domain
+            // example.com` should skip the DNS-provider/manual-cert flow, since
+            // the whole point of --auto is a zero-prompt install.
+            self.apply_auto_defaults();
 
             println!();
         }
 
-        // Validate required fields (after auto-resolution)
+        // Validate the admin identity before making network calls to derive a
+        // default domain. The admin email is also setup's established default
+        // ACME contact (and is documented as such); persist it explicitly so
+        // the on-demand TLS manager has the contact it requires. The generated
+        // --auto placeholder is deliberately excluded because it is not a
+        // deliverable Let's Encrypt contact.
         let admin_email = self.admin_email.clone().ok_or_else(|| {
             anyhow::anyhow!(
                 "--admin-email is required. Use --auto for automatic setup with defaults."
             )
         })?;
-        let wildcard_domain = self.wildcard_domain.clone().ok_or_else(|| {
-            anyhow::anyhow!(
-                "--wildcard-domain is required. Use --auto to auto-generate from public IP via sslip.io."
-            )
-        })?;
+        let domain_was_defaulted = self.wildcard_domain.is_none();
 
         // Get data directory
         let data_dir = get_data_dir(&self.data_dir)?;
@@ -1635,6 +1751,85 @@ impl SetupCommand {
             }
         };
         print_success("Database connected and migrations applied");
+
+        let existing_app_settings = rt.block_on(load_existing_app_settings(db.as_ref()))?;
+        self.resolve_acme_contact(
+            &admin_email,
+            existing_app_settings
+                .as_ref()
+                .and_then(|settings| settings.letsencrypt.email.as_deref()),
+        )?;
+
+        // A missing domain is a convenience for first-time setup, not consent
+        // to replace an existing installation's routing. Require the operator
+        // to repeat the current domain (or provide a new one) explicitly when
+        // setup has already completed.
+        if domain_was_defaulted {
+            if let Some(existing_domain) = existing_app_settings
+                .as_ref()
+                .and_then(completed_preview_domain)
+            {
+                return Err(anyhow::anyhow!(
+                    "Setup is already configured with preview domain '{existing_domain}'. \
+                     Re-run with --wildcard-domain '*.{existing_domain}' to keep it, or provide \
+                     the new wildcard domain explicitly."
+                ));
+            }
+        }
+
+        // sslip.io is the first-install fallback whenever no wildcard domain
+        // was given, independent of --auto. It requires neither a DNS provider
+        // nor eager wildcard-certificate ordering; public addresses use
+        // on-demand HTTP-01, while private addresses remain explicitly local.
+        if self.wildcard_domain.is_none() {
+            print_section("Domain");
+            let ip = if let Some(ip) = self.server_ip.clone() {
+                print_success(&format!("Using configured server IP: {}", ip.bright_cyan()));
+                ip
+            } else {
+                match rt.block_on(detect_public_ip()) {
+                    Ok(ip) => {
+                        print_success(&format!("Detected public IP: {}", ip.bright_cyan()));
+                        ip
+                    }
+                    Err(_) => {
+                        // A private fallback is useful for local/LAN installs,
+                        // but it is not reachable by public ACME validators.
+                        let ip = detect_private_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+                        print_success(&format!(
+                            "Using IP: {} (public IP detection failed)",
+                            ip.bright_cyan()
+                        ));
+                        ip
+                    }
+                }
+            };
+            let sslip_domain = sslip_domain_for(&ip)?;
+            print_success(&format!(
+                "No --wildcard-domain given — defaulting to sslip.io: {}",
+                format!("*.{sslip_domain}").bright_cyan()
+            ));
+            print_warning(
+                "The generated hostname uses the third-party sslip.io DNS service and is \
+                 intended for quick-start use. Configure your own wildcard domain for production.",
+            );
+            if sslip_ipv4_from_zone(&sslip_domain)
+                .is_some_and(|address| validate_ipv4(&address).is_err())
+            {
+                print_warning(
+                    "The generated domain points to a private or reserved IP. \
+                     This is an HTTP-only local/LAN setup; public on-demand TLS is disabled.",
+                );
+            }
+            self.apply_sslip_domain_defaults(ip, &sslip_domain);
+            println!();
+        }
+
+        let wildcard_domain = self.wildcard_domain.clone().ok_or_else(|| {
+            anyhow::anyhow!(
+                "internal error: wildcard_domain must be set explicitly or defaulted to sslip.io"
+            )
+        })?;
 
         // Initialize roles (admin, user)
         print_section("Initializing Roles");
@@ -3002,6 +3197,17 @@ fn finish_setup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    fn parse_setup(extra_args: &[&str]) -> Box<SetupCommand> {
+        let mut args = vec!["temps", "setup", "--database-url", "postgres://example"];
+        args.extend_from_slice(extra_args);
+        let cli = crate::Cli::try_parse_from(args).expect("setup arguments should parse");
+        let crate::Commands::Setup(command) = cli.command else {
+            panic!("expected setup command");
+        };
+        command
+    }
 
     #[test]
     fn repository_scoped_github_token_does_not_require_user_identity() {
@@ -3092,12 +3298,186 @@ mod tests {
     /// party — so the behaviour needs an assertion, not just a comment.
     #[test]
     fn sslip_domain_uses_the_dashed_ip_spelling() {
-        assert_eq!(sslip_domain_for("127.0.0.1"), "127-0-0-1.sslip.io");
-        assert_eq!(sslip_domain_for("203.0.113.42"), "203-0-113-42.sslip.io");
+        assert_eq!(
+            sslip_domain_for("127.0.0.1").expect("IPv4 should produce a domain"),
+            "127-0-0-1.sslip.io"
+        );
+        assert_eq!(
+            sslip_domain_for("203.0.113.42").expect("IPv4 should produce a domain"),
+            "203-0-113-42.sslip.io"
+        );
         // The generated base must stay loopback-detectable, or `temps setup`
         // would advertise on-demand TLS for a zone Let's Encrypt can't reach.
-        assert!(is_loopback_zone(&sslip_domain_for("127.0.0.1")));
-        assert!(!is_loopback_zone(&sslip_domain_for("203.0.113.42")));
+        assert!(is_loopback_zone(
+            &sslip_domain_for("127.0.0.1").expect("IPv4 should produce a domain")
+        ));
+        assert!(!is_loopback_zone(
+            &sslip_domain_for("203.0.113.42").expect("IPv4 should produce a domain")
+        ));
+        assert!(sslip_domain_for("2001:db8::1")
+            .expect_err("IPv6 should require an explicit wildcard domain")
+            .to_string()
+            .contains("currently require IPv4"));
+    }
+
+    #[test]
+    fn missing_domain_defaults_to_sslip_without_dns_or_eager_ssl() {
+        let mut command = parse_setup(&[
+            "--admin-email",
+            "admin@example.com",
+            "--server-ip",
+            "203.0.113.42",
+            "--external-url",
+            "https://console.example.com",
+        ]);
+
+        command.apply_sslip_domain_defaults("203.0.113.42".to_string(), "203-0-113-42.sslip.io");
+
+        assert_eq!(
+            command.wildcard_domain.as_deref(),
+            Some("*.203-0-113-42.sslip.io")
+        );
+        assert_eq!(command.server_ip.as_deref(), Some("203.0.113.42"));
+        assert!(command.skip_ssl);
+        assert!(command.skip_dns_records);
+        assert_eq!(
+            command.external_url.as_deref(),
+            Some("https://console.example.com"),
+            "an explicit external URL must not be overwritten"
+        );
+    }
+
+    #[test]
+    fn sslip_defaults_set_the_http_external_url_when_it_is_absent() {
+        let mut command = parse_setup(&[
+            "--admin-email",
+            "admin@example.com",
+            "--server-ip",
+            "1.1.1.1",
+        ]);
+
+        command.apply_sslip_domain_defaults("1.1.1.1".to_string(), "1-1-1-1.sslip.io");
+
+        assert_eq!(command.server_ip.as_deref(), Some("1.1.1.1"));
+        assert_eq!(
+            command.external_url.as_deref(),
+            Some("http://1-1-1-1.sslip.io")
+        );
+    }
+
+    #[test]
+    fn auto_defaults_do_not_replace_an_explicit_domain() {
+        let mut command = parse_setup(&[
+            "--auto",
+            "--wildcard-domain",
+            "*.apps.example.com",
+            "--admin-email",
+            "owner@example.com",
+        ]);
+
+        command.apply_auto_defaults();
+
+        assert_eq!(
+            command.wildcard_domain.as_deref(),
+            Some("*.apps.example.com")
+        );
+        assert_eq!(command.admin_email.as_deref(), Some("owner@example.com"));
+        assert!(command.non_interactive);
+        assert!(command.skip_ssl);
+        assert!(command.skip_dns_records);
+        assert!(command.skip_git);
+    }
+
+    #[test]
+    fn acme_contact_precedence_is_explicit_then_existing_then_admin() {
+        let mut command = parse_setup(&["--admin-email", "owner@example.com"]);
+        command
+            .resolve_acme_contact("owner@example.com", None)
+            .expect("a deliverable admin email should be accepted");
+        assert_eq!(
+            command.letsencrypt_email.as_deref(),
+            Some("owner@example.com")
+        );
+
+        command.letsencrypt_email = None;
+        command
+            .resolve_acme_contact("new-owner@example.com", Some("certs@example.net"))
+            .expect("an existing contact should be preserved");
+        assert_eq!(
+            command.letsencrypt_email.as_deref(),
+            Some("certs@example.net")
+        );
+
+        command.letsencrypt_email = Some("certs@example.net".to_string());
+        command
+            .resolve_acme_contact("owner@example.com", Some("old@example.org"))
+            .expect("an explicit contact should take precedence");
+        assert_eq!(
+            command.letsencrypt_email.as_deref(),
+            Some("certs@example.net")
+        );
+
+        command.letsencrypt_email = None;
+        command
+            .resolve_acme_contact(" ADMIN@LOCALHOST ", None)
+            .expect("a placeholder admin email should leave TLS unconfigured");
+        assert_eq!(command.letsencrypt_email, None);
+
+        command.letsencrypt_email = Some("not-an-email".to_string());
+        assert!(command
+            .resolve_acme_contact("owner@example.com", None)
+            .expect_err("an invalid explicit contact must fail setup")
+            .to_string()
+            .contains("deliverable email"));
+    }
+
+    #[test]
+    fn on_demand_tls_requires_a_public_zone_and_acme_contact() {
+        let mut settings = AppSettings::default();
+
+        configure_on_demand_tls(&mut settings, "1-1-1-1.sslip.io");
+        assert!(!settings.on_demand_tls.enabled);
+        assert_eq!(settings.on_demand_tls.zone, None);
+
+        settings.letsencrypt.email = Some("not-an-email".to_string());
+        configure_on_demand_tls(&mut settings, "1-1-1-1.sslip.io");
+        assert!(!settings.on_demand_tls.enabled);
+        assert_eq!(settings.on_demand_tls.zone, None);
+
+        settings.letsencrypt.email = Some("certs@example.com".to_string());
+        configure_on_demand_tls(&mut settings, " 1-1-1-1.SSLIP.IO ");
+        assert!(settings.on_demand_tls.enabled);
+        assert_eq!(
+            settings.on_demand_tls.zone.as_deref(),
+            Some("1-1-1-1.sslip.io")
+        );
+
+        configure_on_demand_tls(&mut settings, "127-0-0-1.sslip.io");
+        assert!(!settings.on_demand_tls.enabled);
+        assert_eq!(settings.on_demand_tls.zone, None);
+
+        configure_on_demand_tls(&mut settings, "192-168-1-10.sslip.io");
+        assert!(!settings.on_demand_tls.enabled);
+        assert_eq!(settings.on_demand_tls.zone, None);
+    }
+
+    #[test]
+    fn completed_setup_domain_requires_explicit_confirmation_on_rerun() {
+        let mut settings = AppSettings::default();
+        assert_eq!(completed_preview_domain(&settings), None);
+
+        settings.preview_domain = " apps.example.com ".to_string();
+        assert_eq!(
+            completed_preview_domain(&settings).as_deref(),
+            Some("apps.example.com"),
+            "legacy settings rows with a custom domain must be protected"
+        );
+
+        settings.setup_complete = true;
+        assert_eq!(
+            completed_preview_domain(&settings).as_deref(),
+            Some("apps.example.com")
+        );
     }
 
     #[test]
@@ -3112,21 +3492,6 @@ mod tests {
         assert!(is_loopback_zone("*.localho.st"));
         assert!(is_loopback_zone("app.localho.st"));
         assert!(!is_loopback_zone("localho.st.example.com"));
-    }
-
-    #[test]
-    fn test_on_demand_tls_auto_enable_decision() {
-        // The exact condition used in update_app_settings, decoupled from
-        // sslip.io: any non-empty, non-loopback base domain enables on-demand
-        // TLS — loopback (local mode) is the only thing that disables it.
-        let should_enable = |zone: &str| !zone.trim().is_empty() && !is_loopback_zone(zone);
-        assert!(should_enable("1.2.3.4.sslip.io")); // sslip.io quick install
-        assert!(should_enable("apps.mycompany.com")); // custom wildcard domain
-        assert!(!should_enable("127.0.0.1.sslip.io")); // local mode (loopback)
-        assert!(!should_enable("localhost")); // local mode
-        assert!(!should_enable("")); // no domain
-        assert!(!should_enable("   ")); // whitespace-only
-        assert!(!should_enable("localho.st")); // local/dev-cluster loopback domain
     }
 
     #[test]

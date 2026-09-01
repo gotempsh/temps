@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, State},
     http::StatusCode,
@@ -18,7 +21,7 @@ use utoipa::{OpenApi, ToSchema};
 use crate::handlers::audit::{AuditContext, SourceFileUploadedAudit, SourceFilesDeletedAudit};
 
 use crate::services::source_map_service::{
-    SourceFileInfo, SourceMapError, SourceMapInfo, SourceMapService,
+    SourceFileInfo, SourceMapError, SourceMapInfo, SourceMapService, MAX_SOURCE_MAP_BYTES,
 };
 
 #[derive(OpenApi)]
@@ -59,7 +62,6 @@ pub fn configure_source_map_routes() -> Router<Arc<SourceMapAppState>> {
     // Body-size caps that fire at the transport layer, before the multipart
     // extractor buffers the request into memory. The per-field checks in the
     // handlers are defense-in-depth on top of these.
-    const SOURCE_MAP_UPLOAD_LIMIT: usize = 50 * 1024 * 1024;
     const SOURCE_FILE_UPLOAD_LIMIT: usize = 10 * 1024 * 1024;
 
     Router::new()
@@ -68,7 +70,7 @@ pub fn configure_source_map_routes() -> Router<Arc<SourceMapAppState>> {
             post(upload_source_map)
                 .get(list_source_maps)
                 .delete(delete_release_source_maps)
-                .layer(DefaultBodyLimit::max(SOURCE_MAP_UPLOAD_LIMIT)),
+                .layer(DefaultBodyLimit::max(MAX_SOURCE_MAP_BYTES)),
         )
         .route(
             "/projects/{project_id}/source-map-releases",
@@ -149,6 +151,11 @@ impl From<SourceMapError> for Problem {
             SourceMapError::Validation(msg) => problemdetails::new(StatusCode::BAD_REQUEST)
                 .with_title("Validation Error")
                 .with_detail(msg),
+            too_large @ SourceMapError::TooLarge { .. } => {
+                problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
+                    .with_title("Source Map Too Large")
+                    .with_detail(too_large.to_string())
+            }
             SourceMapError::Database(e) => {
                 error!("Source map database error: {}", e);
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
@@ -195,9 +202,6 @@ async fn upload_source_map(
     permission_guard!(auth, ErrorTrackingCreate);
     project_access_guard!(auth, project_id, state.project_access_checker);
 
-    // Maximum source map size: 50MB
-    const MAX_SOURCE_MAP_SIZE: usize = 50 * 1024 * 1024;
-
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_path: Option<String> = None;
     let mut dist: Option<String> = None;
@@ -226,13 +230,13 @@ async fn upload_source_map(
                         .with_detail(e.to_string())
                 })?;
 
-                if data.len() > MAX_SOURCE_MAP_SIZE {
+                if data.len() > MAX_SOURCE_MAP_BYTES {
                     return Err(problemdetails::new(StatusCode::PAYLOAD_TOO_LARGE)
                         .with_title("Source Map Too Large")
                         .with_detail(format!(
                             "Source map size {} bytes exceeds maximum of {} bytes",
                             data.len(),
-                            MAX_SOURCE_MAP_SIZE
+                            MAX_SOURCE_MAP_BYTES
                         )));
                 }
 

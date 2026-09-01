@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration: cross-project trace discovery index (ADR-027 Phase 0).
 //!
 //! Creates `cross_project_trace_refs`, a lightweight append-only control table

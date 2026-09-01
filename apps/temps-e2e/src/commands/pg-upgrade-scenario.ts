@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * PostgreSQL major-version upgrade (17 → 18) against a live Temps instance,
  * using MinIO as the local S3-compatible target for the mandatory pre-upgrade

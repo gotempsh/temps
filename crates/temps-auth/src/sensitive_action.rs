@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use async_trait::async_trait;
 use axum::http::StatusCode;
 use chrono::{Duration, Utc};
@@ -14,10 +17,27 @@ use crate::{context::AuthContext, user_service::UserService};
 pub const STEP_UP_TTL_MINUTES: i64 = 5;
 
 /// Default policy: interactive browser sessions whose user has **enrolled**
-/// MFA need recent verification. Machine credentials are denied because they
-/// cannot satisfy an interactive identity check; installations that need
-/// narrowly scoped automation can provide a different policy through
+/// MFA need recent verification. Machine credentials (API keys, CLI device
+/// tokens, deployment tokens) skip step-up entirely rather than being denied
+/// — see "Machine credentials" below. Installations that need a stricter
+/// posture for automation can provide a different policy through
 /// [`SensitiveActionAuthorizer`].
+///
+/// # Machine credentials
+///
+/// API keys, CLI tokens, and deployment tokens are not challenged and are
+/// not denied — they pass straight through to [`SensitiveActionDecision::Allow`].
+/// This is a deliberate product decision, not an oversight: step-up is an
+/// interactive TOTP/recovery-code prompt, which has no equivalent a script or
+/// CI job can satisfy. Denying these principals outright (the original
+/// policy) does not add security for a stolen key — the key already grants
+/// whatever `permission_guard!` allows for its scope — it just silently
+/// breaks any existing automation that calls a newly-gated endpoint, which
+/// is a worse outcome than the exposure being closed. If a stronger posture
+/// is needed for machine credentials specifically (e.g. a confirmation
+/// header, or short-lived scoped tokens for destructive calls), that is a
+/// distinct mechanism to design deliberately, not a side effect of this
+/// authorizer's session-based step-up.
 ///
 /// # Users without MFA
 ///
@@ -52,11 +72,15 @@ pub const STEP_UP_TTL_MINUTES: i64 = 5;
 /// incentive; it does not remove a barrier the attacker could not already
 /// cross.
 ///
-/// **That reasoning is load-bearing.** If enrolment is ever put behind
-/// re-authentication (current password, or a step-up for re-enrolment), the
-/// pre-existing behaviour *would* become a real control, and this policy must
-/// be revisited at the same time — otherwise the fix to enrolment silently
-/// leaves this hole open behind it.
+/// **Update:** `POST /users/me/mfa/setup` now requires the caller's current
+/// password when the account has one set (see `UserService::setup_mfa`), so
+/// the attack this section describes is closed for password-backed accounts
+/// — a stolen session alone can no longer self-enrol without also knowing
+/// the password. SSO-only accounts (no local password) still skip that
+/// check, so the reasoning above still applies to them, and revisiting this
+/// policy for password-backed accounts (e.g. requiring step-up before
+/// unenrolled principals can act) is a reasonable follow-up now that the
+/// premise has changed.
 ///
 /// # Operators who want the stricter posture
 ///
@@ -83,15 +107,51 @@ impl SensitiveActionAuthorizer for DefaultSensitiveActionAuthorizer {
         action: &SensitiveAction,
         principal: &SensitiveActionPrincipal,
     ) -> Result<SensitiveActionDecision, SensitiveActionAuthorizationError> {
-        let SensitiveActionPrincipal::UserSession {
-            user_id,
-            session_id,
-            mfa_enabled,
-        } = principal
-        else {
-            return Ok(SensitiveActionDecision::Deny {
-                reason: "interactive_verification_required".to_string(),
-            });
+        let (user_id, session_id, mfa_enabled) = match principal {
+            SensitiveActionPrincipal::UserSession {
+                user_id,
+                session_id,
+                mfa_enabled,
+            } => (user_id, session_id, mfa_enabled),
+            // Machine credentials (API keys, CLI device tokens, deployment
+            // tokens used by running containers) have no interactive factor
+            // to re-verify, so step-up is not "denied" here, it is a no-op —
+            // the same reasoning as the unenrolled-user case below, just for
+            // a principal that can never enroll one. Their blast radius is
+            // already bounded by the key's own scope/permissions, checked by
+            // `permission_guard!` in the handler before this runs. Deliberate
+            // product decision (not the original default, which denied these
+            // outright): interactive step-up doesn't compose with scripted /
+            // CI usage, so gating a destructive action here would silently
+            // break existing automation rather than add friction to it.
+            SensitiveActionPrincipal::ApiKey { user_id, key_id } => {
+                tracing::info!(
+                    user_id = *user_id,
+                    key_id = *key_id,
+                    action = action.as_str(),
+                    step_up = "skipped_machine_principal",
+                    "Sensitive action allowed without step-up: API key has no interactive factor to re-verify"
+                );
+                return Ok(SensitiveActionDecision::Allow);
+            }
+            SensitiveActionPrincipal::CliToken { user_id } => {
+                tracing::info!(
+                    user_id = *user_id,
+                    action = action.as_str(),
+                    step_up = "skipped_machine_principal",
+                    "Sensitive action allowed without step-up: CLI token has no interactive factor to re-verify"
+                );
+                return Ok(SensitiveActionDecision::Allow);
+            }
+            SensitiveActionPrincipal::DeploymentToken { token_id } => {
+                tracing::info!(
+                    token_id = *token_id,
+                    action = action.as_str(),
+                    step_up = "skipped_machine_principal",
+                    "Sensitive action allowed without step-up: deployment token has no interactive factor to re-verify"
+                );
+                return Ok(SensitiveActionDecision::Allow);
+            }
         };
 
         // No enrolled factor, nothing to re-verify — allow. See the type-level
@@ -504,27 +564,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn machine_principals_are_denied_by_default() {
+    async fn machine_principals_bypass_step_up() {
+        // Machine credentials have no interactive factor to re-verify, and
+        // denying them outright silently breaks any automation (e.g. the
+        // CLI) that legitimately calls a gated endpoint with a scoped key.
+        // See the "Machine credentials" section of the type-level docs.
         let authorizer = authorizer_with_sessions(vec![]);
-        let decision = authorizer
-            .authorize(
-                &SensitiveAction::DeleteEnvironment {
-                    project_id: 3,
-                    environment_id: 4,
-                },
-                &SensitiveActionPrincipal::ApiKey {
-                    user_id: 7,
-                    key_id: 9,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            decision,
-            SensitiveActionDecision::Deny {
-                reason: "interactive_verification_required".to_string()
-            }
-        );
+        for principal in [
+            SensitiveActionPrincipal::ApiKey {
+                user_id: 7,
+                key_id: 9,
+            },
+            SensitiveActionPrincipal::CliToken { user_id: 7 },
+            SensitiveActionPrincipal::DeploymentToken { token_id: 9 },
+        ] {
+            let decision = authorizer
+                .authorize(
+                    &SensitiveAction::DeleteEnvironment {
+                        project_id: 3,
+                        environment_id: 4,
+                    },
+                    &principal,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                decision,
+                SensitiveActionDecision::Allow,
+                "principal {:?} must bypass step-up, not be denied",
+                principal
+            );
+        }
     }
 
     #[tokio::test]

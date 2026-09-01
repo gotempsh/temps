@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import chalk from 'chalk'
 import { requireAuth } from '../../config/store.js'
 import { setupClient, client, getErrorMessage } from '../../lib/api-client.js'

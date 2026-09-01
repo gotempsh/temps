@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Feature-flag types. These mirror `crates/temps-flags/src/eval.rs` exactly —
  * the SDK evaluates locally, so the two implementations must agree or the same

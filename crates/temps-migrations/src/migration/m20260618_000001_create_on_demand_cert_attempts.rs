@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to create the `on_demand_cert_attempts` table (ADR-018 §5).
 //!
 //! This is the append-only audit log for on-demand TLS issuance. Every

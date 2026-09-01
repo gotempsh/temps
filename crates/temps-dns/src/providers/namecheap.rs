@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Namecheap DNS provider implementation
 //!
 //! This provider uses the Namecheap API to manage DNS records.

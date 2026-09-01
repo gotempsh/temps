@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Make agent-run sandboxes first-class `sandboxes` rows.
 //!
 //! Agent runs (autofixer, workflow agents) historically created their

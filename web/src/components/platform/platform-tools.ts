@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import {
   Activity,
   Bot,
@@ -191,6 +194,22 @@ export const platformToolGroups: PlatformToolGroup[] = [
         icon: Bot,
         keywords: ['automation', 'agents'],
         featureKey: 'ai-agents-workflows',
+      },
+      {
+        title: 'MCP server',
+        description:
+          'Let Claude Code, Cursor, Codex, and other AI clients connect to this Temps instance.',
+        url: '/settings/mcp-server',
+        icon: Bot,
+        keywords: [
+          'model context protocol',
+          'claude',
+          'cursor',
+          'codex',
+          'windsurf',
+          'zed',
+          'tools',
+        ],
       },
       {
         title: 'Settings',

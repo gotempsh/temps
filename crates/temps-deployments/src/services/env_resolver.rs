@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Shared resolver for a container's environment variables, keyed on the
 //! *selected environment*.
 //!
@@ -5,7 +8,8 @@
 //! promotion, and a rollback — resolves env through this one place, so a
 //! container is NEVER created without its environment's fully-resolved set:
 //! user-defined vars, external-service runtime vars (DB/Redis/… connection
-//! strings), `SENTRY_DSN`, `TEMPS_API_URL` / `TEMPS_API_TOKEN`, `CRON_SECRET`,
+//! strings), `SENTRY_DSN` / `SENTRY_TUNNEL`, `TEMPS_API_URL` /
+//! `TEMPS_API_TOKEN`, `CRON_SECRET`,
 //! and the `OTEL_EXPORTER_OTLP_*` instrumentation vars.
 //!
 //! [`WorkflowPlanner`]: super::workflow_planner::WorkflowPlanner
@@ -13,13 +17,121 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
-use temps_core::EncryptionService;
-use temps_entities::{deployments, environments, projects};
+use sea_orm::{ColumnTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter};
+use temps_core::{EncryptionService, SecretsManagerResolver};
+use temps_entities::{deployments, environments, preset::Preset, projects};
+use thiserror::Error;
 use tracing::{debug, info};
 
 use super::deployment_token_service::DeploymentTokenService;
-use super::workflow_planner::{public_sentry_dsn_var, public_sentry_tunnel_var};
+use super::managed_environment_variables::{public_sentry_dsn_var, public_sentry_tunnel_var};
+use super::workflow_planner::SecretsResolverSlot;
+
+#[derive(Debug, Error)]
+pub enum DeploymentEnvResolutionError {
+    #[error(
+        "Failed to query environment-variable bindings for project {project_id}, environment {environment_id}: {source}"
+    )]
+    EnvironmentVariableBindingsQuery {
+        project_id: i32,
+        environment_id: i32,
+        #[source]
+        source: DbErr,
+    },
+
+    #[error(
+        "Failed to query environment variables for project {project_id}, environment {environment_id}: {source}"
+    )]
+    EnvironmentVariablesQuery {
+        project_id: i32,
+        environment_id: i32,
+        #[source]
+        source: DbErr,
+    },
+
+    #[error(
+        "Failed to decrypt environment variable '{key}' (id {variable_id}) for project {project_id}, environment {environment_id}: {reason}"
+    )]
+    EnvironmentVariableDecryption {
+        project_id: i32,
+        environment_id: i32,
+        variable_id: i32,
+        key: String,
+        reason: String,
+    },
+
+    #[error(
+        "Failed to query linked services for project {project_id}, environment {environment_id}: {source}"
+    )]
+    LinkedServicesQuery {
+        project_id: i32,
+        environment_id: i32,
+        #[source]
+        source: DbErr,
+    },
+
+    #[error(
+        "Failed to gather environment variables from linked services for project {project_id}, environment {environment_id}: {failures}"
+    )]
+    LinkedServiceVariables {
+        project_id: i32,
+        environment_id: i32,
+        failures: String,
+    },
+
+    #[error(
+        "Secrets-manager resolution failed for project {project_id}, environment {environment_id}: {reason}. Verify provider connectivity and credentials"
+    )]
+    SecretsManager {
+        project_id: i32,
+        environment_id: i32,
+        reason: String,
+    },
+}
+
+async fn apply_secrets_manager_layer(
+    resolved: &mut HashMap<String, String>,
+    resolver: Option<Arc<dyn SecretsManagerResolver>>,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<(), DeploymentEnvResolutionError> {
+    let Some(resolver) = resolver else {
+        return Ok(());
+    };
+
+    let secret_bindings = resolver
+        .resolve_secrets_for_deployment(project_id, environment_id)
+        .await
+        .map_err(|error| DeploymentEnvResolutionError::SecretsManager {
+            project_id,
+            environment_id,
+            reason: error.to_string(),
+        })?;
+
+    info!(
+        "Resolved {} secret(s) for project {} environment {}: [{}]",
+        secret_bindings.len(),
+        project_id,
+        environment_id,
+        secret_bindings
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    for key in secret_bindings.keys() {
+        if resolved.contains_key(key) {
+            tracing::warn!(
+                "Secrets binding overwrites existing env var '{}' for project {} environment {}",
+                key,
+                project_id,
+                environment_id,
+            );
+        }
+    }
+    resolved.extend(secret_bindings);
+    Ok(())
+}
 
 /// Build the OpenTelemetry SDK header-list value for a deployed project.
 ///
@@ -51,6 +163,40 @@ pub(super) fn otel_exporter_headers(
     }
 }
 
+/// Applies environment-variable layers in increasing precedence order.
+///
+/// Linked services provide convenient defaults such as `POSTGRES_URL`, while
+/// project environment variables are explicit user configuration and must win
+/// when both layers define the same key. Platform-managed variables are added
+/// by the caller after this merge and therefore remain reserved.
+pub(super) fn merge_environment_variable_layers(
+    resolved: &mut HashMap<String, String>,
+    linked_service_vars: HashMap<String, String>,
+    explicit_project_vars: HashMap<String, String>,
+) {
+    resolved.extend(linked_service_vars);
+    resolved.extend(explicit_project_vars);
+}
+
+/// Apply values owned by the deployment runtime after every tenant-controlled
+/// layer has been resolved. These keys must behave identically for normal,
+/// promoted, and rolled-back deployments.
+pub(super) fn apply_deployment_owned_variables(
+    resolved: &mut HashMap<String, String>,
+    preset: Preset,
+    deployment_slug: &str,
+    exposed_port: Option<u32>,
+) {
+    let asset_prefix = format!("/_temps/assets/{deployment_slug}");
+    if let Some(exposed_port) = exposed_port {
+        resolved.insert("PORT".to_string(), exposed_port.to_string());
+    }
+    resolved.insert("TEMPS_ASSET_PREFIX".to_string(), asset_prefix.clone());
+    if preset == Preset::NextJs {
+        resolved.insert("NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string(), asset_prefix);
+    }
+}
+
 /// Resolves the full environment-variable map for a `(project, environment,
 /// deployment)`. Holds the six services the resolution needs; cheap to clone
 /// (every field is an `Arc`).
@@ -62,6 +208,7 @@ pub struct DeploymentEnvResolver {
     pub external_service_manager: Arc<temps_providers::ExternalServiceManager>,
     pub dsn_service: Arc<temps_error_tracking::DSNService>,
     pub deployment_token_service: Arc<DeploymentTokenService>,
+    pub secrets_resolver: SecretsResolverSlot,
 }
 
 impl DeploymentEnvResolver {
@@ -79,10 +226,11 @@ impl DeploymentEnvResolver {
         project: &projects::Model,
         environment: &environments::Model,
         deployment: &deployments::Model,
-    ) -> anyhow::Result<HashMap<String, String>> {
+    ) -> Result<HashMap<String, String>, DeploymentEnvResolutionError> {
         use temps_entities::{env_var_environments, env_vars, project_services};
 
         let mut env_vars_map = HashMap::new();
+        let mut explicit_project_vars = HashMap::new();
 
         // Add default HOST environment variable
         // This ensures containers bind to all network interfaces (0.0.0.0)
@@ -96,7 +244,14 @@ impl DeploymentEnvResolver {
         let env_var_ids: Vec<i32> = env_var_environments::Entity::find()
             .filter(env_var_environments::Column::EnvironmentId.eq(environment.id))
             .all(self.db.as_ref())
-            .await?
+            .await
+            .map_err(
+                |source| DeploymentEnvResolutionError::EnvironmentVariableBindingsQuery {
+                    project_id: project.id,
+                    environment_id: environment.id,
+                    source,
+                },
+            )?
             .into_iter()
             .map(|eve| eve.env_var_id)
             .collect();
@@ -106,30 +261,38 @@ impl DeploymentEnvResolver {
                 .filter(env_vars::Column::Id.is_in(env_var_ids))
                 .filter(env_vars::Column::ProjectId.eq(project.id))
                 .all(self.db.as_ref())
-                .await?;
+                .await
+                .map_err(
+                    |source| DeploymentEnvResolutionError::EnvironmentVariablesQuery {
+                        project_id: project.id,
+                        environment_id: environment.id,
+                        source,
+                    },
+                )?;
 
             for env_var in env_vars_list {
                 let value = if env_var.is_encrypted {
                     self.encryption_service
                         .decrypt_string(&env_var.value)
-                        .map_err(|e| {
-                            anyhow::anyhow!(
-                                "Failed to decrypt environment variable '{}' (id={}): {}",
-                                env_var.key,
-                                env_var.id,
-                                e
-                            )
+                        .map_err(|error| {
+                            DeploymentEnvResolutionError::EnvironmentVariableDecryption {
+                                project_id: project.id,
+                                environment_id: environment.id,
+                                variable_id: env_var.id,
+                                key: env_var.key.clone(),
+                                reason: error.to_string(),
+                            }
                         })?
                 } else {
                     env_var.value
                 };
-                env_vars_map.insert(env_var.key, value);
+                explicit_project_vars.insert(env_var.key, value);
             }
         }
 
         debug!(
             "📦 Loaded {} environment variables from env_vars table via env_var_environments",
-            env_vars_map.len()
+            explicit_project_vars.len()
         );
 
         // 2. Get runtime environment variables from external services
@@ -137,7 +300,12 @@ impl DeploymentEnvResolver {
         let project_services_list = project_services::Entity::find()
             .filter(project_services::Column::ProjectId.eq(project.id))
             .all(self.db.as_ref())
-            .await?;
+            .await
+            .map_err(|source| DeploymentEnvResolutionError::LinkedServicesQuery {
+                project_id: project.id,
+                environment_id: environment.id,
+                source,
+            })?;
 
         debug!(
             "🔌 Found {} external services linked to project {}",
@@ -147,6 +315,7 @@ impl DeploymentEnvResolver {
 
         // Track failed services to provide detailed error messages
         let mut failed_services: Vec<(i32, String)> = Vec::new();
+        let mut linked_service_vars = HashMap::new();
 
         // Get runtime environment variables from each external service
         for project_service in project_services_list {
@@ -171,8 +340,7 @@ impl DeploymentEnvResolver {
                             .collect::<Vec<_>>()
                             .join(", ")
                     );
-                    // Merge service env vars into the main map
-                    env_vars_map.extend(service_env_vars);
+                    linked_service_vars.extend(service_env_vars);
                 }
                 Err(e) => {
                     // Collect the error - we'll fail the entire deployment if any service fails
@@ -196,15 +364,37 @@ impl DeploymentEnvResolver {
                 .collect::<Vec<_>>()
                 .join("\n");
 
-            let error_message = format!(
-                "Failed to gather environment variables from {} external service(s). \
-                The deployment cannot proceed without all required external services configured:\n{}",
-                failed_services.len(),
-                failure_details
-            );
-
-            return Err(anyhow::anyhow!(error_message));
+            return Err(DeploymentEnvResolutionError::LinkedServiceVariables {
+                project_id: project.id,
+                environment_id: environment.id,
+                failures: format!("{} service(s):\n{failure_details}", failed_services.len()),
+            });
         }
+
+        // Linked-service variables are defaults. Explicit project variables
+        // express user intent and therefore take precedence on collisions.
+        merge_environment_variable_layers(
+            &mut env_vars_map,
+            linked_service_vars,
+            explicit_project_vars,
+        );
+
+        // Secrets-manager bindings are operator-controlled and therefore
+        // override linked-service defaults and explicit project variables.
+        // Platform-owned values are injected after this layer and remain
+        // authoritative. Resolution is fail-closed: a deployment must never
+        // continue with silently missing secrets.
+        let maybe_secrets_resolver = {
+            let guard = self.secrets_resolver.read().await;
+            guard.as_ref().cloned()
+        };
+        apply_secrets_manager_layer(
+            &mut env_vars_map,
+            maybe_secrets_resolver,
+            project.id,
+            environment.id,
+        )
+        .await?;
 
         // 3. Get or create Sentry DSN for error tracking
         // Generate/fetch DSN for this project/environment combination
@@ -235,6 +425,10 @@ impl DeploymentEnvResolver {
                         // Always add SENTRY_DSN for server-side usage
                         env_vars_map.insert("SENTRY_DSN".to_string(), project_dsn.dsn.clone());
 
+                        let sentry_tunnel =
+                            format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH);
+                        env_vars_map.insert("SENTRY_TUNNEL".to_string(), sentry_tunnel.clone());
+
                         // Add framework-specific public DSN env var based on preset.
                         // Each client bundler only exposes vars matching its own prefix
                         // convention to the browser bundle, so we mirror that mapping.
@@ -249,10 +443,7 @@ impl DeploymentEnvResolver {
                         // the path can change in one place (here) without touching
                         // deployed apps' source or docs.
                         if let Some(tunnel_var) = public_sentry_tunnel_var(project.preset) {
-                            env_vars_map.insert(
-                                tunnel_var.to_string(),
-                                format!("/api{}", temps_error_tracking::SENTRY_TUNNEL_ROUTE_PATH),
-                            );
+                            env_vars_map.insert(tunnel_var.to_string(), sentry_tunnel);
                         }
                     }
                     Err(e) => {
@@ -370,13 +561,24 @@ impl DeploymentEnvResolver {
 
             // Use commit SHA as service version when available
             if let Some(ref commit_sha) = deployment.commit_sha {
-                env_vars_map.insert("OTEL_SERVICE_VERSION".to_string(), commit_sha.clone());
+                env_vars_map
+                    .entry("OTEL_SERVICE_VERSION".to_string())
+                    .or_insert_with(|| commit_sha.clone());
             }
 
             debug!(
                 "Set OTEL_EXPORTER_OTLP_ENDPOINT for project {} environment {}",
                 project.id, environment.id
             );
+        }
+
+        // Release identity is a platform-provided default, but advanced users
+        // may supply a semantic release name. Keep the explicit/secret value
+        // when present, matching the normal Git and image planners.
+        if let Some(ref commit_sha) = deployment.commit_sha {
+            env_vars_map
+                .entry("SENTRY_RELEASE".to_string())
+                .or_insert_with(|| commit_sha.clone());
         }
 
         info!(
@@ -390,7 +592,192 @@ impl DeploymentEnvResolver {
 
 #[cfg(test)]
 mod tests {
-    use super::otel_exporter_headers;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use temps_core::SecretsManagerResolver;
+    use temps_entities::preset::Preset;
+
+    use super::{
+        apply_deployment_owned_variables, apply_secrets_manager_layer,
+        merge_environment_variable_layers, otel_exporter_headers, DeploymentEnvResolutionError,
+    };
+
+    struct TestSecretsResolver {
+        result: Result<HashMap<String, String>, String>,
+    }
+
+    #[async_trait]
+    impl SecretsManagerResolver for TestSecretsResolver {
+        async fn resolve_secrets_for_deployment(
+            &self,
+            _project_id: i32,
+            _environment_id: i32,
+        ) -> Result<HashMap<String, String>, Box<dyn std::error::Error + Send + Sync>> {
+            self.result
+                .clone()
+                .map_err(|reason| std::io::Error::other(reason).into())
+        }
+    }
+
+    #[test]
+    fn explicit_project_vars_override_linked_service_defaults() {
+        let mut resolved = HashMap::from([("HOST".to_string(), "0.0.0.0".to_string())]);
+        let linked_service_vars = HashMap::from([
+            (
+                "POSTGRES_URL".to_string(),
+                "postgresql://linked-database/app".to_string(),
+            ),
+            ("POSTGRES_HOST".to_string(), "linked-database".to_string()),
+        ]);
+        let explicit_project_vars = HashMap::from([(
+            "POSTGRES_URL".to_string(),
+            "postgresql://user-selected-database/app".to_string(),
+        )]);
+
+        merge_environment_variable_layers(
+            &mut resolved,
+            linked_service_vars,
+            explicit_project_vars,
+        );
+
+        assert_eq!(
+            resolved.get("POSTGRES_URL").map(String::as_str),
+            Some("postgresql://user-selected-database/app")
+        );
+        assert_eq!(
+            resolved.get("POSTGRES_HOST").map(String::as_str),
+            Some("linked-database")
+        );
+        assert_eq!(resolved.get("HOST").map(String::as_str), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn platform_managed_vars_still_override_explicit_project_vars() {
+        let mut resolved = HashMap::new();
+        let explicit_project_vars = HashMap::from([(
+            "SENTRY_DSN".to_string(),
+            "https://user-defined.example/1".to_string(),
+        )]);
+
+        merge_environment_variable_layers(&mut resolved, HashMap::new(), explicit_project_vars);
+        resolved.insert(
+            "SENTRY_DSN".to_string(),
+            "https://temps-managed.example/2".to_string(),
+        );
+
+        assert_eq!(
+            resolved.get("SENTRY_DSN").map(String::as_str),
+            Some("https://temps-managed.example/2")
+        );
+    }
+
+    #[tokio::test]
+    async fn secrets_manager_values_override_tenant_layers() {
+        let mut resolved = HashMap::from([("DATABASE_URL".to_string(), "tenant".to_string())]);
+        let resolver = Arc::new(TestSecretsResolver {
+            result: Ok(HashMap::from([
+                ("DATABASE_URL".to_string(), "secret".to_string()),
+                ("API_KEY".to_string(), "managed".to_string()),
+            ])),
+        });
+
+        apply_secrets_manager_layer(&mut resolved, Some(resolver), 41, 52)
+            .await
+            .expect("the test secrets resolver should succeed");
+
+        assert_eq!(
+            resolved.get("DATABASE_URL").map(String::as_str),
+            Some("secret")
+        );
+        assert_eq!(resolved.get("API_KEY").map(String::as_str), Some("managed"));
+    }
+
+    #[tokio::test]
+    async fn secrets_manager_failure_is_typed_and_contextual() {
+        let resolver = Arc::new(TestSecretsResolver {
+            result: Err("provider unavailable".to_string()),
+        });
+
+        let error = apply_secrets_manager_layer(&mut HashMap::new(), Some(resolver), 41, 52)
+            .await
+            .expect_err("secret resolution must fail closed");
+
+        assert!(matches!(
+            error,
+            DeploymentEnvResolutionError::SecretsManager {
+                project_id: 41,
+                environment_id: 52,
+                ..
+            }
+        ));
+        assert!(error.to_string().contains("provider unavailable"));
+    }
+
+    #[tokio::test]
+    async fn missing_secrets_manager_is_a_no_op() {
+        let mut resolved = HashMap::from([("DATABASE_URL".to_string(), "tenant".to_string())]);
+
+        apply_secrets_manager_layer(&mut resolved, None, 41, 52)
+            .await
+            .expect("an unconfigured optional secrets manager should be a no-op");
+
+        assert_eq!(
+            resolved.get("DATABASE_URL").map(String::as_str),
+            Some("tenant")
+        );
+    }
+
+    #[test]
+    fn deployment_owned_vars_override_tenant_layers() {
+        let mut resolved = HashMap::from([
+            ("PORT".to_string(), "9999".to_string()),
+            (
+                "TEMPS_ASSET_PREFIX".to_string(),
+                "/tenant-controlled".to_string(),
+            ),
+            (
+                "NEXT_PUBLIC_TEMPS_ASSET_PREFIX".to_string(),
+                "/tenant-controlled".to_string(),
+            ),
+        ]);
+
+        apply_deployment_owned_variables(&mut resolved, Preset::NextJs, "deploy-abc", Some(3000));
+
+        assert_eq!(resolved.get("PORT").map(String::as_str), Some("3000"));
+        assert_eq!(
+            resolved.get("TEMPS_ASSET_PREFIX").map(String::as_str),
+            Some("/_temps/assets/deploy-abc")
+        );
+        assert_eq!(
+            resolved
+                .get("NEXT_PUBLIC_TEMPS_ASSET_PREFIX")
+                .map(String::as_str),
+            Some("/_temps/assets/deploy-abc")
+        );
+    }
+
+    #[test]
+    fn compose_deployments_do_not_receive_a_global_port() {
+        let mut resolved = HashMap::from([("PORT".to_string(), "service-owned".to_string())]);
+
+        apply_deployment_owned_variables(
+            &mut resolved,
+            Preset::DockerCompose,
+            "deploy-compose",
+            None,
+        );
+
+        assert_eq!(
+            resolved.get("PORT").map(String::as_str),
+            Some("service-owned")
+        );
+        assert_eq!(
+            resolved.get("TEMPS_ASSET_PREFIX").map(String::as_str),
+            Some("/_temps/assets/deploy-compose")
+        );
+    }
 
     #[test]
     fn otel_headers_include_encoded_token_and_project_slug() {

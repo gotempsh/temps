@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Docker network integration.
 //!
 //! We pin a Docker bridge network to the kernel bridge that the rest of this

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 use base64::{engine::general_purpose, Engine as _};
 
 const PALETTE: [(u8, u8, u8); 16] = [

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Java preset implementation using autopack
 //!
 //! This preset detects Java projects (pom.xml, build.gradle, build.gradle.kts)

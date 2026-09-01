@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Per-upstream concurrent-connection limiting for the proxy hot path.
 //!
 //! Protects the proxy's own connection/file-descriptor budget from a single

@@ -1,3 +1,6 @@
+-- SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+-- SPDX-License-Identifier: MIT OR Apache-2.0
+
 -- Replace the fixed 30-day TTL with a per-row expression driven by the
 -- retention_days column added in 0003_retention_days.sql.  This is a
 -- metadata-only operation in ClickHouse; existing rows are not re-scanned

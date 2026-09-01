@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Import plan display — renders a `CreatePlanResponse` (real ImportPlan +
  * ValidationReport from the temps-import backend) in a readable, colorful

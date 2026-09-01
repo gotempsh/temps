@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 import type { Command } from 'commander'
 import { config, credentials, type TempsConfig } from '../config/store.js'
 import { setDefaultProject } from '../config/resolve-project.js'

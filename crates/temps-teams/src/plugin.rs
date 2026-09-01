@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Plugin entrypoint for teams + project-scoped RBAC.
 //!
 //! Registration order matters: this plugin registers the
@@ -68,7 +71,15 @@ impl TempsPlugin for TeamsPlugin {
 
             let audit = context.require_service::<dyn temps_core::AuditLogger>();
 
-            let app_state = Arc::new(TeamsAppState::new(team_service, audit, checker.clone()));
+            let sensitive_action_authorizer =
+                context.require_service::<dyn temps_core::SensitiveActionAuthorizer>();
+
+            let app_state = Arc::new(TeamsAppState::new(
+                team_service,
+                audit,
+                checker.clone(),
+                sensitive_action_authorizer,
+            ));
             context.register_service(app_state);
 
             // Registering this activates `project_access_guard!` and
@@ -83,7 +94,20 @@ impl TempsPlugin for TeamsPlugin {
     }
 
     fn configure_routes(&self, context: &PluginContext) -> Option<PluginRoutes> {
-        let app_state = context.require_service::<TeamsAppState>();
+        // Rebind the authorizer here rather than trust the one captured in
+        // `register_services`: an EE/custom `SensitiveActionAuthorizer`
+        // (e.g. one that denies unenrolled principals) may be registered by
+        // a plugin later in registration order, and `register_services`
+        // last-write-wins semantics mean the earliest-registered instance
+        // otherwise wins silently. `configure_routes` runs only after every
+        // plugin's `register_services` has completed, so re-resolving here
+        // always sees the final policy — same pattern as AuthPlugin's
+        // `with_sensitive_action_authorizer`.
+        let app_state = Arc::new(TeamsAppState {
+            sensitive_action_authorizer: context
+                .require_service::<dyn temps_core::SensitiveActionAuthorizer>(),
+            ..(*context.require_service::<TeamsAppState>()).clone()
+        });
 
         // Attach the optional membership resolver here rather than in
         // `register_services`: it's registered by a different plugin, and

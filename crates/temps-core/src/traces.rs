@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! A minimal, stable read contract over the distributed-trace store.
 //!
 //! Consumers that only need to *read* traces (e.g. the AI debugging chat in

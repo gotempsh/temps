@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 /**
  * Managed-services (external-services) lifecycle against a live Temps
  * instance -- closing a real gap: `scenario --with-db` already provisions a

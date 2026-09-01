@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to create the static_asset_cache table.
 //!
 //! Maps URL paths to CAS content hashes for stale-chunk fallback serving.

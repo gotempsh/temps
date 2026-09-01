@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Migration to create the `deployment_container_logs` table.
 //!
 //! Runtime container logs are normally only available live, streamed straight

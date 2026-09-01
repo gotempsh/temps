@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
 //! Merge service: parallel-fetches per-kind row streams from the source
 //! stores, maps each to the unified `ObservabilityEvent` wire type
 //! (truncating heavy fields server-side), and k-way merges them by
