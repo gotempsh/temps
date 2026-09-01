@@ -13,7 +13,10 @@ TypeScript packages for building applications and standalone plugins on Temps.
 | [`@temps-sdk/blob`](./packages/blob) | Blob storage client. |
 
 For a complete external plugin with a React UI, see
-[`examples/node-hello-plugin`](./examples/node-hello-plugin).
+[`examples/node-hello-plugin`](./examples/node-hello-plugin). For a practical,
+production-shaped example, see
+[`examples/deployment-pulse-plugin`](./examples/deployment-pulse-plugin), a
+read-only deployment health dashboard with an embedded React UI.
 
 ## React analytics
 

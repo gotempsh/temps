@@ -89,7 +89,7 @@ graph TB
 
 ## Example Plugins {{ anchor: true, id: 'examples' }}
 
-The [`gotempsh/plugins`](https://github.com/gotempsh/plugins) repository ships four Rust reference plugins that demonstrate the external plugin SDK end-to-end. Each one is a standalone Cargo crate with source, tests, and an optional Vite/React UI bundle. The main repository also contains a TypeScript/Bun example that compiles to the same standalone plugin format.
+The [`gotempsh/plugins`](https://github.com/gotempsh/plugins) repository ships four Rust reference plugins that demonstrate the external plugin SDK end-to-end. Each one is a standalone Cargo crate with source, tests, and an optional Vite/React UI bundle. The main repository also contains TypeScript/Bun examples that compile to the same standalone plugin format.
 
 | Plugin | Purpose |
 | --- | --- |
@@ -98,6 +98,7 @@ The [`gotempsh/plugins`](https://github.com/gotempsh/plugins) repository ships f
 | [`indexnow-plugin`](https://github.com/gotempsh/plugins/tree/main/indexnow-plugin) | Submits deployed URLs to IndexNow-supporting search engines (Bing, Yandex, Seznam). |
 | [`google-indexing-plugin`](https://github.com/gotempsh/plugins/tree/main/google-indexing-plugin) | Notifies the Google Indexing API when pages are published or removed. |
 | [`typescript-hello-plugin`](https://github.com/gotempsh/temps/tree/main/sdks/node/examples/node-hello-plugin) | Complete TypeScript plugin with authenticated routes, platform queries, events, an embedded React UI, and a protocol integration test. |
+| [`deployment-pulse-plugin`](https://github.com/gotempsh/temps/tree/main/sdks/node/examples/deployment-pulse-plugin) | Practical, read-only TypeScript dashboard for cross-project deployment health, recent failures, search, and health filters. |
 
 Every tagged release publishes per-platform binaries on [GitHub Releases](https://github.com/gotempsh/plugins/releases) — drop one into `~/.temps/plugins/`, click **Reload Plugins** in the dashboard, and it's live. Or clone the repo and run `cargo build --release` to build from source.
 
@@ -137,7 +138,7 @@ await runPlugin(plugin)
 
 The SDK implements external-plugin protocol v2, verifies the host's per-process request assertion before exposing caller identity, and provides typed read-only platform queries. Plugins that need the platform HTTP API must declare `api_read` or `api_write` and use `context.apiAsCaller(caller)` so Temps re-applies the caller's permissions.
 
-Start with the [complete TypeScript example](https://github.com/gotempsh/temps/tree/main/sdks/node/examples/node-hello-plugin), which includes build scripts and an executable-level integration test.
+Start with the [complete TypeScript example](https://github.com/gotempsh/temps/tree/main/sdks/node/examples/node-hello-plugin), which includes build scripts and an executable-level integration test. Then inspect [Deployment Pulse](https://github.com/gotempsh/temps/tree/main/sdks/node/examples/deployment-pulse-plugin) for a production-shaped, read-only dashboard built entirely on typed SDK calls.
 
 ---
 
