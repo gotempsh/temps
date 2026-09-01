@@ -385,7 +385,7 @@ impl CloudLink {
         ))
     }
 
-    fn parse_backend(&self, value: &str) -> Result<BackendUrl, CloudError> {
+    pub(crate) fn parse_backend(&self, value: &str) -> Result<BackendUrl, CloudError> {
         if self.allows_loopback_development() {
             BackendUrl::loopback_development(value)
         } else {
@@ -809,7 +809,10 @@ impl CloudLink {
             .await
     }
 
-    fn linked_credential(&self) -> Result<(String, String), CloudError> {
+    /// The one place the instance credential is read. `pub(crate)` so
+    /// [`crate::query`] reuses it instead of introducing a second source for
+    /// the same token.
+    pub(crate) fn linked_credential(&self) -> Result<(String, String), CloudError> {
         if let Some(error) = self.unreadable_cloud_error() {
             return Err(error);
         }

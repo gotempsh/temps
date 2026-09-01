@@ -25,6 +25,7 @@
 
 pub mod flusher;
 pub mod link;
+pub mod query;
 pub mod spool;
 pub mod state;
 pub mod status;
@@ -138,7 +139,10 @@ impl BackendUrl {
         })
     }
 
-    fn endpoint(&self, path: &str) -> url::Url {
+    /// `pub(crate)` so the ClickHouse read-proxy client in [`crate::query`]
+    /// builds its URL the same way every other Cloud endpoint does, rather
+    /// than string-concatenating a second one.
+    pub(crate) fn endpoint(&self, path: &str) -> url::Url {
         let mut endpoint = self.url.clone();
         endpoint.set_path(path);
         endpoint
@@ -161,7 +165,11 @@ impl BackendUrl {
 ///
 /// Deliberately short. This runs alongside the instance's own work, and a slow
 /// backend must never become the instance's latency.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+///
+/// `pub(crate)` so [`crate::query`] bounds reads against the Cloud telemetry
+/// proxy with this same number instead of declaring a second one that can drift
+/// away from it.
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const AI_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const UPLOAD_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const UPLOAD_IDLE_TIMEOUT: Duration = Duration::from_secs(60);

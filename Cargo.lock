@@ -1903,9 +1903,11 @@ dependencies = [
  "futures-util",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "lz4_flex",
  "polonius-the-crab",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -10989,7 +10991,9 @@ name = "temps-cloud-client"
 version = "0.1.0-beta.56"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "chrono",
+ "clickhouse",
  "futures",
  "hmac 0.13.0",
  "reqwest 0.12.28",

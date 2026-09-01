@@ -12,7 +12,19 @@ description = "Optional client that links a self-hosted Temps instance to a mana
 temps-cloud-protocol = { path = "../temps-cloud-protocol" }
 temps-core = { path = "../temps-core" }
 
+base64.workspace = true
 chrono.workspace = true
+# Points a stock ClickHouse client at Temps Cloud's HTTP-interface read proxy
+# (`src/query.rs`). Same 0.15 line as `temps-otel` and `temps-analytics-backend`
+# so the workspace resolves one version.
+#
+# The TLS features are what those two crates do not need: they talk to a local
+# ClickHouse over plain HTTP, whereas the Cloud backend is HTTPS. `ring` matches
+# the provider the workspace already pins for `rustls`/`tokio-rustls`, and
+# webpki roots match what `reqwest`'s `rustls-tls` feature already gives
+# `CloudClient`. The connector stays `https_or_http`, so the existing plain-HTTP
+# ClickHouse callers are unaffected by the feature unification.
+clickhouse = { version = "0.15", features = ["rustls-tls-ring", "rustls-tls-webpki-roots"] }
 hmac = "0.13"
 reqwest.workspace = true
 serde.workspace = true
