@@ -158,6 +158,8 @@ export function RetainedComposeContainers({
                 {isExpanded && (
                   <div
                     id={panelId}
+                    role="region"
+                    aria-label={`Live logs for ${container.container_name}`}
                     className="h-[24rem] border-t bg-background"
                   >
                     <ContainerLogs
