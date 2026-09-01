@@ -48,6 +48,7 @@ import {
   ThresholdLineChart,
   type ThresholdLineSeries,
 } from '@/components/charts/threshold-line-chart'
+import { seriesLineColor } from '@/components/charts/chart-colors'
 import type { MetricTone } from '@/components/charts/metric-sparkline'
 import { useQuery } from '@tanstack/react-query'
 import { formatDistanceToNow } from 'date-fns'
@@ -142,28 +143,6 @@ const TREND_PANELS: TrendPanelDef[] = [
   },
 ]
 
-// Mirrors ThresholdLineChart's own SERIES_STROKE / BREAKDOWN_STROKES
-// fallback so the legend swatches below always match the line colors it
-// picks for the same `tone` / index.
-const TONE_SWATCH: Record<MetricTone, string> = {
-  good: 'var(--chart-2)',
-  warn: 'var(--chart-3)',
-  poor: 'var(--chart-4)',
-  neutral: 'var(--chart-1)',
-}
-const BREAKDOWN_SWATCH = [
-  'var(--chart-1)',
-  'var(--chart-2)',
-  'var(--chart-3)',
-  'var(--chart-4)',
-  'var(--chart-5)',
-]
-function swatchColor(tone: MetricTone | undefined, index: number): string {
-  return tone
-    ? TONE_SWATCH[tone]
-    : BREAKDOWN_SWATCH[index % BREAKDOWN_SWATCH.length]
-}
-
 /**
  * A chart row: epoch-ms timestamp, its pre-formatted axis/tooltip label
  * (ThresholdLineChart reads a categorical `label` x-axis, same as
@@ -186,9 +165,16 @@ function seriesSlotKeys(series: TrendSeriesDef[]): Map<string, string> {
 /**
  * Pivot the API's series-of-points into ThresholdLineChart's row-per-point shape.
  *
- * Every series shares the same server-derived bucket grid, so timestamps align
- * and a missing sample simply leaves that key absent for the row (the chart
- * renders a gap rather than a false zero, via `connectNulls`).
+ * ThresholdLineChart's x-axis is categorical (one equal-width slot per row),
+ * so the row set must cover every *expected* bucket in the window — not just
+ * the ones the API returned — or a real gap (e.g. the server was down and
+ * the sampler wrote nothing) would vanish instead of taking its proportional
+ * share of the axis, visually compressing the surrounding samples together.
+ * `start_time`/`end_time`/`step_seconds` (server-clamped, so this is at most
+ * a few hundred rows even for the 7-day preset) pre-seed one slot per step;
+ * a bucket the API has no data for then stays `undefined`, which the chart
+ * renders as a break in the line via `connectNulls`, instead of a false
+ * zero.
  */
 function buildTrendRows(
   history: PipelineHistoryResponse | undefined,
@@ -198,14 +184,22 @@ function buildTrendRows(
   if (!history) return []
   const byTs = new Map<number, TrendRow>()
 
+  const stepMs = history.step_seconds * 1000
+  const startMs = new Date(history.start_time).getTime()
+  const endMs = new Date(history.end_time).getTime()
+  if (stepMs > 0 && Number.isFinite(startMs) && Number.isFinite(endMs)) {
+    for (let ts = startMs; ts <= endMs; ts += stepMs) {
+      byTs.set(ts, { ts, label: labelFormatter(ts) })
+    }
+  }
+
   for (const series of history.series) {
     const slotKey = slotKeys.get(series.name)
     if (!slotKey) continue
     for (const point of series.points) {
       const ts = new Date(point.time).getTime()
       if (Number.isNaN(ts)) continue
-      const row =
-        byTs.get(ts) ?? ({ ts, label: labelFormatter(ts) } as TrendRow)
+      const row = byTs.get(ts) ?? { ts, label: labelFormatter(ts) }
       row[slotKey] = point.value
       byTs.set(ts, row)
     }
@@ -298,7 +292,7 @@ function TrendPanel({
           >
             <span
               className="inline-block h-2 w-2 rounded-full"
-              style={{ backgroundColor: swatchColor(s.tone, i) }}
+              style={{ backgroundColor: seriesLineColor(s.tone, i) }}
             />
             {s.label}
           </span>

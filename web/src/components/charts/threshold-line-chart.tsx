@@ -25,6 +25,11 @@ import {
 } from '@/lib/chart-range-selection'
 import type { ChartDateRange } from '@/lib/chart-range-selection'
 import type { MetricTone } from './metric-sparkline'
+import {
+  SERIES_STROKE,
+  THRESHOLD_STROKE,
+  seriesLineColor,
+} from './chart-colors'
 
 export type ThresholdLineSeries = {
   /** Data key on each point — what to plot. */
@@ -115,36 +120,6 @@ interface ThresholdLineChartProps {
   /** Confirmed-but-not-yet-applied range to keep highlighted on the chart. */
   selectedRange?: ChartDateRange | null
   className?: string
-}
-
-const SERIES_STROKE: Record<
-  NonNullable<ThresholdLineSeries['tone']>,
-  string
-> = {
-  good: 'var(--chart-2)',
-  warn: 'var(--chart-3)',
-  poor: 'var(--chart-4)',
-  neutral: 'var(--chart-1)',
-  primary: 'var(--chart-1)',
-}
-
-// Breakdown lines don't carry good/warn/poor semantics — cycle the same five
-// theme chart vars every other chart in the app rotates through (see
-// AiAgentsTimelineChart's SERIES_COLORS) so a breakdown looks native in both
-// light and dark mode instead of inventing new hex colors.
-const BREAKDOWN_STROKES = [
-  'var(--chart-1)',
-  'var(--chart-2)',
-  'var(--chart-3)',
-  'var(--chart-4)',
-  'var(--chart-5)',
-]
-
-const THRESHOLD_STROKE: Record<MetricTone, string> = {
-  good: 'var(--chart-2)',
-  warn: 'var(--chart-3)',
-  poor: 'var(--chart-4)',
-  neutral: 'var(--muted-foreground)',
 }
 
 function SelectedRangeLabel({
@@ -366,10 +341,10 @@ export function ThresholdLineChart({
   seriesList.forEach((s, i) => {
     config[s.dataKey] = {
       label: s.label,
-      color: s.tone
-        ? SERIES_STROKE[s.tone]
-        : isMulti
-          ? BREAKDOWN_STROKES[i % BREAKDOWN_STROKES.length]
+      color: isMulti
+        ? seriesLineColor(s.tone, i)
+        : s.tone
+          ? SERIES_STROKE[s.tone]
           : SERIES_STROKE.primary,
     }
   })
