@@ -5,13 +5,22 @@ import { listContainerHistoryOptions } from '@/api/client/@tanstack/react-query.
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
+import { ContainerLogs } from '@/components/containers/ContainerLogs'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   currentRetainedContainers,
   retainedContainerLogsPath,
+  toggleRetainedContainerLogs,
 } from '@/lib/retained-compose-containers'
 import { useQuery } from '@tanstack/react-query'
-import { AlertTriangle, ExternalLink, ScrollText } from 'lucide-react'
+import {
+  AlertTriangle,
+  ChevronDown,
+  ChevronUp,
+  ExternalLink,
+  ScrollText,
+} from 'lucide-react'
+import { useState } from 'react'
 import { Link } from 'react-router'
 
 interface RetainedComposeContainersProps {
@@ -34,6 +43,9 @@ export function RetainedComposeContainers({
   deploymentId,
   deploymentStatus,
 }: RetainedComposeContainersProps) {
+  const [expandedContainerId, setExpandedContainerId] = useState<string | null>(
+    null
+  )
   const isFailed = deploymentStatus === 'failed'
   const { data, isPending, isError } = useQuery({
     ...listContainerHistoryOptions({
@@ -83,37 +95,82 @@ export function RetainedComposeContainers({
         </p>
 
         <div className="flex flex-col gap-2">
-          {retained.map((container) => (
-            <div
-              key={container.id}
-              className="flex flex-col gap-3 rounded-md border border-border/60 bg-background/70 px-3 py-3 sm:flex-row sm:items-center"
-            >
-              <ScrollText className="h-4 w-4 shrink-0 text-muted-foreground" />
-              <div className="min-w-0 flex-1">
-                <div className="truncate font-mono text-sm">
-                  {container.container_name}
+          {retained.map((container) => {
+            const isExpanded = expandedContainerId === container.container_id
+            const panelId = `retained-container-logs-${container.id}`
+
+            return (
+              <div
+                key={container.id}
+                className="overflow-hidden rounded-md border border-border/60 bg-background/70"
+              >
+                <div className="flex flex-col gap-3 px-3 py-3 sm:flex-row sm:items-center">
+                  <ScrollText className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate font-mono text-sm">
+                      {container.container_name}
+                    </div>
+                    {container.service_name && (
+                      <div className="text-xs text-muted-foreground">
+                        Compose service: {container.service_name}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      aria-expanded={isExpanded}
+                      aria-controls={panelId}
+                      onClick={() =>
+                        setExpandedContainerId((current) =>
+                          toggleRetainedContainerLogs(
+                            current,
+                            container.container_id
+                          )
+                        )
+                      }
+                    >
+                      {isExpanded ? 'Hide logs' : 'Show logs'}
+                      {isExpanded ? (
+                        <ChevronUp className="ml-2 h-3.5 w-3.5" />
+                      ) : (
+                        <ChevronDown className="ml-2 h-3.5 w-3.5" />
+                      )}
+                    </Button>
+                    <Button variant="ghost" size="icon" asChild>
+                      <Link
+                        to={retainedContainerLogsPath(
+                          projectSlug,
+                          environmentId,
+                          deploymentId,
+                          container.container_id
+                        )}
+                        aria-label={`Open full logs for ${container.container_name}`}
+                        title="Open full log view"
+                      >
+                        <ExternalLink className="h-3.5 w-3.5" />
+                      </Link>
+                    </Button>
+                  </div>
                 </div>
-                {container.service_name && (
-                  <div className="text-xs text-muted-foreground">
-                    Compose service: {container.service_name}
+
+                {isExpanded && (
+                  <div
+                    id={panelId}
+                    className="h-[24rem] border-t bg-background"
+                  >
+                    <ContainerLogs
+                      projectId={projectId.toString()}
+                      environmentId={environmentId.toString()}
+                      containerId={container.container_id}
+                      serviceName={container.service_name}
+                    />
                   </div>
                 )}
               </div>
-              <Button variant="outline" size="sm" asChild>
-                <Link
-                  to={retainedContainerLogsPath(
-                    projectSlug,
-                    environmentId,
-                    deploymentId,
-                    container.container_id
-                  )}
-                >
-                  View logs
-                  <ExternalLink className="ml-2 h-3.5 w-3.5" />
-                </Link>
-              </Button>
-            </div>
-          ))}
+            )
+          })}
         </div>
       </CardContent>
     </Card>

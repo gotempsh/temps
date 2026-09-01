@@ -6,6 +6,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   currentRetainedContainers,
   retainedContainerLogsPath,
+  toggleRetainedContainerLogs,
 } from './retained-compose-containers'
 
 describe('retained Compose container diagnostics', () => {
@@ -23,5 +24,15 @@ describe('retained Compose container diagnostics', () => {
     expect(retainedContainerLogsPath('my-project', 7, 42, 'container-id')).toBe(
       '/projects/my-project/environments/containers/container-id?env=7&deployment=42'
     )
+  })
+
+  test('opens one inline log stream at a time and closes it on a second click', () => {
+    expect(toggleRetainedContainerLogs(null, 'activepieces')).toBe(
+      'activepieces'
+    )
+    expect(toggleRetainedContainerLogs('activepieces', 'postgres')).toBe(
+      'postgres'
+    )
+    expect(toggleRetainedContainerLogs('postgres', 'postgres')).toBeNull()
   })
 })

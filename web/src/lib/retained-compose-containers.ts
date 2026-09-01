@@ -15,3 +15,12 @@ export function retainedContainerLogsPath(
 ): string {
   return `/projects/${projectSlug}/environments/containers/${containerId}?env=${environmentId}&deployment=${deploymentId}`
 }
+
+export function toggleRetainedContainerLogs(
+  expandedContainerId: string | null,
+  selectedContainerId: string
+): string | null {
+  return expandedContainerId === selectedContainerId
+    ? null
+    : selectedContainerId
+}
