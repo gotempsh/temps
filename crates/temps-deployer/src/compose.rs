@@ -5019,6 +5019,7 @@ impl ComposeExecutor {
         // mappings (`web: {image: nginx}`), anchors (`web: &app`), and merge
         // keys are all hardened, not just lines that end in `:`.
         let services = self.parse_service_names_yaml(compose_content);
+        let image_owned_init_services = Self::services_with_image_owned_init(compose_content);
 
         let sandboxed_services = services
             .iter()
@@ -5053,10 +5054,40 @@ impl ComposeExecutor {
             // behavior, not a gap.
             override_yaml.push_str("      - no-new-privileges:true\n");
             override_yaml.push_str("    pids_limit: 512\n");
-            override_yaml.push_str("    init: true\n");
+            // An explicit `init: false` is a compatibility contract: the
+            // image owns PID 1 (commonly s6-overlay) and Docker's init wrapper
+            // would make that entrypoint fail. Keep every other sandbox guard
+            // instead of forcing the user to disable the entire sandbox.
+            if !image_owned_init_services.contains(service.as_str()) {
+                override_yaml.push_str("    init: true\n");
+            }
         }
 
         override_yaml
+    }
+
+    fn services_with_image_owned_init(compose_content: &str) -> std::collections::HashSet<String> {
+        let Ok(mut root) = serde_yaml::from_str::<Value>(compose_content) else {
+            return std::collections::HashSet::new();
+        };
+        if root.apply_merge().is_err() {
+            return std::collections::HashSet::new();
+        }
+        root.get("services")
+            .and_then(Value::as_mapping)
+            .into_iter()
+            .flat_map(Mapping::iter)
+            .filter_map(|(name, definition)| {
+                let owns_init = definition
+                    .as_mapping()
+                    .and_then(|service| service.get("init"))
+                    .and_then(Value::as_bool)
+                    == Some(false);
+                owns_init
+                    .then(|| name.as_str().map(str::to_string))
+                    .flatten()
+            })
+            .collect()
     }
 
     /// Generate a docker-compose override that adds Temps labels to every service.
@@ -6598,6 +6629,38 @@ services:
             executor.generate_security_override(compose, &[], &["webserver".to_string()]);
 
         assert!(override_yaml.is_empty());
+    }
+
+    #[test]
+    fn test_explicit_init_false_keeps_sandbox_but_does_not_wrap_image_init() {
+        // Constructing the Bollard client does not contact the daemon. Keep
+        // this pure YAML-generation regression mandatory in Docker-less CI.
+        let executor = ComposeExecutor::new(
+            Arc::new(Docker::connect_with_defaults().expect("construct Docker client")),
+            PathBuf::from("/tmp/test"),
+        );
+        let compose = r#"
+x-image-init: &image-init
+  init: false
+services:
+  budge:
+    image: lscr.io/linuxserver/budge:latest
+    <<: *image-init
+  worker:
+    image: alpine:latest
+"#;
+
+        let override_yaml =
+            executor.generate_security_override(compose, &["budge".to_string()], &[]);
+        let override_value: Value = serde_yaml::from_str(&override_yaml).unwrap();
+        let budge = override_value["services"]["budge"].as_mapping().unwrap();
+        let worker = override_value["services"]["worker"].as_mapping().unwrap();
+
+        assert_eq!(budge.get("init"), None);
+        assert_eq!(budge.get("pids_limit").and_then(Value::as_u64), Some(512));
+        assert!(budge.contains_key("cap_drop"));
+        assert!(budge.contains_key("cap_add"));
+        assert_eq!(worker.get("init").and_then(Value::as_bool), Some(true));
     }
 
     #[test]

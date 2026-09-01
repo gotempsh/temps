@@ -1006,6 +1006,7 @@ pub fn prepare_template(
     normalize_project_owned_names(&mut root, &mut transformations);
     externalize_literal_credentials(&mut root, &mut transformations);
     normalize_project_storage_bind_mounts(&mut root, &mut transformations);
+    preserve_image_owned_init_processes(&mut root, &mut transformations);
     normalize_known_service_healthchecks(&mut root, &mut transformations);
     let mut compatibility_issues = compatibility_issues(&root);
     let requires_host_access = requires_host_access(&root);
@@ -1289,6 +1290,55 @@ fn normalized_image_repository(image: &str) -> String {
         _ => image,
     }
     .to_ascii_lowercase()
+}
+
+/// LinuxServer images use s6-overlay as their container init and require it to
+/// remain PID 1. Temps normally asks Docker Compose to inject a tiny init
+/// process for zombie reaping, but doing that in front of s6 makes the image
+/// exit immediately with `s6-overlay-suexec: fatal: can only run as pid 1`.
+///
+/// Persist the exception in the copied Compose source rather than coupling the
+/// deployment runtime to the Coolify catalog. The project remains editable,
+/// the setting survives redeploys, and users can apply the same `init: false`
+/// configuration to their own s6-based Compose services.
+fn preserve_image_owned_init_processes(
+    root: &mut YamlValue,
+    transformations: &mut Vec<TemplateTransformation>,
+) {
+    let Some(services) = root.get_mut("services").and_then(YamlValue::as_mapping_mut) else {
+        return;
+    };
+    for (name, definition) in services {
+        let service_name = name.as_str().unwrap_or("service");
+        let Some(service) = definition.as_mapping_mut() else {
+            continue;
+        };
+        let uses_image_owned_init = service
+            .get("image")
+            .and_then(YamlValue::as_str)
+            .map(normalized_image_repository)
+            .is_some_and(|repository| is_linuxserver_image(&repository));
+        if !uses_image_owned_init {
+            continue;
+        }
+        service.insert(
+            YamlValue::String("init".to_string()),
+            YamlValue::Bool(false),
+        );
+        transformations.push(TemplateTransformation {
+            code: "preserve_image_init",
+            description: format!(
+                "Kept service '{service_name}' image-owned s6 init process as PID 1"
+            ),
+        });
+    }
+}
+
+fn is_linuxserver_image(repository: &str) -> bool {
+    repository.starts_with("lscr.io/linuxserver/")
+        || repository.starts_with("ghcr.io/linuxserver/")
+        || repository.starts_with("docker.io/linuxserver/")
+        || repository.starts_with("linuxserver/")
 }
 
 /// Correct known upstream probes that only prove a bundled web server is up.
@@ -2696,6 +2746,53 @@ mod tests {
                 && variable.kind == TemplateVariableKind::GeneratedPassword64
                 && variable.kind.is_secret()
         }));
+    }
+
+    #[test]
+    fn linuxserver_templates_keep_s6_as_pid_one() {
+        let prepared = prepare_template(
+            "budge",
+            &template(
+                r#"services:
+  budge:
+    image: lscr.io/linuxserver/budge:latest
+    init: true
+    environment:
+      - SERVICE_URL_BUDGE_80
+    expose:
+      - 80
+"#,
+                Some("80"),
+            ),
+        )
+        .expect("LinuxServer template should be normalized");
+
+        let compose: YamlValue = serde_yaml::from_str(&prepared.compose).unwrap();
+        assert_eq!(compose["services"]["budge"]["init"].as_bool(), Some(false));
+        assert!(prepared.transformations.iter().any(|transformation| {
+            transformation.code == "preserve_image_init"
+                && transformation.description.contains("budge")
+        }));
+        assert!(prepared.installable());
+    }
+
+    #[test]
+    fn recognizes_supported_linuxserver_image_repositories() {
+        for image in [
+            "lscr.io/linuxserver/budge:latest",
+            "ghcr.io/linuxserver/budge:latest",
+            "docker.io/linuxserver/budge:latest",
+            "linuxserver/budge:latest",
+        ] {
+            assert!(is_linuxserver_image(&normalized_image_repository(image)));
+        }
+        for image in [
+            "example.com/linuxserver/budge:latest",
+            "lscr.io/not-linuxserver/budge:latest",
+            "linuxserver.example/budge:latest",
+        ] {
+            assert!(!is_linuxserver_image(&normalized_image_repository(image)));
+        }
     }
 
     #[test]
