@@ -157,6 +157,25 @@ async fn nft_table_exists(family: &str, name: &str) -> bool {
         .unwrap_or(false)
 }
 
+async fn nft_table_contains(family: &str, name: &str, fragments: &[&str]) -> bool {
+    let output = Command::new("nft")
+        .args(["list", "table", family, name])
+        .output()
+        .await;
+    matches!(output, Ok(output) if output.status.success() && {
+        let rules = String::from_utf8_lossy(&output.stdout);
+        fragments.iter().all(|fragment| rules.contains(fragment))
+    })
+}
+
+async fn iptables_chain_contains(chain: &str, fragments: &[&str]) -> bool {
+    let output = Command::new("iptables").args(["-S", chain]).output().await;
+    matches!(output, Ok(output) if output.status.success() && {
+        let rules = String::from_utf8_lossy(&output.stdout);
+        fragments.iter().all(|fragment| rules.contains(fragment))
+    })
+}
+
 async fn fdb_has_entry(dev: &str, dst: &str) -> bool {
     let out = Command::new("bridge")
         .args(["fdb", "show", "dev", dev])
@@ -183,12 +202,61 @@ async fn docker_network_exists(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+async fn docker_container_running(name: &str) -> bool {
+    let output = Command::new("docker")
+        .args(["inspect", "-f", "{{.State.Running}}", name])
+        .output()
+        .await;
+    matches!(
+        output,
+        Ok(output) if output.status.success()
+            && String::from_utf8_lossy(&output.stdout).trim() == "true"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Per-test fixture: ensure clean state before AND after each test
 // ---------------------------------------------------------------------------
 
 async fn cleanup_all() {
     // Best-effort tear-down of anything a previous test may have left.
+    while Command::new("iptables")
+        .args([
+            "-C",
+            "DOCKER-USER",
+            "-m",
+            "comment",
+            "--comment",
+            "temps-overlay-forward-hook-v1",
+            "-j",
+            "TEMPS_OVERLAY_FORWARD",
+        ])
+        .output()
+        .await
+        .is_ok_and(|output| output.status.success())
+    {
+        let _ = Command::new("iptables")
+            .args([
+                "-D",
+                "DOCKER-USER",
+                "-m",
+                "comment",
+                "--comment",
+                "temps-overlay-forward-hook-v1",
+                "-j",
+                "TEMPS_OVERLAY_FORWARD",
+            ])
+            .output()
+            .await;
+    }
+    let _ = Command::new("iptables")
+        .args(["-F", "TEMPS_OVERLAY_FORWARD"])
+        .output()
+        .await;
+    let _ = Command::new("iptables")
+        .args(["-X", "TEMPS_OVERLAY_FORWARD"])
+        .output()
+        .await;
     let _ = Command::new("docker")
         .args(["network", "rm", "temps-overlay"])
         .output()
@@ -236,6 +304,39 @@ async fn fixture() -> (Env, NetworkManager, Cleanup) {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn detect_underlay_device_matches_default_route() {
+    // Regression test for the bug where the underlay device was hardcoded
+    // to "eth0" everywhere, breaking any host whose default-route
+    // interface has a different name (e.g. cloud "predictable naming"
+    // like enp6s0/ens5). Inside the DinD harness the default route goes
+    // out `TEMPS_IT_UNDERLAY_DEV` (or "eth0" if unset), so auto-detection
+    // must land on the same device the rest of the suite already assumes.
+    cleanup_all().await;
+    let env = Env::from_env();
+
+    let detected = temps_network::detect_underlay_device()
+        .await
+        .expect("detect_underlay_device");
+
+    assert_eq!(detected, env.underlay_dev);
+}
+
+#[tokio::test]
+async fn detect_underlay_mtu_matches_kernel_link() {
+    cleanup_all().await;
+    let env = Env::from_env();
+    let expected = link_mtu(&env.underlay_dev)
+        .await
+        .expect("underlay link must report an MTU");
+
+    let detected = temps_network::detect_underlay_mtu(&env.underlay_dev)
+        .await
+        .expect("detect_underlay_mtu");
+
+    assert_eq!(detected, expected);
+}
+
+#[tokio::test]
 async fn bootstrap_creates_all_kernel_state() {
     let (env, mgr, _cleanup) = fixture().await;
     let alloc = env.alloc();
@@ -272,6 +373,38 @@ async fn bootstrap_creates_all_kernel_state() {
         nft_table_exists("inet", "temps_network").await,
         "nftables table must exist"
     );
+    assert!(
+        nft_table_contains(
+            "inet",
+            "temps_network",
+            &[
+                &env.peer_cidr.to_string(),
+                &env.local_cidr.to_string(),
+                &env.local_bridge_ip.to_string(),
+                "snat",
+            ]
+        )
+        .await,
+        "remote overlay traffic must be SNATed to the local bridge so a dual-network service replies over VXLAN"
+    );
+    assert!(
+        iptables_chain_contains(
+            "TEMPS_OVERLAY_FORWARD",
+            &[
+                "-m physdev",
+                "--physdev-is-bridged",
+                "--physdev-in vxlan-temps0",
+                &env.peer_cidr.to_string(),
+                &env.local_cidr.to_string(),
+            ]
+        )
+        .await,
+        "Docker's default-DROP FORWARD chain must permit scoped VXLAN ingress"
+    );
+    assert!(
+        !iptables_chain_contains("TEMPS_OVERLAY_FORWARD", &["-o vxlan-temps0"]).await,
+        "Temps must not bypass Docker isolation for locally spoofed VXLAN egress"
+    );
 }
 
 #[tokio::test]
@@ -291,6 +424,43 @@ async fn bootstrap_is_idempotent() {
         .expect("second bootstrap");
     assert!(link_exists("br-temps0").await);
     assert!(fdb_has_entry("vxlan-temps0", &env.peer_underlay.to_string()).await);
+}
+
+#[tokio::test]
+async fn bootstrap_rejects_existing_vxlan_with_incompatible_topology() {
+    let (env, mgr, _cleanup) = fixture().await;
+    let output = Command::new("ip")
+        .args([
+            "link",
+            "add",
+            "vxlan-temps0",
+            "type",
+            "vxlan",
+            "id",
+            "99",
+            "dev",
+            &env.underlay_dev,
+            "dstport",
+            "4789",
+            "nolearning",
+        ])
+        .output()
+        .await
+        .expect("create incompatible VXLAN device");
+    assert!(
+        output.status.success(),
+        "create incompatible VXLAN device: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let error = mgr
+        .bootstrap(env.alloc(), vec![])
+        .await
+        .expect_err("bootstrap must not adopt an incompatible VXLAN device");
+    let message = error.to_string();
+    assert!(message.contains("existing VXLAN topology does not match"));
+    assert!(message.contains("vni=42"));
+    assert!(message.contains("id 99"));
 }
 
 #[tokio::test]
@@ -373,6 +543,81 @@ async fn reconcile_peers_noop_on_unchanged() {
 }
 
 #[tokio::test]
+async fn bootstrap_migrates_the_exact_legacy_forwarding_rule() {
+    let (env, mgr, _cleanup) = fixture().await;
+    let alloc = env.alloc();
+    let peer = env.peer();
+    mgr.bootstrap(alloc.clone(), vec![peer.clone()])
+        .await
+        .expect("initial bootstrap");
+
+    let peer_cidr = peer.compute_cidr.to_string();
+    let local_cidr = alloc.compute_cidr.to_string();
+    let current_rule = [
+        "-D",
+        "TEMPS_OVERLAY_FORWARD",
+        "-m",
+        "physdev",
+        "--physdev-is-bridged",
+        "--physdev-in",
+        "vxlan-temps0",
+        "-s",
+        &peer_cidr,
+        "-d",
+        &local_cidr,
+        "-m",
+        "comment",
+        "--comment",
+        "temps-overlay-forward-rule-v1",
+        "-j",
+        "ACCEPT",
+    ];
+    let deleted = Command::new("iptables")
+        .args(current_rule)
+        .output()
+        .await
+        .expect("delete current forwarding rule");
+    assert!(deleted.status.success());
+
+    let legacy_rule = [
+        "-A",
+        "TEMPS_OVERLAY_FORWARD",
+        "-i",
+        "vxlan-temps0",
+        "-s",
+        &peer_cidr,
+        "-d",
+        &local_cidr,
+        "-m",
+        "comment",
+        "--comment",
+        "temps-overlay-forward-rule-v1",
+        "-j",
+        "ACCEPT",
+    ];
+    let appended = Command::new("iptables")
+        .args(legacy_rule)
+        .output()
+        .await
+        .expect("append legacy forwarding rule");
+    assert!(appended.status.success());
+
+    mgr.bootstrap(alloc, vec![peer])
+        .await
+        .expect("upgrade bootstrap must migrate the owned legacy rule");
+
+    let output = Command::new("iptables")
+        .args(["-S", "TEMPS_OVERLAY_FORWARD"])
+        .output()
+        .await
+        .expect("inspect migrated forwarding rules");
+    assert!(output.status.success());
+    let rules = String::from_utf8_lossy(&output.stdout);
+    assert!(rules.contains("--physdev-in vxlan-temps0"));
+    assert!(!rules.contains(" -i vxlan-temps0"));
+}
+
+#[tokio::test]
 async fn teardown_removes_everything_and_is_idempotent() {
     let (env, mgr, _cleanup) = fixture().await;
     mgr.bootstrap(env.alloc(), vec![env.peer()])
@@ -386,6 +631,10 @@ async fn teardown_removes_everything_and_is_idempotent() {
     assert!(
         !nft_table_exists("inet", "temps_network").await,
         "nftables table must be gone"
+    );
+    assert!(
+        !iptables_chain_contains("TEMPS_OVERLAY_FORWARD", &[]).await,
+        "owned Docker forwarding chain must be gone"
     );
 
     // Second teardown must succeed silently.
@@ -499,6 +748,62 @@ async fn bridge_address_outside_cidr_rejected() {
     ));
 }
 
+#[tokio::test]
+async fn full_pool_collision_is_rejected_without_partial_kernel_state() {
+    if std::env::var("TEMPS_IT_PHASE_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    cleanup_all().await;
+    let env = Env::from_env();
+    let pool: Ipv4Net = parse_env("TEMPS_IT_CLUSTER_POOL");
+    let existing_cidr =
+        std::env::var("TEMPS_IT_EXISTING_CIDR").unwrap_or_else(|_| "10.240.99.0/24".into());
+    let existing = "temps-it-existing-cidr";
+    let _ = Command::new("docker")
+        .args(["network", "rm", existing])
+        .output()
+        .await;
+    let output = Command::new("docker")
+        .args([
+            "network",
+            "create",
+            "--driver",
+            "bridge",
+            "--subnet",
+            &existing_cidr,
+            existing,
+        ])
+        .output()
+        .await
+        .expect("create pre-existing Docker CIDR");
+    assert!(
+        output.status.success(),
+        "create pre-existing CIDR: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let docker = bollard::Docker::connect_with_local_defaults().expect("docker connect");
+    let error = temps_network::docker::preflight_network_for_pool(
+        &docker,
+        &env.config(),
+        &env.alloc(),
+        pool,
+    )
+    .await
+    .expect_err("the full cluster pool must reject an occupied future peer subnet");
+    assert!(error.to_string().contains(existing));
+    assert!(!link_exists("br-temps0").await);
+    assert!(!link_exists("vxlan-temps0").await);
+    assert!(!docker_network_exists("temps-overlay").await);
+    assert!(!nft_table_exists("inet", "temps_network").await);
+    assert!(!route_exists(&env.peer_cidr.to_string()).await);
+
+    let _ = Command::new("docker")
+        .args(["network", "rm", existing])
+        .output()
+        .await;
+}
+
 // ---------------------------------------------------------------------------
 // Cross-host scenario: a "bootstrap_only" test the DinD runner triggers
 // once per node so each side ends up bootstrapped with its peer pointing
@@ -532,4 +837,93 @@ async fn bootstrap_only() {
     temps_network::docker::ensure_network(&docker, &cfg, &alloc)
         .await
         .expect("ensure docker network");
+}
+
+/// Production-shaped lifecycle regression: the control plane starts alone,
+/// remains alive, and reconciles a worker which physically starts later.
+///
+/// The DinD runner coordinates the two nodes with marker files in the shared
+/// workspace. Keeping this test process alive is intentional: constructing a
+/// second manager after the worker joins would only prove restart recovery,
+/// not live late-worker reconciliation.
+#[tokio::test]
+#[cfg(feature = "control_plane")]
+async fn control_plane_stays_running_and_reconciles_worker_later() {
+    if std::env::var("TEMPS_IT_PHASE_TESTS").as_deref() != Ok("1") {
+        return;
+    }
+    let env = Env::from_env();
+    let pool: Ipv4Net = parse_env("TEMPS_IT_CLUSTER_POOL");
+    let ready_file = parse_env::<String>("TEMPS_IT_CONTROL_PLANE_READY_FILE");
+    let worker_file = parse_env::<String>("TEMPS_IT_WORKER_READY_FILE");
+    let existing_app_network = parse_env::<String>("TEMPS_IT_EXISTING_APP_NETWORK");
+    let existing_app_cidr = parse_env::<String>("TEMPS_IT_EXISTING_APP_CIDR");
+    let existing_app_container = parse_env::<String>("TEMPS_IT_EXISTING_APP_CONTAINER");
+    let existing_custom_route = parse_env::<String>("TEMPS_IT_EXISTING_CUSTOM_ROUTE");
+    cleanup_all().await;
+    let _ = tokio::fs::remove_file(&ready_file).await;
+    let _ = tokio::fs::remove_file(&worker_file).await;
+    let cfg = env.config();
+    assert!(
+        docker_network_exists(&existing_app_network).await,
+        "the pre-existing control-plane app network must exist before setup"
+    );
+    assert!(route_exists(&existing_app_cidr).await);
+    assert!(route_exists(&existing_custom_route).await);
+    assert!(docker_container_running(&existing_app_container).await);
+    temps_network::preflight_compute_pool_routes(&cfg, pool)
+        .await
+        .expect("safe cluster pool must not overlap host routes");
+    let alloc = env.alloc();
+    let mgr = NetworkManager::new(cfg.clone()).expect("manager new");
+    mgr.bootstrap(alloc.clone(), vec![])
+        .await
+        .expect("bootstrap control plane without workers");
+    let docker = bollard::Docker::connect_with_local_defaults().expect("docker connect");
+    temps_network::docker::ensure_network(&docker, &cfg, &alloc)
+        .await
+        .expect("ensure control-plane Docker overlay");
+    assert!(!route_exists(&env.peer_cidr.to_string()).await);
+    assert!(docker_network_exists(&existing_app_network).await);
+    assert!(route_exists(&existing_app_cidr).await);
+    assert!(route_exists(&existing_custom_route).await);
+    assert!(docker_container_running(&existing_app_container).await);
+    tokio::fs::write(&ready_file, b"ready\n")
+        .await
+        .expect("publish control-plane ready marker");
+
+    // Node B is created only after this marker. A cold CI runner may need to
+    // install and compile Rust in that new container, which is not a network
+    // convergence failure and must not make this lifecycle test flaky.
+    let worker_ready_timeout = std::env::var("TEMPS_IT_WORKER_READY_TIMEOUT_SECS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(900);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(worker_ready_timeout);
+    while tokio::fs::metadata(&worker_file).await.is_err() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "worker did not become ready before the lifecycle-test deadline"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    let peer = env.peer();
+    let changed = temps_network::control_plane::reconcile_peer_snapshot(
+        &mgr,
+        &docker,
+        &cfg,
+        &alloc,
+        pool,
+        vec![peer.clone()],
+    )
+    .await
+    .expect("reconcile late worker");
+    assert!(changed);
+    assert!(route_exists(&peer.compute_cidr.to_string()).await);
+    assert!(fdb_has_entry("vxlan-temps0", &peer.underlay_address.to_string()).await);
+    assert!(docker_network_exists(&existing_app_network).await);
+    assert!(route_exists(&existing_app_cidr).await);
+    assert!(route_exists(&existing_custom_route).await);
+    assert!(docker_container_running(&existing_app_container).await);
 }

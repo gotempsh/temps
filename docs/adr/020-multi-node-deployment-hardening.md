@@ -105,7 +105,7 @@ Adopt a **zero-trust posture for the multi-node fabric**: treat every node as a 
 
 Each enforcement switch ships **observe-then-enforce**:
 
-- **Phase A (ship, default off):** new code paths land; `require_mtls`, `enforce_node_isolation` default `false`; the CP auto-issues a CA and per-node certs at the next reconnect so already-joined nodes silently gain mTLS material without operator action. Legacy shared token still accepted.
+- **Phase A (ship):** fresh installations default `require_mtls` to `true`; enrollment is fail-closed and requires a worker-generated CSR. Existing serialized settings that predate the flag continue to deserialize it as `false`, so an upgrade does not unexpectedly disconnect an established fleet. Legacy workers remain on HTTP until the operator enables mTLS and re-enrolls them; private keys are always generated and retained by the worker rather than silently provisioned by the control plane.
 - **Phase B (warn):** the CP surfaces which nodes still lack mTLS / are on the legacy token; admin UI nudges rotation.
 - **Phase C (enforce):** once all nodes report ready, the operator flips `require_mtls` / `enforce_node_isolation` / `legacy_shared_token_enabled=false`. New installs default to enforced.
 

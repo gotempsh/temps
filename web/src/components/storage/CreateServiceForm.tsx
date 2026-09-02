@@ -91,11 +91,11 @@ function BackupWarning({
           Atomic backups only
         </p>
         <p className="text-xs text-amber-700 dark:text-amber-300">
-          This image does not include WAL-G. Backups will buffer the entire
-          database in memory before uploading to S3. For large databases this
-          can cause out-of-memory failures and service interruptions. Use the
-          default image or a <code className="font-mono">gotempsh/</code> image
-          for streaming backups with constant memory usage.
+          This image does not include WAL-G. Logical backups must stage a
+          complete database dump on local disk before uploading to S3. For large
+          databases this can exhaust disk space and interrupt backup jobs. Use
+          the default image or a <code className="font-mono">gotempsh/</code>{' '}
+          image for streaming backups with constant memory usage.
         </p>
       </div>
     </div>

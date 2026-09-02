@@ -5848,6 +5848,7 @@ View project analytics
 
 **Subcommands:**
 
+- `keys` - Manage analytics ingest keys (pa_...) for apps Temps does not deploy
 - `overview` (`o`) - Show analytics dashboard overview
 - `top` - Show breakdown by dimension: pages, referrers, browsers, os, devices, countries, regions, cities, channels, events, languages, utm_source, utm_medium, utm_campaign
 - `funnels` - Show funnel conversion metrics for all funnels
@@ -5862,6 +5863,89 @@ View project analytics
 - `api-path` - Show client IPs calling one path with latency and error analytics
 - `api-query` - Run a typed multi-dimensional API traffic aggregation
 - `api-summary` - Show an AI-generated summary of API traffic from /api-analytics/summary (requires AI Assistance to be configured and enabled on the project)
+
+### `analytics keys`
+
+Manage analytics ingest keys (pa_...) for apps Temps does not deploy
+
+**Subcommands:**
+
+- `list` (`ls`) - List analytics ingest keys for a project
+- `create` (`add`) - Mint a new analytics ingest key
+- `update` - Update an ingest key's label, origin allowlist, or rate limit
+- `rotate` - Replace an ingest key value, keeping the same row and scope
+- `revoke` - Revoke (deactivate) an analytics ingest key
+
+#### `analytics keys list` (alias: `ls`)
+
+List analytics ingest keys for a project
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys create` (alias: `add`)
+
+Mint a new analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `-n, --name <name>` | Operator-facing label for the key | - | No |
+| `--environment-id <id>` | Scope the key to one environment (omit for a project-wide key) | - | No |
+| `--allowed-origins <origins...>` | Browser origins allowed to use this key (omit to allow any origin) | - | No |
+| `--rate-limit <n>` | Requests per minute (omit for the server default; 0 or less for unlimited) | - | No |
+| `-y, --yes` | Skip confirmation prompts (for automation) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys update`
+
+Update an ingest key's label, origin allowlist, or rate limit
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-n, --name <name>` | New operator-facing label | - | No |
+| `--allowed-origins <origins...>` | Replace the origin allowlist with these origins | - | No |
+| `--clear-origins` | Clear the origin allowlist (allow any origin) | - | No |
+| `--rate-limit <n>` | New requests-per-minute limit | - | No |
+| `--clear-rate-limit` | Clear the rate limit (unlimited) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys rotate`
+
+Replace an ingest key value, keeping the same row and scope
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `analytics keys revoke`
+
+Revoke (deactivate) an analytics ingest key
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <project>` | Project slug or ID | - | No |
+| `--key-id <id>` | Analytics ingest key ID | - | Yes |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation (alias for --force) | - | No |
 
 ### `analytics overview` (alias: `o`)
 
@@ -7245,8 +7329,12 @@ Temps Cloud
 - `login` - Login to Temps Cloud
 - `logout` - Logout from Temps Cloud
 - `whoami` - Show current Temps Cloud account
+- `status` - Show this self-hosted instance's Temps Cloud link
+- `connect` - Connect this self-hosted instance using an enrollment code
+- `disconnect` - Disconnect this self-hosted instance from Temps Cloud
 - `vps` - Manage cloud VPS instances
 - `billing` - Manage Temps Cloud billing and subscription
+- `telemetry` - Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
 
 ### `cloud login`
 
@@ -7259,6 +7347,37 @@ Logout from Temps Cloud
 ### `cloud whoami`
 
 Show current Temps Cloud account
+
+### `cloud status`
+
+Show this self-hosted instance's Temps Cloud link
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
+
+### `cloud connect`
+
+Connect this self-hosted instance using an enrollment code
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--code <code>` | Single-use enrollment code from Temps Cloud | - | Yes |
+
+### `cloud disconnect`
+
+Disconnect this self-hosted instance from Temps Cloud
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `cloud vps`
 
@@ -7398,6 +7517,100 @@ Upgrade your plan
 |------|-------------|---------|----------|
 | `--yearly` | Use yearly billing cycle (default: monthly) | - | No |
 | `--no-browser` | Don't open browser, just show the URL | - | No |
+
+### `cloud telemetry`
+
+Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
+
+**Subcommands:**
+
+- `write-mode` - Read or change a project’s telemetry write mode
+- `status` - Instance-wide Cloud telemetry write status: queue depth, gaps, and whether the local span store is still required
+- `bulk-switch` - Switch many projects to Temps Cloud and ship their history in one job — estimates first, then asks
+- `bulk-status` - Show the Temps Cloud activation running on this instance — progress, ETA, skips and failures
+- `bulk-cancel` - Stop a Temps Cloud activation at its next chunk boundary
+
+#### `cloud telemetry write-mode`
+
+Read or change a project’s telemetry write mode
+
+**Subcommands:**
+
+- `get` - Show where a project’s spans are written, what is queued, and any gaps
+- `set` - Set the write mode to "local" (stored on this instance) or "cloud" (written to Temps Cloud, not stored here)
+
+##### `cloud telemetry write-mode get`
+
+Show where a project’s spans are written, what is queued, and any gaps
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `cloud telemetry write-mode set`
+
+Set the write mode to "local" (stored on this instance) or "cloud" (written to Temps Cloud, not stored here)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug>` | Project slug | - | No |
+| `--fidelity <tier>` | Also set Cloud telemetry fidelity: metered or queryable. "cloud" requires "queryable". | - | No |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cloud telemetry status`
+
+Instance-wide Cloud telemetry write status: queue depth, gaps, and whether the local span store is still required
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cloud telemetry bulk-switch`
+
+Switch many projects to Temps Cloud and ship their history in one job — estimates first, then asks
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--all` | Every project still storing its spans on this instance. Projects already on Temps Cloud are not included. | - | No |
+| `-p, --project <id>` | A project id to switch. Repeatable. Cannot be combined with --all. | `` | No |
+| `--from <timestamp>` | Start of the history window to ship (RFC 3339). Defaults to the oldest span local retention can still be holding. | - | No |
+| `--to <timestamp>` | End of the history window to ship (RFC 3339). Defaults to now. | - | No |
+| `-y, --yes` | Skip the confirmation. The estimate is still computed and printed. | - | No |
+| `--watch` | Follow the job until it finishes | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cloud telemetry bulk-status`
+
+Show the Temps Cloud activation running on this instance — progress, ETA, skips and failures
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--watch` | Follow the job until it finishes | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cloud telemetry bulk-cancel`
+
+Stop a Temps Cloud activation at its next chunk boundary
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
 
 
 ---

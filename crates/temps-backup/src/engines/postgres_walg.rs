@@ -30,6 +30,7 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{error, info, warn};
 
+use super::dispatch::service_container_name;
 use super::ring_buffer::RingBuffer;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
@@ -137,10 +138,13 @@ impl BackupEngine for PostgresWalgEngine {
                 reason: format!("decrypt secret key: {}", e),
             })?;
 
-        let container_name = format!("postgres-{}", service.name);
+        let session_token = v2_common::decrypt_session_token(&s3_source, &deps.encryption_service)?;
+
+        let container_name = service_container_name(&service);
         let s3_credentials = temps_providers::externalsvc::S3Credentials {
             access_key_id: access_key.clone(),
             secret_key: secret_key.clone(),
+            session_token: session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -209,6 +213,11 @@ impl BackupEngine for PostgresWalgEngine {
             "WALG_UPLOAD_QUEUE=2".to_string(),
             "WALG_TAR_SIZE_THRESHOLD=134217728".to_string(),
         ];
+        // Absent unless this source holds a temporary credential, so a
+        // long-lived one produces exactly the environment it did before.
+        walg_env.extend(temps_providers::externalsvc::aws_session_token_env(
+            session_token.as_deref(),
+        ));
         walg_env.extend(v2_common::walg_identity_env(&backup_uuid));
         if let Some(ep) = container_endpoint {
             let url = if ep.starts_with("http") {

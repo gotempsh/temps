@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Temps Cloud:** Connect a self-hosted instance to the optional managed control plane in two steps from Settings, mirror OpenTelemetry spans without putting the managed service on the ingest path, and surface connection, buffering, and credential health through the console and CLI.
+- **providers:** Reset all accumulated `pg_stat_statements` statistics from the Query Performance page through a write-protected, audited API with explicit destructive-action confirmation.
+- **providers:** `pg_stat_statements`-based slow-query monitoring for user-provisioned Postgres services — a dedicated "Query Performance" page (sortable, paginated, with a per-query detail view) alongside a `GET /external-services/{id}/pg-stat-statements/slow-queries` endpoint and a `temps services slow-queries --id <id>` CLI command ([#460](https://github.com/gotempsh/temps/pull/460))
+- **providers:** self-service "Enable & Restart" action to load `pg_stat_statements` on standalone Postgres services that predate this feature — clustered/HA services are rejected with a clear error instead, since a blind single-container restart bypasses controlled failover ([#460](https://github.com/gotempsh/temps/pull/460))
+- **web:** date/time range picker (15m/1h/24h/7d + custom) on the service Logs screen, and a `temps services logs --id <id>` CLI command with `--from`/`--to` filtering ([#460](https://github.com/gotempsh/temps/pull/460))
 - **funnels:** Add time-range shortcuts and show exact completion seconds ([#750](https://github.com/gotempsh/temps/issues/750))
 - **projects:** Always show a health indicator on the project card ([#747](https://github.com/gotempsh/temps/issues/747))
 

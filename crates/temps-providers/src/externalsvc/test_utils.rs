@@ -192,8 +192,11 @@ mod docker_utils {
                 bucket_path: "".to_string(),
                 access_key_id: access_key.to_string(),
                 secret_key: secret_key.to_string(),
+                session_token: None,
+                credentials_expire_at: None,
                 force_path_style: Some(true),
                 is_default: false,
+                managed_by_cloud: false,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
             };
@@ -229,6 +232,7 @@ mod docker_utils {
             super::super::S3Credentials {
                 access_key_id: self.access_key.clone(),
                 secret_key: self.secret_key.clone(),
+                session_token: None,
                 region: "us-east-1".to_string(),
                 endpoint: Some(format!("http://localhost:{}", self.port)),
                 bucket_name: self.bucket_name.clone(),

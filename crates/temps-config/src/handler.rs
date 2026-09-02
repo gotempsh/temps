@@ -18,18 +18,21 @@ use temps_auth::{permission_guard, RequireAuth};
 use temps_core::error_builder::ErrorBuilder;
 use temps_core::{
     problemdetails::Problem, AiChatLimitsSettings, AiConfigSettings, AppSettings, AuditContext,
-    AuditLogger, AuditOperation, BuildLimitsSettings, ClusterDnsSettings, ContainerLogSettings,
-    DiskSpaceAlertSettings, ImageRetentionSettings, LetsEncryptSettings, MetricsStoreKind,
-    MonitoringSettings, ObservabilityCompressionSettings, ObservabilityRetentionSettings,
-    PublicHostnameStrategy, RateLimitSettings, RequestMetadata, RequestTimeoutSettings,
-    ScreenshotSettings, SecurityHeadersSettings,
+    AuditLogger, AuditOperation, BuildLimitsSettings, CloudSettings, ClusterDnsSettings,
+    ContainerLogSettings, DiskSpaceAlertSettings, ImageRetentionSettings, LetsEncryptSettings,
+    MetricsStoreKind, MonitoringSettings, ObservabilityCompressionSettings,
+    ObservabilityRetentionSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
+    RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
 
 pub struct SettingsState {
     pub config_service: Arc<ConfigService>,
+    pub encryption_service: Arc<temps_core::EncryptionService>,
     pub audit_service: Arc<dyn AuditLogger>,
+    pub sensitive_action_authorizer: Arc<dyn temps_core::SensitiveActionAuthorizer>,
     pub route_table_refresher: Option<Arc<dyn temps_core::route_table::RouteTableRefresher>>,
     /// Node enrollment token minting/listing/revocation (ADR-020 WS-1.1).
     pub enrollment_token_service: Arc<crate::enrollment_tokens::EnrollmentTokenService>,
@@ -50,9 +53,104 @@ struct SettingsUpdatedAudit {
     context: AuditContext,
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct ClusterCaRotatedAudit {
+    context: AuditContext,
+    previous_fingerprint: String,
+    new_fingerprint: String,
+    revoked_enrollment_tokens: u64,
+}
+
+impl AuditOperation for ClusterCaRotatedAudit {
+    fn operation_type(&self) -> String {
+        "CLUSTER_CA_ROTATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|error| anyhow::anyhow!("Failed to serialize audit operation {error}"))
+    }
+}
+
 impl AuditOperation for SettingsUpdatedAudit {
     fn operation_type(&self) -> String {
         "SETTINGS_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// The two ADR-042 §6.3 bulk-activation guard settings, resolved to the values
+/// that would actually be **in effect**.
+///
+/// Effective rather than raw, for both of the jobs this type has. The
+/// permission bar must compare like with like — `None` and `Some(5.0)` are the
+/// same guard, and treating a client that omits the field as "widening from
+/// nothing" would refuse ordinary saves. And the audit record has to name the
+/// number that was really in force, because the point of writing it down is that
+/// somebody months later can say what this instance's spend guard was on a given
+/// day without also having to know which build's defaults applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BulkActivationGuards {
+    anomaly_factor: f32,
+    rate_limit_spans_per_sec: Option<u32>,
+}
+
+impl From<&CloudSettings> for BulkActivationGuards {
+    fn from(cloud: &CloudSettings) -> Self {
+        Self {
+            anomaly_factor: cloud.effective_bulk_anomaly_factor(),
+            rate_limit_spans_per_sec: cloud.effective_bulk_rate_limit_spans_per_sec(),
+        }
+    }
+}
+
+/// `CLOUD_TELEMETRY_BULK_GUARD_UPDATED` — a change to one of ADR-042 §6.3's two
+/// bulk-activation guard settings, carrying the values on both sides.
+///
+/// A separate event from `SETTINGS_UPDATED`, which records only who saved and
+/// from where. That is enough for a presentation setting and not nearly enough
+/// for these two: widening the anomaly factor from 5× to 50× raises the ceiling
+/// on what a purchase-triggered activation may spend without any human
+/// confirming it, and under one undifferentiated `SETTINGS_UPDATED` row it is
+/// indistinguishable from somebody changing the instance's display name. An
+/// audit trail that cannot answer "when did this instance's spend guard change,
+/// and to what" is not an audit trail for a money guard.
+#[derive(Debug, Clone, serde::Serialize)]
+struct CloudTelemetryBulkGuardUpdatedAudit {
+    context: AuditContext,
+    previous_anomaly_factor: f32,
+    new_anomaly_factor: f32,
+    previous_rate_limit_spans_per_sec: Option<u32>,
+    new_rate_limit_spans_per_sec: Option<u32>,
+    /// Whether this change *loosened* the money guard — i.e. raised the anomaly
+    /// factor. Recorded as its own field so the one direction that matters is
+    /// greppable without a reader having to compare two floats themselves.
+    widened_anomaly_factor: bool,
+}
+
+impl AuditOperation for CloudTelemetryBulkGuardUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "CLOUD_TELEMETRY_BULK_GUARD_UPDATED".to_string()
     }
     fn user_id(&self) -> Option<i32> {
         Some(self.context.user_id)
@@ -139,6 +237,9 @@ pub struct AppSettingsResponse {
     /// is unset. The console uses this to preview a project's real
     /// `{slug}-{env_slug}.{preview_domain}:{port}` URL before it's deployed.
     pub proxy_port: u16,
+
+    /// Managed control-plane destination and explicit export consent flags.
+    pub cloud: CloudSettings,
 
     // Screenshot settings
     pub screenshots: ScreenshotSettings,
@@ -333,10 +434,24 @@ pub struct MultiNodeSettingsMasked {
     /// SHA-256 fingerprint of the cluster CA certificate (public — operators can
     /// verify it out of band; the CA private key is never exposed).
     pub cluster_ca_fingerprint: Option<String>,
+    /// Effective cluster-wide container address pool. `None` only when the
+    /// singleton network configuration could not be read.
+    pub cluster_network: Option<ClusterNetworkSettings>,
     /// Node resource-alert thresholds (percent); `None` = that alert disabled.
     pub node_cpu_alert_percent: Option<f64>,
     pub node_memory_alert_percent: Option<f64>,
     pub node_disk_alert_percent: Option<f64>,
+}
+
+/// Read-only cluster network state. Pool changes are performed on the control
+/// plane through `temps network setup-multi-node`, which enforces that no
+/// existing node allocation can be stranded by an in-place edit.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct ClusterNetworkSettings {
+    pub compute_pool_cidr: String,
+    pub subnet_prefix_len: u8,
+    pub allocation_count: u64,
+    pub locked: bool,
 }
 
 /// DNS provider settings with masked sensitive fields
@@ -374,6 +489,7 @@ impl From<AppSettings> for AppSettingsResponse {
             // own fallback so an un-reconciled response is never worse than
             // that.
             proxy_port: 8080,
+            cloud: settings.cloud,
             screenshots: settings.screenshots,
             letsencrypt: settings.letsencrypt,
             dns_provider: DnsProviderSettingsMasked {
@@ -447,6 +563,7 @@ impl From<AppSettings> for AppSettingsResponse {
                     .cluster_ca_cert_pem
                     .as_deref()
                     .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok()),
+                cluster_network: None,
                 node_cpu_alert_percent: settings.multi_node.node_cpu_alert_percent,
                 node_memory_alert_percent: settings.multi_node.node_memory_alert_percent,
                 node_disk_alert_percent: settings.multi_node.node_disk_alert_percent,
@@ -478,6 +595,16 @@ impl From<AppSettings> for AppSettingsResponse {
 }
 
 impl AppSettingsResponse {
+    fn with_cluster_network_state(mut self, state: Option<crate::ClusterNetworkState>) -> Self {
+        self.multi_node.cluster_network = state.map(|state| ClusterNetworkSettings {
+            compute_pool_cidr: state.compute_pool_cidr,
+            subnet_prefix_len: state.subnet_prefix_len,
+            allocation_count: state.allocation_count,
+            locked: state.allocation_count > 0,
+        });
+        self
+    }
+
     /// Reconcile `effective_metrics_store` with the server's ClickHouse
     /// configuration. The runtime only uses ClickHouse when both the
     /// `monitoring.store` toggle is `click_house` AND all `TEMPS_CLICKHOUSE_*`
@@ -570,6 +697,7 @@ impl AppSettingsResponse {
         mint_enrollment_token,
         list_enrollment_tokens,
         revoke_enrollment_token,
+        rotate_cluster_ca,
         refresh_route_table,
     ),
     components(schemas(
@@ -580,6 +708,7 @@ impl AppSettingsResponse {
         crate::disk_status::DiskSpaceCheckResult,
         ContainerLogSettings,
         ClusterDnsSettings,
+        CloudSettings,
         PublicHostnameStrategy,
         DnsProviderSettingsMasked,
         DockerRegistrySettingsMasked,
@@ -598,6 +727,8 @@ impl AppSettingsResponse {
         MintEnrollmentTokenResponse,
         EnrollmentTokenInfo,
         EnrollmentTokenListResponse,
+        RotateClusterCaRequest,
+        RotateClusterCaResponse,
         RouteRefreshResponse,
         UpdateStatusResponse,
         UpdateCapabilityResponse,
@@ -646,6 +777,7 @@ pub fn configure_routes() -> Router<Arc<SettingsState>> {
             "/settings/enrollment-tokens/{id}",
             delete(revoke_enrollment_token),
         )
+        .route("/settings/cluster-ca/rotate", post(rotate_cluster_ca))
         .route("/settings/routes/refresh", post(refresh_route_table))
 }
 
@@ -690,8 +822,8 @@ pub struct MintEnrollmentTokenResponse {
     pub token: String,
     pub expires_at: String,
     pub max_uses: i32,
-    /// SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
-    /// worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+    /// SHA-256 fingerprint of the cluster CA. Token issuance initializes the
+    /// CA when needed, so every newly minted token carries a trust pin.
     pub ca_fingerprint: Option<String>,
     pub message: String,
 }
@@ -709,6 +841,172 @@ pub struct EnrollmentTokenInfo {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct EnrollmentTokenListResponse {
     pub tokens: Vec<EnrollmentTokenInfo>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct RotateClusterCaRequest {
+    /// Fingerprint observed through a trusted operator channel immediately
+    /// before rotation. The request fails if the active root changed.
+    pub expected_fingerprint: String,
+    /// Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
+    pub confirmation: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct RotateClusterCaResponse {
+    pub previous_fingerprint: String,
+    pub new_fingerprint: String,
+    pub revoked_enrollment_tokens: u64,
+    pub message: String,
+}
+
+/// Replace a compromised cluster CA and invalidate outstanding enrollment
+/// tokens. Existing workers fail closed until they are re-enrolled.
+#[utoipa::path(
+    tag = "Settings",
+    post,
+    path = "/settings/cluster-ca/rotate",
+    request_body = RotateClusterCaRequest,
+    responses(
+        (status = 200, description = "Cluster CA rotated", body = RotateClusterCaResponse),
+        (status = 400, description = "Invalid confirmation or CA state"),
+        (status = 401, description = "Unauthorized"),
+        (status = 403, description = "Insufficient permissions"),
+        (status = 409, description = "Expected fingerprint is stale"),
+        (status = 428, description = "Fresh MFA verification required"),
+        (status = 500, description = "Internal server error")
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn rotate_cluster_ca(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<SettingsState>>,
+    Extension(metadata): Extension<RequestMetadata>,
+    Json(req): Json<RotateClusterCaRequest>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, SettingsWrite);
+    permission_guard!(auth, ClusterCaRotate);
+
+    require_cluster_ca_rotation_authorization(
+        app_state.sensitive_action_authorizer.as_ref(),
+        &auth,
+    )
+    .await?;
+
+    if req.confirmation != "ROTATE CLUSTER CA" {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Confirmation Required")
+            .detail("confirmation must be exactly ROTATE CLUSTER CA")
+            .build());
+    }
+
+    let (replacement, result) = crate::cluster_ca::rotate_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+        req.expected_fingerprint.trim(),
+    )
+    .await
+    .map_err(|error| {
+        use crate::cluster_ca::ClusterCaError;
+        use crate::ConfigServiceError;
+        match error {
+            ClusterCaError::Settings(ConfigServiceError::ClusterCaFingerprintMismatch) => {
+                ErrorBuilder::new(StatusCode::CONFLICT)
+                    .title("Cluster CA Changed")
+                    .detail("The active cluster CA no longer matches expected_fingerprint. Read the current fingerprint through a trusted channel before retrying.")
+                    .build()
+            }
+            ClusterCaError::Settings(ConfigServiceError::ClusterCaNotInitialized) => {
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Cluster CA Not Initialized")
+                    .detail("Mint an enrollment token to initialize the cluster CA before rotating it.")
+                    .build()
+            }
+            ClusterCaError::Settings(ConfigServiceError::InvalidConfiguration { .. }) => {
+                error!(%error, "Refused cluster CA rotation from an incomplete or invalid state");
+                ErrorBuilder::new(StatusCode::BAD_REQUEST)
+                    .title("Invalid Cluster CA State")
+                    .detail("The active cluster CA state is incomplete or invalid. Check the server logs and restore the control-plane settings backup before retrying.")
+                    .build()
+            }
+            error => {
+                error!(%error, "Failed to rotate cluster CA");
+                ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .title("Cluster CA Rotation Failed")
+                    .detail("The cluster CA was not rotated. Check the server logs for details.")
+                    .build()
+            }
+        }
+    })?;
+    let new_fingerprint = temps_core::node_pki::ca_fingerprint_sha256(&replacement.cert_pem)
+        .map_err(|error| {
+            error!(%error, "Failed to fingerprint newly committed cluster CA");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Cluster CA Rotation Incomplete")
+                .detail("The new CA was committed but its fingerprint response could not be generated. Read the current fingerprint from authenticated settings before re-enrolling workers.")
+                .build()
+        })?;
+
+    let audit = ClusterCaRotatedAudit {
+        context: AuditContext {
+            user_id: auth.user_id(),
+            ip_address: Some(metadata.ip_address.clone()),
+            user_agent: metadata.user_agent.clone(),
+        },
+        previous_fingerprint: result.previous_fingerprint.clone(),
+        new_fingerprint: new_fingerprint.clone(),
+        revoked_enrollment_tokens: result.revoked_enrollment_tokens,
+    };
+    if let Err(error) = app_state.audit_service.create_audit_log(&audit).await {
+        tracing::error!(%error, "Failed to record cluster CA rotation audit log");
+    }
+
+    Ok(Json(RotateClusterCaResponse {
+        previous_fingerprint: result.previous_fingerprint,
+        new_fingerprint,
+        revoked_enrollment_tokens: result.revoked_enrollment_tokens,
+        message: "Cluster CA rotated. Every worker must now be re-enrolled with a new single-use token and the new fingerprint.".to_string(),
+    }))
+}
+
+async fn require_cluster_ca_rotation_authorization(
+    authorizer: &dyn temps_core::SensitiveActionAuthorizer,
+    auth: &temps_auth::AuthContext,
+) -> Result<(), Problem> {
+    if !auth.is_session() || auth.session_id().is_none() {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Persisted Browser Session Required")
+            .detail("Cluster CA rotation cannot be performed with an API key, CLI token, deployment token, or non-persisted session. Sign in to the Temps console as an administrator.")
+            .value("error_code", "CLUSTER_CA_ROTATION_BROWSER_SESSION_REQUIRED")
+            .build());
+    }
+
+    if !auth.is_admin() {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("Administrator Required")
+            .detail("Only a full Temps administrator may rotate the cluster CA. Platform administrators and delegated roles are not sufficient.")
+            .value("error_code", "CLUSTER_CA_ROTATION_ADMIN_REQUIRED")
+            .build());
+    }
+
+    let mfa_enabled = auth.user.as_ref().is_some_and(|user| user.mfa_enabled);
+    if !mfa_enabled {
+        return Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+            .title("MFA Enrollment Required")
+            .detail(
+                "Enroll an MFA method in account security settings before rotating the cluster CA.",
+            )
+            .value("error_code", "CLUSTER_CA_ROTATION_MFA_REQUIRED")
+            .value("setup_path", "/settings/security")
+            .build());
+    }
+
+    temps_auth::require_sensitive_action(
+        authorizer,
+        auth,
+        temps_core::SensitiveAction::RotateClusterCa,
+    )
+    .await
 }
 
 fn enrollment_error_to_problem(e: crate::enrollment_tokens::EnrollmentError) -> Problem {
@@ -760,21 +1058,30 @@ async fn mint_enrollment_token(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
 
-    // If a cluster CA already exists, embed its SHA-256 fingerprint so a joining
-    // node can verify the control plane's CA out of band (ADR-020 WS-2.2). The
-    // CA is minted lazily on the first mTLS enrollment, so the very first token
-    // may carry no fingerprint; subsequent tokens do.
-    let settings = app_state.config_service.get_settings().await.map_err(|e| {
+    // Initialize the cluster CA before minting the token. This makes the first
+    // enrollment as strongly pinned as every subsequent enrollment and avoids
+    // trust-on-first-use against the registration response.
+    let cluster_ca = crate::cluster_ca::ensure_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await
+    .map_err(|error| {
+        error!(%error, "Failed to initialize cluster CA before enrollment-token minting");
         ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
-            .title("Settings Error")
-            .detail(format!("Failed to read settings: {e}"))
+            .title("Cluster CA Initialization Failed")
+            .detail("The enrollment token was not created because the cluster trust root could not be initialized. Check the server logs for details.")
             .build()
     })?;
-    let ca_fingerprint = settings
-        .multi_node
-        .cluster_ca_cert_pem
-        .as_deref()
-        .and_then(|pem| temps_core::node_pki::ca_fingerprint_sha256(pem).ok());
+    let ca_fingerprint = Some(
+        temps_core::node_pki::ca_fingerprint_sha256(&cluster_ca.cert_pem).map_err(|error| {
+            error!(%error, "Failed to fingerprint initialized cluster CA");
+            ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Cluster CA Initialization Failed")
+                .detail("The enrollment token was not created because the cluster trust root could not be fingerprinted. Check the server logs for details.")
+                .build()
+        })?,
+    );
 
     let params = crate::enrollment_tokens::MintParams {
         max_uses: req.max_uses.unwrap_or(1),
@@ -1353,10 +1660,11 @@ async fn get_settings(
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsRead);
 
-    let (settings_result, policies_result, monitored_services_result) = tokio::join!(
+    let (settings_result, policies_result, monitored_services_result, cluster_network_result) = tokio::join!(
         app_state.config_service.get_settings(),
         app_state.config_service.get_effective_telemetry_policies(),
         app_state.config_service.count_monitored_services(),
+        app_state.config_service.get_cluster_network_state(),
     );
 
     match settings_result {
@@ -1380,9 +1688,18 @@ async fn get_settings(
                     );
                 })
                 .ok();
+            let cluster_network_state = cluster_network_result
+                .inspect_err(|error| {
+                    tracing::warn!(
+                        %error,
+                        "Failed to read cluster network state; CIDR controls are unavailable"
+                    );
+                })
+                .ok();
             let response = AppSettingsResponse::from(settings)
                 .with_effective_store(app_state.config_service.is_clickhouse_enabled())
                 .with_effective_timescale_state(policies, monitored_services_count)
+                .with_cluster_network_state(cluster_network_state)
                 .with_proxy_port(app_state.config_service.proxy_port());
             Ok(Json(response))
         }
@@ -1461,6 +1778,98 @@ fn preserve_self_recorded_fields(incoming: &mut AppSettings, current: &AppSettin
 fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSettings) {
     if incoming.self_update.is_none() {
         incoming.self_update = current.self_update.clone();
+    }
+}
+
+/// Which of the operator-tuned `cloud.*` keys a `PUT /settings` body actually
+/// carried.
+///
+/// `AppSettings` deserializes with `#[serde(default)]` at every level, so a body
+/// that never mentions `cloud` produces a `CloudSettings::default()` that is —
+/// once deserialization is done — indistinguishable from one where the client
+/// spelled every default out. That is the whole bug this type exists to fix: the
+/// console's own save has never sent a `cloud` block, so any unrelated settings
+/// save silently reset the ADR-041 outbox ceiling and both ADR-042 spend guards
+/// to their build-time defaults. Worse than the reset, an operator who had
+/// *narrowed* the anomaly factor also had their next unrelated save refused with
+/// a 403, because the guard authorization compares the incoming factor against
+/// the stored one and an absent field reads as "widen it back to 5x".
+///
+/// Absence is therefore read off the wire, once, *before* the body becomes an
+/// `AppSettings`. The obvious cheaper alternative — "if the value equals the
+/// default, treat it as absent" — cannot work here: three of these four fields
+/// have a non-sentinel default, so that rule makes the default unwritable. An
+/// operator who narrowed the factor to 2x could never put it back to 5x, and one
+/// who pointed `backend_url` at a staging Cloud could never point it home again.
+///
+/// An explicit `null` counts as **sent**: a client writing
+/// `"telemetry_bulk_rate_limit_spans_per_sec": null` is asking to clear the
+/// throttle, and honouring that is precisely why presence is tracked rather than
+/// inferred from the value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CloudFieldsSent {
+    backend_url: bool,
+    telemetry_outbox_max_bytes: bool,
+    telemetry_bulk_rate_limit_spans_per_sec: bool,
+    telemetry_bulk_anomaly_factor: bool,
+}
+
+impl CloudFieldsSent {
+    /// Read key presence from a raw settings document. A `cloud` member that is
+    /// missing, or present but not an object, means the client sent none of
+    /// these fields — a non-object is rejected moments later by deserialization
+    /// anyway, so "sent nothing" is both true and the safe answer.
+    fn from_settings_body(body: &serde_json::Value) -> Self {
+        let Some(cloud) = body.get("cloud").and_then(serde_json::Value::as_object) else {
+            return Self::default();
+        };
+        Self {
+            backend_url: cloud.contains_key("backend_url"),
+            telemetry_outbox_max_bytes: cloud.contains_key("telemetry_outbox_max_bytes"),
+            telemetry_bulk_rate_limit_spans_per_sec: cloud
+                .contains_key("telemetry_bulk_rate_limit_spans_per_sec"),
+            telemetry_bulk_anomaly_factor: cloud.contains_key("telemetry_bulk_anomaly_factor"),
+        }
+    }
+}
+
+/// Keep the parts of the `cloud` block a generic settings write must not change:
+/// the export consent flags always, and every operator-tuned field the client
+/// did not send.
+///
+/// Two rules, both consequences of `PUT /settings` replacing the whole document:
+///
+/// - **Consent is never writable through this endpoint.** Enabling a Cloud
+///   export requires resource-specific permissions and goes through
+///   `PATCH /cloud/features`; a generic settings write must not bypass those
+///   guards even when it submits a complete `AppSettings`. Restored from the DB
+///   unconditionally, whether the client sent it or not.
+/// - **A field the client did not send keeps its stored value.** Applies to
+///   `backend_url` and `telemetry_outbox_max_bytes` (ADR-041) and to both
+///   bulk-activation guards (ADR-042 §3, §6.3). See [`CloudFieldsSent`] for why
+///   "did not send" is read from the request body rather than inferred from the
+///   deserialized value.
+fn preserve_cloud_settings_not_sent_by_every_client(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+    sent: CloudFieldsSent,
+) {
+    incoming.cloud.telemetry_enabled = current.cloud.telemetry_enabled;
+    incoming.cloud.backups_enabled = current.cloud.backups_enabled;
+    incoming.cloud.notifications_enabled = current.cloud.notifications_enabled;
+
+    if !sent.backend_url {
+        incoming.cloud.backend_url = current.cloud.backend_url.clone();
+    }
+    if !sent.telemetry_outbox_max_bytes {
+        incoming.cloud.telemetry_outbox_max_bytes = current.cloud.telemetry_outbox_max_bytes;
+    }
+    if !sent.telemetry_bulk_rate_limit_spans_per_sec {
+        incoming.cloud.telemetry_bulk_rate_limit_spans_per_sec =
+            current.cloud.telemetry_bulk_rate_limit_spans_per_sec;
+    }
+    if !sent.telemetry_bulk_anomaly_factor {
+        incoming.cloud.telemetry_bulk_anomaly_factor = current.cloud.telemetry_bulk_anomaly_factor;
     }
 }
 
@@ -1641,6 +2050,98 @@ fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), P
     Ok(())
 }
 
+/// Reject a bulk-activation anomaly factor outside the supported range.
+///
+/// `effective_bulk_anomaly_factor` clamps on read, so an out-of-range value
+/// could never reach the worker — but silently clamping a write hides the
+/// operator's mistake behind a settings page that echoes back `1000` while the
+/// instance is really running at 50. Worse, it hides it in the one direction
+/// that costs money: an operator who believes they widened the guard to 1000×
+/// and did not is being lied to about their own spend ceiling. Rejecting keeps
+/// the stored value and the effective value the same thing, which is the only
+/// way the page can be trusted.
+fn validate_bulk_activation_guards(cloud: &CloudSettings) -> Result<(), Problem> {
+    let Some(factor) = cloud.telemetry_bulk_anomaly_factor else {
+        // Unset is the documented default, not an out-of-range value.
+        return Ok(());
+    };
+    if !factor.is_finite()
+        || !(MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR..=MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR)
+            .contains(&factor)
+    {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "cloud.telemetry_bulk_anomaly_factor must be between \
+                 {MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR} and \
+                 {MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR} (got {factor}). This is the multiple \
+                 of its own estimate a project may ship before a bulk Temps Cloud activation \
+                 stops it, so it is a tuning range and not an off switch. A project that needs a \
+                 wider margin than {MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR}x should be activated \
+                 from the Cloud telemetry status card, which estimates it and shows the number \
+                 before anything is sent."
+            ))
+            .value(
+                "minimum",
+                MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR.to_string(),
+            )
+            .value(
+                "maximum",
+                MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR.to_string(),
+            )
+            .build());
+    }
+    Ok(())
+}
+
+/// Confine *widening* the bulk-activation money guard to an instance operator.
+///
+/// Asymmetric on purpose, and the asymmetry is the whole point:
+///
+/// - **Narrowing** it (a smaller factor, a stricter guard) makes an activation
+///   more likely to stop early with its cursor intact. The worst outcome is a
+///   retry click, so ordinary `SettingsWrite` is the right bar — and requiring
+///   more would mean an operator who spots a runaway bill cannot tighten the
+///   guard without finding an administrator first.
+/// - **Widening** it raises the ceiling on what a purchase-triggered activation
+///   may spend with nobody confirming it. That is the same authority the
+///   operator bulk-activation endpoints already reserve to an instance
+///   administrator (`OtelWrite` + instance admin), and it would be incoherent
+///   for `POST /bulk-jobs` to demand it while a `SettingsWrite` holder could
+///   raise the ceiling on the very same spend through the settings document.
+///
+/// Scoped to this one field rather than to the endpoint: tightening the whole
+/// settings PUT to instance-admin would break every unrelated caller that
+/// legitimately holds `SettingsWrite`.
+fn authorize_bulk_activation_guard_change(
+    auth: &temps_auth::AuthContext,
+    previous: BulkActivationGuards,
+    next: BulkActivationGuards,
+) -> Result<(), Problem> {
+    if next.anomaly_factor <= previous.anomaly_factor || auth.is_instance_admin() {
+        return Ok(());
+    }
+    Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+        .type_("https://temps.sh/probs/insufficient-permissions")
+        .title("Instance Administrator Required")
+        .detail(format!(
+            "Raising cloud.telemetry_bulk_anomaly_factor from {} to {} widens the byte budget a \
+             bulk Temps Cloud telemetry activation may spend on a project before it stops, on a \
+             path that spends without a human confirming it. Loosening that guard is restricted \
+             to an instance administrator, the same bar the bulk activation endpoints \
+             themselves use. Lowering it, or leaving it alone, needs only settings:write.",
+            previous.anomaly_factor, next.anomaly_factor
+        ))
+        .value("required_role", temps_auth::Role::PlatformAdmin.to_string())
+        .value("user_role", auth.effective_role.to_string())
+        .value(
+            "current_anomaly_factor",
+            previous.anomaly_factor.to_string(),
+        )
+        .value("requested_anomaly_factor", next.anomaly_factor.to_string())
+        .build())
+}
+
 fn validate_observability_retention(
     retention: &ObservabilityRetentionSettings,
 ) -> Result<(), Problem> {
@@ -1693,9 +2194,81 @@ async fn update_settings(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<SettingsState>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Json(mut settings): Json<AppSettings>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // Taken as raw JSON first, and only then turned into an `AppSettings`,
+    // because which `cloud.*` keys the client sent is information
+    // `#[serde(default)]` destroys: it cannot be recovered from the
+    // deserialized document. See `CloudFieldsSent`.
+    let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
+    let mut settings: AppSettings = serde_path_to_error::deserialize(body).map_err(|e| {
+        let field = e.path().to_string();
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Settings Payload")
+            .detail(format!(
+                "The settings document could not be read at `{}`: {}. Nothing was saved.",
+                field,
+                e.into_inner()
+            ))
+            .value("field", field)
+            .build()
+    })?;
+
+    // ADR-042 §6.3: the money guard on bulk Temps Cloud activation. Validated,
+    // authorized and captured here — before any other field is touched — for
+    // three reasons that all need the *previous* value, which a completed save
+    // can no longer produce: an out-of-range factor is refused rather than
+    // silently clamped, widening it needs the same instance-admin bar the bulk
+    // activation endpoints use, and the change is recorded as its own audit
+    // event with both sides.
+    //
+    // Validated against what the client actually sent, before anything is
+    // merged in from the DB: a stored value that predates a range change, or
+    // was hand-edited, must not make every unrelated save fail with a message
+    // about a field the client never mentioned. `effective_*` clamps such a row
+    // on read.
+    //
+    // A read failure aborts the save. Proceeding would mean applying a
+    // possibly-widened spend ceiling with neither the check nor the record that
+    // are supposed to accompany it.
+    validate_bulk_activation_guards(&settings.cloud)?;
+    let stored_settings = match app_state.config_service.get_settings().await {
+        Ok(current) => current,
+        Err(e) => {
+            error!(
+                "Could not read the current Temps Cloud bulk activation guard settings; \
+                 aborting settings save: {}",
+                e
+            );
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Settings Save Aborted")
+                .detail(format!(
+                    "Could not read the current Temps Cloud settings, so a change to the bulk \
+                     activation guards could be neither authorized nor recorded, and the fields \
+                     this client did not send could not be preserved; the save was aborted \
+                     rather than applied unchecked. Retry the save; if this persists, check \
+                     database connectivity: {}",
+                    e
+                ))
+                .build());
+        }
+    };
+
+    // Merge the `cloud` block *before* the guard comparison below, not after:
+    // a save that never mentioned `cloud` is not a request to widen the spend
+    // guard back to its default, and must be neither refused as one (403) nor
+    // recorded as one in the audit log.
+    preserve_cloud_settings_not_sent_by_every_client(
+        &mut settings,
+        &stored_settings,
+        cloud_fields_sent,
+    );
+
+    let previous_bulk_guards = BulkActivationGuards::from(&stored_settings.cloud);
+    let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
+    authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
     // If sensitive fields are masked, preserve the existing values
     if let Some(ref key) = settings.dns_provider.cloudflare_api_key {
@@ -1750,6 +2323,9 @@ async fn update_settings(
             // out of `current_settings` below.
             preserve_self_recorded_fields(&mut settings, &current_settings);
             preserve_omitted_security_fields(&mut settings, &current_settings);
+            // The `cloud` block was already merged, further up: the ADR-042
+            // guard authorization depends on the merged value, so it cannot
+            // wait until here.
 
             // Per-provider credentials: keep existing unless caller supplied a new one
             for (id, current_cfg) in current_settings.agent_sandbox.providers.iter() {
@@ -1916,6 +2492,42 @@ async fn update_settings(
                 error!("Failed to create audit log: {}", e);
             }
 
+            // ADR-042 §6.3: a change to either bulk-activation guard gets its
+            // own record with both sides, because `SETTINGS_UPDATED` carries no
+            // field-level values and a widened spend ceiling must not be
+            // indistinguishable from an unrelated save.
+            if next_bulk_guards != previous_bulk_guards {
+                let widened = next_bulk_guards.anomaly_factor > previous_bulk_guards.anomaly_factor;
+                info!(
+                    previous_anomaly_factor = previous_bulk_guards.anomaly_factor,
+                    new_anomaly_factor = next_bulk_guards.anomaly_factor,
+                    previous_rate_limit_spans_per_sec =
+                        previous_bulk_guards.rate_limit_spans_per_sec,
+                    new_rate_limit_spans_per_sec = next_bulk_guards.rate_limit_spans_per_sec,
+                    widened,
+                    "Temps Cloud bulk activation guard settings changed"
+                );
+                let guard_audit = CloudTelemetryBulkGuardUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_anomaly_factor: previous_bulk_guards.anomaly_factor,
+                    new_anomaly_factor: next_bulk_guards.anomaly_factor,
+                    previous_rate_limit_spans_per_sec: previous_bulk_guards
+                        .rate_limit_spans_per_sec,
+                    new_rate_limit_spans_per_sec: next_bulk_guards.rate_limit_spans_per_sec,
+                    widened_anomaly_factor: widened,
+                };
+                if let Err(e) = app_state.audit_service.create_audit_log(&guard_audit).await {
+                    error!(
+                        "Failed to create the Temps Cloud bulk activation guard audit log: {}",
+                        e
+                    );
+                }
+            }
+
             Ok((
                 StatusCode::OK,
                 Json(SettingsUpdateResponse {
@@ -2010,6 +2622,24 @@ async fn generate_join_token(
     Extension(metadata): Extension<RequestMetadata>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // Keep the deprecated shared-token path safe for upgrades from older
+    // installations. Cluster trust belongs to the control plane and must
+    // exist before any credential capable of enrolling a worker is issued.
+    // Startup normally initializes it; this endpoint is a deterministic
+    // repair path for a process upgraded without a restart.
+    crate::cluster_ca::ensure_cluster_ca(
+        &app_state.config_service,
+        &app_state.encryption_service,
+    )
+    .await
+    .map_err(|error| {
+        error!(%error, "Failed to initialize cluster CA before join-token generation");
+        ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+            .title("Cluster CA Initialization Failed")
+            .detail("The join token was not created because the cluster trust root could not be initialized. Check the server logs for details.")
+            .build()
+    })?;
 
     // Generate a random 32-byte token as hex
     let plaintext_token = {
@@ -2204,6 +2834,283 @@ mod tests {
     use super::*;
     use temps_core::{AgentSandboxSettings, AiChatLimitsSettings, AppSettings, ProviderConfig};
 
+    fn rotation_test_user(mfa_enabled: bool) -> temps_entities::users::Model {
+        let now = chrono::Utc::now();
+        temps_entities::users::Model {
+            id: 71,
+            name: "CA Rotation Admin".to_string(),
+            email: "ca-rotation@example.com".to_string(),
+            password_hash: None,
+            email_verified: true,
+            email_verification_token: None,
+            email_verification_expires: None,
+            password_reset_token: None,
+            password_reset_expires: None,
+            must_change_password: false,
+            deleted_at: None,
+            mfa_secret: mfa_enabled.then(|| "test-secret".to_string()),
+            mfa_enabled,
+            mfa_recovery_codes: None,
+            oidc_subject: None,
+            oidc_provider_id: None,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    // ── ADR-042 §6.3 review, Finding 2: the bulk-activation money guard ──
+
+    fn guard_principal(role: temps_auth::Role) -> temps_auth::AuthContext {
+        temps_auth::AuthContext::new_session(rotation_test_user(false), role)
+    }
+
+    fn cloud_with_factor(factor: Option<f32>) -> CloudSettings {
+        CloudSettings {
+            telemetry_bulk_anomaly_factor: factor,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_anomaly_factor_above_the_ceiling_is_rejected_rather_than_silently_clamped() {
+        // Clamping on read alone would leave the settings page echoing back a
+        // number that is not in force — and lying in the one direction that
+        // costs money, because the operator would believe they had widened the
+        // spend guard when they had not.
+        for absurd in [
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR + 0.5,
+            1_000.0,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            let problem = validate_bulk_activation_guards(&cloud_with_factor(Some(absurd)))
+                .expect_err("an out-of-range factor must be refused");
+            assert_eq!(
+                problem.status_code,
+                StatusCode::BAD_REQUEST,
+                "{absurd} must be a 400"
+            );
+            let body = format!("{problem:?}");
+            assert!(body.contains("telemetry_bulk_anomaly_factor"), "{body}");
+            // The operator must learn the range *and* what to do when their
+            // project genuinely needs a wider margin than the ceiling allows.
+            assert!(body.contains("maximum"), "{body}");
+            assert!(body.contains("Cloud telemetry status card"), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_factor_below_the_floor_is_rejected_too_and_the_whole_range_is_accepted() {
+        assert_eq!(
+            validate_bulk_activation_guards(&cloud_with_factor(Some(0.5)))
+                .expect_err("below the floor every project pauses on its first chunk")
+                .status_code,
+            StatusCode::BAD_REQUEST
+        );
+
+        for usable in [
+            None,
+            Some(MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            Some(temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            Some(MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+        ] {
+            assert!(
+                validate_bulk_activation_guards(&cloud_with_factor(usable)).is_ok(),
+                "{usable:?} is inside the tuning range and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn widening_the_money_guard_needs_an_instance_admin_but_narrowing_does_not() {
+        let previous = BulkActivationGuards::from(&cloud_with_factor(Some(5.0)));
+        let wider = BulkActivationGuards::from(&cloud_with_factor(Some(40.0)));
+        let narrower = BulkActivationGuards::from(&cloud_with_factor(Some(2.0)));
+
+        // A settings:write holder who is not an instance admin may tighten the
+        // guard — an operator watching a bill run away must never have to find
+        // an administrator before they can stop it — but not loosen it.
+        let ordinary = guard_principal(temps_auth::Role::User);
+        assert!(authorize_bulk_activation_guard_change(&ordinary, previous, narrower).is_ok());
+        assert!(authorize_bulk_activation_guard_change(&ordinary, previous, previous).is_ok());
+
+        let refused = authorize_bulk_activation_guard_change(&ordinary, previous, wider)
+            .expect_err("loosening the money guard is an instance-admin action");
+        assert_eq!(refused.status_code, StatusCode::FORBIDDEN);
+        let body = format!("{refused:?}");
+        assert!(body.contains("required_role"), "{body}");
+        assert!(body.contains("requested_anomaly_factor"), "{body}");
+
+        // The bar the operator bulk-activation endpoints already use.
+        for role in [temps_auth::Role::Admin, temps_auth::Role::PlatformAdmin] {
+            assert!(
+                authorize_bulk_activation_guard_change(
+                    &guard_principal(role.clone()),
+                    previous,
+                    wider
+                )
+                .is_ok(),
+                "{role} runs the instance and may widen its own spend guard"
+            );
+        }
+    }
+
+    #[test]
+    fn omitting_the_factor_is_not_treated_as_a_change_let_alone_a_widening() {
+        // The settings PUT replaces the whole document, so a client built before
+        // this field existed sends `None`. `None` and `Some(5.0)` are the same
+        // guard, and refusing every such save with a 403 would break every
+        // unrelated settings write on the instance.
+        let unset = BulkActivationGuards::from(&cloud_with_factor(None));
+        let explicit_default = BulkActivationGuards::from(&cloud_with_factor(Some(
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+        )));
+
+        assert_eq!(unset, explicit_default);
+        assert!(authorize_bulk_activation_guard_change(
+            &guard_principal(temps_auth::Role::User),
+            unset,
+            explicit_default
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_guard_change_is_audited_with_both_sides_and_the_direction() {
+        // `SETTINGS_UPDATED` carries no field-level values, so under it alone a
+        // widened spend ceiling is indistinguishable from a display-name change.
+        let event = CloudTelemetryBulkGuardUpdatedAudit {
+            context: AuditContext {
+                user_id: 71,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "test".to_string(),
+            },
+            previous_anomaly_factor: 5.0,
+            new_anomaly_factor: 40.0,
+            previous_rate_limit_spans_per_sec: Some(5_000),
+            new_rate_limit_spans_per_sec: None,
+            widened_anomaly_factor: true,
+        };
+
+        assert_eq!(
+            AuditOperation::operation_type(&event),
+            "CLOUD_TELEMETRY_BULK_GUARD_UPDATED"
+        );
+        let serialized = AuditOperation::serialize(&event).expect("must serialize");
+        assert!(
+            serialized.contains("\"previous_anomaly_factor\":5.0"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"new_anomaly_factor\":40.0"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"previous_rate_limit_spans_per_sec\":5000"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"new_rate_limit_spans_per_sec\":null"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"widened_anomaly_factor\":true"),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn a_throttle_change_alone_is_still_a_recordable_guard_change() {
+        // The rate limit is the other half of what governs how fast a paid-for
+        // activation spends. A change to it with the factor untouched must not
+        // fall through the "did anything change" check.
+        let previous = BulkActivationGuards::from(&CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: Some(1_000),
+            ..Default::default()
+        });
+        let next = BulkActivationGuards::from(&CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: None,
+            ..Default::default()
+        });
+
+        assert_ne!(previous, next);
+        // …and removing a throttle is not a widening of the money guard, so it
+        // stays under ordinary settings:write.
+        assert!(authorize_bulk_activation_guard_change(
+            &guard_principal(temps_auth::Role::User),
+            previous,
+            next
+        )
+        .is_ok());
+    }
+
+    fn disconnected_authorizer() -> temps_auth::DefaultSensitiveActionAuthorizer {
+        temps_auth::DefaultSensitiveActionAuthorizer::new(Arc::new(
+            sea_orm::DatabaseConnection::Disconnected,
+        ))
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_rejects_machine_credentials_even_with_permission() {
+        let auth = temps_auth::AuthContext::new_api_key(
+            rotation_test_user(true),
+            None,
+            Some(vec![
+                temps_auth::Permission::SettingsWrite,
+                temps_auth::Permission::ClusterCaRotate,
+            ]),
+            "rotation-key".to_string(),
+            19,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("API keys must never rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!(
+                "CLUSTER_CA_ROTATION_BROWSER_SESSION_REQUIRED"
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_rejects_platform_administrators() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            rotation_test_user(true),
+            temps_auth::Role::PlatformAdmin,
+            24,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("platform administrators must not rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("CLUSTER_CA_ROTATION_ADMIN_REQUIRED"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cluster_ca_rotation_requires_mfa_enrollment() {
+        let auth = temps_auth::AuthContext::new_persisted_session(
+            rotation_test_user(false),
+            temps_auth::Role::Admin,
+            23,
+        );
+
+        let error = require_cluster_ca_rotation_authorization(&disconnected_authorizer(), &auth)
+            .await
+            .expect_err("an admin without MFA must not rotate the cluster CA");
+        assert_eq!(error.status_code, StatusCode::FORBIDDEN);
+        assert_eq!(
+            error.body.get("error_code"),
+            Some(&serde_json::json!("CLUSTER_CA_ROTATION_MFA_REQUIRED"))
+        );
+    }
+
     /// An operator's decision to forbid console updates must survive a save
     /// from a client that has never heard of the field.
     ///
@@ -2268,6 +3175,201 @@ mod tests {
         assert!(settings.self_update.is_none());
         assert!(settings.self_update().enabled);
         assert_eq!(settings.self_update().channel, None);
+    }
+
+    #[test]
+    fn generic_settings_update_cannot_enable_cloud_exports() {
+        let current = AppSettings::default();
+        let mut incoming = AppSettings::default();
+        incoming.cloud.telemetry_enabled = true;
+        incoming.cloud.backups_enabled = true;
+        incoming.cloud.notifications_enabled = true;
+
+        preserve_cloud_settings_not_sent_by_every_client(
+            &mut incoming,
+            &current,
+            CloudFieldsSent::default(),
+        );
+
+        assert!(!incoming.cloud.telemetry_enabled);
+        assert!(!incoming.cloud.backups_enabled);
+        assert!(!incoming.cloud.notifications_enabled);
+    }
+
+    #[test]
+    fn generic_settings_update_preserves_existing_cloud_export_consent() {
+        let mut current = AppSettings::default();
+        current.cloud.telemetry_enabled = true;
+        current.cloud.backups_enabled = true;
+        current.cloud.notifications_enabled = true;
+        let mut incoming = AppSettings::default();
+
+        preserve_cloud_settings_not_sent_by_every_client(
+            &mut incoming,
+            &current,
+            CloudFieldsSent::default(),
+        );
+
+        assert!(incoming.cloud.telemetry_enabled);
+        assert!(incoming.cloud.backups_enabled);
+        assert!(incoming.cloud.notifications_enabled);
+    }
+
+    /// A settings row whose operator-tuned Cloud fields have all been moved off
+    /// their defaults, so that "reset to default" is visible as a failure.
+    fn stored_settings_with_tuned_cloud_fields() -> AppSettings {
+        let mut current = AppSettings::default();
+        // ADR-041: a bigger outbox than the 512 MiB default, and a Cloud that
+        // is not the production one.
+        current.cloud.backend_url = "https://cloud.staging.example".to_string();
+        current.cloud.telemetry_outbox_max_bytes = 1024 * 1024 * 1024;
+        // ADR-042: a narrowed spend guard and a throttled backfill.
+        current.cloud.telemetry_bulk_anomaly_factor = Some(2.0);
+        current.cloud.telemetry_bulk_rate_limit_spans_per_sec = Some(5_000);
+        current
+    }
+
+    /// Mirror exactly what `update_settings` does with a request body: read key
+    /// presence off the raw JSON, deserialize, then merge the stored `cloud`
+    /// block in. Testing from the wire format is the point — the bug being
+    /// guarded against lives in the gap between "key absent" and "value equals
+    /// the default", which no test built from an `AppSettings` value could see.
+    fn merge_settings_body(body: serde_json::Value, current: &AppSettings) -> AppSettings {
+        let sent = CloudFieldsSent::from_settings_body(&body);
+        let mut incoming: AppSettings =
+            serde_json::from_value(body).expect("settings body should deserialize");
+        preserve_cloud_settings_not_sent_by_every_client(&mut incoming, current, sent);
+        incoming
+    }
+
+    /// The console's own save has never carried a `cloud` block, and no client
+    /// built before ADR-041/ADR-042 does either. Such a save must leave every
+    /// operator-tuned Cloud field exactly as stored, not reset it to the
+    /// build-time default.
+    #[test]
+    fn a_settings_save_that_omits_the_cloud_block_keeps_the_stored_spend_guards() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        // A realistic unrelated save: some other settings page, no `cloud` key.
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "preview_domain": "apps.example.test",
+                "insecure_tls": false,
+            }),
+            &current,
+        );
+
+        // ADR-042 §6.3 — the narrowed money guard survives.
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, Some(2.0));
+        assert_eq!(merged.cloud.effective_bulk_anomaly_factor(), 2.0);
+        assert_ne!(
+            merged.cloud.effective_bulk_anomaly_factor(),
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // ADR-042 §3 — the throttle survives.
+        assert_eq!(
+            merged.cloud.telemetry_bulk_rate_limit_spans_per_sec,
+            Some(5_000)
+        );
+        // ADR-041 — the outbox ceiling and the Cloud destination survive.
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(merged.cloud.backend_url, "https://cloud.staging.example");
+    }
+
+    /// The same save must also not *look* like a guard change, or an operator
+    /// holding only `settings:write` would be refused with a 403 (widening 2x
+    /// back to the 5x default is instance-admin only) and the audit log would
+    /// record a spend-guard change that nobody made.
+    #[test]
+    fn a_settings_save_that_omits_the_cloud_block_is_not_a_guard_change() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({ "preview_domain": "apps.example.test" }),
+            &current,
+        );
+
+        assert_eq!(
+            BulkActivationGuards::from(&merged.cloud),
+            BulkActivationGuards::from(&current.cloud)
+        );
+    }
+
+    /// Preserving is not freezing: a client that names a field still writes it,
+    /// including writing it *back to its default value* — the case a
+    /// "value equals the default means absent" heuristic would silently drop.
+    #[test]
+    fn an_explicitly_sent_cloud_field_still_overrides_the_stored_one() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "cloud": {
+                    "telemetry_bulk_anomaly_factor": 7.5,
+                    "backend_url": "https://app.temps.sh",
+                }
+            }),
+            &current,
+        );
+
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, Some(7.5));
+        // Explicitly restoring the default destination is a real write.
+        assert_eq!(merged.cloud.backend_url, "https://app.temps.sh");
+        // The two keys this body did not name are still preserved.
+        assert_eq!(
+            merged.cloud.telemetry_bulk_rate_limit_spans_per_sec,
+            Some(5_000)
+        );
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+    }
+
+    /// An explicit `null` is a value, not an omission: it is how a client
+    /// removes the backfill throttle and returns the anomaly factor to the
+    /// documented default.
+    #[test]
+    fn an_explicit_null_clears_a_cloud_field_instead_of_preserving_it() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "cloud": {
+                    "telemetry_bulk_rate_limit_spans_per_sec": null,
+                    "telemetry_bulk_anomaly_factor": null,
+                }
+            }),
+            &current,
+        );
+
+        assert_eq!(merged.cloud.telemetry_bulk_rate_limit_spans_per_sec, None);
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, None);
+        assert_eq!(
+            merged.cloud.effective_bulk_anomaly_factor(),
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // Still scoped: the unnamed ADR-041 fields are untouched.
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(merged.cloud.backend_url, "https://cloud.staging.example");
+    }
+
+    #[test]
+    fn cloud_field_presence_is_read_per_key_from_the_request_body() {
+        let nothing = CloudFieldsSent::from_settings_body(&serde_json::json!({}));
+        assert_eq!(nothing, CloudFieldsSent::default());
+
+        // A `cloud` block that exists but names no operator-tuned field (what a
+        // client that only knows about the consent flags would send).
+        let consent_only = CloudFieldsSent::from_settings_body(&serde_json::json!({
+            "cloud": { "telemetry_enabled": true }
+        }));
+        assert_eq!(consent_only, CloudFieldsSent::default());
+
+        let outbox_only = CloudFieldsSent::from_settings_body(&serde_json::json!({
+            "cloud": { "telemetry_outbox_max_bytes": 1024 }
+        }));
+        assert!(outbox_only.telemetry_outbox_max_bytes);
+        assert!(!outbox_only.backend_url);
+        assert!(!outbox_only.telemetry_bulk_anomaly_factor);
+        assert!(!outbox_only.telemetry_bulk_rate_limit_spans_per_sec);
     }
 
     /// The stored value and the effective value must be the same number.
@@ -2754,6 +3856,44 @@ mod tests {
         assert_eq!(response.observability_retention.otel_spans_days, 75);
         assert_eq!(response.observability_retention.otel_logs_days, 45);
         assert_eq!(response.observability_retention.otel_metrics_days, 60);
+    }
+
+    #[test]
+    fn response_exposes_cluster_pool_and_locks_it_after_allocation() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+                compute_pool_cidr: "10.240.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 2,
+            }));
+
+        assert_eq!(
+            response.multi_node.cluster_network,
+            Some(ClusterNetworkSettings {
+                compute_pool_cidr: "10.240.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 2,
+                locked: true,
+            })
+        );
+    }
+
+    #[test]
+    fn response_marks_an_unused_cluster_pool_as_configurable() {
+        let response = AppSettingsResponse::from(AppSettings::default())
+            .with_cluster_network_state(Some(crate::ClusterNetworkState {
+                compute_pool_cidr: "172.20.0.0/16".to_string(),
+                subnet_prefix_len: 24,
+                allocation_count: 0,
+            }));
+
+        assert!(
+            !response
+                .multi_node
+                .cluster_network
+                .expect("cluster network state")
+                .locked
+        );
     }
 
     #[test]

@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! `MongodbEngine`: in-process MongoDB backup using `mongodump --archive --gzip`,
-//! implemented against `engine_v2::BackupEngine`.
+//! `MongodbEngine`: direct-to-S3 WAL-G stream backups for managed MongoDB
+//! images, with a logical `mongodump` fallback for arbitrary OSS images.
 //!
 //! ## Flow
 //!
@@ -14,12 +14,14 @@
 //!    narrower role). Verified necessary on 2026-05-14 when configured user
 //!    silently emitted a 927-byte admin-only archive instead of the real
 //!    100k+ docs.
-//! 3. Run a one-shot `mongo` sidecar that executes
+//! 3. When the service image contains WAL-G, execute `wal-g backup-push`
+//!    inside the service container. WAL-G streams `mongodump --archive`
+//!    directly to S3 without a database-sized host file.
+//! 4. Otherwise run a one-shot `mongo` sidecar that executes
 //!    `mongodump --archive --gzip` against the target container over the
 //!    user-defined bridge network, capturing the archive in a host bind
 //!    mount.
-//! 4. Upload the resulting `.archive` to S3.
-//! 5. Write the `metadata.json` companion.
+//! 5. Upload the fallback `.archive` to S3 and write its metadata companion.
 //!
 //! ## Why a sidecar, not exec
 //!
@@ -36,13 +38,18 @@ use sea_orm::{DatabaseConnection, EntityTrait};
 use serde_json::{json, Value};
 use tracing::{info, warn};
 
+use super::dispatch::{container_has_walg, service_container_name};
 use super::oneshot::{run_one_shot, OneShotError, OneShotSpec};
+use super::postgres_walg::run_walg_exec;
 use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 const ENGINE_KEY: &str = "mongodb";
 const DUMP_FILE_SUFFIX: &str = "dump.archive";
-const MONGO_SIDECAR_IMAGE: &str = "mongo:7";
+const MONGO_SIDECAR_IMAGE: &str =
+    "mongo:7.0.39-jammy@sha256:04582c3a144d088f841c446abfc19f79adcefa8bd00ad4a7fb18e27b9585c5d6";
+const WALG_STREAM_CREATE_COMMAND: &str = "mongodump --archive --uri=\"$MONGODB_URI\"";
+const WALG_STREAM_RESTORE_COMMAND: &str = "mongorestore --archive --drop --uri=\"$MONGODB_URI\"";
 
 pub struct MongodbDeps {
     pub db: Arc<DatabaseConnection>,
@@ -111,7 +118,7 @@ impl BackupEngine for MongodbEngine {
             .unwrap_or("")
             .to_string();
 
-        let target_container = format!("temps-mongodb-{}", service.name);
+        let target_container = service_container_name(&service);
         match deps
             .docker
             .inspect_container(
@@ -150,6 +157,26 @@ impl BackupEngine for MongodbEngine {
         );
 
         let backup_uuid = v2_common::load_backup_uuid(deps.db.as_ref(), backup_id).await?;
+        if container_has_walg(&deps.docker, &target_container).await {
+            return run_walg_backup(
+                &deps,
+                ctx,
+                &service,
+                &s3_source,
+                &s3_client,
+                &target_container,
+                &username,
+                &password,
+                &backup_uuid,
+            )
+            .await;
+        }
+        warn!(
+            backup_id,
+            container = %target_container,
+            "MongodbEngine: WAL-G is unavailable; using logical mongodump fallback. This backup remains usable in OSS but is not eligible for managed Cloud restore verification",
+        );
+
         let s3_key = v2_common::build_external_service_s3_key(
             &s3_source.bucket_path,
             "mongodb",
@@ -279,5 +306,219 @@ impl BackupEngine for MongodbEngine {
             size_bytes: Some(file_size),
             compression: "gzip".to_string(),
         })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_walg_backup(
+    deps: &MongodbDeps,
+    ctx: &BackupContext,
+    service: &temps_entities::external_services::Model,
+    s3_source: &temps_entities::s3_sources::Model,
+    s3_client: &aws_sdk_s3::Client,
+    container_name: &str,
+    username: &str,
+    password: &str,
+    backup_uuid: &str,
+) -> Result<BackupOutcome, BackupError> {
+    let bucket_path = s3_source.bucket_path.trim_matches('/');
+    let service_root = format!("external_services/mongodb/{}/walg", service.name);
+    let repository_key = if bucket_path.is_empty() {
+        service_root
+    } else {
+        format!("{bucket_path}/{service_root}")
+    };
+    let walg_prefix = format!("s3://{}/{}", s3_source.bucket_name, repository_key);
+    let list_prefix = format!("{repository_key}/");
+
+    let access_key = deps
+        .encryption_service
+        .decrypt_string(&s3_source.access_key_id)
+        .map_err(|error| BackupError::PermanentFailure {
+            reason: format!("decrypt MongoDB WAL-G access key: {error}"),
+        })?;
+    let secret_key = deps
+        .encryption_service
+        .decrypt_string(&s3_source.secret_key)
+        .map_err(|error| BackupError::PermanentFailure {
+            reason: format!("decrypt MongoDB WAL-G secret key: {error}"),
+        })?;
+    let session_token = v2_common::decrypt_session_token(s3_source, &deps.encryption_service)?;
+    let container_endpoint = temps_providers::externalsvc::S3Credentials {
+        access_key_id: access_key.clone(),
+        secret_key: secret_key.clone(),
+        session_token: session_token.clone(),
+        region: s3_source.region.clone(),
+        endpoint: s3_source.endpoint.clone(),
+        bucket_name: s3_source.bucket_name.clone(),
+        bucket_path: s3_source.bucket_path.clone(),
+        force_path_style: s3_source.force_path_style.unwrap_or(true),
+    }
+    .resolve_endpoint_for_container(&deps.docker, container_name)
+    .await;
+    let mongodb_uri = format!(
+        "mongodb://{}:{}@127.0.0.1:27017/?authSource=admin",
+        urlencoding::encode(username),
+        urlencoding::encode(password),
+    );
+    let mut env = vec![
+        format!("WALG_S3_PREFIX={walg_prefix}"),
+        format!("AWS_ACCESS_KEY_ID={access_key}"),
+        format!("AWS_SECRET_ACCESS_KEY={secret_key}"),
+        format!("AWS_REGION={}", s3_source.region),
+        format!("MONGODB_URI={mongodb_uri}"),
+        format!("WALG_STREAM_CREATE_COMMAND={WALG_STREAM_CREATE_COMMAND}"),
+        format!("WALG_STREAM_RESTORE_COMMAND={WALG_STREAM_RESTORE_COMMAND}"),
+    ];
+    // Present only for a temporary credential; a long-lived one contributes
+    // nothing here and the container's environment is byte-for-byte unchanged.
+    env.extend(temps_providers::externalsvc::aws_session_token_env(
+        session_token.as_deref(),
+    ));
+    env.extend(v2_common::walg_identity_env(backup_uuid));
+    if let Some(endpoint) = container_endpoint {
+        env.push(format!(
+            "AWS_ENDPOINT={}",
+            if endpoint.starts_with("http") {
+                endpoint
+            } else {
+                format!("http://{endpoint}")
+            }
+        ));
+    }
+    if s3_source.force_path_style.unwrap_or(true) {
+        env.push("AWS_S3_FORCE_PATH_STYLE=true".into());
+    }
+
+    info!(
+        backup_id = ctx.backup_id,
+        repository = %walg_prefix,
+        "MongodbEngine: starting direct WAL-G stream backup",
+    );
+    let exec = run_walg_exec(
+        &deps.docker,
+        container_name,
+        "wal-g backup-push",
+        &env,
+        &ctx.cancel,
+    )
+    .await?;
+    if exec.exit_code != 0 {
+        return Err(BackupError::Failed {
+            reason: format!(
+                "MongoDB wal-g backup-push exited with code {}. stderr: {}",
+                exec.exit_code,
+                bounded_tail(&exec.stderr),
+            ),
+        });
+    }
+
+    let file_size = list_total_s3_size(s3_client, &s3_source.bucket_name, &list_prefix).await?;
+    if file_size <= 0 {
+        return Err(BackupError::Failed {
+            reason: format!("MongoDB WAL-G repository {walg_prefix} contains no backup bytes"),
+        });
+    }
+    let metadata_key = format!("{list_prefix}{backup_uuid}.metadata.json");
+    v2_common::write_metadata_companion(
+        s3_client,
+        &s3_source.bucket_name,
+        &metadata_key,
+        ENGINE_KEY,
+        backup_uuid,
+        &walg_prefix,
+        file_size,
+        s3_source.id,
+        "wal-g-native",
+        Some(json!({
+            "backup_tool": "wal-g+mongodump-stream",
+            "service": { "id": service.id, "name": service.name },
+        })),
+    )
+    .await?;
+    v2_common::record_walg_identity(deps.db.as_ref(), ctx.backup_id, backup_uuid).await?;
+
+    info!(
+        backup_id = ctx.backup_id,
+        repository = %walg_prefix,
+        size_bytes = file_size,
+        "MongodbEngine: WAL-G stream backup complete",
+    );
+    Ok(BackupOutcome {
+        location: walg_prefix,
+        size_bytes: Some(file_size),
+        compression: "wal-g-native".to_string(),
+    })
+}
+
+fn bounded_tail(value: &str) -> String {
+    const MAX_BYTES: usize = 2_000;
+    let trimmed = value.trim();
+    if trimmed.len() <= MAX_BYTES {
+        return trimmed.to_string();
+    }
+    let mut start = trimmed.len() - MAX_BYTES;
+    while !trimmed.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("…{}", &trimmed[start..])
+}
+
+async fn list_total_s3_size(
+    client: &aws_sdk_s3::Client,
+    bucket: &str,
+    prefix: &str,
+) -> Result<i64, BackupError> {
+    let mut total = 0_i64;
+    let mut continuation = None;
+    loop {
+        let mut request = client.list_objects_v2().bucket(bucket).prefix(prefix);
+        if let Some(token) = continuation {
+            request = request.continuation_token(token);
+        }
+        let response = request.send().await.map_err(|error| BackupError::Failed {
+            reason: format!("list MongoDB WAL-G repository {prefix}: {error}"),
+        })?;
+        for object in response.contents() {
+            total = total
+                .checked_add(object.size().unwrap_or(0))
+                .ok_or_else(|| BackupError::Failed {
+                    reason: format!("MongoDB WAL-G repository {prefix} size overflowed i64"),
+                })?;
+        }
+        if response.is_truncated().unwrap_or(false) {
+            continuation = response.next_continuation_token().map(str::to_owned);
+        } else {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mongo_sidecar_image_is_release_and_digest_pinned() {
+        assert!(MONGO_SIDECAR_IMAGE.contains("mongo:7.0.39-jammy@"));
+        assert!(MONGO_SIDECAR_IMAGE
+            .contains("sha256:04582c3a144d088f841c446abfc19f79adcefa8bd00ad4a7fb18e27b9585c5d6"));
+    }
+
+    #[test]
+    fn walg_stream_commands_use_ephemeral_uri_environment() {
+        assert!(WALG_STREAM_CREATE_COMMAND.contains("$MONGODB_URI"));
+        assert!(WALG_STREAM_RESTORE_COMMAND.contains("$MONGODB_URI"));
+        assert!(!WALG_STREAM_CREATE_COMMAND.contains("mongodb://"));
+        assert!(!WALG_STREAM_RESTORE_COMMAND.contains("mongodb://"));
+    }
+
+    #[test]
+    fn bounded_tail_preserves_utf8_boundaries() {
+        let value = format!("{}END", "é".repeat(1_100));
+        let tail = bounded_tail(&value);
+        assert!(tail.ends_with("END"));
+        assert!(tail.starts_with('…'));
     }
 }

@@ -56,6 +56,18 @@ pub struct AgentCommand {
     /// Overrides labels from saved config. Sent in every heartbeat.
     #[arg(long, env = "TEMPS_NODE_LABELS", value_delimiter = ',')]
     pub labels: Vec<String>,
+
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. "enp6s0"). Overrides the saved config. Defaults to
+    /// auto-detecting the device carrying this host's IPv4 default route.
+    #[arg(long, env = "TEMPS_AGENT_UNDERLAY_DEV")]
+    pub underlay_dev: Option<String>,
+
+    /// Optional MTU ceiling for the overlay underlay. Defaults to reading the
+    /// selected interface's MTU from the kernel. Set this only when the path
+    /// MTU is lower than the interface advertises.
+    #[arg(long, env = "TEMPS_AGENT_UNDERLAY_MTU")]
+    pub underlay_mtu: Option<u32>,
 }
 
 impl AgentCommand {
@@ -325,6 +337,15 @@ impl AgentCommand {
         let tls_cert_path = saved.as_ref().and_then(|c| c.tls_cert_path.clone());
         let tls_key_path = saved.as_ref().and_then(|c| c.tls_key_path.clone());
         let cluster_ca_path = saved.as_ref().and_then(|c| c.cluster_ca_path.clone());
+        let require_mtls = saved.as_ref().is_some_and(|c| c.require_mtls);
+
+        let underlay_dev = self
+            .underlay_dev
+            .clone()
+            .or_else(|| saved.as_ref().and_then(|c| c.underlay_dev.clone()));
+        let underlay_mtu = self
+            .underlay_mtu
+            .or_else(|| saved.as_ref().and_then(|c| c.underlay_mtu));
 
         Ok(temps_agent::AgentConfig {
             listen_address,
@@ -340,13 +361,16 @@ impl AgentCommand {
             tls_cert_path,
             tls_key_path,
             cluster_ca_path,
+            require_mtls,
+            underlay_dev,
+            underlay_mtu,
         })
     }
 
-    /// Try to load `~/.temps/agent.json`. Returns None if not found or unparsable.
+    /// Try to load `agent.json` from the configured agent data directory.
+    /// Returns None if not found or unparsable.
     fn load_saved_config(&self) -> Option<temps_agent::AgentConfig> {
-        let home = dirs::home_dir()?;
-        let config_path = home.join(".temps").join("agent.json");
+        let config_path = agent_data_dir().join("agent.json");
         let data = std::fs::read_to_string(&config_path).ok()?;
         match serde_json::from_str::<temps_agent::AgentConfig>(&data) {
             Ok(config) => {

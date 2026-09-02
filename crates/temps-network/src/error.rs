@@ -69,12 +69,36 @@ pub enum NetworkError {
         reason: String,
     },
 
+    /// Auto-detecting the underlay device (the interface carrying the
+    /// default route) failed. Callers fall back to an operator-supplied
+    /// override or a hardcoded default and log this reason.
+    #[error("could not auto-detect underlay device from the default route: {reason}")]
+    UnderlayDetection { reason: String },
+
+    /// Reading the MTU from the selected underlay device failed. Building a
+    /// VXLAN with a guessed MTU is unsafe because Linux rejects an overlay
+    /// larger than its parent and a too-large path MTU causes silent packet
+    /// loss on provider networks such as Hetzner vSwitch.
+    #[error("could not detect MTU for underlay device '{device}': {reason}")]
+    UnderlayMtuDetection { device: String, reason: String },
+
     // ----- firewall -----
     /// nftables rule installation failed.
     #[error("nftables operation '{op}' on table '{table}' failed: {reason}")]
     Nftables {
         op: &'static str,
         table: String,
+        reason: String,
+    },
+
+    /// Docker's documented `DOCKER-USER` firewall hook could not be
+    /// reconciled. Cross-host VXLAN frames enter through the VXLAN device,
+    /// not the Docker bridge, so Docker's generated bridge rules alone do
+    /// not permit them through a default-DROP FORWARD chain.
+    #[error("iptables operation '{op}' on chain '{chain}' failed: {reason}")]
+    Iptables {
+        op: &'static str,
+        chain: String,
         reason: String,
     },
 
@@ -91,13 +115,23 @@ pub enum NetworkError {
     /// The CIDR we were asked to use for our Docker network is already in use
     /// by a different Docker network on this host.
     #[error(
-        "cidr {cidr} is already used by docker network '{existing_network}'; \
+        "requested cidr {cidr} overlaps {existing_cidr} used by docker network '{existing_network}'; \
          refusing to create '{desired_network}' to avoid corruption"
     )]
     DockerCidrCollision {
         cidr: Ipv4Net,
+        existing_cidr: Ipv4Net,
         existing_network: String,
         desired_network: String,
+    },
+
+    #[error(
+        "compute pool {pool} overlaps host route {existing_cidr} on device '{device}'; choose a different cluster pool before enabling the overlay"
+    )]
+    HostRouteCollision {
+        pool: Ipv4Net,
+        existing_cidr: Ipv4Net,
+        device: String,
     },
 
     // ----- config / validation -----

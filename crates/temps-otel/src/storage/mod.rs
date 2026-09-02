@@ -9,7 +9,14 @@
 //! implementing this trait.
 
 pub mod clickhouse;
+/// ADR-040 §2 / ADR-041 §8: routes span reads for Cloud-primary projects.
+pub mod cloud_routed;
+/// Reads mirrored spans back out of Temps Cloud through its read proxy.
+pub mod cloud_spans;
 pub mod timescaledb;
+
+pub use cloud_routed::{CloudRoutedOtelStorage, CloudSpanSource};
+pub use cloud_spans::CloudTelemetrySpanSource;
 
 use async_trait::async_trait;
 

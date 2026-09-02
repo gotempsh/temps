@@ -1739,71 +1739,52 @@ SELECT cp.id
         // Generate unique backup ID
         let backup_id = Uuid::new_v4().to_string();
 
-        // Create S3 client (needed for metadata upload and legacy fallback)
+        // Create S3 client for the portable OSS fallback.
         let s3_client = self.create_s3_client(&s3_source).await?;
 
-        // Try WAL-G backup first (requires the internal DB container to have WAL-G installed).
-        // Falls back to pg_dump sidecar if the DB is not running in a Docker container we can exec into.
-        let (s3_location, size_bytes, compression_type) =
-            match self.backup_postgres_walg(&s3_source, &backup_id).await {
-                Ok((location, size)) => {
-                    info!("WAL-G backup completed: {}", location);
-                    (location, size, "lz4".to_string())
+        // WAL-G is preferred because it supports PITR and streams directly to
+        // object storage. OSS remains usable with arbitrary PostgreSQL images,
+        // so a local-only pg_dump artifact is still a supported fallback. The
+        // Cloud mirror deliberately rejects that fallback and explains that a
+        // WAL-G-capable image is required for managed backups.
+        let (s3_location, size_bytes, compression_type) = match self
+            .backup_postgres_walg(&s3_source, &backup_id)
+            .await
+        {
+            Ok((location, size)) => {
+                info!("WAL-G backup completed: {}", location);
+                (location, size, "lz4".to_string())
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "WAL-G unavailable; creating a local OSS pg_dump backup that will not be mirrored to Cloud"
+                );
+                let mut temp_file = NamedTempFile::new().map_err(BackupError::Io)?;
+                self.backup_postgres_database(&mut temp_file).await?;
+                let size_bytes = temp_file
+                    .as_file()
+                    .metadata()
+                    .map_err(BackupError::Io)?
+                    .len() as i64;
+                if size_bytes == 0 {
+                    return Err(BackupError::Validation(
+                        "Backup failed: pg_dump produced an empty artifact".to_string(),
+                    ));
                 }
-                Err(e) => {
-                    // WAL-G not available (e.g., DB on localhost, no Docker container found).
-                    // Fall back to pg_dump sidecar approach.
-                    warn!(
-                        "WAL-G backup not available ({}), falling back to pg_dump sidecar",
-                        e
-                    );
-
-                    let mut temp_file = NamedTempFile::new().map_err(BackupError::Io)?;
-
-                    self.backup_postgres_database(&mut temp_file)
-                        .await
-                        .map_err(|e| {
-                            error!(
-                                "Database backup failed for S3 source {}: {}",
-                                s3_source_id, e
-                            );
-                            e
-                        })?;
-
-                    let size_bytes = temp_file
-                        .as_file()
-                        .metadata()
-                        .map_err(BackupError::Io)?
-                        .len() as i64;
-
-                    if size_bytes == 0 {
-                        return Err(BackupError::Validation(
-                            "Backup failed: backup file has zero size".to_string(),
-                        ));
-                    }
-
-                    let s3_location = build_s3_key(
-                        &s3_source.bucket_path,
-                        &format!(
-                            "backups/{}/{}/backup.sql.gz",
-                            Utc::now().format("%Y/%m/%d"),
-                            backup_id
-                        ),
-                    );
-
-                    self.upload_backup(&s3_client, &s3_source, &temp_file, &s3_location)
-                        .await
-                        .map_err(|e| {
-                            error!(
-                                "Failed to upload backup to S3 source {} at {}: {}",
-                                s3_source_id, s3_location, e
-                            );
-                            e
-                        })?;
-
-                    (s3_location, size_bytes, "gzip".to_string())
-                }
-            };
+                let s3_location = build_s3_key(
+                    &s3_source.bucket_path,
+                    &format!(
+                        "backups/{}/{}/backup.sql.gz",
+                        Utc::now().format("%Y/%m/%d"),
+                        backup_id
+                    ),
+                );
+                self.upload_backup(&s3_client, &s3_source, &temp_file, &s3_location)
+                    .await?;
+                (s3_location, size_bytes, "gzip".to_string())
+            }
+        };
 
         // Create backup record
         let new_backup = temps_entities::backups::ActiveModel {
@@ -2158,6 +2139,15 @@ SELECT cp.id
                 message: format!("Failed to decrypt S3 secret key: {}", e),
             })?;
 
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to decrypt S3 session token: {}", e),
+        })?;
+
         // Build environment variables for WAL-G
         let mut env_vars: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
@@ -2166,12 +2156,17 @@ SELECT cp.id
             format!("AWS_REGION={}", s3_source.region),
             format!("PGDATA={}", pgdata),
         ];
+        // Absent for a long-lived credential, so its environment is unchanged.
+        env_vars.extend(temps_providers::externalsvc::aws_session_token_env(
+            decrypted_session_token.as_deref(),
+        ));
 
         // Resolve S3 endpoint for use inside the Docker container.
         // localhost/127.0.0.1 endpoints are translated to Docker-resolvable addresses.
         let s3_creds = temps_providers::S3Credentials {
             access_key_id: decrypted_access_key.clone(),
             secret_key: decrypted_secret_key.clone(),
+            session_token: decrypted_session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -2821,10 +2816,19 @@ SELECT cp.id
             .decrypt_string(&s3_source.secret_key)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt secret key: {}", e))?;
 
+        // `None` for a long-lived credential — the third argument stays exactly
+        // what it was for every operator-configured source. `Some` only for a
+        // temporary one, which SigV4 rejects without its session token.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
+
         let creds = aws_sdk_s3::config::Credentials::new(
             decrypted_access_key,
             decrypted_secret_key,
-            None,
+            decrypted_session_token,
             None,
             "backup-service",
         );
@@ -3952,6 +3956,15 @@ SELECT cp.id
                 message: format!("Failed to decrypt S3 secret key: {}", e),
             })?;
 
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to decrypt S3 session token: {}", e),
+        })?;
+
         let walg_s3_prefix = &backup.s3_location;
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
@@ -3960,11 +3973,16 @@ SELECT cp.id
             format!("AWS_REGION={}", s3_source.region),
             format!("PGDATA={}", pgdata),
         ];
+        // Absent for a long-lived credential, so its environment is unchanged.
+        walg_env.extend(temps_providers::externalsvc::aws_session_token_env(
+            decrypted_session_token.as_deref(),
+        ));
 
         // Resolve S3 endpoint for use inside the Docker container.
         let s3_creds = temps_providers::S3Credentials {
             access_key_id: decrypted_access_key.clone(),
             secret_key: decrypted_secret_key.clone(),
+            session_token: decrypted_session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -4797,12 +4815,24 @@ SELECT cp.id
                     source.id, error
                 ))
             })?;
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            source,
+        )
+        .map_err(|error| {
+            BackupError::Configuration(format!(
+                "Failed to decrypt session token for S3 source {}: {}",
+                source.id, error
+            ))
+        })?;
         let docker = bollard::Docker::connect_with_local_defaults().map_err(|error| {
             BackupError::ExternalService(format!("Failed to connect to Docker: {}", error))
         })?;
         let endpoint = temps_providers::externalsvc::S3Credentials {
             access_key_id: access_key.clone(),
             secret_key: secret_key.clone(),
+            session_token: session_token.clone(),
             region: source.region.clone(),
             endpoint: source.endpoint.clone(),
             bucket_name: source.bucket_name.clone(),
@@ -4821,6 +4851,10 @@ SELECT cp.id
             format!("AWS_SECRET_ACCESS_KEY={}", secret_key),
             format!("AWS_REGION={}", source.region),
         ];
+        // Absent for a long-lived credential, so its environment is unchanged.
+        env.extend(temps_providers::externalsvc::aws_session_token_env(
+            session_token.as_deref(),
+        ));
         if let Some(endpoint) = endpoint {
             env.push(format!(
                 "AWS_ENDPOINT={}",
@@ -5348,21 +5382,6 @@ SELECT cp.id
         self.test_and_create_s3_bucket(&s3_client, &request.bucket_name)
             .await?;
 
-        // Encrypt sensitive credentials before storing
-        let encrypted_access_key = self
-            .encryption_service
-            .encrypt_string(&request.access_key_id)
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to encrypt access key: {}", e),
-            })?;
-
-        let encrypted_secret_key = self
-            .encryption_service
-            .encrypt_string(&request.secret_key)
-            .map_err(|e| BackupError::Internal {
-                message: format!("Failed to encrypt secret key: {}", e),
-            })?;
-
         // First source is automatically default; subsequent sources require an explicit
         // set-default call. An explicit `is_default: true` in the request is honored and
         // will swap default atomically.
@@ -5386,22 +5405,36 @@ SELECT cp.id
                 .await?;
         }
 
-        let new_source = temps_entities::s3_sources::ActiveModel {
-            id: sea_orm::NotSet,
-            name: sea_orm::Set(request.name.clone()),
-            bucket_name: sea_orm::Set(request.bucket_name),
-            bucket_path: sea_orm::Set(request.bucket_path),
-            access_key_id: sea_orm::Set(encrypted_access_key),
-            secret_key: sea_orm::Set(encrypted_secret_key),
-            region: sea_orm::Set(request.region),
-            created_at: sea_orm::Set(Utc::now()),
-            updated_at: sea_orm::Set(Utc::now()),
-            endpoint: sea_orm::Set(request.endpoint),
-            force_path_style: sea_orm::Set(request.force_path_style),
-            is_default: sea_orm::Set(should_be_default),
-        };
-
-        let source = new_source.insert(&txn).await?;
+        // Encrypt sensitive credentials and insert — shared with
+        // `temps-cloud`'s Cloud-managed backup credential provisioning so the
+        // encryption call site and the persisted row shape never drift.
+        let source = temps_entities::s3_sources::insert_encrypted(
+            &txn,
+            &self.encryption_service,
+            temps_entities::s3_sources::S3SourceCredentials {
+                name: request.name.clone(),
+                bucket_name: request.bucket_name,
+                bucket_path: request.bucket_path,
+                access_key_id: request.access_key_id,
+                secret_key: request.secret_key,
+                // An operator typing credentials into the S3 Sources form is
+                // always configuring a long-lived credential. Temporary,
+                // prefix-scoped credentials only ever arrive from Temps Cloud
+                // via `CloudService::provision_managed_backup_source`, so this
+                // path stores NULL for both and behaves exactly as before.
+                session_token: None,
+                credentials_expire_at: None,
+                region: request.region,
+                endpoint: request.endpoint,
+                force_path_style: request.force_path_style,
+            },
+            should_be_default,
+            false,
+        )
+        .await
+        .map_err(|error| BackupError::Internal {
+            message: format!("Failed to create S3 source '{}': {}", request.name, error),
+        })?;
         txn.commit().await?;
 
         debug!(
@@ -5559,6 +5592,18 @@ SELECT cp.id
         // First check if source exists and is not in use
         let source = self.get_s3_source(id).await?;
 
+        // Refuse to delete a Cloud-managed source. It was not created by an
+        // operator and cannot be recreated by one; only Temps Cloud's own
+        // disconnect cleanup (which does not go through this method) may
+        // remove it.
+        if source.managed_by_cloud {
+            return Err(BackupError::Validation(format!(
+                "S3 source '{}' is managed by Temps Cloud and cannot be deleted manually. \
+                 Disconnect Temps Cloud to remove it.",
+                source.name
+            )));
+        }
+
         // Refuse to delete the default source while other sources exist. The caller
         // should set a different source as default first.
         if source.is_default {
@@ -5583,6 +5628,22 @@ SELECT cp.id
             return Err(BackupError::Validation(format!(
                 "Cannot delete S3 source '{}': still referenced by {} backup schedule(s)",
                 source.name, schedule_count
+            )));
+        }
+
+        // Completed and failed backup records are retained as recovery evidence.
+        // Deleting their source would cascade into `backups`, which is deliberately
+        // prevented once a restore run references a backup. Check the direct
+        // dependency up front so callers receive a stable validation error instead
+        // of leaking a database foreign-key violation as HTTP 500.
+        let backup_count = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::S3SourceId.eq(id))
+            .count(self.db.as_ref())
+            .await?;
+        if backup_count > 0 {
+            return Err(BackupError::Validation(format!(
+                "Cannot delete S3 source '{}': still referenced by {} backup record(s)",
+                source.name, backup_count
             )));
         }
 
@@ -7608,6 +7669,16 @@ RETURNING id
                 detail: "S3 source not found".to_string(),
             })?;
 
+        // Refuse to edit a Cloud-managed source. Its credentials are rotated
+        // by Temps Cloud's own provisioning path, not by an operator editing
+        // this row by hand.
+        if current.managed_by_cloud {
+            return Err(BackupError::Validation(format!(
+                "S3 source '{}' is managed by Temps Cloud and cannot be edited manually.",
+                current.name
+            )));
+        }
+
         let mut active = current.into_active_model();
 
         if let Some(name) = request.name {
@@ -8546,6 +8617,22 @@ ORDER BY a.opened_at DESC
             })
     }
 
+    /// Resolve the live backup artifact and Cloud mirror compatibility for an
+    /// external service. Database lookup and Docker probing stay in the
+    /// service layer so HTTP handlers only perform authorization and mapping.
+    pub async fn get_external_service_backup_capability(
+        &self,
+        service_id: i32,
+    ) -> Result<super::ExternalServiceBackupCapability, super::BackupCapabilityError> {
+        let service = temps_entities::external_services::Entity::find_by_id(service_id)
+            .one(self.db.as_ref())
+            .await
+            .map_err(|source| super::BackupCapabilityError::LoadService { service_id, source })?
+            .ok_or(super::BackupCapabilityError::ServiceNotFound { service_id })?;
+
+        Ok(super::capability::probe_external_service_backup_capability(&service).await)
+    }
+
     pub async fn backup_external_service(
         &self,
         service: &temps_entities::external_services::Model,
@@ -8584,9 +8671,18 @@ ORDER BY a.opened_at DESC
             .map_err(|e| BackupError::Internal {
                 message: format!("Failed to decrypt secret key for backup: {}", e),
             })?;
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            &s3_source,
+        )
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to decrypt session token for backup: {}", e),
+        })?;
         let s3_credentials = temps_providers::S3Credentials {
             access_key_id: decrypted_access_key,
             secret_key: decrypted_secret_key,
+            session_token: decrypted_session_token,
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -9883,10 +9979,13 @@ mod tests {
             bucket_path: "tenant".to_string(),
             access_key_id: "key".to_string(),
             secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: None,
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -9935,6 +10034,163 @@ mod tests {
             "selected-backup"
         ));
         assert!(!json_contains_backup_identity(&repository, "missing"));
+    }
+
+    #[tokio::test]
+    async fn delete_s3_source_refuses_retained_backup_records_before_delete() {
+        let source = s3_sources::Model {
+            id: 17,
+            name: "recovery-evidence".to_string(),
+            bucket_name: "backups".to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let count_row = |count: i64| {
+            let mut row = std::collections::BTreeMap::new();
+            row.insert("num_items".to_string(), sea_orm::Value::BigInt(Some(count)));
+            row
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .append_query_results(vec![vec![count_row(0)]])
+                .append_query_results(vec![vec![count_row(2)]])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+        let error = service
+            .delete_s3_source(17)
+            .await
+            .expect_err("retained backups must block source deletion");
+
+        assert!(matches!(
+            error,
+            BackupError::Validation(message)
+                if message.contains("recovery-evidence")
+                    && message.contains("2 backup record(s)")
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            3,
+            "validation must stop after source lookup and the two reference counts, before DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_s3_source_refuses_a_cloud_managed_row() {
+        let source = s3_sources::Model {
+            id: 21,
+            name: "Temps Cloud managed backups".to_string(),
+            bucket_name: "cloud-bucket".to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(false),
+            is_default: false,
+            managed_by_cloud: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+        let error = service
+            .delete_s3_source(21)
+            .await
+            .expect_err("a Cloud-managed source must refuse user-initiated deletion");
+
+        assert!(matches!(
+            error,
+            BackupError::Validation(ref message)
+                if message.contains("Temps Cloud managed backups")
+                    && message.contains("managed by Temps Cloud")
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            1,
+            "the managed_by_cloud guard must stop the delete before any reference-count query"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_s3_source_refuses_a_cloud_managed_row() {
+        let source = s3_sources::Model {
+            id: 22,
+            name: "Temps Cloud managed backups".to_string(),
+            bucket_name: "cloud-bucket".to_string(),
+            bucket_path: "tenant".to_string(),
+            access_key_id: "key".to_string(),
+            secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(false),
+            is_default: false,
+            managed_by_cloud: true,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        };
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![source]])
+                .into_connection(),
+        );
+        let service = build_service_for_mock(db.clone()).expect("mock service should construct");
+
+        let error = service
+            .update_s3_source(
+                22,
+                crate::handlers::backup_handler::UpdateS3SourceRequest {
+                    name: Some("renamed".to_string()),
+                    bucket_name: None,
+                    bucket_path: None,
+                    access_key_id: Some("attacker-key".to_string()),
+                    secret_key: Some("attacker-secret".to_string()),
+                    region: None,
+                    endpoint: None,
+                    force_path_style: None,
+                },
+            )
+            .await
+            .expect_err("a Cloud-managed source must refuse manual credential edits");
+
+        assert!(matches!(
+            error,
+            BackupError::Validation(ref message)
+                if message.contains("Temps Cloud managed backups")
+                    && message.contains("managed by Temps Cloud")
+        ));
+        drop(service);
+        let db = Arc::try_unwrap(db).expect("service must release the mock database");
+        assert_eq!(
+            db.into_transaction_log().len(),
+            1,
+            "the managed_by_cloud guard must stop the update before any write"
+        );
     }
 
     #[tokio::test]
@@ -10029,10 +10285,13 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: encrypted_access_key,
             secret_key: encrypted_secret_key,
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10295,10 +10554,13 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: encrypted_access_key,
             secret_key: encrypted_secret_key,
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -10424,10 +10686,13 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: "test-key".to_string(),
             secret_key: "test-secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -11490,8 +11755,11 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: "key".to_string(),
             secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             force_path_style: Some(true),
             is_default: false,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         };
@@ -12690,10 +12958,13 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -12872,10 +13143,13 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13033,10 +13307,13 @@ mod tests {
                     bucket_path: "/".to_string(),
                     access_key_id: "".to_string(),
                     secret_key: "".to_string(),
+                    session_token: None,
+                    credentials_expire_at: None,
                     region: "us-east-1".to_string(),
                     endpoint: None,
                     force_path_style: Some(true),
                     is_default: true,
+                    managed_by_cloud: false,
                     created_at: Utc::now(),
                     updated_at: Utc::now(),
                 }]])
@@ -13166,10 +13443,13 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }
@@ -13308,10 +13588,13 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
             is_default: Set(true),
+            managed_by_cloud: Set(false),
             created_at: Set(chrono::Utc::now()),
             updated_at: Set(chrono::Utc::now()),
         }

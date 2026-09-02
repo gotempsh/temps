@@ -17,9 +17,9 @@ use crate::handlers::authz::{
 use crate::handlers::types::BackupAppState;
 use crate::services::BackupTriggerParams;
 use crate::services::{
-    BackupAccessScope, BackupError, ChildBackupEntry, EnqueuedJob, RetentionCleanupReport,
-    ScheduleRunEntry, ScheduleRunJobEntry, ScheduleRunListResponse, ScheduleRunResponse,
-    ScheduleRunSummary, ScheduleRunSummaryList,
+    BackupAccessScope, BackupCapabilityError, BackupError, ChildBackupEntry, EnqueuedJob,
+    ExternalServiceBackupCapability, RetentionCleanupReport, ScheduleRunEntry, ScheduleRunJobEntry,
+    ScheduleRunListResponse, ScheduleRunResponse, ScheduleRunSummary, ScheduleRunSummaryList,
 };
 use axum::{
     extract::{Extension, Path, State},
@@ -46,7 +46,6 @@ impl From<ResolveEngineError> for Problem {
                 .with_title("Unsupported Service Type")
                 .with_detail(error.to_string()),
             ResolveEngineError::WalgProbeFailed { .. } => {
-                // Probe failure is non-fatal: caller should retry or fall back.
                 problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
                     .with_title("Engine Detection Failed")
                     .with_detail(error.to_string())
@@ -131,6 +130,29 @@ impl From<BackupError> for Problem {
     }
 }
 
+impl From<BackupCapabilityError> for Problem {
+    fn from(error: BackupCapabilityError) -> Self {
+        match error {
+            BackupCapabilityError::ServiceNotFound { service_id } => {
+                let detail = format!(
+                    "External service {service_id} was not found while checking backup capability"
+                );
+                problemdetails::new(StatusCode::NOT_FOUND)
+                    .with_title("External Service Not Found")
+                    .with_detail(detail)
+            }
+            BackupCapabilityError::LoadService { service_id, source } => {
+                error!(service_id, error = %source, "Could not load backup capability source");
+                problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                    .with_title("Backup Capability Unavailable")
+                    .with_detail(format!(
+                        "Could not determine backup capability for external service {service_id}"
+                    ))
+            }
+        }
+    }
+}
+
 #[derive(OpenApi)]
 #[openapi(
     paths(
@@ -163,6 +185,7 @@ impl From<BackupError> for Problem {
         enable_backup_schedule,
         update_backup_schedule,
         run_external_service_backup,
+        get_external_service_backup_capability,
         list_backup_alerts,
         list_schedule_services,
         attach_schedule_services,
@@ -182,6 +205,7 @@ impl From<BackupError> for Problem {
             BackupScheduleResponse,
             BackupResponse,
             ExternalServiceSummary,
+            ExternalServiceBackupCapabilityResponse,
             ExternalServiceBackupResponse,
             SourceBackupIndexResponse,
             SourceBackupEntry,
@@ -523,6 +547,10 @@ pub struct S3SourceResponse {
     pub endpoint: Option<String>,
     pub force_path_style: Option<bool>,
     pub is_default: bool,
+    /// True when this source was auto-provisioned by a Temps Cloud link
+    /// rather than entered by an operator. Managed sources cannot be edited
+    /// or deleted from this API; disconnect Temps Cloud to remove one.
+    pub managed_by_cloud: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -727,6 +755,7 @@ impl From<temps_entities::s3_sources::Model> for S3SourceResponse {
             endpoint: source.endpoint,
             force_path_style: source.force_path_style,
             is_default: source.is_default,
+            managed_by_cloud: source.managed_by_cloud,
             created_at: source.created_at.timestamp_millis(),
             updated_at: source.updated_at.timestamp_millis(),
         }
@@ -1368,7 +1397,77 @@ pub fn configure_routes() -> Router<Arc<BackupAppState>> {
             "/backups/external-services/{id}/run",
             post(run_external_service_backup),
         )
+        .route(
+            "/backups/external-services/{id}/capability",
+            get(get_external_service_backup_capability),
+        )
         .route("/backups/alerts", get(list_backup_alerts))
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct ExternalServiceBackupCapabilityResponse {
+    /// Whether this running service can produce the physical WAL-G repository
+    /// required by Temps Cloud. Logical dump fallback is intentionally not
+    /// considered compatible.
+    pub cloud_backup_compatible: bool,
+    /// False when Docker or the target container was unavailable, meaning the
+    /// endpoint intentionally did not guess whether required tools exist.
+    pub verified: bool,
+    pub wal_g_installed: bool,
+    pub engine: String,
+    /// Concrete artifact Cloud would mirror, such as `walg_repository`,
+    /// `redis_walg_stream`, or `object_set`.
+    pub artifact: String,
+    pub reason: Option<String>,
+    pub remediation: Option<String>,
+    pub recommended_image: Option<String>,
+}
+
+impl From<ExternalServiceBackupCapability> for ExternalServiceBackupCapabilityResponse {
+    fn from(capability: ExternalServiceBackupCapability) -> Self {
+        Self {
+            cloud_backup_compatible: capability.cloud_backup_compatible,
+            verified: capability.verified,
+            wal_g_installed: capability.wal_g_installed,
+            engine: capability.engine,
+            artifact: capability.artifact,
+            reason: capability.reason,
+            remediation: capability.remediation,
+            recommended_image: capability.recommended_image,
+        }
+    }
+}
+
+/// Report whether an existing service can produce a Cloud-restorable backup.
+///
+/// This probes the running container instead of trusting its configured image
+/// name: operators can build their own WAL-G image, and an image label alone
+/// cannot prove that the binary is actually executable.
+#[utoipa::path(
+    tag = "Backups",
+    get,
+    path = "/backups/external-services/{id}/capability",
+    responses(
+        (status = 200, description = "Cloud backup compatibility", body = ExternalServiceBackupCapabilityResponse),
+        (status = 401, description = "Unauthorized", body = ProblemDetails),
+        (status = 404, description = "External service not found", body = ProblemDetails),
+        (status = 500, description = "Capability could not be loaded", body = ProblemDetails),
+    ),
+    security(("bearer_auth" = []))
+)]
+async fn get_external_service_backup_capability(
+    RequireAuth(auth): RequireAuth,
+    State(app_state): State<Arc<BackupAppState>>,
+    Path(id): Path<i32>,
+) -> Result<impl IntoResponse, Problem> {
+    permission_guard!(auth, BackupsRead);
+    let capability = app_state
+        .backup_service
+        .get_external_service_backup_capability(id)
+        .await?;
+    Ok(Json(ExternalServiceBackupCapabilityResponse::from(
+        capability,
+    )))
 }
 
 /// List all S3 sources
@@ -3167,4 +3266,53 @@ async fn list_backup_alerts(
         .collect();
 
     Ok(Json(BackupAlertListResponse { alerts }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_dto_preserves_service_result() {
+        let response =
+            ExternalServiceBackupCapabilityResponse::from(ExternalServiceBackupCapability {
+                cloud_backup_compatible: true,
+                verified: true,
+                wal_g_installed: false,
+                engine: "s3_mirror".to_string(),
+                artifact: "object_set".to_string(),
+                reason: None,
+                remediation: None,
+                recommended_image: None,
+            });
+
+        assert!(response.cloud_backup_compatible);
+        assert!(response.verified);
+        assert_eq!(response.engine, "s3_mirror");
+        assert_eq!(response.artifact, "object_set");
+    }
+
+    #[test]
+    fn capability_load_error_maps_context_without_leaking_database_detail() {
+        let problem = Problem::from(BackupCapabilityError::LoadService {
+            service_id: 71,
+            source: sea_orm::DbErr::Custom("database-password=do-not-leak".to_string()),
+        });
+
+        assert_eq!(problem.status_code, StatusCode::INTERNAL_SERVER_ERROR);
+        let body = serde_json::to_string(&problem.body).unwrap();
+        assert!(body.contains("external service 71"));
+        assert!(!body.contains("do-not-leak"));
+        assert!(!body.contains("database-password"));
+    }
+
+    #[test]
+    fn capability_not_found_maps_to_contextual_404() {
+        let problem = Problem::from(BackupCapabilityError::ServiceNotFound { service_id: 404 });
+
+        assert_eq!(problem.status_code, StatusCode::NOT_FOUND);
+        assert!(serde_json::to_string(&problem.body)
+            .unwrap()
+            .contains("External service 404"));
+    }
 }

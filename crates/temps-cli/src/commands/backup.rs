@@ -109,6 +109,11 @@ struct ListBackupsArgs {
     #[arg(long, env = "S3_SECRET_ACCESS_KEY", hide_env_values = true)]
     secret_access_key: String,
 
+    /// S3 session token, for a temporary (STS-style) credential such as one
+    /// vended by Temps Cloud. Omit it for an ordinary long-lived credential.
+    #[arg(long, env = "S3_SESSION_TOKEN", hide_env_values = true)]
+    session_token: Option<String>,
+
     /// S3 bucket name
     #[arg(long, env = "S3_BUCKET_NAME")]
     bucket_name: String,
@@ -148,6 +153,11 @@ struct RestoreBackupArgs {
     #[arg(long, env = "S3_SECRET_ACCESS_KEY", hide_env_values = true)]
     secret_access_key: String,
 
+    /// S3 session token, for a temporary (STS-style) credential such as one
+    /// vended by Temps Cloud. Omit it for an ordinary long-lived credential.
+    #[arg(long, env = "S3_SESSION_TOKEN", hide_env_values = true)]
+    session_token: Option<String>,
+
     /// S3 bucket name
     #[arg(long, env = "S3_BUCKET_NAME")]
     bucket_name: String,
@@ -186,6 +196,11 @@ struct RestoreServiceArgs {
     /// S3 secret access key
     #[arg(long, env = "S3_SECRET_ACCESS_KEY", hide_env_values = true)]
     secret_access_key: String,
+
+    /// S3 session token, for a temporary (STS-style) credential such as one
+    /// vended by Temps Cloud. Omit it for an ordinary long-lived credential.
+    #[arg(long, env = "S3_SESSION_TOKEN", hide_env_values = true)]
+    session_token: Option<String>,
 
     /// S3 bucket name
     #[arg(long, env = "S3_BUCKET_NAME")]
@@ -243,6 +258,7 @@ impl BackupCommand {
         let s3_client = rt.block_on(Self::create_s3_client(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             args.force_path_style,
@@ -363,6 +379,7 @@ impl BackupCommand {
         let s3_client = rt.block_on(Self::create_s3_client(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             args.force_path_style,
@@ -370,6 +387,7 @@ impl BackupCommand {
         let s3_credentials = Self::restore_s3_credentials(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             &args.bucket_name,
@@ -711,6 +729,7 @@ impl BackupCommand {
     async fn create_s3_client(
         access_key_id: &str,
         secret_access_key: &str,
+        session_token: Option<&str>,
         region: &str,
         endpoint: Option<&str>,
         force_path_style: bool,
@@ -721,7 +740,11 @@ impl BackupCommand {
         let creds = Credentials::new(
             access_key_id,
             secret_access_key,
-            None,
+            // `None` for a long-lived credential, exactly as before. `Some`
+            // only for a temporary one, which SigV4 rejects without it.
+            session_token
+                .filter(|token| !token.is_empty())
+                .map(str::to_string),
             None,
             "temps-cli-backup",
         );
@@ -742,6 +765,7 @@ impl BackupCommand {
     fn restore_s3_credentials(
         access_key_id: &str,
         secret_access_key: &str,
+        session_token: Option<&str>,
         region: &str,
         endpoint: Option<&str>,
         bucket_name: &str,
@@ -750,6 +774,9 @@ impl BackupCommand {
         temps_providers::S3Credentials {
             access_key_id: access_key_id.to_string(),
             secret_key: secret_access_key.to_string(),
+            session_token: session_token
+                .map(str::to_owned)
+                .filter(|token| !token.is_empty()),
             region: region.to_string(),
             endpoint: endpoint.map(str::to_owned),
             bucket_name: bucket_name.to_string(),
@@ -1756,8 +1783,11 @@ impl BackupCommand {
             bucket_path: s3_credentials.bucket_path.clone(),
             access_key_id: s3_credentials.access_key_id.clone(),
             secret_key: s3_credentials.secret_key.clone(),
+            session_token: s3_credentials.session_token.clone(),
+            credentials_expire_at: None,
             force_path_style: Some(s3_credentials.force_path_style),
             is_default: false,
+            managed_by_cloud: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
         };
@@ -1813,6 +1843,7 @@ impl BackupCommand {
         let s3_client = rt.block_on(Self::create_s3_client(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             args.force_path_style,
@@ -1820,6 +1851,7 @@ impl BackupCommand {
         let s3_credentials = Self::restore_s3_credentials(
             &args.access_key_id,
             &args.secret_access_key,
+            args.session_token.as_deref(),
             &args.region,
             args.endpoint.as_deref(),
             &args.bucket_name,
@@ -2298,6 +2330,7 @@ mod tests {
         let credentials = BackupCommand::restore_s3_credentials(
             "flag-access-key",
             "flag-secret-key",
+            None,
             "eu-central-1",
             Some("https://objects.example.test"),
             "recovery-bucket",

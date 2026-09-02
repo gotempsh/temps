@@ -1007,6 +1007,66 @@ impl WorkflowTask for DeployComposeJob {
             }
         }
     }
+
+    /// Tear down the compose stack when the workflow marks this job failed.
+    ///
+    /// Without this, a stack that deployed successfully but was failed by a
+    /// later job (health check, readiness wait) keeps running under its
+    /// `restart: unless-stopped`/`always` policy: the workflow gives up, but
+    /// Docker keeps crash-looping the containers forever on the node.
+    async fn cleanup(&self, context: &WorkflowContext) -> Result<(), WorkflowError> {
+        let project_name = format!("temps-{}-{}", self.project_id, self.environment_id);
+        let compose_file_name = self.compose_path.as_deref().unwrap_or("docker-compose.yml");
+        validate_relative_path(compose_file_name, "compose_path")?;
+        validate_relative_path(&self.directory, "directory")?;
+
+        let cleanup_repo_path = if self.compose_content.is_none() {
+            let repo_dir: Option<String> = context
+                .get_output(&self.download_job_id, "repo_dir")
+                .map_err(|error| WorkflowError::JobExecutionFailed(error.to_string()))?;
+            repo_dir
+                .map(|repo_dir| {
+                    canonicalize_confined_repo_path(
+                        Path::new(&repo_dir),
+                        Path::new(&self.directory),
+                        "directory",
+                    )
+                })
+                .transpose()?
+        } else {
+            None
+        };
+
+        if let Some(ref log_id) = self.log_id {
+            let _ = self
+                .log_service
+                .log_info(
+                    log_id,
+                    &format!(
+                        "Cleaning up failed compose stack (project: {})",
+                        project_name
+                    ),
+                )
+                .await;
+        }
+
+        self.compose_executor
+            .teardown_at(
+                &project_name,
+                cleanup_repo_path.as_deref(),
+                Some(compose_file_name),
+                &self.environment_vars,
+                // The workflow has failed and no subsequent deploy will consume
+                // the materialized secret files.
+                true,
+            )
+            .await
+            .map_err(|error| {
+                WorkflowError::JobExecutionFailed(format!(
+                    "Failed to clean up compose stack {project_name} after job failure: {error}"
+                ))
+            })
+    }
 }
 
 /// Confine a user-supplied path (`compose_path`, `directory`) to the repo

@@ -319,6 +319,24 @@ async fn setup_e2e_as_full(
         otel_relay_tx: None,
         project_access_checker: None,
         facet_service,
+        cloud_backfill_progress: Arc::new(temps_otel::services::CloudBackfillProgressService::new(
+            db.clone(),
+        )),
+        // ADR-041: no Cloud link in these tests, so every project resolves to
+        // `local` and the span-read path is the local store — which is exactly
+        // the deployment shape these tests are asserting.
+        telemetry_write_modes: Arc::new(temps_otel::services::TelemetryWriteModeService::new(
+            db.clone(),
+        )),
+        cloud_link: None,
+        // ADR-042: the activation service is always present so the endpoints
+        // can answer "no job is running" on an instance that never linked
+        // Cloud; the span source and worker are the parts that need a link.
+        bulk_activation: Arc::new(temps_otel::services::CloudBulkActivationService::new(
+            db.clone(),
+        )),
+        cloud_backfill_source: None,
+        plan_signing_key: Arc::new([0u8; 32]),
     };
 
     // Create auth middleware that injects AuthContext into request extensions.

@@ -76,6 +76,11 @@ pub fn project_model(id: i32) -> projects::Model {
         cross_project_trace_sharing: true,
         ai_api_traffic_summary_enabled: None,
         image_retention_hours: None,
+        cloud_telemetry_fidelity:
+            temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
+        cloud_telemetry_write_mode:
+            temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
+        cloud_telemetry_attribute_allowlist: Vec::new(),
     }
 }
 

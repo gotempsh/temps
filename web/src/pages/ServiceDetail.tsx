@@ -190,7 +190,7 @@ export function ServiceDetail() {
     container_name: string
   } | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [prevStatus, setPrevStatus] = useState<string | undefined>(undefined)
+  const prevStatusRef = useRef<string | undefined>(undefined)
   const [visibleParameters, setVisibleParameters] = useState<Set<string>>(
     new Set()
   )
@@ -305,12 +305,6 @@ export function ServiceDetail() {
     Math.ceil((serviceBackupsData?.total ?? 0) / BACKUPS_PAGE_SIZE)
   )
 
-  useEffect(() => {
-    if (backupsPage > backupsTotalPages) {
-      setBackupsPage(backupsTotalPages)
-    }
-  }, [backupsPage, backupsTotalPages])
-
   const paginatedBackups = serviceBackups
 
   const backupsPageWindow = useMemo(() => {
@@ -359,15 +353,14 @@ export function ServiceDetail() {
   // Notify when cluster creation completes or fails
   useEffect(() => {
     const currentStatus = service?.service?.status
-    if (prevStatus === 'creating' && currentStatus === 'running') {
+    const previousStatus = prevStatusRef.current
+    if (previousStatus === 'creating' && currentStatus === 'running') {
       toast.success('Cluster created successfully')
-    } else if (prevStatus === 'creating' && currentStatus === 'failed') {
+    } else if (previousStatus === 'creating' && currentStatus === 'failed') {
       toast.error('Cluster creation failed')
     }
-    if (currentStatus) {
-      setPrevStatus(currentStatus)
-    }
-  }, [service?.service?.status, prevStatus])
+    prevStatusRef.current = currentStatus
+  }, [service?.service?.status])
 
   const startService = useMutation({
     ...startServiceMutation(),
@@ -880,6 +873,7 @@ export function ServiceDetail() {
             <WalHealthPanel
               serviceId={parseInt(id!)}
               serviceType={service.service.service_type}
+              onUpgrade={() => setIsUpgradeDialogOpen(true)}
             />
           ) : null}
 
@@ -1835,8 +1829,8 @@ export function ServiceDetail() {
                 {memberToRemove?.container_name}
               </span>{' '}
               from this cluster. The container, its data volume, and the
-              member's DNS record will be deleted. The pg_auto_failover monitor
-              will mark the node as unreachable; run{' '}
+              member&apos;s DNS record will be deleted. The pg_auto_failover
+              monitor will mark the node as unreachable; run{' '}
               <span className="font-mono">pg_autoctl drop node</span> manually
               if you want a fully-clean monitor view.
             </DialogDescription>

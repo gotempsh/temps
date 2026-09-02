@@ -354,7 +354,7 @@ pub(crate) fn container_identity_error_status(error: &ContainerIdentityError) ->
     }
 }
 
-fn remove_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
+fn container_error_status(error: &temps_deployer::DeployerError) -> StatusCode {
     match error {
         temps_deployer::DeployerError::ContainerNotFound(_) => StatusCode::NOT_FOUND,
         temps_deployer::DeployerError::DeploymentFailed(_)
@@ -625,7 +625,7 @@ pub async fn remove_container(
             AgentResponse::ok("removed".to_string()).into_response()
         }
         Err(e) => {
-            let status = remove_error_status(&e);
+            let status = container_error_status(&e);
             if status == StatusCode::NOT_FOUND {
                 tracing::info!(container_id = %container_id, reason = %e, "Container already absent");
             } else {
@@ -641,7 +641,7 @@ pub async fn remove_container(
 }
 
 #[cfg(test)]
-mod remove_tests {
+mod container_error_tests {
     use super::*;
 
     #[test]
@@ -649,14 +649,14 @@ mod remove_tests {
         let error = temps_deployer::DeployerError::ContainerNotFound(
             "container no longer exists".to_string(),
         );
-        assert_eq!(remove_error_status(&error), StatusCode::NOT_FOUND);
+        assert_eq!(container_error_status(&error), StatusCode::NOT_FOUND);
     }
 
     #[test]
     fn operational_remove_failure_maps_to_http_internal_server_error() {
         let error = temps_deployer::DeployerError::NetworkError("dockerd unavailable".to_string());
         assert_eq!(
-            remove_error_status(&error),
+            container_error_status(&error),
             StatusCode::INTERNAL_SERVER_ERROR
         );
     }
@@ -1459,6 +1459,7 @@ pub async fn stream_container_logs(
     responses(
         (status = 200, description = "Container info", body = AgentResponse<temps_deployer::ContainerInfo>),
         (status = 401, description = "Unauthorized"),
+        (status = 404, description = "Container not found"),
         (status = 500, description = "Failed to get info")
     ),
     security(("bearer_auth" = []))
@@ -1480,9 +1481,14 @@ pub async fn get_container_info(
             }
         },
         Err(e) => {
-            tracing::error!(container_id = %container_id, "Failed to get info: {}", e);
+            let status = container_error_status(&e);
+            if status == StatusCode::NOT_FOUND {
+                tracing::debug!(container_id = %container_id, reason = %e, "Container already absent");
+            } else {
+                tracing::error!(container_id = %container_id, "Failed to get info: {}", e);
+            }
             error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
+                status,
                 format!("Failed to get info for container {}: {}", container_id, e),
             )
             .into_response()

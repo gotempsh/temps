@@ -55,7 +55,7 @@ export interface WalHealthResponse {
 }
 
 export async function getPostgresWalHealth(
-  id: number,
+  id: number
 ): Promise<WalHealthResponse> {
   const response = await fetch(`/api/external-services/${id}/wal-health`, {
     credentials: 'include',

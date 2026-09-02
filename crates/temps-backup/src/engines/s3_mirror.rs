@@ -30,8 +30,7 @@ use super::v2_common;
 use temps_backup_core::engine_v2::{BackupContext, BackupEngine, BackupError, BackupOutcome};
 
 const ENGINE_KEY: &str = "s3_mirror";
-const MC_IMAGE: &str =
-    "minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
+const MC_IMAGE: &str = "minio/mc:RELEASE.2025-08-13T08-35-41Z@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727";
 
 pub struct S3MirrorDeps {
     pub db: Arc<DatabaseConnection>,
@@ -126,6 +125,8 @@ impl BackupEngine for S3MirrorEngine {
             .map_err(|e| BackupError::PermanentFailure {
                 reason: format!("decrypt dest secret key: {}", e),
             })?;
+        let dest_session_token =
+            v2_common::decrypt_session_token(&s3_dest, &deps.encryption_service)?;
 
         let dest_endpoint = s3_dest.endpoint.as_deref().unwrap_or("").to_string();
         let dest_endpoint = if dest_endpoint.is_empty() {
@@ -177,10 +178,30 @@ impl BackupEngine for S3MirrorEngine {
                 source_access_key, source_secret_key, source_host, source_port
             ),
             format!(
-                "MC_HOST_dest={}://{}:{}@{}",
-                dest_scheme, dest_access_key, dest_secret_key, dest_hostpath
+                "MC_HOST_dest={}://{}@{}",
+                dest_scheme,
+                temps_providers::externalsvc::mc_host_credential(
+                    &dest_access_key,
+                    &dest_secret_key,
+                    dest_session_token.as_deref(),
+                ),
+                dest_hostpath
             ),
         ];
+
+        // mc echoes the credential-bearing `MC_HOST_*` URL it could not use
+        // straight into stderr, and that stderr is folded into the
+        // `BackupError::Failed` reason persisted on the backup row and surfaced
+        // through the API. A Cloud-vended destination credential carries a
+        // session token that is not individually revocable, so it must be
+        // scrubbed alongside the keys.
+        let sensitive_values = temps_providers::externalsvc::SensitiveValues::new()
+            .credential(&source_access_key, &source_secret_key, None)
+            .credential(
+                &dest_access_key,
+                &dest_secret_key,
+                dest_session_token.as_deref(),
+            );
 
         let mirror_cmd = format!(
             "mc mirror --overwrite {} {}",
@@ -218,8 +239,8 @@ impl BackupEngine for S3MirrorEngine {
                 reason: format!(
                     "mc mirror exited with code {}. stderr: {}. stdout: {}",
                     result.exit_code,
-                    result.stderr_tail.trim(),
-                    result.stdout_tail.trim(),
+                    sensitive_values.redact(result.stderr_tail.trim()),
+                    sensitive_values.redact(result.stdout_tail.trim()),
                 ),
             });
         }
@@ -227,7 +248,7 @@ impl BackupEngine for S3MirrorEngine {
             info!(
                 backup_id,
                 "mc mirror stderr (warnings): {}",
-                result.stderr_tail.trim(),
+                sensitive_values.redact(result.stderr_tail.trim()),
             );
         }
 
@@ -318,11 +339,14 @@ async fn list_total_s3_size(
 }
 
 #[cfg(test)]
-mod image_tests {
-    use super::MC_IMAGE;
+mod tests {
+    use super::*;
 
     #[test]
-    fn credentialed_sidecar_uses_immutable_image() {
+    fn minio_client_image_is_release_and_digest_pinned() {
+        assert!(MC_IMAGE.contains("minio/mc:RELEASE.2025-08-13T08-35-41Z@"));
+        assert!(MC_IMAGE
+            .contains("sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727"));
         assert!(MC_IMAGE.contains("@sha256:"));
     }
 }

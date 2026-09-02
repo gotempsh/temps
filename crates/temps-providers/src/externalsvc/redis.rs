@@ -585,12 +585,17 @@ impl RedisService {
         let mut total_wait = Duration::from_secs(0);
         let max_wait = Duration::from_secs(90);
         let max_delay = Duration::from_secs(2);
+        let initial_restart_count = docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await?
+            .restart_count
+            .unwrap_or(0);
 
         while total_wait < max_wait {
             let info = docker
                 .inspect_container(container_id, None::<InspectContainerOptions>)
                 .await?;
-            if let Some(state) = info.state {
+            if let Some(state) = info.state.as_ref() {
                 // Considered ready if it's running and either has a HEALTHY
                 // Docker healthcheck status or no healthcheck is defined at
                 // all (e.g. an imported container built from a vanilla image
@@ -610,10 +615,33 @@ impl RedisService {
                     || state.status == Some(bollard::models::ContainerStateStatusEnum::DEAD)
                 {
                     let exit_code = state.exit_code.unwrap_or(-1);
-                    return Err(anyhow::anyhow!(
-                        "Redis container exited unexpectedly with code {}",
-                        exit_code
-                    ));
+                    return Err(self
+                        .redis_container_startup_error(
+                            docker,
+                            container_id,
+                            exit_code,
+                            info.restart_count,
+                        )
+                        .await);
+                }
+
+                // A container with restart_policy=always rarely remains EXITED long
+                // enough for the next poll to observe it. Docker reports RESTARTING
+                // between crashes instead. Treat the first new restart as a startup
+                // failure and include the process logs instead of hiding the cause
+                // behind a 90-second health-check timeout.
+                let restart_count = info.restart_count.unwrap_or(0);
+                if state.status == Some(bollard::models::ContainerStateStatusEnum::RESTARTING)
+                    && restart_count > initial_restart_count
+                {
+                    return Err(self
+                        .redis_container_startup_error(
+                            docker,
+                            container_id,
+                            state.exit_code.unwrap_or(-1),
+                            info.restart_count,
+                        )
+                        .await);
                 }
             }
             sleep(delay).await;
@@ -621,7 +649,72 @@ impl RedisService {
             delay = std::cmp::min(delay.mul_f32(1.5), max_delay);
         }
 
-        Err(anyhow::anyhow!("Redis container health check timed out"))
+        let info = docker
+            .inspect_container(container_id, None::<InspectContainerOptions>)
+            .await?;
+        Err(self
+            .redis_container_startup_error(
+                docker,
+                container_id,
+                info.state
+                    .as_ref()
+                    .and_then(|state| state.exit_code)
+                    .unwrap_or(-1),
+                info.restart_count,
+            )
+            .await)
+    }
+
+    async fn redis_container_startup_error(
+        &self,
+        docker: &Docker,
+        container_id: &str,
+        exit_code: i64,
+        restart_count: Option<i64>,
+    ) -> anyhow::Error {
+        use bollard::query_parameters::LogsOptions;
+        use futures::StreamExt;
+
+        let mut stream = docker.logs(
+            container_id,
+            Some(LogsOptions {
+                stdout: true,
+                stderr: true,
+                follow: false,
+                tail: "80".to_string(),
+                ..Default::default()
+            }),
+        );
+        let mut logs = String::new();
+        while let Some(chunk) = stream.next().await {
+            match chunk {
+                Ok(chunk) => logs.push_str(&chunk.to_string()),
+                Err(error) => {
+                    logs.push_str(&format!("<failed to read Redis logs: {error}>"));
+                    break;
+                }
+            }
+        }
+
+        let logs = logs.trim();
+        let logs = if logs.is_empty() {
+            "<no container output>"
+        } else {
+            logs
+        };
+        error!(
+            container_id,
+            exit_code,
+            restart_count = restart_count.unwrap_or(0),
+            recent_container_logs = logs,
+            "Redis container failed to become healthy"
+        );
+        anyhow::anyhow!(
+            "Redis container '{}' failed to become healthy (exit code {}, restart count {}); inspect the server logs for the Redis startup error",
+            container_id,
+            exit_code,
+            restart_count.unwrap_or(0)
+        )
     }
 
     fn resource_mapping_key(resource_name: &str) -> String {
@@ -971,6 +1064,7 @@ impl RedisService {
         walg_s3_prefix: &str,
         s3_credentials: &super::S3Credentials,
         service_config: ServiceConfig,
+        backup_id: &str,
     ) -> anyhow::Result<()> {
         let redis_password = self
             .get_redis_config(service_config)
@@ -998,7 +1092,15 @@ impl RedisService {
             format!("AWS_REGION={}", s3_credentials.region),
             format!("WALG_STREAM_CREATE_COMMAND={}", stream_create_cmd),
             "WALG_STREAM_RESTORE_COMMAND=cat > /data/dump.rdb".to_string(),
+            format!(
+                "WALG_SENTINEL_USER_DATA={}",
+                serde_json::json!({ "temps_backup_id": backup_id })
+            ),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         if !redis_password.is_empty() {
             walg_env.push(format!("WALG_REDIS_PASSWORD={}", redis_password));
@@ -1057,6 +1159,10 @@ impl RedisService {
             "WALG_STREAM_CREATE_COMMAND=echo noop".to_string(),
             "WALG_STREAM_RESTORE_COMMAND=cat > /data/dump.rdb".to_string(),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         // Resolve S3 endpoint for use inside the Docker container.
         if let Some(resolved_endpoint) = s3_credentials
@@ -2504,6 +2610,7 @@ impl ExternalService for RedisService {
                 &walg_s3_prefix,
                 s3_credentials,
                 service_config,
+                &backup.backup_id,
             )
             .await;
 
@@ -3049,6 +3156,107 @@ impl ExternalService for RedisService {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn wait_for_health_reports_restart_loop_logs_without_timing_out() {
+        let docker = match Docker::connect_with_local_defaults() {
+            Ok(docker) if docker.ping().await.is_ok() => Arc::new(docker),
+            _ => {
+                println!("Docker is unavailable; skipping Redis restart-loop test");
+                return;
+            }
+        };
+
+        let image = "gotempsh/redis-walg:8-bookworm";
+        if docker.inspect_image(image).await.is_err() {
+            println!("Redis WAL-G image is unavailable; skipping restart-loop test");
+            return;
+        }
+
+        let container_name = format!(
+            "temps-test-redis-restart-loop-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+        let marker = "redis-startup-regression-marker";
+        let container = docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&container_name)
+                        .build(),
+                ),
+                bollard::models::ContainerCreateBody {
+                    image: Some(image.to_string()),
+                    cmd: Some(vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!("echo {marker} >&2; exit 23"),
+                    ]),
+                    host_config: Some(bollard::models::HostConfig {
+                        restart_policy: Some(bollard::models::RestartPolicy {
+                            name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                            maximum_retry_count: None,
+                        }),
+                        ..Default::default()
+                    }),
+                    // Keep the fixture in Docker's STARTING state during the
+                    // brief window before `sh` exits. Without an explicit
+                    // healthcheck, the production helper intentionally treats
+                    // a running imported container as ready, which makes this
+                    // crash-loop assertion depend on scheduler timing.
+                    healthcheck: Some(bollard::models::HealthConfig {
+                        test: Some(vec!["CMD-SHELL".to_string(), "exit 1".to_string()]),
+                        interval: Some(100_000_000),
+                        timeout: Some(100_000_000),
+                        retries: Some(1),
+                        start_period: Some(5_000_000_000),
+                        start_interval: Some(100_000_000),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create isolated restart-loop container");
+
+        docker
+            .start_container(
+                &container.id,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .expect("start isolated restart-loop container");
+
+        let service = RedisService::new("restart-loop-test".to_string(), docker.clone());
+        let result = tokio::time::timeout(
+            Duration::from_secs(15),
+            service.wait_for_container_health(&docker, &container.id),
+        )
+        .await;
+
+        let _ = docker
+            .remove_container(
+                &container.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: true,
+                    ..Default::default()
+                }),
+            )
+            .await;
+
+        let error = result
+            .expect("restart-loop detection must not wait for the 90-second timeout")
+            .expect_err("a restart-looping Redis container must fail its health check")
+            .to_string();
+        assert!(
+            error.contains("restart count"),
+            "restart diagnostics missing from: {error}"
+        );
+        assert!(
+            !error.contains(marker),
+            "container output must stay in operator logs, not user-facing errors: {error}"
+        );
+    }
 
     #[test]
     fn health_probe_config_preserves_missing_and_short_passwords() {

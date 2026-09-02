@@ -134,6 +134,23 @@ test.describe('command palette', () => {
     await expect(navigation.locator(':scope > svg')).toHaveCount(1)
   })
 
+  test('finds Temps Cloud by name and by what it does', async ({ page }) => {
+    // The example query changes as the palette evolves; the combobox role is
+    // its stable, user-facing contract.
+    const search = page.getByRole('combobox')
+    const entry = page.locator('[cmdk-item]').filter({ hasText: 'Temps Cloud' })
+
+    await search.fill('temps cloud')
+    await expect(entry).toBeVisible()
+
+    // Someone hunting for managed retention will not type "temps cloud".
+    await search.fill('retention')
+    await expect(entry).toBeVisible()
+
+    await entry.first().click()
+    await expect(page).toHaveURL(/\/settings\/cloud$/)
+  })
+
   test('loads later project pages for cross-project environment navigation', async ({
     page,
   }) => {

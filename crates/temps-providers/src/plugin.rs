@@ -5,6 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
+use sea_orm::EntityTrait;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
@@ -77,6 +78,61 @@ impl TempsPlugin for ProvidersPlugin {
                 manager_for_startup
                     .spawn_reconcilers_for_existing_clusters()
                     .await;
+            });
+
+            // Multi-node networking can be enabled or repaired while the
+            // control plane keeps running (`temps network setup-multi-node`).
+            // Re-publish standalone service records periodically so existing
+            // control-plane PostgreSQL/Redis/etc. containers are attached to
+            // the newly-created overlay without a process restart.
+            let manager_for_dns = external_service_manager.clone();
+            let db_for_dns = db.clone();
+            tokio::spawn(async move {
+                loop {
+                    let overlay_ready = match temps_entities::network_config::Entity::find_by_id(1)
+                        .one(db_for_dns.as_ref())
+                        .await
+                    {
+                        Ok(Some(config)) => config.control_plane_overlay_ready,
+                        Ok(None) => false,
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "Could not inspect control-plane overlay readiness"
+                            );
+                            false
+                        }
+                    };
+                    if !overlay_ready {
+                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                        continue;
+                    }
+                    match manager_for_dns.list_services().await {
+                        Ok(services) => {
+                            for service in services {
+                                if let Err(error) = manager_for_dns
+                                    .register_standalone_service_dns(service.id)
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        service_id = service.id,
+                                        service_name = %service.name,
+                                        error = %error,
+                                        "Could not reconcile standalone managed-service DNS"
+                                    );
+                                }
+                            }
+                        }
+                        Err(error) => tracing::warn!(
+                            error = %error,
+                            "Could not list managed services for DNS reconciliation"
+                        ),
+                    }
+                    // Service create/start paths publish immediately. This is
+                    // only a bounded recovery sweep for runtime enablement or
+                    // external Docker drift, not a hot polling path.
+                    tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+                }
             });
 
             tracing::debug!("Providers plugin services registered successfully");

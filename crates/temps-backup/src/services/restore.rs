@@ -429,10 +429,21 @@ impl RestoreService {
                         .encryption_service
                         .decrypt_string(&s3_source.secret_key)
                         .ok();
+                    // A source without a session token yields `None` here; a
+                    // decrypt failure is also treated as "no token" on this
+                    // best-effort probe path, exactly like the two keys above.
+                    let decrypted_session_token =
+                        temps_entities::s3_sources::decrypt_session_token(
+                            self.encryption_service.as_ref(),
+                            &s3_source,
+                        )
+                        .ok()
+                        .flatten();
                     if let (Some(a), Some(s)) = (decrypted_access_key, decrypted_secret_key) {
                         let creds = S3Credentials {
                             access_key_id: a,
                             secret_key: s,
+                            session_token: decrypted_session_token,
                             region: s3_source.region.clone(),
                             endpoint: s3_source.endpoint.clone(),
                             bucket_name: s3_source.bucket_name.clone(),
@@ -1626,9 +1637,19 @@ async fn run_restore_inner(
                 reason: format!("Failed to decrypt secret key: {}", e),
             })?;
 
+    // `None` for every long-lived operator-configured credential, so nothing
+    // about those restores changes.
+    let decrypted_session_token =
+        temps_entities::s3_sources::decrypt_session_token(enc.as_ref(), &s3_source).map_err(
+            |e| RestoreError::Encryption {
+                reason: format!("Failed to decrypt session token: {}", e),
+            },
+        )?;
+
     let s3_credentials = S3Credentials {
         access_key_id: decrypted_access_key.clone(),
         secret_key: decrypted_secret_key.clone(),
+        session_token: decrypted_session_token.clone(),
         region: s3_source.region.clone(),
         endpoint: s3_source.endpoint.clone(),
         bucket_name: s3_source.bucket_name.clone(),
@@ -1641,10 +1662,13 @@ async fn run_restore_inner(
     // for mc-alias setup (s3/rustfs/blob) needs plaintext or it will pass
     // ciphertext to mc and get "not signed up" back. `backup_to_s3` already
     // decrypts before passing; the restore dispatch path did not — that was
-    // the source of the in-place-restore auth failure.
+    // the source of the in-place-restore auth failure. `session_token` is on
+    // the same footing: leaving it encrypted here would sign a ciphertext
+    // token and get a 403 back from the provider.
     let s3_source_plain = temps_entities::s3_sources::Model {
         access_key_id: decrypted_access_key.clone(),
         secret_key: decrypted_secret_key.clone(),
+        session_token: decrypted_session_token,
         ..s3_source.clone()
     };
 
@@ -1942,7 +1966,9 @@ fn build_s3_client(creds: &S3Credentials) -> S3Client {
     let aws_creds = aws_sdk_s3::config::Credentials::new(
         creds.access_key_id.clone(),
         creds.secret_key.clone(),
-        None,
+        // `None` for the long-lived credentials operators configure; `Some`
+        // only for a temporary one, which SigV4 rejects without its token.
+        creds.session_token.clone(),
         None,
         "restore-service",
     );
@@ -3320,6 +3346,7 @@ mod tests {
         let creds = S3Credentials {
             access_key_id: "k".into(),
             secret_key: "s".into(),
+            session_token: None,
             region: "eu-central-1".into(),
             endpoint: Some("http://localhost:9000".into()),
             bucket_name: "b".into(),
@@ -3336,6 +3363,7 @@ mod tests {
         let creds = S3Credentials {
             access_key_id: "k".into(),
             secret_key: "s".into(),
+            session_token: None,
             region: "us-east-1".into(),
             endpoint: Some("minio.example.com:9000".into()),
             bucket_name: "b".into(),
@@ -3501,8 +3529,11 @@ mod tests {
             bucket_path: String::new(),
             access_key_id: LOCATION_TEST_MINIO_ACCESS_KEY.to_string(),
             secret_key: LOCATION_TEST_MINIO_SECRET_KEY.to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             force_path_style: Some(true),
             is_default: true,
+            managed_by_cloud: false,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
@@ -3544,6 +3575,7 @@ mod tests {
         let s3_client = build_s3_client(&S3Credentials {
             access_key_id: LOCATION_TEST_MINIO_ACCESS_KEY.to_string(),
             secret_key: LOCATION_TEST_MINIO_SECRET_KEY.to_string(),
+            session_token: None,
             region: "us-east-1".to_string(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: bucket.to_string(),

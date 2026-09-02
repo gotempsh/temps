@@ -31,7 +31,8 @@ use tracing::{error, info, warn};
 use crate::utils::ensure_network_exists;
 
 use super::{
-    ExternalService, HealthProbeResult, ServiceConfig, ServiceResourceLimits, ServiceType,
+    ExternalService, HealthProbeResult, SensitiveValues, ServiceConfig, ServiceResourceLimits,
+    ServiceType,
 };
 
 /// Default RustFS Docker image (from Docker Hub).
@@ -281,18 +282,6 @@ fn restore_mirror_command<'a>(
     }
     command.extend([source, destination]);
     command
-}
-
-/// Remove credentials from external-client output before it reaches logs,
-/// persisted restore errors, or API responses. Replacing the individual key
-/// values also redacts them when `mc` echoes a credential-bearing URL.
-fn redact_sensitive_output(output: &str, sensitive_values: &[&str]) -> String {
-    sensitive_values
-        .iter()
-        .filter(|value| !value.is_empty())
-        .fold(output.to_string(), |redacted, value| {
-            redacted.replace(value, "***")
-        })
 }
 
 fn docker_error_is_not_found(error: &bollard::errors::Error) -> bool {
@@ -1632,9 +1621,16 @@ impl ExternalService for RustfsService {
             .encryption_service
             .decrypt_string(&s3_source.secret_key)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt secret key: {}", e))?;
+        // `None` for every operator-configured long-lived credential, which
+        // leaves the values below byte-for-byte what they were.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
 
         // Environment variables for mc - source is the RustFS service, dest is backup S3
-        let env_vars = [
+        let mut env_vars = vec![
             format!(
                 "MC_HOST_source=http://{}:{}@{}:{}",
                 rustfs_config.access_key,
@@ -1643,10 +1639,25 @@ impl ExternalService for RustfsService {
                 rustfs_config.port
             ),
             format!(
-                "MC_HOST_dest=http://{}:{}@{}",
-                decrypted_access_key, decrypted_secret_key, dest_endpoint
+                "MC_HOST_dest=http://{}@{}",
+                super::mc_host_credential(
+                    &decrypted_access_key,
+                    &decrypted_secret_key,
+                    decrypted_session_token.as_deref(),
+                ),
+                dest_endpoint
             ),
         ];
+        // The `mc alias set backup-dest ...` call below cannot carry a session
+        // token; this override can, and mc prefers it. Absent entirely for a
+        // long-lived credential.
+        env_vars.extend(super::mc_host_alias_override(
+            "backup-dest",
+            &dest_endpoint,
+            &decrypted_access_key,
+            &decrypted_secret_key,
+            decrypted_session_token.as_deref(),
+        ));
 
         // Create mc container with shell entrypoint and host networking
         let mc_config = bollard::models::ContainerCreateBody {
@@ -1717,12 +1728,17 @@ impl ExternalService for RustfsService {
 
         let mut success = true;
         let mut error_logs = Vec::new();
-        let sensitive_values = [
-            rustfs_config.access_key.as_str(),
-            rustfs_config.secret_key.as_str(),
-            decrypted_access_key.as_str(),
-            decrypted_secret_key.as_str(),
-        ];
+        // mc echoes the credential-bearing `MC_HOST_*` URL into stderr on
+        // failure, and that stderr lands in `external_service_backups
+        // .error_message`. The destination credential may be a temporary one,
+        // so its session token has to be on this list alongside the keys.
+        let sensitive_values = SensitiveValues::new()
+            .credential(&rustfs_config.access_key, &rustfs_config.secret_key, None)
+            .credential(
+                &decrypted_access_key,
+                &decrypted_secret_key,
+                decrypted_session_token.as_deref(),
+            );
 
         for cmd in commands {
             // Log only the subcommand — args may contain credentials (e.g. `mc alias set`).
@@ -1736,7 +1752,7 @@ impl ExternalService for RustfsService {
                 .await?;
 
             if !ok {
-                error_logs.push(redact_sensitive_output(&stderr, &sensitive_values));
+                error_logs.push(sensitive_values.redact(&stderr));
                 success = false;
                 break;
             }
@@ -1830,19 +1846,36 @@ impl ExternalService for RustfsService {
         // s3_source credentials are expected to be plain-text (already decrypted by caller)
         let source_access_key = &s3_source.access_key_id;
         let source_secret_key = &s3_source.secret_key;
+        // Plaintext on the same contract; `None` for a long-lived credential.
+        let source_session_token = s3_source.session_token.as_deref();
         let source_endpoint = s3_source.endpoint.as_deref().unwrap_or("s3.amazonaws.com");
 
         // Environment variables for mc - source is backup S3, dest is the RustFS service
-        let env_vars = [
+        let mut env_vars = vec![
             format!(
-                "MC_HOST_source=http://{}:{}@{}",
-                source_access_key, source_secret_key, source_endpoint
+                "MC_HOST_source=http://{}@{}",
+                super::mc_host_credential(
+                    source_access_key,
+                    source_secret_key,
+                    source_session_token,
+                ),
+                source_endpoint
             ),
             format!(
                 "MC_HOST_dest=http://{}:{}@localhost:{}",
                 rustfs_config.access_key, rustfs_config.secret_key, rustfs_config.port
             ),
         ];
+        // The `mc alias set backup-source ...` call below cannot carry a
+        // session token; this override can, and mc prefers it. Absent entirely
+        // for a long-lived credential.
+        env_vars.extend(super::mc_host_alias_override(
+            "backup-source",
+            source_endpoint,
+            source_access_key,
+            source_secret_key,
+            source_session_token,
+        ));
 
         // Create mc container with shell entrypoint and host networking
         let mc_config = bollard::models::ContainerCreateBody {
@@ -1901,12 +1934,12 @@ impl ExternalService for RustfsService {
                 &rustfs_config.secret_key,
             ],
         ];
-        let sensitive_values = [
-            source_access_key,
-            source_secret_key,
-            rustfs_config.access_key.as_str(),
-            rustfs_config.secret_key.as_str(),
-        ];
+        // The backup source may be a temporary credential, so its session token
+        // is as sensitive as its secret key and mc will echo it back inside the
+        // `MC_HOST_*` URL it failed to use.
+        let sensitive_values = SensitiveValues::new()
+            .credential(source_access_key, source_secret_key, source_session_token)
+            .credential(&rustfs_config.access_key, &rustfs_config.secret_key, None);
 
         for cmd in setup_commands {
             let (ok, _stdout, stderr) = self.exec_in_container(docker, &container.id, cmd).await?;
@@ -1923,7 +1956,7 @@ impl ExternalService for RustfsService {
                     .await?;
                 return Err(anyhow::anyhow!(
                     "Failed to set up mc aliases for RustFS restore: {}",
-                    redact_sensitive_output(&stderr, &sensitive_values)
+                    sensitive_values.redact(&stderr)
                 ));
             }
         }
@@ -1951,7 +1984,7 @@ impl ExternalService for RustfsService {
             return Err(anyhow::anyhow!(
                 "RustFS in-place restore could not list backup location '{}': {}",
                 source_backup_location,
-                redact_sensitive_output(&list_stderr, &sensitive_values).trim()
+                sensitive_values.redact(&list_stderr).trim()
             ));
         }
 
@@ -2008,7 +2041,7 @@ impl ExternalService for RustfsService {
                 .await?;
 
             if !ok {
-                let safe_stderr = redact_sensitive_output(&stderr, &sensitive_values);
+                let safe_stderr = sensitive_values.redact(&stderr);
                 error!("Mirror failed for bucket {}: {}", bucket_name, safe_stderr);
                 let _ = docker
                     .remove_container(
@@ -2144,31 +2177,51 @@ impl ExternalService for RustfsService {
             // Re-decrypting would fail because these are no longer ciphertext.
             let source_access_key = ctx.s3_source.access_key_id.clone();
             let source_secret_key = ctx.s3_source.secret_key.clone();
+            // Plaintext on the same contract; `None` for a long-lived one.
+            let source_session_token = ctx.s3_source.session_token.clone();
             let source_endpoint = ctx
                 .s3_source
                 .endpoint
                 .as_deref()
                 .unwrap_or("s3.amazonaws.com");
-            let sensitive_values = [
-                source_access_key.as_str(),
-                source_secret_key.as_str(),
-                new_config.access_key.as_str(),
-                new_config.secret_key.as_str(),
-            ];
+            // A session token is exactly as sensitive as the secret key, so mc
+            // output has to have it redacted too.
+            let sensitive_values = SensitiveValues::new()
+                .credential(
+                    &source_access_key,
+                    &source_secret_key,
+                    source_session_token.as_deref(),
+                )
+                .credential(&new_config.access_key, &new_config.secret_key, None);
 
             self.pull_mc_image(&self.docker).await?;
 
             let mc_container_name = format!("mc-restore-new-{}", uuid::Uuid::new_v4());
-            let env_vars = [
+            let mut env_vars = vec![
                 format!(
-                    "MC_HOST_source=http://{}:{}@{}",
-                    source_access_key, source_secret_key, source_endpoint
+                    "MC_HOST_source=http://{}@{}",
+                    super::mc_host_credential(
+                        &source_access_key,
+                        &source_secret_key,
+                        source_session_token.as_deref(),
+                    ),
+                    source_endpoint
                 ),
                 format!(
                     "MC_HOST_dest=http://{}:{}@localhost:{}",
                     new_config.access_key, new_config.secret_key, new_config.port
                 ),
             ];
+            // The `mc alias set backup-source ...` call below cannot carry a
+            // session token; this override can, and mc prefers it. Absent
+            // entirely for a long-lived credential.
+            env_vars.extend(super::mc_host_alias_override(
+                "backup-source",
+                source_endpoint,
+                &source_access_key,
+                &source_secret_key,
+                source_session_token.as_deref(),
+            ));
 
             let mc_config = bollard::models::ContainerCreateBody {
                 image: Some(Self::MC_IMAGE.to_string()),
@@ -2234,7 +2287,7 @@ impl ExternalService for RustfsService {
                 if !ok {
                     Err(anyhow::anyhow!(
                         "Failed to set up mc aliases for new RustFS restore: {}",
-                        redact_sensitive_output(&stderr, &sensitive_values)
+                        sensitive_values.redact(&stderr)
                     ))?;
                 }
             }
@@ -2253,7 +2306,7 @@ impl ExternalService for RustfsService {
                     "RustFS restore to new service '{}' could not list backup location '{}': {}",
                     new_service_name,
                     source_backup_location,
-                    redact_sensitive_output(&list_stderr, &sensitive_values).trim()
+                    sensitive_values.redact(&list_stderr).trim()
                 ))?;
             }
 
@@ -2300,7 +2353,7 @@ impl ExternalService for RustfsService {
                     .exec_in_container(&self.docker, &container.id, mirror_cmd)
                     .await?;
                 if !ok {
-                    let safe_stderr = redact_sensitive_output(&stderr, &sensitive_values);
+                    let safe_stderr = sensitive_values.redact(&stderr);
                     error!("Mirror failed for bucket {}: {}", bucket_name, safe_stderr);
                     Err(anyhow::anyhow!(
                         "RustFS restore to new service '{}' failed while mirroring bucket '{}': {}",
@@ -2452,7 +2505,9 @@ mod tests {
         let output =
             "request to http://access-key:secret-key@backup.internal failed for access-key";
 
-        let redacted = redact_sensitive_output(output, &["access-key", "secret-key"]);
+        let redacted = SensitiveValues::new()
+            .credential("access-key", "secret-key", None)
+            .redact(output);
 
         assert_eq!(
             redacted,
@@ -2460,6 +2515,28 @@ mod tests {
         );
         assert!(!redacted.contains("access-key"));
         assert!(!redacted.contains("secret-key"));
+    }
+
+    /// The gap this file had at two of its three mc call sites: a temporary
+    /// destination credential's session token was left out of the redaction
+    /// list, so mc's echoed `MC_HOST_*` URL carried it into
+    /// `external_service_backups.error_message` and the API response.
+    #[test]
+    fn external_client_output_redacts_a_temporary_credentials_session_token() {
+        let sensitive = SensitiveValues::new()
+            .credential("live-key", "live-secret", None)
+            .credential("bkp-key", "bkp-secret", Some("sts-session-token"));
+
+        let redacted = sensitive.redact(
+            "mc: <ERROR> Unable to initialize \
+             http://bkp-key:bkp-secret:sts-session-token@backup.internal",
+        );
+
+        assert_eq!(
+            redacted,
+            "mc: <ERROR> Unable to initialize http://***:***:***@backup.internal"
+        );
+        assert!(!redacted.contains("sts-session-token"));
     }
 
     #[test]

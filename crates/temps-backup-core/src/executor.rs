@@ -58,7 +58,7 @@ const DEFAULT_MAX_CONCURRENT: usize = 4;
 /// Default backoff sequence (seconds) between retries. Index = attempt
 /// number, value = sleep duration before that attempt. Length is the
 /// implicit `max_attempts`.
-const RETRY_BACKOFFS_SECS: &[u64] = &[0, 30, 120];
+const RETRY_BACKOFFS_SECS: &[u64] = &[0, 30, 60, 120];
 
 // ── Executor ─────────────────────────────────────────────────────────────────
 
@@ -426,10 +426,18 @@ UPDATE backups
 
     async fn mark_backup_running(&self, backup_id: i32) -> Result<(), sea_orm::DbErr> {
         let sql = r#"
-UPDATE backups
+WITH updated_backup AS (
+    UPDATE backups
+       SET state      = 'running',
+           started_at = COALESCE(started_at, NOW())
+     WHERE id         = $1
+       AND state      = 'pending'
+     RETURNING id
+)
+UPDATE external_service_backups
    SET state      = 'running',
        started_at = COALESCE(started_at, NOW())
- WHERE id         = $1
+ WHERE backup_id IN (SELECT id FROM updated_backup)
    AND state      = 'pending'
         "#;
         self.inner
@@ -445,11 +453,20 @@ UPDATE backups
 
     async fn mark_backup_failed(&self, backup_id: i32, reason: &str) -> Result<(), sea_orm::DbErr> {
         let sql = r#"
-UPDATE backups
+WITH updated_backup AS (
+    UPDATE backups
+       SET state         = 'failed',
+           error_message = $1,
+           finished_at   = COALESCE(finished_at, NOW())
+     WHERE id            = $2
+       AND state IN ('pending', 'running')
+     RETURNING id
+)
+UPDATE external_service_backups
    SET state         = 'failed',
        error_message = $1,
        finished_at   = COALESCE(finished_at, NOW())
- WHERE id            = $2
+ WHERE backup_id IN (SELECT id FROM updated_backup)
    AND state IN ('pending', 'running')
         "#;
         self.inner
@@ -522,13 +539,23 @@ UPDATE backups
         outcome: BackupOutcome,
     ) -> Result<(), sea_orm::DbErr> {
         let sql = r#"
-UPDATE backups
+WITH updated_backup AS (
+    UPDATE backups
+       SET state            = 'completed',
+           finished_at      = COALESCE(finished_at, NOW()),
+           s3_location      = $1,
+           size_bytes       = $2,
+           compression_type = $3
+     WHERE id               = $4
+     RETURNING id
+)
+UPDATE external_service_backups
    SET state            = 'completed',
        finished_at      = COALESCE(finished_at, NOW()),
        s3_location      = $1,
        size_bytes       = $2,
        compression_type = $3
- WHERE id               = $4
+ WHERE backup_id IN (SELECT id FROM updated_backup)
         "#;
         self.inner
             .db
@@ -576,7 +603,7 @@ UPDATE backups
     }
 }
 
-// ── Engine invocation with timeout + retries ─────────────────────────────────
+// ── Engine invocation with timeout + retries ────────────────────────────────
 
 async fn run_with_retries(
     engine: &Arc<dyn BackupEngine>,
@@ -648,4 +675,479 @@ async fn run_with_retries(
     Err(last_err.unwrap_or_else(|| BackupError::Failed {
         reason: "Engine retries exhausted with no recorded error".to_string(),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use async_trait::async_trait;
+    use sea_orm::{
+        ActiveModelTrait, DatabaseBackend, EntityTrait, MockDatabase, MockExecResult, Set,
+    };
+
+    use super::*;
+
+    fn executor_with_one_exec() -> (BackupExecutor, Arc<DatabaseConnection>) {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([MockExecResult {
+                    last_insert_id: 0,
+                    rows_affected: 2,
+                }])
+                .into_connection(),
+        );
+        (BackupExecutorBuilder::new(db.clone()).build(), db)
+    }
+
+    fn executed_sql(executor: BackupExecutor, db: Arc<DatabaseConnection>) -> String {
+        drop(executor);
+        let log = Arc::try_unwrap(db)
+            .expect("executor should release the mock database")
+            .into_transaction_log();
+        assert_eq!(
+            log.len(),
+            1,
+            "state transition should be one atomic statement"
+        );
+        log[0].statements()[0].sql.clone()
+    }
+
+    struct FlakyEngine {
+        failures_before_success: usize,
+        calls: AtomicUsize,
+        cleanups: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BackupEngine for FlakyEngine {
+        fn engine(&self) -> &'static str {
+            "flaky"
+        }
+
+        async fn run(&self, _ctx: &BackupContext) -> Result<BackupOutcome, BackupError> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            if call < self.failures_before_success {
+                return Err(BackupError::Failed {
+                    reason: format!("injected service outage on attempt {}", call + 1),
+                });
+            }
+            Ok(BackupOutcome {
+                location: "s3://bench/resumed".to_string(),
+                size_bytes: Some(42),
+                compression: "wal-g-native".to_string(),
+            })
+        }
+
+        async fn cleanup(&self, _ctx: &BackupContext) -> Result<(), BackupError> {
+            self.cleanups.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn retry_context() -> BackupContext {
+        BackupContext {
+            backup_id: 42,
+            engine_key: "flaky".to_string(),
+            params: serde_json::json!({}),
+            cancel: CancellationToken::new(),
+            db: Arc::new(MockDatabase::new(DatabaseBackend::Postgres).into_connection()),
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transient_service_outages_retry_with_exponential_backoff() {
+        let engine = Arc::new(FlakyEngine {
+            failures_before_success: 3,
+            calls: AtomicUsize::new(0),
+            cleanups: AtomicUsize::new(0),
+        });
+        let trait_engine: Arc<dyn BackupEngine> = engine.clone();
+        let started = tokio::time::Instant::now();
+
+        let outcome = run_with_retries(&trait_engine, &retry_context(), Duration::from_secs(60))
+            .await
+            .expect("fourth attempt should recover after the injected outage");
+
+        assert_eq!(outcome.location, "s3://bench/resumed");
+        assert_eq!(engine.calls.load(Ordering::SeqCst), 4);
+        assert_eq!(engine.cleanups.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            started.elapsed(),
+            Duration::from_secs(30 + 60 + 120),
+            "retry delays must follow the documented 30s, 60s, 120s schedule"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_backup_failures_do_not_retry() {
+        struct PermanentEngine(AtomicUsize);
+
+        #[async_trait]
+        impl BackupEngine for PermanentEngine {
+            fn engine(&self) -> &'static str {
+                "permanent"
+            }
+
+            async fn run(&self, _ctx: &BackupContext) -> Result<BackupOutcome, BackupError> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Err(BackupError::PermanentFailure {
+                    reason: "invalid credentials".to_string(),
+                })
+            }
+        }
+
+        let engine = Arc::new(PermanentEngine(AtomicUsize::new(0)));
+        let trait_engine: Arc<dyn BackupEngine> = engine.clone();
+        let result =
+            run_with_retries(&trait_engine, &retry_context(), Duration::from_secs(60)).await;
+
+        assert!(matches!(result, Err(BackupError::PermanentFailure { .. })));
+        assert_eq!(engine.0.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn running_transition_updates_parent_and_external_service_child() {
+        let (executor, db) = executor_with_one_exec();
+
+        executor
+            .mark_backup_running(42)
+            .await
+            .expect("running transition should execute");
+
+        let sql = executed_sql(executor, db);
+        assert!(sql.contains("UPDATE backups"));
+        assert!(sql.contains("UPDATE external_service_backups"));
+        assert!(sql.contains("state      = 'running'"));
+    }
+
+    #[tokio::test]
+    async fn failed_transition_updates_parent_and_external_service_child() {
+        let (executor, db) = executor_with_one_exec();
+
+        executor
+            .mark_backup_failed(42, "engine stopped")
+            .await
+            .expect("failed transition should execute");
+
+        let sql = executed_sql(executor, db);
+        assert!(sql.contains("UPDATE backups"));
+        assert!(sql.contains("UPDATE external_service_backups"));
+        assert!(sql.contains("state         = 'failed'"));
+    }
+
+    #[tokio::test]
+    async fn completed_transition_copies_restore_metadata_to_external_service_child() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_exec_results([
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 2,
+                    },
+                    MockExecResult {
+                        last_insert_id: 0,
+                        rows_affected: 1,
+                    },
+                ])
+                .into_connection(),
+        );
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+
+        executor
+            .finalize_completed(
+                42,
+                "mariadb_physical",
+                BackupOutcome {
+                    location: "s3://backups/mariadb/walg".to_string(),
+                    size_bytes: Some(3_004_748),
+                    compression: "wal-g-native".to_string(),
+                },
+            )
+            .await
+            .expect("completed transition should execute");
+
+        drop(executor);
+        let log = Arc::try_unwrap(db)
+            .expect("executor should release the mock database")
+            .into_transaction_log();
+        assert_eq!(
+            log.len(),
+            2,
+            "completion updates the backup atomically, then closes its schedule run"
+        );
+        let sql = log[0].statements()[0].sql.clone();
+        assert!(sql.contains("UPDATE backups"));
+        assert!(sql.contains("UPDATE external_service_backups"));
+        assert!(sql.contains("s3_location      = $1"));
+        assert!(sql.contains("size_bytes       = $2"));
+        assert!(sql.contains("compression_type = $3"));
+    }
+
+    async fn setup_real_backup_pair(
+        db: &DatabaseConnection,
+    ) -> (
+        temps_entities::backups::Model,
+        temps_entities::external_service_backups::Model,
+    ) {
+        use temps_entities::{
+            backups, external_service_backups, external_services, s3_sources, users,
+        };
+
+        let now = chrono::Utc::now();
+        let user = users::ActiveModel {
+            name: Set("Backup transition test".into()),
+            email: Set(format!(
+                "backup-transition-{}@example.invalid",
+                uuid::Uuid::new_v4()
+            )),
+            password_hash: Set(None),
+            email_verified: Set(true),
+            email_verification_token: Set(None),
+            email_verification_expires: Set(None),
+            password_reset_token: Set(None),
+            password_reset_expires: Set(None),
+            must_change_password: Set(false),
+            deleted_at: Set(None),
+            mfa_secret: Set(None),
+            mfa_enabled: Set(false),
+            mfa_recovery_codes: Set(None),
+            oidc_subject: Set(None),
+            oidc_provider_id: Set(None),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test user");
+        let source = s3_sources::ActiveModel {
+            name: Set(format!("transition-source-{}", uuid::Uuid::new_v4())),
+            bucket_name: Set("backup-transition-tests".into()),
+            region: Set("test-region-1".into()),
+            endpoint: Set(None),
+            bucket_path: Set(String::new()),
+            access_key_id: Set("encrypted-test-key".into()),
+            secret_key: Set("encrypted-test-secret".into()),
+            force_path_style: Set(Some(true)),
+            is_default: Set(false),
+            created_at: Set(now),
+            updated_at: Set(now),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test S3 source");
+        let service = external_services::ActiveModel {
+            name: Set(format!("transition-db-{}", uuid::Uuid::new_v4())),
+            service_type: Set("postgres".into()),
+            version: Set(Some("17".into())),
+            status: Set("running".into()),
+            created_at: Set(now),
+            updated_at: Set(now),
+            slug: Set(None),
+            config: Set(None),
+            node_id: Set(None),
+            topology: Set("standalone".into()),
+            error_message: Set(None),
+            health_status: Set(None),
+            last_health_check_at: Set(None),
+            last_health_error: Set(None),
+            consecutive_health_failures: Set(0),
+            health_metadata: Set(None),
+            metrics_enabled: Set(false),
+            default_backup_provisioned: Set(false),
+            container_name: Set(None),
+            ai_data_access: Set(false),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test external service");
+        let backup = backups::ActiveModel {
+            name: Set("atomic transition".into()),
+            backup_id: Set(uuid::Uuid::new_v4().to_string()),
+            schedule_id: Set(None),
+            backup_type: Set("full".into()),
+            state: Set("pending".into()),
+            started_at: Set(now),
+            finished_at: Set(None),
+            size_bytes: Set(None),
+            file_count: Set(None),
+            s3_source_id: Set(source.id),
+            s3_location: Set("s3://backup-transition-tests/source/walg".into()),
+            error_message: Set(None),
+            metadata: Set(r#"{"local":"preserved"}"#.into()),
+            checksum: Set(None),
+            compression_type: Set("none".into()),
+            created_by: Set(user.id),
+            expires_at: Set(None),
+            tags: Set("[]".into()),
+            schedule_run_id: Set(None),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test backup");
+        let child = external_service_backups::ActiveModel {
+            service_id: Set(service.id),
+            backup_id: Set(backup.id),
+            backup_type: Set("full".into()),
+            state: Set("pending".into()),
+            started_at: Set(now),
+            finished_at: Set(None),
+            size_bytes: Set(None),
+            s3_location: Set(String::new()),
+            error_message: Set(None),
+            metadata: Set(serde_json::json!({"engine": "postgres"})),
+            checksum: Set(None),
+            compression_type: Set("none".into()),
+            created_by: Set(user.id),
+            expires_at: Set(None),
+            ..Default::default()
+        }
+        .insert(db)
+        .await
+        .expect("insert transition-test child backup");
+        (backup, child)
+    }
+
+    #[tokio::test]
+    async fn test_backup_transition_concurrent_start_updates_parent_and_child_once() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/TestDatabase unavailable; skipping atomic transition test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (backup, child) = setup_real_backup_pair(db.as_ref()).await;
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+
+        let (first, second) = tokio::join!(
+            executor.mark_backup_running(backup.id),
+            executor.mark_backup_running(backup.id)
+        );
+
+        first.expect("first running transition");
+        second.expect("duplicate running transition is an idempotent no-op");
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let child = external_service_backups::Entity::find_by_id(child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "running");
+        assert_eq!(child.state, "running");
+    }
+
+    #[tokio::test]
+    async fn test_backup_transition_failure_recovery_keeps_parent_and_child_consistent() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/TestDatabase unavailable; skipping failure transition test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (backup, child) = setup_real_backup_pair(db.as_ref()).await;
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+        executor
+            .mark_backup_running(backup.id)
+            .await
+            .expect("mark running");
+
+        executor
+            .mark_backup_failed(backup.id, "object store unavailable after retries")
+            .await
+            .expect("mark failed atomically");
+
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let child = external_service_backups::Entity::find_by_id(child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "failed");
+        assert_eq!(child.state, "failed");
+        assert_eq!(
+            parent.error_message.as_deref(),
+            Some("object store unavailable after retries")
+        );
+        assert_eq!(child.error_message, parent.error_message);
+        assert!(parent.finished_at.is_some());
+        assert!(child.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_backup_transition_completion_propagates_restore_contract_atomically() {
+        use temps_entities::{backups, external_service_backups};
+
+        let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
+            Ok(db) => db,
+            Err(error) => {
+                eprintln!(
+                    "Docker/TestDatabase unavailable; skipping completion transition test: {error}"
+                );
+                return;
+            }
+        };
+        let db = test_db.connection_arc();
+        let (backup, child) = setup_real_backup_pair(db.as_ref()).await;
+        let executor = BackupExecutorBuilder::new(db.clone()).build();
+
+        executor
+            .finalize_completed(
+                backup.id,
+                "postgres_walg",
+                BackupOutcome {
+                    location: "s3://backup-transition-tests/cloud/walg".into(),
+                    size_bytes: Some(5_242_881),
+                    compression: "wal-g-native".into(),
+                },
+            )
+            .await
+            .expect("complete parent and child atomically");
+
+        let parent = backups::Entity::find_by_id(backup.id)
+            .one(db.as_ref())
+            .await
+            .expect("query parent")
+            .expect("parent exists");
+        let child = external_service_backups::Entity::find_by_id(child.id)
+            .one(db.as_ref())
+            .await
+            .expect("query child")
+            .expect("child exists");
+        assert_eq!(parent.state, "completed");
+        assert_eq!(child.state, "completed");
+        assert_eq!(parent.s3_location, child.s3_location);
+        assert_eq!(parent.size_bytes, child.size_bytes);
+        assert_eq!(parent.compression_type, child.compression_type);
+        assert_eq!(parent.metadata, r#"{"local":"preserved"}"#);
+        assert_eq!(child.metadata["engine"], "postgres");
+        assert!(parent.finished_at.is_some());
+        assert!(child.finished_at.is_some());
+    }
 }

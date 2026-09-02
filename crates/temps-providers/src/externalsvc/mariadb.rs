@@ -24,7 +24,8 @@ use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 const MARIADB_INTERNAL_PORT: &str = "3306";
-const DEFAULT_MARIADB_IMAGE: &str = "mariadb:lts";
+const MARIADB_IMAGE_REFERENCE_EXAMPLE: &str =
+    "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// Repositories a restore-time `docker_image` override may name, in addition
 /// to whatever repository the source service already runs. See
@@ -51,6 +52,56 @@ const MARIADB_IMAGE_PULL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 const MARIADB_BINLOG_UPLOAD_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_BINLOG_REPLAY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const MARIADB_RESTORE_HELPER_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+const MAX_BINLOG_POSITION: u64 = u32::MAX as u64;
+const MAX_BINLOG_MANIFEST_BYTES: u64 = 1024 * 1024;
+const MAX_BINLOG_SEGMENTS: usize = 4096;
+const MAX_BINLOG_COMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_BINLOG_UNCOMPRESSED_BYTES: u64 = 1024 * 1024 * 1024;
+const MAX_RESTORE_COMPRESSED_BYTES: u64 = 1024 * 1024 * 1024 * 1024;
+const MAX_RESTORE_UNCOMPRESSED_BYTES: u64 = 4 * 1024 * 1024 * 1024 * 1024;
+
+fn walg_target_user_data(backup: &temps_entities::backups::Model) -> Result<Option<String>> {
+    let metadata: serde_json::Value = serde_json::from_str(&backup.metadata).map_err(|error| {
+        anyhow::anyhow!(
+            "Backup {} has invalid metadata JSON: {}",
+            backup.backup_id,
+            error
+        )
+    })?;
+    let Some(version) = metadata.get("walg_identity_version") else {
+        return Ok(None);
+    };
+    if version.as_u64() != Some(1) {
+        return Err(anyhow::anyhow!(
+            "Backup {} uses unsupported WAL-G identity version {}",
+            backup.backup_id,
+            version
+        ));
+    }
+    let value = metadata.get("walg_target_user_data").ok_or_else(|| {
+        anyhow::anyhow!(
+            "Backup {} is missing its WAL-G target user data",
+            backup.backup_id
+        )
+    })?;
+    if value
+        .get("temps_backup_id")
+        .and_then(serde_json::Value::as_str)
+        != Some(backup.backup_id.as_str())
+    {
+        return Err(anyhow::anyhow!(
+            "Backup {} has WAL-G target user data for a different backup",
+            backup.backup_id
+        ));
+    }
+    serde_json::to_string(value).map(Some).map_err(|error| {
+        anyhow::anyhow!(
+            "Failed to serialize WAL-G target user data for backup {}: {}",
+            backup.backup_id,
+            error
+        )
+    })
+}
 
 /// Resource/tuning profile for Temps-managed MariaDB containers.
 ///
@@ -248,6 +299,36 @@ pub struct BinlogManifest {
     pub shipped_files: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MariaDbBinlogCoordinate {
+    file: String,
+    position: u64,
+    gtid: String,
+}
+
+struct BoundedChunkReader {
+    receiver: tokio::sync::mpsc::Receiver<std::result::Result<bytes::Bytes, String>>,
+    current: std::io::Cursor<bytes::Bytes>,
+}
+
+impl std::io::Read for BoundedChunkReader {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let read = std::io::Read::read(&mut self.current, buffer)?;
+            if read > 0 {
+                return Ok(read);
+            }
+            match self.receiver.blocking_recv() {
+                Some(Ok(chunk)) => self.current = std::io::Cursor::new(chunk),
+                Some(Err(reason)) => {
+                    return Err(std::io::Error::other(reason));
+                }
+                None => return Ok(0),
+            }
+        }
+    }
+}
+
 /// Longest binlog filename we will accept. Real names are ~20 characters
 /// (`mysql-bin.000007`); this only exists to bound the S3 key we build.
 const MAX_BINLOG_FILE_NAME_LEN: usize = 255;
@@ -320,8 +401,7 @@ pub struct MariaDbInputConfig {
     pub root_password: Option<String>,
 
     /// Full Docker image reference.
-    #[serde(default = "default_docker_image")]
-    #[schemars(example = example_docker_image(), default = "default_docker_image")]
+    #[schemars(example = example_docker_image())]
     pub docker_image: String,
 
     /// Managed service size/tuning profile.
@@ -427,8 +507,32 @@ fn default_username() -> String {
     "app".to_string()
 }
 
-fn default_docker_image() -> String {
-    DEFAULT_MARIADB_IMAGE.to_string()
+fn mariadb_image_pull_failure_message(image: &str, error: &str) -> String {
+    format!("Failed to pull MariaDB image {image}: {error}")
+}
+
+pub(crate) fn validate_immutable_mariadb_image(image: &str) -> std::result::Result<(), String> {
+    let digest = image
+        .strip_prefix("sha256:")
+        .or_else(|| image.rsplit_once("@sha256:").map(|(_, digest)| digest));
+    let Some(digest) = digest else {
+        return Err(format!(
+            "MariaDB WAL-G image must be immutable; configure repository@sha256:<64-hex-digest> (for example {MARIADB_IMAGE_REFERENCE_EXAMPLE}) or a local sha256:<64-hex-image-id>"
+        ));
+    };
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(
+            "MariaDB WAL-G image digest must contain exactly 64 hexadecimal characters".into(),
+        );
+    }
+    if image.contains('@')
+        && image
+            .split_once('@')
+            .is_some_and(|(repository, _)| repository.is_empty())
+    {
+        return Err("MariaDB WAL-G image digest is missing its repository name".into());
+    }
+    Ok(())
 }
 
 fn example_host() -> &'static str {
@@ -456,7 +560,7 @@ fn example_root_password() -> &'static str {
 }
 
 fn example_docker_image() -> &'static str {
-    DEFAULT_MARIADB_IMAGE
+    MARIADB_IMAGE_REFERENCE_EXAMPLE
 }
 
 fn generate_password() -> String {
@@ -502,6 +606,211 @@ impl MariaDbService {
             .unwrap_or_else(|| self.get_container_name())
     }
 
+    fn normalize_binlog_filename(raw: &str) -> Result<String> {
+        let filename = raw.trim().trim_matches(['\'', '"']);
+        let filename = filename.strip_prefix("./").unwrap_or(filename);
+        Self::validate_binlog_filename(filename)?;
+        Ok(filename.to_string())
+    }
+
+    fn validate_binlog_filename(filename: &str) -> Result<()> {
+        let valid = filename.len() <= 255
+            && filename.rsplit_once('.').is_some_and(|(prefix, sequence)| {
+                !prefix.is_empty()
+                    && prefix
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+                    && !sequence.is_empty()
+                    && sequence.len() <= 20
+                    && sequence.bytes().all(|byte| byte.is_ascii_digit())
+                    && sequence.parse::<u64>().is_ok_and(|value| value > 0)
+            });
+
+        if !valid {
+            return Err(anyhow::anyhow!(
+                "Invalid MariaDB binlog filename '{}': expected a safe basename like mysql-bin.000001",
+                filename
+            ));
+        }
+        Ok(())
+    }
+
+    fn parse_binlog_position(raw: &str, context: &str) -> Result<u64> {
+        let position = raw.parse::<u64>().map_err(|error| {
+            anyhow::anyhow!(
+                "Invalid MariaDB binlog position '{}' in {}: {}",
+                raw,
+                context,
+                error
+            )
+        })?;
+        if !(4..=MAX_BINLOG_POSITION).contains(&position) {
+            return Err(anyhow::anyhow!(
+                "Invalid MariaDB binlog position {} in {}: expected 4..={}",
+                position,
+                context,
+                MAX_BINLOG_POSITION
+            ));
+        }
+        Ok(position)
+    }
+
+    fn validate_binlog_manifest(manifest: &BinlogManifest) -> Result<()> {
+        if manifest.shipped_files.len() > MAX_BINLOG_SEGMENTS {
+            return Err(anyhow::anyhow!(
+                "MariaDB binlog manifest contains {} segments; limit is {}",
+                manifest.shipped_files.len(),
+                MAX_BINLOG_SEGMENTS
+            ));
+        }
+        if let Some(file) = &manifest.last_shipped_file {
+            Self::validate_binlog_filename(file)?;
+        }
+        for file in &manifest.shipped_files {
+            Self::validate_binlog_filename(file)?;
+        }
+        Ok(())
+    }
+
+    async fn stream_gzip_body_to_file_bounded(
+        mut body: aws_sdk_s3::primitives::ByteStream,
+        output_path: &std::path::Path,
+        label: &str,
+        max_compressed_bytes: u64,
+        max_uncompressed_bytes: u64,
+    ) -> Result<u64> {
+        use std::io::Read;
+
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        let output = output_path.to_path_buf();
+        let decode_label = label.to_string();
+        let decoder = tokio::task::spawn_blocking(move || {
+            let reader = BoundedChunkReader {
+                receiver,
+                current: std::io::Cursor::new(bytes::Bytes::new()),
+            };
+            let mut decoder = flate2::read::GzDecoder::new(reader).take(max_uncompressed_bytes + 1);
+            let mut file = std::fs::File::create(&output).map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to create decompressed MariaDB {} at {}: {}",
+                    decode_label,
+                    output.display(),
+                    error
+                )
+            })?;
+            let written = std::io::copy(&mut decoder, &mut file).map_err(|error| {
+                anyhow::anyhow!("Failed to gunzip MariaDB {}: {}", decode_label, error)
+            })?;
+            if written == 0 || written > max_uncompressed_bytes {
+                drop(file);
+                let _ = std::fs::remove_file(&output);
+                return Err(anyhow::anyhow!(
+                    "MariaDB {} decompressed to {} bytes; expected 1..={} bytes",
+                    decode_label,
+                    written,
+                    max_uncompressed_bytes
+                ));
+            }
+            Ok(written)
+        });
+
+        let mut compressed_bytes = 0_u64;
+        let producer_result = async {
+            while let Some(chunk) = body.next().await {
+                let chunk = chunk.map_err(|error| {
+                    anyhow::anyhow!("Failed to stream compressed MariaDB {}: {}", label, error)
+                })?;
+                compressed_bytes = compressed_bytes
+                    .checked_add(chunk.len() as u64)
+                    .ok_or_else(|| anyhow::anyhow!("MariaDB {} compressed size overflow", label))?;
+                if compressed_bytes > max_compressed_bytes {
+                    return Err(anyhow::anyhow!(
+                        "Compressed MariaDB {} exceeds the {} byte limit",
+                        label,
+                        max_compressed_bytes
+                    ));
+                }
+                sender.send(Ok(chunk)).await.map_err(|_| {
+                    anyhow::anyhow!(
+                        "MariaDB {} gzip decoder stopped before input completed",
+                        label
+                    )
+                })?;
+            }
+            if compressed_bytes == 0 {
+                return Err(anyhow::anyhow!("Compressed MariaDB {} is empty", label));
+            }
+            Ok::<(), anyhow::Error>(())
+        }
+        .await;
+        drop(sender);
+
+        let decoder_result = decoder.await.map_err(|error| {
+            anyhow::anyhow!("MariaDB {} decompression task failed: {}", label, error)
+        })?;
+        match (producer_result, decoder_result) {
+            (_, Err(error)) => {
+                let _ = tokio::fs::remove_file(output_path).await;
+                Err(error)
+            }
+            (Err(error), Ok(_)) => {
+                let _ = tokio::fs::remove_file(output_path).await;
+                Err(error)
+            }
+            (Ok(()), Ok(written)) => Ok(written),
+        }
+    }
+
+    async fn stream_body_to_file_bounded(
+        mut body: aws_sdk_s3::primitives::ByteStream,
+        output_path: &std::path::Path,
+        label: &str,
+        max_bytes: u64,
+    ) -> Result<u64> {
+        use tokio::io::AsyncWriteExt;
+
+        let mut output = tokio::fs::File::create(output_path)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to create MariaDB {} staging file at {}: {}",
+                    label,
+                    output_path.display(),
+                    error
+                )
+            })?;
+        let mut written = 0_u64;
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| {
+                anyhow::anyhow!("Failed to stream MariaDB {}: {}", label, error)
+            })?;
+            written = written
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("MariaDB {} compressed size overflow", label))?;
+            if written > max_bytes {
+                drop(output);
+                let _ = tokio::fs::remove_file(output_path).await;
+                return Err(anyhow::anyhow!(
+                    "MariaDB {} exceeds the {} byte limit",
+                    label,
+                    max_bytes
+                ));
+            }
+            output.write_all(&chunk).await.map_err(|error| {
+                anyhow::anyhow!("Failed to write MariaDB {} staging file: {}", label, error)
+            })?;
+        }
+        output.flush().await.map_err(|error| {
+            anyhow::anyhow!("Failed to flush MariaDB {} staging file: {}", label, error)
+        })?;
+        if written == 0 {
+            drop(output);
+            let _ = tokio::fs::remove_file(output_path).await;
+            return Err(anyhow::anyhow!("MariaDB {} is empty", label));
+        }
+        Ok(written)
+    }
+
     fn get_effective_address_for_environment(
         &self,
         service_config: ServiceConfig,
@@ -526,6 +835,13 @@ impl MariaDbService {
         Self::validate_identifier("username", &config.username)?;
         Self::validate_password("password", &config.password)?;
         Self::validate_password("root_password", &config.root_password)?;
+        validate_immutable_mariadb_image(&config.docker_image).map_err(|reason| {
+            anyhow::anyhow!(
+                "Invalid MariaDB docker_image '{}': {}",
+                config.docker_image,
+                reason
+            )
+        })?;
 
         Ok(config)
     }
@@ -536,6 +852,13 @@ impl MariaDbService {
         config: &MariaDbConfig,
         resource_limits: &ServiceResourceLimits,
     ) -> Result<()> {
+        validate_immutable_mariadb_image(&config.docker_image).map_err(|reason| {
+            anyhow::anyhow!(
+                "Refusing to execute MariaDB image '{}': {}",
+                config.docker_image,
+                reason
+            )
+        })?;
         let container_name = self.get_container_name();
 
         if docker.inspect_image(&config.docker_image).await.is_ok() {
@@ -545,7 +868,6 @@ impl MariaDbService {
             );
         } else {
             info!("Pulling MariaDB image {}", config.docker_image);
-
             tokio::time::timeout(
                 MARIADB_IMAGE_PULL_TIMEOUT,
                 crate::utils::pull_image_with_retry(docker, &config.docker_image, None),
@@ -558,7 +880,12 @@ impl MariaDbService {
                     MARIADB_IMAGE_PULL_TIMEOUT.as_secs()
                 )
             })?
-            .map_err(|e| anyhow::anyhow!("Failed to pull MariaDB image: {}", e))?;
+            .map_err(|error| {
+                anyhow::anyhow!(mariadb_image_pull_failure_message(
+                    &config.docker_image,
+                    &error.to_string()
+                ))
+            })?;
         }
 
         let containers = docker
@@ -1266,7 +1593,7 @@ impl MariaDbService {
 
         // 2. Enumerate segments. The last entry is the new active segment.
         let raw = self.show_binary_logs(config).await?;
-        let all_files = Self::parse_show_binary_logs(&raw);
+        let all_files = Self::parse_show_binary_logs(&raw)?;
         let closed = Self::closed_binlog_files(&all_files);
         if closed.is_empty() {
             debug!(
@@ -1279,8 +1606,7 @@ impl MariaDbService {
         // 3. Read the manifest to learn what we have already shipped.
         let mut manifest = self
             .read_binlog_manifest(s3_client, bucket, prefix, &self.name)
-            .await
-            .unwrap_or_default();
+            .await?;
 
         // 4. Compute the to-ship set: closed segments lexicographically
         //    greater than last_shipped_file (excludes the active file and
@@ -1299,7 +1625,7 @@ impl MariaDbService {
 
         let mut shipped = 0usize;
         for file in &to_ship {
-            let key = Self::binlog_object_key(prefix, &self.name, file);
+            let key = Self::binlog_object_key(prefix, &self.name, file)?;
             match self
                 .ship_one_binlog(s3_client, bucket, &container_name, file, &key)
                 .await
@@ -1487,48 +1813,34 @@ impl MariaDbService {
             Err(_) => return Ok(BinlogManifest::default()),
         };
 
-        let bytes = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read binlog manifest body: {}", e))?
-            .into_bytes();
+        let mut body = resp.body;
+        let mut bytes = Vec::new();
+        while let Some(chunk) = body.next().await {
+            let chunk = chunk.map_err(|error| {
+                anyhow::anyhow!("Failed to read binlog manifest body: {}", error)
+            })?;
+            let new_len = (bytes.len() as u64)
+                .checked_add(chunk.len() as u64)
+                .ok_or_else(|| anyhow::anyhow!("MariaDB binlog manifest size overflow"))?;
+            if new_len > MAX_BINLOG_MANIFEST_BYTES {
+                return Err(anyhow::anyhow!(
+                    "MariaDB binlog manifest exceeds the {} byte limit",
+                    MAX_BINLOG_MANIFEST_BYTES
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
 
         let manifest = serde_json::from_slice::<BinlogManifest>(&bytes)
-            .map_err(|e| anyhow::anyhow!("Failed to parse binlog manifest: {}", e))?;
-
-        // Reject the whole manifest rather than filtering: a manifest carrying
-        // a traversal entry is either corrupt or hostile, and silently
-        // replaying the remaining subset would produce a PITR result that
-        // looks successful while skipping segments.
-        if let Some(bad) = manifest
-            .shipped_files
-            .iter()
-            .find(|file| !is_safe_binlog_file_name(file))
-        {
-            return Err(anyhow::anyhow!(
-                "Binlog manifest s3://{}/{} contains an unsafe segment name '{}'; \
-                 binlog filenames must be a single path component of [A-Za-z0-9._-]. \
-                 Refusing to use this manifest.",
+            .map_err(|error| anyhow::anyhow!("Failed to parse binlog manifest: {}", error))?;
+        Self::validate_binlog_manifest(&manifest).map_err(|error| {
+            anyhow::anyhow!(
+                "Binlog manifest s3://{}/{} is unsafe or invalid: {}. Refusing to use this manifest.",
                 bucket,
                 key,
-                bad
-            ));
-        }
-        if let Some(last) = manifest
-            .last_shipped_file
-            .as_deref()
-            .filter(|last| !is_safe_binlog_file_name(last))
-        {
-            return Err(anyhow::anyhow!(
-                "Binlog manifest s3://{}/{} has an unsafe last_shipped_file '{}'. \
-                 Refusing to use this manifest.",
-                bucket,
-                key,
-                last
-            ));
-        }
-
+                error
+            )
+        })?;
         Ok(manifest)
     }
 
@@ -1565,14 +1877,14 @@ impl MariaDbService {
     /// Parse `SHOW BINARY LOGS` output into segment filenames, in order.
     /// Each row is tab-separated (`filename\tsize[\t...]`); blank lines and
     /// the `Log_name` header (when present) are ignored.
-    pub(crate) fn parse_show_binary_logs(raw: &str) -> Vec<String> {
+    pub(crate) fn parse_show_binary_logs(raw: &str) -> Result<Vec<String>> {
         raw.lines()
             .filter_map(|line| {
                 let name = line.split('\t').next()?.trim();
                 if name.is_empty() || name == "Log_name" {
                     return None;
                 }
-                Some(name.to_string())
+                Some(Self::normalize_binlog_filename(name))
             })
             .collect()
     }
@@ -1604,16 +1916,21 @@ impl MariaDbService {
     /// S3 object key for a single gzipped binlog segment.
     /// `{prefix}/external_services/mariadb/{service}/binlog/{file}.gz`
     /// (the leading `{prefix}/` is dropped when `prefix` is empty).
-    pub(crate) fn binlog_object_key(prefix: &str, service_name: &str, file: &str) -> String {
+    pub(crate) fn binlog_object_key(
+        prefix: &str,
+        service_name: &str,
+        file: &str,
+    ) -> Result<String> {
+        Self::validate_binlog_filename(file)?;
         let tail = format!(
             "external_services/mariadb/{}/binlog/{}.gz",
             service_name, file
         );
-        if prefix.is_empty() {
+        Ok(if prefix.is_empty() {
             tail
         } else {
             format!("{}/{}", prefix, tail)
-        }
+        })
     }
 
     /// S3 object key for the binlog manifest.
@@ -1785,7 +2102,7 @@ impl MariaDbService {
 
         let mut deleted: Vec<String> = Vec::with_capacity(stale.len());
         for file in &stale {
-            let key = Self::binlog_object_key(prefix, &self.name, file);
+            let key = Self::binlog_object_key(prefix, &self.name, file)?;
             match s3_client
                 .delete_object()
                 .bucket(bucket)
@@ -2053,6 +2370,12 @@ impl MariaDbService {
         location.ends_with("base.mbstream.gz")
     }
 
+    /// True when the backup location points at a WAL-G repository rather than
+    /// a single legacy mbstream object.
+    pub(crate) fn is_walg_repository_location(location: &str) -> bool {
+        location.trim_end_matches('/').ends_with("/walg")
+    }
+
     /// Derive the `metadata.json` companion key from a base backup key by
     /// replacing the last path segment. Mirrors
     /// `temps_backup::engines::v2_common::derive_metadata_key`.
@@ -2104,8 +2427,6 @@ impl MariaDbService {
         base_key: &str,
         dest: &std::path::Path,
     ) -> Result<()> {
-        use std::io::Read;
-
         let resp = s3_client
             .get_object()
             .bucket(bucket)
@@ -2120,26 +2441,15 @@ impl MariaDbService {
                     e
                 )
             })?;
-        let gz = resp
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read physical base body: {}", e))?
-            .into_bytes();
 
-        let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(gz));
-        let mut stream = Vec::new();
-        decoder
-            .read_to_end(&mut stream)
-            .map_err(|e| anyhow::anyhow!("Failed to gunzip physical base: {}", e))?;
-        if stream.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Physical base mbstream is empty after gunzip"
-            ));
-        }
-        tokio::fs::write(dest, &stream).await.map_err(|e| {
-            anyhow::anyhow!("Failed to write mbstream to {}: {}", dest.display(), e)
-        })?;
+        Self::stream_gzip_body_to_file_bounded(
+            resp.body,
+            dest,
+            "physical base backup",
+            MAX_RESTORE_COMPRESSED_BYTES,
+            MAX_RESTORE_UNCOMPRESSED_BYTES,
+        )
+        .await?;
         Ok(())
     }
 
@@ -2231,6 +2541,329 @@ impl MariaDbService {
 
         info!("MariaDB physical restore completed for {}", container_name);
         Ok(())
+    }
+
+    /// Restore a WAL-G repository directly into a MariaDB data volume.
+    ///
+    /// The helper shares the stopped service's volume and downloads from S3
+    /// itself, so a database-sized archive never lands on the Temps host.
+    /// `xtrabackup_binlog_info` is emitted after fetch/prepare and becomes the
+    /// exact replay anchor for PITR.
+    async fn restore_walg_repository_into_container(
+        &self,
+        config: &MariaDbConfig,
+        s3_credentials: &super::S3Credentials,
+        repository: &str,
+        target_user_data: Option<&str>,
+    ) -> Result<Option<MariaDbBinlogCoordinate>> {
+        use bollard::models::{ContainerCreateBody, HostConfig};
+
+        let container_name = self.get_live_container_name(config);
+        let container_info = self
+            .docker
+            .inspect_container(&container_name, None::<InspectContainerOptions>)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to inspect MariaDB container '{}' before WAL-G restore: {}",
+                    container_name,
+                    error
+                )
+            })?;
+        let image = container_info
+            .config
+            .and_then(|container_config| container_config.image)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "MariaDB container '{}' does not report the immutable image used for restore",
+                    container_name
+                )
+            })?;
+
+        let mut env = vec![
+            format!("WALG_S3_PREFIX={repository}"),
+            format!("AWS_ACCESS_KEY_ID={}", s3_credentials.access_key_id),
+            format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
+            format!("AWS_REGION={}", s3_credentials.region),
+            format!(
+                "WALG_MYSQL_DATASOURCE_NAME=root:{}@tcp(127.0.0.1:3306)/mysql",
+                config.root_password
+            ),
+            "WALG_STREAM_CREATE_COMMAND=echo noop".to_string(),
+            "WALG_STREAM_RESTORE_COMMAND=mbstream -x -C /var/lib/mysql".to_string(),
+            "WALG_MYSQL_BACKUP_PREPARE_COMMAND=mariadb-backup --prepare --target-dir=/var/lib/mysql".to_string(),
+        ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        env.extend(s3_credentials.session_token_env());
+        if let Some(endpoint) = s3_credentials
+            .resolve_endpoint_for_container(&self.docker, &container_name)
+            .await
+        {
+            env.push(format!("AWS_ENDPOINT={endpoint}"));
+        }
+        if s3_credentials.force_path_style {
+            env.push("AWS_S3_FORCE_PATH_STYLE=true".to_string());
+        }
+        if let Some(target_user_data) = target_user_data {
+            env.push(format!("WALG_FETCH_TARGET_USER_DATA={target_user_data}"));
+        }
+
+        self.docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to disable restart policy for MariaDB WAL-G restore '{}': {}",
+                    container_name,
+                    error
+                )
+            })?;
+        let _ = self
+            .docker
+            .stop_container(
+                &container_name,
+                Some(StopContainerOptions {
+                    t: Some(30),
+                    signal: None,
+                }),
+            )
+            .await;
+
+        ensure_network_exists(&self.docker)
+            .await
+            .map_err(|error| anyhow::anyhow!("Failed to ensure restore network: {error:?}"))?;
+        let helper_name = format!("{}-walg-restore-{}", container_name, uuid::Uuid::new_v4());
+        let fetch_target = if target_user_data.is_some() {
+            "--target-user-data \"$WALG_FETCH_TARGET_USER_DATA\""
+        } else {
+            "LATEST"
+        };
+        let restore_script = format!(
+            concat!(
+                "set -eu; ",
+                "find /var/lib/mysql -mindepth 1 -maxdepth 1 -exec rm -rf -- {{}} +; ",
+                "wal-g backup-fetch {}; ",
+                "if test -s /var/lib/mysql/xtrabackup_binlog_info; then ",
+                "printf 'TEMPS_BINLOG_COORD='; cat /var/lib/mysql/xtrabackup_binlog_info; fi; ",
+                "chown -R mysql:mysql /var/lib/mysql"
+            ),
+            fetch_target
+        );
+        let helper = self
+            .docker
+            .create_container(
+                Some(
+                    bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                        .name(&helper_name)
+                        .build(),
+                ),
+                ContainerCreateBody {
+                    image: Some(image),
+                    cmd: Some(vec!["sh".to_string(), "-c".to_string(), restore_script]),
+                    env: Some(env),
+                    host_config: Some(HostConfig {
+                        volumes_from: Some(vec![container_name.clone()]),
+                        ..Default::default()
+                    }),
+                    networking_config: Some(bollard::models::NetworkingConfig {
+                        endpoints_config: Some(HashMap::from([(
+                            temps_core::NETWORK_NAME.to_string(),
+                            bollard::models::EndpointSettings::default(),
+                        )])),
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to create MariaDB WAL-G restore helper for '{}': {}",
+                    container_name,
+                    error
+                )
+            })?;
+
+        let helper_result = async {
+            self.docker
+                .start_container(
+                    &helper.id,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "Failed to start MariaDB WAL-G restore helper for '{}': {}",
+                        container_name,
+                        error
+                    )
+                })?;
+            let wait = tokio::time::timeout(
+                MARIADB_RESTORE_HELPER_TIMEOUT,
+                self.docker
+                    .wait_container(
+                        &helper.id,
+                        None::<bollard::query_parameters::WaitContainerOptions>,
+                    )
+                    .next(),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "MariaDB WAL-G restore helper for '{}' timed out after {:?}",
+                    container_name,
+                    MARIADB_RESTORE_HELPER_TIMEOUT
+                )
+            })?;
+
+            let mut log_stream = self.docker.logs(
+                &helper.id,
+                Some(bollard::query_parameters::LogsOptions {
+                    stdout: true,
+                    stderr: true,
+                    follow: false,
+                    ..Default::default()
+                }),
+            );
+            let mut logs = String::new();
+            while let Some(chunk) = log_stream.next().await {
+                match chunk {
+                    Ok(output) => logs.push_str(&output.to_string()),
+                    Err(error) => {
+                        logs.push_str(&format!("\nunable to read helper logs: {error}"));
+                        break;
+                    }
+                }
+            }
+            match wait {
+                Some(Ok(response)) if response.status_code == 0 => {
+                    Self::parse_optional_walg_restore_coordinate(&logs)
+                }
+                Some(Ok(response)) => Err(anyhow::anyhow!(
+                    "MariaDB WAL-G restore helper for '{}' exited with code {}: {}",
+                    container_name,
+                    response.status_code,
+                    logs
+                )),
+                Some(Err(error)) => Err(anyhow::anyhow!(
+                    "Failed waiting for MariaDB WAL-G restore helper for '{}': {}. Logs: {}",
+                    container_name,
+                    error,
+                    logs
+                )),
+                None => Err(anyhow::anyhow!(
+                    "MariaDB WAL-G restore helper for '{}' ended without a status",
+                    container_name
+                )),
+            }
+        }
+        .await;
+
+        let _ = self
+            .docker
+            .remove_container(
+                &helper.id,
+                Some(bollard::query_parameters::RemoveContainerOptions {
+                    force: true,
+                    v: false,
+                    ..Default::default()
+                }),
+            )
+            .await;
+        if let Err(error) = self
+            .docker
+            .update_container(
+                &container_name,
+                bollard::models::ContainerUpdateBody {
+                    restart_policy: Some(bollard::models::RestartPolicy {
+                        name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                        maximum_retry_count: None,
+                    }),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            warn!(container = %container_name, %error, "Failed to restore MariaDB restart policy");
+        }
+
+        let coordinate = helper_result?;
+        self.docker
+            .start_container(
+                &container_name,
+                None::<bollard::query_parameters::StartContainerOptions>,
+            )
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "Failed to start MariaDB '{}' after WAL-G restore: {}",
+                    container_name,
+                    error
+                )
+            })?;
+        self.wait_for_container_health(&self.docker, &container_name)
+            .await?;
+        Ok(coordinate)
+    }
+
+    fn parse_optional_walg_restore_coordinate(
+        logs: &str,
+    ) -> Result<Option<MariaDbBinlogCoordinate>> {
+        if let Some(line) = logs.lines().find_map(|line| {
+            line.split_once("TEMPS_BINLOG_COORD=")
+                .map(|(_, value)| value)
+        }) {
+            let mut fields = line.split_whitespace();
+            let file = fields
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("xtrabackup_binlog_info has no binlog filename"))?;
+            let position = fields
+                .next()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("xtrabackup_binlog_info has no position"))?;
+            return Ok(Some(MariaDbBinlogCoordinate {
+                file: Self::normalize_binlog_filename(file)?,
+                position: Self::parse_binlog_position(position, "xtrabackup_binlog_info")?,
+                gtid: fields.next().unwrap_or_default().to_string(),
+            }));
+        }
+
+        for line in logs.lines() {
+            let Some((_, coordinate)) = line.split_once("Last binlog file ") else {
+                continue;
+            };
+            let Some((file, position)) = coordinate.split_once(", position ") else {
+                continue;
+            };
+            let position = position.split_whitespace().next().unwrap_or_default();
+            if !file.is_empty() && !position.is_empty() {
+                return Ok(Some(MariaDbBinlogCoordinate {
+                    file: Self::normalize_binlog_filename(file)?,
+                    position: Self::parse_binlog_position(position, "WAL-G prepare log")?,
+                    gtid: String::new(),
+                }));
+            }
+        }
+
+        Ok(None)
+    }
+
+    #[cfg(test)]
+    fn parse_walg_restore_coordinate(logs: &str) -> Result<MariaDbBinlogCoordinate> {
+        Self::parse_optional_walg_restore_coordinate(logs)?.ok_or_else(|| {
+            anyhow::anyhow!("WAL-G restore did not emit a MariaDB binlog coordinate")
+        })
     }
 
     /// Create (don't start) the helper, upload the mbstream onto its writable
@@ -2508,21 +3141,16 @@ impl MariaDbService {
                 Self::format_stop_datetime(*time),
             ))),
             RecoveryTarget::Lsn { lsn } => {
-                // Accept "binlog_file:position"; reject a bare position.
-                match lsn.rsplit_once(':') {
-                    Some((file, pos))
-                        if !file.is_empty()
-                            && pos.chars().all(|c| c.is_ascii_digit())
-                            && !pos.is_empty() =>
-                    {
-                        Ok(Some(("--stop-position".to_string(), pos.to_string())))
-                    }
-                    _ => Err(anyhow::anyhow!(
+                let (file, raw_position) = lsn.rsplit_once(':').ok_or_else(|| {
+                    anyhow::anyhow!(
                         "PITR Lsn target must be 'binlog_file:position' (a bare position is \
                          ambiguous across binlog segments); got '{}'",
                         lsn
-                    )),
-                }
+                    )
+                })?;
+                Self::validate_binlog_filename(file)?;
+                let position = Self::parse_binlog_position(raw_position, "PITR Lsn target")?;
+                Ok(Some(("--stop-position".to_string(), position.to_string())))
             }
             RecoveryTarget::Xid { xid } => Err(anyhow::anyhow!(
                 "PITR Xid/GTID target ('{}') is not yet supported for MariaDB physical \
@@ -2538,13 +3166,16 @@ impl MariaDbService {
 
     /// For an `Lsn` target, the binlog file the `--stop-position` applies to
     /// (the final segment to replay). `None` for non-Lsn targets.
-    fn lsn_target_file(target: &RecoveryTarget) -> Option<String> {
+    fn lsn_target_file(target: &RecoveryTarget) -> Result<Option<String>> {
         match target {
-            RecoveryTarget::Lsn { lsn } => lsn
-                .rsplit_once(':')
-                .map(|(file, _)| file.to_string())
-                .filter(|f| !f.is_empty()),
-            _ => None,
+            RecoveryTarget::Lsn { lsn } => {
+                let (file, _) = lsn.rsplit_once(':').ok_or_else(|| {
+                    anyhow::anyhow!("PITR Lsn target '{}' has no binlog filename", lsn)
+                })?;
+                Self::validate_binlog_filename(file)?;
+                Ok(Some(file.to_string()))
+            }
+            _ => Ok(None),
         }
     }
 
@@ -2563,7 +3194,7 @@ impl MariaDbService {
         start_file: &str,
         dest_dir: &std::path::Path,
     ) -> Result<Vec<(std::path::PathBuf, String)>> {
-        use std::io::Read;
+        Self::validate_binlog_filename(start_file)?;
 
         // Propagate, don't default. `read_binlog_manifest` rejects a manifest
         // outright when any entry has an unsafe filename, precisely so a
@@ -2590,6 +3221,13 @@ impl MariaDbService {
             .collect();
         files.sort();
         files.dedup();
+        if files.len() > MAX_BINLOG_SEGMENTS {
+            return Err(anyhow::anyhow!(
+                "MariaDB PITR requires {} binlog segments; limit is {}",
+                files.len(),
+                MAX_BINLOG_SEGMENTS
+            ));
+        }
 
         if files.is_empty() {
             warn!(
@@ -2602,17 +3240,8 @@ impl MariaDbService {
 
         let mut result = Vec::with_capacity(files.len());
         for file in files {
-            // Defence in depth: `read_binlog_manifest` already rejects unsafe
-            // names, but this is the call that turns a string into a host path
-            // and an S3 key, so it must not depend on a caller having checked.
-            if !is_safe_binlog_file_name(&file) {
-                return Err(anyhow::anyhow!(
-                    "Refusing to restore binlog segment '{}': filenames must be a \
-                     single path component of [A-Za-z0-9._-]",
-                    file
-                ));
-            }
-            let key = Self::binlog_object_key(prefix, source_name, &file);
+            Self::validate_binlog_filename(&file)?;
+            let key = Self::binlog_object_key(prefix, source_name, &file)?;
             let resp = s3_client
                 .get_object()
                 .bucket(bucket)
@@ -2627,21 +3256,22 @@ impl MariaDbService {
                         e
                     )
                 })?;
-            let gz = resp
-                .body
-                .collect()
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to read binlog segment {}: {}", file, e))?
-                .into_bytes();
-            let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(gz));
-            let mut raw = Vec::new();
-            decoder
-                .read_to_end(&mut raw)
-                .map_err(|e| anyhow::anyhow!("Failed to gunzip binlog segment {}: {}", file, e))?;
+
             let host_path = dest_dir.join(&file);
-            tokio::fs::write(&host_path, &raw)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to write binlog {} to host: {}", file, e))?;
+            let uncompressed_bytes = Self::stream_gzip_body_to_file_bounded(
+                resp.body,
+                &host_path,
+                &format!("compressed binlog segment {}", file),
+                MAX_BINLOG_COMPRESSED_BYTES,
+                MAX_BINLOG_UNCOMPRESSED_BYTES,
+            )
+            .await?;
+            debug!(
+                service = %self.name,
+                binlog = %file,
+                uncompressed_bytes,
+                "Staged bounded MariaDB binlog segment"
+            );
             result.push((host_path, file));
         }
         Ok(result)
@@ -2660,7 +3290,7 @@ impl MariaDbService {
         &self,
         config: &MariaDbConfig,
         segments: &[(std::path::PathBuf, String)],
-        start_position: &str,
+        start_position: u64,
         target: &RecoveryTarget,
     ) -> Result<()> {
         if segments.is_empty() {
@@ -2711,7 +3341,7 @@ impl MariaDbService {
         // For an Lsn target, --stop-position is only sound when the target file
         // is the LAST segment replayed; otherwise the same numeric position
         // exists in multiple files and we'd stop in the wrong one.
-        if let Some(target_file) = Self::lsn_target_file(target) {
+        if let Some(target_file) = Self::lsn_target_file(target)? {
             let last = container_files
                 .last()
                 .map(|p| p.rsplit('/').next().unwrap_or(p).to_string())
@@ -2729,15 +3359,7 @@ impl MariaDbService {
         // `$BINLOG` is resolved at run time in the shell below — mariadb:lts
         // ships `mariadb-binlog`, not `mysqlbinlog`.
         let mut binlog_args = String::from("\"$BINLOG\" --disable-log-bin");
-        // `start_position` originates in an S3-hosted `metadata.json` that any
-        // writer to the bucket can tamper with, and it is interpolated into a
-        // shell command. Re-validate at the sink (callers validate on read too)
-        // and quote it like every other value in this script.
-        let start_position = Self::validate_binlog_position(start_position)?;
-        binlog_args.push_str(&format!(
-            " --start-position={}",
-            Self::shell_single_quote(&start_position)
-        ));
+        binlog_args.push_str(&format!(" --start-position={}", start_position));
         if let Some((flag, value)) = &stop_flag {
             // Quote the value (datetimes contain a space).
             binlog_args.push_str(&format!(" {}={}", flag, Self::shell_single_quote(value)));
@@ -2747,13 +3369,12 @@ impl MariaDbService {
             binlog_args.push_str(&Self::shell_single_quote(f));
         }
 
-        // Resolve tool names at run time: mariadb:lts ships `mariadb-binlog`
-        // and `mariadb` (NOT `mysqlbinlog`/`mysql`); fall back to the mysql
-        // names for non-MariaDB images. dash has no pipefail, so we decode to
-        // an intermediate file FIRST (under `set -e`, a failed decode aborts
-        // before the client runs) and only then feed it to the client — this
-        // surfaces a broken replay as an error rather than a silent
-        // half-apply masked by the client's exit code in a pipe.
+        // The pinned managed image guarantees bash, so we run the decoder and
+        // the client as a single pipefail-protected pipeline rather than
+        // dash's decode-to-file dance: pipefail makes either a decoder
+        // failure or a client failure fail the replay without staging
+        // decoded SQL, which can be much larger than the binlog segments.
+        //
         // `set -x` traces every command AFTER parameter expansion, and
         // `run_exec` folds that trace into the error text of a failed exec —
         // which lands verbatim in the UNENCRYPTED `restore_runs.error_message`
@@ -2763,20 +3384,20 @@ impl MariaDbService {
         // exactly like every other exec in this file, and the password is not
         // on argv. The trace is worth keeping — it is the only diagnostic a
         // self-hosted operator gets when a replay fails mid-script.
-        let replay_file = "/var/tmp/temps-pitr-replay.sql";
+        let pipeline = format!(
+            "{} | \"$CLIENT\" --protocol=TCP -h127.0.0.1 -P3306 --connect-timeout=10 -uroot --binary-mode=1",
+            binlog_args
+        );
+        let pipefail_command = Self::shell_pipeline_with_pipefail(&pipeline);
         let replay_cmd = format!(
             "set -ex; \
              if command -v mariadb-binlog >/dev/null 2>&1; then BINLOG=mariadb-binlog; else BINLOG=mysqlbinlog; fi; \
              if command -v mariadb >/dev/null 2>&1; then CLIENT=mariadb; else CLIENT=mysql; fi; \
-             echo temps-mariadb-pitr-replay: decode-binlogs; \
-             timeout 120s {binlog} > {file}; \
-             ls -lh {file}; \
-             echo temps-mariadb-pitr-replay: apply-sql; \
-             timeout 120s \"$CLIENT\" --protocol=TCP -h127.0.0.1 -P3306 --connect-timeout=10 -uroot --binary-mode=1 < {file}; \
-             rm -f {file}; \
+             export BINLOG CLIENT; \
+             echo temps-mariadb-pitr-replay: stream-binlogs; \
+             timeout 120s {pipeline}; \
              echo temps-mariadb-pitr-replay: complete",
-            binlog = binlog_args,
-            file = replay_file,
+            pipeline = pipefail_command,
         );
 
         let env = vec![
@@ -2940,8 +3561,6 @@ impl MariaDbService {
         backup_location: &str,
         config: &MariaDbConfig,
     ) -> Result<()> {
-        use std::io::Read;
-
         let backup_key = Self::backup_key_from_location(backup_location, bucket);
         let response = s3_client
             .get_object()
@@ -2951,23 +3570,26 @@ impl MariaDbService {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to download MariaDB backup from S3: {}", e))?;
 
-        let backup_data = response
-            .body
-            .collect()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read MariaDB backup data: {}", e))?
-            .into_bytes();
-
         let temp_dir = tempfile::tempdir()?;
         let sql_path = temp_dir.path().join("restore.sql");
 
         if backup_key.ends_with(".gz") {
-            let mut decoder = flate2::read::GzDecoder::new(std::io::Cursor::new(backup_data));
-            let mut sql = Vec::new();
-            decoder.read_to_end(&mut sql)?;
-            tokio::fs::write(&sql_path, sql).await?;
+            Self::stream_gzip_body_to_file_bounded(
+                response.body,
+                &sql_path,
+                "logical backup",
+                MAX_RESTORE_COMPRESSED_BYTES,
+                MAX_RESTORE_UNCOMPRESSED_BYTES,
+            )
+            .await?;
         } else {
-            tokio::fs::write(&sql_path, backup_data).await?;
+            Self::stream_body_to_file_bounded(
+                response.body,
+                &sql_path,
+                "logical backup",
+                MAX_RESTORE_UNCOMPRESSED_BYTES,
+            )
+            .await?;
         }
 
         self.restore_sql_file(config, &sql_path).await
@@ -2976,6 +3598,10 @@ impl MariaDbService {
     /// POSIX single-quote escape for embedding a value in an `sh -c` string.
     pub(crate) fn shell_single_quote(s: &str) -> String {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+
+    fn shell_pipeline_with_pipefail(pipeline: &str) -> String {
+        format!("bash -o pipefail -c {}", Self::shell_single_quote(pipeline))
     }
 
     /// Validate a binlog byte-offset that came from an UNTRUSTED source before
@@ -3605,6 +4231,32 @@ impl ExternalService for MariaDbService {
         Ok(())
     }
 
+    async fn restore_in_place(&self, ctx: super::RestoreContext<'_>) -> Result<()> {
+        let bucket = &ctx.s3_source.bucket_name;
+        let backup_key = Self::backup_key_from_location(ctx.backup_location, bucket);
+        if Self::is_walg_repository_location(&backup_key) {
+            let config = self.get_mariadb_config(ctx.source_config)?;
+            let target_user_data = walg_target_user_data(ctx.backup)?;
+            self.restore_walg_repository_into_container(
+                &config,
+                ctx.s3_credentials,
+                ctx.backup_location,
+                target_user_data.as_deref(),
+            )
+            .await?;
+            Ok(())
+        } else {
+            self.restore_from_s3(
+                ctx.s3_client,
+                ctx.s3_credentials,
+                ctx.backup_location,
+                ctx.s3_source,
+                ctx.source_config,
+            )
+            .await
+        }
+    }
+
     /// MariaDB supports in-place restore, restore-to-new-service, and PITR.
     /// PITR requires a physical (`mariadb-backup`) base plus archived binlogs;
     /// logical-only backups are rejected at execute time by `restore_pitr`.
@@ -3675,58 +4327,66 @@ impl ExternalService for MariaDbService {
         // ── Guard: PITR requires a physical base with binlog coordinates ─────
         // Mirrors postgres' WAL-G guard. Logical (`mariadb_dump`) backups carry
         // no binlog start position and cannot anchor a replay.
-        if !Self::is_physical_base_location(&base_key) {
+        let is_walg_repository = Self::is_walg_repository_location(&base_key);
+        if !is_walg_repository && !Self::is_physical_base_location(&base_key) {
             return Err(anyhow::anyhow!(
                 "PITR requires a physical (mariadb-backup) base backup; '{}' is a \
                  logical dump and cannot be used for point-in-time recovery",
                 ctx.backup_location
             ));
         }
-        let metadata = self
-            .fetch_base_metadata(ctx.s3_client, bucket, &base_key)
-            .await?;
-        let engine = metadata
-            .get("engine")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let pitr_enabled = metadata
-            .get("pitr")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let binlog_file = metadata
-            .get("binlog_file")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        let binlog_position = metadata
-            .get("binlog_position")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-        if engine != "mariadb_physical" || !pitr_enabled || binlog_file.is_empty() {
-            return Err(anyhow::anyhow!(
-                "PITR requires a physical (mariadb-backup) base with binlog coordinates; \
-                 base metadata has engine='{}', pitr={}, binlog_file='{}' — not usable for \
-                 point-in-time recovery",
-                engine,
-                pitr_enabled,
-                binlog_file
-            ));
-        }
-        // Validate BEFORE any container work: `binlog_position` is free-form
-        // text from an S3-hosted `metadata.json` that ends up interpolated into
-        // the replay shell command, so a tampered base must fail here — loudly,
-        // with nothing destroyed — rather than deep inside the replay script.
-        let start_position = if binlog_position.is_empty() {
-            "4".to_string() // binlog header size; replay the whole first segment
+        let legacy_coordinate = if is_walg_repository {
+            None
         } else {
-            Self::validate_binlog_position(&binlog_position)?
+            let metadata = self
+                .fetch_base_metadata(ctx.s3_client, bucket, &base_key)
+                .await?;
+            let engine = metadata
+                .get("engine")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let pitr_enabled = metadata
+                .get("pitr")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+            let file = metadata
+                .get("binlog_file")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            if engine != "mariadb_physical" || !pitr_enabled || file.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "PITR requires a physical (mariadb-backup) base with binlog coordinates; \
+                     base metadata has engine='{}', pitr={}, binlog_file='{}' — not usable for \
+                     point-in-time recovery",
+                    engine,
+                    pitr_enabled,
+                    file
+                ));
+            }
+            // Validate BEFORE any container work: `binlog_position` is free-form
+            // text from an S3-hosted `metadata.json` that ends up interpolated
+            // into the replay shell command, so a tampered base must fail here
+            // — loudly, with nothing destroyed — rather than deep inside the
+            // replay script.
+            Some(MariaDbBinlogCoordinate {
+                file: Self::normalize_binlog_filename(file)?,
+                position: Self::parse_binlog_position(
+                    Self::validate_binlog_position(
+                        metadata
+                            .get("binlog_position")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("4"),
+                    )?
+                    .as_str(),
+                    "physical base metadata",
+                )?,
+                gtid: metadata
+                    .get("gtid")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+            })
         };
-
-        info!(
-            "Running MariaDB PITR to target {:?} (to_new_service={}) from base {} (binlog {}:{})",
-            target, to_new_service, ctx.backup_location, binlog_file, start_position
-        );
 
         // Validate the recovery target maps to something we can honor BEFORE
         // we destroy any data — fail fast on Name/Xid/bad-Lsn targets.
@@ -3764,24 +4424,42 @@ impl ExternalService for MariaDbService {
             (svc, config, None)
         };
 
-        // Physical base restore into the target container.
-        let temp_dir = tempfile::tempdir()?;
-        let mbstream_path = temp_dir.path().join("base.mbstream");
+        // Physical base restore into the target container. WAL-G repositories
+        // are fetched by a volume-sharing helper and never touch host disk.
+        let coordinate = if is_walg_repository {
+            let target_user_data = walg_target_user_data(ctx.backup)?;
+            target_service
+                .restore_walg_repository_into_container(
+                    &target_config,
+                    ctx.s3_credentials,
+                    ctx.backup_location,
+                    target_user_data.as_deref(),
+                )
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("MariaDB WAL-G PITR restore did not emit a binlog coordinate")
+                })?
+        } else {
+            let temp_dir = tempfile::tempdir()?;
+            let mbstream_path = temp_dir.path().join("base.mbstream");
+            target_service
+                .download_and_gunzip_base(ctx.s3_client, bucket, &base_key, &mbstream_path)
+                .await?;
+            target_service
+                .physical_restore_into_container(&target_config, &mbstream_path)
+                .await?;
+            legacy_coordinate.ok_or_else(|| {
+                anyhow::anyhow!("Legacy physical MariaDB backup has no binlog coordinate")
+            })?
+        };
+        let start_position = coordinate.position;
         info!(
             target_service = %target_service.name,
-            base_key = %base_key,
-            "Downloading MariaDB PITR physical base"
+            binlog_file = %coordinate.file,
+            binlog_position = %start_position,
+            gtid = %coordinate.gtid,
+            "Restored MariaDB PITR physical base"
         );
-        target_service
-            .download_and_gunzip_base(ctx.s3_client, bucket, &base_key, &mbstream_path)
-            .await?;
-        info!(
-            target_service = %target_service.name,
-            "Restoring MariaDB PITR physical base"
-        );
-        target_service
-            .physical_restore_into_container(&target_config, &mbstream_path)
-            .await?;
         info!(
             target_service = %target_service.name,
             "Restored MariaDB PITR physical base"
@@ -3798,7 +4476,7 @@ impl ExternalService for MariaDbService {
                 bucket,
                 prefix,
                 &ctx.source_config.name,
-                &binlog_file,
+                &coordinate.file,
                 binlog_temp.path(),
             )
             .await?;
@@ -3808,7 +4486,7 @@ impl ExternalService for MariaDbService {
             "Fetched MariaDB PITR binlog segments"
         );
         target_service
-            .replay_binlogs(&target_config, &segments, &start_position, &target)
+            .replay_binlogs(&target_config, &segments, start_position, &target)
             .await?;
 
         info!("MariaDB PITR completed successfully");
@@ -4055,7 +4733,7 @@ mod tests {
 
         // The same string is interpolated into an S3 key, where `..` reads
         // outside the service's own binlog prefix.
-        assert!(MariaDbService::binlog_object_key("p", "svc", traversal).contains(".."));
+        assert!(MariaDbService::binlog_object_key("p", "svc", traversal).is_err());
     }
 
     #[test]
@@ -4122,7 +4800,7 @@ mod tests {
             username: "app".to_string(),
             password: Some("secretpass".to_string()),
             root_password: Some("rootpass1".to_string()),
-            docker_image: DEFAULT_MARIADB_IMAGE.to_string(),
+            docker_image: MARIADB_IMAGE_REFERENCE_EXAMPLE.to_string(),
             container_name: None,
             size_profile: MariaDbSizeProfile::Standard,
             binlog_archive_interval: BinlogArchiveInterval::Min15,
@@ -4168,9 +4846,11 @@ mod tests {
 
     #[test]
     fn binlog_interval_serde_round_trips_wire_format() {
-        let cfg: MariaDbInputConfig =
-            serde_json::from_value(serde_json::json!({ "binlog_archive_interval": "1m" }))
-                .expect("parse");
+        let cfg: MariaDbInputConfig = serde_json::from_value(serde_json::json!({
+            "binlog_archive_interval": "1m",
+            "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
+        }))
+        .expect("parse");
         assert_eq!(cfg.binlog_archive_interval, BinlogArchiveInterval::Min1);
     }
 
@@ -4220,7 +4900,7 @@ mod tests {
         // Typical `mariadb -N -B` output: tab-separated, no header.
         let raw = "mysql-bin.000001\t1234\nmysql-bin.000002\t5678\nmysql-bin.000003\t90\n";
         assert_eq!(
-            MariaDbService::parse_show_binary_logs(raw),
+            MariaDbService::parse_show_binary_logs(raw).expect("valid binlog listing"),
             vec![
                 "mysql-bin.000001".to_string(),
                 "mysql-bin.000002".to_string(),
@@ -4234,9 +4914,49 @@ mod tests {
         // Some clients (non -N) emit a header row and trailing blank lines.
         let raw = "Log_name\tFile_size\nmysql-bin.000007\t100\n\n";
         assert_eq!(
-            MariaDbService::parse_show_binary_logs(raw),
+            MariaDbService::parse_show_binary_logs(raw).expect("valid binlog listing"),
             vec!["mysql-bin.000007".to_string()]
         );
+    }
+
+    #[test]
+    fn rejects_unsafe_binlog_filenames_from_server_and_manifest() {
+        for filename in [
+            "../mysql-bin.000001",
+            "nested/mysql-bin.000001",
+            "mysql-bin.000001.gz",
+            "mysql-bin.$(id)",
+            "mysql-bin.000000",
+        ] {
+            let listing = format!("{filename}\t100\nmysql-bin.000002\t100\n");
+            assert!(
+                MariaDbService::parse_show_binary_logs(&listing).is_err(),
+                "server filename {filename:?} must be rejected"
+            );
+
+            let manifest = BinlogManifest {
+                last_shipped_file: Some(filename.to_string()),
+                updated_at: String::new(),
+                shipped_files: vec![filename.to_string()],
+            };
+            assert!(
+                MariaDbService::validate_binlog_manifest(&manifest).is_err(),
+                "manifest filename {filename:?} must be rejected"
+            );
+            assert!(MariaDbService::binlog_object_key("backups", "service", filename).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_binlog_manifest_with_too_many_segments() {
+        let manifest = BinlogManifest {
+            last_shipped_file: None,
+            updated_at: String::new(),
+            shipped_files: vec!["mysql-bin.000001".to_string(); MAX_BINLOG_SEGMENTS + 1],
+        };
+        let error = MariaDbService::validate_binlog_manifest(&manifest)
+            .expect_err("oversized manifest must fail");
+        assert!(error.to_string().contains("limit"));
     }
 
     #[test]
@@ -4370,12 +5090,14 @@ mod tests {
     fn binlog_object_key_handles_empty_and_nonempty_prefix() {
         // Non-empty bucket_path prefix.
         assert_eq!(
-            MariaDbService::binlog_object_key("backups/prod", "orders-db", "mysql-bin.000007"),
+            MariaDbService::binlog_object_key("backups/prod", "orders-db", "mysql-bin.000007")
+                .expect("valid binlog filename"),
             "backups/prod/external_services/mariadb/orders-db/binlog/mysql-bin.000007.gz"
         );
         // Empty prefix drops the leading segment.
         assert_eq!(
-            MariaDbService::binlog_object_key("", "orders-db", "mysql-bin.000007"),
+            MariaDbService::binlog_object_key("", "orders-db", "mysql-bin.000007")
+                .expect("valid binlog filename"),
             "external_services/mariadb/orders-db/binlog/mysql-bin.000007.gz"
         );
     }
@@ -4439,7 +5161,7 @@ mod tests {
                 "username": "app",
                 "password": "secretpass",
                 "root_password": "rootpass1",
-                "docker_image": DEFAULT_MARIADB_IMAGE,
+                "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
             }),
         };
         let caps = service
@@ -4460,6 +5182,151 @@ mod tests {
             "backups/prod/mariadb_backup_20260623_010101.sql.gz"
         ));
         assert!(!MariaDbService::is_physical_base_location("dump.sql.gz"));
+        assert!(MariaDbService::is_walg_repository_location(
+            "external_services/mariadb/orders/walg"
+        ));
+        assert!(MariaDbService::is_walg_repository_location(
+            "s3://backups/external_services/mariadb/orders/walg/"
+        ));
+        assert!(!MariaDbService::is_walg_repository_location(
+            "backups/mariadb/orders.sql.gz"
+        ));
+    }
+
+    #[test]
+    fn selects_the_exact_walg_backup_from_metadata() {
+        let mut backup = crate::externalsvc::test_utils::create_mock_backup("repository/walg");
+        backup.backup_id = "selected-backup".to_string();
+        backup.metadata = serde_json::json!({
+            "walg_identity_version": 1,
+            "walg_target_user_data": { "temps_backup_id": "selected-backup" }
+        })
+        .to_string();
+
+        assert_eq!(
+            walg_target_user_data(&backup).expect("valid selector"),
+            Some(r#"{"temps_backup_id":"selected-backup"}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_walg_metadata_for_a_different_backup() {
+        let mut backup = crate::externalsvc::test_utils::create_mock_backup("repository/walg");
+        backup.backup_id = "selected-backup".to_string();
+        backup.metadata = serde_json::json!({
+            "walg_identity_version": 1,
+            "walg_target_user_data": { "temps_backup_id": "another-backup" }
+        })
+        .to_string();
+
+        let error = walg_target_user_data(&backup).expect_err("mismatch must fail");
+        assert!(error.to_string().contains("different backup"));
+    }
+
+    #[test]
+    fn parses_walg_restore_binlog_coordinate() {
+        let coordinate = MariaDbService::parse_walg_restore_coordinate(
+            "restore complete\nTEMPS_BINLOG_COORD=mysql-bin.000007 421 0-1-99\n",
+        )
+        .expect("coordinate");
+
+        assert_eq!(coordinate.file, "mysql-bin.000007");
+        assert_eq!(coordinate.position, 421);
+        assert_eq!(coordinate.gtid, "0-1-99");
+    }
+
+    #[test]
+    fn rejects_walg_restore_without_binlog_coordinate() {
+        let error = MariaDbService::parse_walg_restore_coordinate("restore complete")
+            .expect_err("missing coordinate must fail");
+
+        assert!(error
+            .to_string()
+            .contains("did not emit a MariaDB binlog coordinate"));
+    }
+
+    #[test]
+    fn ordinary_walg_restore_allows_backup_without_binlog_coordinate() {
+        let coordinate = MariaDbService::parse_optional_walg_restore_coordinate("restore complete")
+            .expect("ordinary restore should accept a prepared base without binlog metadata");
+
+        assert_eq!(coordinate, None);
+    }
+
+    #[test]
+    fn rejects_malicious_walg_restore_coordinates() {
+        for coordinate in [
+            "../mysql-bin.000007 421",
+            "mysql-bin.000007 421;touch_/tmp/pwn",
+            "mysql-bin.000007 3",
+            "mysql-bin.000007 4294967296",
+        ] {
+            let logs = format!("TEMPS_BINLOG_COORD={coordinate}\n");
+            assert!(
+                MariaDbService::parse_walg_restore_coordinate(&logs).is_err(),
+                "coordinate {coordinate:?} must be rejected"
+            );
+        }
+        for logs in [
+            "[00] Last binlog file '../../mysql-bin.000007', position 421\n",
+            "[00] Last binlog file './mysql-bin.000007', position 421;id\n",
+        ] {
+            assert!(MariaDbService::parse_walg_restore_coordinate(logs).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_gzip_decompression_rejects_bombs_and_removes_partial_output() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let output_path = temp.path().join("bomb.out");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder
+            .write_all(&vec![0_u8; 128 * 1024])
+            .expect("write compressible payload");
+        let compressed = encoder.finish().expect("finish gzip");
+
+        let error = MariaDbService::stream_gzip_body_to_file_bounded(
+            aws_sdk_s3::primitives::ByteStream::from(compressed),
+            &output_path,
+            "test bomb",
+            1024 * 1024,
+            1024,
+        )
+        .await
+        .expect_err("gzip bomb must exceed decompressed limit");
+        assert!(error.to_string().contains("expected 1..=1024 bytes"));
+        assert!(!output_path.exists(), "partial output must be removed");
+    }
+
+    #[tokio::test]
+    async fn streaming_gzip_surfaces_decoder_failure() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let output_path = temp.path().join("invalid.out");
+        let error = MariaDbService::stream_gzip_body_to_file_bounded(
+            aws_sdk_s3::primitives::ByteStream::from_static(b"not gzip"),
+            &output_path,
+            "invalid segment",
+            1024,
+            1024,
+        )
+        .await
+        .expect_err("invalid gzip must fail");
+        assert!(error.to_string().contains("gunzip"));
+        assert!(!output_path.exists(), "partial output must be removed");
+    }
+
+    #[test]
+    fn parses_walg_prepare_log_binlog_coordinate() {
+        let coordinate = MariaDbService::parse_walg_restore_coordinate(
+            "[00] recovery\n[00] Last binlog file './mysql-bin.000002', position 1969\n",
+        )
+        .expect("prepare-log coordinate");
+
+        assert_eq!(coordinate.file, "mysql-bin.000002");
+        assert_eq!(coordinate.position, 1969);
+        assert!(coordinate.gtid.is_empty());
     }
 
     #[test]
@@ -4513,6 +5380,20 @@ mod tests {
             })
             .is_err()
         );
+        for lsn in [
+            "../mysql-bin.000007:1234",
+            "mysql-bin.000007:1234;id",
+            "mysql-bin.000007:3",
+            "mysql-bin.000007:4294967296",
+        ] {
+            assert!(
+                MariaDbService::recovery_target_to_stop_flag(&RecoveryTarget::Lsn {
+                    lsn: lsn.to_string(),
+                })
+                .is_err(),
+                "LSN {lsn:?} must be rejected"
+            );
+        }
     }
 
     #[test]
@@ -4582,6 +5463,18 @@ mod tests {
             MariaDbService::shell_single_quote("2026-06-23 14:30:15"),
             "'2026-06-23 14:30:15'"
         );
+    }
+
+    #[test]
+    fn replay_pipefail_surfaces_decoder_and_client_failures() {
+        for pipeline in ["false | cat", "printf ok | false"] {
+            let command = MariaDbService::shell_pipeline_with_pipefail(pipeline);
+            let status = std::process::Command::new("sh")
+                .args(["-c", &command])
+                .status()
+                .expect("bash pipefail command should run");
+            assert!(!status.success(), "pipeline {pipeline:?} must fail");
+        }
     }
 
     #[test]
@@ -4764,7 +5657,7 @@ mod tests {
             username: default_username(),
             password: None,
             root_password: None,
-            docker_image: default_docker_image(),
+            docker_image: MARIADB_IMAGE_REFERENCE_EXAMPLE.to_string(),
             container_name: None,
             size_profile: MariaDbSizeProfile::default(),
             binlog_archive_interval: BinlogArchiveInterval::default(),
@@ -4775,7 +5668,7 @@ mod tests {
         assert_eq!(config.host, "localhost");
         assert_eq!(config.database, "app");
         assert_eq!(config.username, "app");
-        assert_eq!(config.docker_image, DEFAULT_MARIADB_IMAGE);
+        assert_eq!(config.docker_image, MARIADB_IMAGE_REFERENCE_EXAMPLE);
         assert_eq!(config.size_profile, MariaDbSizeProfile::Small);
         assert_eq!(config.binlog_archive_interval, BinlogArchiveInterval::Min5);
         // Auto-generated credentials: 24 alphanumeric chars, distinct.
@@ -4827,7 +5720,7 @@ mod tests {
             "database": "app",
             "username": "app",
             "password": "short",
-            "docker_image": DEFAULT_MARIADB_IMAGE,
+            "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
         }))
         .expect("parse input config");
         assert!(
@@ -4883,10 +5776,49 @@ mod tests {
     }
 
     #[test]
-    fn test_default_docker_image_constant() {
-        // The default image tag the service provisions with.
-        assert_eq!(default_docker_image(), "mariadb:lts");
-        assert_eq!(DEFAULT_MARIADB_IMAGE, "mariadb:lts");
+    fn immutable_image_validation_rejects_tags_and_accepts_digests() {
+        assert!(validate_immutable_mariadb_image(MARIADB_IMAGE_REFERENCE_EXAMPLE).is_ok());
+        assert!(validate_immutable_mariadb_image(
+            "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        )
+        .is_ok());
+        let error = validate_immutable_mariadb_image("ghcr.io/gotempsh/mariadb-walg:11.4")
+            .expect_err("mutable tag must be rejected");
+        assert!(error.contains("must be immutable"));
+    }
+
+    #[tokio::test]
+    async fn container_execution_rejects_mutable_restore_override_before_docker_io() {
+        let service = mariadb_service_for_tests();
+        let config = MariaDbConfig {
+            host: "localhost".into(),
+            port: "3306".into(),
+            database: "app".into(),
+            username: "app".into(),
+            password: "secretpass".into(),
+            root_password: "rootpass1".into(),
+            docker_image: "registry.example/mariadb-walg:latest".into(),
+            container_name: None,
+            size_profile: MariaDbSizeProfile::Small,
+            binlog_archive_interval: BinlogArchiveInterval::Min5,
+        };
+
+        let error = service
+            .create_container(&service.docker, &config, &ServiceResourceLimits::default())
+            .await
+            .expect_err("mutable restore override must fail before Docker access");
+        let message = error.to_string();
+        assert!(message.contains("Refusing to execute MariaDB image"));
+        assert!(message.contains("must be immutable"));
+    }
+
+    #[test]
+    fn image_pull_error_names_the_immutable_reference() {
+        let custom = mariadb_image_pull_failure_message(MARIADB_IMAGE_REFERENCE_EXAMPLE, "denied");
+        assert_eq!(
+            custom,
+            format!("Failed to pull MariaDB image {MARIADB_IMAGE_REFERENCE_EXAMPLE}: denied")
+        );
     }
 
     // ── Address / env-var routing (parity with Postgres) ────────────────────
@@ -4908,7 +5840,7 @@ mod tests {
                 "username": "app",
                 "password": "secretpass",
                 "root_password": "rootpass1",
-                "docker_image": DEFAULT_MARIADB_IMAGE,
+                "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
             }),
         };
 
@@ -4937,7 +5869,7 @@ mod tests {
                 "username": "app",
                 "password": "secretpass",
                 "root_password": "rootpass1",
-                "docker_image": DEFAULT_MARIADB_IMAGE,
+                "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
             }),
         };
 
@@ -4966,7 +5898,7 @@ mod tests {
                 "username": "app",
                 "password": "secretpass",
                 "root_password": "rootpass1",
-                "docker_image": DEFAULT_MARIADB_IMAGE,
+                "docker_image": MARIADB_IMAGE_REFERENCE_EXAMPLE,
                 "container_name": "legacy-mariadb",
             }),
         };

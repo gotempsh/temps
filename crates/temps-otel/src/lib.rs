@@ -120,4 +120,52 @@ pub struct OtelAppState {
     pub otel_relay_tx: Option<crate::relay::OtelRelayQueueSender>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<std::sync::Arc<dyn temps_core::ProjectAccessChecker>>,
+    /// Read side of the out-of-process Cloud telemetry backfill's progress
+    /// record (ADR-040 §1).
+    ///
+    /// The backfill runs under `temps backfill cloud-telemetry`, not in this
+    /// process, so this is how the Console learns a run exists at all. Required
+    /// rather than optional: an endpoint that sometimes cannot answer "is a
+    /// backfill running" is worse than one that always can.
+    pub cloud_backfill_progress:
+        std::sync::Arc<crate::services::cloud_backfill_progress::CloudBackfillProgressService>,
+    /// Per-project telemetry write mode, its §1 gate and its interval ledger
+    /// (ADR-041).
+    ///
+    /// Required rather than optional, for the same reason
+    /// `cloud_backfill_progress` is: the write-mode control renders in every
+    /// project's settings, including on an instance that has never linked Cloud
+    /// — where it must onboard rather than disappear. An endpoint that
+    /// sometimes cannot answer "where do this project's spans go" would make
+    /// that impossible.
+    pub telemetry_write_modes: std::sync::Arc<crate::services::TelemetryWriteModeService>,
+    /// The Cloud link, read only for the §1 gate's prerequisites (linked,
+    /// telemetry switch on, credential accepted) and for rendering them.
+    ///
+    /// `None` on a build that wires no Cloud integration at all, which resolves
+    /// to "not linked" — the safe answer, and the one that produces an
+    /// onboarding state rather than an error.
+    pub cloud_link: Option<std::sync::Arc<temps_cloud_client::CloudLink>>,
+    /// Durable state of bulk Cloud-telemetry activation jobs (ADR-042 §8).
+    ///
+    /// Required rather than optional, for the same reason
+    /// `telemetry_write_modes` is: the activation card renders on every
+    /// instance, including one that has never linked Cloud, and an endpoint
+    /// that sometimes cannot answer "is an activation running" would make that
+    /// impossible.
+    pub bulk_activation: std::sync::Arc<crate::services::CloudBulkActivationService>,
+    /// Where an activation estimate reads local span history from.
+    ///
+    /// The same source the worker ships from — chosen once, so the quote and
+    /// the shipment can never disagree about which table holds the history.
+    /// `None` on a build with no Cloud link, where the estimate answers
+    /// `configured: false` rather than erroring.
+    pub cloud_backfill_source: Option<std::sync::Arc<crate::services::CloudBackfillSource>>,
+    /// HMAC key for the ADR-042 `plan_token`, derived from the instance's
+    /// master encryption key under its own domain.
+    ///
+    /// Derived rather than generated per process so an operator who reads an
+    /// estimate, gets interrupted and comes back inside the token's TTL is not
+    /// forced to re-estimate by an unrelated restart.
+    pub plan_signing_key: std::sync::Arc<[u8; 32]>,
 }

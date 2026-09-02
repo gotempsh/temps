@@ -907,7 +907,7 @@ async fn test_notification_provider(
             }
 
             let message = if result {
-                Some("Test email sent successfully".to_string())
+                Some("Test notification sent successfully".to_string())
             } else {
                 Some("Test failed - provider connection or configuration issue".to_string())
             };

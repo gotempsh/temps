@@ -463,6 +463,24 @@ impl From<crate::services::services::DeploymentError> for Problem {
                     .with_title("Invalid Bundle Path")
                     .with_detail(format!("Bundle path '{path}' is invalid: {reason}"))
             }
+            DeploymentError::ContainerOperation {
+                container_id,
+                operation,
+                location,
+                reason,
+            } => problemdetails::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .with_title("Container Operation Failed")
+                .with_detail(format!(
+                    "Container {operation} failed for {container_id} on {location}: {reason}"
+                )),
+            DeploymentError::ContainerExecTimeout {
+                container_id,
+                timeout_seconds,
+            } => problemdetails::new(StatusCode::GATEWAY_TIMEOUT)
+                .with_title("Container Exec Timeout")
+                .with_detail(format!(
+                    "Container exec for {container_id} timed out after {timeout_seconds} seconds"
+                )),
             error @ (DeploymentError::AssetOriginNotFound { .. }
             | DeploymentError::AssetOriginCycle { .. }
             | DeploymentError::EnvironmentResolution(_)) => {

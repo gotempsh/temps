@@ -33,6 +33,30 @@ fn postgres_ready_wait_for() -> WaitFor {
 /// contention. Matches the budget used by `temps_database::test_utils`.
 const CONTAINER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// The migration whose reversibility `test_api_traffic_ai_and_model_catalog_migrations`
+/// exercises.
+const MIGRATION_EXTERNAL_SERVICE_CREATOR: &str = "m20260830_000001_add_external_service_creator";
+
+/// How many `Migrator::down` steps reach `name`, inclusive.
+///
+/// A reversibility test that hardcodes `Some(1)` is only correct until the next
+/// migration is appended, and then it fails by rolling back something unrelated
+/// — which looks like the migration under test is broken. Deriving the count
+/// from the registered list keeps the assertion about the migration it names.
+fn steps_back_to(name: &str) -> u32 {
+    let migrations = Migrator::migrations();
+    let position = migrations
+        .iter()
+        .position(|migration| migration.name() == name)
+        .unwrap_or_else(|| {
+            panic!(
+                "migration `{name}` is not registered in `Migrator`; update this test's constant \
+                 if it was renamed"
+            )
+        });
+    (migrations.len() - position) as u32
+}
+
 async fn env_var_preview_default(db: &DatabaseConnection) -> anyhow::Result<String> {
     let row = db
         .query_one(sea_orm::Statement::from_string(
@@ -2890,20 +2914,16 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
     assert!(schema.try_get::<bool>("", "service_creator_column")?);
     assert!(schema.try_get::<bool>("", "service_creator_fk")?);
 
-    // Exercise the creator-ownership migration's reversal and re-application
-    // so upgrades retain an emergency rollback. Targeted by name rather than
-    // assuming it is the last registered migration — hardcoding `Some(1)`
-    // here broke the moment a later migration was registered after it, for a
-    // reason that had nothing to do with whatever added that later one.
-    let target = "m20260830_000001_add_external_service_creator";
-    let all_migrations = Migrator::migrations();
-    let target_position = all_migrations
-        .iter()
-        .position(|migration| migration.name() == target)
-        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
-    let steps_from_target_to_head = (all_migrations.len() - target_position) as u32;
-
-    Migrator::down(&db, Some(steps_from_target_to_head)).await?;
+    // Exercise the creator-ownership migration's reversal and re-application so
+    // upgrades retain an emergency rollback.
+    //
+    // How far down to go is *derived* rather than hardcoded to 1. It used to
+    // assume this was the newest migration, which silently stopped being true
+    // the moment anything was appended after it — and then failed by rolling
+    // back an unrelated migration and asserting about a column that migration
+    // never touched, which reads as "the creator migration is broken".
+    let steps = steps_back_to(MIGRATION_EXTERNAL_SERVICE_CREATOR);
+    Migrator::down(&db, Some(steps)).await?;
     let creator_column_after_down = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -2916,7 +2936,7 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
         .expect("creator column rollback query");
     assert!(!creator_column_after_down.try_get::<bool>("", "present")?);
 
-    Migrator::up(&db, Some(steps_from_target_to_head)).await?;
+    Migrator::up(&db, Some(steps)).await?;
     let creator_column_after_reapply = db
         .query_one(sea_orm::Statement::from_string(
             sea_orm::DatabaseBackend::Postgres,
@@ -2930,4 +2950,75 @@ async fn test_api_traffic_ai_and_model_catalog_migrations() -> anyhow::Result<()
     assert!(creator_column_after_reapply.try_get::<bool>("", "present")?);
 
     Ok(())
+}
+
+#[tokio::test]
+async fn test_control_plane_overlay_allocation_migration_is_reversible() -> anyhow::Result<()> {
+    if external_db_configured() {
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!("Skipping control-plane overlay migration test: Docker unavailable: {error}");
+            return Ok(());
+        }
+    };
+
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    let db = connect_with_retries(&db_url).await?;
+    let target = "m20260827_000001_add_control_plane_overlay_allocation";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+    assert_eq!(control_plane_overlay_column_count(&db).await?, 0);
+
+    Migrator::up(&db, Some(1)).await?;
+    assert_eq!(control_plane_overlay_column_count(&db).await?, 3);
+    db.execute_unprepared(
+        "UPDATE network_config SET \
+         control_plane_compute_cidr = '172.20.255.0/24', \
+         control_plane_underlay_address = '10.200.4.2' WHERE id = 1",
+    )
+    .await?;
+
+    Migrator::down(&db, Some(1)).await?;
+    assert_eq!(control_plane_overlay_column_count(&db).await?, 0);
+
+    Ok(())
+}
+
+async fn control_plane_overlay_column_count(db: &DatabaseConnection) -> anyhow::Result<i32> {
+    let row = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT count(*)::int AS n FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = 'network_config' \
+               AND column_name IN ('control_plane_compute_cidr', \
+                                   'control_plane_underlay_address', \
+                                   'control_plane_overlay_ready')"
+                .to_string(),
+        ))
+        .await?
+        .expect("network_config column count");
+    Ok(row.try_get("", "n")?)
 }

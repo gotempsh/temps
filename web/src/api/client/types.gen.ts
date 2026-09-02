@@ -1404,6 +1404,11 @@ export type AppSettings = {
      */
     build_limits?: BuildLimitsSettings;
     /**
+     * Managed control-plane connection. Credentials are deliberately not
+     * stored here; they live in the owner-only cloud-link state file.
+     */
+    cloud?: CloudSettings;
+    /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). Off by
      * default — see `ClusterDnsSettings` for the incident background and
      * trade-offs. Must be explicitly enabled by operators who need
@@ -1565,6 +1570,10 @@ export type AppSettingsResponse = {
      * passed through as-is.
      */
     build_limits: BuildLimitsSettings;
+    /**
+     * Managed control-plane destination and explicit export consent flags.
+     */
+    cloud: CloudSettings;
     /**
      * Cluster-DNS resolver settings (ADR-024, experimental beta). No masking
      * needed — `enabled` is a plain bool with no sensitive content. Passed
@@ -2299,6 +2308,219 @@ export type BuildLimitsSettings = {
 };
 
 /**
+ * The quote.
+ */
+export type BulkActivationEstimateResponse = {
+    /**
+     * A job already running. Submitting would be refused with `409`, so the
+     * client can offer "watch the running job" instead of a button that fails.
+     */
+    active_batch_id?: string | null;
+    /**
+     * Whether a bulk activation could run at all right now.
+     *
+     * `false` is the normal state on an unlinked instance and must render as
+     * onboarding, not as an error.
+     */
+    configured: boolean;
+    eligible_projects: number;
+    estimated_bytes: number;
+    /**
+     * Totals over the **eligible** projects only — what confirming this quote
+     * would actually send.
+     */
+    estimated_spans: number;
+    plan_expires_at?: string | null;
+    /**
+     * Stable identity of the project set and windows, recorded on the job.
+     */
+    plan_hash?: string | null;
+    /**
+     * The handle to send back to `POST /bulk-jobs`.
+     *
+     * `None` when nothing is eligible: there is no bill to confirm, and
+     * handing back a token that would be refused on submit would be a dead
+     * end with no explanation attached.
+     */
+    plan_token?: string | null;
+    /**
+     * Every project considered, eligible or not, ascending by id.
+     */
+    projects: Array<BulkActivationProjectEstimateResponse>;
+    reason?: string | null;
+    setup_path?: string | null;
+    skipped_projects: number;
+    total_projects: number;
+    window_from: string;
+    window_to: string;
+};
+
+/**
+ * How much of the ETA this instance can honestly claim to know.
+ */
+export type BulkActivationEtaState = 'estimating' | 'known' | 'finished';
+
+/**
+ * One project's row inside a job.
+ */
+export type BulkActivationJobProjectResponse = {
+    bytes_shipped: number;
+    completed_at?: string | null;
+    estimated_bytes: number;
+    estimated_spans: number;
+    /**
+     * Why this project stopped, when `status` is `failed`. The switch is never
+     * rolled back, so this project is Cloud-primary with a recorded hole in
+     * its history — which is retryable, and must be visible to be retried.
+     */
+    last_error?: string | null;
+    /**
+     * `spans_shipped / estimated_spans`, clamped to 0–100. `None` when the
+     * estimate is zero or unknown — an empty window is not "0% done".
+     */
+    percent_complete?: number | null;
+    project_id: number;
+    setup_path?: string | null;
+    skip_detail?: string | null;
+    skip_reason?: string | null;
+    spans_shipped: number;
+    started_at?: string | null;
+    status: BulkJobProjectStatus;
+    window_from: string;
+    window_to: string;
+};
+
+/**
+ * A job, its projects, its progress and its ETA.
+ */
+export type BulkActivationJobResponse = {
+    /**
+     * The same reason as a sentence naming the fix and the page that applies
+     * it.
+     */
+    abort_detail?: string | null;
+    /**
+     * Machine-readable instance-wide abort reason, e.g. `not_linked`.
+     */
+    abort_reason?: string | null;
+    batch_id: string;
+    bytes_shipped: number;
+    /**
+     * Set as soon as a cancel is requested, before the worker honours it at
+     * the next chunk boundary — so the UI can stop offering Cancel twice.
+     */
+    cancel_requested: boolean;
+    cancel_requested_at?: string | null;
+    completed_at?: string | null;
+    created_at: string;
+    /**
+     * The project being switched or backfilled right now.
+     */
+    current_project_id?: number | null;
+    estimated_bytes: number;
+    estimated_spans: number;
+    /**
+     * Seconds remaining, or `null` when `eta_state` is not `known`.
+     */
+    eta_seconds?: number | null;
+    eta_state: BulkActivationEtaState;
+    /**
+     * The average this job has actually achieved since it started. Sent so the
+     * client can render a coarse rate instead of implying a precision the
+     * average does not have.
+     */
+    observed_spans_per_sec?: number | null;
+    percent_complete?: number | null;
+    plan_hash?: string | null;
+    projects: Array<BulkActivationJobProjectResponse>;
+    projects_done: number;
+    projects_failed: number;
+    projects_pending: number;
+    projects_skipped: number;
+    projects_total: number;
+    requested_by_user_id?: number | null;
+    spans_shipped: number;
+    started_at?: string | null;
+    status: BulkJobStatus;
+    trigger: BulkJobTrigger;
+};
+
+/**
+ * One project's line on the quote.
+ */
+export type BulkActivationProjectEstimateResponse = {
+    average_span_bytes: number;
+    /**
+     * Whether this project is part of the plan the token covers.
+     */
+    eligible: boolean;
+    /**
+     * `average_span_bytes * estimated_spans`, rounded up. Temps Cloud's own
+     * acknowledgement is authoritative; this is what this instance can know
+     * before sending.
+     */
+    estimated_bytes: number;
+    /**
+     * Exact count of local spans in the window. Zero for a skipped project —
+     * nothing was counted, because nothing would be sent.
+     */
+    estimated_spans: number;
+    fidelity: CloudTelemetryFidelity;
+    project_id: number;
+    /**
+     * How many spans were actually projected to derive the average.
+     */
+    sampled_spans: number;
+    /**
+     * Where the operator goes to unblock it, when anywhere.
+     */
+    setup_path?: string | null;
+    /**
+     * The same reason as a sentence, so no client has to map an enum to prose.
+     */
+    skip_detail?: string | null;
+    /**
+     * Machine-readable reason it is not, e.g. `fidelity_not_queryable`.
+     */
+    skip_reason?: string | null;
+    window_from: string;
+    window_to: string;
+};
+
+/**
+ * Where one project has got to inside a bulk job.
+ *
+ * `switching` and `backfilling` are separate on purpose: the switch is cheap,
+ * atomic and egresses nothing, while the backfill can run for hours and costs
+ * money. An operator watching a stuck job needs to know which of the two it is
+ * stuck in, and a project that failed after switching is *not* rolled back
+ * (ADR-042 §7) — so the two must be distinguishable after the fact too.
+ */
+export type BulkJobProjectStatus = 'pending' | 'switching' | 'backfilling' | 'done' | 'failed' | 'skipped';
+
+/**
+ * Lifecycle of a bulk job.
+ *
+ * The three terminal-with-a-problem states are deliberately distinct.
+ * `completed_with_failures` means the job ran to the end and some projects
+ * did not; `aborted` means an instance-wide condition stopped it and the
+ * untouched projects are still `pending`, ready to resume; `cancelled` means
+ * an operator asked it to stop. Collapsing any two of those would leave the
+ * Console unable to say what to do next.
+ */
+export type BulkJobStatus = 'pending' | 'running' | 'completed' | 'completed_with_failures' | 'aborted' | 'cancelled';
+
+/**
+ * Which entry point created the job (ADR-042 §1).
+ *
+ * The engine does not branch on this. It exists so an operator disputing an
+ * invoice, or reading an audit trail, can tell "this instance spent money
+ * because someone clicked a button" apart from "…because a purchase completed
+ * and the payment was the authorization".
+ */
+export type BulkJobTrigger = 'purchase' | 'operator';
+
+/**
  * Response body for cancel endpoints.
  */
 export type CancelBackupResponse = {
@@ -2647,10 +2869,262 @@ export type CliLoginRequest = {
     username: string;
 };
 
+export type CloudAiCapability = {
+    configured: boolean;
+    model?: string | null;
+    reason?: string | null;
+    setup_path: string;
+};
+
+export type CloudBackfillStatusResponse = {
+    /**
+     * Whether a backfill would be accepted right now. False means the project
+     * is still at `metered` fidelity.
+     */
+    backfill_available: boolean;
+    /**
+     * The exact command an operator should run. Always present, in every
+     * state, so the capability is discoverable from the Console even though
+     * the Console deliberately cannot trigger it.
+     */
+    command: string;
+    completed_at?: string | null;
+    /**
+     * Current per-project egress fidelity. A `metered` project cannot be
+     * backfilled at all — the CLI refuses — so the client must be able to
+     * render "not set up" rather than "not started".
+     */
+    fidelity: CloudTelemetryFidelity;
+    /**
+     * Reason the last run stopped, when `status` is `failed`. Verbatim, but
+     * length-bounded: it originates as raw driver/server text and is readable
+     * by every project member with `OtelRead`, not only whoever ran the
+     * command.
+     */
+    last_error?: string | null;
+    /**
+     * `spans_processed / spans_total`, clamped to 0–100. `None` when the total
+     * is unknown or zero — an empty window is not "0% done".
+     */
+    percent_complete?: number | null;
+    project_id: number;
+    /**
+     * Where to go to raise fidelity, when `backfill_available` is false.
+     */
+    setup_path?: string | null;
+    spans_processed: number;
+    spans_total: number;
+    started_at?: string | null;
+    /**
+     * `not_started` when no backfill has ever run for this project.
+     */
+    status: CloudTelemetryBackfillStatus;
+    /**
+     * Bumped on every progress write. A `running` status whose `updated_at` is
+     * far in the past is a stalled run, and the client should say so instead
+     * of showing a spinner forever.
+     */
+    updated_at?: string | null;
+    window_from?: string | null;
+    window_to?: string | null;
+};
+
+export type CloudCapability = {
+    configured: boolean;
+    reason?: string | null;
+    setup_path: string;
+};
+
+export type CloudFeatureSwitchesRequest = {
+    backups_enabled: boolean;
+    notifications_enabled: boolean;
+    telemetry_enabled: boolean;
+};
+
 /**
  * Cloud provider detected from node metadata
  */
 export type CloudProvider = 'aws' | 'gcp' | 'azure' | 'hetzner' | 'digitalocean' | 'other';
+
+/**
+ * Non-secret managed control-plane settings stored with application settings.
+ *
+ * `PartialEq` but deliberately **not** `Eq`: `telemetry_bulk_anomaly_factor` is
+ * a float, and the total-equality contract `Eq` promises is one `f32` cannot
+ * keep. Nothing compares two `CloudSettings` for equality outside this module's
+ * own tests, so the weaker bound costs nothing.
+ */
+export type CloudSettings = {
+    /**
+     * HTTPS origin used for enrollment and telemetry mirroring.
+     */
+    backend_url?: string;
+    /**
+     * Explicit consent to export completed backup objects.
+     */
+    backups_enabled?: boolean;
+    /**
+     * Explicit consent to send notifications through managed providers.
+     */
+    notifications_enabled?: boolean;
+    /**
+     * ADR-042 §6.3: how far a project's shipped bytes may exceed its pre-send
+     * estimate before the bulk activation stops that project.
+     *
+     * `None` — the default — resolves to
+     * [`DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`]. The guard exists because
+     * an estimate that is wrong by an order of magnitude means a bug, and *a
+     * bug that costs money should stop* rather than run away with a customer's
+     * egress spend on a path that has no human confirm behind it.
+     *
+     * An operator setting on the singleton `settings` row rather than an
+     * environment variable, per CLAUDE.md: the right multiple depends on how
+     * heterogeneous that instance's spans actually are, which only the operator
+     * running it can know, and they must be able to widen it — or narrow it —
+     * without restarting the binary mid-activation.
+     *
+     * Below `1.0` every project would pause on its first chunk, and above
+     * [`MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`] the guard stops being a
+     * tuning knob and becomes an off switch. The settings write path rejects
+     * values outside that range, and the effective value is clamped on read
+     * besides; see [`CloudSettings::effective_bulk_anomaly_factor`].
+     *
+     * The schema bounds below are documentation for a client; they are not
+     * what enforces this. The server validates the range on write.
+     */
+    telemetry_bulk_anomaly_factor?: number | null;
+    /**
+     * ADR-042 §3: optional throttle, in spans per second, on a **bulk Cloud
+     * telemetry activation** backfill.
+     *
+     * `None` — the default — is unthrottled, which is what "activate now"
+     * means and is right for an instance that is idle or being cut over
+     * deliberately. An operator running an activation against a live instance
+     * can set a ceiling so the backfill stops competing with their own read IO
+     * and with the Cloud ingest allowance.
+     *
+     * An operator setting on the singleton `settings` row rather than an
+     * environment variable, per CLAUDE.md, so it can be changed **while a job
+     * is running** — which is exactly when an operator discovers they need it,
+     * and exactly when restarting the binary would mean stopping an activation
+     * they have already paid for. The worker re-reads it each time it picks up
+     * a project, so a change takes effect at the next project boundary rather
+     * than at the next restart.
+     *
+     * Only the bulk worker reads this. The live Cloud-primary write path is a
+     * primary path and is never throttled; the offline
+     * `temps backfill cloud-telemetry` tool keeps its own
+     * `--rate-limit-spans-per-sec` flag, because it runs in a different
+     * process with the server stopped.
+     */
+    telemetry_bulk_rate_limit_spans_per_sec?: number | null;
+    /**
+     * Explicit consent to mirror locally stored telemetry.
+     */
+    telemetry_enabled?: boolean;
+    /**
+     * ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that
+     * backs Cloud-primary telemetry writes.
+     *
+     * An operator setting on the singleton `settings` row rather than an
+     * environment variable, per CLAUDE.md, so it can be raised at runtime by
+     * the operator watching a queue fill up — which is exactly when they need
+     * to change it and exactly when restarting the binary is the worst
+     * available option.
+     *
+     * Expressed in **bytes and not rows**: the reference deployment is
+     * 3 vCPU / 4 GB, and a row count says nothing about disk on a table whose
+     * rows are serialized spans of wildly varying size. When the queue reaches
+     * this size the instance stops accepting new spans for Cloud-primary
+     * projects and records a gap window with a start, an end and a count —
+     * see [`DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES`] for how the default is
+     * sized and what it buys.
+     */
+    telemetry_outbox_max_bytes?: number;
+};
+
+export type CloudStatus = {
+    account_email?: string | null;
+    backend_url: string;
+    backups_enabled: boolean;
+    health: string;
+    health_message: string;
+    instance_id?: string | null;
+    managed_backup_setup: ManagedBackupSetup;
+    notifications_enabled: boolean;
+    spooled_spans: number;
+    status: string;
+    status_message: string;
+    telemetry_enabled: boolean;
+};
+
+/**
+ * Lifecycle of the most recent backfill run for a project.
+ */
+export type CloudTelemetryBackfillStatus = 'not_started' | 'running' | 'completed' | 'failed';
+
+/**
+ * Per-project fidelity tier for the optional Temps Cloud telemetry mirror.
+ */
+export type CloudTelemetryFidelity = 'metered' | 'queryable';
+
+/**
+ * Per-project destination for span writes.
+ */
+export type CloudTelemetryWriteMode = 'local' | 'cloud';
+
+/**
+ * Instance-wide aggregate for the Cloud settings page.
+ */
+export type CloudTelemetryWriteStatusResponse = {
+    /**
+     * Whether the console should offer decommission guidance. True only when
+     * `local_span_store_required` is false — the ADR is explicit that the
+     * advice must not appear before then.
+     */
+    can_decommission_local_span_store: boolean;
+    cloud_primary_projects: number;
+    /**
+     * Whether Cloud-primary writes can be used at all on this instance.
+     */
+    configured: boolean;
+    /**
+     * Rows that exhausted their retries. Never swept automatically; an
+     * operator has to see them.
+     */
+    dead_lettered_rows: number;
+    gap_windows: Array<TelemetryGapWindowResponse>;
+    local_history_until?: string | null;
+    local_mode_projects: number;
+    local_span_store_reason?: string | null;
+    /**
+     * The derived decommission signal. `true` means the operator gets **zero**
+     * resource win from removing their local span store, whatever the write
+     * modes say.
+     */
+    local_span_store_required: boolean;
+    /**
+     * Age of the oldest unshipped span, in seconds. `None` when the queue is
+     * empty — different from zero, and it must not render as zero.
+     */
+    oldest_unshipped_age_secs?: number | null;
+    queue_bytes: number;
+    /**
+     * Spans queued for Cloud across all projects.
+     */
+    queue_depth: number;
+    /**
+     * The operator-set ceiling, so the depth above is readable against
+     * something rather than being a number with no scale.
+     */
+    queue_max_bytes: number;
+    reason?: string | null;
+    setup_path?: string | null;
+    /**
+     * Set while Cloud-primary writes are falling back to local storage.
+     */
+    write_suspension?: string | null;
+};
 
 /**
  * Configuration for a Cloudflare Email Sending notification provider.
@@ -2825,6 +3299,18 @@ export type ClusterMemberRequest = {
      * Service-type-specific role (e.g., "monitor", "primary", "replica")
      */
     role: string;
+};
+
+/**
+ * Read-only cluster network state. Pool changes are performed on the control
+ * plane through `temps network setup-multi-node`, which enforces that no
+ * existing node allocation can be stranded by an in-place edit.
+ */
+export type ClusterNetworkSettings = {
+    allocation_count: number;
+    compute_pool_cidr: string;
+    locked: boolean;
+    subnet_prefix_len: number;
 };
 
 export type CmdBody = {
@@ -3869,6 +4355,19 @@ export type CreateBitbucketRequest = {
      * Display name for this provider.
      */
     name: string;
+};
+
+/**
+ * Body for `POST /bulk-jobs`.
+ *
+ * Deliberately one field. The plan is inside the token, so there is no project
+ * list here to disagree with the one that was quoted.
+ */
+export type CreateBulkActivationJobRequest = {
+    /**
+     * The `plan_token` from a `POST /bulk-jobs/estimate` response.
+     */
+    plan_token: string;
 };
 
 export type CreateCloudflareProviderRequest = {
@@ -6907,6 +7406,10 @@ export type EnrichVisitorResponse = {
     visitor_id: string;
 };
 
+export type EnrollCloudRequest = {
+    enrollment_code: string;
+};
+
 export type EnrollmentTokenInfo = {
     bound_node_name?: string | null;
     created_at: string;
@@ -7347,6 +7850,35 @@ export type ErrorTimeSeriesQuery = {
      */
     environment_id?: number | null;
     start_time: string;
+};
+
+/**
+ * What to quote.
+ *
+ * Exactly one of `all_eligible_projects` and a non-empty `project_ids` must be
+ * given. Defaulting an omitted scope to "everything" would make a typo cost
+ * money; defaulting it to "nothing" would make the endpoint silently useless.
+ */
+export type EstimateBulkActivationRequest = {
+    /**
+     * Quote every project that still writes its spans to this instance.
+     */
+    all_eligible_projects?: boolean;
+    /**
+     * Quote exactly these projects. Projects that are already Cloud-primary
+     * are accepted here — re-shipping a window is the retry path — but are
+     * never picked up by `all_eligible_projects`.
+     */
+    project_ids?: Array<number> | null;
+    /**
+     * Start of the window to ship. Defaults to the oldest span local retention
+     * can still be holding.
+     */
+    window_from?: string | null;
+    /**
+     * End of the window to ship. Defaults to now.
+     */
+    window_to?: string | null;
 };
 
 /**
@@ -8000,6 +8532,30 @@ export type ExternalImageResponse = {
     tag?: string | null;
 };
 
+export type ExternalServiceBackupCapabilityResponse = {
+    /**
+     * Concrete artifact Cloud would mirror, such as `walg_repository`,
+     * `redis_walg_stream`, or `object_set`.
+     */
+    artifact: string;
+    /**
+     * Whether this running service can produce the physical WAL-G repository
+     * required by Temps Cloud. Logical dump fallback is intentionally not
+     * considered compatible.
+     */
+    cloud_backup_compatible: boolean;
+    engine: string;
+    reason?: string | null;
+    recommended_image?: string | null;
+    remediation?: string | null;
+    /**
+     * False when Docker or the target container was unavailable, meaning the
+     * endpoint intentionally did not guess whether required tools exist.
+     */
+    verified: boolean;
+    wal_g_installed: boolean;
+};
+
 /**
  * Response type for external service backup
  */
@@ -8092,6 +8648,33 @@ export type ExternalServiceSummary = {
  * stamping it on each row keeps the status fields unambiguous.
  */
 export type FacetBackendKind = 'clickhouse' | 'timescaledb';
+
+/**
+ * Whether a facet registered now would actually cover anything
+ * (Feature Discoverability: "not built" and "not set up" need different UI).
+ */
+export type FacetCapability = {
+    /**
+     * False when the facet would populate for no project at all.
+     */
+    configured: boolean;
+    /**
+     * Why, when `configured` is false. Always populated in that case.
+     */
+    reason?: string | null;
+    /**
+     * Where the operator goes to change it.
+     */
+    setup_path?: string | null;
+    /**
+     * Projects whose spans this facet will **not** cover, because they are
+     * Cloud-primary and store no spans on this instance. Non-empty alongside
+     * `configured: true` is a real and useful state: the facet works for the
+     * other projects, and the operator must be told which ones it misses
+     * rather than discovering it from an empty filter.
+     */
+    uncovered_project_ids: Array<number>;
+};
 
 /**
  * Public representation of a registered span attribute facet.
@@ -10680,6 +11263,17 @@ export type LogsResponse = {
     data: Array<LogRecord>;
 };
 
+export type ManagedBackupSetup = {
+    action: ManagedBackupSetupAction;
+    message: string;
+    ready: boolean;
+    status: ManagedBackupSetupStatus;
+};
+
+export type ManagedBackupSetupAction = 'none' | 'retry' | 'renew_subscription';
+
+export type ManagedBackupSetupStatus = 'disabled' | 'ready' | 'needs_setup' | 'subscription_required' | 'unavailable';
+
 /**
  * Managed domain response
  */
@@ -11125,8 +11719,8 @@ export type MintEnrollmentTokenRequest = {
 
 export type MintEnrollmentTokenResponse = {
     /**
-     * SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the
-     * worker as `temps join --ca-fingerprint <fp>` to verify the CA on join.
+     * SHA-256 fingerprint of the cluster CA. Token issuance initializes the
+     * CA when needed, so every newly minted token carries a trust pin.
      */
     ca_fingerprint?: string | null;
     expires_at: string;
@@ -11380,9 +11974,10 @@ export type MultiNodeSettings = {
      */
     private_address?: string | null;
     /**
-     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`
-     * (default), the control plane ignores join-time CSRs and nodes keep
-     * serving plaintext HTTP — zero behavior change. When `true`, the CP signs
+     * Whether to enforce multi-node mTLS (ADR-020 WS-2.1). New installations
+     * default to `true`. Existing serialized settings that predate this field
+     * deserialize it as `false`, providing an explicit migration window rather
+     * than unexpectedly disconnecting legacy workers. When `true`, the CP signs
      * node CSRs, nodes serve mutual TLS, and every CP→agent call uses the
      * cluster client cert. Observe-then-enforce: flip this on only once all
      * workers have re-enrolled with certs.
@@ -11399,6 +11994,7 @@ export type MultiNodeSettingsMasked = {
      * verify it out of band; the CA private key is never exposed).
      */
     cluster_ca_fingerprint?: string | null;
+    cluster_network?: null | ClusterNetworkSettings;
     has_join_token: boolean;
     /**
      * Whether the deprecated shared join token is still accepted.
@@ -11489,6 +12085,16 @@ export type NetworkConfiguration = {
  */
 export type NetworkMode = 'bridge' | 'host' | 'none' | {
     custom: string;
+};
+
+/**
+ * Cluster-wide pool which every node must use. This is intentionally sent
+ * alongside the local allocation so operators and agents can detect stale or
+ * independently configured nodes before routes are changed.
+ */
+export type NetworkPoolEntry = {
+    compute_pool_cidr: string;
+    subnet_prefix_len: number;
 };
 
 /**
@@ -12803,6 +13409,7 @@ export type PeerListResponse = {
      * and newer version skew degrades to the safe default of `false`.
      */
     cluster_dns_enabled: boolean;
+    network: NetworkPoolEntry;
     /**
      * All other nodes with a `compute_cidr` set, excluding the caller.
      */
@@ -13106,6 +13713,15 @@ export type PipelineStats = {
      * `otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.
      */
     rate_limited_requests: number;
+    /**
+     * Cumulative count of best-effort relay batches rejected because the
+     * bounded relay handoff was saturated or closed.
+     */
+    relay_dropped_batches: number;
+    /**
+     * Cumulative signal-item count contained in rejected relay batches.
+     */
+    relay_dropped_items: number;
     spans_dropped: number;
     spans_received: number;
     spans_stored: number;
@@ -13145,7 +13761,7 @@ export type PlanMetadata = {
 export type PlanSourceBackup = {
     created_at?: string | null;
     /**
-     * "walg", "pg_dump", "unknown".
+     * "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
      */
     format: string;
     /**
@@ -13593,6 +14209,68 @@ export type ProjectAccessResponse = {
     role: TeamRole;
     team_id: number;
     updated_at: string;
+};
+
+/**
+ * A project's Cloud telemetry configuration, in every state.
+ */
+export type ProjectCloudTelemetryResponse = {
+    attribute_allowlist: Array<string>;
+    /**
+     * Whether `write_mode = cloud` could be set right now.
+     *
+     * `false` is the normal state on an unlinked instance and must render as
+     * onboarding, not as an error.
+     */
+    cloud_write_mode_available: boolean;
+    /**
+     * Spans this instance accepted for this project and gave up on delivering.
+     *
+     * The instance-wide card only shows a count; this route is already scoped
+     * to one project, so it can say *why* without exposing another tenant's
+     * failures.
+     */
+    dead_lettered_spans: number;
+    effective_reason?: null | TelemetryWriteIntervalReason;
+    effective_reason_message?: string | null;
+    /**
+     * Where this project's spans are going right now, which differs from
+     * `write_mode` during a quota or credential fallback.
+     */
+    effective_write_mode: CloudTelemetryWriteMode;
+    fidelity: CloudTelemetryFidelity;
+    /**
+     * Gap windows in the last 30 days.
+     */
+    gap_windows: Array<TelemetryGapWindowResponse>;
+    /**
+     * The write-mode ledger, newest first.
+     */
+    intervals: Array<TelemetryWriteIntervalResponse>;
+    last_dead_letter_at?: string | null;
+    /**
+     * The reason the most recent give-up gave, if there is one.
+     *
+     * Delivery metadata only — this instance's own bounded error string. It is
+     * never the span payload, and this field must not become a place one
+     * appears.
+     */
+    last_dead_letter_error?: string | null;
+    project_id: number;
+    /**
+     * Spans queued for Cloud for this project and not yet acknowledged.
+     */
+    queued_spans: number;
+    /**
+     * The single most relevant missing prerequisite, when
+     * `cloud_write_mode_available` is false.
+     */
+    reason?: string | null;
+    setup_path?: string | null;
+    /**
+     * The operator's declared intent.
+     */
+    write_mode: CloudTelemetryWriteMode;
 };
 
 /**
@@ -15003,6 +15681,10 @@ export type RegisterNodeResponse = {
     cert_pem?: string | null;
     id: number;
     message: string;
+    /**
+     * Whether this node must serve mTLS and reject plaintext agent traffic.
+     */
+    mtls_required: boolean;
     name: string;
     status: string;
 };
@@ -15582,7 +16264,7 @@ export type RestorePlan = {
     steps: Array<string>;
     /**
      * How the restore will be performed: "walg_restore", "pg_dump_restore",
-     * or "unsupported".
+     * "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
      */
     strategy: string;
     /**
@@ -15783,6 +16465,25 @@ export type RootfsVmEntry = {
     sandbox_name: string;
 };
 
+export type RotateClusterCaRequest = {
+    /**
+     * Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.
+     */
+    confirmation: string;
+    /**
+     * Fingerprint observed through a trusted operator channel immediately
+     * before rotation. The request fails if the active root changed.
+     */
+    expected_fingerprint: string;
+};
+
+export type RotateClusterCaResponse = {
+    message: string;
+    new_fingerprint: string;
+    previous_fingerprint: string;
+    revoked_enrollment_tokens: number;
+};
+
 export type RouteRefreshResponse = {
     /**
      * Human-readable message
@@ -15906,6 +16607,12 @@ export type S3SourceResponse = {
     force_path_style?: boolean | null;
     id: number;
     is_default: boolean;
+    /**
+     * True when this source was auto-provisioned by a Temps Cloud link
+     * rather than entered by an operator. Managed sources cannot be edited
+     * or deleted from this API; disconnect Temps Cloud to remove one.
+     */
+    managed_by_cloud: boolean;
     name: string;
     region: string;
     updated_at: number;
@@ -18816,6 +19523,39 @@ export type TeamResponse = {
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
 
 /**
+ * A gap window as the client renders it.
+ */
+export type TelemetryGapWindowResponse = {
+    dropped_bytes: number;
+    dropped_spans: number;
+    ended_at: string;
+    /**
+     * The sentence shown to the operator. Sent by the server so the client
+     * never has to map an enum to prose and never renders a bare enum name.
+     */
+    message: string;
+    project_id: number;
+    reason: TelemetryWriteIntervalReason;
+    started_at: string;
+};
+
+/**
+ * Why an interval opened.
+ */
+export type TelemetryWriteIntervalReason = 'operator' | 'cloud_disconnected' | 'quota_exhausted' | 'credential_rejected' | 'queue_overflow_spill' | 'cloud_recovered';
+
+/**
+ * One entry of the write-mode ledger.
+ */
+export type TelemetryWriteIntervalResponse = {
+    effective_from: string;
+    effective_to?: string | null;
+    message: string;
+    mode: CloudTelemetryWriteMode;
+    reason: TelemetryWriteIntervalReason;
+};
+
+/**
  * Response type for a single template
  */
 export type TemplateResponse = {
@@ -20610,6 +21350,19 @@ export type UpdatePreferencesRequest = {
 };
 
 /**
+ * Body for changing a project's Cloud telemetry settings.
+ *
+ * Both fields are optional and independent: an operator raising fidelity and
+ * one flipping the write mode are two different acts, and forcing a client to
+ * send both would make each one able to clobber the other.
+ */
+export type UpdateProjectCloudTelemetryRequest = {
+    attribute_allowlist?: Array<string> | null;
+    fidelity?: null | CloudTelemetryFidelity;
+    write_mode?: null | CloudTelemetryWriteMode;
+};
+
+/**
  * Request to update a project secret. The `value` field is optional — omit it
  * to rotate only the environment scoping / preview flag without touching the
  * ciphertext.
@@ -21979,6 +22732,12 @@ export type S3SourceResponseWritable = {
     force_path_style?: boolean | null;
     id: number;
     is_default: boolean;
+    /**
+     * True when this source was auto-provisioned by a Temps Cloud link
+     * rather than entered by an operator. Managed sources cannot be edited
+     * or deleted from this API; disconnect Temps Cloud to remove one.
+     */
+    managed_by_cloud: boolean;
     name: string;
     region: string;
     secret_key: string;
@@ -26080,6 +26839,41 @@ export type CleanupExpiredBackupsResponses = {
 
 export type CleanupExpiredBackupsResponse = CleanupExpiredBackupsResponses[keyof CleanupExpiredBackupsResponses];
 
+export type GetExternalServiceBackupCapabilityData = {
+    body?: never;
+    path: {
+        id: number;
+    };
+    query?: never;
+    url: '/backups/external-services/{id}/capability';
+};
+
+export type GetExternalServiceBackupCapabilityErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * External service not found
+     */
+    404: ProblemDetails;
+    /**
+     * Capability could not be loaded
+     */
+    500: ProblemDetails;
+};
+
+export type GetExternalServiceBackupCapabilityError = GetExternalServiceBackupCapabilityErrors[keyof GetExternalServiceBackupCapabilityErrors];
+
+export type GetExternalServiceBackupCapabilityResponses = {
+    /**
+     * Cloud backup compatibility
+     */
+    200: ExternalServiceBackupCapabilityResponse;
+};
+
+export type GetExternalServiceBackupCapabilityResponse = GetExternalServiceBackupCapabilityResponses[keyof GetExternalServiceBackupCapabilityResponses];
+
 export type RunExternalServiceBackupData = {
     body: RunExternalServiceBackupRequest;
     path: {
@@ -27724,6 +28518,97 @@ export type BlobHeadResponses = {
      */
     200: unknown;
 };
+
+export type DisconnectCloudData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud';
+};
+
+export type DisconnectCloudResponses = {
+    200: CloudStatus;
+};
+
+export type DisconnectCloudResponse = DisconnectCloudResponses[keyof DisconnectCloudResponses];
+
+export type GetCloudAiCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/ai/capability';
+};
+
+export type GetCloudAiCapabilityResponses = {
+    200: CloudAiCapability;
+};
+
+export type GetCloudAiCapabilityResponse = GetCloudAiCapabilityResponses[keyof GetCloudAiCapabilityResponses];
+
+export type ReconcileCloudBackupSourceData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/backups/source/reconcile';
+};
+
+export type ReconcileCloudBackupSourceResponses = {
+    200: ManagedBackupSetup;
+};
+
+export type ReconcileCloudBackupSourceResponse = ReconcileCloudBackupSourceResponses[keyof ReconcileCloudBackupSourceResponses];
+
+export type GetCloudCapabilityData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/capability';
+};
+
+export type GetCloudCapabilityResponses = {
+    200: CloudCapability;
+};
+
+export type GetCloudCapabilityResponse = GetCloudCapabilityResponses[keyof GetCloudCapabilityResponses];
+
+export type EnrollCloudData = {
+    body: EnrollCloudRequest;
+    path?: never;
+    query?: never;
+    url: '/cloud/enroll';
+};
+
+export type EnrollCloudResponses = {
+    200: CloudStatus;
+};
+
+export type EnrollCloudResponse = EnrollCloudResponses[keyof EnrollCloudResponses];
+
+export type UpdateCloudFeaturesData = {
+    body: CloudFeatureSwitchesRequest;
+    path?: never;
+    query?: never;
+    url: '/cloud/features';
+};
+
+export type UpdateCloudFeaturesResponses = {
+    200: CloudStatus;
+};
+
+export type UpdateCloudFeaturesResponse = UpdateCloudFeaturesResponses[keyof UpdateCloudFeaturesResponses];
+
+export type GetCloudStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/cloud/status';
+};
+
+export type GetCloudStatusResponses = {
+    200: CloudStatus;
+};
+
+export type GetCloudStatusResponse = GetCloudStatusResponses[keyof GetCloudStatusResponses];
 
 export type ClusterDnsStatusData = {
     body?: never;
@@ -38078,6 +38963,364 @@ export type UpdateAlertResponses = {
 };
 
 export type UpdateAlertResponse = UpdateAlertResponses[keyof UpdateAlertResponses];
+
+export type GetCloudBackfillStatusData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/backfill/{project_id}';
+};
+
+export type GetCloudBackfillStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCloudBackfillStatusError = GetCloudBackfillStatusErrors[keyof GetCloudBackfillStatusErrors];
+
+export type GetCloudBackfillStatusResponses = {
+    /**
+     * Backfill status
+     */
+    200: CloudBackfillStatusResponse;
+};
+
+export type GetCloudBackfillStatusResponse = GetCloudBackfillStatusResponses[keyof GetCloudBackfillStatusResponses];
+
+export type CreateBulkActivationJobData = {
+    body: CreateBulkActivationJobRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs';
+};
+
+export type CreateBulkActivationJobErrors = {
+    /**
+     * The plan token is invalid, altered or expired
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * An activation is already running; the response carries its batch_id
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CreateBulkActivationJobError = CreateBulkActivationJobErrors[keyof CreateBulkActivationJobErrors];
+
+export type CreateBulkActivationJobResponses = {
+    /**
+     * The activation was queued
+     */
+    202: BulkActivationJobResponse;
+};
+
+export type CreateBulkActivationJobResponse = CreateBulkActivationJobResponses[keyof CreateBulkActivationJobResponses];
+
+export type GetCurrentBulkActivationJobData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs/current';
+};
+
+export type GetCurrentBulkActivationJobErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCurrentBulkActivationJobError = GetCurrentBulkActivationJobErrors[keyof GetCurrentBulkActivationJobErrors];
+
+export type GetCurrentBulkActivationJobResponses = {
+    /**
+     * The active activation job, or null when none is running
+     */
+    200: null | BulkActivationJobResponse;
+};
+
+export type GetCurrentBulkActivationJobResponse = GetCurrentBulkActivationJobResponses[keyof GetCurrentBulkActivationJobResponses];
+
+export type EstimateBulkActivationData = {
+    body: EstimateBulkActivationRequest;
+    path?: never;
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs/estimate';
+};
+
+export type EstimateBulkActivationErrors = {
+    /**
+     * Neither or both scopes given, or an invalid window
+     */
+    400: ProblemDetails;
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Temps Cloud is not ready for telemetry
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type EstimateBulkActivationError = EstimateBulkActivationErrors[keyof EstimateBulkActivationErrors];
+
+export type EstimateBulkActivationResponses = {
+    /**
+     * Per-project and total estimate, plus a plan token
+     */
+    200: BulkActivationEstimateResponse;
+};
+
+export type EstimateBulkActivationResponse = EstimateBulkActivationResponses[keyof EstimateBulkActivationResponses];
+
+export type GetBulkActivationJobData = {
+    body?: never;
+    path: {
+        /**
+         * Activation job id (UUID)
+         */
+        batch_id: string;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs/{batch_id}';
+};
+
+export type GetBulkActivationJobErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No such activation job
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetBulkActivationJobError = GetBulkActivationJobErrors[keyof GetBulkActivationJobErrors];
+
+export type GetBulkActivationJobResponses = {
+    /**
+     * The activation job
+     */
+    200: BulkActivationJobResponse;
+};
+
+export type GetBulkActivationJobResponse = GetBulkActivationJobResponses[keyof GetBulkActivationJobResponses];
+
+export type CancelBulkActivationJobData = {
+    body?: never;
+    path: {
+        /**
+         * Activation job id (UUID)
+         */
+        batch_id: string;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel';
+};
+
+export type CancelBulkActivationJobErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * No such activation job
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type CancelBulkActivationJobError = CancelBulkActivationJobErrors[keyof CancelBulkActivationJobErrors];
+
+export type CancelBulkActivationJobResponses = {
+    /**
+     * The cancellation was recorded, or the job had already stopped
+     */
+    200: BulkActivationJobResponse;
+};
+
+export type CancelBulkActivationJobResponse = CancelBulkActivationJobResponses[keyof CancelBulkActivationJobResponses];
+
+export type GetProjectCloudTelemetryData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/projects/{project_id}';
+};
+
+export type GetProjectCloudTelemetryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetProjectCloudTelemetryError = GetProjectCloudTelemetryErrors[keyof GetProjectCloudTelemetryErrors];
+
+export type GetProjectCloudTelemetryResponses = {
+    /**
+     * Project Cloud telemetry settings
+     */
+    200: ProjectCloudTelemetryResponse;
+};
+
+export type GetProjectCloudTelemetryResponse = GetProjectCloudTelemetryResponses[keyof GetProjectCloudTelemetryResponses];
+
+export type UpdateProjectCloudTelemetryData = {
+    body: UpdateProjectCloudTelemetryRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/otel/cloud-telemetry/projects/{project_id}';
+};
+
+export type UpdateProjectCloudTelemetryErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Project not found
+     */
+    404: ProblemDetails;
+    /**
+     * A prerequisite is missing
+     */
+    409: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type UpdateProjectCloudTelemetryError = UpdateProjectCloudTelemetryErrors[keyof UpdateProjectCloudTelemetryErrors];
+
+export type UpdateProjectCloudTelemetryResponses = {
+    /**
+     * Updated settings
+     */
+    200: ProjectCloudTelemetryResponse;
+};
+
+export type UpdateProjectCloudTelemetryResponse = UpdateProjectCloudTelemetryResponses[keyof UpdateProjectCloudTelemetryResponses];
+
+export type GetCloudTelemetryStatusData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/otel/cloud-telemetry/status';
+};
+
+export type GetCloudTelemetryStatusErrors = {
+    /**
+     * Unauthorized
+     */
+    401: ProblemDetails;
+    /**
+     * Insufficient permissions
+     */
+    403: ProblemDetails;
+    /**
+     * Internal server error
+     */
+    500: ProblemDetails;
+};
+
+export type GetCloudTelemetryStatusError = GetCloudTelemetryStatusErrors[keyof GetCloudTelemetryStatusErrors];
+
+export type GetCloudTelemetryStatusResponses = {
+    /**
+     * Instance Cloud telemetry write status
+     */
+    200: CloudTelemetryWriteStatusResponse;
+};
+
+export type GetCloudTelemetryStatusResponse = GetCloudTelemetryStatusResponses[keyof GetCloudTelemetryStatusResponses];
 
 export type ListDashboardsData = {
     body?: never;
@@ -52690,6 +53933,49 @@ export type SaveAiProviderCredentialResponses = {
 };
 
 export type SaveAiProviderCredentialResponse = SaveAiProviderCredentialResponses[keyof SaveAiProviderCredentialResponses];
+
+export type RotateClusterCaData = {
+    body: RotateClusterCaRequest;
+    path?: never;
+    query?: never;
+    url: '/settings/cluster-ca/rotate';
+};
+
+export type RotateClusterCaErrors = {
+    /**
+     * Invalid confirmation or CA state
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Expected fingerprint is stale
+     */
+    409: unknown;
+    /**
+     * Fresh MFA verification required
+     */
+    428: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RotateClusterCaResponses = {
+    /**
+     * Cluster CA rotated
+     */
+    200: RotateClusterCaResponse;
+};
+
+export type RotateClusterCaResponse2 = RotateClusterCaResponses[keyof RotateClusterCaResponses];
 
 export type GetDiskStatusData = {
     body?: never;

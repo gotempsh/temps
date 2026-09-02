@@ -112,58 +112,70 @@ impl GatewayAiService {
             .filter(temps_entities::ai_provider_keys::Column::IsActive.eq(true))
             .one(self.db.as_ref())
             .await
-            .ok()??;
-        if let Some(m) = key
-            .default_model
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            let catalog_is_empty = temps_entities::ai_provider_models::Entity::find()
-                .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
-                .one(self.db.as_ref())
-                .await
-                .ok()?
-                .is_none();
-            if catalog_is_empty {
-                return Some(m.to_string());
+            .ok()
+            .flatten();
+        if let Some(key) = key {
+            if let Some(m) = key
+                .default_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                let catalog_is_empty = temps_entities::ai_provider_models::Entity::find()
+                    .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
+                    .one(self.db.as_ref())
+                    .await
+                    .ok()?
+                    .is_none();
+                if catalog_is_empty {
+                    return Some(m.to_string());
+                }
+                let pinned_is_enabled = temps_entities::ai_provider_models::Entity::find()
+                    .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
+                    .filter(temps_entities::ai_provider_models::Column::ModelId.eq(m))
+                    .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
+                    .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
+                    .one(self.db.as_ref())
+                    .await
+                    .ok()?
+                    .is_some();
+                if pinned_is_enabled {
+                    return Some(m.to_string());
+                }
             }
-            let pinned_is_enabled = temps_entities::ai_provider_models::Entity::find()
+            let catalog_models = temps_entities::ai_provider_models::Entity::find()
                 .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
-                .filter(temps_entities::ai_provider_models::Column::ModelId.eq(m))
                 .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
                 .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
-                .one(self.db.as_ref())
+                .filter(
+                    temps_entities::ai_provider_models::Column::ModelId
+                        .not_like("text-embedding-%"),
+                )
+                .order_by_asc(temps_entities::ai_provider_models::Column::ModelId)
+                .all(self.db.as_ref())
                 .await
-                .ok()?
-                .is_some();
-            if pinned_is_enabled {
-                return Some(m.to_string());
+                .ok()?;
+            if catalog_models.is_empty() {
+                if let Some(model) = default_model_for_provider(&key.provider) {
+                    return Some(model);
+                }
+            }
+            if let Some(preferred) = default_model_for_provider(&key.provider) {
+                if catalog_models
+                    .iter()
+                    .any(|model| model.model_id == preferred)
+                {
+                    return Some(preferred);
+                }
+            }
+            if let Some(model) = catalog_models.into_iter().next() {
+                return Some(model.model_id);
             }
         }
-        let catalog_models = temps_entities::ai_provider_models::Entity::find()
-            .filter(temps_entities::ai_provider_models::Column::ProviderKeyId.eq(key.id))
-            .filter(temps_entities::ai_provider_models::Column::IsEnabled.eq(true))
-            .filter(temps_entities::ai_provider_models::Column::IsAvailable.eq(true))
-            .filter(
-                temps_entities::ai_provider_models::Column::ModelId.not_like("text-embedding-%"),
-            )
-            .order_by_asc(temps_entities::ai_provider_models::Column::ModelId)
-            .all(self.db.as_ref())
+        self.gateway
+            .managed_model()
             .await
-            .ok()?;
-        if let Some(preferred) = default_model_for_provider(&key.provider) {
-            if catalog_models
-                .iter()
-                .any(|model| model.model_id == preferred)
-            {
-                return Some(preferred);
-            }
-        }
-        if let Some(model) = catalog_models.into_iter().next() {
-            return Some(model.model_id);
-        }
-        default_model_for_provider(&key.provider)
+            .map(|_| "temps-cloud".to_string())
     }
 }
 

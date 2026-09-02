@@ -119,7 +119,7 @@ function PresetGroup({
             <p className="font-medium">Point-in-time recovery not available</p>
             <p className="text-xs">
               This image does not include WAL-G. Backups will be basic snapshots
-              — you won’t be able to restore to a specific timestamp.
+              — you won&apos;t be able to restore to a specific timestamp.
               {pitrManagedImage && (
                 <>
                   {' '}
@@ -184,16 +184,16 @@ export function useServiceTypePreset(serviceType: string | null): PresetState {
 }
 
 // -----------------------------------------------------------------------------
-// MariaDB preset — official MariaDB LTS image + custom.
+// MariaDB preset — managed WAL-G image + custom.
 // -----------------------------------------------------------------------------
 
-const MARIADB_MANAGED_IMAGE = 'mariadb:lts'
+const MARIADB_MANAGED_IMAGE = 'ghcr.io/gotempsh/mariadb-walg:11.4'
 
 const MARIADB_OPTIONS: PresetOption[] = [
   {
     id: 'managed',
-    title: 'MariaDB LTS',
-    subtitle: 'Official image',
+    title: 'MariaDB 11.4',
+    subtitle: 'Managed + WAL-G',
     value: MARIADB_MANAGED_IMAGE,
   },
   {

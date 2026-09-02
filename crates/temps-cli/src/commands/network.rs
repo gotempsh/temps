@@ -3,12 +3,13 @@
 
 //! `temps network` — operator visibility into the multi-host overlay.
 //!
-//! This command is purely additive. `temps join` is unchanged; the only
-//! way the overlay gets enabled on a node is when the control plane
-//! allocates a `compute_cidr` for it. These subcommands let an operator
-//! inspect the resulting state.
+//! `temps join` remains the worker enrollment path. These subcommands let an
+//! operator configure/repair the control-plane side and inspect the resulting
+//! state.
 //!
 //! Subcommands:
+//!   - `temps network setup-multi-node` — idempotently join the control plane
+//!     to the overlay and republish managed-service DNS without a restart
 //!   - `temps network status` — local kernel data plane (bridge, vxlan,
 //!     route table, FDB count, nftables table)
 //!   - `temps network peers`  — peer list as fetched from the control
@@ -16,10 +17,13 @@
 //!   - `temps network diag`   — ICMP/UDP reachability check against each
 //!     peer's bridge_address
 
+use std::path::PathBuf;
 use std::process::Command as ProcCommand;
+use std::sync::Arc;
 
 use clap::{Args, Subcommand};
 use colored::Colorize;
+use sea_orm::EntityTrait;
 use serde::Deserialize;
 
 /// Inspect the multi-host overlay on this node and across the cluster.
@@ -31,6 +35,11 @@ pub struct NetworkCommand {
 
 #[derive(Subcommand)]
 pub enum NetworkSubcommand {
+    /// Configure or repair the control-plane side of multi-node networking.
+    /// Existing services are attached and their internal DNS records are
+    /// republished without restarting `temps serve`.
+    #[command(alias = "setup-control-plane-network")]
+    SetupMultiNode(SetupMultiNodeCommand),
     /// Show the local overlay state: bridge, vxlan device, routes, fdb,
     /// nftables baseline. Run on a worker node.
     Status(NetworkStatusCommand),
@@ -42,7 +51,43 @@ pub enum NetworkSubcommand {
 }
 
 #[derive(Args)]
+pub struct SetupMultiNodeCommand {
+    /// Database URL. Environment-only so credentials do not leak through the
+    /// process list.
+    #[arg(skip)]
+    pub database_url: Option<String>,
+
+    /// Private address of this control plane on the multi-node underlay.
+    /// When omitted, the value saved by `temps serve --private-address` is
+    /// used.
+    #[arg(long, env = "TEMPS_PRIVATE_ADDRESS")]
+    pub private_address: Option<String>,
+
+    /// Interface carrying the private address (for example enp6s0.4000 or
+    /// wg0). Normally detected from the address.
+    #[arg(long, env = "TEMPS_UNDERLAY_DEV")]
+    pub underlay_dev: Option<String>,
+
+    /// Cluster-wide private pool carved into one Docker overlay subnet per
+    /// node. It may only be changed before any node has an allocation.
+    #[arg(long, env = "TEMPS_COMPUTE_POOL_CIDR")]
+    pub compute_pool_cidr: Option<String>,
+
+    /// Prefix allocated to each node (for example 24 gives 254 container
+    /// addresses per node). It may only be changed with an unused pool.
+    #[arg(long, env = "TEMPS_COMPUTE_SUBNET_PREFIX_LEN")]
+    pub node_prefix_len: Option<u8>,
+
+    /// Temps data directory containing the existing encryption_key.
+    #[arg(long, env = "TEMPS_DATA_DIR")]
+    pub data_dir: Option<PathBuf>,
+}
+
+#[derive(Args)]
 pub struct NetworkStatusCommand {
+    /// Docker overlay network name (default: temps0)
+    #[arg(long, default_value = "temps0")]
+    pub docker_network: String,
     /// Bridge name (default: br-temps0)
     #[arg(long, default_value = "br-temps0")]
     pub bridge: String,
@@ -90,9 +135,17 @@ pub struct NetworkDiagCommand {
 #[derive(Debug, Clone, Deserialize)]
 struct WirePeerListResponse {
     #[serde(default)]
+    network: Option<WireNetworkPool>,
+    #[serde(default)]
     alloc: Option<WireAlloc>,
     #[serde(default)]
     peers: Vec<WirePeer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WireNetworkPool {
+    compute_pool_cidr: String,
+    subnet_prefix_len: u8,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -172,12 +225,142 @@ impl NetworkCommand {
         let rt = tokio::runtime::Runtime::new()?;
         rt.block_on(async {
             match self.command {
+                NetworkSubcommand::SetupMultiNode(c) => execute_setup_multi_node(c).await,
                 NetworkSubcommand::Status(c) => execute_status(c),
                 NetworkSubcommand::Peers(c) => execute_peers(c).await,
                 NetworkSubcommand::Diag(c) => execute_diag(c).await,
             }
         })
     }
+}
+
+async fn execute_setup_multi_node(cmd: SetupMultiNodeCommand) -> anyhow::Result<()> {
+    let database_url = cmd
+        .database_url
+        .or_else(|| std::env::var("TEMPS_DATABASE_URL").ok())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("TEMPS_DATABASE_URL must be set in the protected process environment")
+        })?;
+    let db = temps_database::establish_connection(&database_url)
+        .await
+        .map_err(|error| anyhow::anyhow!("could not connect to the Temps database: {error}"))?;
+
+    let allocator = temps_network::allocator::PostgresAllocator::new(db.clone());
+    let current_network = allocator
+        .cluster_config()
+        .await
+        .map_err(|error| anyhow::anyhow!("could not load cluster network config: {error}"))?;
+    let requested_pool = cmd
+        .compute_pool_cidr
+        .as_deref()
+        .map(str::parse)
+        .transpose()
+        .map_err(|error| anyhow::anyhow!("invalid --compute-pool-cidr: {error}"))?
+        .unwrap_or(current_network.compute_pool_cidr);
+    let requested_prefix = cmd
+        .node_prefix_len
+        .unwrap_or(current_network.subnet_prefix_len);
+    let cluster_network = allocator
+        .configure_pool(requested_pool, requested_prefix)
+        .await
+        .map_err(|error| anyhow::anyhow!("cluster network configuration refused: {error}"))?;
+
+    let private_address = match cmd.private_address {
+        Some(value) if !value.trim().is_empty() => value,
+        _ => {
+            let settings = temps_entities::settings::Entity::find_by_id(1)
+                .one(db.as_ref())
+                .await
+                .map_err(|error| anyhow::anyhow!("could not load multi-node settings: {error}"))?
+                .map(|model| temps_core::AppSettings::from_json(model.data))
+                .unwrap_or_default();
+            settings.multi_node.private_address.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the control-plane private address is not configured; pass \
+                     --private-address <IP> or start once with \
+                     `temps serve --private-address <IP>`"
+                )
+            })?
+        }
+    };
+
+    let docker = Arc::new(
+        bollard::Docker::connect_with_defaults()
+            .map_err(|error| anyhow::anyhow!("could not connect to Docker: {error}"))?,
+    );
+    let overlay = temps_network::control_plane::setup(
+        db.clone(),
+        docker.as_ref(),
+        private_address.trim(),
+        cmd.underlay_dev.as_deref(),
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!("multi-node control-plane setup failed: {error}"))?;
+
+    let data_dir = cmd
+        .data_dir
+        .or_else(|| std::env::var_os("TEMPS_DATA_DIR").map(PathBuf::from))
+        .or_else(|| dirs::home_dir().map(|home| home.join(".temps")))
+        .ok_or_else(|| anyhow::anyhow!("could not determine the Temps data directory"))?;
+    let key_path = data_dir.join("encryption_key");
+    let encryption_key = std::fs::read_to_string(&key_path).map_err(|error| {
+        anyhow::anyhow!(
+            "could not read the existing encryption key at {}: {error}; pass the same \
+             --data-dir used by `temps serve`",
+            key_path.display()
+        )
+    })?;
+    let encryption = Arc::new(
+        temps_core::EncryptionService::new(encryption_key.trim())
+            .map_err(|error| anyhow::anyhow!("invalid Temps encryption key: {error}"))?,
+    );
+    let dns_registry = Arc::new(temps_dns::DnsRegistry::new(db.clone()));
+    let services =
+        temps_providers::ExternalServiceManager::new(db.clone(), encryption, docker, dns_registry);
+    let existing = services
+        .list_services()
+        .await
+        .map_err(|error| anyhow::anyhow!("could not list managed services: {error}"))?;
+
+    let mut published = 0usize;
+    let mut skipped = 0usize;
+    for service in existing {
+        match services.register_standalone_service_dns(service.id).await {
+            Ok(Some(fqdn)) => {
+                published += 1;
+                println!("  {} {} -> {}", "DNS".bright_green(), service.name, fqdn);
+            }
+            Ok(None) => skipped += 1,
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "overlay is ready, but DNS reconciliation failed for service {} (id {}): {}",
+                    service.name,
+                    service.id,
+                    error
+                ));
+            }
+        }
+    }
+
+    println!();
+    println!(
+        "  {} Multi-node control-plane networking is ready",
+        "PASS".bright_green().bold()
+    );
+    println!(
+        "  Cluster pool: {} (one /{} Docker subnet per node)",
+        cluster_network.compute_pool_cidr, cluster_network.subnet_prefix_len
+    );
+    println!("  Overlay CIDR: {}", overlay.alloc.compute_cidr);
+    println!("  Bridge: {}", overlay.alloc.bridge_address);
+    println!(
+        "  Underlay: {} via {}",
+        overlay.alloc.underlay_address, overlay.config.underlay_dev
+    );
+    println!("  Managed-service DNS: {published} published, {skipped} skipped");
+    println!("  No `temps serve` restart is required.");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -197,8 +380,15 @@ fn execute_status(cmd: NetworkStatusCommand) -> anyhow::Result<()> {
     print_link("bridge", &cmd.bridge);
     print_link("vxlan", &cmd.vxlan);
 
+    print_section("Docker overlay allocation:");
+    print_docker_network(&cmd.docker_network);
+
     print_section("Routes:");
-    print_routes(&cmd.vxlan);
+    // VXLAN peer CIDRs are deliberately routed through the bridge so
+    // containers attached to the Docker bridge can use the routes directly.
+    // Showing routes on the VXLAN device therefore reports a false empty
+    // state even when reconciliation succeeded.
+    print_routes(&cmd.bridge);
 
     print_section("FDB entries:");
     print_fdb(&cmd.vxlan);
@@ -208,6 +398,34 @@ fn execute_status(cmd: NetworkStatusCommand) -> anyhow::Result<()> {
 
     println!();
     Ok(())
+}
+
+fn print_docker_network(network: &str) {
+    let output = ProcCommand::new("docker")
+        .args([
+            "network",
+            "inspect",
+            network,
+            "--format",
+            "{{range .IPAM.Config}}{{.Subnet}} gateway={{.Gateway}}{{end}}",
+        ])
+        .output();
+    match output {
+        Ok(result) if result.status.success() => {
+            let allocation = String::from_utf8_lossy(&result.stdout);
+            println!("    {}: {}", network, allocation.trim().bright_green());
+        }
+        Ok(result) => println!(
+            "    {}",
+            format!(
+                "{} not found or unreadable: {}",
+                network,
+                String::from_utf8_lossy(&result.stderr).trim()
+            )
+            .bright_black()
+        ),
+        Err(error) => println!("    could not run docker network inspect: {error}"),
+    }
 }
 
 fn print_link(label: &str, name: &str) {
@@ -305,6 +523,23 @@ async fn execute_peers(cmd: NetworkPeersCommand) -> anyhow::Result<()> {
     let resp = fetch_peers(&auth).await?;
 
     println!();
+    if let Some(network) = &resp.network {
+        println!(
+            "  {}",
+            "Authoritative cluster network".bright_white().bold()
+        );
+        println!(
+            "    {} {}",
+            "compute_pool:".bright_white(),
+            network.compute_pool_cidr.bright_green()
+        );
+        println!(
+            "    {} /{} per node",
+            "allocation:".bright_white(),
+            network.subnet_prefix_len
+        );
+        println!();
+    }
     if let Some(a) = &resp.alloc {
         println!("  {}", "Local allocation".bright_white().bold());
         println!("    {} {}", "node_id:".bright_white(), a.node_id);
@@ -468,6 +703,34 @@ async fn fetch_peers(auth: &ResolvedAuth) -> anyhow::Result<WirePeerListResponse
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn setup_multi_node_command_is_explicitly_scoped() {
+        let cli = crate::Cli::try_parse_from([
+            "temps",
+            "network",
+            "setup-multi-node",
+            "--private-address",
+            "10.200.4.1",
+            "--compute-pool-cidr",
+            "10.240.0.0/16",
+            "--node-prefix-len",
+            "24",
+        ])
+        .expect("multi-node setup arguments should parse");
+        assert!(matches!(
+            cli.command,
+            crate::Commands::Network(NetworkCommand {
+                command: NetworkSubcommand::SetupMultiNode(SetupMultiNodeCommand {
+                    private_address: Some(ref address),
+                    compute_pool_cidr: Some(ref pool),
+                    node_prefix_len: Some(24),
+                    ..
+                }),
+            }) if address == "10.200.4.1" && pool == "10.240.0.0/16"
+        ));
+    }
 
     #[test]
     fn first_usable_host_basic() {

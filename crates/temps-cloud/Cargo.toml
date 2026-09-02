@@ -1,0 +1,37 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-cloud"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host integration for the optional Temps managed control plane."
+
+[dependencies]
+temps-auth = { path = "../temps-auth" }
+temps-cloud-client = { path = "../temps-cloud-client" }
+temps-cloud-protocol = { path = "../temps-cloud-protocol" }
+temps-config = { path = "../temps-config" }
+temps-core = { path = "../temps-core" }
+temps-entities = { path = "../temps-entities" }
+
+anyhow.workspace = true
+aws-sdk-s3.workspace = true
+axum.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+reqwest.workspace = true
+sea-orm.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
+tracing.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+temps-database = { path = "../temps-database" }

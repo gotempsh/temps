@@ -366,6 +366,9 @@ import type {
   CreateSlackProviderData,
   CreateSlackProviderErrors,
   CreateSlackProviderResponses,
+  CreateSnapshotData,
+  CreateSnapshotErrors,
+  CreateSnapshotResponses,
   CreateTeamData,
   CreateTeamErrors,
   CreateTeamResponses,
@@ -511,6 +514,9 @@ import type {
   DeleteSkillData,
   DeleteSkillErrors,
   DeleteSkillResponses,
+  DeleteSnapshotData,
+  DeleteSnapshotErrors,
+  DeleteSnapshotResponses,
   DeleteSourceMapData,
   DeleteSourceMapErrors,
   DeleteSourceMapResponses,
@@ -553,6 +559,9 @@ import type {
   DetachScheduleServiceData,
   DetachScheduleServiceErrors,
   DetachScheduleServiceResponses,
+  DetectPublicEnvExampleData,
+  DetectPublicEnvExampleErrors,
+  DetectPublicEnvExampleResponses,
   DetectPublicPresetsData,
   DetectPublicPresetsErrors,
   DetectPublicPresetsResponses,
@@ -562,6 +571,8 @@ import type {
   DisableMfaData,
   DisableMfaErrors,
   DisableMfaResponses,
+  DisconnectCloudData,
+  DisconnectCloudResponses,
   DiscoverWorkloadsData,
   DiscoverWorkloadsErrors,
   DiscoverWorkloadsResponses,
@@ -589,6 +600,8 @@ import type {
   EnrichVisitorData,
   EnrichVisitorErrors,
   EnrichVisitorResponses,
+  EnrollCloudData,
+  EnrollCloudResponses,
   ExecData,
   ExecDetachedData,
   ExecDetachedErrors,
@@ -685,6 +698,9 @@ import type {
   GetAiPageBreakdownData,
   GetAiPageBreakdownErrors,
   GetAiPageBreakdownResponses,
+  GetAiProviderStatusData,
+  GetAiProviderStatusErrors,
+  GetAiProviderStatusResponses,
   GetAiStatusBreakdownData,
   GetAiStatusBreakdownErrors,
   GetAiStatusBreakdownResponses,
@@ -742,6 +758,12 @@ import type {
   GetCliStatusData,
   GetCliStatusErrors,
   GetCliStatusResponses,
+  GetCloudAiCapabilityData,
+  GetCloudAiCapabilityResponses,
+  GetCloudCapabilityData,
+  GetCloudCapabilityResponses,
+  GetCloudStatusData,
+  GetCloudStatusResponses,
   GetClusterHealthData,
   GetClusterHealthErrors,
   GetClusterHealthResponses,
@@ -926,6 +948,9 @@ import type {
   GetExternalImageData,
   GetExternalImageErrors,
   GetExternalImageResponses,
+  GetExternalServiceBackupCapabilityData,
+  GetExternalServiceBackupCapabilityErrors,
+  GetExternalServiceBackupCapabilityResponses,
   GetFileData,
   GetFileErrors,
   GetFileResponses,
@@ -1139,6 +1164,12 @@ import type {
   GetPublicBranchesData,
   GetPublicBranchesErrors,
   GetPublicBranchesResponses,
+  GetPublicComposePreviewData,
+  GetPublicComposePreviewErrors,
+  GetPublicComposePreviewResponses,
+  GetPublicComposeServicesData,
+  GetPublicComposeServicesErrors,
+  GetPublicComposeServicesResponses,
   GetPublicIpData,
   GetPublicIpErrors,
   GetPublicIpResponses,
@@ -1166,6 +1197,15 @@ import type {
   GetRepositoryByNameData,
   GetRepositoryByNameErrors,
   GetRepositoryByNameResponses,
+  GetRepositoryComposePreviewData,
+  GetRepositoryComposePreviewErrors,
+  GetRepositoryComposePreviewResponses,
+  GetRepositoryComposeServicesLiveData,
+  GetRepositoryComposeServicesLiveErrors,
+  GetRepositoryComposeServicesLiveResponses,
+  GetRepositoryEnvExampleLiveData,
+  GetRepositoryEnvExampleLiveErrors,
+  GetRepositoryEnvExampleLiveResponses,
   GetRepositoryPresetByNameData,
   GetRepositoryPresetByNameErrors,
   GetRepositoryPresetByNameResponses,
@@ -1274,6 +1314,9 @@ import type {
   GetSlowQueriesData,
   GetSlowQueriesErrors,
   GetSlowQueriesResponses,
+  GetSnapshotData,
+  GetSnapshotErrors,
+  GetSnapshotResponses,
   GetStaticBundleData,
   GetStaticBundleErrors,
   GetStaticBundleResponses,
@@ -1372,6 +1415,9 @@ import type {
   HasPerformanceMetricsData,
   HasPerformanceMetricsErrors,
   HasPerformanceMetricsResponses,
+  HasTracesData,
+  HasTracesErrors,
+  HasTracesResponses,
   ImportExternalServiceData,
   ImportExternalServiceErrors,
   ImportExternalServiceResponses,
@@ -1399,12 +1445,18 @@ import type {
   IngestTracesData,
   IngestTracesErrors,
   IngestTracesResponses,
+  IngestTunneledEnvelopeData,
+  IngestTunneledEnvelopeErrors,
+  IngestTunneledEnvelopeResponses,
   InitSessionReplayData,
   InitSessionReplayErrors,
   InitSessionReplayResponses,
   InspectDropArchiveData,
   InspectDropArchiveErrors,
   InspectDropArchiveResponses,
+  IssueRuntimeCredentialsData,
+  IssueRuntimeCredentialsErrors,
+  IssueRuntimeCredentialsResponses,
   JobLogsData,
   JobLogsErrors,
   JobLogsResponses,
@@ -1691,6 +1743,9 @@ import type {
   ListRemoteExternalImagesData,
   ListRemoteExternalImagesErrors,
   ListRemoteExternalImagesResponses,
+  ListRenewalAttemptsData,
+  ListRenewalAttemptsErrors,
+  ListRenewalAttemptsResponses,
   ListRepositoriesByConnectionData,
   ListRepositoriesByConnectionErrors,
   ListRepositoriesByConnectionResponses,
@@ -1738,6 +1793,9 @@ import type {
   ListSkillsData,
   ListSkillsErrors,
   ListSkillsResponses,
+  ListSnapshotsData,
+  ListSnapshotsErrors,
+  ListSnapshotsResponses,
   ListSourceBackupsData,
   ListSourceBackupsErrors,
   ListSourceBackupsResponses,
@@ -1885,6 +1943,9 @@ import type {
   RecordSpeedMetricsData,
   RecordSpeedMetricsErrors,
   RecordSpeedMetricsResponses,
+  RefreshAiProviderStatusData,
+  RefreshAiProviderStatusErrors,
+  RefreshAiProviderStatusResponses,
   RefreshRouteTableData,
   RefreshRouteTableErrors,
   RefreshRouteTableResponses,
@@ -1936,6 +1997,9 @@ import type {
   ResolveAlarmData,
   ResolveAlarmErrors,
   ResolveAlarmResponses,
+  ResolvePermissionData,
+  ResolvePermissionErrors,
+  ResolvePermissionResponses,
   RestartContainerData,
   RestartContainerErrors,
   RestartContainerResponses,
@@ -1977,6 +2041,9 @@ import type {
   RevealNotificationProviderConfigData,
   RevealNotificationProviderConfigErrors,
   RevealNotificationProviderConfigResponses,
+  RevealServiceEnvironmentVariablesData,
+  RevealServiceEnvironmentVariablesErrors,
+  RevealServiceEnvironmentVariablesResponses,
   RevealServiceParameterData,
   RevealServiceParameterErrors,
   RevealServiceParameterResponses,
@@ -2148,6 +2215,9 @@ import type {
   StopServiceData,
   StopServiceErrors,
   StopServiceResponses,
+  StorageSummaryData,
+  StorageSummaryErrors,
+  StorageSummaryResponses,
   StreamContainerMetricsData,
   StreamContainerMetricsErrors,
   StreamContainerMetricsResponses,
@@ -2224,6 +2294,9 @@ import type {
   UpdateAgentResponses,
   UpdateAiProviderData,
   UpdateAiProviderErrors,
+  UpdateAiProviderPreferenceData,
+  UpdateAiProviderPreferenceErrors,
+  UpdateAiProviderPreferenceResponses,
   UpdateAiProviderResponses,
   UpdateAlertData,
   UpdateAlertErrors,
@@ -2240,6 +2313,8 @@ import type {
   UpdateBackupScheduleData,
   UpdateBackupScheduleErrors,
   UpdateBackupScheduleResponses,
+  UpdateCloudFeaturesData,
+  UpdateCloudFeaturesResponses,
   UpdateCloudflareProviderData,
   UpdateCloudflareProviderErrors,
   UpdateCloudflareProviderResponses,
@@ -2638,6 +2713,44 @@ export const recordEventMetrics = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Ingest a browser-tunneled Sentry envelope.
+ *
+ * No DSN credential — the project/environment/deployment are resolved from
+ * the `Host` header via the proxy's route table, the same way
+ * `/api/_temps/event` (analytics) resolves. Browser SDKs reach this path via
+ * `Sentry.init({ tunnel: SENTRY_TUNNEL_ROUTE_PATH })`, which the proxy
+ * forwards to the console from any domain a project is deployed on
+ * (`ROUTE_PREFIX_TEMPS`), so it works on custom domains and previews without
+ * per-domain DSN configuration.
+ *
+ * Since there is no credential, an `Origin`/`Referer` check stands in for
+ * authentication: the request must claim to come from the same host it
+ * resolves to, or it is rejected. This is weaker than a DSN (both are
+ * visible to anyone who can read the page), but it closes the trivial case
+ * of a script targeting an arbitrary victim domain with no recon at all.
+ */
+export const ingestTunneledEnvelope = <ThrowOnError extends boolean = false>(
+  options: Options<IngestTunneledEnvelopeData, ThrowOnError>,
+): RequestResult<
+  IngestTunneledEnvelopeResponses,
+  IngestTunneledEnvelopeErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    IngestTunneledEnvelopeResponses,
+    IngestTunneledEnvelopeErrors,
+    ThrowOnError
+  >({
+    bodySerializer: null,
+    url: "/_temps/sentry/envelope",
+    ...options,
+    headers: {
+      "Content-Type": "application/octet-stream",
+      ...options.headers,
+    },
+  });
+
+/**
  * Add events to existing session replay
  */
 export const addSessionReplayEvents = <ThrowOnError extends boolean = false>(
@@ -2924,9 +3037,8 @@ export const webhookTrigger = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * List every active conversation across all projects, most-recently-active
- * first, annotated with project name/slug. Powers the unified "all chats"
- * switcher in the AI assistant dock.
+ * List the current user's active conversations across all projects,
+ * most-recently-active first, annotated with project name/slug.
  */
 export const listAllConversations = <ThrowOnError extends boolean = false>(
   options?: Options<ListAllConversationsData, ThrowOnError>,
@@ -2955,6 +3067,63 @@ export const getPricing = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/ai/pricing",
+    ...options,
+  });
+
+export const updateAiProviderPreference = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<UpdateAiProviderPreferenceData, ThrowOnError>,
+): RequestResult<
+  UpdateAiProviderPreferenceResponses,
+  UpdateAiProviderPreferenceErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).put<
+    UpdateAiProviderPreferenceResponses,
+    UpdateAiProviderPreferenceErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/provider-preference",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getAiProviderStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetAiProviderStatusData, ThrowOnError>,
+): RequestResult<
+  GetAiProviderStatusResponses,
+  GetAiProviderStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).get<
+    GetAiProviderStatusResponses,
+    GetAiProviderStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/provider-status",
+    ...options,
+  });
+
+export const refreshAiProviderStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<RefreshAiProviderStatusData, ThrowOnError>,
+): RequestResult<
+  RefreshAiProviderStatusResponses,
+  RefreshAiProviderStatusErrors,
+  ThrowOnError
+> =>
+  (options?.client ?? client).post<
+    RefreshAiProviderStatusResponses,
+    RefreshAiProviderStatusErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/ai/provider-status/refresh",
     ...options,
   });
 
@@ -4188,6 +4357,32 @@ export const cleanupExpiredBackups = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Report whether an existing service can produce a Cloud-restorable backup.
+ *
+ * This probes the running container instead of trusting its configured image
+ * name: operators can build their own WAL-G image, and an image label alone
+ * cannot prove that the binary is actually executable.
+ */
+export const getExternalServiceBackupCapability = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetExternalServiceBackupCapabilityData, ThrowOnError>,
+): RequestResult<
+  GetExternalServiceBackupCapabilityResponses,
+  GetExternalServiceBackupCapabilityErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetExternalServiceBackupCapabilityResponses,
+    GetExternalServiceBackupCapabilityErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/backups/external-services/{id}/capability",
+    ...options,
+  });
+
+/**
  * Run a backup for an external service manually.
  *
  * Enqueues the backup for asynchronous execution via the `BackupRunner`
@@ -5072,6 +5267,88 @@ export const blobHead = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+export const disconnectCloud = <ThrowOnError extends boolean = false>(
+  options?: Options<DisconnectCloudData, ThrowOnError>,
+): RequestResult<DisconnectCloudResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).delete<
+    DisconnectCloudResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud",
+    ...options,
+  });
+
+export const getCloudAiCapability = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudAiCapabilityData, ThrowOnError>,
+): RequestResult<GetCloudAiCapabilityResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudAiCapabilityResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/ai/capability",
+    ...options,
+  });
+
+export const getCloudCapability = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudCapabilityData, ThrowOnError>,
+): RequestResult<GetCloudCapabilityResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudCapabilityResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/capability",
+    ...options,
+  });
+
+export const enrollCloud = <ThrowOnError extends boolean = false>(
+  options: Options<EnrollCloudData, ThrowOnError>,
+): RequestResult<EnrollCloudResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).post<EnrollCloudResponses, unknown, ThrowOnError>({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/enroll",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const updateCloudFeatures = <ThrowOnError extends boolean = false>(
+  options: Options<UpdateCloudFeaturesData, ThrowOnError>,
+): RequestResult<UpdateCloudFeaturesResponses, unknown, ThrowOnError> =>
+  (options.client ?? client).patch<
+    UpdateCloudFeaturesResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/features",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+export const getCloudStatus = <ThrowOnError extends boolean = false>(
+  options?: Options<GetCloudStatusData, ThrowOnError>,
+): RequestResult<GetCloudStatusResponses, unknown, ThrowOnError> =>
+  (options?.client ?? client).get<
+    GetCloudStatusResponses,
+    unknown,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/cloud/status",
+    ...options,
+  });
+
 /**
  * Get dashboard analytics for multiple projects in a single batch request
  *
@@ -5863,6 +6140,33 @@ export const renewDomain = <ThrowOnError extends boolean = false>(
   >({
     security: [{ scheme: "bearer", type: "http" }],
     url: "/domains/{domain}/renew",
+    ...options,
+  });
+
+/**
+ * List certificate renewal attempts for a domain
+ *
+ * Returns rows from the append-only `renewal_attempts` audit log, newest
+ * first: every `request_challenge` (order creation) and `complete_challenge`
+ * (order finalization) attempt for this domain, successful or failed, with
+ * the full error detail. Backs the domain detail page's renewal timeline —
+ * `domains.last_error` only ever holds the MOST RECENT failure, so this is
+ * the only way to see the history behind it.
+ */
+export const listRenewalAttempts = <ThrowOnError extends boolean = false>(
+  options: Options<ListRenewalAttemptsData, ThrowOnError>,
+): RequestResult<
+  ListRenewalAttemptsResponses,
+  ListRenewalAttemptsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    ListRenewalAttemptsResponses,
+    ListRenewalAttemptsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/domains/{domain}/renewal-attempts",
     ...options,
   });
 
@@ -6791,6 +7095,28 @@ export const getClusterHealth = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Reveal a service's basic environment variables in plaintext, before it is
+ * linked to any project. Used by the new-project wizard to fill a detected
+ * variable (e.g. `DATABASE_URL`) from a service the user just picked or
+ * created — every successful reveal is recorded, matching the audited
+ * single-variable reveal used once a service is project-linked.
+ */
+export const revealServiceEnvironmentVariables = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<RevealServiceEnvironmentVariablesData, ThrowOnError>,
+): RequestResult<
+  RevealServiceEnvironmentVariablesResponses,
+  RevealServiceEnvironmentVariablesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    RevealServiceEnvironmentVariablesResponses,
+    RevealServiceEnvironmentVariablesErrors,
+    ThrowOnError
+  >({ url: "/external-services/{id}/environment", ...options });
+
+/**
  * Run a health check for one service right now
  *
  * Triggers the same engine-specific probe as the background monitor, writes
@@ -7312,6 +7638,41 @@ export const getServiceEnvironmentVariable = <
     ThrowOnError
   >({
     url: "/external-services/{id}/projects/{project_id}/environment/{var_name}",
+    ...options,
+  });
+
+/**
+ * Issue live connection credentials for a service in an environment
+ *
+ * Provisions the per-tenant database if it does not exist yet, then returns
+ * the connection variables in plaintext — the same values a deployment gets
+ * injected at runtime.
+ *
+ * **This is a POST because it is not a read.** It creates a database as a
+ * side effect, and its response is a live credential: a GET would be
+ * prefetchable, cacheable, and liable to end up in a proxy access log with
+ * the whole connection in the URL's neighbourhood. Nothing about it is safe
+ * or idempotent in the HTTP sense.
+ *
+ * Intended for callers that need to *connect* an application to a managed
+ * service — the console's own deploy path does this in-process; external
+ * plugins reach it here. For inspecting configuration, use the masked bulk
+ * read or the single-variable reveal instead.
+ */
+export const issueRuntimeCredentials = <ThrowOnError extends boolean = false>(
+  options: Options<IssueRuntimeCredentialsData, ThrowOnError>,
+): RequestResult<
+  IssueRuntimeCredentialsResponses,
+  IssueRuntimeCredentialsErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    IssueRuntimeCredentialsResponses,
+    IssueRuntimeCredentialsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/external-services/{id}/projects/{project_id}/environments/{environment_id}/runtime-credentials",
     ...options,
   });
 
@@ -8706,6 +9067,65 @@ export const getPublicBranches = <ThrowOnError extends boolean = false>(
     GetPublicBranchesErrors,
     ThrowOnError
   >({ url: "/git/public/{provider}/{owner}/{repo}/branches", ...options });
+
+/**
+ * Parse a compose file's services for a public repository (supports GitHub
+ * and GitLab). Unlike env-example detection, the caller already knows the
+ * path (from the `compose_files` list `/preset` already returned), so this
+ * fetches that one file directly rather than scanning the tree first.
+ */
+export const getPublicComposeServices = <ThrowOnError extends boolean = false>(
+  options: Options<GetPublicComposeServicesData, ThrowOnError>,
+): RequestResult<
+  GetPublicComposeServicesResponses,
+  GetPublicComposeServicesErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetPublicComposeServicesResponses,
+    GetPublicComposeServicesErrors,
+    ThrowOnError
+  >({ url: "/git/public/{provider}/{owner}/{repo}/compose-file", ...options });
+
+/**
+ * Render a redacted effective Compose preview for a public repository.
+ */
+export const getPublicComposePreview = <ThrowOnError extends boolean = false>(
+  options: Options<GetPublicComposePreviewData, ThrowOnError>,
+): RequestResult<
+  GetPublicComposePreviewResponses,
+  GetPublicComposePreviewErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    GetPublicComposePreviewResponses,
+    GetPublicComposePreviewErrors,
+    ThrowOnError
+  >({
+    url: "/git/public/{provider}/{owner}/{repo}/compose-file",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Detect and parse a `.env.example`-style file for a public repository
+ * (supports GitHub and GitLab)
+ */
+export const detectPublicEnvExample = <ThrowOnError extends boolean = false>(
+  options: Options<DetectPublicEnvExampleData, ThrowOnError>,
+): RequestResult<
+  DetectPublicEnvExampleResponses,
+  DetectPublicEnvExampleErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    DetectPublicEnvExampleResponses,
+    DetectPublicEnvExampleErrors,
+    ThrowOnError
+  >({ url: "/git/public/{provider}/{owner}/{repo}/env-example", ...options });
 
 /**
  * Detect presets for a public repository (supports GitHub and GitLab)
@@ -10400,6 +10820,29 @@ export const getUnifiedTrace = <ThrowOnError extends boolean = false>(
   });
 
 /**
+ * Whether a project has ever received at least one trace span.
+ *
+ * A pure existence check for onboarding/setup UI (e.g. "has this project
+ * set up OpenTelemetry yet?"). Deliberately not `/otel/trace-summaries`
+ * with `limit=1`: that endpoint aggregates by trace (`GROUP BY trace_id`,
+ * `argMax`) and, without a time bound, that aggregation runs over every
+ * span the project has ever ingested. This endpoint answers the same
+ * yes/no question in O(1) — see `OtelStorage::has_traces`.
+ */
+export const hasTraces = <ThrowOnError extends boolean = false>(
+  options: Options<HasTracesData, ThrowOnError>,
+): RequestResult<HasTracesResponses, HasTracesErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    HasTracesResponses,
+    HasTracesErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/otel/has-traces/{project_id}",
+    ...options,
+  });
+
+/**
  * Get health summaries for a project.
  */
 export const getHealth = <ThrowOnError extends boolean = false>(
@@ -11661,9 +12104,9 @@ export const getAggregatedBuckets = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Find the existing chat for a context (returns `null` if none yet). Requires
- * the per-project `ai_debug_chat_enabled` toggle to be on; returns 403 when the
- * feature is disabled so revoking it consistently hides existing chat content.
+ * Find the current user's existing chat for a context (returns `null` if none
+ * yet). Conversations are private even between members of the same project.
+ * Requires the per-project `ai_debug_chat_enabled` toggle to be on.
  */
 export const findConversation = <ThrowOnError extends boolean = false>(
   options: Options<FindConversationData, ThrowOnError>,
@@ -11683,7 +12126,7 @@ export const findConversation = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * Get-or-create the chat for a context (seeds it on first open).
+ * Get-or-create the current user's private chat for a context.
  */
 export const createConversation = <ThrowOnError extends boolean = false>(
   options: Options<CreateConversationData, ThrowOnError>,
@@ -11707,8 +12150,8 @@ export const createConversation = <ThrowOnError extends boolean = false>(
   });
 
 /**
- * List all active conversations for a project, most-recently-active first.
- * Powers the conversation switcher in the AI assistant sidebar.
+ * List the current user's active conversations for a project,
+ * most-recently-active first.
  */
 export const listConversations = <ThrowOnError extends boolean = false>(
   options: Options<ListConversationsData, ThrowOnError>,
@@ -11829,6 +12272,27 @@ export const listPendingActions = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/projects/{project_id}/ai/conversations/{public_id}/pending-actions",
     ...options,
+  });
+
+export const resolvePermission = <ThrowOnError extends boolean = false>(
+  options: Options<ResolvePermissionData, ThrowOnError>,
+): RequestResult<
+  ResolvePermissionResponses,
+  ResolvePermissionErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    ResolvePermissionResponses,
+    ResolvePermissionErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/projects/{project_id}/ai/conversations/{public_id}/permissions/{permission_id}/resolve",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 /**
@@ -16023,6 +16487,76 @@ export const getRepositoryTags = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * Parse a compose file's services for a connected repository, live
+ */
+export const getRepositoryComposeServicesLive = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetRepositoryComposeServicesLiveData, ThrowOnError>,
+): RequestResult<
+  GetRepositoryComposeServicesLiveResponses,
+  GetRepositoryComposeServicesLiveErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetRepositoryComposeServicesLiveResponses,
+    GetRepositoryComposeServicesLiveErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/repositories/{repository_id}/compose-file/live",
+    ...options,
+  });
+
+/**
+ * Render a redacted effective Compose preview for a connected repository.
+ */
+export const getRepositoryComposePreview = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetRepositoryComposePreviewData, ThrowOnError>,
+): RequestResult<
+  GetRepositoryComposePreviewResponses,
+  GetRepositoryComposePreviewErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).post<
+    GetRepositoryComposePreviewResponses,
+    GetRepositoryComposePreviewErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/repositories/{repository_id}/compose-file/preview",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
+  });
+
+/**
+ * Detect and parse a `.env.example`-style file for a connected repository
+ */
+export const getRepositoryEnvExampleLive = <
+  ThrowOnError extends boolean = false,
+>(
+  options: Options<GetRepositoryEnvExampleLiveData, ThrowOnError>,
+): RequestResult<
+  GetRepositoryEnvExampleLiveResponses,
+  GetRepositoryEnvExampleLiveErrors,
+  ThrowOnError
+> =>
+  (options.client ?? client).get<
+    GetRepositoryEnvExampleLiveResponses,
+    GetRepositoryEnvExampleLiveErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/repositories/{repository_id}/env-example/live",
+    ...options,
+  });
+
 export const getRepositoryPresetLive = <ThrowOnError extends boolean = false>(
   options: Options<GetRepositoryPresetLiveData, ThrowOnError>,
 ): RequestResult<
@@ -17428,6 +17962,70 @@ export const removeRole = <ThrowOnError extends boolean = false>(
     ...options,
   });
 
+/**
+ * `GET /v1/sandbox-snapshots`
+ */
+export const listSnapshots = <ThrowOnError extends boolean = false>(
+  options?: Options<ListSnapshotsData, ThrowOnError>,
+): RequestResult<ListSnapshotsResponses, ListSnapshotsErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    ListSnapshotsResponses,
+    ListSnapshotsErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandbox-snapshots",
+    ...options,
+  });
+
+/**
+ * `GET /v1/sandbox-snapshots/storage-summary`
+ */
+export const storageSummary = <ThrowOnError extends boolean = false>(
+  options?: Options<StorageSummaryData, ThrowOnError>,
+): RequestResult<StorageSummaryResponses, StorageSummaryErrors, ThrowOnError> =>
+  (options?.client ?? client).get<
+    StorageSummaryResponses,
+    StorageSummaryErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandbox-snapshots/storage-summary",
+    ...options,
+  });
+
+/**
+ * `DELETE /v1/sandbox-snapshots/{snap_id}`
+ */
+export const deleteSnapshot = <ThrowOnError extends boolean = false>(
+  options: Options<DeleteSnapshotData, ThrowOnError>,
+): RequestResult<DeleteSnapshotResponses, DeleteSnapshotErrors, ThrowOnError> =>
+  (options.client ?? client).delete<
+    DeleteSnapshotResponses,
+    DeleteSnapshotErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandbox-snapshots/{snap_id}",
+    ...options,
+  });
+
+/**
+ * `GET /v1/sandbox-snapshots/{snap_id}`
+ */
+export const getSnapshot = <ThrowOnError extends boolean = false>(
+  options: Options<GetSnapshotData, ThrowOnError>,
+): RequestResult<GetSnapshotResponses, GetSnapshotErrors, ThrowOnError> =>
+  (options.client ?? client).get<
+    GetSnapshotResponses,
+    GetSnapshotErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandbox-snapshots/{snap_id}",
+    ...options,
+  });
+
 export const listSandboxes = <ThrowOnError extends boolean = false>(
   options?: Options<ListSandboxesData, ThrowOnError>,
 ): RequestResult<ListSandboxesResponses, ListSandboxesErrors, ThrowOnError> =>
@@ -17930,6 +18528,34 @@ export const resumeSandbox = <ThrowOnError extends boolean = false>(
     security: [{ scheme: "bearer", type: "http" }],
     url: "/v1/sandboxes/{id}/resume",
     ...options,
+  });
+
+/**
+ * `POST /v1/sandboxes/{id}/snapshots`
+ *
+ * Initiates a snapshot of the sandbox. The response is **202 Accepted**
+ * with the snapshot row in `creating` status. The caller should poll
+ * `GET /v1/sandbox-snapshots/{snap_id}` until `status` is `ready` or
+ * `failed`.
+ *
+ * The sandbox is stopped for the duration of the snapshot and restarted
+ * automatically when it completes (unless it was already stopped).
+ */
+export const createSnapshot = <ThrowOnError extends boolean = false>(
+  options: Options<CreateSnapshotData, ThrowOnError>,
+): RequestResult<CreateSnapshotResponses, CreateSnapshotErrors, ThrowOnError> =>
+  (options.client ?? client).post<
+    CreateSnapshotResponses,
+    CreateSnapshotErrors,
+    ThrowOnError
+  >({
+    security: [{ scheme: "bearer", type: "http" }],
+    url: "/v1/sandboxes/{id}/snapshots",
+    ...options,
+    headers: {
+      "Content-Type": "application/json",
+      ...options.headers,
+    },
   });
 
 export const sourceSandbox = <ThrowOnError extends boolean = false>(

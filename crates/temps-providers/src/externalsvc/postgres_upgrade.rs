@@ -3777,8 +3777,11 @@ mod tests {
                     bucket_path: Set("postgres-upgrade-tests".to_string()),
                     access_key_id: Set("test-access-key".to_string()),
                     secret_key: Set("test-secret-key".to_string()),
+                    session_token: Set(None),
+                    credentials_expire_at: Set(None),
                     force_path_style: Set(Some(true)),
                     is_default: Set(true),
+                    managed_by_cloud: Set(false),
                     created_at: Set(now),
                     updated_at: Set(now),
                 }

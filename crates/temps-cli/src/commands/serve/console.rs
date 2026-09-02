@@ -26,6 +26,7 @@ use temps_audit::AuditPlugin;
 use temps_auth::{ApiKeyPlugin, AuthPlugin};
 use temps_backup::BackupPlugin;
 use temps_blob::BlobPlugin;
+use temps_cloud::{CloudPlugin, CloudService};
 use temps_config::ConfigPlugin;
 use temps_config::ServerConfig;
 use temps_core::plugin::{PluginManager, TempsPlugin};
@@ -2310,6 +2311,15 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let config_plugin = Box::new(ConfigPlugin::new(config.clone()));
     plugin_manager.register_plugin(config_plugin);
 
+    // Optional managed control plane. It owns the enrollment state and the
+    // background telemetry mirror consumed later by OtelPlugin.
+    debug!("Registering CloudPlugin");
+    let cloud_plugin = Box::new(CloudPlugin::new(
+        config.data_dir.clone(),
+        env!("CARGO_PKG_VERSION"),
+    ));
+    plugin_manager.register_plugin(cloud_plugin);
+
     // 1.5. TelemetryPlugin - registers the anonymous telemetry reporter
     // (depends only on ServerConfig for the data dir). Registered early so
     // every later plugin can require the Arc<dyn TelemetryReporter>.
@@ -3673,6 +3683,9 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
     let external_plugins_service = plugin_manager
         .service_context()
         .get_service::<temps_external_plugins::ExternalPluginsService>();
+    let cloud_service = plugin_manager
+        .service_context()
+        .get_service::<CloudService>();
 
     // Join the channel to the router now that both exist. Plugins connect
     // during startup, before this router could possibly be assembled (it
@@ -3710,9 +3723,14 @@ pub async fn start_console_api(params: ConsoleApiParams) -> anyhow::Result<()> {
 
     let shutdown_signal = {
         let svc = external_plugins_service.clone();
+        let cloud = cloud_service.clone();
         async move {
             let _ = tokio::signal::ctrl_c().await;
-            info!("Console API received shutdown signal, stopping external plugins...");
+            info!("Console API received shutdown signal, stopping background services...");
+            if let Some(service) = cloud {
+                service.shutdown().await;
+                info!("Managed telemetry mirror shut down");
+            }
             if let Some(service) = svc {
                 service.shutdown_all().await;
                 info!("External plugins shut down");

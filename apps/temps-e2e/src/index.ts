@@ -468,6 +468,10 @@ program
       'run a real backup (physical or logical, engine-selected) to MinIO, insert post-backup rows, restore in place, ' +
       'and verify via the data-browser API that pre-backup rows are present and post-backup rows are absent',
   )
+  .option(
+    '--mariadb-image <image>',
+    'immutable MariaDB WAL-G image (repository@sha256 digest or local sha256 image ID); or $TEMPS_E2E_MARIADB_IMAGE',
+  )
   .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
   .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
   .option('--keep', 'do not tear down created resources')

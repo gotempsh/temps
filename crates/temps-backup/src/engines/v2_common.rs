@@ -429,6 +429,23 @@ pub fn walg_identity_env(backup_uuid: &str) -> [String; 2] {
     ]
 }
 
+/// Decrypt the optional STS session token on an S3 source row.
+///
+/// `Ok(None)` for every long-lived, operator-configured credential — which is
+/// every source that existed before Cloud-managed backup destinations — so
+/// callers can hand the result straight to
+/// `aws_sdk_s3::config::Credentials::new`'s third argument.
+pub fn decrypt_session_token(
+    s3_source: &temps_entities::s3_sources::Model,
+    encryption_service: &Arc<EncryptionService>,
+) -> Result<Option<String>, BackupError> {
+    temps_entities::s3_sources::decrypt_session_token(encryption_service, s3_source).map_err(|e| {
+        BackupError::PermanentFailure {
+            reason: format!("failed to decrypt S3 session token: {}", e),
+        }
+    })
+}
+
 /// Build an S3 client from an already-loaded S3 source row. Decrypts the
 /// access/secret keys via the supplied `EncryptionService` at call time —
 /// the engine never holds plaintext credentials beyond this point.
@@ -449,9 +466,18 @@ pub fn build_s3_client(
         .map_err(|e| BackupError::PermanentFailure {
             reason: format!("failed to decrypt S3 secret key: {}", e),
         })?;
+    // `None` for a long-lived credential, which leaves the signer behaving
+    // exactly as it always has. `Some` only for a temporary (prefix-scoped)
+    // credential, which SigV4 rejects unless the token is signed alongside it.
+    let session_token = decrypt_session_token(s3_source, encryption_service)?;
 
-    let creds =
-        aws_sdk_s3::config::Credentials::new(access_key, secret_key, None, None, user_agent);
+    let creds = aws_sdk_s3::config::Credentials::new(
+        access_key,
+        secret_key,
+        session_token,
+        None,
+        user_agent,
+    );
 
     let mut builder = Config::builder()
         .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
@@ -878,7 +904,73 @@ pub async fn best_effort_remove(path: &std::path::Path) {
 
 #[cfg(test)]
 mod tests {
-    use super::walg_identity_env;
+    use std::sync::Arc;
+
+    use super::{decrypt_session_token, walg_identity_env};
+    use temps_core::EncryptionService;
+
+    fn s3_source_row(session_token: Option<String>) -> temps_entities::s3_sources::Model {
+        let now = chrono::Utc::now();
+        temps_entities::s3_sources::Model {
+            id: 1,
+            name: "operator-source".to_string(),
+            bucket_name: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: "prod".to_string(),
+            access_key_id: "ciphertext".to_string(),
+            secret_key: "ciphertext".to_string(),
+            session_token,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: true,
+            managed_by_cloud: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// Every engine calls this before signing. For an operator-configured
+    /// source it must return `None`, which is what keeps
+    /// `Credentials::new(.., None, ..)` — the pre-existing behaviour — in
+    /// force for the installs already running their own S3 credentials.
+    #[test]
+    fn a_source_without_a_session_token_decrypts_to_none() {
+        let encryption = Arc::new(EncryptionService::new_from_password("v2-common-tests"));
+        assert!(decrypt_session_token(&s3_source_row(None), &encryption)
+            .expect("no token is not an error")
+            .is_none());
+    }
+
+    #[test]
+    fn a_source_with_a_session_token_decrypts_it_for_the_signer() {
+        let encryption = Arc::new(EncryptionService::new_from_password("v2-common-tests"));
+        let sealed = encryption
+            .encrypt_string("sts-session-token")
+            .expect("encrypt");
+        assert_eq!(
+            decrypt_session_token(&s3_source_row(Some(sealed)), &encryption)
+                .expect("decrypt")
+                .as_deref(),
+            Some("sts-session-token")
+        );
+    }
+
+    /// A corrupt or wrong-key token is a permanent failure with the source
+    /// named, not a silent fallback to an unsigned request that would fail
+    /// later with an opaque 403 from the provider.
+    #[test]
+    fn an_undecryptable_session_token_is_a_contextual_permanent_failure() {
+        let encryption = Arc::new(EncryptionService::new_from_password("v2-common-tests"));
+        let other = EncryptionService::new_from_password("some-other-key");
+        let sealed = other.encrypt_string("sts-session-token").expect("encrypt");
+
+        let error = decrypt_session_token(&s3_source_row(Some(sealed)), &encryption)
+            .expect_err("a token sealed with another key must not decode");
+        let rendered = error.to_string();
+        assert!(rendered.contains("session token"), "{rendered}");
+        assert!(rendered.contains("operator-source"), "{rendered}");
+    }
 
     #[test]
     fn walg_identity_env_forces_full_backup_and_exact_user_data() {

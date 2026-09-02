@@ -44,12 +44,17 @@ temps-backup = { path = "../temps-backup" }
 temps-revenue = { path = "../temps-revenue" }
 temps-observability = { path = "../temps-observability" }
 temps-config = { path = "../temps-config" }
+temps-cloud = { path = "../temps-cloud" }
+# `temps backfill cloud-telemetry` loads the instance's own Cloud link state
+# (ADR-040) out of process, so it needs the client directly rather than the
+# plugin that normally owns it inside `temps serve`.
+temps-cloud-client = { path = "../temps-cloud-client" }
 temps-core = { path = "../temps-core" }
 temps-database = { path = "../temps-database" }
 temps-deployer = { path = "../temps-deployer" }
 temps-deployments = { path = "../temps-deployments" }
 temps-dns = { path = "../temps-dns" }
-temps-network = { path = "../temps-network" }
+temps-network = { path = "../temps-network", features = ["control_plane"] }
 temps-domains = { path = "../temps-domains" }
 temps-email = { path = "../temps-email" }
 temps-email-tracking = { path = "../temps-email-tracking" }

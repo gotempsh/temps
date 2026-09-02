@@ -24,11 +24,18 @@ AIMD = "AIMD"
 # MongoDB query operator `$nin` ("not in"), in the data browser's filter
 # allowlist. typos reads it as a misspelling of "nine"/"min".
 nin = "nin"
+# Linux routing term "oif" (outgoing interface index) and the matching
+# `netlink_packet_route::route::RouteAttribute::Oif` enum variant from the
+# upstream netlink-packet-route crate. typos "corrects" it to "of"/"Of",
+# which silently breaks compilation since `Of` isn't a real variant.
+oif = "oif"
+Oif = "Oif"
 # Expected last four characters of "properly" in a masking regression test.
 erly = "erly"
-# The hyphenated prefix in "mis-attribute"/"mis-attributed" (ADR-040 docs and
-# ingest-key handlers) tokenizes to the bare word "mis", which typos reads as
-# a misspelling of "miss"/"mist".
+# The "mis-" prefix in hyphenated words like "mis-routes"/"mis-routing"
+# (ADR-041's ledger docs) and "mis-attribute"/"mis-attributed" (ADR-040 docs
+# and ingest-key handlers). typos tokenizes on the hyphen and mistakes the
+# fragment "mis" for "miss"/"mist".
 mis = "mis"
 
 [default.extend-identifiers]
@@ -36,6 +43,12 @@ mis = "mis"
 # (crates/temps-proxy/src/proxy.rs `extract_traceparent_trace_id` tests).
 # Hex string contains "ba" which the spell-checker mistakes for "by"/"be".
 "00f067aa0ba902b7" = "00f067aa0ba902b7"
+# Synthetic parent-span-id fixture in the ADR-040 fidelity tests
+# (crates/temps-otel/src/services/otel_service.rs, crates/temps-cloud-protocol/src/messages.rs) —
+# one hex digit off the W3C example above, deliberately, so a span's own id
+# and its parent's id are never byte-identical in the assertions. Same "ba"
+# false positive.
+"00f067aa0ba902b6" = "00f067aa0ba902b6"
 "deadbeef" = "deadbeef"
 # git-cliff nightly-tag changelog entry (CHANGELOG.md) — the short commit
 # hash "ba96c0f7" isolates to "ba", mistaken for "by"/"be".

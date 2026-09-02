@@ -116,6 +116,26 @@ pub struct AgentConfig {
     /// verifies the control plane's client certificate.
     #[serde(default)]
     pub cluster_ca_path: Option<std::path::PathBuf>,
+    /// Refuse to start the agent listener without a complete mTLS identity.
+    /// Newly enrolled workers set this to `true`. The serde default remains
+    /// `false` so legacy `agent.json` files can be upgraded deliberately.
+    #[serde(default)]
+    pub require_mtls: bool,
+    /// Network device the VXLAN overlay should bind to as its underlay
+    /// parent (e.g. `enp6s0`). `None` (the default) auto-detects the
+    /// device carrying the host's IPv4 default route at startup — set
+    /// this only when a host has multiple candidate interfaces and the
+    /// default route doesn't point at the one that should carry overlay
+    /// traffic. `#[serde(default)]` so older `agent.json` files without
+    /// this field still parse.
+    #[serde(default)]
+    pub underlay_dev: Option<String>,
+    /// Optional MTU ceiling for the selected underlay. When absent, the
+    /// agent reads the interface MTU from the kernel. A configured value can
+    /// lower that detected ceiling for tunnels with a smaller path MTU, but
+    /// it can never raise the overlay beyond what the link supports.
+    #[serde(default)]
+    pub underlay_mtu: Option<u32>,
 }
 
 fn default_dns_data_dir() -> std::path::PathBuf {
@@ -402,11 +422,32 @@ mod tests {
             tls_cert_path: None,
             tls_key_path: None,
             cluster_ca_path: None,
+            require_mtls: false,
+            underlay_dev: None,
+            underlay_mtu: None,
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let parsed: AgentConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.node_name, "worker-1");
         assert_eq!(parsed.node_id, 1);
+        assert!(!parsed.require_mtls);
+    }
+
+    #[test]
+    fn test_agent_config_without_underlay_mtu_remains_compatible() {
+        let json = r#"{
+            "listen_address":"0.0.0.0:3100",
+            "token":"test-token",
+            "node_name":"worker-1",
+            "control_plane_url":"https://control:3000",
+            "node_id":1,
+            "labels":{},
+            "dns_data_dir":"/tmp/temps-dns"
+        }"#;
+
+        let parsed: AgentConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.underlay_mtu, None);
+        assert!(!parsed.require_mtls);
     }
 }

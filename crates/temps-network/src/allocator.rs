@@ -24,7 +24,7 @@ use async_trait::async_trait;
 use ipnet::Ipv4Net;
 use sea_orm::{
     sea_query::Expr, ActiveModelTrait, ColumnTrait, DatabaseConnection, DbErr, EntityTrait,
-    QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
+    PaginatorTrait, QueryFilter, QueryOrder, QuerySelect, Set, TransactionTrait,
 };
 use std::net::IpAddr;
 use std::str::FromStr;
@@ -33,6 +33,10 @@ use temps_entities::{network_config as nc, nodes};
 use thiserror::Error;
 use tracing::info;
 use uuid::Uuid;
+
+/// Synthetic identity used by the data plane only. The control plane remains
+/// absent from the `nodes` table so it can never become a scheduler target.
+pub const CONTROL_PLANE_NODE_UUID: Uuid = Uuid::from_u128(0x74656d70732d63702d6f7665726c6179);
 
 /// Errors returned by the compute-network allocator.
 #[derive(Debug, Error)]
@@ -55,6 +59,43 @@ pub enum AllocatorError {
     #[error("network_config is invalid: {reason}")]
     InvalidConfig { reason: String },
 
+    /// Cluster-wide pool changes are unsafe after a node has received an
+    /// allocation. Every member must agree on one pool for routes and DNS.
+    #[error(
+        "cannot change compute pool from {current_pool} (/{current_prefix_len} per node) to \
+         {requested_pool} (/{requested_prefix_len} per node): {allocation_count} allocation(s) \
+         already exist; remove/re-enrol those nodes before changing the cluster pool"
+    )]
+    PoolChangeAfterAllocation {
+        current_pool: Ipv4Net,
+        current_prefix_len: u8,
+        requested_pool: Ipv4Net,
+        requested_prefix_len: u8,
+        allocation_count: u64,
+    },
+
+    /// A concurrent setup or pool reconfiguration replaced the reservation
+    /// this caller prepared. Stale setup attempts must never publish or
+    /// withdraw the replacement allocation.
+    #[error(
+        "control-plane overlay setup for {compute_cidr} via {underlay_address} was superseded by another configuration change"
+    )]
+    SupersededControlPlaneSetup {
+        compute_cidr: Ipv4Net,
+        underlay_address: IpAddr,
+    },
+
+    #[error(
+        "refusing to release ready control-plane allocation {compute_cidr} via {underlay_address}; tear down the cluster explicitly"
+    )]
+    ReadyControlPlaneRelease {
+        compute_cidr: Ipv4Net,
+        underlay_address: IpAddr,
+    },
+
+    #[error("underlay address {address} is inside compute pool {pool}")]
+    UnderlayOverlapsComputePool { address: IpAddr, pool: Ipv4Net },
+
     /// The node already has a `compute_cidr` allocated.
     #[error("node {node_id} already has compute_cidr {existing}")]
     AlreadyAllocated { node_id: i32, existing: Ipv4Net },
@@ -71,6 +112,11 @@ pub enum AllocatorError {
         raw: String,
         reason: String,
     },
+
+    /// Public addresses would expose VXLAN directly to the internet and are
+    /// never valid cluster-underlay endpoints.
+    #[error("node {node_id} has publicly-routable underlay address {address}")]
+    PublicUnderlayAddress { node_id: i32, address: IpAddr },
 
     /// Persisted compute_cidr is not a valid IPv4 CIDR.
     #[error("node {node_id} has malformed compute_cidr {raw:?}: {reason}")]
@@ -125,12 +171,37 @@ pub struct NodeAllocPersisted {
     pub underlay_address: IpAddr,
 }
 
+/// Authoritative cluster-wide pool from the `network_config` singleton.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClusterNetworkConfig {
+    pub compute_pool_cidr: Ipv4Net,
+    pub subnet_prefix_len: u8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlPlaneReservation {
+    pub alloc: NodeAllocPersisted,
+    pub was_ready: bool,
+    pub cluster_config: ClusterNetworkConfig,
+    pub setup_generation: i64,
+}
+
 impl From<NodeAllocPersisted> for crate::NodeAlloc {
     fn from(p: NodeAllocPersisted) -> Self {
         Self {
             node_id: p.external_id,
             compute_cidr: p.compute_cidr,
             bridge_address: p.bridge_address,
+            underlay_address: p.underlay_address,
+        }
+    }
+}
+
+impl From<NodeAllocPersisted> for Peer {
+    fn from(p: NodeAllocPersisted) -> Self {
+        Self {
+            node_id: p.external_id,
+            compute_cidr: p.compute_cidr,
             underlay_address: p.underlay_address,
         }
     }
@@ -146,6 +217,378 @@ impl PostgresAllocator {
     pub fn new(db: Arc<DatabaseConnection>) -> Self {
         Self { db }
     }
+
+    /// Read the one authoritative compute pool shared by the control plane
+    /// and every worker.
+    pub async fn cluster_config(&self) -> Result<ClusterNetworkConfig, AllocatorError> {
+        let cfg = nc::Entity::find_by_id(1)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or(AllocatorError::InvalidConfig {
+                reason: "network_config singleton row missing".into(),
+            })?;
+        cluster_config_from_model(&cfg)
+    }
+
+    /// Configure the global pool before the first node is allocated.
+    ///
+    /// Once any allocation or reservation exists, changing the pool would
+    /// leave an in-flight setup mutating kernel state for a stale topology.
+    /// Failed setup is retried with the same authoritative pool; changing it
+    /// requires explicitly removing the cluster allocation first.
+    pub async fn configure_pool(
+        &self,
+        requested_pool: Ipv4Net,
+        requested_prefix_len: u8,
+    ) -> Result<ClusterNetworkConfig, AllocatorError> {
+        validate_pool(requested_pool, requested_prefix_len)?;
+        let txn = self.db.begin().await?;
+        let cfg = nc::Entity::find_by_id(1)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(AllocatorError::InvalidConfig {
+                reason: "network_config singleton row missing".into(),
+            })?;
+        let current = cluster_config_from_model(&cfg)?;
+        let requested = ClusterNetworkConfig {
+            compute_pool_cidr: requested_pool,
+            subnet_prefix_len: requested_prefix_len,
+        };
+        if current == requested {
+            txn.commit().await?;
+            return Ok(current);
+        }
+
+        let worker_allocations = nodes::Entity::find()
+            .filter(nodes::Column::ComputeCidr.is_not_null())
+            .count(&txn)
+            .await?;
+        let control_plane_allocations = u64::from(cfg.control_plane_compute_cidr.is_some());
+        let allocation_count = worker_allocations + control_plane_allocations;
+        if allocation_count > 0 {
+            return Err(AllocatorError::PoolChangeAfterAllocation {
+                current_pool: current.compute_pool_cidr,
+                current_prefix_len: current.subnet_prefix_len,
+                requested_pool,
+                requested_prefix_len,
+                allocation_count,
+            });
+        }
+
+        let next_generation = cfg
+            .control_plane_setup_generation
+            .checked_add(1)
+            .ok_or_else(|| AllocatorError::InvalidConfig {
+                reason: "control-plane setup generation exhausted".into(),
+            })?;
+        let mut active: nc::ActiveModel = cfg.into();
+        active.compute_pool_cidr = Set(requested_pool.to_string());
+        active.subnet_prefix_len = Set(i32::from(requested_prefix_len));
+        // No allocation exists here, so these fields should already be empty.
+        // Clear them defensively to keep the singleton internally consistent.
+        active.control_plane_compute_cidr = Set(None);
+        active.control_plane_underlay_address = Set(None);
+        active.control_plane_overlay_ready = Set(false);
+        // Fence any setup attempt that captured the previous pool.
+        active.control_plane_setup_generation = Set(next_generation);
+        active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(requested)
+    }
+
+    /// Reserve (or refresh) the control plane's stable overlay allocation.
+    ///
+    /// The highest free subnet is used so upgrades of existing clusters do
+    /// not collide with workers, which historically allocate from the bottom
+    /// of the pool. The value is persisted in `network_config`, making this
+    /// operation safe to run repeatedly from startup and `temps network setup`.
+    pub async fn ensure_control_plane_alloc(
+        &self,
+        underlay_address: IpAddr,
+    ) -> Result<NodeAllocPersisted, AllocatorError> {
+        Ok(self
+            .ensure_control_plane_reservation(underlay_address)
+            .await?
+            .alloc)
+    }
+
+    pub async fn ensure_control_plane_reservation(
+        &self,
+        underlay_address: IpAddr,
+    ) -> Result<ControlPlaneReservation, AllocatorError> {
+        let txn = self.db.begin().await?;
+        let cfg = nc::Entity::find_by_id(1)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(AllocatorError::InvalidConfig {
+                reason: "network_config singleton row missing".into(),
+            })?;
+
+        let pool =
+            parse_cidr(&cfg.compute_pool_cidr).map_err(|error| AllocatorError::InvalidConfig {
+                reason: format!("compute_pool_cidr: {error}"),
+            })?;
+        let prefix_len =
+            u8::try_from(cfg.subnet_prefix_len).map_err(|_| AllocatorError::InvalidConfig {
+                reason: format!("subnet_prefix_len {} out of range", cfg.subnet_prefix_len),
+            })?;
+        validate_subnet_prefix(pool, prefix_len)?;
+        validate_underlay_outside_pool(underlay_address, pool)?;
+        let cluster_config = ClusterNetworkConfig {
+            compute_pool_cidr: pool,
+            subnet_prefix_len: prefix_len,
+        };
+
+        let previous_cidr = cfg.control_plane_compute_cidr.clone();
+        let previous_underlay = cfg.control_plane_underlay_address.clone();
+        let was_ready = cfg.control_plane_overlay_ready;
+        let cidr = if let Some(raw) = previous_cidr.as_deref() {
+            parse_cidr(raw).map_err(|error| AllocatorError::ComputeCidrInvalid {
+                node_id: 0,
+                raw: raw.to_owned(),
+                reason: error.to_string(),
+            })?
+        } else {
+            let used_rows: Vec<Option<String>> = nodes::Entity::find()
+                .filter(nodes::Column::ComputeCidr.is_not_null())
+                .select_only()
+                .column(nodes::Column::ComputeCidr)
+                .into_tuple()
+                .all(&txn)
+                .await?;
+            let mut used = Vec::with_capacity(used_rows.len());
+            for raw in used_rows.into_iter().flatten() {
+                used.push(parse_cidr(&raw).map_err(|error| {
+                    AllocatorError::ComputeCidrInvalid {
+                        node_id: 0,
+                        raw,
+                        reason: error.to_string(),
+                    }
+                })?);
+            }
+            pick_highest_free_subnet(pool, prefix_len, &used).ok_or(
+                AllocatorError::PoolExhausted {
+                    pool,
+                    prefix_len,
+                    used_count: used.len(),
+                },
+            )?
+        };
+
+        let cidr_string = cidr.to_string();
+        let underlay_string = underlay_address.to_string();
+        let unchanged = previous_cidr.as_deref() == Some(cidr_string.as_str())
+            && previous_underlay.as_deref() == Some(underlay_string.as_str());
+        let setup_generation = cfg
+            .control_plane_setup_generation
+            .checked_add(1)
+            .ok_or_else(|| AllocatorError::InvalidConfig {
+                reason: "control-plane setup generation exhausted".into(),
+            })?;
+        let mut active: nc::ActiveModel = cfg.into();
+        active.control_plane_compute_cidr = Set(Some(cidr_string));
+        active.control_plane_underlay_address = Set(Some(underlay_string));
+        // A reservation is not a routable peer until privileged setup has
+        // completed. Preserve readiness only for an unchanged allocation.
+        active.control_plane_overlay_ready = Set(was_ready && unchanged);
+        active.control_plane_setup_generation = Set(setup_generation);
+        active.update(&txn).await?;
+        txn.commit().await?;
+
+        Ok(ControlPlaneReservation {
+            alloc: NodeAllocPersisted {
+                node_id: 0,
+                external_id: CONTROL_PLANE_NODE_UUID,
+                compute_cidr: cidr,
+                bridge_address: bridge_address_for(&cidr),
+                underlay_address,
+            },
+            was_ready: was_ready && unchanged,
+            cluster_config,
+            setup_generation,
+        })
+    }
+
+    /// Publish or withdraw exactly the reservation this setup attempt owns.
+    /// The compare-and-set filters fence stale concurrent setup attempts.
+    pub async fn set_control_plane_ready_for(
+        &self,
+        reservation: &ControlPlaneReservation,
+        ready: bool,
+    ) -> Result<(), AllocatorError> {
+        let result = nc::Entity::update_many()
+            .col_expr(nc::Column::ControlPlaneOverlayReady, Expr::value(ready))
+            .filter(nc::Column::Id.eq(1))
+            .filter(
+                nc::Column::ControlPlaneComputeCidr
+                    .eq(Some(reservation.alloc.compute_cidr.to_string())),
+            )
+            .filter(
+                nc::Column::ControlPlaneUnderlayAddress
+                    .eq(Some(reservation.alloc.underlay_address.to_string())),
+            )
+            .filter(
+                nc::Column::ComputePoolCidr
+                    .eq(reservation.cluster_config.compute_pool_cidr.to_string()),
+            )
+            .filter(
+                nc::Column::SubnetPrefixLen
+                    .eq(i32::from(reservation.cluster_config.subnet_prefix_len)),
+            )
+            .filter(nc::Column::ControlPlaneSetupGeneration.eq(reservation.setup_generation))
+            .exec(self.db.as_ref())
+            .await?;
+        if result.rows_affected == 0 {
+            return Err(AllocatorError::SupersededControlPlaneSetup {
+                compute_cidr: reservation.alloc.compute_cidr,
+                underlay_address: reservation.alloc.underlay_address,
+            });
+        }
+        Ok(())
+    }
+
+    /// Release a failed, unpublished first-setup reservation. The generation
+    /// and topology comparison fence concurrent setup attempts; a ready
+    /// control plane is never removed by failure recovery.
+    pub async fn release_unready_control_plane_reservation(
+        &self,
+        reservation: &ControlPlaneReservation,
+    ) -> Result<(), AllocatorError> {
+        let txn = self.db.begin().await?;
+        let cfg = nc::Entity::find_by_id(1)
+            .lock_exclusive()
+            .one(&txn)
+            .await?
+            .ok_or(AllocatorError::InvalidConfig {
+                reason: "network_config singleton row missing".into(),
+            })?;
+        let matches_reservation = cfg.control_plane_compute_cidr.as_deref()
+            == Some(reservation.alloc.compute_cidr.to_string().as_str())
+            && cfg.control_plane_underlay_address.as_deref()
+                == Some(reservation.alloc.underlay_address.to_string().as_str())
+            && cfg.compute_pool_cidr == reservation.cluster_config.compute_pool_cidr.to_string()
+            && cfg.subnet_prefix_len == i32::from(reservation.cluster_config.subnet_prefix_len)
+            && cfg.control_plane_setup_generation == reservation.setup_generation;
+        if !matches_reservation {
+            return Err(AllocatorError::SupersededControlPlaneSetup {
+                compute_cidr: reservation.alloc.compute_cidr,
+                underlay_address: reservation.alloc.underlay_address,
+            });
+        }
+        if cfg.control_plane_overlay_ready {
+            return Err(AllocatorError::ReadyControlPlaneRelease {
+                compute_cidr: reservation.alloc.compute_cidr,
+                underlay_address: reservation.alloc.underlay_address,
+            });
+        }
+        let next_generation = cfg
+            .control_plane_setup_generation
+            .checked_add(1)
+            .ok_or_else(|| AllocatorError::InvalidConfig {
+                reason: "control-plane setup generation exhausted".into(),
+            })?;
+        let mut active: nc::ActiveModel = cfg.into();
+        active.control_plane_compute_cidr = Set(None);
+        active.control_plane_underlay_address = Set(None);
+        active.control_plane_overlay_ready = Set(false);
+        active.control_plane_setup_generation = Set(next_generation);
+        active.update(&txn).await?;
+        txn.commit().await?;
+        Ok(())
+    }
+
+    /// Return the persisted control-plane allocation, if networking has been
+    /// configured for it.
+    pub async fn get_control_plane_alloc(
+        &self,
+    ) -> Result<Option<NodeAllocPersisted>, AllocatorError> {
+        let Some(cfg) = nc::Entity::find_by_id(1).one(self.db.as_ref()).await? else {
+            return Err(AllocatorError::InvalidConfig {
+                reason: "network_config singleton row missing".into(),
+            });
+        };
+        if !cfg.control_plane_overlay_ready {
+            return Ok(None);
+        }
+        let (Some(cidr_raw), Some(underlay_raw)) = (
+            cfg.control_plane_compute_cidr,
+            cfg.control_plane_underlay_address,
+        ) else {
+            return Ok(None);
+        };
+        let cidr = parse_cidr(&cidr_raw).map_err(|error| AllocatorError::ComputeCidrInvalid {
+            node_id: 0,
+            raw: cidr_raw,
+            reason: error.to_string(),
+        })?;
+        let underlay_address =
+            underlay_raw
+                .parse()
+                .map_err(
+                    |error: std::net::AddrParseError| AllocatorError::UnderlayInvalid {
+                        node_id: 0,
+                        raw: underlay_raw,
+                        reason: error.to_string(),
+                    },
+                )?;
+        validate_private_underlay(0, underlay_address)?;
+        Ok(Some(NodeAllocPersisted {
+            node_id: 0,
+            external_id: CONTROL_PLANE_NODE_UUID,
+            compute_cidr: cidr,
+            bridge_address: bridge_address_for(&cidr),
+            underlay_address,
+        }))
+    }
+
+    /// Worker peers as seen by the control plane.
+    pub async fn control_plane_peer_list(&self) -> Result<Vec<Peer>, AllocatorError> {
+        self.worker_peers(None).await
+    }
+
+    async fn worker_peers(
+        &self,
+        excluded_node_id: Option<i32>,
+    ) -> Result<Vec<Peer>, AllocatorError> {
+        let mut query = nodes::Entity::find()
+            .filter(nodes::Column::ComputeCidr.is_not_null())
+            .filter(nodes::Column::UnderlayAddress.is_not_null())
+            .order_by_asc(nodes::Column::Id);
+        if let Some(node_id) = excluded_node_id {
+            query = query.filter(nodes::Column::Id.ne(node_id));
+        }
+        let rows = query.all(self.db.as_ref()).await?;
+        let mut peers = Vec::with_capacity(rows.len());
+        for row in rows {
+            let id = row.id;
+            let cidr_raw = row.compute_cidr.unwrap_or_default();
+            let underlay_raw = row.underlay_address.unwrap_or_default();
+            let compute_cidr =
+                parse_cidr(&cidr_raw).map_err(|error| AllocatorError::ComputeCidrInvalid {
+                    node_id: id,
+                    raw: cidr_raw,
+                    reason: error.to_string(),
+                })?;
+            let underlay_address =
+                underlay_raw
+                    .parse()
+                    .map_err(
+                        |error: std::net::AddrParseError| AllocatorError::UnderlayInvalid {
+                            node_id: id,
+                            raw: underlay_raw,
+                            reason: error.to_string(),
+                        },
+                    )?;
+            peers.push(Peer {
+                node_id: Uuid::new_v5(&Uuid::NAMESPACE_OID, format!("temps-node-{id}").as_bytes()),
+                compute_cidr,
+                underlay_address,
+            });
+        }
+        Ok(peers)
+    }
 }
 
 #[async_trait]
@@ -154,12 +597,11 @@ impl ComputeNetworkAllocator for PostgresAllocator {
         let txn = self.db.begin().await?;
 
         // 1. Load the cluster network config (singleton row id = 1).
-        let cfg = nc::Entity::find()
-            .one(&txn)
-            .await?
-            .ok_or(AllocatorError::InvalidConfig {
+        let cfg = nc::Entity::find().lock_exclusive().one(&txn).await?.ok_or(
+            AllocatorError::InvalidConfig {
                 reason: "network_config singleton row missing".into(),
-            })?;
+            },
+        )?;
 
         let pool =
             parse_cidr(&cfg.compute_pool_cidr).map_err(|e| AllocatorError::InvalidConfig {
@@ -169,15 +611,7 @@ impl ComputeNetworkAllocator for PostgresAllocator {
             u8::try_from(cfg.subnet_prefix_len).map_err(|_| AllocatorError::InvalidConfig {
                 reason: format!("subnet_prefix_len {} out of range", cfg.subnet_prefix_len),
             })?;
-        if prefix_len <= pool.prefix_len() || prefix_len > 32 {
-            return Err(AllocatorError::InvalidConfig {
-                reason: format!(
-                    "subnet_prefix_len {} must be greater than pool prefix {} and <= 32",
-                    prefix_len,
-                    pool.prefix_len()
-                ),
-            });
-        }
+        validate_subnet_prefix(pool, prefix_len)?;
 
         // 2. Load the target node and verify preconditions.
         let node = nodes::Entity::find_by_id(node_id)
@@ -210,6 +644,15 @@ impl ComputeNetworkAllocator for PostgresAllocator {
                     reason: e.to_string(),
                 },
             )?;
+        validate_underlay_outside_pool(underlay, pool)?;
+        // Public-underlay worker clusters predate control-plane overlay
+        // participation and must keep working on upgrade. Once the control
+        // plane is advertised as a peer, however, every newly allocated node
+        // must be on the same private underlay; accepting a public endpoint
+        // would create an unreachable mixed topology and expose VXLAN.
+        if cfg.control_plane_overlay_ready {
+            validate_private_underlay(node_id, underlay)?;
+        }
 
         // 3. Load all currently-used CIDRs so we can pick a free one.
         let used_rows: Vec<Option<String>> = nodes::Entity::find()
@@ -220,7 +663,7 @@ impl ComputeNetworkAllocator for PostgresAllocator {
             .all(&txn)
             .await?;
 
-        let mut used: Vec<Ipv4Net> = Vec::with_capacity(used_rows.len());
+        let mut used: Vec<Ipv4Net> = Vec::with_capacity(used_rows.len() + 1);
         for raw in used_rows.into_iter().flatten() {
             match parse_cidr(&raw) {
                 Ok(c) => used.push(c),
@@ -234,6 +677,15 @@ impl ComputeNetworkAllocator for PostgresAllocator {
                     });
                 }
             }
+        }
+        if let Some(raw) = cfg.control_plane_compute_cidr.as_deref() {
+            used.push(
+                parse_cidr(raw).map_err(|error| AllocatorError::ComputeCidrInvalid {
+                    node_id: 0,
+                    raw: raw.to_owned(),
+                    reason: error.to_string(),
+                })?,
+            );
         }
 
         // 4. Find the lowest-numbered free subnet of `prefix_len` inside `pool`.
@@ -284,44 +736,9 @@ impl ComputeNetworkAllocator for PostgresAllocator {
     }
 
     async fn peer_list(&self, viewer_node_id: i32) -> Result<Vec<Peer>, AllocatorError> {
-        let rows = nodes::Entity::find()
-            .filter(nodes::Column::ComputeCidr.is_not_null())
-            .filter(nodes::Column::UnderlayAddress.is_not_null())
-            .filter(nodes::Column::Id.ne(viewer_node_id))
-            .order_by_asc(nodes::Column::Id)
-            .all(self.db.as_ref())
-            .await?;
-
-        let mut peers = Vec::with_capacity(rows.len());
-        for row in rows {
-            let id = row.id;
-            // Both columns guaranteed non-NULL by the filters above; unwrap is safe in this scope.
-            let cidr_raw = row.compute_cidr.unwrap_or_default();
-            let underlay_raw = row.underlay_address.unwrap_or_default();
-            let cidr = parse_cidr(&cidr_raw).map_err(|e| AllocatorError::ComputeCidrInvalid {
-                node_id: id,
-                raw: cidr_raw.clone(),
-                reason: e.to_string(),
-            })?;
-            let underlay: IpAddr =
-                underlay_raw
-                    .parse()
-                    .map_err(
-                        |e: std::net::AddrParseError| AllocatorError::UnderlayInvalid {
-                            node_id: id,
-                            raw: underlay_raw.clone(),
-                            reason: e.to_string(),
-                        },
-                    )?;
-            let external_id = Uuid::new_v5(
-                &Uuid::NAMESPACE_OID,
-                format!("temps-node-{}", id).as_bytes(),
-            );
-            peers.push(Peer {
-                node_id: external_id,
-                compute_cidr: cidr,
-                underlay_address: underlay,
-            });
+        let mut peers = self.worker_peers(Some(viewer_node_id)).await?;
+        if let Some(control_plane) = self.get_control_plane_alloc().await? {
+            peers.push(control_plane.into());
         }
         Ok(peers)
     }
@@ -369,6 +786,78 @@ impl ComputeNetworkAllocator for PostgresAllocator {
     }
 }
 
+fn validate_subnet_prefix(pool: Ipv4Net, prefix_len: u8) -> Result<(), AllocatorError> {
+    if prefix_len <= pool.prefix_len() || prefix_len > 30 {
+        return Err(AllocatorError::InvalidConfig {
+            reason: format!(
+                "subnet_prefix_len {} must be greater than the pool prefix {} and <= 30 so each node has a gateway and container address",
+                prefix_len,
+                pool.prefix_len()
+            ),
+        });
+    }
+    if prefix_len - pool.prefix_len() > 20 {
+        return Err(AllocatorError::InvalidConfig {
+            reason: format!(
+                "compute pool {pool} split into /{prefix_len} would create more than 1,048,576 subnets"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_underlay_outside_pool(address: IpAddr, pool: Ipv4Net) -> Result<(), AllocatorError> {
+    if let IpAddr::V4(address) = address {
+        if pool.contains(&address) {
+            return Err(AllocatorError::UnderlayOverlapsComputePool {
+                address: IpAddr::V4(address),
+                pool,
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_pool(pool: Ipv4Net, prefix_len: u8) -> Result<(), AllocatorError> {
+    if !pool.network().is_private() || !pool.broadcast().is_private() {
+        return Err(AllocatorError::InvalidConfig {
+            reason: format!("compute pool {pool} must be entirely within RFC1918 private space"),
+        });
+    }
+    validate_subnet_prefix(pool, prefix_len)
+}
+
+fn cluster_config_from_model(cfg: &nc::Model) -> Result<ClusterNetworkConfig, AllocatorError> {
+    let pool =
+        parse_cidr(&cfg.compute_pool_cidr).map_err(|error| AllocatorError::InvalidConfig {
+            reason: format!("compute_pool_cidr: {error}"),
+        })?;
+    let prefix_len =
+        u8::try_from(cfg.subnet_prefix_len).map_err(|_| AllocatorError::InvalidConfig {
+            reason: format!("subnet_prefix_len {} out of range", cfg.subnet_prefix_len),
+        })?;
+    validate_pool(pool, prefix_len)?;
+    Ok(ClusterNetworkConfig {
+        compute_pool_cidr: pool,
+        subnet_prefix_len: prefix_len,
+    })
+}
+
+pub(crate) fn is_private_underlay(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => address.is_private() || address.is_link_local(),
+        IpAddr::V6(address) => address.is_unique_local() || address.is_unicast_link_local(),
+    }
+}
+
+fn validate_private_underlay(node_id: i32, address: IpAddr) -> Result<(), AllocatorError> {
+    if is_private_underlay(address) {
+        Ok(())
+    } else {
+        Err(AllocatorError::PublicUnderlayAddress { node_id, address })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers (unit-tested below; no DB / IO).
 // ---------------------------------------------------------------------------
@@ -395,6 +884,24 @@ pub(crate) fn pick_free_subnet(pool: Ipv4Net, prefix_len: u8, used: &[Ipv4Net]) 
     })
 }
 
+fn pick_highest_free_subnet(pool: Ipv4Net, prefix_len: u8, used: &[Ipv4Net]) -> Option<Ipv4Net> {
+    let subnet_count = 1_u64.checked_shl(u32::from(prefix_len.checked_sub(pool.prefix_len())?))?;
+    let subnet_size = 1_u64.checked_shl(u32::from(32_u8.checked_sub(prefix_len)?))?;
+    let pool_start = u64::from(u32::from(pool.network()));
+    for index in (0..subnet_count).rev() {
+        let address = pool_start.checked_add(index.checked_mul(subnet_size)?)?;
+        let address = std::net::Ipv4Addr::from(u32::try_from(address).ok()?);
+        let candidate = Ipv4Net::new(address, prefix_len).ok()?;
+        if !used
+            .iter()
+            .any(|existing| crate::config::cidrs_overlap(existing, &candidate))
+        {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Tests — pure helpers only. Postgres-touching tests live in
 // crates/temps-network/tests/it_allocator.rs (Docker-gated).
@@ -403,6 +910,40 @@ pub(crate) fn pick_free_subnet(pool: Ipv4Net, prefix_len: u8, used: &[Ipv4Net]) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pool_must_be_private_and_larger_than_node_subnets() {
+        let valid: Ipv4Net = "10.240.0.0/16".parse().unwrap();
+        assert!(validate_pool(valid, 24).is_ok());
+
+        let public: Ipv4Net = "100.64.0.0/16".parse().unwrap();
+        assert!(matches!(
+            validate_pool(public, 24),
+            Err(AllocatorError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            validate_pool(valid, 16),
+            Err(AllocatorError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            validate_pool(valid, 31),
+            Err(AllocatorError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            validate_pool(valid, 32),
+            Err(AllocatorError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn underlay_must_not_be_inside_compute_pool() {
+        let pool: Ipv4Net = "10.240.0.0/16".parse().unwrap();
+        assert!(validate_underlay_outside_pool("10.200.4.2".parse().unwrap(), pool).is_ok());
+        assert!(matches!(
+            validate_underlay_outside_pool("10.240.4.2".parse().unwrap(), pool),
+            Err(AllocatorError::UnderlayOverlapsComputePool { .. })
+        ));
+    }
 
     #[test]
     fn bridge_address_is_first_host() {
@@ -443,5 +984,23 @@ mod tests {
         let pool = Ipv4Net::from_str("10.50.0.0/16").unwrap();
         let chosen = pick_free_subnet(pool, 24, &[]).unwrap();
         assert_eq!(chosen.to_string(), "10.50.0.0/24");
+    }
+
+    #[test]
+    fn control_plane_picks_highest_free_subnet() {
+        let pool = Ipv4Net::from_str("172.20.0.0/16").unwrap();
+        let used = vec![Ipv4Net::from_str("172.20.255.0/24").unwrap()];
+        let chosen = pick_highest_free_subnet(pool, 24, &used).unwrap();
+        assert_eq!(chosen.to_string(), "172.20.254.0/24");
+    }
+
+    #[test]
+    fn underlay_accepts_private_addresses_and_rejects_public_addresses() {
+        assert!(is_private_underlay("10.200.4.2".parse().unwrap()));
+        assert!(is_private_underlay("fd00::2".parse().unwrap()));
+        assert!(!is_private_underlay("88.198.50.37".parse().unwrap()));
+        assert!(!is_private_underlay(
+            "2001:4860:4860::8888".parse().unwrap()
+        ));
     }
 }

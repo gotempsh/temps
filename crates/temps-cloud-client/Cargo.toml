@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "temps-cloud-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Optional client that links a self-hosted Temps instance to a managed backend."
+
+[dependencies]
+temps-cloud-protocol = { path = "../temps-cloud-protocol" }
+temps-core = { path = "../temps-core" }
+# ADR-041 §3a: the Cloud-primary write path's durable outbox is a Postgres
+# table, deliberately reusing the proven `events_ch_outbox` pattern rather than
+# inventing a file queue. Postgres is unconditionally present on every
+# deployment shape, so this adds no new runtime dependency — only a compile-time
+# one on the entity definitions and the ORM the rest of the workspace already
+# uses.
+temps-entities = { path = "../temps-entities" }
+sea-orm = { workspace = true }
+
+async-trait.workspace = true
+base64.workspace = true
+chrono.workspace = true
+# Points a stock ClickHouse client at Temps Cloud's HTTP-interface read proxy
+# (`src/query.rs`). Same 0.15 line as `temps-otel` and `temps-analytics-backend`
+# so the workspace resolves one version.
+#
+# The TLS features are what those two crates do not need: they talk to a local
+# ClickHouse over plain HTTP, whereas the Cloud backend is HTTPS. `ring` matches
+# the provider the workspace already pins for `rustls`/`tokio-rustls`, and
+# webpki roots match what `reqwest`'s `rustls-tls` feature already gives
+# `CloudClient`. The connector stays `https_or_http`, so the existing plain-HTTP
+# ClickHouse callers are unaffected by the feature unification.
+clickhouse = { version = "0.15", features = ["rustls-tls-ring", "rustls-tls-webpki-roots"] }
+hmac = "0.13"
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile = "3"
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["serde"] }
+
+[dev-dependencies]
+axum.workspace = true
+futures.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

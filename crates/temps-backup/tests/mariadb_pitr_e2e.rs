@@ -7,7 +7,7 @@
 //! containers - no mocks of the backup/restore mechanics:
 //!
 //!   1. Boot MinIO (S3) + create a bucket.
-//!   2. Boot a `mariadb:lts` "source" container with binary logging on.
+//!   2. Boot the WAL-G-enabled MariaDB image with binary logging on.
 //!   3. Stand up a Postgres test DB with the real schema (`TestDatabase`),
 //!      then insert an `external_services` row (config encrypted with the
 //!      SAME `EncryptionService` the engine uses) + an `s3_sources` row
@@ -47,6 +47,7 @@ use temps_providers::externalsvc::{
 };
 use tokio_util::sync::CancellationToken;
 
+const DEFAULT_MARIADB_WALG_IMAGE: &str = "ghcr.io/gotempsh/mariadb-walg:11.4";
 // A fixed 64-hex-char master key (== 32 bytes) shared by the test and every
 // EncryptionService instance, so encrypt-here / decrypt-in-engine round-trips.
 const MASTER_KEY_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -129,9 +130,39 @@ async fn connect_docker() -> Option<Docker> {
     Some(docker)
 }
 
-/// Pull an image (best-effort; ignores "already present" style results).
+async fn ensure_pitr_network(docker: &Docker) -> anyhow::Result<()> {
+    if docker
+        .inspect_network(
+            temps_core::NETWORK_NAME.as_str(),
+            None::<bollard::query_parameters::InspectNetworkOptions>,
+        )
+        .await
+        .is_ok()
+    {
+        return Ok(());
+    }
+    docker
+        .create_network(bollard::models::NetworkCreateRequest {
+            name: temps_core::NETWORK_NAME.to_string(),
+            driver: Some("bridge".to_string()),
+            ..Default::default()
+        })
+        .await
+        .map(|_| ())
+        .map_err(|error| anyhow::anyhow!("create PITR Docker network: {error}"))
+}
+
+/// Ensure an image is available locally, pulling it only when it is absent.
+///
+/// CI builds unreleased service images from this checkout, so attempting an
+/// unconditional registry pull would fail even though the exact image under
+/// test is already present in the daemon.
 async fn pull_image(docker: &Docker, image: &str) -> anyhow::Result<()> {
     use futures::StreamExt;
+    if docker.inspect_image(image).await.is_ok() {
+        return Ok(());
+    }
+
     let (name, tag) = image.split_once(':').unwrap_or((image, "latest"));
     let mut stream = docker.create_image(
         Some(bollard::query_parameters::CreateImageOptions {
@@ -148,14 +179,40 @@ async fn pull_image(docker: &Docker, image: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the test image to the immutable local image ID Docker will execute.
+///
+/// CI builds the image from this checkout under a convenient tag, while local
+/// release-gate runs may provide a different tag through
+/// `TEMPS_MARIADB_WALG_IMAGE`. The application contract deliberately rejects
+/// mutable tags, so the service configuration used by backup and restore must
+/// contain the inspected `sha256:<image-id>`, not that setup tag.
+async fn resolve_mariadb_image(docker: &Docker) -> anyhow::Result<(String, String)> {
+    let requested = std::env::var("TEMPS_MARIADB_WALG_IMAGE")
+        .unwrap_or_else(|_| DEFAULT_MARIADB_WALG_IMAGE.to_string());
+    pull_image(docker, &requested).await?;
+    let inspected = docker
+        .inspect_image(&requested)
+        .await
+        .map_err(|error| anyhow::anyhow!("inspect MariaDB WAL-G image {requested}: {error}"))?;
+    let immutable = inspected
+        .id
+        .filter(|id| id.starts_with("sha256:") && id.len() == 71)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "MariaDB WAL-G image {requested} did not resolve to an immutable sha256 image ID"
+            )
+        })?;
+    Ok((requested, immutable))
+}
+
 fn find_available_port(start: u16) -> Option<u16> {
     use std::net::TcpListener;
     (start..start + 200).find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok())
 }
 
-/// Boot a MinIO container, returning (host_port, guard). Skips (None) on
-/// failure so the test can bail gracefully.
-async fn boot_minio(docker: &Docker) -> Option<(u16, ContainerGuard)> {
+/// Boot a MinIO container, returning (host_port, container_name, guard).
+/// Skips (None) on failure so the test can bail gracefully.
+async fn boot_minio(docker: &Docker) -> Option<(u16, String, ContainerGuard)> {
     if pull_image(docker, "minio/minio:latest").await.is_err() {
         eprintln!("Could not pull MinIO image, skipping");
         return None;
@@ -179,6 +236,12 @@ async fn boot_minio(docker: &Docker) -> Option<(u16, ContainerGuard)> {
                 }]),
             )])),
             ..Default::default()
+        }),
+        networking_config: Some(bollard::models::NetworkingConfig {
+            endpoints_config: Some(HashMap::from([(
+                temps_core::NETWORK_NAME.to_string(),
+                bollard::models::EndpointSettings::default(),
+            )])),
         }),
         ..Default::default()
     };
@@ -209,7 +272,7 @@ async fn boot_minio(docker: &Docker) -> Option<(u16, ContainerGuard)> {
 
     // Give MinIO a moment to bind its port.
     tokio::time::sleep(Duration::from_secs(3)).await;
-    Some((port, guard))
+    Some((port, name, guard))
 }
 
 /// Build a host-side S3 client against the local MinIO. Returns None when the
@@ -240,10 +303,12 @@ fn build_s3_client(port: u16) -> Option<aws_sdk_s3::Client> {
     }
 }
 
-/// Boot a `mariadb:lts` source container with binlog enabled. Returns
-/// (container_name, host_port, guard). The container name is `mariadb-<name>`
-/// so it matches what the engine/provider derive from the service name.
-async fn boot_mariadb_source(
+/// Boot a plain `mariadb:lts` source container with binlog enabled, for flows
+/// that only need real binlog archiving/retention semantics and not the
+/// pinned WAL-G physical-backup tooling. Returns (container_name, host_port,
+/// guard); the container name is `mariadb-<name>` so it matches what the
+/// engine/provider derive from the service name.
+async fn boot_default_mariadb_source(
     docker: &Docker,
     service_name: &str,
 ) -> Option<(String, u16, ContainerGuard)> {
@@ -325,6 +390,101 @@ async fn boot_mariadb_source(
     None
 }
 
+/// Boot a WAL-G-enabled MariaDB source container with binlog enabled. Returns
+/// (container_name, host_port, guard). The container name is `mariadb-<name>`
+/// so it matches what the engine/provider derive from the service name.
+async fn boot_mariadb_source(
+    docker: &Docker,
+    service_name: &str,
+    minio_container_name: &str,
+    launch_image: &str,
+) -> Option<(String, u16, ContainerGuard)> {
+    let port = find_available_port(33060)?;
+    let container_name = format!("mariadb-{service_name}");
+
+    let config = bollard::models::ContainerCreateBody {
+        image: Some(launch_image.to_string()),
+        cmd: Some(vec![
+            "--log-bin=mysql-bin".to_string(),
+            "--server-id=1".to_string(),
+            "--binlog-format=ROW".to_string(),
+        ]),
+        env: Some(vec![
+            format!("MARIADB_ROOT_PASSWORD={ROOT_PASSWORD}"),
+            "TZ=UTC".to_string(),
+        ]),
+        host_config: Some(bollard::models::HostConfig {
+            // Docker's default bridge does not provide automatic DNS. Link
+            // the MinIO name returned by `resolve_endpoint_for_container` so
+            // WAL-G can stream directly to the test object store.
+            links: Some(vec![format!(
+                "{minio_container_name}:{minio_container_name}"
+            )]),
+            port_bindings: Some(HashMap::from([(
+                "3306/tcp".to_string(),
+                Some(vec![bollard::models::PortBinding {
+                    host_ip: Some("127.0.0.1".to_string()),
+                    host_port: Some(port.to_string()),
+                }]),
+            )])),
+            ..Default::default()
+        }),
+        networking_config: Some(bollard::models::NetworkingConfig {
+            endpoints_config: Some(HashMap::from([(
+                temps_core::NETWORK_NAME.to_string(),
+                bollard::models::EndpointSettings::default(),
+            )])),
+        }),
+        ..Default::default()
+    };
+
+    let created = docker
+        .create_container(
+            Some(
+                bollard::query_parameters::CreateContainerOptionsBuilder::new()
+                    .name(&container_name)
+                    .build(),
+            ),
+            config,
+        )
+        .await
+        .ok()?;
+    let guard = ContainerGuard {
+        docker: docker.clone(),
+        id: created.id.clone(),
+        label: container_name.clone(),
+    };
+    docker
+        .start_container(
+            &created.id,
+            None::<bollard::query_parameters::StartContainerOptions>,
+        )
+        .await
+        .ok()?;
+
+    // Wait for MariaDB to accept connections on the mapped host port.
+    let conn_str = format!("mysql://root:{ROOT_PASSWORD}@127.0.0.1:{port}/");
+    for attempt in 0..40 {
+        match MySqlPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_secs(3))
+            .connect(&conn_str)
+            .await
+        {
+            Ok(pool) => {
+                pool.close().await;
+                return Some((container_name, port, guard));
+            }
+            Err(_) if attempt < 39 => tokio::time::sleep(Duration::from_millis(750)).await,
+            Err(e) => {
+                eprintln!("MariaDB source never became reachable: {e}");
+                return None;
+            }
+        }
+    }
+    None
+}
+
 /// Open a sqlx MySQL pool against the given host port.
 async fn mysql_pool(port: u16) -> anyhow::Result<sqlx::MySqlPool> {
     let conn = format!("mysql://root:{ROOT_PASSWORD}@127.0.0.1:{port}/");
@@ -339,7 +499,7 @@ async fn mysql_pool(port: u16) -> anyhow::Result<sqlx::MySqlPool> {
 /// The MariaDB ServiceConfig parameters JSON that both the engine and the
 /// provider parse (`MariaDbInputConfig`). `container_name` is set so the
 /// provider talks to our pre-created `mariadb-<name>` container.
-fn mariadb_params(service_name: &str, host_port: u16) -> serde_json::Value {
+fn mariadb_params(service_name: &str, host_port: u16, immutable_image: &str) -> serde_json::Value {
     serde_json::json!({
         "host": "localhost",
         "port": host_port.to_string(),
@@ -347,7 +507,7 @@ fn mariadb_params(service_name: &str, host_port: u16) -> serde_json::Value {
         "username": "root",
         "password": ROOT_PASSWORD,
         "root_password": ROOT_PASSWORD,
-        "docker_image": "mariadb:lts",
+        "docker_image": immutable_image,
         "container_name": format!("mariadb-{service_name}"),
     })
 }
@@ -366,6 +526,10 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
     let Some(docker) = connect_docker().await else {
         return;
     };
+    if let Err(error) = ensure_pitr_network(&docker).await {
+        eprintln!("Could not create PITR Docker network, skipping: {error}");
+        return;
+    }
 
     let test_db = match temps_database::test_utils::TestDatabase::with_migrations().await {
         Ok(db) => db,
@@ -376,7 +540,7 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
     };
     let pool = test_db.connection_arc();
 
-    let Some((minio_port, _minio_guard)) = boot_minio(&docker).await else {
+    let Some((minio_port, minio_container_name, _minio_guard)) = boot_minio(&docker).await else {
         return;
     };
     let Some(s3_client) = build_s3_client(minio_port) else {
@@ -387,9 +551,12 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
         return;
     }
 
+    let (launch_image, immutable_image) = resolve_mariadb_image(&docker)
+        .await
+        .expect("resolve the MariaDB WAL-G test image to an immutable image ID");
     let service_name = format!("pitr{}", uuid::Uuid::new_v4().simple());
     let Some((container_name, mariadb_port, _mariadb_guard)) =
-        boot_mariadb_source(&docker, &service_name).await
+        boot_mariadb_source(&docker, &service_name, &minio_container_name, &launch_image).await
     else {
         return;
     };
@@ -405,6 +572,7 @@ async fn mariadb_pitr_full_chain_e2e_inner() {
         &service_name,
         &container_name,
         mariadb_port,
+        &immutable_image,
     )
     .await
     .expect("PITR end-to-end flow");
@@ -419,6 +587,7 @@ async fn run_pitr_flow(
     service_name: &str,
     container_name: &str,
     mariadb_port: u16,
+    immutable_image: &str,
 ) -> anyhow::Result<()> {
     let pool: &temps_database::DbConnection = pool_arc.as_ref();
     eprintln!("Running PITR flow against source container {container_name}");
@@ -427,7 +596,7 @@ async fn run_pitr_flow(
     // Insert encrypted DB rows.
     // The engine decrypts `external_services.config` and the s3 creds with the
     // SAME EncryptionService, so we encrypt with it here.
-    let config_plaintext = mariadb_params(service_name, mariadb_port).to_string();
+    let config_plaintext = mariadb_params(service_name, mariadb_port, immutable_image).to_string();
     let config_encrypted = encryption.encrypt_string(&config_plaintext)?;
 
     let service_model = temps_entities::external_services::ActiveModel {
@@ -447,9 +616,9 @@ async fn run_pitr_flow(
         name: Set("pitr-s3".to_string()),
         bucket_name: Set(BUCKET.to_string()),
         region: Set("us-east-1".to_string()),
-        // Host-side clients (engine + archiver + restore) all reach MinIO on
-        // localhost - MariaDB does ALL S3 IO host-side (download base/binlogs
-        // to host, then upload into the container), so localhost is correct.
+        // Host-side clients reach MinIO through this mapped port. The physical
+        // engine resolves the same endpoint to the linked MinIO container so
+        // WAL-G streams the base backup directly without a host-side copy.
         endpoint: Set(Some(format!("http://127.0.0.1:{minio_port}"))),
         bucket_path: Set(String::new()),
         access_key_id: Set(encryption.encrypt_string(MINIO_ACCESS_KEY)?),
@@ -540,37 +709,38 @@ async fn run_pitr_flow(
     completed_backup.size_bytes = Set(outcome.size_bytes);
     completed_backup.s3_location = Set(outcome.location.clone());
     let backup_model = completed_backup.update(pool).await?;
-    eprintln!("Base backup landed at key: {}", outcome.location);
-    assert!(
-        outcome.location.ends_with("base.mbstream.gz"),
-        "engine should produce a physical base, got {}",
-        outcome.location
+    eprintln!("Base backup landed at repository: {}", outcome.location);
+    let expected_prefix = format!("s3://{BUCKET}/external_services/mariadb/{service_name}/walg");
+    assert_eq!(
+        outcome.location, expected_prefix,
+        "engine should return the WAL-G repository prefix"
     );
+    let repository_key = outcome
+        .location
+        .strip_prefix(&format!("s3://{BUCKET}/"))
+        .ok_or_else(|| anyhow::anyhow!("invalid WAL-G repository URI: {}", outcome.location))?;
 
-    // Confirm the base object actually landed in MinIO.
-    let head = s3_client
-        .head_object()
+    // Confirm WAL-G produced a physical repository rather than a single
+    // host-staged dump object.
+    let listed = s3_client
+        .list_objects_v2()
         .bucket(BUCKET)
-        .key(&outcome.location)
+        .prefix(format!("{repository_key}/"))
         .send()
-        .await;
-    assert!(head.is_ok(), "base object must exist in MinIO: {head:?}");
-
-    // DIAGNOSTIC: verify the stored base object is valid gzip.
-    {
-        let obj = s3_client
-            .get_object()
-            .bucket(BUCKET)
-            .key(&outcome.location)
-            .send()
-            .await?;
-        let bytes = obj.body.collect().await?.into_bytes();
-        eprintln!(
-            "DIAG base object: {} bytes, first4={:02x?}",
-            bytes.len(),
-            &bytes[..bytes.len().min(4)]
-        );
-    }
+        .await?;
+    let repository_objects = listed.contents();
+    assert!(
+        repository_objects.iter().any(|object| object
+            .key()
+            .is_some_and(|key| key.contains("/basebackups_005/"))),
+        "WAL-G repository must contain a physical base backup: {repository_objects:?}"
+    );
+    assert!(
+        repository_objects
+            .iter()
+            .any(|object| object.size().unwrap_or_default() > 0),
+        "WAL-G repository objects must contain bytes"
+    );
 
     // Insert batch B, capture T, insert batch C.
     for i in 0..4 {
@@ -600,11 +770,10 @@ async fn run_pitr_flow(
     // the now-closed segments to MinIO. Run it twice so the segment that
     // contains B and C is closed by a later FLUSH and then shipped.
     let mariadb_svc = MariaDbService::new(service_name.to_string(), Arc::new(docker.clone()));
-    let mariadb_config = parse_mariadb_config(service_name, mariadb_port);
+    let mariadb_config = parse_mariadb_config(service_name, mariadb_port, immutable_image);
 
     // Decrypt the s3 source row the way the orchestrator does before calling
     // the provider: the archiver reads `s3_source.bucket_name`/`bucket_path`
-    // only (creds come from the passed s3_client), so the model can stay as-is.
     let mut shipped_total = 0usize;
     for round in 0..2 {
         let n = mariadb_svc
@@ -621,10 +790,7 @@ async fn run_pitr_flow(
     // so we can see the recorded binlog coordinates and which segments shipped.
     eprintln!("DIAG recovery target T (UTC) = {t}");
     {
-        let meta_key = {
-            let (dir, _) = outcome.location.rsplit_once('/').unwrap();
-            format!("{dir}/metadata.json")
-        };
+        let meta_key = format!("{repository_key}/{}.metadata.json", backup_model.backup_id);
         if let Ok(o) = s3_client
             .get_object()
             .bucket(BUCKET)
@@ -659,6 +825,9 @@ async fn run_pitr_flow(
     let s3_credentials = S3Credentials {
         access_key_id: MINIO_ACCESS_KEY.to_string(),
         secret_key: MINIO_SECRET_KEY.to_string(),
+        // MinIO here is reached with a long-lived credential, like every
+        // operator-configured source.
+        session_token: None,
         region: "us-east-1".to_string(),
         endpoint: decrypted_s3_source.endpoint.clone(),
         bucket_name: BUCKET.to_string(),
@@ -670,7 +839,7 @@ async fn run_pitr_flow(
         name: service_name.to_string(),
         service_type: ServiceType::Mariadb,
         version: None,
-        parameters: mariadb_params(service_name, mariadb_port),
+        parameters: mariadb_params(service_name, mariadb_port, immutable_image),
     };
 
     let restored_name = format!("{service_name}-restored");
@@ -815,7 +984,7 @@ async fn setup_e2e_env(name_prefix: &str) -> Option<E2eEnv> {
     };
     let pool = test_db.connection_arc();
 
-    let (minio_port, minio_guard) = boot_minio(&docker).await?;
+    let (minio_port, _minio_container_name, minio_guard) = boot_minio(&docker).await?;
     let s3_client = build_s3_client(minio_port)?;
     if let Err(e) = s3_client.create_bucket().bucket(BUCKET).send().await {
         eprintln!("Could not create MinIO bucket, skipping: {e}");
@@ -824,7 +993,7 @@ async fn setup_e2e_env(name_prefix: &str) -> Option<E2eEnv> {
 
     let service_name = format!("{name_prefix}{}", uuid::Uuid::new_v4().simple());
     let (container_name, mariadb_port, mariadb_guard) =
-        boot_mariadb_source(&docker, &service_name).await?;
+        boot_default_mariadb_source(&docker, &service_name).await?;
     eprintln!("Booted MariaDB source container {container_name} on host port {mariadb_port}");
 
     Some(E2eEnv {
@@ -855,7 +1024,7 @@ async fn seed_service_rows(
     temps_entities::s3_sources::Model,
     i32,
 )> {
-    let config_plaintext = mariadb_params(service_name, mariadb_port).to_string();
+    let config_plaintext = mariadb_params(service_name, mariadb_port, "mariadb:lts").to_string();
     let config_encrypted = encryption.encrypt_string(&config_plaintext)?;
 
     let service_model = temps_entities::external_services::ActiveModel {
@@ -1113,7 +1282,7 @@ async fn run_binlog_retention_flow(env: &E2eEnv) -> anyhow::Result<()> {
     );
 
     let mariadb_svc = MariaDbService::new(service_name.to_string(), Arc::new(env.docker.clone()));
-    let mariadb_config = parse_mariadb_config(service_name, env.mariadb_port);
+    let mariadb_config = parse_mariadb_config(service_name, env.mariadb_port, "mariadb:lts");
 
     // ── Ship several segments: each round FLUSHes (rotating the active
     //    segment closed) and uploads everything newly closed. Real writes in
@@ -1519,6 +1688,7 @@ async fn run_logical_dump_restore_flow(env: &E2eEnv) -> anyhow::Result<()> {
     let s3_credentials = S3Credentials {
         access_key_id: MINIO_ACCESS_KEY.to_string(),
         secret_key: MINIO_SECRET_KEY.to_string(),
+        session_token: None,
         region: "us-east-1".to_string(),
         endpoint: decrypted_s3_source.endpoint.clone(),
         bucket_name: BUCKET.to_string(),
@@ -1675,9 +1845,10 @@ async fn run_logical_dump_restore_flow(env: &E2eEnv) -> anyhow::Result<()> {
 fn parse_mariadb_config(
     service_name: &str,
     host_port: u16,
+    immutable_image: &str,
 ) -> temps_providers::externalsvc::mariadb::MariaDbConfig {
     let input: temps_providers::externalsvc::mariadb::MariaDbInputConfig =
-        serde_json::from_value(mariadb_params(service_name, host_port))
+        serde_json::from_value(mariadb_params(service_name, host_port, immutable_image))
             .expect("parse MariaDbInputConfig");
     temps_providers::externalsvc::mariadb::MariaDbConfig::from(input)
 }

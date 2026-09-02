@@ -1,0 +1,79 @@
+# SPDX-FileCopyrightText: 2024-2026 Temps Contributors
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+name: MariaDB WAL-G Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'images/mariadb-walg/**'
+      - '.github/workflows/mariadb-walg-image.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: mariadb-walg-image-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  # On the canonical repository this resolves to the runtime default
+  # `ghcr.io/gotempsh/mariadb-walg`; forks publish only to their own namespace.
+  IMAGE_REPOSITORY: ghcr.io/${{ github.repository_owner }}/mariadb-walg
+  IMAGE_VERSION: 11.4.12-walg-v3.0.8
+
+jobs:
+  build-and-publish:
+    name: Build and publish MariaDB WAL-G
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish multi-architecture image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7
+        with:
+          context: images/mariadb-walg
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.IMAGE_REPOSITORY }}:${{ env.IMAGE_VERSION }}-${{ github.sha }}
+            ${{ env.IMAGE_REPOSITORY }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ env.IMAGE_VERSION }}
+            org.opencontainers.image.title=Temps MariaDB WAL-G
+            org.opencontainers.image.description=MariaDB 11.4 with WAL-G physical streaming backup support
+          cache-from: type=gha,scope=mariadb-walg
+          cache-to: type=gha,scope=mariadb-walg,mode=max
+          provenance: true
+          sbom: true
+
+      - name: Record immutable runtime reference
+        run: |
+          echo '### MariaDB WAL-G immutable image' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo 'Use this reviewed manifest reference in the Temps MariaDB default:' >> "$GITHUB_STEP_SUMMARY"
+          echo '' >> "$GITHUB_STEP_SUMMARY"
+          echo '`${{ env.IMAGE_REPOSITORY }}@${{ steps.build.outputs.digest }}`' >> "$GITHUB_STEP_SUMMARY"

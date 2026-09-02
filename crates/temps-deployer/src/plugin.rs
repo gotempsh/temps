@@ -4,10 +4,12 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
+use thiserror::Error;
 use utoipa::openapi::OpenApi;
 
 use crate::{
@@ -18,6 +20,76 @@ use crate::{
 
 /// Deployer Plugin for managing container deployment operations
 pub struct DeployerPlugin;
+
+const CONTROL_PLANE_OVERLAY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Error)]
+enum ControlPlaneOverlayReconcileError {
+    #[error("could not load the persisted control-plane network allocation: {0}")]
+    Allocation(#[from] temps_network::allocator::AllocatorError),
+    #[error(transparent)]
+    Setup(#[from] temps_network::control_plane::ControlPlaneSetupError),
+}
+
+async fn reconcile_control_plane_overlay(
+    db: Arc<sea_orm::DatabaseConnection>,
+    docker: Arc<bollard::Docker>,
+    preferred_private_address: Option<&str>,
+    underlay_dev: Option<&str>,
+) -> Result<bool, ControlPlaneOverlayReconcileError> {
+    let persisted = temps_network::allocator::PostgresAllocator::new(db.clone())
+        .get_control_plane_alloc()
+        .await?;
+    let persisted_address = persisted
+        .as_ref()
+        .map(|allocation| allocation.underlay_address.to_string());
+    let Some(private_address) = preferred_private_address
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or(persisted_address.as_deref())
+    else {
+        return Ok(false);
+    };
+
+    let overlay = temps_network::control_plane::setup(
+        db.clone(),
+        docker.as_ref(),
+        private_address,
+        underlay_dev,
+    )
+    .await?;
+    overlay.spawn_peer_reconciler(db);
+    Ok(true)
+}
+
+fn spawn_control_plane_overlay_setup_watcher(
+    db: Arc<sea_orm::DatabaseConnection>,
+    docker: Arc<bollard::Docker>,
+    preferred_private_address: Option<String>,
+    underlay_dev: Option<String>,
+) {
+    tokio::spawn(async move {
+        loop {
+            match reconcile_control_plane_overlay(
+                db.clone(),
+                docker.clone(),
+                preferred_private_address.as_deref(),
+                underlay_dev.as_deref(),
+            )
+            .await
+            {
+                Ok(true) => break,
+                Ok(false) => {}
+                Err(error) => tracing::warn!(
+                    error = %error,
+                    repair = "temps network setup-multi-node",
+                    "Could not reconcile control-plane multi-node networking; retrying"
+                ),
+            }
+            tokio::time::sleep(CONTROL_PLANE_OVERLAY_RETRY_INTERVAL).await;
+        }
+    });
+}
 
 impl DeployerPlugin {
     pub fn new() -> Self {
@@ -131,19 +203,24 @@ impl TempsPlugin for DeployerPlugin {
             // keep working and we must never accidentally enable the DNS
             // injection when we can't confirm the operator opted in.
             let config_service = context.require_service::<temps_config::ConfigService>();
-            let (build_limits, cluster_dns_enabled) = match config_service.get_settings().await {
-                Ok(settings) => (Some(settings.build_limits), settings.cluster_dns.enabled),
-                Err(e) => {
-                    tracing::warn!(
-                        "Could not read settings ({}). \
+            let (build_limits, cluster_dns_enabled, control_plane_private_address) =
+                match config_service.get_settings().await {
+                    Ok(settings) => (
+                        Some(settings.build_limits),
+                        settings.cluster_dns.enabled,
+                        settings.multi_node.private_address,
+                    ),
+                    Err(e) => {
+                        tracing::warn!(
+                            "Could not read settings ({}). \
                          Builds will run with the legacy unbounded behaviour \
                          and cluster DNS resolver will not be started \
                          until settings are saved.",
-                        e
-                    );
-                    (None, false)
-                }
-            };
+                            e
+                        );
+                        (None, false, None)
+                    }
+                };
 
             // Create DockerRuntime service
             let server_config = config_service.get_server_config();
@@ -180,6 +257,23 @@ impl TempsPlugin for DeployerPlugin {
                 tracing::warn!(
                     error = %error,
                     "Could not reconcile the app network during deployer startup"
+                );
+            }
+
+            // A control-plane-hosted managed service must participate in the
+            // same overlay as worker applications. Previously only `temps
+            // agent` bootstrapped `temps0`, leaving local PostgreSQL/Redis/etc.
+            // without a routable address or internal DNS record. Reconcile the
+            // control-plane side whenever multi-node has a private address.
+            // The same idempotent operation is available at runtime through
+            // `temps network setup-multi-node`, so enabling multi-node does not
+            // require restarting this process.
+            if let Some(db) = context.get_service::<sea_orm::DatabaseConnection>() {
+                spawn_control_plane_overlay_setup_watcher(
+                    db,
+                    docker.clone(),
+                    control_plane_private_address,
+                    std::env::var("TEMPS_UNDERLAY_DEV").ok(),
                 );
             }
 

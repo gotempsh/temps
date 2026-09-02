@@ -594,6 +594,26 @@ const settingsNavItems: NavigationItem[] = [
     keywords: ['disk', 'space', 'storage', 'alerts', 'monitoring'],
   },
   {
+    title: 'Temps Cloud',
+    url: '/settings/cloud',
+    icon: Cloud,
+    // "connect"/"link"/"enroll" are what the docs and the CLI call this, and
+    // "backup"/"retention" are what someone is actually shopping for when they
+    // go looking for it.
+    keywords: [
+      'cloud',
+      'temps cloud',
+      'managed',
+      'connect',
+      'link',
+      'enroll',
+      'telemetry',
+      'retention',
+      'backup',
+      'subscription',
+    ],
+  },
+  {
     title: 'Metrics Monitoring',
     url: '/settings/metrics-monitoring',
     icon: BarChart3,

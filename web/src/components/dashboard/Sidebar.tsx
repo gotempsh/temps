@@ -29,6 +29,7 @@ import {
   ChevronsUpDown,
   Clock,
   Check,
+  Cloud,
   Database,
   DatabaseBackup,
   Folder,
@@ -174,6 +175,7 @@ const settingsGroups: SettingsGroupDef[] = [
       { title: 'Platform', url: '/settings', icon: Settings2 },
       { title: 'Version', url: '/settings/version', icon: ArrowUpCircle },
       { title: 'Notifications', url: '/settings/notifications', icon: Bell },
+      { title: 'Temps Cloud', url: '/settings/cloud', icon: Cloud },
     ],
   },
   {

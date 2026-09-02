@@ -26,6 +26,7 @@ import {
   adminGetNodeOptions,
   adminListNodeContainersOptions,
   getJoinTokenStatusOptions,
+  getSettingsOptions,
   generateJoinTokenMutation,
   revokeJoinTokenMutation,
 } from '@/api/client/@tanstack/react-query.gen'
@@ -61,6 +62,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate, useParams } from 'react-router'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -146,19 +148,9 @@ function formatPercent(value: number): string {
 
 // ── Mini usage bar ──
 
-function UsageBar({
-  percent,
-  label,
-}: {
-  percent: number
-  label: string
-}) {
+function UsageBar({ percent, label }: { percent: number; label: string }) {
   const color =
-    percent > 90
-      ? 'bg-red-500'
-      : percent > 70
-        ? 'bg-amber-500'
-        : 'bg-green-500'
+    percent > 90 ? 'bg-red-500' : percent > 70 ? 'bg-amber-500' : 'bg-green-500'
   return (
     <div className="flex items-center gap-1.5" title={label}>
       <div className="w-12 h-1.5 bg-muted rounded-full overflow-hidden">
@@ -223,13 +215,22 @@ function NodeCapacityMini({ capacity }: { capacity: unknown }) {
   return (
     <div className="flex flex-col gap-0.5">
       {metrics.cpu_percent !== undefined && (
-        <UsageBar percent={metrics.cpu_percent} label={`CPU: ${formatPercent(metrics.cpu_percent)}`} />
+        <UsageBar
+          percent={metrics.cpu_percent}
+          label={`CPU: ${formatPercent(metrics.cpu_percent)}`}
+        />
       )}
       {metrics.memory_total_bytes && (
-        <UsageBar percent={memPercent} label={`Memory: ${formatPercent(memPercent)}`} />
+        <UsageBar
+          percent={memPercent}
+          label={`Memory: ${formatPercent(memPercent)}`}
+        />
       )}
       {metrics.disk_total_bytes && (
-        <UsageBar percent={diskPercent} label={`Disk: ${formatPercent(diskPercent)}`} />
+        <UsageBar
+          percent={diskPercent}
+          label={`Disk: ${formatPercent(diskPercent)}`}
+        />
       )}
     </div>
   )
@@ -301,6 +302,9 @@ function JoinTokenSection() {
     onSuccess: () => {
       queryClient.invalidateQueries({
         queryKey: getJoinTokenStatusOptions().queryKey,
+      })
+      queryClient.invalidateQueries({
+        queryKey: getSettingsOptions().queryKey,
       })
     },
   })
@@ -495,7 +499,7 @@ function JoinInstructions({ joinCommand }: { joinCommand: string }) {
               <CopyButton text={joinCommand} />
             </div>
             <p className="mt-1 text-xs">
-              Replace <code>&lt;worker-ip&gt;</code> with the worker machine's
+              Replace <code>&lt;worker-ip&gt;</code> with the worker machine’s
               private IP address.
             </p>
           </div>
@@ -529,11 +533,7 @@ function JoinInstructions({ joinCommand }: { joinCommand: string }) {
 
 // ── Node Table ──
 
-function NodeTable({
-  nodes,
-}: {
-  nodes: NodeInfoResponse[]
-}) {
+function NodeTable({ nodes }: { nodes: NodeInfoResponse[] }) {
   const navigate = useNavigate()
   return (
     <div className="overflow-x-auto">
@@ -708,7 +708,9 @@ function EdgeAnalyticsSection({ nodeId }: { nodeId: number }) {
           <Globe className="h-4 w-4" />
           Edge Analytics
         </CardTitle>
-        <CardDescription>Cache performance and traffic overview</CardDescription>
+        <CardDescription>
+          Cache performance and traffic overview
+        </CardDescription>
       </CardHeader>
       <CardContent>
         {isLoading ? (
@@ -717,49 +719,82 @@ function EdgeAnalyticsSection({ nodeId }: { nodeId: number }) {
           </div>
         ) : !overview ? (
           <p className="text-sm text-muted-foreground text-center py-6">
-            No analytics data available. The edge node may be offline or hasn't received traffic yet.
+            No analytics data available. The edge node may be offline or hasn’t
+            received traffic yet.
           </p>
         ) : (
           <div className="space-y-4">
             {/* Cache metrics */}
             <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
-              <MiniStat label="Total Requests" value={overview.total_requests.toLocaleString()} />
-              <MiniStat label="Cache Hits" value={overview.cache_hits.toLocaleString()} accent="green" />
-              <MiniStat label="Cache Misses" value={overview.cache_misses.toLocaleString()} accent="yellow" />
-              <MiniStat label="Bypassed" value={overview.cache_bypasses.toLocaleString()} />
+              <MiniStat
+                label="Total Requests"
+                value={overview.total_requests.toLocaleString()}
+              />
+              <MiniStat
+                label="Cache Hits"
+                value={overview.cache_hits.toLocaleString()}
+                accent="green"
+              />
+              <MiniStat
+                label="Cache Misses"
+                value={overview.cache_misses.toLocaleString()}
+                accent="yellow"
+              />
+              <MiniStat
+                label="Bypassed"
+                value={overview.cache_bypasses.toLocaleString()}
+              />
             </div>
 
             {/* Hit rate bar */}
             <div className="space-y-1.5">
               <div className="flex justify-between text-xs">
                 <span className="text-muted-foreground">Cache Hit Rate</span>
-                <span className="font-medium">{formatPercent(overview.cache_hit_rate * 100)}</span>
+                <span className="font-medium">
+                  {formatPercent(overview.cache_hit_rate * 100)}
+                </span>
               </div>
               <div className="h-2 rounded-full bg-muted overflow-hidden">
                 <div
                   className="h-full rounded-full bg-green-500 transition-all duration-500"
-                  style={{ width: `${Math.min(overview.cache_hit_rate * 100, 100)}%` }}
+                  style={{
+                    width: `${Math.min(overview.cache_hit_rate * 100, 100)}%`,
+                  }}
                 />
               </div>
             </div>
 
             {/* Bandwidth */}
             <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
-              <MiniStat label="Served from Cache" value={formatBytes(overview.bytes_from_cache)} accent="green" />
-              <MiniStat label="From Origin" value={formatBytes(overview.bytes_from_origin)} />
-              <MiniStat label="Avg Origin Latency" value={`${overview.avg_origin_latency_ms.toFixed(1)}ms`} />
+              <MiniStat
+                label="Served from Cache"
+                value={formatBytes(overview.bytes_from_cache)}
+                accent="green"
+              />
+              <MiniStat
+                label="From Origin"
+                value={formatBytes(overview.bytes_from_origin)}
+              />
+              <MiniStat
+                label="Avg Origin Latency"
+                value={`${overview.avg_origin_latency_ms.toFixed(1)}ms`}
+              />
             </div>
 
             {/* Bandwidth savings */}
             <div className="space-y-1.5">
               <div className="flex justify-between text-xs">
                 <span className="text-muted-foreground">Bandwidth Savings</span>
-                <span className="font-medium">{formatPercent(overview.bandwidth_savings_rate * 100)}</span>
+                <span className="font-medium">
+                  {formatPercent(overview.bandwidth_savings_rate * 100)}
+                </span>
               </div>
               <div className="h-2 rounded-full bg-muted overflow-hidden">
                 <div
                   className="h-full rounded-full bg-blue-500 transition-all duration-500"
-                  style={{ width: `${Math.min(overview.bandwidth_savings_rate * 100, 100)}%` }}
+                  style={{
+                    width: `${Math.min(overview.bandwidth_savings_rate * 100, 100)}%`,
+                  }}
                 />
               </div>
             </div>
@@ -779,18 +814,21 @@ function MiniStat({
   value: string
   accent?: 'green' | 'yellow' | 'blue'
 }) {
-  const accentClass = accent === 'green'
-    ? 'text-green-600 dark:text-green-400'
-    : accent === 'yellow'
-      ? 'text-yellow-600 dark:text-yellow-400'
-      : accent === 'blue'
-        ? 'text-blue-600 dark:text-blue-400'
-        : ''
+  const accentClass =
+    accent === 'green'
+      ? 'text-green-600 dark:text-green-400'
+      : accent === 'yellow'
+        ? 'text-yellow-600 dark:text-yellow-400'
+        : accent === 'blue'
+          ? 'text-blue-600 dark:text-blue-400'
+          : ''
 
   return (
     <div className="rounded-lg border p-3">
       <p className="text-xs text-muted-foreground">{label}</p>
-      <p className={`text-lg font-semibold tabular-nums ${accentClass}`}>{value}</p>
+      <p className={`text-lg font-semibold tabular-nums ${accentClass}`}>
+        {value}
+      </p>
     </div>
   )
 }
@@ -900,8 +938,12 @@ function NodeDetail({
         return
       }
       toast.success(`Node is now draining`)
-      queryClient.invalidateQueries({ queryKey: adminGetNodeOptions({ path: { node_id: nodeId } }).queryKey })
-      queryClient.invalidateQueries({ queryKey: adminListNodesOptions().queryKey })
+      queryClient.invalidateQueries({
+        queryKey: adminGetNodeOptions({ path: { node_id: nodeId } }).queryKey,
+      })
+      queryClient.invalidateQueries({
+        queryKey: adminListNodesOptions().queryKey,
+      })
     } catch {
       toast.error('Failed to drain node')
     } finally {
@@ -922,7 +964,9 @@ function NodeDetail({
         return
       }
       toast.success('Node removed')
-      queryClient.invalidateQueries({ queryKey: adminListNodesOptions().queryKey })
+      queryClient.invalidateQueries({
+        queryKey: adminListNodesOptions().queryKey,
+      })
       onBack()
     } catch {
       toast.error('Failed to remove node')
@@ -944,8 +988,12 @@ function NodeDetail({
         return
       }
       toast.success('Node reactivated')
-      queryClient.invalidateQueries({ queryKey: adminGetNodeOptions({ path: { node_id: nodeId } }).queryKey })
-      queryClient.invalidateQueries({ queryKey: adminListNodesOptions().queryKey })
+      queryClient.invalidateQueries({
+        queryKey: adminGetNodeOptions({ path: { node_id: nodeId } }).queryKey,
+      })
+      queryClient.invalidateQueries({
+        queryKey: adminListNodesOptions().queryKey,
+      })
     } catch {
       toast.error('Failed to undrain node')
     } finally {
@@ -974,15 +1022,22 @@ function NodeDetail({
 
   const canDrain = node.status === 'active'
   const canUndrain = node.status === 'draining' || node.status === 'drained'
-  const canRemove = (node.status === 'drained' && (drainStatus?.can_remove ?? containers.length === 0))
-    || node.status === 'offline'
+  const canRemove =
+    (node.status === 'drained' &&
+      (drainStatus?.can_remove ?? containers.length === 0)) ||
+    node.status === 'offline'
 
   return (
     <div className="space-y-6">
       {verificationDialog}
       {/* Header */}
       <div className="flex items-center gap-3">
-        <Button variant="ghost" size="icon" onClick={onBack} className="h-8 w-8">
+        <Button
+          variant="ghost"
+          size="icon"
+          onClick={onBack}
+          className="h-8 w-8"
+        >
           <ArrowLeft className="h-4 w-4" />
         </Button>
         <div className="flex-1 min-w-0">
@@ -993,8 +1048,8 @@ function NodeDetail({
             <NodeArchitecture architecture={node.architecture} />
           </div>
           <p className="text-sm text-muted-foreground mt-0.5">
-            {node.private_address} &middot; {node.role} &middot; Last
-            heartbeat {formatRelativeTime(node.last_heartbeat)}
+            {node.private_address} &middot; {node.role} &middot; Last heartbeat{' '}
+            {formatRelativeTime(node.last_heartbeat)}
           </p>
         </div>
         <div className="flex items-center gap-2 shrink-0">
@@ -1050,17 +1105,22 @@ function NodeDetail({
       <AlertDialog open={showDrainDialog} onOpenChange={setShowDrainDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Drain node "{node.name}"?</AlertDialogTitle>
+            <AlertDialogTitle>Drain node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
               This will stop scheduling new containers to this node and redeploy
               existing workloads to other healthy nodes. The node will remain in
-              the cluster in a "draining" state until all containers are migrated.
+              the cluster in a “draining” state until all containers are
+              migrated.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={drainPending}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={drainPending}>
+              Cancel
+            </AlertDialogCancel>
             <AlertDialogAction onClick={handleDrain} disabled={drainPending}>
-              {drainPending && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
+              {drainPending && (
+                <Loader2 className="h-4 w-4 animate-spin mr-1" />
+              )}
               Drain Node
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -1071,20 +1131,25 @@ function NodeDetail({
       <AlertDialog open={showRemoveDialog} onOpenChange={setShowRemoveDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Remove node "{node.name}"?</AlertDialogTitle>
+            <AlertDialogTitle>Remove node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will permanently remove the node from the cluster. This action
-              cannot be undone. The node must be drained first (no active containers).
+              This will permanently remove the node from the cluster. This
+              action cannot be undone. The node must be drained first (no active
+              containers).
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={removePending}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={removePending}>
+              Cancel
+            </AlertDialogCancel>
             <AlertDialogAction
               onClick={handleRemove}
               disabled={removePending}
               className="bg-destructive text-white hover:bg-destructive/90"
             >
-              {removePending && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
+              {removePending && (
+                <Loader2 className="h-4 w-4 animate-spin mr-1" />
+              )}
               Remove Node
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -1095,17 +1160,24 @@ function NodeDetail({
       <AlertDialog open={showUndrainDialog} onOpenChange={setShowUndrainDialog}>
         <AlertDialogContent>
           <AlertDialogHeader>
-            <AlertDialogTitle>Reactivate node "{node.name}"?</AlertDialogTitle>
+            <AlertDialogTitle>Reactivate node “{node.name}”?</AlertDialogTitle>
             <AlertDialogDescription>
-              This will set the node back to "active" so it can accept new container
-              deployments again. Any containers that were already migrated off will
-              not be moved back automatically.
+              This will set the node back to “active” so it can accept new
+              container deployments again. Any containers that were already
+              migrated off will not be moved back automatically.
             </AlertDialogDescription>
           </AlertDialogHeader>
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={undrainPending}>Cancel</AlertDialogCancel>
-            <AlertDialogAction onClick={handleUndrain} disabled={undrainPending}>
-              {undrainPending && <Loader2 className="h-4 w-4 animate-spin mr-1" />}
+            <AlertDialogCancel disabled={undrainPending}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              onClick={handleUndrain}
+              disabled={undrainPending}
+            >
+              {undrainPending && (
+                <Loader2 className="h-4 w-4 animate-spin mr-1" />
+              )}
               Reactivate Node
             </AlertDialogAction>
           </AlertDialogFooter>
@@ -1114,16 +1186,38 @@ function NodeDetail({
 
       {/* Draining/drained status banner */}
       {(node.status === 'draining' || node.status === 'drained') && (
-        <Alert className={node.status === 'drained' || drainStatus?.drain_complete ? 'border-green-500/30 bg-green-500/5' : 'border-orange-500/30 bg-orange-500/5'}>
+        <Alert
+          className={
+            node.status === 'drained' || drainStatus?.drain_complete
+              ? 'border-green-500/30 bg-green-500/5'
+              : 'border-orange-500/30 bg-orange-500/5'
+          }
+        >
           {node.status === 'drained' || drainStatus?.drain_complete ? (
             <AlertCircle className="h-4 w-4 text-green-500" />
           ) : (
             <Pause className="h-4 w-4 text-orange-500" />
           )}
-          <AlertTitle className={node.status === 'drained' || drainStatus?.drain_complete ? 'text-green-700 dark:text-green-400' : 'text-orange-700 dark:text-orange-400'}>
-            {node.status === 'drained' ? 'Node is drained' : drainStatus?.drain_complete ? 'Drain complete' : 'Node is draining'}
+          <AlertTitle
+            className={
+              node.status === 'drained' || drainStatus?.drain_complete
+                ? 'text-green-700 dark:text-green-400'
+                : 'text-orange-700 dark:text-orange-400'
+            }
+          >
+            {node.status === 'drained'
+              ? 'Node is drained'
+              : drainStatus?.drain_complete
+                ? 'Drain complete'
+                : 'Node is draining'}
           </AlertTitle>
-          <AlertDescription className={node.status === 'drained' || drainStatus?.drain_complete ? 'text-green-600 dark:text-green-300' : 'text-orange-600 dark:text-orange-300'}>
+          <AlertDescription
+            className={
+              node.status === 'drained' || drainStatus?.drain_complete
+                ? 'text-green-600 dark:text-green-300'
+                : 'text-orange-600 dark:text-orange-300'
+            }
+          >
             {node.status === 'drained'
               ? 'All containers have been migrated. You can remove the node or reactivate it with the Undrain button.'
               : drainStatus
@@ -1150,23 +1244,29 @@ function NodeDetail({
             />
           )}
 
-          {metrics.memory_total_bytes != null && metrics.memory_used_bytes != null && (
-            <MetricCard
-              icon={<MemoryStick className="h-4 w-4 text-muted-foreground" />}
-              label="Memory"
-              value={`${formatBytes(metrics.memory_used_bytes)} / ${formatBytes(metrics.memory_total_bytes)}`}
-              percent={(metrics.memory_used_bytes / metrics.memory_total_bytes) * 100}
-            />
-          )}
+          {metrics.memory_total_bytes != null &&
+            metrics.memory_used_bytes != null && (
+              <MetricCard
+                icon={<MemoryStick className="h-4 w-4 text-muted-foreground" />}
+                label="Memory"
+                value={`${formatBytes(metrics.memory_used_bytes)} / ${formatBytes(metrics.memory_total_bytes)}`}
+                percent={
+                  (metrics.memory_used_bytes / metrics.memory_total_bytes) * 100
+                }
+              />
+            )}
 
-          {metrics.disk_total_bytes != null && metrics.disk_used_bytes != null && (
-            <MetricCard
-              icon={<HardDrive className="h-4 w-4 text-muted-foreground" />}
-              label="Disk"
-              value={`${formatBytes(metrics.disk_used_bytes)} / ${formatBytes(metrics.disk_total_bytes)}`}
-              percent={(metrics.disk_used_bytes / metrics.disk_total_bytes) * 100}
-            />
-          )}
+          {metrics.disk_total_bytes != null &&
+            metrics.disk_used_bytes != null && (
+              <MetricCard
+                icon={<HardDrive className="h-4 w-4 text-muted-foreground" />}
+                label="Disk"
+                value={`${formatBytes(metrics.disk_used_bytes)} / ${formatBytes(metrics.disk_total_bytes)}`}
+                percent={
+                  (metrics.disk_used_bytes / metrics.disk_total_bytes) * 100
+                }
+              />
+            )}
         </div>
       )}
 
@@ -1263,6 +1363,179 @@ function NodeDetail({
   )
 }
 
+const ROTATE_CLUSTER_CA_CONFIRMATION = 'ROTATE CLUSTER CA'
+
+function ClusterTrustCard() {
+  const queryClient = useQueryClient()
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const [confirmation, setConfirmation] = useState('')
+  const [rotationPending, setRotationPending] = useState(false)
+  const { handleSensitiveActionError, verificationDialog } =
+    useSensitiveActionVerification()
+  const settingsQuery = useQuery(getSettingsOptions())
+  const fingerprint =
+    settingsQuery.data?.multi_node.cluster_ca_fingerprint ?? null
+
+  const closeDialog = () => {
+    setDialogOpen(false)
+    setConfirmation('')
+  }
+
+  const rotateClusterCa = async () => {
+    if (!fingerprint || confirmation !== ROTATE_CLUSTER_CA_CONFIRMATION) return
+
+    setRotationPending(true)
+    try {
+      const response = await client.post({
+        url: '/settings/cluster-ca/rotate' as never,
+        body: {
+          expected_fingerprint: fingerprint,
+          confirmation,
+        } as never,
+      })
+      if (response.error) {
+        if (
+          handleSensitiveActionError(response.error, () => {
+            void rotateClusterCa()
+          })
+        ) {
+          // Avoid stacking two modal focus traps while the MFA step-up dialog
+          // is active. Keep the typed confirmation for the one-shot retry.
+          setDialogOpen(false)
+          return
+        }
+        const problem = response.error as {
+          detail?: string
+          title?: string
+        }
+        toast.error(
+          problem.detail ?? problem.title ?? 'Failed to rotate the cluster CA'
+        )
+        return
+      }
+
+      const result = response.data as
+        | { new_fingerprint?: string; revoked_enrollment_tokens?: number }
+        | undefined
+      toast.success(
+        `Cluster CA rotated. ${result?.revoked_enrollment_tokens ?? 0} enrollment token(s) revoked.`
+      )
+      closeDialog()
+      await queryClient.invalidateQueries({
+        queryKey: getSettingsOptions().queryKey,
+      })
+    } catch {
+      toast.error('Failed to rotate the cluster CA')
+    } finally {
+      setRotationPending(false)
+    }
+  }
+
+  return (
+    <>
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Shield className="h-5 w-5" />
+            Cluster trust
+          </CardTitle>
+          <CardDescription>
+            The cluster CA authenticates the control plane and every worker.
+            Rotation is an emergency recovery operation.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="rounded-md border bg-muted/30 p-4">
+            <p className="text-sm font-medium">Active CA fingerprint</p>
+            <p className="mt-2 break-all font-mono text-xs text-muted-foreground">
+              {settingsQuery.isLoading
+                ? 'Loading…'
+                : (fingerprint ??
+                  'Initializing cluster trust… restart the control plane if this persists.')}
+            </p>
+          </div>
+          <Alert variant="destructive">
+            <AlertTriangle className="h-4 w-4" />
+            <AlertTitle>Emergency rotation</AlertTitle>
+            <AlertDescription>
+              Rotation immediately invalidates worker trust and outstanding
+              enrollment tokens. Every worker must be re-enrolled. Only a full
+              Admin using a fresh MFA-verified browser session can proceed.
+            </AlertDescription>
+          </Alert>
+          <Button
+            variant="destructive"
+            onClick={() => setDialogOpen(true)}
+            disabled={!fingerprint || settingsQuery.isLoading}
+          >
+            Rotate cluster CA
+          </Button>
+        </CardContent>
+      </Card>
+
+      <AlertDialog
+        open={dialogOpen}
+        onOpenChange={(open) => {
+          setDialogOpen(open)
+          if (!open) setConfirmation('')
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Rotate the cluster CA?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This disconnects every existing worker until it is re-enrolled
+              against the new fingerprint. Verify the fingerprint below through
+              a trusted operator channel before continuing.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <div className="space-y-3">
+            <p className="break-all rounded-md border bg-muted/30 p-3 font-mono text-xs">
+              {fingerprint}
+            </p>
+            <label className="space-y-2 text-sm font-medium">
+              <span>
+                Type{' '}
+                <span className="font-mono">
+                  {ROTATE_CLUSTER_CA_CONFIRMATION}
+                </span>
+              </span>
+              <Input
+                autoComplete="off"
+                value={confirmation}
+                onChange={(event) => setConfirmation(event.target.value)}
+                placeholder={ROTATE_CLUSTER_CA_CONFIRMATION}
+              />
+            </label>
+          </div>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={rotationPending} onClick={closeDialog}>
+              Cancel
+            </AlertDialogCancel>
+            <AlertDialogAction
+              className="bg-destructive text-white hover:bg-destructive/90"
+              disabled={
+                rotationPending ||
+                confirmation !== ROTATE_CLUSTER_CA_CONFIRMATION
+              }
+              onClick={(event) => {
+                event.preventDefault()
+                void rotateClusterCa()
+              }}
+            >
+              {rotationPending && (
+                <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+              )}
+              Rotate and disconnect workers
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      {verificationDialog}
+    </>
+  )
+}
+
 // ── Main Page ──
 
 export function NodesPage() {
@@ -1330,6 +1603,7 @@ export function NodesPage() {
       </Card>
 
       <ClusterDnsCard />
+      <ClusterTrustCard />
     </div>
   )
 }

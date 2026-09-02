@@ -92,7 +92,8 @@ pub struct NetworkConfig {
     /// Transport mode for cross-node traffic.
     pub transport: Transport,
     /// MTU of the underlay network. Defaults to 1500 (standard Ethernet).
-    /// Hetzner Cloud private networks use 1450, so override if needed.
+    /// Agents replace this default with the selected interface's actual MTU
+    /// before constructing the manager.
     pub underlay_mtu: u32,
     /// Name of the underlay network device VXLAN should use as its parent
     /// (e.g. `eth0`, `enp1s0`, `bond0`). Ignored for [`Transport::Native`].
@@ -151,11 +152,15 @@ impl NetworkConfig {
                 reason: "docker_network_name must not be empty".into(),
             });
         }
-        if self.underlay_mtu < 1280 {
+        let minimum_underlay_mtu = match self.transport {
+            Transport::Vxlan { .. } => 1330,
+            Transport::Native => 1280,
+        };
+        if self.underlay_mtu < minimum_underlay_mtu {
             return Err(NetworkError::InvalidConfig {
                 reason: format!(
-                    "underlay_mtu {} is below the IPv6 minimum of 1280",
-                    self.underlay_mtu
+                    "underlay_mtu {} is below the minimum {} required by {:?}",
+                    self.underlay_mtu, minimum_underlay_mtu, self.transport
                 ),
             });
         }
@@ -299,6 +304,28 @@ mod tests {
             c.validate().unwrap_err(),
             NetworkError::InvalidConfig { .. }
         ));
+    }
+
+    #[test]
+    fn vxlan_rejects_mtu_that_leaves_an_overlay_below_ipv6_minimum() {
+        let c = NetworkConfig {
+            underlay_mtu: 1329,
+            ..NetworkConfig::default()
+        };
+        assert!(matches!(
+            c.validate().unwrap_err(),
+            NetworkError::InvalidConfig { .. }
+        ));
+    }
+
+    #[test]
+    fn vxlan_accepts_minimum_mtu_with_encapsulation_overhead() {
+        let c = NetworkConfig {
+            underlay_mtu: 1330,
+            ..NetworkConfig::default()
+        };
+        c.validate().unwrap();
+        assert_eq!(c.transport.bridge_mtu(c.underlay_mtu), 1280);
     }
 
     #[test]

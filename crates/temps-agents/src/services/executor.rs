@@ -4134,6 +4134,11 @@ mod tests {
         projects::Model {
             id,
             image_retention_hours: None,
+            cloud_telemetry_fidelity:
+                temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity::Metered,
+            cloud_telemetry_write_mode:
+                temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode::Local,
+            cloud_telemetry_attribute_allowlist: Vec::new(),
             name: "test-app".into(),
             repo_name: "repo".into(),
             repo_owner: "testowner".into(),

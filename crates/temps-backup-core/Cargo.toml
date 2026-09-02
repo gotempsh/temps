@@ -34,5 +34,6 @@ futures = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+temps-database = { path = "../temps-database" }
 sea-orm = { workspace = true, features = ["mock"] }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full", "test-util"] }

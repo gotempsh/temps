@@ -8,7 +8,7 @@
 //! is identical to deploying locally.
 
 use async_trait::async_trait;
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -192,6 +192,24 @@ impl RemoteNodeDeployer {
         &self,
         path: &str,
     ) -> Result<T, DeployerError> {
+        self.agent_get_inner(path, None).await
+    }
+
+    /// GET a container-scoped agent resource while preserving a missing
+    /// runtime container as the typed, idempotent not-found outcome.
+    async fn agent_get_container<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        container_id: &str,
+    ) -> Result<T, DeployerError> {
+        self.agent_get_inner(path, Some(container_id)).await
+    }
+
+    async fn agent_get_inner<T: for<'de> Deserialize<'de>>(
+        &self,
+        path: &str,
+        missing_container_id: Option<&str>,
+    ) -> Result<T, DeployerError> {
         let url = format!("{}{}", self.agent_url, path);
         let response = self
             .client
@@ -213,6 +231,18 @@ impl RemoteNodeDeployer {
                 self.node_name, url, e
             ))
         })?;
+
+        if status == reqwest::StatusCode::NOT_FOUND {
+            if let Some(container_id) = missing_container_id {
+                return Err(DeployerError::ContainerNotFound(format!(
+                    "container {} was not found on node {} at {}: {}",
+                    container_id,
+                    self.node_name,
+                    url,
+                    body.error.unwrap_or_else(|| "not found".to_string())
+                )));
+            }
+        }
 
         if !body.success {
             return Err(DeployerError::DeploymentFailed(format!(
@@ -292,12 +322,6 @@ impl RemoteNodeDeployer {
                     self.node_name, url, e
                 ))
             })?;
-        let status = response.status();
-
-        if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(DeployerError::ContainerNotFound(path.to_string()));
-        }
-
         let status = response.status();
 
         if status == reqwest::StatusCode::NOT_FOUND {
@@ -418,16 +442,22 @@ impl ContainerDeployer for RemoteNodeDeployer {
     }
 
     async fn get_container_info(&self, container_id: &str) -> Result<ContainerInfo, DeployerError> {
-        self.agent_get(&format!("/agent/containers/{}/info", container_id))
-            .await
+        self.agent_get_container(
+            &format!("/agent/containers/{}/info", container_id),
+            container_id,
+        )
+        .await
     }
 
     async fn get_container_stats(
         &self,
         container_id: &str,
     ) -> Result<ContainerStats, DeployerError> {
-        self.agent_get(&format!("/agent/containers/{}/stats", container_id))
-            .await
+        self.agent_get_container(
+            &format!("/agent/containers/{}/stats", container_id),
+            container_id,
+        )
+        .await
     }
 
     async fn list_containers(&self) -> Result<Vec<ContainerInfo>, DeployerError> {
@@ -435,17 +465,58 @@ impl ContainerDeployer for RemoteNodeDeployer {
     }
 
     async fn get_container_logs(&self, container_id: &str) -> Result<String, DeployerError> {
-        self.agent_get(&format!("/agent/containers/{}/logs", container_id))
-            .await
+        self.agent_get_container(
+            &format!("/agent/containers/{}/logs", container_id),
+            container_id,
+        )
+        .await
     }
 
     async fn stream_container_logs(
         &self,
-        _container_id: &str,
+        container_id: &str,
     ) -> Result<Box<dyn futures::Stream<Item = String> + Unpin + Send>, DeployerError> {
-        Err(DeployerError::Other(
-            "Log streaming not yet supported on remote nodes".into(),
-        ))
+        let url = format!(
+            "{}/agent/containers/{}/logs/stream?follow=true&tail=all",
+            self.agent_url,
+            urlencoding::encode(container_id)
+        );
+        let response = self
+            .client
+            .get(&url)
+            .bearer_auth(&self.token)
+            .send()
+            .await
+            .map_err(|e| {
+                DeployerError::NetworkError(format!(
+                    "Failed to start log stream for container {} on node {} at {}: {}",
+                    container_id, self.node_name, url, e
+                ))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|e| format!("response body could not be read: {e}"));
+            return Err(DeployerError::DeploymentFailed(format!(
+                "Agent on node {} rejected log stream for container {} ({}): {}",
+                self.node_name, container_id, status, body
+            )));
+        }
+
+        let node_name = self.node_name.clone();
+        let container_id = container_id.to_string();
+        let stream = response.bytes_stream().map(move |chunk| match chunk {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).replace('\0', ""),
+            Err(e) => format!(
+                "Log stream transport error for container {} on node {}: {}",
+                container_id, node_name, e
+            ),
+        });
+
+        Ok(Box::new(Box::pin(stream)))
     }
 
     async fn image_exists(&self, image_name: &str) -> Result<bool, DeployerError> {
@@ -660,6 +731,41 @@ mod tests {
         )
         .expect("create remote deployer");
         let result = deployer.remove_container("already-gone").await;
+        assert!(matches!(result, Err(DeployerError::ContainerNotFound(_))));
+        server.await.expect("mock agent task");
+    }
+
+    #[tokio::test]
+    async fn get_container_info_maps_agent_not_found_to_typed_error() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock agent");
+        let address = listener.local_addr().expect("mock agent address");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut request = [0_u8; 2048];
+            let _ = stream.read(&mut request).await.expect("read request");
+            let body = r#"{"success":false,"data":null,"error":"container missing"}"#;
+            let response = format!(
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let deployer = RemoteNodeDeployer::new(
+            format!("http://{address}"),
+            "test-token".to_string(),
+            "worker-test".to_string(),
+        )
+        .expect("create remote deployer");
+        let result = deployer.get_container_info("already-gone").await;
         assert!(matches!(result, Err(DeployerError::ContainerNotFound(_))));
         server.await.expect("mock agent task");
     }

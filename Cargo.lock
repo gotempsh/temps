@@ -1915,8 +1915,10 @@ dependencies = [
  "hashbrown 0.17.1",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "lz4_flex",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
@@ -10488,10 +10490,13 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "temps-agents",
  "temps-ai",
  "temps-ai-agent-cli",
  "temps-auth",
+ "temps-cloud-client",
+ "temps-cloud-protocol",
  "temps-config",
  "temps-core",
  "temps-entities",
@@ -10795,6 +10800,7 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-core",
+ "temps-database",
  "temps-entities",
  "thiserror 2.0.20",
  "tokio",
@@ -10906,6 +10912,8 @@ dependencies = [
  "temps-auth",
  "temps-backup",
  "temps-blob",
+ "temps-cloud",
+ "temps-cloud-client",
  "temps-config",
  "temps-core",
  "temps-database",
@@ -10968,6 +10976,74 @@ dependencies = [
 ]
 
 [[package]]
+name = "temps-cloud"
+version = "0.1.0-beta.56"
+dependencies = [
+ "anyhow",
+ "aws-sdk-s3",
+ "axum",
+ "chrono",
+ "reqwest 0.12.28",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "temps-auth",
+ "temps-cloud-client",
+ "temps-cloud-protocol",
+ "temps-config",
+ "temps-core",
+ "temps-database",
+ "temps-entities",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "utoipa",
+ "uuid",
+]
+
+[[package]]
+name = "temps-cloud-client"
+version = "0.1.0-beta.56"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.23.1",
+ "chrono",
+ "clickhouse",
+ "futures",
+ "hmac 0.13.0",
+ "reqwest 0.12.28",
+ "sea-orm",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "temps-cloud-protocol",
+ "temps-core",
+ "temps-entities",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "temps-cloud-protocol"
+version = "0.1.0-beta.56"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "uuid",
+]
+
+[[package]]
 name = "temps-config"
 version = "0.1.0-beta.56"
 dependencies = [
@@ -10984,6 +11060,7 @@ dependencies = [
  "serde",
  "serde_derive",
  "serde_json",
+ "serde_path_to_error",
  "sha2 0.11.0",
  "sqlx 0.8.6",
  "sysinfo",
@@ -12245,6 +12322,8 @@ dependencies = [
  "serde",
  "serde_json",
  "temps-auth",
+ "temps-cloud",
+ "temps-cloud-protocol",
  "temps-core",
  "temps-database",
  "temps-entities",
@@ -12302,12 +12381,14 @@ dependencies = [
  "aws-config",
  "aws-sdk-s3",
  "axum",
+ "base64 0.23.1",
  "bytes",
  "chrono",
  "clickhouse",
  "flate2",
  "futures",
  "hex",
+ "hmac 0.13.0",
  "http 1.5.0",
  "http-body-util",
  "hyper",
@@ -12318,8 +12399,11 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "temps-ai",
  "temps-auth",
+ "temps-cloud-client",
+ "temps-cloud-protocol",
  "temps-config",
  "temps-core",
  "temps-database",
@@ -12457,6 +12541,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "mongodb",
+ "percent-encoding",
  "rand 0.10.2",
  "redis",
  "regex",

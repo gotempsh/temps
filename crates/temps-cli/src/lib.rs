@@ -62,7 +62,7 @@ pub enum Commands {
     ApiKey(ApiKeyCommand),
     /// Backup management commands
     Backup(BackupCommand),
-    /// One-shot data migration utilities (e.g. TimescaleDB → ClickHouse)
+    /// One-shot data migration utilities (TimescaleDB → ClickHouse, spans → Temps Cloud)
     Backfill(BackfillCommand),
     /// Manage platform services (KV, Blob)
     Services(ServicesCommand),
@@ -129,6 +129,9 @@ pub fn install_tracing_extra(log_level: &str, log_format: &str, extra: &str) {
              temps_providers={level},\
              temps_audit={level},\
              temps_backup={level},\
+             temps_cloud={level},\
+             temps_cloud_client={level},\
+             temps_cloud_protocol={level},\
              temps_config={level},\
              temps_analytics={level},\
              temps_notifications={level},\

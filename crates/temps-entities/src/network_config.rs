@@ -32,6 +32,17 @@ pub struct Model {
     /// Underlay MTU. Bridge MTU is derived: `underlay_mtu - 50` for VXLAN,
     /// `underlay_mtu` for native.
     pub underlay_mtu: i32,
+    /// Stable overlay CIDR reserved for the control plane. Keeping this in the
+    /// singleton avoids modelling the control plane as a schedulable worker.
+    pub control_plane_compute_cidr: Option<String>,
+    /// Address workers use as the VXLAN underlay endpoint for the control
+    /// plane. Usually the private/VLAN address configured by the operator.
+    pub control_plane_underlay_address: Option<String>,
+    /// Set only after kernel and Docker overlay setup completes successfully.
+    pub control_plane_overlay_ready: bool,
+    /// Monotonic fencing token for control-plane setup attempts. A stale
+    /// attempt may only publish or withdraw the exact generation it reserved.
+    pub control_plane_setup_generation: i64,
     pub updated_at: DBDateTime,
 }
 

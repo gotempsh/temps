@@ -19,7 +19,7 @@ use sea_orm::{ActiveModelTrait, ConnectionTrait, Database, DatabaseConnection, E
 use sea_orm_migration::MigratorTrait;
 use std::str::FromStr;
 use std::sync::Arc;
-use temps_entities::nodes;
+use temps_entities::{network_config, nodes};
 use temps_migrations::Migrator;
 use temps_network::allocator::{AllocatorError, ComputeNetworkAllocator, PostgresAllocator};
 use testcontainers::{core::WaitFor, runners::AsyncRunner, GenericImage, ImageExt};
@@ -121,6 +121,41 @@ async fn insert_node(db: &DatabaseConnection, name: &str, underlay: Option<&str>
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn pool_can_change_before_first_allocation() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let configured = allocator
+        .configure_pool("10.240.0.0/16".parse().unwrap(), 24)
+        .await
+        .unwrap();
+    assert_eq!(configured.compute_pool_cidr.to_string(), "10.240.0.0/16");
+
+    let node_id = insert_node(&fx.db, "node-custom", Some("10.0.0.1")).await;
+    let allocation = allocator.allocate_for_node(node_id).await.unwrap();
+    assert_eq!(allocation.compute_cidr.to_string(), "10.240.0.0/24");
+}
+
+#[tokio::test]
+async fn pool_change_is_rejected_after_worker_allocation() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let node_id = insert_node(&fx.db, "node-fixed", Some("10.0.0.1")).await;
+    allocator.allocate_for_node(node_id).await.unwrap();
+
+    let error = allocator
+        .configure_pool("10.240.0.0/16".parse().unwrap(), 24)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AllocatorError::PoolChangeAfterAllocation {
+            allocation_count: 1,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn allocate_assigns_lowest_free_cidr() {
     let Some(fx) = fixture().await else { return };
     let alloc = PostgresAllocator::new(fx.db.clone());
@@ -156,6 +191,254 @@ async fn second_allocation_picks_next_subnet() {
 
     assert_eq!(r1.compute_cidr.to_string(), "172.20.0.0/24");
     assert_eq!(r2.compute_cidr.to_string(), "172.20.1.0/24");
+}
+
+#[tokio::test]
+async fn legacy_public_underlay_remains_compatible_without_control_plane_peer() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let node_id = insert_node(&fx.db, "public-node", Some("203.0.113.10")).await;
+
+    let allocation = allocator.allocate_for_node(node_id).await.unwrap();
+    assert_eq!(allocation.underlay_address.to_string(), "203.0.113.10");
+}
+
+#[tokio::test]
+async fn public_underlay_is_rejected_after_control_plane_overlay_is_ready() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let reservation = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+    allocator
+        .set_control_plane_ready_for(&reservation, true)
+        .await
+        .unwrap();
+
+    let node_id = insert_node(&fx.db, "public-node", Some("203.0.113.10")).await;
+    let error = allocator.allocate_for_node(node_id).await.unwrap_err();
+    assert!(matches!(
+        error,
+        AllocatorError::PublicUnderlayAddress { node_id: rejected, .. }
+            if rejected == node_id
+    ));
+}
+
+#[tokio::test]
+async fn control_plane_allocation_is_stable_and_visible_to_workers() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+
+    let reservation = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+    let control_plane = reservation.alloc.clone();
+    assert_eq!(control_plane.compute_cidr.to_string(), "172.20.255.0/24");
+    assert_eq!(control_plane.bridge_address.to_string(), "172.20.255.1");
+
+    let worker_id = insert_node(&fx.db, "node-a", Some("10.200.4.2")).await;
+    let worker = allocator.allocate_for_node(worker_id).await.unwrap();
+    assert_eq!(worker.compute_cidr.to_string(), "172.20.0.0/24");
+
+    let peers = allocator.peer_list(worker_id).await.unwrap();
+    assert!(
+        peers.is_empty(),
+        "an unready reservation must not be advertised"
+    );
+
+    allocator
+        .set_control_plane_ready_for(&reservation, true)
+        .await
+        .unwrap();
+    let peers = allocator.peer_list(worker_id).await.unwrap();
+    assert_eq!(peers.len(), 1);
+    assert_eq!(peers[0].compute_cidr, control_plane.compute_cidr);
+    assert_eq!(peers[0].underlay_address.to_string(), "10.200.4.1");
+
+    let refreshed = allocator
+        .ensure_control_plane_alloc("10.200.4.9".parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(refreshed.compute_cidr, control_plane.compute_cidr);
+    assert_eq!(refreshed.underlay_address.to_string(), "10.200.4.9");
+    assert!(allocator.peer_list(worker_id).await.unwrap().is_empty());
+
+    let persisted = network_config::Entity::find_by_id(1)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.control_plane_compute_cidr.as_deref(),
+        Some("172.20.255.0/24")
+    );
+    assert_eq!(
+        persisted.control_plane_underlay_address.as_deref(),
+        Some("10.200.4.9")
+    );
+}
+
+#[tokio::test]
+async fn stale_control_plane_setup_cannot_publish_replacement_reservation() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let stale = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+    let current = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+
+    assert!(current.setup_generation > stale.setup_generation);
+
+    let error = allocator
+        .set_control_plane_ready_for(&stale, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AllocatorError::SupersededControlPlaneSetup { .. }
+    ));
+    allocator
+        .set_control_plane_ready_for(&current, true)
+        .await
+        .unwrap();
+    let stale_withdrawal = allocator
+        .set_control_plane_ready_for(&stale, false)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        stale_withdrawal,
+        AllocatorError::SupersededControlPlaneSetup { .. }
+    ));
+    let persisted = network_config::Entity::find_by_id(1)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.control_plane_overlay_ready);
+    assert_eq!(
+        persisted.control_plane_underlay_address.as_deref(),
+        Some("10.200.4.1")
+    );
+}
+
+#[tokio::test]
+async fn pool_change_is_rejected_while_control_plane_setup_is_in_flight() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let stale = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+
+    let replacement_pool: Ipv4Net = "10.240.0.0/16".parse().unwrap();
+    let error = allocator
+        .configure_pool(replacement_pool, 24)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AllocatorError::PoolChangeAfterAllocation {
+            allocation_count: 1,
+            ..
+        }
+    ));
+    allocator
+        .set_control_plane_ready_for(&stale, true)
+        .await
+        .unwrap();
+
+    let persisted = network_config::Entity::find_by_id(1)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.control_plane_overlay_ready);
+    assert_eq!(persisted.compute_pool_cidr, "172.20.0.0/16");
+    assert_eq!(
+        persisted.control_plane_setup_generation,
+        stale.setup_generation
+    );
+}
+
+#[tokio::test]
+async fn failed_unready_setup_can_release_reservation_and_choose_corrected_pool() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let failed = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+
+    allocator
+        .release_unready_control_plane_reservation(&failed)
+        .await
+        .unwrap();
+    let corrected_pool: Ipv4Net = "10.240.0.0/16".parse().unwrap();
+    let corrected = allocator.configure_pool(corrected_pool, 24).await.unwrap();
+    assert_eq!(corrected.compute_pool_cidr, corrected_pool);
+
+    let persisted = network_config::Entity::find_by_id(1)
+        .one(fx.db.as_ref())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(persisted.control_plane_compute_cidr.is_none());
+    assert!(persisted.control_plane_underlay_address.is_none());
+    assert!(!persisted.control_plane_overlay_ready);
+    assert!(persisted.control_plane_setup_generation > failed.setup_generation);
+}
+
+#[tokio::test]
+async fn stale_setup_cannot_release_newer_control_plane_reservation() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let stale = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+    let current = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+    assert!(current.setup_generation > stale.setup_generation);
+
+    let error = allocator
+        .release_unready_control_plane_reservation(&stale)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AllocatorError::SupersededControlPlaneSetup { .. }
+    ));
+}
+
+#[tokio::test]
+async fn ready_control_plane_reservation_cannot_be_released_by_failure_recovery() {
+    let Some(fx) = fixture().await else { return };
+    let allocator = PostgresAllocator::new(fx.db.clone());
+    let ready = allocator
+        .ensure_control_plane_reservation("10.200.4.1".parse().unwrap())
+        .await
+        .unwrap();
+    allocator
+        .set_control_plane_ready_for(&ready, true)
+        .await
+        .unwrap();
+
+    let error = allocator
+        .release_unready_control_plane_reservation(&ready)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AllocatorError::ReadyControlPlaneRelease { .. }
+    ));
 }
 
 #[tokio::test]
@@ -288,22 +571,25 @@ async fn external_id_is_stable_across_calls() {
 async fn pool_exhaustion_returns_typed_error() {
     let Some(fx) = fixture().await else { return };
 
-    // Shrink the pool to a single /30 to force exhaustion fast.
+    // Shrink the pool to two /30s to force exhaustion fast while preserving
+    // the production invariant that a pool contains more than one node CIDR.
     fx.db
         .execute_unprepared(
-            "UPDATE network_config SET compute_pool_cidr = '172.30.0.0/30', \
+            "UPDATE network_config SET compute_pool_cidr = '172.30.0.0/29', \
              subnet_prefix_len = 30 WHERE id = 1",
         )
         .await
         .unwrap();
 
     let alloc = PostgresAllocator::new(fx.db.clone());
-    // /30 within /30 = exactly 1 subnet.
+    // /30 within /29 = exactly 2 subnets.
     let a = insert_node(&fx.db, "node-a", Some("10.0.0.1")).await;
     let b = insert_node(&fx.db, "node-b", Some("10.0.0.2")).await;
+    let c = insert_node(&fx.db, "node-c", Some("10.0.0.3")).await;
 
     alloc.allocate_for_node(a).await.unwrap();
-    let err = alloc.allocate_for_node(b).await.unwrap_err();
+    alloc.allocate_for_node(b).await.unwrap();
+    let err = alloc.allocate_for_node(c).await.unwrap_err();
     assert!(
         matches!(err, AllocatorError::PoolExhausted { .. }),
         "got {:?}",

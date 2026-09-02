@@ -14,6 +14,7 @@ import {
   listFacetsOptions,
   queryTraceSummariesOptions,
 } from '@/api/client/@tanstack/react-query.gen'
+import { TelemetryBacklogBanner } from '@/components/observe/TelemetryBacklogBanner'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -1114,6 +1115,17 @@ export default function TracesList({ project }: TracesListProps) {
           )}
         </div>
       </div>
+
+      {/* Cloud-primary honesty: an outbox backlog looks exactly like an app
+          that stopped emitting spans, and a gap window looks exactly like a
+          quiet hour. Both are volunteered here rather than left to be
+          discovered. Renders nothing for a project storing spans locally. */}
+      <TelemetryBacklogBanner
+        projectId={project.id}
+        projectSlug={project.slug}
+        startTime={startTime}
+        endTime={endTime}
+      />
 
       {/* Setup section — onboarding for a project that has NEVER received a
           trace, or when the user explicitly toggles it. Deliberately NOT gated

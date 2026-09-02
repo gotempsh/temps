@@ -112,6 +112,12 @@ impl ResolverHandle {
             // 65535 = the maximum DNS-over-TCP message size (2-byte length
             // prefix), so a single response never has to be split.
             server.register_listener(tcp, TCP_IDLE_TIMEOUT, u16::MAX as usize);
+        }
+
+        // Do not announce individual listeners until every requested UDP/TCP
+        // bind has succeeded. Otherwise an error on a later address leaves a
+        // misleading "listening" line immediately before startup aborts.
+        for addr in &config.listen_addrs {
             info!(%addr, "DNS resolver listening (UDP + TCP)");
         }
 

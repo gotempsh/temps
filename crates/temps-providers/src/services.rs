@@ -3,7 +3,7 @@
 
 use crate::externalsvc::{
     legacy_managed_instance_names, managed_instance_name,
-    mariadb::{MariaDbService, MariaDbSizeProfile},
+    mariadb::{validate_immutable_mariadb_image, MariaDbService, MariaDbSizeProfile},
     mongodb::MongodbService,
     postgres::PostgresService,
     postgres_cluster::PostgresClusterService,
@@ -32,7 +32,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use temps_entities::{
     external_service_backups, external_service_health_checks, external_services, nodes,
-    postgres_major_upgrades, project_services, projects, service_members,
+    postgres_major_upgrades, project_services, projects, service_members, settings,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -934,6 +934,18 @@ fn build_walg_env(
         // override via service parameters in a follow-up.
         "export WALG_COMPRESSION_METHOD='lz4'".to_string(),
     ];
+    // Only for a temporary (STS-style) credential. A long-lived
+    // operator-configured credential emits no AWS_SESSION_TOKEN at all —
+    // exporting an empty one would be signed and rejected. The empty-string
+    // filter is what makes that true for `Some("")` as well, matching
+    // `aws_session_token_env` and `mc_host_credential`.
+    if let Some(session_token) = creds
+        .session_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    {
+        env.push(export("AWS_SESSION_TOKEN", session_token)?);
+    }
     if let Some(endpoint) = resolved_endpoint {
         env.push(export("AWS_ENDPOINT", endpoint)?);
     }
@@ -1374,7 +1386,70 @@ impl ExternalServiceManager {
                     })
             })?;
 
-        RemoteServiceClient::new(node.address.clone(), token, node.name.clone())
+        if node.address.starts_with("https://") {
+            let settings_row = settings::Entity::find_by_id(1)
+                .one(self.db.as_ref())
+                .await?
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): application settings row is missing",
+                        node_id, node.name
+                    ),
+                })?;
+            let app_settings = temps_core::AppSettings::from_json(settings_row.data);
+            let ca_cert = app_settings.multi_node.cluster_ca_cert_pem.ok_or_else(|| {
+                ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): cluster CA certificate is missing",
+                        node_id, node.name
+                    ),
+                }
+            })?;
+            let encrypted_ca_key = app_settings
+                .multi_node
+                .cluster_ca_key_encrypted
+                .ok_or_else(|| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): encrypted cluster CA key is missing",
+                        node_id, node.name
+                    ),
+                })?;
+            let ca_key = self
+                .encryption_service
+                .decrypt_string(&encrypted_ca_key)
+                .map_err(|e| ExternalServiceError::InternalError {
+                    reason: format!(
+                        "Cannot authenticate mTLS node {} ({}): failed to decrypt cluster CA key: {}",
+                        node_id, node.name, e
+                    ),
+                })?;
+            let csr = temps_core::node_pki::generate_node_keypair_csr(
+                "temps-control-plane",
+                &[],
+            )
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Cannot authenticate mTLS node {} ({}): failed to generate control-plane identity: {}",
+                    node_id, node.name, e
+                ),
+            })?;
+            let signed = temps_core::node_pki::sign_node_csr(
+                &ca_cert,
+                &ca_key,
+                &csr.csr_pem,
+                &[],
+            )
+            .map_err(|e| ExternalServiceError::InternalError {
+                reason: format!(
+                    "Cannot authenticate mTLS node {} ({}): failed to sign control-plane identity: {}",
+                    node_id, node.name, e
+                ),
+            })?;
+            let identity_pem = format!("{}\n{}", signed.cert_pem, csr.key_pem);
+            RemoteServiceClient::new_mtls(node.address, token, node.name, &identity_pem, &ca_cert)
+        } else {
+            RemoteServiceClient::new(node.address, token, node.name)
+        }
     }
 
     async fn resolve_remote_container_name(
@@ -1448,7 +1523,17 @@ impl ExternalServiceManager {
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .unwrap_or_else(|| "mariadb:lts".to_string());
+                    .ok_or_else(|| ExternalServiceError::ParameterValidationFailed {
+                        service_id: 0,
+                        reason: "MariaDB requires an immutable docker_image in repository@sha256:<64-hex-digest> format"
+                            .to_string(),
+                    })?;
+                validate_immutable_mariadb_image(&image).map_err(|reason| {
+                    ExternalServiceError::ParameterValidationFailed {
+                        service_id: 0,
+                        reason,
+                    }
+                })?;
                 let size_profile = parameters
                     .get("size_profile")
                     .and_then(|value| MariaDbSizeProfile::parse(value))
@@ -8924,30 +9009,15 @@ echo "[restore] Pre-seed complete"
     /// never need a cross-node address in the first place.
     async fn attach_container_to_overlay(&self, container_ref: &str) -> Option<String> {
         let overlay = Self::overlay_network_name();
-
-        let overlay_exists = match self
-            .docker
-            .list_networks(None::<bollard::query_parameters::ListNetworksOptions>)
-            .await
+        let network_config = temps_network::NetworkConfig::default();
+        if let Err(error) =
+            temps_network::docker::validate_owned_network(&self.docker, &network_config).await
         {
-            Ok(networks) => networks
-                .iter()
-                .any(|n| n.name.as_deref() == Some(overlay.as_str())),
-            Err(e) => {
-                debug!(
-                    container = container_ref,
-                    overlay = %overlay,
-                    error = %e,
-                    "Could not list docker networks; skipping overlay attach"
-                );
-                return None;
-            }
-        };
-        if !overlay_exists {
             debug!(
                 container = container_ref,
                 overlay = %overlay,
-                "Overlay network not present on this host; skipping attach"
+                error = %error,
+                "Temps-owned overlay network is unavailable; skipping attach"
             );
             return None;
         }
@@ -11580,8 +11650,17 @@ mod tests {
                 Some(DEFAULT_RUSTFS_IMAGE),
             ),
         ] {
+            let parameters = if service_type == ServiceType::Mariadb {
+                HashMap::from([(
+                    "docker_image".to_string(),
+                    "ghcr.io/gotempsh/mariadb-walg@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                        .to_string(),
+                )])
+            } else {
+                HashMap::new()
+            };
             let params = manager
-                .build_remote_create_params("orders", &service_type, &HashMap::new())
+                .build_remote_create_params("orders", &service_type, &parameters)
                 .expect("default remote service parameters should be valid");
             assert_eq!(params.name, expected_name, "wrong name for {service_type}");
             if let Some(expected_image) = expected_image {
@@ -12093,6 +12172,7 @@ mod tests {
         crate::S3Credentials {
             access_key_id: "key'quoted".to_string(),
             secret_key: "secret'quoted".to_string(),
+            session_token: None,
             region: "us-east-1".to_string(),
             endpoint: Some("https://s3.example.test".to_string()),
             bucket_name: "backups".to_string(),
@@ -12124,6 +12204,52 @@ mod tests {
         let error = build_walg_env(&credentials, "s3://backups/repo", None)
             .expect_err("line breaks must be rejected before heredoc interpolation");
         assert!(error.contains("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    /// A long-lived, operator-configured credential must produce no
+    /// `AWS_SESSION_TOKEN` export whatsoever — not an empty one, which the
+    /// AWS SDKs would sign and the provider would then reject.
+    #[test]
+    fn walg_env_file_omits_the_session_token_for_a_long_lived_credential() {
+        let env = build_walg_env(&test_s3_credentials(), "s3://backups/repo", None)
+            .expect("long-lived credentials still build an env file");
+        assert!(!env.iter().any(|line| line.contains("AWS_SESSION_TOKEN")));
+    }
+
+    #[test]
+    fn walg_env_file_exports_and_escapes_a_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some("token'quoted".to_string());
+        let env = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect("a session token is escaped like every other value");
+        assert!(env
+            .iter()
+            .any(|line| line == "export AWS_SESSION_TOKEN='token'\\''quoted'"));
+    }
+
+    /// Parity with `aws_session_token_env` and `mc_host_credential`, which
+    /// already filter this: `export AWS_SESSION_TOKEN=''` is worse than no
+    /// export at all, because WAL-G signs the empty token and the provider
+    /// rejects every request.
+    #[test]
+    fn walg_env_file_omits_an_empty_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some(String::new());
+        let env = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect("an empty session token still builds an env file");
+        assert!(
+            !env.iter().any(|line| line.contains("AWS_SESSION_TOKEN")),
+            "an empty session token must be absent, never exported as ''"
+        );
+    }
+
+    #[test]
+    fn walg_env_file_rejects_line_break_injection_through_the_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some("token\nWALG_RESTORE_EOF\nid".to_string());
+        let error = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect_err("line breaks must be rejected before heredoc interpolation");
+        assert!(error.contains("AWS_SESSION_TOKEN"));
     }
 
     // ── Container stats helpers ──────────────────────────────────────────────
