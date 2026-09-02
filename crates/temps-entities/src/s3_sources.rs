@@ -31,8 +31,14 @@ pub struct Model {
     /// environment of every shelled-out engine (`wal-g`, `mc`, `mariabackup`).
     pub session_token: Option<String>,
     /// When the credential in this row stops working, for a temporary
-    /// credential. `None` means it does not expire. Not a secret: the console
-    /// shows it so an operator learns about a lapse before an upload fails.
+    /// credential. `None` means it does not expire.
+    ///
+    /// Not a secret, and currently **write-only**: the Cloud enrolment path
+    /// records it, but nothing reads it yet — it is absent from
+    /// `S3SourceResponse` and the rotation loop does not consult it. It is
+    /// stored now so a future console surface can warn about a lapse before an
+    /// upload fails, and so rotation can eventually be scheduled off the actual
+    /// expiry instead of a fixed interval.
     pub credentials_expire_at: Option<DBDateTime>,
     pub force_path_style: Option<bool>,
     pub is_default: bool,
@@ -188,9 +194,17 @@ fn encrypt_credentials(
     // persist a NULL column, not an encrypted empty string, so that reading it
     // back yields "no session token" rather than "a session token that is the
     // empty string" (which would be signed and rejected by the provider).
+    //
+    // `Some("")` is normalised to the same NULL. Callers already filter it at
+    // the wire boundary, but this is the DB-write boundary and the only place
+    // that can guarantee the invariant regardless of what any caller does: an
+    // *encrypted* empty string is a non-empty ciphertext column, so
+    // `decrypt_session_token`'s own empty-string guard would not catch it and
+    // every signer downstream would receive `Some("")`.
     let session_token = credentials
         .session_token
         .as_deref()
+        .filter(|token| !token.is_empty())
         .map(|token| {
             encryption
                 .encrypt_string(token)
@@ -369,6 +383,27 @@ mod tests {
         assert!(
             columns.session_token.is_none(),
             "an operator-configured source must store NULL, not an encrypted empty string"
+        );
+    }
+
+    /// Distinct from the ciphertext-empty-string case below: here the
+    /// *plaintext* is empty, which only a Cloud-vended wire payload could
+    /// produce. Encrypting it would store a perfectly valid non-empty
+    /// ciphertext, so `decrypt_session_token`'s empty-string guard would not
+    /// catch it and every signer downstream would receive `Some("")` —
+    /// `X-Amz-Security-Token: ` gets signed and the provider rejects it.
+    #[test]
+    fn an_empty_session_token_persists_as_null_rather_than_encrypted_emptiness() {
+        let credentials = S3SourceCredentials {
+            session_token: Some(String::new()),
+            ..long_lived_credentials()
+        };
+
+        let columns = encrypt_credentials(&encryption(), &credentials).expect("encrypt");
+
+        assert!(
+            columns.session_token.is_none(),
+            "an empty session token must store NULL, not the ciphertext of an empty string"
         );
     }
 

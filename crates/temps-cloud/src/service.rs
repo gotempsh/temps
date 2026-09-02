@@ -824,7 +824,13 @@ fn managed_backup_credentials_from_capability(
         // without it — `update_encrypted`/`insert_encrypted` seal it with the
         // same `EncryptionService` as `secret_key`, and every signer and
         // shell-out reads it back from there.
-        session_token: capability.session_token,
+        //
+        // This is the boundary where a wire payload first becomes a stored
+        // credential, so an empty string is normalised to `None` here rather
+        // than left for each downstream signer to guess about: `Some("")` is
+        // not "a session token", and one that reaches a SigV4 signer gets
+        // signed as `X-Amz-Security-Token: ` and rejected by the provider.
+        session_token: capability.session_token.filter(|token| !token.is_empty()),
         credentials_expire_at: capability.expires_at,
         region,
         endpoint: capability.endpoint,
@@ -1076,6 +1082,22 @@ mod tests {
 
         assert!(credentials.session_token.is_none());
         assert!(credentials.credentials_expire_at.is_none());
+    }
+
+    /// This is the boundary where a wire payload first becomes a stored
+    /// credential, so `Some("")` — which only a backend can produce, never an
+    /// existing self-hosted row — is normalised here rather than left for each
+    /// downstream signer to guess about. An empty `X-Amz-Security-Token` gets
+    /// signed and rejected; no token at all is correct.
+    #[test]
+    fn a_vended_empty_session_token_is_normalised_to_none() {
+        let credentials = managed_backup_credentials_from_capability(capability(Some(""), None))
+            .expect("an empty session token is not a translation failure");
+
+        assert!(
+            credentials.session_token.is_none(),
+            "an empty session token must be indistinguishable from no session token"
+        );
     }
 
     /// Neither secret may reach a log line or an error string through `{:?}`.

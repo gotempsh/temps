@@ -14,9 +14,14 @@
 //! long-lived credential an operator configured themselves — keeps a NULL
 //! session token and behaves exactly as it did. `session_token` holds
 //! ciphertext produced by `EncryptionService`, never plaintext, the same as
-//! `access_key_id` and `secret_key` on this table. `credentials_expire_at` is
-//! not a secret: the console shows it so a lapse is visible before an upload
-//! fails.
+//! `access_key_id` and `secret_key` on this table.
+//!
+//! `credentials_expire_at` is not a secret, and is write-only for now: the
+//! Cloud enrolment path records it but nothing reads it yet — it is not in
+//! `S3SourceResponse` and the rotation loop does not consult it. The column
+//! exists so a future console surface can warn about a lapse before an upload
+//! fails, and so rotation can eventually be scheduled off the real expiry
+//! rather than a fixed interval.
 
 use sea_orm_migration::prelude::*;
 

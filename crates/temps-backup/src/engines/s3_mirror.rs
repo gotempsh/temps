@@ -189,6 +189,20 @@ impl BackupEngine for S3MirrorEngine {
             ),
         ];
 
+        // mc echoes the credential-bearing `MC_HOST_*` URL it could not use
+        // straight into stderr, and that stderr is folded into the
+        // `BackupError::Failed` reason persisted on the backup row and surfaced
+        // through the API. A Cloud-vended destination credential carries a
+        // session token that is not individually revocable, so it must be
+        // scrubbed alongside the keys.
+        let sensitive_values = temps_providers::externalsvc::SensitiveValues::new()
+            .credential(&source_access_key, &source_secret_key, None)
+            .credential(
+                &dest_access_key,
+                &dest_secret_key,
+                dest_session_token.as_deref(),
+            );
+
         let mirror_cmd = format!(
             "mc mirror --overwrite {} {}",
             v2_common::shell_escape(&source_path),
@@ -225,8 +239,8 @@ impl BackupEngine for S3MirrorEngine {
                 reason: format!(
                     "mc mirror exited with code {}. stderr: {}. stdout: {}",
                     result.exit_code,
-                    result.stderr_tail.trim(),
-                    result.stdout_tail.trim(),
+                    sensitive_values.redact(result.stderr_tail.trim()),
+                    sensitive_values.redact(result.stdout_tail.trim()),
                 ),
             });
         }
@@ -234,7 +248,7 @@ impl BackupEngine for S3MirrorEngine {
             info!(
                 backup_id,
                 "mc mirror stderr (warnings): {}",
-                result.stderr_tail.trim(),
+                sensitive_values.redact(result.stderr_tail.trim()),
             );
         }
 

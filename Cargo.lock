@@ -12528,6 +12528,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "mongodb",
+ "percent-encoding",
  "rand 0.10.2",
  "redis",
  "regex",

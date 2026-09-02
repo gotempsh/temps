@@ -936,8 +936,14 @@ fn build_walg_env(
     ];
     // Only for a temporary (STS-style) credential. A long-lived
     // operator-configured credential emits no AWS_SESSION_TOKEN at all —
-    // exporting an empty one would be signed and rejected.
-    if let Some(session_token) = creds.session_token.as_deref() {
+    // exporting an empty one would be signed and rejected. The empty-string
+    // filter is what makes that true for `Some("")` as well, matching
+    // `aws_session_token_env` and `mc_host_credential`.
+    if let Some(session_token) = creds
+        .session_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+    {
         env.push(export("AWS_SESSION_TOKEN", session_token)?);
     }
     if let Some(endpoint) = resolved_endpoint {
@@ -12206,6 +12212,22 @@ mod tests {
         assert!(env
             .iter()
             .any(|line| line == "export AWS_SESSION_TOKEN='token'\\''quoted'"));
+    }
+
+    /// Parity with `aws_session_token_env` and `mc_host_credential`, which
+    /// already filter this: `export AWS_SESSION_TOKEN=''` is worse than no
+    /// export at all, because WAL-G signs the empty token and the provider
+    /// rejects every request.
+    #[test]
+    fn walg_env_file_omits_an_empty_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some(String::new());
+        let env = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect("an empty session token still builds an env file");
+        assert!(
+            !env.iter().any(|line| line.contains("AWS_SESSION_TOKEN")),
+            "an empty session token must be absent, never exported as ''"
+        );
     }
 
     #[test]

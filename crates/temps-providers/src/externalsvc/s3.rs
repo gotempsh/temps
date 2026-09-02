@@ -26,7 +26,8 @@ use tracing::{debug, error, info, warn};
 use crate::utils::ensure_network_exists;
 
 use super::{
-    ExternalService, HealthProbeResult, ServiceConfig, ServiceResourceLimits, ServiceType,
+    ExternalService, HealthProbeResult, SensitiveValues, ServiceConfig, ServiceResourceLimits,
+    ServiceType,
 };
 
 /// Input configuration for creating an S3/MinIO service
@@ -1426,6 +1427,22 @@ impl ExternalService for S3Service {
 
         let mut success = true;
         let mut error_logs = Vec::new();
+        // mc echoes the credential-bearing `MC_HOST_*` URL into stderr when it
+        // cannot use it, and this stderr is both logged and persisted into
+        // `external_service_backups.error_message`. The destination credential
+        // may be a temporary one, so its session token belongs on the list
+        // alongside the keys.
+        let sensitive_values = SensitiveValues::new()
+            .credential(
+                &s3_source_config.access_key,
+                &s3_source_config.secret_key,
+                None,
+            )
+            .credential(
+                &decrypted_access_key,
+                &decrypted_secret_key,
+                decrypted_session_token.as_deref(),
+            );
 
         for cmd in commands {
             // Log only the subcommand — args may contain credentials (e.g. `mc alias set`).
@@ -1456,8 +1473,10 @@ impl ExternalService for S3Service {
                             info!("stdout: {}", String::from_utf8_lossy(&message));
                         }
                         bollard::container::LogOutput::StdErr { message } => {
-                            error!("stderr: {}", String::from_utf8_lossy(&message));
-                            error_logs.push(String::from_utf8_lossy(&message).to_string());
+                            let safe_stderr =
+                                sensitive_values.redact(String::from_utf8_lossy(&message).as_ref());
+                            error!("stderr: {}", safe_stderr);
+                            error_logs.push(safe_stderr);
                         }
                         _ => {}
                     }
@@ -1630,6 +1649,16 @@ impl ExternalService for S3Service {
         // When called from main app, caller should decrypt before passing
         let source_access_key = &s3_source.access_key_id;
         let source_secret_key = &s3_source.secret_key;
+        // Plaintext on the same contract; `None` for a long-lived credential.
+        let source_session_token = s3_source.session_token.as_deref();
+
+        // mc prints the `MC_HOST_*` URL it could not use straight into stderr,
+        // and that stderr is logged and folded into the returned error. Both
+        // credentials — including a temporary source credential's session
+        // token — have to be scrubbed out of it first.
+        let sensitive_values = SensitiveValues::new()
+            .credential(source_access_key, source_secret_key, source_session_token)
+            .credential(&s3_config.access_key, &s3_config.secret_key, None);
 
         // Base commands for setting up aliases
         let setup_commands = vec![
@@ -1678,7 +1707,10 @@ impl ExternalService for S3Service {
                             info!("stdout: {}", String::from_utf8_lossy(&message));
                         }
                         bollard::container::LogOutput::StdErr { message } => {
-                            error!("stderr: {}", String::from_utf8_lossy(&message));
+                            error!(
+                                "stderr: {}",
+                                sensitive_values.redact(String::from_utf8_lossy(&message).as_ref())
+                            );
                         }
                         _ => {}
                     }
@@ -1766,7 +1798,10 @@ impl ExternalService for S3Service {
                             info!("stdout: {}", msg);
                         }
                         bollard::container::LogOutput::StdErr { message } => {
-                            error!("stderr: {}", String::from_utf8_lossy(&message));
+                            error!(
+                                "stderr: {}",
+                                sensitive_values.redact(String::from_utf8_lossy(&message).as_ref())
+                            );
                         }
                         _ => {}
                     }
@@ -1780,7 +1815,7 @@ impl ExternalService for S3Service {
                         "Failed to create bucket {}: Exit code {} - {}",
                         bucket_name,
                         inspect_result,
-                        stdout
+                        sensitive_values.redact(&stdout)
                     ));
                 }
             }
@@ -1835,7 +1870,7 @@ impl ExternalService for S3Service {
                         }
                         bollard::container::LogOutput::StdErr { message } => {
                             let msg = String::from_utf8_lossy(&message).into_owned();
-                            error!("mirror stderr: {}", msg);
+                            error!("mirror stderr: {}", sensitive_values.redact(&msg));
                             mirror_stderr.push_str(&msg);
                         }
                         _ => {}
@@ -1858,12 +1893,15 @@ impl ExternalService for S3Service {
                         }),
                     )
                     .await;
+                // Redact the accumulated output, not the individual chunks: a
+                // credential can straddle two Docker log frames and only the
+                // joined string is guaranteed to contain it intact.
                 return Err(anyhow::anyhow!(
                     "mc mirror failed for bucket '{}' with exit code {}. stdout: {}. stderr: {}",
                     bucket_name,
                     mirror_exit,
-                    mirror_stdout.trim(),
-                    mirror_stderr.trim(),
+                    sensitive_values.redact(mirror_stdout.trim()),
+                    sensitive_values.redact(mirror_stderr.trim()),
                 ));
             }
         }
@@ -2015,6 +2053,19 @@ impl ExternalService for S3Service {
             format!("RESTORE_PREFIX={}/", backup_prefix),
         ];
 
+        // The container's combined stdout/stderr is folded into the error this
+        // method returns, which is persisted to `restore_runs.error` and shown
+        // in the API. mc prints the `MC_HOST_*` URL it failed on, so every
+        // credential in those variables — session token included — has to be
+        // scrubbed out of that blob first.
+        let sensitive_values = SensitiveValues::new()
+            .credential(
+                &ctx.s3_source.access_key_id,
+                &ctx.s3_source.secret_key,
+                ctx.s3_source.session_token.as_deref(),
+            )
+            .credential(&s3_config.access_key, &s3_config.secret_key, None);
+
         // Static script constant — no user-supplied values are interpolated here.
         let script = Self::RESTORE_IN_PLACE_SCRIPT.to_string();
 
@@ -2104,7 +2155,7 @@ impl ExternalService for S3Service {
                 "S3 restore failed: mc mirror exited with code {} for service '{}'. Logs:\n{}",
                 exit_code,
                 ctx.source_service.name,
-                logs.trim(),
+                sensitive_values.redact(logs.trim()),
             ));
         }
 
@@ -2242,6 +2293,19 @@ impl ExternalService for S3Service {
             source_session_token.as_deref(),
         ));
 
+        // mc echoes the credential-bearing `MC_HOST_*` URL into stderr when it
+        // cannot use it, and that stderr is logged and folded into the error
+        // persisted to `restore_runs.error`. A temporary source credential's
+        // session token is as sensitive as its secret key, so it goes on the
+        // list too.
+        let sensitive_values = SensitiveValues::new()
+            .credential(
+                &source_access_key,
+                &source_secret_key,
+                source_session_token.as_deref(),
+            )
+            .credential(&new_config.access_key, &new_config.secret_key, None);
+
         let container_config = bollard::models::ContainerCreateBody {
             image: Some(Self::MC_IMAGE.to_string()),
             env: Some(env_vars.iter().map(|s| s.as_str().to_string()).collect()),
@@ -2323,7 +2387,10 @@ impl ExternalService for S3Service {
                             info!("mc stdout: {}", String::from_utf8_lossy(&message));
                         }
                         bollard::container::LogOutput::StdErr { message } => {
-                            error!("mc stderr: {}", String::from_utf8_lossy(&message));
+                            error!(
+                                "mc stderr: {}",
+                                sensitive_values.redact(String::from_utf8_lossy(&message).as_ref())
+                            );
                         }
                         _ => {}
                     }
@@ -2497,7 +2564,7 @@ impl ExternalService for S3Service {
                         }
                         bollard::container::LogOutput::StdErr { message } => {
                             let msg = String::from_utf8_lossy(&message).into_owned();
-                            error!("mirror stderr: {}", msg);
+                            error!("mirror stderr: {}", sensitive_values.redact(&msg));
                             new_mirror_stderr.push_str(&msg);
                         }
                         _ => {}
@@ -2522,14 +2589,17 @@ impl ExternalService for S3Service {
                         }),
                     )
                     .await;
+                // Redact the accumulated output rather than the individual
+                // chunks: a credential can straddle two Docker log frames and
+                // only the joined string is guaranteed to contain it intact.
                 return Err(anyhow::anyhow!(
                     "mc mirror failed for bucket '{}' into new service '{}' with exit code {}. \
                      stdout: {}. stderr: {}",
                     bucket_name,
                     new_service_name,
                     mirror_exit,
-                    new_mirror_stdout.trim(),
-                    new_mirror_stderr.trim(),
+                    sensitive_values.redact(new_mirror_stdout.trim()),
+                    sensitive_values.redact(new_mirror_stderr.trim()),
                 ));
             }
         }

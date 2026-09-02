@@ -759,20 +759,157 @@ pub fn aws_session_token_env(session_token: Option<&str>) -> Option<String> {
         .map(|token| format!("AWS_SESSION_TOKEN={token}"))
 }
 
+/// Bytes that cannot appear literally in the userinfo of an `MC_HOST_<alias>`
+/// URL.
+///
+/// `mc` parses that variable with Go's `net/url`, which percent-decodes
+/// userinfo, so every byte that would otherwise terminate the authority
+/// (`/ ? #`), separate the userinfo from the host (`@`), or separate the three
+/// credential fields (`:`) has to be escaped — as does `%` itself, being the
+/// escape character. `[`/`]` are gen-delims that Go rejects outright in
+/// userinfo, and a raw space or control byte is never valid there either.
+/// Non-ASCII bytes are always escaped by `utf8_percent_encode`, independent of
+/// this set.
+///
+/// Deliberately minimal. An access key or secret key drawn from the usual
+/// base64/hex alphabet contains none of these bytes, so its encoded form is the
+/// *same bytes* it has always been and every existing long-lived credential
+/// produces the exact `MC_HOST_*` string it produced before. Only a value that
+/// would otherwise have built a malformed URL changes — and STS session tokens
+/// routinely contain `/`.
+const MC_USERINFO_ESCAPE: &percent_encoding::AsciiSet = &percent_encoding::CONTROLS
+    .add(b'%')
+    .add(b':')
+    .add(b'/')
+    .add(b'?')
+    .add(b'#')
+    .add(b'@')
+    .add(b'[')
+    .add(b']')
+    .add(b' ');
+
+/// Percent-encode one credential field for splicing into an `MC_HOST_*` URL.
+///
+/// Returns `Cow::Borrowed` — the identical bytes — for anything that needs no
+/// escaping, which is every ordinary access key and secret key.
+fn encode_mc_userinfo(value: &str) -> std::borrow::Cow<'_, str> {
+    percent_encoding::utf8_percent_encode(value, MC_USERINFO_ESCAPE).into()
+}
+
 /// The credential segment of an `MC_HOST_<alias>` URL.
 ///
 /// `mc` takes `<scheme>://<access key>:<secret key>[:<session token>]@<host>`.
 /// The session token is a third colon-separated field rather than an
 /// environment variable, because `mc` does not read `AWS_SESSION_TOKEN` at all.
 /// A long-lived credential produces the two-field form byte-for-byte as before.
+///
+/// Each field is percent-encoded (see [`MC_USERINFO_ESCAPE`]) because an STS
+/// session token routinely contains `/` and `+`, and a raw `/` in userinfo ends
+/// the URL authority — mc would fail to parse the variable at all and report a
+/// confusing URL error instead of a credential error.
 pub fn mc_host_credential(
     access_key: &str,
     secret_key: &str,
     session_token: Option<&str>,
 ) -> String {
+    let access_key = encode_mc_userinfo(access_key);
+    let secret_key = encode_mc_userinfo(secret_key);
     match session_token.filter(|token| !token.is_empty()) {
-        Some(token) => format!("{access_key}:{secret_key}:{token}"),
+        Some(token) => {
+            let token = encode_mc_userinfo(token);
+            format!("{access_key}:{secret_key}:{token}")
+        }
         None => format!("{access_key}:{secret_key}"),
+    }
+}
+
+/// Remove credentials from external-client output before it reaches logs,
+/// persisted restore/backup errors, or API responses. Replacing the individual
+/// key values also redacts them when `mc` echoes a credential-bearing URL.
+///
+/// Prefer [`SensitiveValues`] over calling this with a hand-rolled array: it is
+/// what guarantees no credential field is left off the list.
+pub fn redact_sensitive_output(output: &str, sensitive_values: &[&str]) -> String {
+    sensitive_values
+        .iter()
+        .filter(|value| !value.is_empty())
+        .fold(output.to_string(), |redacted, value| {
+            redacted.replace(value, "***")
+        })
+}
+
+/// Every credential value that must not survive into a log line, a persisted
+/// `external_service_backups.error_message` / `restore_runs.error`, or an API
+/// response.
+///
+/// `mc` echoes the credential-bearing `MC_HOST_*` URL it failed to use straight
+/// into stderr, and that stderr is logged, persisted and surfaced. Each call
+/// site that captures external-client output therefore has to know *every*
+/// secret that could appear in it. Hand-rolled arrays drifted the moment a new
+/// credential field (the STS session token) was added, so this type is the one
+/// place that builds the list: [`SensitiveValues::credential`] takes the
+/// session token as a required argument precisely so a call site cannot
+/// silently omit it, and it registers the percent-encoded spelling too, because
+/// that is the form mc prints back from an `MC_HOST_*` URL.
+#[derive(Debug, Default, Clone)]
+pub struct SensitiveValues<'a> {
+    values: Vec<std::borrow::Cow<'a, str>>,
+}
+
+impl<'a> SensitiveValues<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Register one credential triple. `session_token` is `None` for every
+    /// long-lived, operator-configured credential — pass it explicitly rather
+    /// than omitting the argument, so adding a credential is always a decision
+    /// about all three fields.
+    #[must_use]
+    pub fn credential(
+        mut self,
+        access_key: &'a str,
+        secret_key: &'a str,
+        session_token: Option<&'a str>,
+    ) -> Self {
+        self.push(access_key);
+        self.push(secret_key);
+        if let Some(token) = session_token {
+            self.push(token);
+        }
+        self
+    }
+
+    /// Register an already-assembled [`S3Credentials`], token included.
+    #[must_use]
+    pub fn s3_credentials(self, credentials: &'a S3Credentials) -> Self {
+        self.credential(
+            &credentials.access_key_id,
+            &credentials.secret_key,
+            credentials.session_token.as_deref(),
+        )
+    }
+
+    /// Replace every registered credential value in `output` with `***`.
+    pub fn redact(&self, output: &str) -> String {
+        let values: Vec<&str> = self.values.iter().map(|value| value.as_ref()).collect();
+        redact_sensitive_output(output, &values)
+    }
+
+    fn push(&mut self, value: &'a str) {
+        // An empty needle would match at every position; skip it rather than
+        // turning the whole message into `***`.
+        if value.is_empty() {
+            return;
+        }
+        // The URL-encoded spelling first: it is the longer of the two and the
+        // form mc prints when it echoes the `MC_HOST_*` URL back.
+        let encoded = encode_mc_userinfo(value);
+        if encoded != value {
+            self.values
+                .push(std::borrow::Cow::Owned(encoded.into_owned()));
+        }
+        self.values.push(std::borrow::Cow::Borrowed(value));
     }
 }
 
@@ -783,6 +920,20 @@ pub fn mc_host_credential(
 /// temporary credential at all. `MC_HOST_<alias>` can, and mc resolves it ahead
 /// of its config file — so emitting this alongside the existing `alias set`
 /// call upgrades the alias in place.
+///
+/// KNOWN GAP (temporary credentials only — left for the ADR author, since it
+/// needs a decision about the whole mc invocation flow rather than a patch
+/// here): when no `--api` flag is passed, `mc alias set` auto-probes the
+/// endpoint by `Stat`-ing a random bucket with the *positional* credentials and
+/// accepts only `BucketDoesNotExist` or `AccessDenied`. It builds that probe
+/// client from the CLI arguments alone — `MC_HOST_*` is consulted when an alias
+/// is *resolved*, never while it is being set — so a key pair that needs a
+/// session token gets `InvalidAccessKeyId` and mc exits non-zero before the
+/// override is ever read. Every path here that runs `alias set` and checks its
+/// exit code therefore fails first. Long-lived credentials (every
+/// operator-configured source) are unaffected, as are the paths that pass
+/// credentials exclusively through `MC_HOST_*`
+/// (`S3Service::restore_in_place`, `S3MirrorEngine`).
 ///
 /// Returns `None` when there is no session token, which is every long-lived
 /// operator-configured credential: nothing is added to the container
@@ -1254,12 +1405,17 @@ pub enum RecoveryTarget {
 pub struct RestoreContext<'a> {
     pub s3_client: &'a aws_sdk_s3::Client,
     pub s3_credentials: &'a S3Credentials,
-    /// S3 source row with DECRYPTED `access_key_id` / `secret_key` fields.
-    /// The orchestrator clones the DB row and swaps the ciphertext out before
-    /// handing it here, so trait implementations can use these values
-    /// directly (passing to mc, env vars, etc.) without calling
+    /// S3 source row with DECRYPTED `access_key_id`, `secret_key` and
+    /// `session_token` fields. The orchestrator clones the DB row and swaps the
+    /// ciphertext out before handing it here, so trait implementations can use
+    /// these values directly (passing to mc, env vars, etc.) without calling
     /// `EncryptionService::decrypt_string` again — doing so would fail
     /// because the bytes are no longer ciphertext.
+    ///
+    /// `session_token` is `None` for every long-lived operator-configured
+    /// credential and `Some` only for a temporary (STS-style) one; it is
+    /// exactly as sensitive as `secret_key` and must be redacted out of any
+    /// external-client output the implementation logs or persists.
     pub s3_source: &'a temps_entities::s3_sources::Model,
     pub backup: &'a temps_entities::backups::Model,
     pub backup_location: &'a str,
@@ -2116,6 +2272,141 @@ mod temporary_credential_tests {
             mc_host_credential("key", "secret", Some("token")),
             "key:secret:token"
         );
+    }
+
+    /// The no-regression guarantee for every source an operator ever typed in:
+    /// percent-encoding must be a byte-for-byte no-op on the alphabets real
+    /// access keys and secret keys are drawn from.
+    #[test]
+    fn mc_host_credential_is_byte_identical_for_a_long_lived_credential() {
+        for (access_key, secret_key) in [
+            (
+                "AKIAIOSFODNN7EXAMPLE",
+                "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY",
+            ),
+            ("minioadmin", "minioadmin"),
+            ("temps-dev", "a-b_c.d~e"),
+            ("0123456789", "+=,!*()'$&;"),
+        ] {
+            assert_eq!(
+                mc_host_credential(access_key, secret_key, None),
+                format!("{access_key}:{secret_key}"),
+                "encoding must not alter a credential that needs no escaping"
+            );
+        }
+    }
+
+    /// A secret key containing `/` (AWS's own example key does) used to splice
+    /// a path separator into the URL authority, which ends it — mc reported a
+    /// URL parse error rather than anything about credentials.
+    #[test]
+    fn mc_host_credential_escapes_a_slash_in_the_secret_key() {
+        assert_eq!(
+            mc_host_credential("AKIAEXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCY", None),
+            "AKIAEXAMPLE:wJalrXUtnFEMI%2FK7MDENG%2FbPxRfiCY"
+        );
+    }
+
+    /// STS session tokens are long base64 blobs: `/` must be escaped so the
+    /// authority survives, `+` must NOT be (it is a valid userinfo sub-delim
+    /// and is not decoded as a space outside a query string), and `:` must be
+    /// escaped so it cannot be mistaken for a fourth credential field.
+    #[test]
+    fn mc_host_credential_escapes_a_session_token_with_url_significant_characters() {
+        let token = "FwoGZXIvYXdzE//aB+c:d%e";
+
+        let credential = mc_host_credential("key", "secret", Some(token));
+
+        assert_eq!(credential, "key:secret:FwoGZXIvYXdzE%2F%2FaB+c%3Ad%25e");
+        // Exactly two field separators survive, so mc still sees
+        // access key / secret key / session token and nothing else.
+        assert_eq!(credential.matches(':').count(), 2);
+        assert!(!credential.contains('/'), "a raw / would end the authority");
+        assert!(!credential.contains('@'));
+
+        // And it still parses as a URL authority, which is the whole point.
+        let url = format!("https://{credential}@s3.example.test");
+        let (userinfo, host) = url
+            .trim_start_matches("https://")
+            .rsplit_once('@')
+            .expect("userinfo is separated from the host");
+        assert_eq!(host, "s3.example.test");
+        assert_eq!(userinfo, credential);
+    }
+
+    #[test]
+    fn mc_host_alias_override_escapes_the_session_token_too() {
+        assert_eq!(
+            mc_host_alias_override("bkp", "https://s3.example.test", "k", "s", Some("a/b"))
+                .as_deref(),
+            Some("MC_HOST_bkp=https://k:s:a%2Fb@s3.example.test")
+        );
+    }
+
+    #[test]
+    fn sensitive_values_redacts_every_credential_field_including_the_token() {
+        let sensitive = SensitiveValues::new()
+            .credential("live-key", "live-secret", None)
+            .credential("bkp-key", "bkp-secret", Some("sts-session-token"));
+
+        let redacted = sensitive.redact(
+            "mc: <ERROR> Unable to initialize \
+             https://bkp-key:bkp-secret:sts-session-token@s3.example.test \
+             (live alias live-key/live-secret)",
+        );
+
+        assert!(!redacted.contains("bkp-secret"));
+        assert!(!redacted.contains("sts-session-token"));
+        assert!(!redacted.contains("live-secret"));
+        assert!(!redacted.contains("bkp-key"));
+        assert!(!redacted.contains("live-key"));
+    }
+
+    /// mc echoes back the URL it was handed, so the *encoded* spelling is what
+    /// actually shows up in stderr for a token containing `/`.
+    #[test]
+    fn sensitive_values_redacts_the_percent_encoded_spelling_of_a_token() {
+        let token = "FwoGZXIvYXdzE//aB";
+        let sensitive = SensitiveValues::new().credential("key", "secret", Some(token));
+
+        let stderr = format!(
+            "mc: <ERROR> Unable to initialize https://{}@s3.example.test",
+            mc_host_credential("key", "secret", Some(token))
+        );
+        let redacted = sensitive.redact(&stderr);
+
+        assert!(!redacted.contains("FwoGZXIvYXdzE"));
+        assert!(!redacted.contains("%2F%2FaB"));
+        assert_eq!(
+            redacted,
+            "mc: <ERROR> Unable to initialize https://***:***:***@s3.example.test"
+        );
+    }
+
+    /// A `Some("")` token must never turn the whole message into `***`.
+    #[test]
+    fn sensitive_values_ignores_an_empty_credential_field() {
+        let sensitive = SensitiveValues::new().credential("key", "secret", Some(""));
+
+        assert_eq!(
+            sensitive.redact("connection refused"),
+            "connection refused",
+            "an empty needle matches everywhere and must be skipped"
+        );
+    }
+
+    #[test]
+    fn sensitive_values_can_be_built_from_s3_credentials() {
+        let credentials = S3Credentials {
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived()
+        };
+
+        let redacted = SensitiveValues::new()
+            .s3_credentials(&credentials)
+            .redact("AKIAOPERATOR / operator-secret / sts-session-token");
+
+        assert_eq!(redacted, "*** / *** / ***");
     }
 
     #[test]
