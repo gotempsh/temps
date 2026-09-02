@@ -4579,6 +4579,11 @@ export type CreateRouteRequest = {
 
 export type CreateS3SourceRequest = {
     access_key_id: string;
+    /**
+     * Managed RustFS/S3 service that supplies this destination. When set,
+     * schedules using this source can never target that service itself.
+     */
+    backing_service_id?: number | null;
     bucket_name: string;
     bucket_path: string;
     /**
@@ -8016,6 +8021,11 @@ export type ExternalServiceBackupResponse = {
     metadata: unknown;
     s3_location: string;
     service_id: number;
+    /**
+     * Immutable provenance retained when the source service is deleted.
+     */
+    service_name_snapshot?: string | null;
+    service_type_snapshot?: string | null;
     size_bytes?: number | null;
     started_at: string;
     state: string;
@@ -13030,6 +13040,15 @@ export type PipelineStats = {
      * `otel.rate_limited_requests` (SourceKind::Node, node_id 0) every 60s.
      */
     rate_limited_requests: number;
+    /**
+     * Cumulative count of best-effort relay batches rejected because the
+     * bounded relay handoff was saturated or closed.
+     */
+    relay_dropped_batches: number;
+    /**
+     * Cumulative signal-item count contained in rejected relay batches.
+     */
+    relay_dropped_items: number;
     spans_dropped: number;
     spans_received: number;
     spans_stored: number;
@@ -13069,7 +13088,7 @@ export type PlanMetadata = {
 export type PlanSourceBackup = {
     created_at?: string | null;
     /**
-     * "walg", "pg_dump", "unknown".
+     * "walg", "pg_dump", "mariadb_physical", "mariadb_dump", "unknown".
      */
     format: string;
     /**
@@ -15490,7 +15509,7 @@ export type RestorePlan = {
     steps: Array<string>;
     /**
      * How the restore will be performed: "walg_restore", "pg_dump_restore",
-     * or "unsupported".
+     * "mariadb_physical_restore", "mariadb_dump_restore", or "unsupported".
      */
     strategy: string;
     /**
@@ -20573,6 +20592,16 @@ export type UpdateSpeedMetricsPayload = {
      * Interaction to Next Paint (milliseconds)
      */
     inp?: number | null;
+    /**
+     * Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+     */
+    sessionId?: string | null;
+    /**
+     * Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+     * Required to identify the right row on the keyed path, where there is
+     * no Temps-issued cookie to fall back on.
+     */
+    visitorId?: string | null;
 };
 
 /**
@@ -31434,6 +31463,14 @@ export type ListServiceProjectsData = {
 
 export type ListServiceProjectsErrors = {
     /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to view this service
+     */
+    403: unknown;
+    /**
      * Service not found
      */
     404: unknown;
@@ -31466,9 +31503,21 @@ export type LinkServiceToProjectData = {
 
 export type LinkServiceToProjectErrors = {
     /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to link this service
+     */
+    403: unknown;
+    /**
      * Service or project not found
      */
     404: unknown;
+    /**
+     * Project already has a database of this type
+     */
+    409: unknown;
     /**
      * Internal server error
      */
@@ -31501,6 +31550,14 @@ export type UnlinkServiceFromProjectData = {
 };
 
 export type UnlinkServiceFromProjectErrors = {
+    /**
+     * Authentication required
+     */
+    401: unknown;
+    /**
+     * Insufficient permission to unlink this service
+     */
+    403: unknown;
     /**
      * Service link not found
      */

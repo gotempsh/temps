@@ -234,6 +234,9 @@ pub struct CreateS3SourceRequest {
     /// The very first S3 source is always created as default regardless of this flag.
     #[schema(example = false)]
     pub is_default: Option<bool>,
+    /// Managed RustFS/S3 service that supplies this destination. When set,
+    /// schedules using this source can never target that service itself.
+    pub backing_service_id: Option<i32>,
 }
 
 #[derive(Deserialize, ToSchema, Clone)]
@@ -419,6 +422,9 @@ pub struct ExternalServiceBackupResponse {
     pub created_by: i32,
     #[schema(example = "2025-02-15T14:30:00.123Z")]
     pub expires_at: Option<String>,
+    /// Immutable provenance retained when the source service is deleted.
+    pub service_name_snapshot: Option<String>,
+    pub service_type_snapshot: Option<String>,
 }
 
 impl From<temps_entities::external_service_backups::Model> for ExternalServiceBackupResponse {
@@ -439,6 +445,8 @@ impl From<temps_entities::external_service_backups::Model> for ExternalServiceBa
             compression_type: backup.compression_type,
             created_by: backup.created_by,
             expires_at: backup.expires_at.map(|dt| dt.to_rfc3339()),
+            service_name_snapshot: backup.service_name_snapshot,
+            service_type_snapshot: backup.service_type_snapshot,
         }
     }
 }

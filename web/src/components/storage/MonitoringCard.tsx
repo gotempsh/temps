@@ -81,6 +81,7 @@ import {
   ResponsiveContainer,
 } from 'recharts'
 import { formatBytes } from '@/lib/utils'
+import { telemetryFreshnessSummary } from '@/lib/telemetry-freshness'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -1073,6 +1074,11 @@ export function MonitoringCard({
     refetchInterval: 30_000,
   })
   const lastReceivedAt = statusData?.last_received_at ?? null
+  const freshnessSummary = telemetryFreshnessSummary(
+    normalEngine,
+    latestMetrics?.map((metric) => metric.name) ?? [],
+    lastReceivedAt ? formatRelativeTime(lastReceivedAt) : null
+  )
 
   const enableMonitoring = useMutation({
     ...externalServiceMetricsToggleMutation(),
@@ -1203,9 +1209,9 @@ export function MonitoringCard({
           <span className="flex items-center gap-2">
             <Activity className="h-4 w-4" />
             Monitoring
-            {lastReceivedAt && (
+            {freshnessSummary && (
               <span className="text-xs font-normal text-muted-foreground">
-                · last received {formatRelativeTime(lastReceivedAt)}
+                · {freshnessSummary}
               </span>
             )}
           </span>

@@ -120,7 +120,7 @@ function PresetGroup({
             </p>
             <p className="text-xs">
               This image does not include WAL-G. Backups will be basic
-              snapshots — you won't be able to restore to a specific
+              snapshots — you won&apos;t be able to restore to a specific
               timestamp.
               {pitrManagedImage && (
                 <>
@@ -395,7 +395,7 @@ const S3_OPTIONS: PresetOption[] = [
     id: 'rustfs',
     title: 'RustFS',
     subtitle: 'Rust-native',
-    value: 'rustfs/rustfs:1.0.0-alpha.98',
+    value: 'rustfs/rustfs:1.0.0-beta.6',
     hint: 'Default',
   },
   {

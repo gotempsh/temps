@@ -124,6 +124,32 @@ pub struct RustfsConfig {
     pub metrics_ingest_url: Option<String>,
 }
 
+fn rustfs_container_env(config: &RustfsConfig) -> Vec<String> {
+    let mut env_vars = vec![
+        format!("RUSTFS_ACCESS_KEY={}", config.access_key),
+        format!("RUSTFS_SECRET_KEY={}", config.secret_key),
+    ];
+    if let Some(key) = &config.metrics_ingest_key {
+        let base_url = config
+            .metrics_ingest_url
+            .as_deref()
+            .unwrap_or("http://host.docker.internal:8080")
+            .trim_end_matches('/');
+        env_vars.push(format!(
+            "RUSTFS_OBS_METRIC_ENDPOINT={}/api/otel/v1/metrics",
+            base_url
+        ));
+        env_vars.push(format!(
+            "RUSTFS_OBS_ENDPOINT_METRICS_HEADERS=Authorization=Bearer%20{}",
+            key
+        ));
+        env_vars.push("RUSTFS_OBS_METRICS_EXPORT_ENABLED=true".to_string());
+        env_vars.push("RUSTFS_OBS_TRACES_EXPORT_ENABLED=false".to_string());
+        env_vars.push("RUSTFS_OBS_LOGS_EXPORT_ENABLED=false".to_string());
+    }
+    env_vars
+}
+
 impl RustfsConfig {
     /// Create a RustfsConfig from input, using async Docker-aware port finding
     /// Even if ports are provided, validates they are available and finds new ones if not
@@ -706,43 +732,9 @@ impl RustfsService {
             (name_label_key.as_str(), self.name.as_str()),
         ]);
 
-        // RustFS uses RUSTFS_ACCESS_KEY and RUSTFS_SECRET_KEY environment variables.
-        // RUSTFS_PROMETHEUS_AUTH_TYPE=public disables JWT auth on the Prometheus
-        // metrics endpoint (/minio/v2/metrics/cluster) so the local scraper can
-        // reach it without generating a bearer token.  These containers are
-        // private (no public exposure), so this is safe.
-        let mut env_vars = vec![
-            format!("RUSTFS_ACCESS_KEY={}", config.access_key),
-            format!("RUSTFS_SECRET_KEY={}", config.secret_key),
-        ];
-        // When a metrics ingest key is stored in config, metrics are enabled —
-        // inject the OTLP push env vars so RustFS reports to Temps automatically.
-        if let Some(key) = &config.metrics_ingest_key {
-            // Base internal URL — resolved from the `internal_url` setting at
-            // provisioning time. Falls back to the Docker Desktop default for
-            // a pre-existing service that has no stored URL.
-            let base_url = config
-                .metrics_ingest_url
-                .as_deref()
-                .unwrap_or("http://host.docker.internal:8080")
-                .trim_end_matches('/');
-            // Standard OTLP metrics endpoint — the `si_` token is sent in the
-            // Authorization header (RustFS ≥ beta.6 forwards custom OTLP
-            // headers), NOT in the URL, so it never leaks into request logs.
-            env_vars.push(format!(
-                "RUSTFS_OBS_METRIC_ENDPOINT={}/api/otel/v1/metrics",
-                base_url
-            ));
-            // RustFS parses header values as URL-encoded — the space after
-            // "Bearer" must be %20.
-            env_vars.push(format!(
-                "RUSTFS_OBS_ENDPOINT_METRICS_HEADERS=Authorization=Bearer%20{}",
-                key
-            ));
-            env_vars.push("RUSTFS_OBS_METRICS_EXPORT_ENABLED=true".to_string());
-            env_vars.push("RUSTFS_OBS_TRACES_EXPORT_ENABLED=false".to_string());
-            env_vars.push("RUSTFS_OBS_LOGS_EXPORT_ENABLED=false".to_string());
-        }
+        // RustFS uses RUSTFS_ACCESS_KEY/RUSTFS_SECRET_KEY and, on the pinned
+        // beta.6 image, pushes application telemetry through the OTLP env.
+        let env_vars = rustfs_container_env(config);
 
         let networking_config = Some(bollard::models::NetworkingConfig {
             endpoints_config: Some(HashMap::from([(
@@ -2631,6 +2623,31 @@ mod tests {
         assert_eq!(config.host, "custom-host");
         assert_eq!(config.region, "eu-west-1");
         assert_eq!(config.docker_image, "rustfs/rustfs:1.0.0");
+    }
+
+    #[test]
+    fn otel_capable_image_receives_exact_metrics_export_environment() {
+        let config = RustfsConfig {
+            port: "9000".to_string(),
+            console_port: "9001".to_string(),
+            access_key: "TEST_ACCESS".to_string(),
+            secret_key: "TEST_SECRET".to_string(),
+            host: "localhost".to_string(),
+            region: "us-east-1".to_string(),
+            docker_image: DEFAULT_RUSTFS_IMAGE.to_string(),
+            metrics_ingest_key: Some("si_TEST_ONLY".to_string()),
+            metrics_ingest_url: Some("http://temps.internal:8080/".to_string()),
+        };
+
+        let env = rustfs_container_env(&config);
+        assert!(env.contains(
+            &"RUSTFS_OBS_METRIC_ENDPOINT=http://temps.internal:8080/api/otel/v1/metrics"
+                .to_string()
+        ));
+        assert!(env.contains(
+            &"RUSTFS_OBS_ENDPOINT_METRICS_HEADERS=Authorization=Bearer%20si_TEST_ONLY".to_string()
+        ));
+        assert!(env.contains(&"RUSTFS_OBS_METRICS_EXPORT_ENABLED=true".to_string()));
     }
 
     #[test]

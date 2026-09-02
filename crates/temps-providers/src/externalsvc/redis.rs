@@ -28,6 +28,23 @@ use urlencoding;
 /// extend this in the future.
 const REDIS_BACKUP_EXEC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3600);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RedisBackupLocationKind {
+    Walg,
+    RdbGzip,
+    Unsupported,
+}
+
+pub fn classify_redis_backup_location(location: &str) -> RedisBackupLocationKind {
+    if location.starts_with("s3://") {
+        RedisBackupLocationKind::Walg
+    } else if location.ends_with(".rdb.gz") {
+        RedisBackupLocationKind::RdbGzip
+    } else {
+        RedisBackupLocationKind::Unsupported
+    }
+}
+
 /// Input configuration for creating a Redis service
 /// This is what users provide when creating the service
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
@@ -2600,11 +2617,7 @@ impl ExternalService for RedisService {
         })
     }
 
-    /// Provision a new Redis service and restore the given WAL-G backup into it.
-    ///
-    /// Only WAL-G backups (s3:// locations) are supported. Legacy .tar backups
-    /// cannot be restored to a new service because the archive format does not
-    /// include enough metadata to reconstruct a fresh container reliably.
+    /// Provision a new Redis service and restore a WAL-G or RDB-gzip backup into it.
     ///
     /// Steps:
     /// 1. Clone the source config, pick a free port (or honour `parameter_overrides`).
@@ -2625,11 +2638,10 @@ impl ExternalService for RedisService {
             new_service_name, ctx.backup_location
         );
 
-        // Only WAL-G backups can be restored to a new service.
-        if !ctx.backup_location.starts_with("s3://") {
+        let backup_location_kind = classify_redis_backup_location(ctx.backup_location);
+        if backup_location_kind == RedisBackupLocationKind::Unsupported {
             return Err(anyhow::anyhow!(
-                "restore_to_new_service requires a WAL-G backup (s3:// location); \
-                 '{}' is a legacy tar backup and cannot be restored to a new service",
+                "Redis backup location '{}' is neither a WAL-G prefix nor a current .rdb.gz object",
                 ctx.backup_location
             ));
         }
@@ -2642,7 +2654,14 @@ impl ExternalService for RedisService {
         if let Some(port_str) = parameter_overrides.get("port").and_then(|v| v.as_str()) {
             new_redis_config.port = port_str.to_string();
         } else {
-            let base: u16 = new_redis_config.port.parse().unwrap_or(6379);
+            let base: u16 = new_redis_config.port.parse().map_err(|error| {
+                anyhow::anyhow!(
+                    "Cannot clone Redis service '{}': source port '{}' is invalid: {}",
+                    new_service_name,
+                    new_redis_config.port,
+                    error
+                )
+            })?;
             new_redis_config.port = find_available_port(base.wrapping_add(1))
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -2682,119 +2701,145 @@ impl ExternalService for RedisService {
             )
             .await?;
 
+        *new_service.config.write().await = Some(new_redis_config.clone());
+
         let new_container_name = new_service.get_container_name();
         let redis_image = new_redis_config.docker_image.clone();
 
-        // Disable restart policy and stop so the helper can write to the volume.
-        info!(
-            "Disabling restart policy and stopping new container '{}' for restore",
-            new_container_name
-        );
-        self.docker
-            .update_container(
-                &new_container_name,
-                bollard::models::ContainerUpdateBody {
-                    restart_policy: Some(bollard::models::RestartPolicy {
-                        name: Some(bollard::models::RestartPolicyNameEnum::NO),
-                        maximum_retry_count: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to disable restart policy on new container '{}': {}",
+        if backup_location_kind == RedisBackupLocationKind::RdbGzip {
+            if let Err(error) = new_service
+                .restore_from_legacy(ctx.s3_client, ctx.backup_location, ctx.s3_source)
+                .await
+            {
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &new_container_name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            v: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "RDB restore into new Redis container '{}' failed, container removed: {}",
                     new_container_name,
-                    e
-                )
-            })?;
-
-        self.docker
-            .stop_container(
-                &new_container_name,
-                None::<bollard::query_parameters::StopContainerOptions>,
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to stop new Redis container '{}' for restore: {}",
-                    new_container_name,
-                    e
-                )
-            })?;
-
-        // Run the WAL-G restore helper into the new container's volume.
-        let restore_result = self
-            .run_walg_restore_helper(
-                &new_container_name,
-                &redis_image,
-                ctx.backup_location,
-                ctx.s3_credentials,
-            )
-            .await;
-
-        // Re-enable restart policy regardless of outcome.
-        let _ = self
-            .docker
-            .update_container(
-                &new_container_name,
-                bollard::models::ContainerUpdateBody {
-                    restart_policy: Some(bollard::models::RestartPolicy {
-                        name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
-                        maximum_retry_count: None,
-                    }),
-                    ..Default::default()
-                },
-            )
-            .await;
-
-        if let Err(e) = restore_result {
-            // Clean up the new container since the restore failed.
-            let _ = self
-                .docker
-                .remove_container(
+                    error
+                ));
+            }
+        } else {
+            // Disable restart policy and stop so the WAL-G helper can write to the volume.
+            info!(
+                "Disabling restart policy and stopping new container '{}' for restore",
+                new_container_name
+            );
+            self.docker
+                .update_container(
                     &new_container_name,
-                    Some(bollard::query_parameters::RemoveContainerOptions {
-                        force: true,
-                        v: true,
+                    bollard::models::ContainerUpdateBody {
+                        restart_policy: Some(bollard::models::RestartPolicy {
+                            name: Some(bollard::models::RestartPolicyNameEnum::NO),
+                            maximum_retry_count: None,
+                        }),
                         ..Default::default()
-                    }),
+                    },
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to disable restart policy on new container '{}': {}",
+                        new_container_name,
+                        e
+                    )
+                })?;
+
+            self.docker
+                .stop_container(
+                    &new_container_name,
+                    None::<bollard::query_parameters::StopContainerOptions>,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to stop new Redis container '{}' for restore: {}",
+                        new_container_name,
+                        e
+                    )
+                })?;
+
+            // Run the WAL-G restore helper into the new container's volume.
+            let restore_result = self
+                .run_walg_restore_helper(
+                    &new_container_name,
+                    &redis_image,
+                    ctx.backup_location,
+                    ctx.s3_credentials,
                 )
                 .await;
-            return Err(anyhow::anyhow!(
-                "WAL-G restore into new Redis container '{}' failed, container removed: {}",
-                new_container_name,
-                e
-            ));
+
+            // Re-enable restart policy regardless of outcome.
+            let _ = self
+                .docker
+                .update_container(
+                    &new_container_name,
+                    bollard::models::ContainerUpdateBody {
+                        restart_policy: Some(bollard::models::RestartPolicy {
+                            name: Some(bollard::models::RestartPolicyNameEnum::ALWAYS),
+                            maximum_retry_count: None,
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await;
+
+            if let Err(e) = restore_result {
+                // Clean up the new container since the restore failed.
+                let _ = self
+                    .docker
+                    .remove_container(
+                        &new_container_name,
+                        Some(bollard::query_parameters::RemoveContainerOptions {
+                            force: true,
+                            v: true,
+                            ..Default::default()
+                        }),
+                    )
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "WAL-G restore into new Redis container '{}' failed, container removed: {}",
+                    new_container_name,
+                    e
+                ));
+            }
+
+            // Start the new container with restored data.
+            self.docker
+                .start_container(
+                    &new_container_name,
+                    None::<bollard::query_parameters::StartContainerOptions>,
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to start new Redis container '{}' after restore: {}",
+                        new_container_name,
+                        e
+                    )
+                })?;
+
+            // Wait for the healthcheck to pass.
+            new_service
+                .wait_for_container_health(&self.docker, &new_container_name)
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "New Redis container '{}' did not become healthy after restore: {}",
+                        new_container_name,
+                        e
+                    )
+                })?;
         }
-
-        // Start the new container with restored data.
-        self.docker
-            .start_container(
-                &new_container_name,
-                None::<bollard::query_parameters::StartContainerOptions>,
-            )
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "Failed to start new Redis container '{}' after restore: {}",
-                    new_container_name,
-                    e
-                )
-            })?;
-
-        // Wait for the healthcheck to pass.
-        new_service
-            .wait_for_container_health(&self.docker, &new_container_name)
-            .await
-            .map_err(|e| {
-                anyhow::anyhow!(
-                    "New Redis container '{}' did not become healthy after restore: {}",
-                    new_container_name,
-                    e
-                )
-            })?;
 
         info!(
             "New Redis service '{}' provisioned and restored successfully \
@@ -3077,6 +3122,33 @@ mod tests {
             })
             .unwrap();
         assert_eq!(short_password.password, "short");
+    }
+
+    #[test]
+    fn classifies_supported_redis_backup_locations() {
+        assert_eq!(
+            classify_redis_backup_location("s3://backups/redis/cache/walg"),
+            RedisBackupLocationKind::Walg
+        );
+        assert_eq!(
+            classify_redis_backup_location("external_services/redis/cache/backup-00000000.rdb.gz"),
+            RedisBackupLocationKind::RdbGzip
+        );
+    }
+
+    #[test]
+    fn rejects_legacy_or_malformed_redis_backup_locations() {
+        for location in [
+            "",
+            "redis-backup.tar",
+            "snapshot.rdb",
+            "snapshot.rdb.gz.tmp",
+        ] {
+            assert_eq!(
+                classify_redis_backup_location(location),
+                RedisBackupLocationKind::Unsupported
+            );
+        }
     }
 
     /// `restore_capabilities` must declare in-place and new-service restore as

@@ -23,6 +23,10 @@ pub struct Model {
     pub is_default: bool,
     pub created_at: DBDateTime,
     pub updated_at: DBDateTime,
+    /// Managed external service that supplies this destination, when any.
+    /// Backup schedules must never target this service because doing so would
+    /// recursively write a backup into itself.
+    pub backing_service_id: Option<i32>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]
@@ -31,6 +35,12 @@ pub enum Relation {
     BackupSchedules,
     #[sea_orm(has_many = "super::backups::Entity")]
     Backups,
+    #[sea_orm(
+        belongs_to = "super::external_services::Entity",
+        from = "Column::BackingServiceId",
+        to = "super::external_services::Column::Id"
+    )]
+    BackingService,
 }
 
 impl Related<super::backup_schedules::Entity> for Entity {
@@ -42,6 +52,12 @@ impl Related<super::backup_schedules::Entity> for Entity {
 impl Related<super::backups::Entity> for Entity {
     fn to() -> RelationDef {
         Relation::Backups.def()
+    }
+}
+
+impl Related<super::external_services::Entity> for Entity {
+    fn to() -> RelationDef {
+        Relation::BackingService.def()
     }
 }
 

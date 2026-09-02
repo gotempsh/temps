@@ -31,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 use temps_entities::{
-    external_service_backups, external_service_health_checks, external_services, nodes,
-    postgres_major_upgrades, project_services, projects, service_members,
+    backup_schedule_services, backup_schedules, external_service_backups,
+    external_service_health_checks, external_services, nodes, postgres_major_upgrades,
+    project_services, projects, service_members,
 };
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -56,6 +57,13 @@ fn live_state_is_writable_primary(state: Option<&str>) -> bool {
     state
         .and_then(|state| state.parse::<PgAutoFailoverState>().ok())
         .is_some_and(PgAutoFailoverState::is_primary)
+}
+
+fn generated_schedule_loses_last_target(
+    generated_kind: Option<&str>,
+    remaining_targets: u64,
+) -> bool {
+    generated_kind.is_some() && remaining_targets == 0
 }
 
 /// Return the monitor identity of the sole healthy, recently reporting writer.
@@ -1983,7 +1991,6 @@ impl ExternalServiceManager {
         })?;
 
         let parameters = self.get_service_parameters(service_id).await?;
-
         let config = ServiceConfig {
             name: service.name.clone(),
             service_type,
@@ -2525,17 +2532,58 @@ impl ExternalServiceManager {
         // get_service_parameters looks the service up by ID, which would fail
         // once the row is gone.
         let parameters = self.get_service_parameters(service_id).await?;
+        let service_name_snapshot = service.name.clone();
+        let service_type_snapshot = service.service_type.clone();
 
         // Delete from database first
         self.db
             .transaction::<_, (), ExternalServiceError>(|txn| {
                 Box::pin(async move {
+                    // Auto-generated per-service schedules are lifecycle-owned
+                    // by Temps. Disable one in the same transaction when its
+                    // final target is removed; user-created schedules are left
+                    // untouched for the operator to repair deliberately.
+                    let generated_schedules = backup_schedules::Entity::find()
+                        .inner_join(backup_schedule_services::Entity)
+                        .filter(backup_schedule_services::Column::ServiceId.eq(service_id))
+                        .filter(backup_schedules::Column::GeneratedKind.is_not_null())
+                        .all(txn)
+                        .await?;
+                    for schedule in generated_schedules {
+                        let remaining_targets = backup_schedule_services::Entity::find()
+                            .filter(backup_schedule_services::Column::ScheduleId.eq(schedule.id))
+                            .filter(backup_schedule_services::Column::ServiceId.ne(service_id))
+                            .count(txn)
+                            .await?;
+                        if generated_schedule_loses_last_target(
+                            schedule.generated_kind.as_deref(),
+                            remaining_targets,
+                        ) {
+                            let mut update: backup_schedules::ActiveModel = schedule.into();
+                            update.enabled = Set(false);
+                            update.updated_at = Set(Utc::now());
+                            update.update(txn).await?;
+                        }
+                    }
+
                     project_services::Entity::delete_many()
                         .filter(project_services::Column::ServiceId.eq(service_id))
                         .exec(txn)
                         .await?;
 
-                    external_service_backups::Entity::delete_many()
+                    // Backup audit rows intentionally outlive their source
+                    // service. Capture immutable provenance before deleting
+                    // the mutable service record; the migration removes the
+                    // former ON DELETE CASCADE foreign key.
+                    external_service_backups::Entity::update_many()
+                        .col_expr(
+                            external_service_backups::Column::ServiceNameSnapshot,
+                            Expr::value(service_name_snapshot.clone()),
+                        )
+                        .col_expr(
+                            external_service_backups::Column::ServiceTypeSnapshot,
+                            Expr::value(service_type_snapshot.clone()),
+                        )
                         .filter(external_service_backups::Column::ServiceId.eq(service_id))
                         .exec(txn)
                         .await?;
@@ -11287,6 +11335,19 @@ mod tests {
             validate_creator_claim(7, Some(99), false, 42),
             Err(ExternalServiceError::ServiceClaimDenied { service_id: 7 })
         ));
+    }
+
+    #[test]
+    fn generated_schedule_is_disabled_only_after_its_last_target_is_deleted() {
+        assert!(generated_schedule_loses_last_target(
+            Some("mariadb_base_backup"),
+            0
+        ));
+        assert!(!generated_schedule_loses_last_target(
+            Some("mariadb_base_backup"),
+            1
+        ));
+        assert!(!generated_schedule_loses_last_target(None, 0));
     }
 
     // ── Cluster write availability ──────────────────────────────────────

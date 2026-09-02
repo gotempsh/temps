@@ -3771,6 +3771,7 @@ mod tests {
                         service_id,
                         now.timestamp_nanos_opt().unwrap_or(0)
                     )),
+                    backing_service_id: Set(None),
                     bucket_name: Set("upgrade-test-bucket".to_string()),
                     region: Set("us-east-1".to_string()),
                     endpoint: Set(Some("http://127.0.0.1:9000".to_string())),

@@ -319,6 +319,7 @@ mod tests {
             max_runtime_secs: None,
             target_all_services: true,
             include_control_plane: true,
+            generated_kind: None,
         }
     }
 

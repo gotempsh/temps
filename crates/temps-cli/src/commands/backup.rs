@@ -1760,6 +1760,7 @@ impl BackupCommand {
             is_default: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            backing_service_id: None,
         };
 
         if service_model.topology == "cluster" && service_model.service_type == "postgres" {

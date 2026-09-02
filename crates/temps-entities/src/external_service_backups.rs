@@ -24,6 +24,9 @@ pub struct Model {
     pub compression_type: String,
     pub created_by: i32,
     pub expires_at: Option<DBDateTime>,
+    /// Immutable service identity retained after the live service is deleted.
+    pub service_name_snapshot: Option<String>,
+    pub service_type_snapshot: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

@@ -125,21 +125,39 @@ describe('projectHealthIndicator', () => {
     })
 
     expect(indicator.tone).toBe('healthy')
-    expect(indicator.label).toBe('Healthy')
+    expect(indicator.label).toBe('Uptime healthy')
     expect(indicator.detail).toContain('uptime monitor')
+  })
+
+  test('qualifies healthy uptime when request traffic is degraded', () => {
+    const indicator = projectHealthIndicator({
+      health: summary({
+        status: 'degraded',
+        total_requests: 150,
+        total_errors: 20,
+        error_rate: 13.3,
+      }),
+      monitor: { status: 'operational' },
+    })
+
+    expect(indicator).toMatchObject({
+      tone: 'healthy',
+      label: 'Uptime healthy',
+    })
+    expect(indicator.label).not.toBe('Healthy')
   })
 
   test('lets the monitor answer when the traffic query failed entirely', () => {
     expect(
       projectHealthIndicator({ error: true, monitor: { status: 'down' } })
-    ).toMatchObject({ tone: 'down', label: 'Down' })
+    ).toMatchObject({ tone: 'down', label: 'Uptime down' })
 
     expect(
       projectHealthIndicator({
         loading: true,
         monitor: { status: 'degraded' },
       })
-    ).toMatchObject({ tone: 'degraded', label: 'Degraded' })
+    ).toMatchObject({ tone: 'degraded', label: 'Uptime degraded' })
   })
 
   test('a failing monitor outranks quiet-but-clean traffic', () => {
@@ -148,7 +166,7 @@ describe('projectHealthIndicator', () => {
         health: summary({ status: 'healthy' }),
         monitor: { status: 'down' },
       })
-    ).toMatchObject({ tone: 'down', label: 'Down' })
+    ).toMatchObject({ tone: 'down', label: 'Uptime down' })
   })
 
   test('falls back to traffic when the project has no monitors', () => {

@@ -196,6 +196,7 @@ mod docker_utils {
                 is_default: false,
                 created_at: chrono::Utc::now(),
                 updated_at: chrono::Utc::now(),
+                backing_service_id: None,
             };
 
             Ok(Self {

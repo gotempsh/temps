@@ -2080,22 +2080,7 @@ impl PostgresService {
         self.write_walg_restore_env_file(&container_name, &walg_env)
             .await?;
 
-        let recovery_target_line = match recovery_target {
-            None => "recovery_target = 'immediate'".to_string(),
-            Some(super::RecoveryTarget::Time { time }) => format!(
-                "recovery_target_time = '{}'",
-                time.format("%Y-%m-%d %H:%M:%S%:z")
-            ),
-            Some(super::RecoveryTarget::Xid { xid }) => {
-                format!("recovery_target_xid = '{}'", xid.replace('\'', ""))
-            }
-            Some(super::RecoveryTarget::Lsn { lsn }) => {
-                format!("recovery_target_lsn = '{}'", lsn.replace('\'', ""))
-            }
-            Some(super::RecoveryTarget::Name { name }) => {
-                format!("recovery_target_name = '{}'", name.replace('\'', ""))
-            }
-        };
+        let recovery_target_line = postgres_recovery_target_setting(recovery_target);
 
         // `restore_command` sources the read-only credential file. `archive_command`
         // and `archive_mode` are explicitly disabled so the restored cluster does
@@ -2875,6 +2860,25 @@ impl PostgresService {
         );
 
         Ok((backup_key, size_bytes))
+    }
+}
+
+fn postgres_recovery_target_setting(recovery_target: Option<&super::RecoveryTarget>) -> String {
+    match recovery_target {
+        None => "recovery_target = 'immediate'".to_string(),
+        Some(super::RecoveryTarget::Time { time }) => format!(
+            "recovery_target_time = '{}'",
+            time.to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
+        ),
+        Some(super::RecoveryTarget::Xid { xid }) => {
+            format!("recovery_target_xid = '{}'", xid.replace('\'', ""))
+        }
+        Some(super::RecoveryTarget::Lsn { lsn }) => {
+            format!("recovery_target_lsn = '{}'", lsn.replace('\'', ""))
+        }
+        Some(super::RecoveryTarget::Name { name }) => {
+            format!("recovery_target_name = '{}'", name.replace('\'', ""))
+        }
     }
 }
 
@@ -6362,6 +6366,7 @@ mod tests {
             is_default: false,
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
+            backing_service_id: None,
         };
         let backup = temps_entities::backups::Model {
             id: 1,
@@ -6479,6 +6484,53 @@ mod tests {
             "expected WAL-G requirement in error, got: {}",
             msg
         );
+    }
+
+    // -----------------------------------------------------------------
+    // PostgreSQL recovery target formatting
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn recovery_target_setting_preserves_fractional_seconds() {
+        let target = chrono::DateTime::parse_from_rfc3339("2026-09-02T17:11:48.133085Z")
+            .expect("test timestamp must parse")
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
+                time: target,
+            })),
+            "recovery_target_time = '2026-09-02T17:11:48.133085Z'"
+        );
+    }
+
+    #[test]
+    fn recovery_target_setting_keeps_exact_whole_second_boundary() {
+        let target = chrono::DateTime::parse_from_rfc3339("2026-09-02T17:11:48Z")
+            .expect("test timestamp must parse")
+            .with_timezone(&chrono::Utc);
+
+        assert_eq!(
+            postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
+                time: target,
+            })),
+            "recovery_target_time = '2026-09-02T17:11:48Z'"
+        );
+    }
+
+    #[test]
+    fn recovery_target_setting_preserves_microsecond_boundaries() {
+        for timestamp in ["2026-09-02T17:11:48.000001Z", "2026-09-02T17:11:48.999999Z"] {
+            let target = chrono::DateTime::parse_from_rfc3339(timestamp)
+                .expect("test timestamp must parse")
+                .with_timezone(&chrono::Utc);
+            assert_eq!(
+                postgres_recovery_target_setting(Some(&crate::externalsvc::RecoveryTarget::Time {
+                    time: target
+                })),
+                format!("recovery_target_time = '{timestamp}'")
+            );
+        }
     }
 
     // -----------------------------------------------------------------

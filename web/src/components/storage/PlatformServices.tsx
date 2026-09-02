@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: 2024-2026 Temps Contributors
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import {
   kvStatusOptions,
   kvEnableMutation,
@@ -68,13 +68,6 @@ function EditDockerImageDialog({
 }: EditDockerImageDialogProps) {
   const [dockerImage, setDockerImage] = useState(currentImage)
 
-  // Sync state when dialog opens with new currentImage
-  useEffect(() => {
-    if (open) {
-      setDockerImage(currentImage)
-    }
-  }, [open, currentImage])
-
   const handleSave = () => {
     if (dockerImage.trim()) {
       onSave(dockerImage.trim())
@@ -98,12 +91,16 @@ function EditDockerImageDialog({
               id="docker-image"
               value={dockerImage}
               onChange={(e) => setDockerImage(e.target.value)}
-              placeholder={serviceName === 'KV Store' ? 'redis:8-alpine' : 'rustfs/rustfs:1.0.0-alpha.98'}
+              placeholder={
+                serviceName === 'KV Store'
+                  ? 'redis:8-alpine'
+                  : 'rustfs/rustfs:1.0.0-beta.6'
+              }
             />
             <p className="text-xs text-muted-foreground">
               {serviceName === 'KV Store'
                 ? 'Examples: redis:8-alpine, redis:8-alpine, valkey/valkey:8-alpine'
-                : 'Examples: rustfs/rustfs:1.0.0-alpha.98, rustfs/rustfs:latest'}
+                : 'Examples: rustfs/rustfs:1.0.0-beta.6, rustfs/rustfs:latest'}
             </p>
           </div>
         </div>
@@ -251,7 +248,7 @@ export function PlatformServices() {
   const currentImage =
     editingService === 'kv'
       ? kvStatus?.docker_image || 'redis:8-alpine'
-      : blobStatus?.docker_image || 'rustfs/rustfs:1.0.0-alpha.98'
+      : blobStatus?.docker_image || 'rustfs/rustfs:1.0.0-beta.6'
 
   return (
     <div className="space-y-6">
@@ -259,9 +256,9 @@ export function PlatformServices() {
         <Info className="h-4 w-4" />
         <AlertTitle>Platform Services</AlertTitle>
         <AlertDescription>
-          These services are shared across all projects. Each project's data is
-          isolated by namespace. Enable a service to make it available for all
-          projects.
+          These services are shared across all projects. Each project&apos;s data
+          is isolated by namespace. Enable a service to make it available for
+          all projects.
         </AlertDescription>
       </Alert>
 
@@ -313,6 +310,7 @@ export function PlatformServices() {
 
       {/* Edit Docker Image Dialog */}
       <EditDockerImageDialog
+        key={`${editingService ?? 'none'}:${currentImage}`}
         open={editDialogOpen}
         onOpenChange={(open) => {
           setEditDialogOpen(open)

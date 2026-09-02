@@ -477,6 +477,7 @@ impl RestoreService {
         // `base.mbstream.gz`, which matches no generic arm at all and would
         // land in `unsupported` even though it is the engine's PITR format.
         let target_is_mariadb = target.service_type.eq_ignore_ascii_case("mariadb");
+        let engine_lower = target.service_type.to_ascii_lowercase();
         let strategy = if target_is_mariadb {
             // Same predicate the MariaDB engine itself dispatches on, so the
             // preview cannot promise a restore shape the executor won't take.
@@ -495,6 +496,12 @@ impl RestoreService {
             || resolved_location.ends_with(".pgdump.gz")
         {
             "pg_dump_restore"
+        } else if engine_lower == "redis"
+            && temps_providers::externalsvc::redis::classify_redis_backup_location(
+                &resolved_location,
+            ) == temps_providers::externalsvc::redis::RedisBackupLocationKind::RdbGzip
+        {
+            "redis_rdb_restore"
         } else {
             "unsupported"
         };
@@ -603,7 +610,6 @@ impl RestoreService {
         // Build step list. Engine-first, because each engine has its own
         // container naming, data format, and recovery mechanics. Within an
         // engine we further branch on strategy + mode.
-        let engine_lower = target.service_type.to_ascii_lowercase();
         let container_name = engine_container_name(&engine_lower, &target.name);
         let mut steps: Vec<String> = Vec::new();
         let mut destructive = false;
@@ -2412,22 +2418,51 @@ fn build_redis_steps(
                 );
             }
         },
+        "redis_rdb_restore" => match mode {
+            RestoreRequestMode::InPlace => {
+                *destructive = true;
+                steps.push(format!(
+                    "Download and decompress {} into a Redis RDB snapshot",
+                    resolved_location
+                ));
+                steps.push(format!(
+                    "Stop {} and install the RDB into its data volume",
+                    container_name
+                ));
+                steps.push(
+                    "Rebuild the Redis 7+ appendonlydir manifest from the restored RDB".into(),
+                );
+                steps.push(format!(
+                    "Restart {} and wait for it to report healthy",
+                    container_name
+                ));
+            }
+            RestoreRequestMode::NewService { name, .. } => {
+                steps.push(format!(
+                    "Allocate a new Redis container 'redis-{}' on a fresh volume",
+                    name
+                ));
+                steps.push(format!(
+                    "Download and decompress {} into the new service's data volume",
+                    resolved_location
+                ));
+                steps
+                    .push("Rebuild the Redis 7+ appendonlydir manifest and start the clone".into());
+                steps
+                    .push("Persist the restored Redis service after its healthcheck passes".into());
+            }
+            RestoreRequestMode::Pitr { .. } => {
+                errors.push(
+                    "Redis does not support point-in-time recovery — RDB snapshots are discrete; pick a specific backup instead."
+                        .into(),
+                );
+            }
+        },
         _ => {
-            steps.push(format!(
-                "Download {} from S3 to a temp file",
+            errors.push(format!(
+                "Redis backup location '{}' is neither a WAL-G prefix nor a current .rdb.gz object.",
                 resolved_location
             ));
-            steps.push(format!(
-                "Extract dump.rdb / appendonly.aof and copy into {}'s volume",
-                container_name
-            ));
-            steps.push(format!(
-                "Restart {} to load the restored data",
-                container_name
-            ));
-            if matches!(mode, RestoreRequestMode::InPlace) {
-                *destructive = true;
-            }
         }
     }
 }
@@ -2668,6 +2703,56 @@ async fn resolve_backup_location_from_s3(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redis_rdb_clone_plan_uses_current_volume_installer() {
+        let mut steps = Vec::new();
+        let mut destructive = false;
+        let mut errors = Vec::new();
+
+        build_redis_steps(
+            "redis_rdb_restore",
+            &RestoreRequestMode::NewService {
+                name: "cache-clone".to_string(),
+                parameter_overrides: serde_json::json!({}),
+            },
+            "redis-source",
+            "external_services/redis/source/test-backup.rdb.gz",
+            &mut steps,
+            &mut destructive,
+            &mut errors,
+        );
+
+        assert!(errors.is_empty());
+        assert!(!destructive);
+        assert!(steps.iter().any(|step| step.contains("redis-cache-clone")));
+        assert!(steps.iter().any(|step| step.contains("appendonlydir")));
+        assert!(!steps.iter().any(|step| step.contains("legacy tar")));
+    }
+
+    #[test]
+    fn redis_unknown_backup_plan_is_rejected() {
+        let mut steps = Vec::new();
+        let mut destructive = false;
+        let mut errors = Vec::new();
+
+        build_redis_steps(
+            "unsupported",
+            &RestoreRequestMode::NewService {
+                name: "cache-clone".to_string(),
+                parameter_overrides: serde_json::json!({}),
+            },
+            "redis-source",
+            "legacy-backup.tar",
+            &mut steps,
+            &mut destructive,
+            &mut errors,
+        );
+
+        assert!(steps.is_empty());
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].contains("neither a WAL-G prefix nor a current .rdb.gz"));
+    }
     use bollard::Docker;
     use sea_orm::{DatabaseBackend, MockDatabase};
     use temps_core::EncryptionService;
@@ -3140,6 +3225,8 @@ mod tests {
             compression_type: "gzip".to_string(),
             created_by: 1,
             expires_at: None,
+            service_name_snapshot: Some(format!("service-{service_id}")),
+            service_type_snapshot: Some("postgres".to_string()),
         }
     }
 
@@ -3495,6 +3582,7 @@ mod tests {
         temps_entities::s3_sources::Model {
             id: 1,
             name: "loc-test-s3".to_string(),
+            backing_service_id: None,
             bucket_name: bucket.to_string(),
             region: "us-east-1".to_string(),
             endpoint: Some(format!("http://127.0.0.1:{port}")),
