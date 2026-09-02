@@ -15,9 +15,11 @@ Rust plugin; the Temps host does not need Node.js or Bun at runtime.
 bun add @temps-sdk/plugin@beta
 ```
 
-SDK releases use the same version as Temps. For example, Temps
-`v0.1.0-beta.56` publishes `@temps-sdk/plugin@0.1.0-beta.56`; prereleases are
-also available through npm's `beta` dist-tag.
+The SDK uses independent semantic versions. During the prerelease period, pin
+an exact beta such as `@temps-sdk/plugin@0.1.0-beta.1`; prereleases are also
+available through npm's `beta` dist-tag. SDK compatibility is defined by the
+Temps external-plugin protocol version rather than the Temps application
+version.
 
 ## Minimal plugin
 

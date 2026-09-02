@@ -3,7 +3,7 @@ name: Publish TypeScript plugin SDK
 on:
   push:
     tags:
-      - "v*"
+      - "plugin-sdk-v*"
 
 permissions:
   contents: read
@@ -24,20 +24,18 @@ jobs:
         with:
           node-version: 24
           registry-url: "https://registry.npmjs.org"
-      - name: Verify tag matches Temps version
+      - name: Verify tag matches package version
+        working-directory: sdks/node/packages/plugin-sdk
         shell: bash
         run: |
-          tag_version="${GITHUB_REF_NAME#v}"
-          workspace_version="$(awk '/^\[workspace.package\]/{found=1; next} found && /^version = /{gsub(/[\" ]/, "", $3); print $3; exit}' Cargo.toml)"
-          test "$tag_version" = "$workspace_version"
+          tag_version="${GITHUB_REF_NAME#plugin-sdk-v}"
+          package_version="$(node -p 'require("./package.json").version')"
+          test "$tag_version" = "$package_version"
       - name: Verify release commit is on main
         shell: bash
         run: |
           release_commit="$(git rev-parse "${GITHUB_SHA}^{commit}")"
           git merge-base --is-ancestor "$release_commit" origin/main
-      - name: Set package version from Temps release
-        working-directory: sdks/node/packages/plugin-sdk
-        run: npm version "${GITHUB_REF_NAME#v}" --no-git-tag-version --allow-same-version
       - name: Install locked dependencies
         working-directory: sdks/node
         run: bun install --frozen-lockfile
@@ -53,7 +51,7 @@ jobs:
         working-directory: sdks/node/packages/plugin-sdk
         shell: bash
         run: |
-          version="${GITHUB_REF_NAME#v}"
+          version="${GITHUB_REF_NAME#plugin-sdk-v}"
           if [[ "$version" == *-* ]]; then
             npm_tag="beta"
           else

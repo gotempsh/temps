@@ -1,6 +1,6 @@
 {
   "name": "@temps-sdk/plugin",
-  "version": "0.1.0-beta.56",
+  "version": "0.1.0-beta.1",
   "description": "TypeScript SDK for building standalone Temps plugins with Bun",
   "type": "module",
   "main": "./dist/index.js",
