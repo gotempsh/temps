@@ -14,10 +14,10 @@ pub use alerts::{sweep_backup_alerts, SweepStats, OVERDUE_GRACE};
 pub use backup::{
     BackupAccessScope, BackupAlertEntry, BackupCollectionAccessScope, BackupError,
     BackupScheduleAccessScope, BackupService, BackupTriggerParams, BackupWithAccessScope,
-    ChildBackupEntry, EnqueuedJob, RetentionCleanupFailure, RetentionCleanupReport,
-    ScheduleRunEntry, ScheduleRunJobEntry, ScheduleRunListResponse, ScheduleRunOutcome,
-    ScheduleRunResponse, ScheduleRunSummary, ScheduleRunSummaryList, ServiceBackupEntry,
-    ServiceProjectScope, TriggerSource,
+    ChildBackupEntry, EnqueuedJob, RecoverySetPublication, RetentionCleanupFailure,
+    RetentionCleanupReport, ScheduleRunEntry, ScheduleRunJobEntry, ScheduleRunListResponse,
+    ScheduleRunOutcome, ScheduleRunResponse, ScheduleRunSummary, ScheduleRunSummaryList,
+    ServiceBackupEntry, ServiceProjectScope, TriggerSource,
 };
 pub use notifier::BackupNotificationAdapter;
 pub use reconcile::reconcile_orphan_backups;

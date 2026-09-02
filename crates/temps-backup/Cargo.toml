@@ -40,6 +40,8 @@ serde_json = { workspace = true }
 serde_derive = { workspace = true }
 thiserror = { workspace = true }
 serde_yaml = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
 tracing = { workspace = true }
 cron = "0.17.0"
 anyhow = { workspace = true }

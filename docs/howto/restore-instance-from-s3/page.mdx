@@ -1,0 +1,296 @@
+export const metadata = {
+  title: 'Restore a Temps Instance from S3',
+  description:
+    'Recover the Temps control plane and managed data services on a replacement host from a complete S3 recovery set.',
+  alternates: {
+    canonical: '/docs/restore-instance-from-s3',
+  },
+}
+
+export const sections = [
+  { title: 'Understand the recovery boundary', id: 'understand-the-recovery-boundary' },
+  { title: 'Before you begin', id: 'before-you-begin' },
+  { title: 'Configure the recovery shell', id: 'configure-the-recovery-shell' },
+  { title: 'Select a recovery set', id: 'select-a-recovery-set' },
+  { title: 'Run the dry run', id: 'run-the-dry-run' },
+  { title: 'Fence the target', id: 'fence-the-target' },
+  { title: 'Restore the instance', id: 'restore-the-instance' },
+  { title: 'Start and verify Temps', id: 'start-and-verify-temps' },
+  { title: 'Recover application workloads', id: 'recover-application-workloads' },
+  { title: 'Handle a failed restore', id: 'handle-a-failed-restore' },
+  { title: 'Test the runbook', id: 'test-the-runbook' },
+]
+
+# Restore a Temps Instance from S3
+
+Use this runbook to recover a failed Temps host onto a replacement host. A complete native recovery set restores the TimescaleDB control plane, the source instance encryption material, and every managed data service included by the backup schedule. {{ className: 'lead' }}
+
+<Warning>
+This is a destructive operation. The restore replaces objects in the target control-plane database and writes the source instance's `encryption_key` and `auth_secret` into the target Temps data directory. Complete the dry run before stopping or changing the target.
+</Warning>
+
+---
+
+## Understand the recovery boundary {{ anchor: true, id: 'understand-the-recovery-boundary' }}
+
+The native recovery set contains:
+
+- The control-plane PostgreSQL/TimescaleDB schema.
+- Operational control-plane data, including users, projects, environments, deployments, domains, environment variables, service configuration, backup configuration, and permissions.
+- One backup artifact for every supported managed service selected by the schedule.
+- The source `encryption_key` and `auth_secret`, encrypted inside the recovery manifest. The manifest is decrypted with the S3 secret access key during recovery.
+
+Version 2 recovery manifests are authenticated with the S3 secret access key and bind the recovery-set identity, service artifact locations, and control-plane SHA-256. Temps refuses legacy unauthenticated manifests and any control-plane artifact whose downloaded bytes do not match the authenticated digest.
+
+The control-plane backup intentionally stores schema but not historical rows for high-volume observability tables. Historical analytics events, proxy logs, OpenTelemetry data, session replays, error events, status checks, and AI usage logs are not recovered.
+
+Application runtime artifacts are not currently stored in the recovery set. Docker image layers, local build cache/CAS files, uploaded static bundles, and arbitrary application volumes must be rebuilt, pulled from their registry, or restored separately. Project, deployment, domain, and environment configuration is recovered, so Git-backed applications can be redeployed after Temps starts.
+
+<Note>
+Temps publishes a whole-instance recovery entry only after every job in a scheduled fan-out run succeeds. A run with one failed database backup is deliberately absent from the recovery index and cannot be selected for a full restore.
+</Note>
+
+---
+
+## Before you begin {{ anchor: true, id: 'before-you-begin' }}
+
+Prepare a replacement host with:
+
+- A Temps binary at the same version as the source, or a newer version that supports its database schema.
+- A running PostgreSQL server with the TimescaleDB extension installed.
+- `psql` and `pg_restore` installed on the host.
+- A reachable Docker daemon with enough disk space for every restored service.
+- Network access to the configured S3 or S3-compatible endpoint.
+- The target control-plane database URL and the target Temps data directory.
+- The S3 bucket, recovery index prefix, region, endpoint, access key, and secret key.
+
+Do not run `temps setup` against the restored database. The restore brings back the existing users and platform configuration.
+
+If the target contains data you may need, make a target-side safety backup before continuing. The native restore does not automatically roll back a partially restored control plane.
+
+---
+
+## Configure the recovery shell {{ anchor: true, id: 'configure-the-recovery-shell' }}
+
+Run these commands on the replacement host. Use environment variables so credentials do not appear in the process list or shell history.
+
+```bash
+export S3_BUCKET_NAME='your-backup-bucket'
+export S3_BUCKET_PATH='your-source-prefix/backups'
+export S3_REGION='eu-central-1'
+export S3_ENDPOINT='https://your-s3-endpoint.example.com'
+export S3_FORCE_PATH_STYLE='true'
+
+printf 'S3 access key: '
+IFS= read -r S3_ACCESS_KEY_ID
+export S3_ACCESS_KEY_ID
+
+printf 'S3 secret key: '
+stty -echo
+IFS= read -r S3_SECRET_ACCESS_KEY
+stty echo
+printf '\n'
+export S3_SECRET_ACCESS_KEY
+
+export TEMPS_DATABASE_URL='postgresql://temps:REDACTED@127.0.0.1:5432/temps'
+export TEMPS_DATA_DIR='/var/lib/temps'
+```
+
+`S3_BUCKET_PATH` points to the recovery index directory, not only the S3 source's configured root. If the S3 source has `bucket_path = platform-a`, use `platform-a/backups`. If its root path is empty, use `backups`.
+
+For AWS S3, omit `S3_ENDPOINT` and set `S3_FORCE_PATH_STYLE=false`. For MinIO, RustFS, and many other compatible services, provide the endpoint and use path-style access.
+
+---
+
+## Select a recovery set {{ anchor: true, id: 'select-a-recovery-set' }}
+
+List the complete recovery sets published to the S3 recovery index:
+
+```bash
+temps backup list
+```
+
+Choose the required UUID from the `Backup ID` field, then place only that non-secret identifier in an environment variable:
+
+```bash
+export BACKUP_ID='00000000-0000-4000-8000-000000000000'
+```
+
+Prefer a recovery point created before the failure but after the most recent important configuration change. A recovery set represents one successful scheduled run; do not assemble artifacts from different runs.
+
+---
+
+## Run the dry run {{ anchor: true, id: 'run-the-dry-run' }}
+
+Keep the existing target Temps process running during this read-only validation:
+
+```bash
+temps backup restore --backup-id "$BACKUP_ID" --dry-run
+```
+
+The dry run performs no writes. It verifies:
+
+- The recovery index and manifest identities match.
+- The recovery set is explicitly marked complete.
+- The manifest authentication and control-plane SHA-256 are valid.
+- Every control-plane and managed-service S3 object or prefix is reachable.
+- The encrypted source configuration can be decrypted with the supplied S3 secret.
+- Docker is reachable.
+- The required PostgreSQL restore tool is installed.
+- The target database accepts a connection and has the TimescaleDB extension.
+- The target data directory, or its parent, is available for the recovered secret files.
+
+Do not continue if the dry run fails. Fix the reported prerequisite or select another recovery set, then rerun it.
+
+---
+
+## Fence the target {{ anchor: true, id: 'fence-the-target' }}
+
+Stop every process that can write to the target control plane. For a typical systemd installation:
+
+```bash
+sudo systemctl stop temps
+sudo systemctl stop temps-proxy 2>/dev/null || true
+```
+
+Leave PostgreSQL and Docker running. Prevent load balancers or DNS from sending traffic to the replacement host until verification is complete.
+
+Confirm Temps is stopped:
+
+```bash
+sudo systemctl is-active temps
+```
+
+Expected output is `inactive` or `failed`. Do not run the restore while `temps serve` is active.
+
+---
+
+## Restore the instance {{ anchor: true, id: 'restore-the-instance' }}
+
+Run the same command without `--dry-run`:
+
+```bash
+temps backup restore --backup-id "$BACKUP_ID"
+```
+
+Review the displayed backup UUID, creation time, S3 location, and redacted target database URL. Confirm only when all four identify the intended source and target.
+
+The command then:
+
+1. Streams the compressed control-plane dump from S3 to a temporary file and verifies its authenticated SHA-256.
+2. Restores the `.sql.gz` control-plane backup with `psql` in stop-on-error mode.
+3. Connects to the restored control plane using the source encryption key.
+4. Cross-checks every service and backup identity against the restored control-plane rows.
+5. Recreates missing managed-service containers from their restored configurations.
+6. Restores each managed service from its exact matching S3 artifact; WAL-G restores use the snapshot selector recorded by that backup.
+7. Installs each source `encryption_key` and `auth_secret` file atomically in `TEMPS_DATA_DIR` with owner-only permissions.
+
+If either secret file already exists with a different value, the command preserves it beside the replacement as `<name>.pre-restore-<timestamp>-<uuid>`. These copies are rollback aids and remain owner-readable only.
+
+---
+
+## Start and verify Temps {{ anchor: true, id: 'start-and-verify-temps' }}
+
+Start the main service first:
+
+```bash
+sudo systemctl start temps
+sudo journalctl -u temps -n 200 --no-pager
+```
+
+Temps applies any forward database migrations during startup. Do not downgrade the binary after migrations have run.
+
+Run platform diagnostics with the restored data directory and database URL still exported:
+
+```bash
+temps doctor
+```
+
+Verify all of the following before restoring traffic:
+
+- The console loads and accepts the restored administrator account.
+- Projects, environments, domains, variables, and managed services are visible.
+- Every managed PostgreSQL, Redis, MariaDB, MongoDB, or S3 service reports healthy.
+- A known row or object written before the backup exists in each restored service.
+- Backup schedules and the S3 source are visible without re-entering credentials.
+- No service is stuck in `initializing`, `running` without a container, or `failed`.
+
+Start the separate proxy service, if used, only after application workloads have been recovered:
+
+```bash
+sudo systemctl start temps-proxy
+```
+
+---
+
+## Recover application workloads {{ anchor: true, id: 'recover-application-workloads' }}
+
+The restored deployment rows describe what was running, but restoring the control plane does not recreate missing application containers. Recover each production environment using its original source:
+
+### Git-backed applications
+
+Redeploy the recorded branch, tag, or commit:
+
+```bash
+temps deploy git \
+  --project PROJECT_SLUG \
+  --environment production \
+  --branch main \
+  --api-url https://TARGET_CONSOLE \
+  --api-token "$TEMPS_API_TOKEN" \
+  --wait
+```
+
+### Registry-backed applications
+
+Deploy the same immutable image digest recorded for the environment:
+
+```bash
+temps deploy image \
+  --project PROJECT_SLUG \
+  --environment production \
+  --image registry.example.com/team/app@sha256:DIGEST \
+  --api-url https://TARGET_CONSOLE \
+  --api-token "$TEMPS_API_TOKEN" \
+  --wait
+```
+
+Uploaded static archives and local-only application volumes require their own copies. If no source artifact exists outside the failed host, native S3 recovery cannot recreate that workload.
+
+After every deployment is healthy, verify domain routing and TLS, then return traffic to the replacement host.
+
+---
+
+## Handle a failed restore {{ anchor: true, id: 'handle-a-failed-restore' }}
+
+Do not start Temps after a restore failure. Capture the full error and keep the target fenced.
+
+- An S3 error before the control-plane step changes nothing; correct access or select another recovery set.
+- A control-plane restore error may leave the target database partially replaced. Restore the target safety backup or reset the replacement database, then rerun the same recovery set.
+- A managed-service error occurs after the control plane has been restored. Correct the container, capacity, or S3 problem and rerun the recovery. Recovery-set identity validation prevents mixing artifacts.
+- A secret-installation error means the database and services may already be restored, but Temps must not start until `encryption_key` and `auth_secret` match the source recovery manifest. Correct `TEMPS_DATA_DIR` permissions and rerun.
+
+The restore is idempotent at the recovery-set selection level, but individual engines may replace target data again. Always keep the target fenced until the entire command succeeds.
+
+---
+
+## Test the runbook {{ anchor: true, id: 'test-the-runbook' }}
+
+Test disaster recovery regularly on an isolated replacement host:
+
+1. Insert a unique marker into every managed data service.
+2. Trigger a schedule that includes the control plane and all services.
+3. Wait until every child job is `completed` and the recovery set appears in `temps backup list`.
+4. Run the dry run against the isolated target.
+5. Restore the recovery set and verify every marker.
+6. Redeploy each Git- or registry-backed application.
+7. Exercise login, API keys, deployments, domains, TLS, scheduled jobs, backups, and application database access.
+8. Destroy only the isolated target after recording the recovery time and any manual steps.
+
+For the maintained Temps test environment, use `temps-test-1` only as the backup source and `temps-test-2` only as the restore target. Never reverse those roles or test destructive recovery against another context without a new explicit approval.
+
+When finished, remove S3 credentials from the shell:
+
+```bash
+unset S3_ACCESS_KEY_ID S3_SECRET_ACCESS_KEY TEMPS_DATABASE_URL TEMPS_API_TOKEN
+```
