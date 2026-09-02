@@ -884,21 +884,33 @@ fn managed_backup_setup_from_outcome(outcome: &ManagedBackupOutcome) -> ManagedB
         {
             subscription_required_managed_backup_setup()
         }
-        ManagedBackupOutcome::NotConfigured { .. } => ManagedBackupSetup {
+        // Cloud's `reason` is operator-facing by design (the capability
+        // contract requires a specific, actionable string whenever
+        // `configured: false`) — surface it verbatim instead of a generic
+        // placeholder, so an operator sees exactly why (no storage
+        // configured, no entitlement, instance too old, ...) rather than a
+        // single message covering every case identically.
+        ManagedBackupOutcome::NotConfigured { reason } => ManagedBackupSetup {
             status: ManagedBackupSetupStatus::NeedsSetup,
             ready: false,
-            message: "Temps Cloud has not created the managed backup destination yet."
-                .to_string(),
+            message: reason.clone().unwrap_or_else(|| {
+                "Temps Cloud has not created the managed backup destination yet.".to_string()
+            }),
             action: ManagedBackupSetupAction::Retry,
         },
         ManagedBackupOutcome::Unavailable(reason) if requires_subscription_renewal(reason) => {
             subscription_required_managed_backup_setup()
         }
-        ManagedBackupOutcome::Unavailable(_) => ManagedBackupSetup {
+        // `reason` here is `error.to_string()` from the client call or the
+        // local persistence step (see `provision_managed_backup_source`), not
+        // raw transport internals, so it's safe and useful to show directly
+        // rather than flattening every failure into one generic sentence.
+        ManagedBackupOutcome::Unavailable(reason) => ManagedBackupSetup {
             status: ManagedBackupSetupStatus::Unavailable,
             ready: false,
-            message: "Temps Cloud could not create the managed backup destination. Retry when the service is available."
-                .to_string(),
+            message: format!(
+                "Temps Cloud could not create the managed backup destination: {reason}"
+            ),
             action: ManagedBackupSetupAction::Retry,
         },
     }
