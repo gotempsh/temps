@@ -622,6 +622,7 @@ async fn do_ingest_metrics(
             payload: data.clone(),
         };
         if let Err(reason) = tx.try_send(msg) {
+            state.otel_service.record_relay_drop(count);
             if let Some(dropped_total) = relay_drop_log_sample() {
                 tracing::warn!(
                     project_id = ctx.project_id,
@@ -729,6 +730,7 @@ async fn do_ingest_traces(
             payload: data.clone(),
         };
         if let Err(reason) = tx.try_send(msg) {
+            state.otel_service.record_relay_drop(count);
             if let Some(dropped_total) = relay_drop_log_sample() {
                 tracing::warn!(
                     project_id = ctx.project_id,
@@ -844,6 +846,7 @@ async fn do_ingest_logs(
             payload: data.clone(),
         };
         if let Err(reason) = tx.try_send(msg) {
+            state.otel_service.record_relay_drop(count);
             if let Some(dropped_total) = relay_drop_log_sample() {
                 tracing::warn!(
                     project_id = ctx.project_id,

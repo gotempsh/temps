@@ -207,7 +207,7 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
 
 /// Number of counters the OTel pipeline-stats sampler publishes each cycle —
 /// one per [`crate::types::PipelineStats`] field.
-pub const OTEL_PIPELINE_STAT_COUNT: usize = 13;
+pub const OTEL_PIPELINE_STAT_COUNT: usize = 15;
 
 /// How often the pipeline-stats sampler snapshots the counters, in seconds.
 ///
@@ -250,6 +250,8 @@ pub const OTEL_PIPELINE_METRIC_NAMES: [&str; OTEL_PIPELINE_STAT_COUNT] = [
     "otel.logs_stored_s3",
     "otel.logs_dropped",
     "otel.ingest_errors",
+    "otel.relay_dropped_batches",
+    "otel.relay_dropped_items",
 ];
 
 /// Turn a pipeline-stats snapshot plus the previous cycle's checkpoint into the
@@ -321,6 +323,16 @@ fn pipeline_stat_deltas(
         (
             "otel.ingest_errors",
             snap.ingest_errors.saturating_sub(prev.ingest_errors),
+        ),
+        (
+            "otel.relay_dropped_batches",
+            snap.relay_dropped_batches
+                .saturating_sub(prev.relay_dropped_batches),
+        ),
+        (
+            "otel.relay_dropped_items",
+            snap.relay_dropped_items
+                .saturating_sub(prev.relay_dropped_items),
         ),
     ]
 }
@@ -991,7 +1003,7 @@ impl TempsPlugin for OtelPlugin {
             // keeping the alarm falsely active. Always writing — including
             // zeros — lets the metric self-resolve on the next cycle, exactly
             // like the proxy sampler's fixed-size point set does. The storage
-            // cost is a fixed 16 rows per minute (13 counters plus three
+            // cost is a fixed 18 rows per minute (15 counters plus three
             // resource-limit gauges) regardless of ingest volume.
             {
                 let stats_otel_service = otel_service.clone();
@@ -1325,6 +1337,8 @@ mod tests {
             ingest_errors: 11,
             rate_limited_requests: 12,
             quota_exceeded_requests: 13,
+            relay_dropped_batches: 14,
+            relay_dropped_items: 15,
         };
 
         let deltas = pipeline_stat_deltas(&snap, &zero);
@@ -1345,6 +1359,8 @@ mod tests {
         assert_eq!(by_name["otel.ingest_errors"], 11);
         assert_eq!(by_name["otel.rate_limited_requests"], 12);
         assert_eq!(by_name["otel.quota_exceeded_requests"], 13);
+        assert_eq!(by_name["otel.relay_dropped_batches"], 14);
+        assert_eq!(by_name["otel.relay_dropped_items"], 15);
     }
 
     /// The writer's names and the reader's published list must be identical,

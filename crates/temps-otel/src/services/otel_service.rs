@@ -170,6 +170,10 @@ struct PipelineStatsAtomic {
     /// Ingest requests rejected because the per-project storage quota was
     /// exhausted (→ HTTP 413).
     quota_exceeded_requests: AtomicU64,
+    /// Relay batches rejected by the bounded handoff queue.
+    relay_dropped_batches: AtomicU64,
+    /// Signal items contained in relay batches rejected by the handoff queue.
+    relay_dropped_items: AtomicU64,
 }
 
 impl Default for PipelineStatsAtomic {
@@ -188,6 +192,8 @@ impl Default for PipelineStatsAtomic {
             ingest_errors: AtomicU64::new(0),
             rate_limited_requests: AtomicU64::new(0),
             quota_exceeded_requests: AtomicU64::new(0),
+            relay_dropped_batches: AtomicU64::new(0),
+            relay_dropped_items: AtomicU64::new(0),
         }
     }
 }
@@ -698,6 +704,17 @@ impl OtelService {
 
     // ── Observability ───────────────────────────────────────────────
 
+    /// Record loss of a best-effort relay copy without affecting primary
+    /// ingest success. Called only after the non-blocking relay enqueue fails.
+    pub fn record_relay_drop(&self, item_count: usize) {
+        self.stats
+            .relay_dropped_batches
+            .fetch_add(1, Ordering::Relaxed);
+        self.stats
+            .relay_dropped_items
+            .fetch_add(item_count as u64, Ordering::Relaxed);
+    }
+
     /// Get pipeline statistics snapshot.
     pub fn pipeline_stats(&self) -> PipelineStats {
         PipelineStats {
@@ -714,6 +731,8 @@ impl OtelService {
             ingest_errors: self.stats.ingest_errors.load(Ordering::Relaxed),
             rate_limited_requests: self.stats.rate_limited_requests.load(Ordering::Relaxed),
             quota_exceeded_requests: self.stats.quota_exceeded_requests.load(Ordering::Relaxed),
+            relay_dropped_batches: self.stats.relay_dropped_batches.load(Ordering::Relaxed),
+            relay_dropped_items: self.stats.relay_dropped_items.load(Ordering::Relaxed),
         }
     }
 
@@ -2152,6 +2171,17 @@ mod tests {
 
         drop(permits);
         assert!(service.try_acquire_ingest_permit().is_ok());
+    }
+
+    #[test]
+    fn relay_drops_are_exposed_in_pipeline_stats() {
+        let (service, _storage) = make_service(MockOtelStorage::new());
+        service.record_relay_drop(27);
+        service.record_relay_drop(15);
+
+        let stats = service.pipeline_stats();
+        assert_eq!(stats.relay_dropped_batches, 2);
+        assert_eq!(stats.relay_dropped_items, 42);
     }
 
     // ── span-stats query validation ─────────────────────────────────

@@ -635,6 +635,11 @@ pub struct PipelineStats {
     /// storage quota was exceeded (→ HTTP 413). Written to the metrics store
     /// as `otel.quota_exceeded_requests` (SourceKind::Node, node_id 0) every 60s.
     pub quota_exceeded_requests: u64,
+    /// Cumulative count of best-effort relay batches rejected because the
+    /// bounded relay handoff was saturated or closed.
+    pub relay_dropped_batches: u64,
+    /// Cumulative signal-item count contained in rejected relay batches.
+    pub relay_dropped_items: u64,
 }
 
 // ── Query types ─────────────────────────────────────────────────────
