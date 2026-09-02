@@ -75,6 +75,29 @@ export function validateNativeTemplateConfig(
       } else if (value.image.endsWith(':latest')) {
         errors.push(`${prefix}.image must not use the floating latest tag`)
       }
+      if (value.resources !== undefined) {
+        if (!isRecord(value.resources)) {
+          errors.push(`${prefix}.resources must be an object`)
+        } else {
+          for (const field of ['cpu_request', 'memory_request', 'memory_limit']) {
+            const resource = value.resources[field]
+            if (resource !== undefined && (!Number.isInteger(resource) || Number(resource) <= 0)) {
+              errors.push(`${prefix}.resources.${field} must be a positive integer`)
+            }
+          }
+          const request = value.resources.memory_request
+          const limit = value.resources.memory_limit
+          if (
+            Number.isInteger(request) &&
+            Number.isInteger(limit) &&
+            Number(request) > Number(limit)
+          ) {
+            errors.push(
+              `${prefix}.resources.memory_request must not exceed memory_limit`
+            )
+          }
+        }
+      }
       if (!Number.isInteger(value.exposed_port) || Number(value.exposed_port) <= 0) {
         errors.push(`${prefix}.exposed_port must be a positive integer`)
       }

@@ -223,15 +223,16 @@ pub struct CreateProjectRequest {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub is_on_demand: Option<bool>,
-    /// Port exposed by the container (fallback when image has no EXPOSE directive)
+    /// Explicit port exposed by the container.
     ///
     /// Priority order for port resolution:
-    /// 1. Image EXPOSE directive (auto-detected from built image)
-    /// 2. Environment-level exposed_port (overrides this value per environment)
-    /// 3. This project-level exposed_port (fallback)
+    /// 1. Environment-level exposed_port (explicit override)
+    /// 2. This project-level exposed_port (explicit override)
+    /// 3. Image EXPOSE directive (auto-detected from built image)
     /// 4. Default: 3000
     ///
-    /// Only set this if your image doesn't use EXPOSE directive.
+    /// Set this when the desired application port differs from the image's
+    /// first EXPOSE directive (for example, an image exposing HTTP and HTTPS).
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 8080)]
     pub exposed_port: Option<i32>,

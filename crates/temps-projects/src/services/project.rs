@@ -565,6 +565,20 @@ pub struct ProjectService {
     encryption_service: Arc<temps_core::EncryptionService>,
 }
 
+fn initial_deployment_config(
+    request: &CreateProjectRequest,
+) -> temps_entities::deployment_config::DeploymentConfig {
+    temps_entities::deployment_config::DeploymentConfig {
+        cpu_request: request.cpu_request.or(Some(DEFAULT_CPU_REQUEST)),
+        cpu_limit: None,
+        memory_request: request.memory_request.or(Some(DEFAULT_MEMORY_REQUEST)),
+        memory_limit: request.memory_limit.or(Some(DEFAULT_MEMORY_LIMIT)),
+        exposed_port: request.exposed_port,
+        automatic_deploy: Some(request.automatic_deploy),
+        ..Default::default()
+    }
+}
+
 impl ProjectService {
     pub fn new(
         db: Arc<temps_database::DbConnection>,
@@ -665,15 +679,20 @@ impl ProjectService {
         // a scheduling request plus a hard memory limit so a runaway app cannot
         // OOM a small single-node host. Operators can still choose standard,
         // dedicated, or explicit uncapped limits later via deployment settings.
-        let deployment_config = Some(temps_entities::deployment_config::DeploymentConfig {
-            cpu_request: Some(DEFAULT_CPU_REQUEST),
-            cpu_limit: None,
-            memory_request: Some(DEFAULT_MEMORY_REQUEST),
-            memory_limit: Some(DEFAULT_MEMORY_LIMIT),
-            exposed_port: request.exposed_port,
-            automatic_deploy: Some(request.automatic_deploy),
-            ..Default::default()
-        });
+        let deployment_config = Some(initial_deployment_config(&request));
+        if request.cpu_request.is_some()
+            || request.memory_request.is_some()
+            || request.memory_limit.is_some()
+        {
+            let app_settings = self.config_service.get_settings().await.map_err(|error| {
+                ProjectError::Other(format!(
+                    "Failed to read instance settings before applying template resources: {error}"
+                ))
+            })?;
+            if let Some(config) = deployment_config.as_ref() {
+                Self::enforce_tenant_ceilings(config, &app_settings)?;
+            }
+        }
 
         // SSRF guard: validate git_url before persisting (Fix #12).
         if let Some(ref git_url) = request.git_url {
@@ -1014,16 +1033,25 @@ impl ProjectService {
         storage_service_claim_ids: Vec<i32>,
         storage_service_claim_user_id: Option<i32>,
     ) -> Result<temps_entities::environments::Model, ProjectError> {
+        let project_config = project.deployment_config.as_ref();
         let default_environment = self
             .environment_service
             .create_environment(
                 project.id,
                 "production".to_string(),
-                Some(DEFAULT_CPU_REQUEST),
-                // CPU remains uncapped by default; memory gets the small hosted-web cap.
-                None,
-                Some(DEFAULT_MEMORY_REQUEST),
-                Some(DEFAULT_MEMORY_LIMIT),
+                project_config
+                    .and_then(|config| config.cpu_request)
+                    .or(Some(DEFAULT_CPU_REQUEST)),
+                // The production environment starts with the project's
+                // effective profile so its normal precedence does not shadow
+                // curated template requirements with platform defaults.
+                project_config.and_then(|config| config.cpu_limit),
+                project_config
+                    .and_then(|config| config.memory_request)
+                    .or(Some(DEFAULT_MEMORY_REQUEST)),
+                project_config
+                    .and_then(|config| config.memory_limit)
+                    .or(Some(DEFAULT_MEMORY_LIMIT)),
                 project.main_branch.clone(),
             )
             .await
@@ -4897,6 +4925,9 @@ mod tests {
             git_provider_connection_id: None,
             automatic_deploy: false,
             exposed_port: None,
+            cpu_request: None,
+            memory_request: None,
+            memory_limit: None,
             is_public_repo: None,
             storage_service_ids: vec![],
             storage_service_claim_ids: vec![],
@@ -5382,6 +5413,9 @@ mod tests {
             git_url: None,
             git_provider_connection_id: None,
             exposed_port: None,
+            cpu_request: None,
+            memory_request: None,
+            memory_limit: None,
             source_type: temps_entities::source_type::SourceType::Git,
             template_slug: None,
         };
@@ -5497,6 +5531,9 @@ mod tests {
             git_provider_connection_id: None,
             automatic_deploy: false,
             exposed_port: None,
+            cpu_request: None,
+            memory_request: None,
+            memory_limit: None,
             is_public_repo: None,
             storage_service_ids: vec![],
             storage_service_claim_ids: vec![],
@@ -5504,6 +5541,22 @@ mod tests {
             source_type: temps_entities::source_type::SourceType::Git,
             template_slug: None,
         }
+    }
+
+    #[test]
+    fn curated_template_resources_override_project_defaults() {
+        let mut request = create_request("Keycloak");
+        request.exposed_port = Some(8080);
+        request.cpu_request = Some(500_000);
+        request.memory_request = Some(512);
+        request.memory_limit = Some(1_536);
+
+        let config = initial_deployment_config(&request);
+
+        assert_eq!(config.exposed_port, Some(8080));
+        assert_eq!(config.cpu_request, Some(500_000));
+        assert_eq!(config.memory_request, Some(512));
+        assert_eq!(config.memory_limit, Some(1_536));
     }
 
     async fn insert_search_test_project(
@@ -5643,6 +5696,43 @@ mod tests {
             .deployment_config
             .expect("default environment should seed deployment_config");
         assert_eq!(env_config.memory_limit, Some(DEFAULT_MEMORY_LIMIT));
+    }
+
+    #[tokio::test]
+    async fn test_create_project_applies_resource_profile_to_default_environment() {
+        use temps_entities::environments;
+
+        if !docker_available().await {
+            println!("Docker not available, skipping");
+            return;
+        }
+        let test_db = TestDatabase::with_migrations().await.unwrap();
+        let db = test_db.db.clone();
+        let mock_queue = Arc::new(MockJobQueue::new());
+        let project_service = create_test_services(db.clone(), mock_queue).await;
+        let mut request = create_request("Keycloak Resources");
+        request.cpu_request = Some(500_000);
+        request.memory_request = Some(512);
+        request.memory_limit = Some(1_536);
+
+        let project = project_service
+            .create_project(request)
+            .await
+            .expect("project with curated resources should be created");
+
+        let production = environments::Entity::find()
+            .filter(environments::Column::ProjectId.eq(project.id))
+            .one(db.as_ref())
+            .await
+            .unwrap()
+            .expect("production environment should exist");
+        let config = production
+            .deployment_config
+            .expect("production should inherit the project's resource profile");
+
+        assert_eq!(config.cpu_request, Some(500_000));
+        assert_eq!(config.memory_request, Some(512));
+        assert_eq!(config.memory_limit, Some(1_536));
     }
 
     #[tokio::test]

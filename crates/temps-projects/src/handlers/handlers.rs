@@ -791,6 +791,9 @@ pub async fn create_project(
         git_url: project.git_url,
         git_provider_connection_id: project.git_provider_connection_id,
         exposed_port: project.exposed_port,
+        cpu_request: None,
+        memory_request: None,
+        memory_limit: None,
         source_type: project.source_type,
         template_slug: service_template_provenance,
     };
@@ -1067,8 +1070,11 @@ pub async fn update_project(
         git_url: None,                      // Keep existing setting
         git_provider_connection_id: None,   // Keep existing setting
         exposed_port: project.exposed_port, // Keep existing or update if provided
-        source_type: project.source_type,   // Preserve source type
-        template_slug: None,                // Template provenance is immutable
+        cpu_request: None,
+        memory_request: None,
+        memory_limit: None,
+        source_type: project.source_type, // Preserve source type
+        template_slug: None,              // Template provenance is immutable
     };
     let updated_project = state
         .project_service
@@ -2483,6 +2489,18 @@ pub async fn create_project_from_template(
             git_url: None,
             git_provider_connection_id: None,
             exposed_port: template.exposed_port,
+            cpu_request: template
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.cpu_request),
+            memory_request: template
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.memory_request),
+            memory_limit: template
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.memory_limit),
             // docker_image source skips the build pipeline entirely; the deploy
             // is triggered explicitly below via Job::DeployImageRequested.
             source_type: SourceType::DockerImage,
@@ -2558,6 +2576,9 @@ pub async fn create_project_from_template(
                     git_url: Some(new_repo.clone_url.clone()),
                     git_provider_connection_id: Some(connection_id),
                     exposed_port: None,
+                    cpu_request: None,
+                    memory_request: None,
+                    memory_limit: None,
                     source_type: SourceType::Git,
                     template_slug: Some(template_provenance.clone()),
                 };
@@ -2607,6 +2628,9 @@ pub async fn create_project_from_template(
                     git_url: Some(template.git.url.clone()),
                     git_provider_connection_id: None,
                     exposed_port: None,
+                    cpu_request: None,
+                    memory_request: None,
+                    memory_limit: None,
                     source_type: SourceType::Git,
                     template_slug: Some(template_provenance.clone()),
                 };

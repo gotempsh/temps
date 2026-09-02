@@ -15,6 +15,11 @@ describe('validateNativeTemplateConfig', () => {
           kind: 'service',
           image: 'quay.io/keycloak/keycloak:26.7.2',
           exposed_port: 8080,
+          resources: {
+            cpu_request: 500000,
+            memory_request: 512,
+            memory_limit: 1536,
+          },
           services: ['postgres'],
           managed_service_bindings: {
             postgres: { KC_DB_USERNAME: 'POSTGRES_USER' },

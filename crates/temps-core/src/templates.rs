@@ -72,6 +72,18 @@ pub enum TemplateKind {
     Service,
 }
 
+/// Resource profile required by a curated template. CPU values use the same
+/// microcore unit as project deployment configuration; memory values are MiB.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+pub struct TemplateResources {
+    #[serde(default)]
+    pub cpu_request: Option<i32>,
+    #[serde(default)]
+    pub memory_request: Option<i32>,
+    #[serde(default)]
+    pub memory_limit: Option<i32>,
+}
+
 /// A curated project template
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ProjectTemplate {
@@ -113,6 +125,10 @@ pub struct ProjectTemplate {
     /// mode (for example Keycloak).
     #[serde(default)]
     pub command: Option<Vec<String>>,
+    /// Minimum/safe runtime resources for this application. These values are
+    /// validated against operator-configured tenant ceilings before creation.
+    #[serde(default)]
+    pub resources: Option<TemplateResources>,
     /// Container port the prebuilt image listens on (used for routing when
     /// deploying from `image`). Falls back to the image's EXPOSE / 3000 default.
     #[serde(default)]
@@ -585,6 +601,25 @@ impl TemplateService {
             errors.push("Command must contain only non-empty arguments".to_string());
         }
 
+        if let Some(resources) = &template.resources {
+            for (name, value) in [
+                ("cpu_request", resources.cpu_request),
+                ("memory_request", resources.memory_request),
+                ("memory_limit", resources.memory_limit),
+            ] {
+                if value.is_some_and(|value| value <= 0) {
+                    errors.push(format!("Template resource {name} must be positive"));
+                }
+            }
+            if resources
+                .memory_request
+                .zip(resources.memory_limit)
+                .is_some_and(|(request, limit)| request > limit)
+            {
+                errors.push("Template memory_request cannot exceed memory_limit".to_string());
+            }
+        }
+
         // Check for empty preset
         if template.preset.is_empty() {
             errors.push("Preset cannot be empty".to_string());
@@ -934,6 +969,13 @@ templates:
             Some("quay.io/keycloak/keycloak:26.7.2")
         );
         assert_eq!(template.command, Some(vec!["start".to_string()]));
+        assert_eq!(
+            template
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.memory_limit),
+            Some(1536)
+        );
         assert_eq!(template.services, vec!["postgres".to_string()]);
         assert_eq!(
             template
@@ -966,6 +1008,7 @@ templates:
                 preset_config: None,
                 image: None,
                 command: None,
+                resources: None,
                 exposed_port: None,
                 health_check_path: None,
                 tags: vec!["test".to_string()],

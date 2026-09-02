@@ -1228,6 +1228,9 @@ async fn execute_plan(
         git_url,
         git_provider_connection_id: context.git_provider_connection_id,
         exposed_port: None,
+        cpu_request: None,
+        memory_request: None,
+        memory_limit: None,
         source_type: temps_entities::source_type::SourceType::Git,
         template_slug: None,
     };

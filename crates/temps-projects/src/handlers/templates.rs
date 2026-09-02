@@ -16,7 +16,9 @@ use std::sync::Arc;
 use temps_auth::RequireAuth;
 use temps_core::{
     problemdetails::{self, Problem},
-    templates::{EnvVarTemplate, ProjectTemplate, TemplateKind, TemplateService},
+    templates::{
+        EnvVarTemplate, ProjectTemplate, TemplateKind, TemplateResources, TemplateService,
+    },
 };
 use utoipa::{OpenApi, ToSchema};
 
@@ -71,6 +73,8 @@ pub struct TemplateResponse {
     pub image: Option<String>,
     /// Optional command passed to the image entrypoint.
     pub command: Option<Vec<String>>,
+    /// Curated CPU/memory profile applied when the project is created.
+    pub resources: Option<TemplateResources>,
     /// Container port the prebuilt image listens on (image deploys only).
     pub exposed_port: Option<i32>,
     /// HTTP health-check path probed after the container starts (image deploys).
@@ -135,6 +139,7 @@ impl From<ProjectTemplate> for TemplateResponse {
             is_featured: template.is_featured,
             image: template.image,
             command: template.command,
+            resources: template.resources,
             exposed_port: template.exposed_port,
             health_check_path: template.health_check_path,
             managed_service_bindings: template.managed_service_bindings,
@@ -422,6 +427,7 @@ mod tests {
             },
             preset: "nextjs".to_string(),
             preset_config: None,
+            resources: None,
             image: None,
             command: None,
             exposed_port: None,

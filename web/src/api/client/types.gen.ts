@@ -4536,15 +4536,16 @@ export type CreateProjectRequest = {
      */
     expected_slug?: string | null;
     /**
-     * Port exposed by the container (fallback when image has no EXPOSE directive)
+     * Explicit port exposed by the container.
      *
      * Priority order for port resolution:
-     * 1. Image EXPOSE directive (auto-detected from built image)
-     * 2. Environment-level exposed_port (overrides this value per environment)
-     * 3. This project-level exposed_port (fallback)
+     * 1. Environment-level exposed_port (explicit override)
+     * 2. This project-level exposed_port (explicit override)
+     * 3. Image EXPOSE directive (auto-detected from built image)
      * 4. Default: 3000
      *
-     * Only set this if your image doesn't use EXPOSE directive.
+     * Set this when the desired application port differs from the image's
+     * first EXPOSE directive (for example, an image exposing HTTP and HTTPS).
      */
     exposed_port?: number | null;
     git_provider_connection_id?: number | null;
@@ -19146,6 +19147,16 @@ export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
 export type TemplateKind = 'starter' | 'service';
 
 /**
+ * Resource profile required by a curated template. CPU values use the same
+ * microcore unit as project deployment configuration; memory values are MiB.
+ */
+export type TemplateResources = {
+    cpu_request?: number | null;
+    memory_limit?: number | null;
+    memory_request?: number | null;
+};
+
+/**
  * Response type for a single template
  */
 export type TemplateResponse = {
@@ -19210,6 +19221,7 @@ export type TemplateResponse = {
      * Framework/preset to use
      */
     preset: string;
+    resources?: null | TemplateResources;
     /**
      * URL to a wide screenshot/banner preview of the deployed template.
      * Absent for templates that don't have one captured yet.

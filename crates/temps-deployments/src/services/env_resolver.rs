@@ -225,6 +225,28 @@ fn apply_managed_service_bindings(
     Ok(())
 }
 
+/// Add reviewed template aliases to linked-service values, then merge those
+/// defaults beneath explicit project variables. Both normal deployments and
+/// rollback/promotion paths use this entry point so their containers receive
+/// the same managed-service contract.
+pub(super) fn merge_managed_service_environment(
+    resolved: &mut HashMap<String, String>,
+    mut linked_service_vars: HashMap<String, String>,
+    explicit_project_vars: HashMap<String, String>,
+    template_slug: Option<&str>,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<(), DeploymentEnvResolutionError> {
+    apply_managed_service_bindings(
+        &mut linked_service_vars,
+        template_slug,
+        project_id,
+        environment_id,
+    )?;
+    merge_environment_variable_layers(resolved, linked_service_vars, explicit_project_vars);
+    Ok(())
+}
+
 /// Apply values owned by the deployment runtime after every tenant-controlled
 /// layer has been resolved. These keys must behave identically for normal,
 /// promoted, and rolled-back deployments.
@@ -418,20 +440,14 @@ impl DeploymentEnvResolver {
             });
         }
 
-        apply_managed_service_bindings(
-            &mut linked_service_vars,
+        merge_managed_service_environment(
+            &mut env_vars_map,
+            linked_service_vars,
+            explicit_project_vars,
             project.template_slug.as_deref(),
             project.id,
             environment.id,
         )?;
-
-        // Linked-service variables are defaults. Explicit project variables
-        // express user intent and therefore take precedence on collisions.
-        merge_environment_variable_layers(
-            &mut env_vars_map,
-            linked_service_vars,
-            explicit_project_vars,
-        );
 
         // Secrets-manager bindings are operator-controlled and therefore
         // override linked-service defaults and explicit project variables.
@@ -655,8 +671,8 @@ mod tests {
 
     use super::{
         apply_deployment_owned_variables, apply_managed_service_bindings,
-        apply_secrets_manager_layer, merge_environment_variable_layers, otel_exporter_headers,
-        DeploymentEnvResolutionError,
+        apply_secrets_manager_layer, merge_environment_variable_layers,
+        merge_managed_service_environment, otel_exporter_headers, DeploymentEnvResolutionError,
     };
 
     struct TestSecretsResolver {
@@ -710,7 +726,7 @@ mod tests {
 
     #[test]
     fn keycloak_aliases_are_derived_from_managed_postgres() {
-        let mut linked = HashMap::from([
+        let linked = HashMap::from([
             ("POSTGRES_HOST".to_string(), "postgres-12".to_string()),
             ("POSTGRES_PORT".to_string(), "5432".to_string()),
             ("POSTGRES_DB".to_string(), "keycloak".to_string()),
@@ -718,20 +734,28 @@ mod tests {
             ("POSTGRES_PASSWORD".to_string(), "secret".to_string()),
         ]);
 
-        apply_managed_service_bindings(&mut linked, Some("keycloak"), 4, 8)
-            .expect("the reviewed Keycloak bindings should resolve");
+        let mut resolved = HashMap::new();
+        merge_managed_service_environment(
+            &mut resolved,
+            linked,
+            HashMap::new(),
+            Some("keycloak"),
+            4,
+            8,
+        )
+        .expect("the reviewed Keycloak bindings should resolve");
 
         assert_eq!(
-            linked.get("KC_DB_URL_HOST"),
+            resolved.get("KC_DB_URL_HOST"),
             Some(&"postgres-12".to_string())
         );
-        assert_eq!(linked.get("KC_DB_URL_PORT"), Some(&"5432".to_string()));
+        assert_eq!(resolved.get("KC_DB_URL_PORT"), Some(&"5432".to_string()));
         assert_eq!(
-            linked.get("KC_DB_URL_DATABASE"),
+            resolved.get("KC_DB_URL_DATABASE"),
             Some(&"keycloak".to_string())
         );
-        assert_eq!(linked.get("KC_DB_USERNAME"), Some(&"temps".to_string()));
-        assert_eq!(linked.get("KC_DB_PASSWORD"), Some(&"secret".to_string()));
+        assert_eq!(resolved.get("KC_DB_USERNAME"), Some(&"temps".to_string()));
+        assert_eq!(resolved.get("KC_DB_PASSWORD"), Some(&"secret".to_string()));
     }
 
     #[test]

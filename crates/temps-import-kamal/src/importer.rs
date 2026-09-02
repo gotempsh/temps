@@ -1136,6 +1136,9 @@ async fn execute_plan(
         git_url: None,
         git_provider_connection_id: context.git_provider_connection_id,
         exposed_port: None,
+        cpu_request: None,
+        memory_request: None,
+        memory_limit: None,
         // Kamal deploys a pre-built image from deploy.yml, no git repo —
         // DockerImage is the correct source_type (was incorrectly Git, which
         // both misrepresents the project and made determine_deployment_source_type

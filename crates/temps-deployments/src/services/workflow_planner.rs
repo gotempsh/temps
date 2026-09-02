@@ -14,7 +14,7 @@ use temps_logs::LogService;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use super::env_resolver::merge_environment_variable_layers;
+use super::env_resolver::merge_managed_service_environment;
 use super::managed_environment_variables::{public_sentry_dsn_var, public_sentry_tunnel_var};
 
 #[derive(Debug, Error)]
@@ -538,13 +538,18 @@ impl WorkflowPlanner {
             return Err(anyhow::anyhow!(error_message));
         }
 
-        // Linked-service variables are defaults. Explicit project variables
-        // express user intent and therefore take precedence on collisions.
-        merge_environment_variable_layers(
+        // Apply reviewed native-template aliases (for example Keycloak's
+        // KC_DB_* contract) before explicit project values take precedence.
+        // This is the normal deployment path; rollback and promotion use the
+        // same shared merge in DeploymentEnvResolver.
+        merge_managed_service_environment(
             &mut env_vars_map,
             linked_service_vars,
             explicit_project_vars,
-        );
+            project.template_slug.as_deref(),
+            project.id,
+            environment.id,
+        )?;
 
         // 2b. Secrets-manager bindings (EE only — strict no-op when resolver is absent).
         //

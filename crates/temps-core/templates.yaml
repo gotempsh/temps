@@ -148,6 +148,10 @@ templates:
     image: quay.io/keycloak/keycloak:26.7.2
     command:
       - start
+    resources:
+      cpu_request: 500000
+      memory_request: 512
+      memory_limit: 1536
     exposed_port: 8080
     health_check_path: /realms/master
     tags:

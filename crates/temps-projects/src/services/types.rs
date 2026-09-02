@@ -268,6 +268,11 @@ pub struct CreateProjectRequest {
     pub git_url: Option<String>,
     pub git_provider_connection_id: Option<i32>,
     pub exposed_port: Option<i32>,
+    /// Optional curated-template resource profile. Generic callers leave
+    /// these unset and receive the platform defaults.
+    pub cpu_request: Option<i32>,
+    pub memory_request: Option<i32>,
+    pub memory_limit: Option<i32>,
     /// Source type for deployments (git, docker_image, or static_files)
     #[serde(default)]
     pub source_type: SourceType,
