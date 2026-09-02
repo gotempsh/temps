@@ -808,7 +808,7 @@ pub async fn pause_deployment(
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(
         auth,
-        DeploymentsDelete,
+        DeploymentsCreate,
         project_id,
         state.project_access_checker
     );
@@ -920,7 +920,7 @@ pub async fn cancel_deployment(
 ) -> Result<impl IntoResponse, Problem> {
     project_permission_guard!(
         auth,
-        DeploymentsDelete,
+        DeploymentsCreate,
         project_id,
         state.project_access_checker
     );
@@ -5632,6 +5632,152 @@ mod tests {
 
         println!(
             "✅ POST /projects/{{project_id}}/deployments/{{deployment_id}}/cancel test passed"
+        );
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+
+    /// Regression test for the developer role being unable to cancel or
+    /// pause its own deployments (issue #876): both handlers previously
+    /// required `DeploymentsDelete`, an admin-only permission, even though
+    /// the equivalent lifecycle actions (rollback/promote/resume) only ever
+    /// required `DeploymentsCreate`, which `Role::User` already has. Uses
+    /// `Role::User` (the non-admin, developer-facing instance role) end to
+    /// end through the real HTTP routes so a regression shows up as a 403
+    /// rather than passing silently through a mocked auth context.
+    #[tokio::test]
+    async fn test_developer_role_can_cancel_and_pause_deployment() {
+        use axum::extract::Request;
+        use axum::middleware;
+        use sea_orm::{ActiveModelTrait, Set};
+        use temps_entities::{deployments, environments, projects};
+
+        let test_db = TestDatabase::with_migrations()
+            .await
+            .expect("Failed to create test database");
+        let db = test_db.connection_arc();
+
+        let temp_dir = std::env::temp_dir().join(format!("test_http_{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).expect("Failed to create temp dir");
+
+        let app_state = create_test_app_state_for_http(db.clone(), temp_dir.clone()).await;
+
+        let project = projects::ActiveModel {
+            name: Set("Test Project".to_string()),
+            slug: Set("test-project".to_string()),
+            repo_name: Set("test-repo".to_string()),
+            repo_owner: Set("test-owner".to_string()),
+            directory: Set("/tmp/test-project".to_string()),
+            main_branch: Set("main".to_string()),
+            preset: Set(temps_entities::preset::Preset::Static),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test project");
+
+        let subdomain = format!("test-env-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+        let environment = environments::ActiveModel {
+            project_id: Set(project.id),
+            name: Set("Test Environment".to_string()),
+            slug: Set("test-env".to_string()),
+            subdomain: Set(subdomain.clone()),
+            host: Set(format!("{}.localhost", subdomain)),
+            upstreams: Set(UpstreamList::default()),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test environment");
+
+        let cancellable_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("pending".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        let pausable_deployment = deployments::ActiveModel {
+            project_id: Set(project.id),
+            environment_id: Set(environment.id),
+            slug: Set(format!("test-deployment-{}", uuid::Uuid::new_v4())),
+            state: Set("deployed".to_string()),
+            metadata: Set(Some(
+                temps_entities::deployments::DeploymentMetadata::default(),
+            )),
+            ..Default::default()
+        }
+        .insert(&*db)
+        .await
+        .expect("Failed to create test deployment");
+
+        // Non-admin developer role — no project_access_checker is configured
+        // for this test app state, so this exercises exactly the instance-wide
+        // permission ceiling that was blocking developers in issue #876.
+        let auth_middleware = middleware::from_fn(
+            |mut req: Request, next: axum::middleware::Next| async move {
+                let auth_context = create_test_auth_context_for_role(temps_auth::Role::User);
+                req.extensions_mut().insert(auth_context);
+                req.extensions_mut().insert(create_test_request_metadata());
+                next.run(req).await
+            },
+        );
+
+        let app = configure_routes()
+            .layer(auth_middleware)
+            .with_state(app_state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Failed to bind");
+        let addr = listener.local_addr().expect("Failed to get address");
+
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("Server failed to start");
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let client = reqwest::Client::new();
+
+        let cancel_response = client
+            .post(format!(
+                "http://{}/projects/{}/deployments/{}/cancel",
+                addr, project.id, cancellable_deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send cancel request");
+        assert_eq!(
+            cancel_response.status(),
+            200,
+            "developer role must be able to cancel its own deployment"
+        );
+
+        let pause_response = client
+            .post(format!(
+                "http://{}/projects/{}/deployments/{}/pause",
+                addr, project.id, pausable_deployment.id
+            ))
+            .send()
+            .await
+            .expect("Failed to send pause request");
+        assert_eq!(
+            pause_response.status(),
+            200,
+            "developer role must be able to pause its own deployment"
+        );
+
+        println!(
+            "✅ developer role (Role::User) can cancel and pause its own deployments (issue #876)"
         );
         std::fs::remove_dir_all(&temp_dir).ok();
     }
