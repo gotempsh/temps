@@ -698,12 +698,12 @@ impl TempsPlugin for OtelPlugin {
             let relay_slot = Arc::new(crate::relay::OtelRelaySlot::new_default());
             let _ = self.relay_slot.set(relay_slot.clone());
 
-            // Bounded channel (capacity 1 000 messages) for fire-and-forget
-            // relay of decoded OTLP batches. Ingest handlers call `try_send`
-            // (non-blocking); when the channel is full the batch is dropped
-            // and a warning is emitted — relay loss is non-fatal.
-            let (otel_relay_tx, mut otel_relay_rx) =
-                tokio::sync::mpsc::channel::<crate::relay::OtelRelayMessage>(1000);
+            // Count- and byte-bounded handoff for fire-and-forget relay of
+            // decoded OTLP batches. Ingest handlers never wait for capacity.
+            let (otel_relay_tx, mut otel_relay_rx) = crate::relay::bounded_relay_queue(
+                crate::relay::RELAY_QUEUE_MAX_BATCHES,
+                crate::relay::RELAY_QUEUE_MAX_BYTES,
+            );
 
             let cross_project_service =
                 Arc::new(CrossProjectTraceService::new(db.clone(), storage.clone()));
