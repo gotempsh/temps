@@ -96,7 +96,18 @@ type MetricLatest = {
 /** Alert-rule form-state unions. The API accepts `comparator`/`severity` as
  *  plain strings; these constrain the UI selects to the supported values. */
 type Comparator = 'gt' | 'lt' | 'gte' | 'lte'
-type Severity = 'info' | 'warning' | 'critical'
+type Severity = 'warning' | 'critical'
+
+/** The API validates `comparator` against the literal symbols (`>`, `<`,
+ *  `>=`, `<=`), not the `Comparator` union's keys — see
+ *  `validate_comparator` in `crates/temps-providers/src/handlers/metrics_handlers.rs`.
+ *  Sending the union key directly (e.g. `"gt"`) fails validation with a 400. */
+const COMPARATOR_SYMBOLS: Record<Comparator, string> = {
+  gt: '>',
+  lt: '<',
+  gte: '>=',
+  lte: '<=',
+}
 
 /** Map the human range selector (hours) to the API's `range` query value. */
 const HOURS_TO_RANGE: Record<number, string> = {
@@ -485,7 +496,6 @@ function AddAlertRuleDialog({
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="info">Info</SelectItem>
                 <SelectItem value="warning">Warning</SelectItem>
                 <SelectItem value="critical">Critical</SelectItem>
               </SelectContent>
@@ -503,7 +513,7 @@ function AddAlertRuleDialog({
                 body: {
                   name,
                   metric_name: metricName,
-                  comparator,
+                  comparator: COMPARATOR_SYMBOLS[comparator],
                   threshold: parseFloat(threshold),
                   severity,
                 },

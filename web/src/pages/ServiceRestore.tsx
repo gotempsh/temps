@@ -47,6 +47,7 @@ import {
 } from '@/components/ui/table'
 import { useBreadcrumbs } from '@/contexts/BreadcrumbContext'
 import { usePageTitle } from '@/hooks/usePageTitle'
+import { isPitrCapableFormat } from '@/lib/utils'
 import { useQuery, useMutation } from '@tanstack/react-query'
 import {
   AlertDialog,
@@ -322,7 +323,7 @@ export function ServiceRestore() {
   })
 
   const isOrphan = selectedBackup?.source === 's3_scan'
-  const selectedIsWalG = selectedBackup?.format === 'walg'
+  const selectedSupportsPitr = isPitrCapableFormat(selectedBackup?.format)
   const isCrossService =
     !!selectedBackup?.origin_service_name &&
     !!service?.name &&
@@ -398,7 +399,7 @@ export function ServiceRestore() {
       if (!pitrTargetTime || Number.isNaN(new Date(pitrTargetTime).getTime()))
         return false
       if (pitrToNewService && newServiceName.trim().length === 0) return false
-      if (!selectedIsWalG) return false
+      if (!selectedSupportsPitr) return false
     }
     if (!confirmOk) return false
     // Block on plan errors — user must resolve them (e.g. pick a different
@@ -823,21 +824,24 @@ export function ServiceRestore() {
               htmlFor="mode-pitr"
               className={`flex items-start gap-3 rounded-md border p-3 cursor-pointer ${
                 mode === 'pitr' ? 'border-primary bg-accent/50' : ''
-              } ${capabilities?.pitr === false || !selectedIsWalG ? 'opacity-50 cursor-not-allowed' : ''}`}
+              } ${capabilities?.pitr === false || !selectedSupportsPitr ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
               <RadioGroupItem
                 value="pitr"
                 id="mode-pitr"
-                disabled={capabilities?.pitr === false || !selectedIsWalG}
+                disabled={capabilities?.pitr === false || !selectedSupportsPitr}
                 className="mt-0.5"
               />
               <div className="flex-1">
                 <div className="font-medium">Point-in-time recovery</div>
                 <div className="text-xs text-muted-foreground mt-0.5">
-                  Recover to a specific timestamp via WAL replay. Requires a
-                  WAL-G backup.
-                  {selectedBackup && !selectedIsWalG
-                    ? ' Selected backup is pg_dump; PITR not available.'
+                  {service?.service_type === 'mariadb'
+                    ? 'Recover to a specific timestamp by replaying archived binlogs. Requires a physical (mariadb-backup) base backup.'
+                    : 'Recover to a specific timestamp via WAL replay. Requires a WAL-G backup.'}
+                  {selectedBackup && !selectedSupportsPitr
+                    ? selectedBackup.format === 'mariadb_dump'
+                      ? ' Selected backup is a logical dump; PITR not available.'
+                      : ' Selected backup is pg_dump; PITR not available.'
                     : ''}
                 </div>
               </div>
@@ -873,8 +877,9 @@ export function ServiceRestore() {
                   className="max-w-md"
                 />
                 <p className="text-xs text-muted-foreground">
-                  PostgreSQL will replay archived WAL from the base backup
-                  through this time.
+                  {service?.service_type === 'mariadb'
+                    ? 'MariaDB will replay archived binlogs from the base backup through this time.'
+                    : 'PostgreSQL will replay archived WAL from the base backup through this time.'}
                 </p>
               </div>
               <div className="flex items-center gap-2">
@@ -1122,6 +1127,18 @@ function FormatBadge({ format }: { format?: string | null }) {
     return (
       <Badge className="text-xs bg-emerald-600 hover:bg-emerald-700">
         WAL-G
+      </Badge>
+    )
+  if (format === 'mariadb_physical')
+    return (
+      <Badge className="text-xs bg-emerald-600 hover:bg-emerald-700">
+        mariadb-backup
+      </Badge>
+    )
+  if (format === 'mariadb_dump')
+    return (
+      <Badge variant="secondary" className="text-xs">
+        mysqldump
       </Badge>
     )
   return (

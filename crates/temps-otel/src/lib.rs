@@ -36,6 +36,7 @@ pub mod detectors;
 pub mod error;
 pub mod handlers;
 pub mod ingest;
+pub mod memory;
 pub mod plugin;
 pub mod proto;
 pub mod relay;
@@ -114,9 +115,9 @@ pub struct OtelAppState {
     /// [`crate::relay::OtelRelaySlot::relay`], which dispatches to whichever
     /// [`crate::relay::OtelRelay`] implementation was registered by a plugin
     /// (defaulting to the no-op). When the channel is full the batch is
-    /// silently dropped and a warning is emitted — relay loss is non-fatal and
+    /// dropped and a warning is emitted — relay loss is non-fatal and
     /// must never add latency to the OTLP HTTP response.
-    pub otel_relay_tx: Option<tokio::sync::mpsc::Sender<crate::relay::OtelRelayMessage>>,
+    pub otel_relay_tx: Option<crate::relay::OtelRelayQueueSender>,
     /// Optional checker for team-based project access (human sessions only).
     pub project_access_checker: Option<std::sync::Arc<dyn temps_core::ProjectAccessChecker>>,
 }

@@ -58,7 +58,9 @@ fn shell_export_assignment(line: &str) -> Option<String> {
 /// The `engine` hint is used to disambiguate formats that share location
 /// shapes. Object-store backups (s3/rustfs/blob/minio) are always a
 /// bucket-to-bucket mirror — their path has no extension — so we tag them
-/// `"mirror"` when the engine identifies them as such.
+/// `"mirror"` when the engine identifies them as such. MariaDB's logical
+/// dump shares the `.sql.gz` suffix with Postgres's legacy pg_dump, so it
+/// needs the hint too; its physical base (`base.mbstream.gz`) does not.
 fn classify_backup_format(location: &str, engine: Option<&str>) -> Option<String> {
     if location.is_empty() {
         return None;
@@ -74,6 +76,20 @@ fn classify_backup_format(location: &str, engine: Option<&str>) -> Option<String
     // Extension-based classification runs first — it's unambiguous when
     // the file suffix is present, regardless of whether the location is
     // an s3:// URL or a bare key.
+    //
+    // MariaDB's physical base carries a suffix no other engine produces, so
+    // it needs no engine hint.
+    if location.ends_with(".mbstream.gz") {
+        return Some("mariadb_physical".to_string());
+    }
+    // `.sql.gz` is the ONE genuinely ambiguous suffix: Postgres's legacy
+    // pg_dump and MariaDB's logical `dump.sql.gz` share it. Filenames can't
+    // separate them, so the engine hint decides — checked BEFORE the generic
+    // Postgres branch, which would otherwise label every MariaDB dump
+    // `pg_dump` and send the restore planner down the pg_restore path.
+    if location.ends_with(".sql.gz") && engine.is_some_and(|e| e.eq_ignore_ascii_case("mariadb")) {
+        return Some("mariadb_dump".to_string());
+    }
     if location.ends_with(".sql.gz") || location.ends_with(".pgdump.gz") {
         return Some("pg_dump".to_string());
     }
@@ -283,7 +299,13 @@ async fn list_walg_sentinels(
     Ok(out)
 }
 
-/// Find pg_dump / rdb / bson dump objects under a service prefix.
+/// Find pg_dump / rdb / bson / mariadb dump-or-base objects under a service
+/// prefix.
+///
+/// MariaDB is the one engine here with no `/walg/` prefix, so
+/// `scan_s3_for_orphan_backups`'s sentinel pass cannot see it at all: if a
+/// MariaDB suffix is missing from this allowlist, its backups are invisible
+/// to the disaster-recovery scan entirely.
 async fn list_dump_objects(
     s3_client: &aws_sdk_s3::Client,
     bucket: &str,
@@ -313,7 +335,10 @@ async fn list_dump_objects(
                 || key.ends_with(".pgdump.gz")
                 || key.ends_with(".rdb.gz")
                 || key.ends_with(".bson.gz")
-                || key.ends_with(".archive"))
+                || key.ends_with(".archive")
+                // MariaDB physical base (`base.mbstream.gz`). Its logical
+                // dump is already covered by `.sql.gz` above.
+                || key.ends_with(".mbstream.gz"))
             {
                 continue;
             }
@@ -1131,6 +1156,35 @@ pub struct BackupAlertEntry {
     pub opened_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Result of attempting to publish a native whole-instance recovery set for a
+/// terminal backup event.
+///
+/// Only fully successful scheduled runs that include a control-plane backup
+/// are published. This prevents `temps backup restore` from presenting a
+/// partial fan-out run as a recoverable instance snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoverySetPublication {
+    NotScheduled,
+    Pending {
+        schedule_run_id: i64,
+    },
+    Incomplete {
+        schedule_run_id: i64,
+        failed_backup_ids: Vec<i32>,
+    },
+    NoControlPlane {
+        schedule_run_id: i64,
+    },
+    AlreadyPublished {
+        schedule_run_id: i64,
+        backup_id: String,
+    },
+    Published {
+        schedule_run_id: i64,
+        backup_id: String,
+    },
+}
+
 #[derive(Clone)]
 pub struct BackupService {
     db: Arc<DatabaseConnection>,
@@ -1202,6 +1256,430 @@ impl BackupService {
         self.queue
             .get()
             .expect("BackupService.queue not set — plugin init did not call set_queue")
+    }
+
+    async fn sha256_s3_object(
+        s3_client: &S3Client,
+        bucket: &str,
+        location: &str,
+    ) -> Result<String, BackupError> {
+        use sha2::{Digest, Sha256};
+        use tokio::io::AsyncReadExt;
+
+        let key = if let Some(uri) = location.strip_prefix("s3://") {
+            let (location_bucket, key) = uri.split_once('/').ok_or_else(|| {
+                BackupError::Validation(format!("Invalid S3 backup location '{}'", location))
+            })?;
+            if location_bucket != bucket {
+                return Err(BackupError::Validation(format!(
+                    "Backup location bucket '{}' does not match source bucket '{}'",
+                    location_bucket, bucket
+                )));
+            }
+            key
+        } else {
+            location.trim_start_matches('/')
+        };
+        if key.is_empty() {
+            return Err(BackupError::Validation(
+                "Control-plane backup location has no object key".to_string(),
+            ));
+        }
+
+        let response = s3_client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|error| {
+                BackupError::S3(crate::engines::v2_common::describe_sdk_error(
+                    "download control-plane backup for integrity hashing",
+                    &error,
+                ))
+            })?;
+        let mut reader = response.body.into_async_read();
+        let mut hasher = Sha256::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let read = reader
+                .read(&mut buffer)
+                .await
+                .map_err(|error| BackupError::Internal {
+                    message: format!(
+                        "Failed to hash control-plane backup {}: {}",
+                        location, error
+                    ),
+                })?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(hex::encode(hasher.finalize()))
+    }
+
+    /// Publish the aggregate recovery manifest consumed by `temps backup
+    /// restore` once every backup in a fan-out schedule run has completed.
+    ///
+    /// The executor publishes one terminal event per child. Those events are
+    /// intentionally treated as hints: the database is re-read here and is
+    /// the source of truth. The operation is idempotent and refuses to publish
+    /// when any child failed or is still live.
+    pub async fn publish_recovery_set_if_complete(
+        &self,
+        terminal_backup_id: i32,
+    ) -> Result<RecoverySetPublication, BackupError> {
+        let terminal_backup = temps_entities::backups::Entity::find_by_id(terminal_backup_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "Backup".to_string(),
+                detail: format!("terminal backup row {}", terminal_backup_id),
+            })?;
+
+        let Some(schedule_run_id) = terminal_backup.schedule_run_id else {
+            return Ok(RecoverySetPublication::NotScheduled);
+        };
+
+        let run_backups = temps_entities::backups::Entity::find()
+            .filter(temps_entities::backups::Column::ScheduleRunId.eq(schedule_run_id))
+            .order_by_asc(temps_entities::backups::Column::Id)
+            .all(self.db.as_ref())
+            .await?;
+
+        if run_backups
+            .iter()
+            .any(|backup| matches!(backup.state.as_str(), "pending" | "running"))
+        {
+            return Ok(RecoverySetPublication::Pending { schedule_run_id });
+        }
+
+        let failed_backup_ids = run_backups
+            .iter()
+            .filter(|backup| backup.state != "completed")
+            .map(|backup| backup.id)
+            .collect::<Vec<_>>();
+        if !failed_backup_ids.is_empty() {
+            return Ok(RecoverySetPublication::Incomplete {
+                schedule_run_id,
+                failed_backup_ids,
+            });
+        }
+
+        let mut parsed_metadata = Vec::with_capacity(run_backups.len());
+        for backup in &run_backups {
+            let metadata =
+                serde_json::from_str::<serde_json::Value>(&backup.metadata).map_err(|error| {
+                    BackupError::Validation(format!(
+                        "Backup {} in schedule run {} has invalid metadata: {}",
+                        backup.id, schedule_run_id, error
+                    ))
+                })?;
+            parsed_metadata.push((backup, metadata));
+        }
+
+        let Some((control_plane, control_plane_metadata)) =
+            parsed_metadata.iter().find(|(_, metadata)| {
+                metadata.get("engine").and_then(serde_json::Value::as_str) == Some("control_plane")
+            })
+        else {
+            return Ok(RecoverySetPublication::NoControlPlane { schedule_run_id });
+        };
+
+        if control_plane_metadata
+            .get("recovery_set_published")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Ok(RecoverySetPublication::AlreadyPublished {
+                schedule_run_id,
+                backup_id: control_plane.backup_id.clone(),
+            });
+        }
+
+        let mut service_ids = BTreeSet::new();
+        for (backup, metadata) in &parsed_metadata {
+            if backup.id == control_plane.id {
+                continue;
+            }
+            let service_id = metadata
+                .get("external_service_id")
+                .or_else(|| metadata.get("service_id"))
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| {
+                    BackupError::Validation(format!(
+                        "External-service backup {} in schedule run {} has no service identity",
+                        backup.id, schedule_run_id
+                    ))
+                })?;
+            service_ids.insert(service_id);
+        }
+        let expected_service_ids = control_plane_metadata
+            .get("expected_service_ids")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                BackupError::Validation(format!(
+                    "Control-plane backup {} in schedule run {} has no expected service snapshot",
+                    control_plane.id, schedule_run_id
+                ))
+            })?
+            .iter()
+            .map(|value| {
+                value
+                    .as_i64()
+                    .and_then(|id| i32::try_from(id).ok())
+                    .ok_or_else(|| {
+                        BackupError::Validation(format!(
+                            "Control-plane backup {} has an invalid expected service id",
+                            control_plane.id
+                        ))
+                    })
+            })
+            .collect::<Result<BTreeSet<_>, _>>()?;
+        if expected_service_ids != service_ids {
+            return Err(BackupError::Validation(format!(
+                "Schedule run {} backup coverage mismatch: expected services {:?}, completed services {:?}",
+                schedule_run_id, expected_service_ids, service_ids
+            )));
+        }
+
+        let services = if service_ids.is_empty() {
+            Vec::new()
+        } else {
+            temps_entities::external_services::Entity::find()
+                .filter(
+                    temps_entities::external_services::Column::Id
+                        .is_in(service_ids.iter().copied()),
+                )
+                .all(self.db.as_ref())
+                .await?
+        };
+        let services_by_id = services
+            .into_iter()
+            .map(|service| (service.id, service))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut external_service_backups = Vec::with_capacity(service_ids.len());
+        for (backup, metadata) in &parsed_metadata {
+            if backup.id == control_plane.id {
+                continue;
+            }
+            let service_id = metadata
+                .get("external_service_id")
+                .or_else(|| metadata.get("service_id"))
+                .and_then(serde_json::Value::as_i64)
+                .and_then(|value| i32::try_from(value).ok())
+                .ok_or_else(|| {
+                    BackupError::Validation(format!(
+                        "External-service backup {} in schedule run {} has no service identity",
+                        backup.id, schedule_run_id
+                    ))
+                })?;
+            let service = services_by_id
+                .get(&service_id)
+                .ok_or_else(|| BackupError::NotFound {
+                    resource: "ExternalService".to_string(),
+                    detail: format!(
+                        "service {} referenced by backup {} in schedule run {}",
+                        service_id, backup.id, schedule_run_id
+                    ),
+                })?;
+            external_service_backups.push(json!({
+                "backup_id": backup.id,
+                "service_id": service_id,
+                "s3_location": backup.s3_location,
+                "state": backup.state,
+                "size_bytes": backup.size_bytes,
+                "type": backup.backup_type,
+                "metadata": {
+                    "service_type": service.service_type,
+                    "service_name": service.name,
+                }
+            }));
+        }
+
+        let s3_source = temps_entities::s3_sources::Entity::find_by_id(control_plane.s3_source_id)
+            .one(self.db.as_ref())
+            .await?
+            .ok_or_else(|| BackupError::NotFound {
+                resource: "S3Source".to_string(),
+                detail: format!(
+                    "source {} referenced by recovery set {}",
+                    control_plane.s3_source_id, control_plane.backup_id
+                ),
+            })?;
+        let s3_client = self.create_s3_client(&s3_source).await?;
+        let control_plane_sha256 = Self::sha256_s3_object(
+            &s3_client,
+            &s3_source.bucket_name,
+            &control_plane.s3_location,
+        )
+        .await?;
+
+        // Server configuration contains the instance encryption key and other
+        // credentials. Legacy manifests wrote it in plaintext. New recovery
+        // sets encrypt it with a key derived from the S3 secret already needed
+        // to download the backup, so bucket contents alone do not expose it.
+        let server_config = serde_yaml::to_string(&self.config_service.get_server_config())
+            .map_err(|error| {
+                BackupError::Configuration(format!(
+                    "Failed to serialize server config for recovery set {}: {}",
+                    control_plane.backup_id, error
+                ))
+            })?;
+        let s3_secret = self
+            .encryption_service
+            .decrypt_string(&s3_source.secret_key)
+            .map_err(|error| {
+                BackupError::Configuration(format!(
+                    "Failed to decrypt S3 secret for recovery set {}: {}",
+                    control_plane.backup_id, error
+                ))
+            })?;
+        let manifest_encryption = temps_core::EncryptionService::new_from_password(&s3_secret);
+        let encrypted_server_config =
+            manifest_encryption
+                .encrypt_string(&server_config)
+                .map_err(|error| BackupError::Internal {
+                    message: format!(
+                        "Failed to encrypt server config for recovery set {}: {}",
+                        control_plane.backup_id, error
+                    ),
+                })?;
+
+        let mut metadata = json!({
+            "recovery_set_version": 2,
+            "complete": true,
+            "schedule_run_id": schedule_run_id,
+            "backup_id": control_plane.backup_id,
+            "name": control_plane.name,
+            "type": control_plane.backup_type,
+            "created_at": control_plane.started_at.to_rfc3339(),
+            "created_by": control_plane.created_by,
+            "size_bytes": control_plane.size_bytes.unwrap_or(0),
+            "compression_type": control_plane.compression_type,
+            "source": {
+                "id": s3_source.id,
+                "name": s3_source.name,
+                "bucket": s3_source.bucket_name,
+                "path": s3_source.bucket_path,
+            },
+            "schedule_id": control_plane.schedule_id,
+            "state": control_plane.state,
+            "tags": serde_json::from_str::<Vec<String>>(&control_plane.tags).unwrap_or_default(),
+            "checksum": control_plane.checksum,
+            "artifact_sha256": control_plane_sha256,
+            "server_config_encrypted": encrypted_server_config,
+            "server_config_encryption": "aes-256-gcm+s3-secret-sha256",
+            "external_service_backups": external_service_backups,
+            "metadata": control_plane_metadata,
+        });
+        let authenticated_payload = serde_json::to_string(&metadata)?;
+        let manifest_authentication = manifest_encryption
+            .encrypt_string(&authenticated_payload)
+            .map_err(|error| BackupError::Internal {
+                message: format!(
+                    "Failed to authenticate recovery manifest {}: {}",
+                    control_plane.backup_id, error
+                ),
+            })?;
+        metadata["manifest_authentication"] = json!(manifest_authentication);
+        let metadata_key =
+            crate::engines::v2_common::derive_metadata_key(&control_plane.s3_location);
+        s3_client
+            .put_object()
+            .bucket(&s3_source.bucket_name)
+            .key(&metadata_key)
+            .body(serde_json::to_vec(&metadata)?.into())
+            .content_type("application/json")
+            .send()
+            .await
+            .map_err(|error| {
+                BackupError::S3(crate::engines::v2_common::describe_sdk_error(
+                    "put recovery metadata",
+                    &error,
+                ))
+            })?;
+        self.update_backup_index(&s3_client, &s3_source, control_plane)
+            .await?;
+
+        let mut updated_metadata =
+            control_plane_metadata.as_object().cloned().ok_or_else(|| {
+                BackupError::Validation(format!(
+                    "Control-plane backup {} metadata is not a JSON object",
+                    control_plane.id
+                ))
+            })?;
+        updated_metadata.insert(
+            "recovery_set_published".to_string(),
+            serde_json::Value::Bool(true),
+        );
+        updated_metadata.insert(
+            "recovery_set_version".to_string(),
+            serde_json::Value::Number(2.into()),
+        );
+        let mut active = (*control_plane).clone().into_active_model();
+        active.metadata = Set(serde_json::Value::Object(updated_metadata).to_string());
+        active.update(self.db.as_ref()).await?;
+
+        Ok(RecoverySetPublication::Published {
+            schedule_run_id,
+            backup_id: control_plane.backup_id.clone(),
+        })
+    }
+
+    /// Heal terminal events lost to process restarts or broadcast lag. The
+    /// marker on the control-plane row keeps this bounded to unpublished
+    /// successful runs; each invocation processes at most 100 candidates.
+    pub async fn reconcile_completed_recovery_sets(&self) -> Result<(), BackupError> {
+        #[derive(FromQueryResult)]
+        struct Candidate {
+            id: i32,
+        }
+
+        let candidates = Candidate::find_by_statement(Statement::from_string(
+            DatabaseBackend::Postgres,
+            r#"
+SELECT cp.id
+  FROM backups cp
+ WHERE cp.schedule_run_id IS NOT NULL
+   AND cp.state = 'completed'
+   AND cp.metadata::jsonb ->> 'engine' = 'control_plane'
+   AND COALESCE((cp.metadata::jsonb ->> 'recovery_set_published')::boolean, false) = false
+   AND NOT EXISTS (
+       SELECT 1
+         FROM backups sibling
+        WHERE sibling.schedule_run_id = cp.schedule_run_id
+          AND sibling.state <> 'completed'
+   )
+ ORDER BY cp.id DESC
+ LIMIT 100
+            "#
+            .to_string(),
+        ))
+        .all(self.db.as_ref())
+        .await?;
+
+        for candidate in candidates {
+            match self.publish_recovery_set_if_complete(candidate.id).await {
+                Ok(RecoverySetPublication::Published {
+                    schedule_run_id,
+                    backup_id,
+                }) => info!(
+                    schedule_run_id,
+                    backup_id, "Published recovered native recovery-set manifest"
+                ),
+                Ok(_) => {}
+                Err(error) => warn!(
+                    backup_id = candidate.id,
+                    error = %error,
+                    "Failed to reconcile native recovery-set manifest"
+                ),
+            }
+        }
+        Ok(())
     }
 
     /// Send a backup failure notification
@@ -1411,10 +1889,17 @@ impl BackupService {
                 "Backup completed with failures. Failed services: {}",
                 failed_services.join(", ")
             );
+            return Err(BackupError::Internal {
+                message: format!(
+                    "Whole-instance backup {} is incomplete because these services failed: {}",
+                    backup.backup_id,
+                    failed_services.join(", ")
+                ),
+            });
         }
 
         // After successful backup upload, create and upload metadata file
-        let metadata = self.generate_backup_metadata(&backup, &s3_source, &external_backups);
+        let metadata = self.generate_backup_metadata(&backup, &s3_source, &external_backups)?;
         let metadata_key = build_s3_key(
             &s3_source.bucket_path,
             &format!(
@@ -6596,6 +7081,10 @@ SELECT sr.id FROM schedule_runs sr
                 }
             }
         }
+        let expected_service_ids = resolved_services
+            .iter()
+            .map(|(service, _)| service.id)
+            .collect::<Vec<_>>();
 
         // ── Step 3: open the write transaction ────────────────────────────────
 
@@ -6671,6 +7160,7 @@ RETURNING id
                     "scheduled": triggered_by == TriggerSource::Cron,
                     "schedule_id": schedule.id,
                     "run_id": run_id,
+                    "expected_service_ids": expected_service_ids,
                     "timestamp": now.to_rfc3339(),
                 })
                 .to_string()),
@@ -6748,14 +7238,15 @@ RETURNING id
                     });
                 }
                 Err(e) => {
-                    warn!(
+                    error!(
                         schedule_id = schedule.id,
                         service_id = svc.id,
                         service_name = %svc.name,
                         engine = engine_key,
                         error = %e,
-                        "enqueue_scheduled_run: failed to insert external service rows, skipping",
+                        "enqueue_scheduled_run: failed to insert external service rows; rolling back the fan-out",
                     );
+                    return Err(e);
                 }
             }
         }
@@ -7173,13 +7664,31 @@ RETURNING id
             temps_entities::external_service_backups::Model,
             temps_entities::external_services::Model,
         )],
-    ) -> serde_json::Value {
-        // Serialize the server config
-        let config_yaml = serde_yaml::to_string(&self.config_service.get_server_config())
-            .unwrap_or_else(|e| {
-                error!("Failed to serialize server config: {}", e);
-                String::new()
-            });
+    ) -> Result<serde_json::Value, BackupError> {
+        let config_yaml =
+            serde_yaml::to_string(&self.config_service.get_server_config()).map_err(|error| {
+                BackupError::Configuration(format!(
+                    "Failed to serialize server config for backup {}: {}",
+                    backup.backup_id, error
+                ))
+            })?;
+        let s3_secret = self
+            .encryption_service
+            .decrypt_string(&s3_source.secret_key)
+            .map_err(|error| {
+                BackupError::Configuration(format!(
+                    "Failed to decrypt S3 secret for backup {}: {}",
+                    backup.backup_id, error
+                ))
+            })?;
+        let encrypted_server_config = temps_core::EncryptionService::new_from_password(&s3_secret)
+            .encrypt_string(&config_yaml)
+            .map_err(|error| BackupError::Internal {
+                message: format!(
+                    "Failed to encrypt server config for backup {}: {}",
+                    backup.backup_id, error
+                ),
+            })?;
 
         // Map external backups to the required format
         let external_backups = external_backups
@@ -7200,7 +7709,7 @@ RETURNING id
             })
             .collect::<Vec<_>>();
 
-        json!({
+        Ok(json!({
             "backup_id": backup.backup_id,
             "name": backup.name,
             "type": backup.backup_type,
@@ -7218,10 +7727,11 @@ RETURNING id
             "state": backup.state,
             "tags": serde_json::from_str::<Vec<String>>(&backup.tags).unwrap_or_default(),
             "checksum": backup.checksum,
-            "server_config": config_yaml,
+            "server_config_encrypted": encrypted_server_config,
+            "server_config_encryption": "aes-256-gcm+s3-secret-sha256",
             "external_service_backups": external_backups,
             "metadata": serde_json::from_str::<serde_json::Value>(&backup.metadata).unwrap_or_default()
-        })
+        }))
     }
 
     /// Update the source's backup index
@@ -9631,6 +10141,50 @@ mod tests {
         assert_eq!(classify_backup_format(unknown, Some("postgres")), None);
     }
 
+    #[test]
+    fn classify_mariadb_physical_base_is_filename_driven() {
+        // `base.mbstream.gz` is produced by no other engine, so it classifies
+        // without an engine hint at all.
+        let loc = "s3://bucket/external_services/mariadb/svc/2026/05/01/uuid/base.mbstream.gz";
+        assert_eq!(
+            classify_backup_format(loc, Some("mariadb")),
+            Some("mariadb_physical".to_string())
+        );
+        assert_eq!(
+            classify_backup_format(loc, None),
+            Some("mariadb_physical".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_mariadb_dump_is_engine_driven_not_filename_driven() {
+        // Regression: MariaDB's logical dump is literally named
+        // `dump.sql.gz`, which the generic `.sql.gz` branch labels `pg_dump`.
+        // Only the engine hint can tell the two apart.
+        let mariadb = "s3://bucket/external_services/mariadb/svc/2026/05/01/uuid/dump.sql.gz";
+        assert_eq!(
+            classify_backup_format(mariadb, Some("mariadb")),
+            Some("mariadb_dump".to_string())
+        );
+        assert_eq!(
+            classify_backup_format(mariadb, Some("MariaDB")),
+            Some("mariadb_dump".to_string()),
+            "engine hint must be matched case-insensitively"
+        );
+
+        // Postgres behavior is unchanged: same suffix, different engine.
+        let postgres = "s3://bucket/external_services/postgres/svc/2026/05/01/uuid/dump.sql.gz";
+        assert_eq!(
+            classify_backup_format(postgres, Some("postgres")),
+            Some("pg_dump".to_string())
+        );
+        // ...including when no hint is available at all.
+        assert_eq!(
+            classify_backup_format(postgres, None),
+            Some("pg_dump".to_string())
+        );
+    }
+
     // Simple mock notification service for testing
     struct TestNotificationService;
 
@@ -9657,7 +10211,7 @@ mod tests {
             "127.0.0.1:3000".to_string(),
             "postgres://localhost:5432/test".to_string(),
             None,
-            None,
+            Some("127.0.0.1:3001".to_string()),
         )
         .unwrap();
 
@@ -10045,8 +10599,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_backup_to_minio_integration() {
-        if bollard::Docker::connect_with_local_defaults().is_err() {
-            println!("Docker not available, skipping test");
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(error) => {
+                println!("Docker not available, skipping test: {}", error);
+                return;
+            }
+        };
+        if let Err(error) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping test: {}", error);
             return;
         }
 
@@ -10363,8 +10924,15 @@ mod tests {
 
     #[tokio::test]
     async fn test_restore_postgres_from_url() {
-        if bollard::Docker::connect_with_local_defaults().is_err() {
-            println!("Docker not available, skipping test");
+        let docker = match bollard::Docker::connect_with_local_defaults() {
+            Ok(docker) => docker,
+            Err(error) => {
+                println!("Docker not available, skipping test: {}", error);
+                return;
+            }
+        };
+        if let Err(error) = docker.ping().await {
+            println!("Docker daemon not reachable, skipping test: {}", error);
             return;
         }
 
@@ -11512,6 +12080,170 @@ mod tests {
             file_count: None,
             tags: "[]".to_string(),
         }
+    }
+
+    #[tokio::test]
+    async fn recovery_set_waits_for_every_fan_out_child() {
+        let mut control_plane = make_test_backup_model(100);
+        control_plane.schedule_id = Some(5);
+        control_plane.schedule_run_id = Some(50);
+        control_plane.metadata = serde_json::json!({"engine": "control_plane"}).to_string();
+
+        let mut service_backup = make_test_backup_model(101);
+        service_backup.schedule_id = Some(5);
+        service_backup.schedule_run_id = Some(50);
+        service_backup.state = "running".to_string();
+        service_backup.metadata =
+            serde_json::json!({"engine": "postgres_pgdump", "service_id": 7}).to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![control_plane.clone()]])
+                .append_query_results(vec![vec![control_plane, service_backup]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let outcome = service
+            .publish_recovery_set_if_complete(100)
+            .await
+            .expect("live siblings should produce a typed pending outcome");
+
+        assert_eq!(
+            outcome,
+            RecoverySetPublication::Pending {
+                schedule_run_id: 50
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_set_refuses_partial_fan_out_run() {
+        let mut control_plane = make_test_backup_model(110);
+        control_plane.schedule_id = Some(6);
+        control_plane.schedule_run_id = Some(60);
+        control_plane.metadata = serde_json::json!({"engine": "control_plane"}).to_string();
+
+        let mut failed_service = make_test_backup_model(111);
+        failed_service.schedule_id = Some(6);
+        failed_service.schedule_run_id = Some(60);
+        failed_service.state = "failed".to_string();
+        failed_service.error_message = Some("container missing".to_string());
+        failed_service.metadata =
+            serde_json::json!({"engine": "postgres_pgdump", "service_id": 8}).to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![failed_service.clone()]])
+                .append_query_results(vec![vec![control_plane, failed_service]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let outcome = service
+            .publish_recovery_set_if_complete(111)
+            .await
+            .expect("failed siblings should produce a typed incomplete outcome");
+
+        assert_eq!(
+            outcome,
+            RecoverySetPublication::Incomplete {
+                schedule_run_id: 60,
+                failed_backup_ids: vec![111],
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_set_requires_a_control_plane_backup() {
+        let mut service_backup = make_test_backup_model(120);
+        service_backup.schedule_id = Some(7);
+        service_backup.schedule_run_id = Some(70);
+        service_backup.metadata =
+            serde_json::json!({"engine": "redis", "service_id": 9}).to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![service_backup.clone()]])
+                .append_query_results(vec![vec![service_backup]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let outcome = service
+            .publish_recovery_set_if_complete(120)
+            .await
+            .expect("service-only schedules are valid but not whole-instance recovery sets");
+
+        assert_eq!(
+            outcome,
+            RecoverySetPublication::NoControlPlane {
+                schedule_run_id: 70
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_set_requires_exact_expected_service_coverage() {
+        let mut control_plane = make_test_backup_model(125);
+        control_plane.schedule_id = Some(7);
+        control_plane.schedule_run_id = Some(75);
+        control_plane.metadata = serde_json::json!({
+            "engine": "control_plane",
+            "expected_service_ids": [9]
+        })
+        .to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![control_plane.clone()]])
+                .append_query_results(vec![vec![control_plane]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let error = service
+            .publish_recovery_set_if_complete(125)
+            .await
+            .expect_err("missing expected service backups must prevent publication");
+
+        assert!(
+            matches!(error, BackupError::Validation(message) if message.contains("coverage mismatch"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_set_publication_is_idempotent() {
+        let mut control_plane = make_test_backup_model(130);
+        control_plane.schedule_id = Some(8);
+        control_plane.schedule_run_id = Some(80);
+        control_plane.metadata = serde_json::json!({
+            "engine": "control_plane",
+            "recovery_set_published": true,
+            "recovery_set_version": 2
+        })
+        .to_string();
+
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results(vec![vec![control_plane.clone()]])
+                .append_query_results(vec![vec![control_plane]])
+                .into_connection(),
+        );
+        let service = make_scope_test_service(db);
+
+        let outcome = service
+            .publish_recovery_set_if_complete(130)
+            .await
+            .expect("already-published recovery sets should be a no-op");
+
+        assert_eq!(
+            outcome,
+            RecoverySetPublication::AlreadyPublished {
+                schedule_run_id: 80,
+                backup_id: "uuid-130".to_string(),
+            }
+        );
     }
 
     #[tokio::test]

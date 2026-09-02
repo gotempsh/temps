@@ -9,7 +9,7 @@ use temps_backup_core::BackupExecutorBuilder;
 use temps_core::plugin::{
     PluginContext, PluginError, PluginRoutes, ServiceRegistrationContext, TempsPlugin,
 };
-use tracing::{error, info};
+use tracing::{error, info, warn};
 use utoipa::openapi::OpenApi;
 use utoipa::OpenApi as OpenApiTrait;
 
@@ -201,6 +201,101 @@ impl TempsPlugin for BackupPlugin {
                     }
                 });
                 info!("BackupJobProcessor started");
+            }
+
+            // Completion events are broadcast hints for publishing the
+            // aggregate recovery set consumed by `temps backup restore`.
+            // The finalizer re-reads every sibling from the database and only
+            // publishes when the entire fan-out succeeded. It also reconciles
+            // unpublished completed runs at startup and after receiver lag so
+            // an in-memory event loss cannot strand a valid recovery set.
+            {
+                let recovery_service = Arc::clone(&backup_service);
+                let mut receiver = job_queue.subscribe();
+                tokio::spawn(async move {
+                    if let Err(error) = recovery_service.reconcile_completed_recovery_sets().await {
+                        warn!(
+                            error = %error,
+                            "Initial native recovery-set reconciliation failed"
+                        );
+                    }
+                    let mut reconciliation =
+                        tokio::time::interval(std::time::Duration::from_secs(300));
+                    reconciliation.tick().await;
+
+                    loop {
+                        let event = tokio::select! {
+                            event = receiver.recv() => Some(event),
+                            _ = reconciliation.tick() => None,
+                        };
+                        let Some(event) = event else {
+                            if let Err(error) =
+                                recovery_service.reconcile_completed_recovery_sets().await
+                            {
+                                warn!(
+                                    error = %error,
+                                    "Periodic native recovery-set reconciliation failed"
+                                );
+                            }
+                            continue;
+                        };
+                        let backup_id = match event {
+                            Ok(temps_core::Job::BackupCompleted(event)) => Some(event.backup_id),
+                            Ok(temps_core::Job::BackupFailed(event)) => Some(event.backup_id),
+                            Ok(_) => None,
+                            Err(temps_core::QueueError::ChannelClosed) => {
+                                info!("Native recovery-set finalizer stopped: queue closed");
+                                break;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    error = %error,
+                                    "Native recovery-set finalizer lagged; reconciling durable state"
+                                );
+                                if let Err(reconcile_error) =
+                                    recovery_service.reconcile_completed_recovery_sets().await
+                                {
+                                    warn!(
+                                        error = %reconcile_error,
+                                        "Native recovery-set reconciliation after queue lag failed"
+                                    );
+                                }
+                                None
+                            }
+                        };
+
+                        let Some(backup_id) = backup_id else {
+                            continue;
+                        };
+                        match recovery_service
+                            .publish_recovery_set_if_complete(backup_id)
+                            .await
+                        {
+                            Ok(crate::services::RecoverySetPublication::Published {
+                                schedule_run_id,
+                                backup_id,
+                            }) => info!(
+                                schedule_run_id,
+                                backup_id, "Published native whole-instance recovery set"
+                            ),
+                            Ok(crate::services::RecoverySetPublication::Incomplete {
+                                schedule_run_id,
+                                failed_backup_ids,
+                            }) => warn!(
+                                schedule_run_id,
+                                ?failed_backup_ids,
+                                "Schedule run is incomplete; native recovery set was not published"
+                            ),
+                            Ok(_) => {}
+                            Err(error) => error!(
+                                backup_id,
+                                error = %error,
+                                "Failed to finalize native recovery set"
+                            ),
+                        }
+                    }
+                });
+                info!("Native recovery-set finalizer started");
             }
 
             let telemetry = context

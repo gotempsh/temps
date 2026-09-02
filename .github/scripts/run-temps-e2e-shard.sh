@@ -55,6 +55,7 @@ case "$SHARD" in
     run_scenario mongodb-restore-scenario
     run_scenario s3-restore-scenario
     run_scenario mariadb-restore-scenario
+    run_scenario mariadb-pitr-scenario
     run_scenario pg-upgrade-scenario --registry "$REGISTRY" --upgrade-timeout 900000
     ;;
   edge)

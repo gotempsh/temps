@@ -24,6 +24,7 @@ use crate::handlers::metric_alert_handler;
 use crate::handlers::query_handler;
 use crate::ingest::auth::OtelAuthService;
 use crate::ingest::rate_limit::RateLimiter;
+use crate::memory::OtelMemoryProfile;
 use crate::relay::OtelRelay;
 use crate::services::cross_project::{prune_stale_hints, CrossProjectTraceService, TraceHintMsg};
 use crate::services::facet_service::FacetService;
@@ -69,6 +70,13 @@ pub struct OtelConfig {
     // Ingest backpressure. Process-wide operational tuning knob (not
     // per-tenant config) — see `crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS`.
     pub max_concurrent_ingest_requests: usize,
+
+    /// Startup-derived memory bounds shared by ingest and relay queues.
+    pub memory_profile: OtelMemoryProfile,
+
+    /// Whether the ingest concurrency was explicitly configured instead of
+    /// selected from effective memory.
+    pub ingest_concurrency_overridden: bool,
 }
 
 impl Default for OtelConfig {
@@ -89,6 +97,8 @@ impl Default for OtelConfig {
             enable_anomaly_detection: true,
             max_concurrent_ingest_requests:
                 crate::services::otel_service::DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS,
+            memory_profile: OtelMemoryProfile::fallback(),
+            ingest_concurrency_overridden: false,
         }
     }
 }
@@ -96,7 +106,12 @@ impl Default for OtelConfig {
 impl OtelConfig {
     /// Read configuration from `TEMPS_OTEL_*` environment variables.
     pub fn from_env() -> Self {
-        let mut config = Self::default();
+        let memory_profile = OtelMemoryProfile::detect();
+        let mut config = Self {
+            max_concurrent_ingest_requests: memory_profile.max_concurrent_ingest_requests,
+            memory_profile,
+            ..Self::default()
+        };
 
         if let Ok(v) = std::env::var("TEMPS_OTEL_S3_REGION") {
             config.s3_region = Some(v);
@@ -152,11 +167,14 @@ impl OtelConfig {
         }
         if let Ok(v) = std::env::var("TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS") {
             match parse_max_concurrent_ingest_requests(&v) {
-                Some(limit) => config.max_concurrent_ingest_requests = limit,
+                Some(limit) => {
+                    config.max_concurrent_ingest_requests = limit;
+                    config.ingest_concurrency_overridden = true;
+                }
                 None => warn!(
                     value = %v,
                     "TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS is set but is not a positive \
-                     integer within the supported range; keeping the default ingest \
+                     integer within the supported range; keeping the automatically selected ingest \
                      concurrency ceiling"
                 ),
             }
@@ -189,7 +207,7 @@ fn parse_max_concurrent_ingest_requests(v: &str) -> Option<usize> {
 
 /// Number of counters the OTel pipeline-stats sampler publishes each cycle —
 /// one per [`crate::types::PipelineStats`] field.
-pub const OTEL_PIPELINE_STAT_COUNT: usize = 13;
+pub const OTEL_PIPELINE_STAT_COUNT: usize = 15;
 
 /// How often the pipeline-stats sampler snapshots the counters, in seconds.
 ///
@@ -232,6 +250,8 @@ pub const OTEL_PIPELINE_METRIC_NAMES: [&str; OTEL_PIPELINE_STAT_COUNT] = [
     "otel.logs_stored_s3",
     "otel.logs_dropped",
     "otel.ingest_errors",
+    "otel.relay_dropped_batches",
+    "otel.relay_dropped_items",
 ];
 
 /// Turn a pipeline-stats snapshot plus the previous cycle's checkpoint into the
@@ -303,6 +323,16 @@ fn pipeline_stat_deltas(
         (
             "otel.ingest_errors",
             snap.ingest_errors.saturating_sub(prev.ingest_errors),
+        ),
+        (
+            "otel.relay_dropped_batches",
+            snap.relay_dropped_batches
+                .saturating_sub(prev.relay_dropped_batches),
+        ),
+        (
+            "otel.relay_dropped_items",
+            snap.relay_dropped_items
+                .saturating_sub(prev.relay_dropped_items),
         ),
     ]
 }
@@ -504,6 +534,16 @@ impl TempsPlugin for OtelPlugin {
     ) -> Pin<Box<dyn Future<Output = Result<(), PluginError>> + Send + 'a>> {
         Box::pin(async move {
             let config = OtelConfig::from_env();
+            info!(
+                effective_memory_bytes = config.memory_profile.effective_memory_bytes,
+                memory_limit_source = config.memory_profile.source.as_str(),
+                max_concurrent_ingest_requests = config.max_concurrent_ingest_requests,
+                ingest_concurrency_overridden = config.ingest_concurrency_overridden,
+                relay_queue_max_bytes = config.memory_profile.relay_queue_max_bytes,
+                external_relay_max_bytes = config.memory_profile.external_relay_max_bytes,
+                "OTel startup memory limits selected"
+            );
+            context.register_service(Arc::new(config.memory_profile));
             let db = context.require_service::<sea_orm::DatabaseConnection>();
 
             // Create S3 archiver if configured
@@ -698,12 +738,12 @@ impl TempsPlugin for OtelPlugin {
             let relay_slot = Arc::new(crate::relay::OtelRelaySlot::new_default());
             let _ = self.relay_slot.set(relay_slot.clone());
 
-            // Bounded channel (capacity 1 000 messages) for fire-and-forget
-            // relay of decoded OTLP batches. Ingest handlers call `try_send`
-            // (non-blocking); when the channel is full the batch is dropped
-            // and a warning is emitted — relay loss is non-fatal.
-            let (otel_relay_tx, mut otel_relay_rx) =
-                tokio::sync::mpsc::channel::<crate::relay::OtelRelayMessage>(1000);
+            // Count- and byte-bounded handoff for fire-and-forget relay of
+            // decoded OTLP batches. Ingest handlers never wait for capacity.
+            let (otel_relay_tx, mut otel_relay_rx) = crate::relay::bounded_relay_queue(
+                crate::relay::RELAY_QUEUE_MAX_BATCHES,
+                config.memory_profile.relay_queue_max_bytes,
+            );
 
             let cross_project_service =
                 Arc::new(CrossProjectTraceService::new(db.clone(), storage.clone()));
@@ -963,10 +1003,13 @@ impl TempsPlugin for OtelPlugin {
             // keeping the alarm falsely active. Always writing — including
             // zeros — lets the metric self-resolve on the next cycle, exactly
             // like the proxy sampler's fixed-size point set does. The storage
-            // cost is a fixed 13 rows per minute regardless of ingest volume.
+            // cost is a fixed 18 rows per minute (15 counters plus three
+            // resource-limit gauges) regardless of ingest volume.
             {
                 let stats_otel_service = otel_service.clone();
                 let stats_metrics_store = metrics_store.clone();
+                let stats_memory_profile = config.memory_profile;
+                let stats_ingest_limit = config.max_concurrent_ingest_requests;
                 tokio::spawn(async move {
                     use chrono::Utc;
                     use std::collections::HashMap;
@@ -992,7 +1035,7 @@ impl TempsPlugin for OtelPlugin {
                         let deltas = pipeline_stat_deltas(&snap, &prev);
 
                         let now = Utc::now();
-                        let points: Vec<MetricPoint> = deltas
+                        let mut points: Vec<MetricPoint> = deltas
                             .iter()
                             .map(|(name, delta)| MetricPoint {
                                 time: now,
@@ -1007,6 +1050,45 @@ impl TempsPlugin for OtelPlugin {
                                 labels: HashMap::new(),
                             })
                             .collect();
+                        points.extend([
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.effective_memory_limit_bytes".to_string(),
+                                value: stats_memory_profile.effective_memory_bytes as f64,
+                                kind: MetricKind::Gauge,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.ingest_concurrency_limit".to_string(),
+                                value: stats_ingest_limit as f64,
+                                kind: MetricKind::Gauge,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                            MetricPoint {
+                                time: now,
+                                source_kind: SourceKind::Node,
+                                source_id: CONTROL_PLANE_NODE_ID,
+                                name: "otel.relay_buffer_limit_bytes".to_string(),
+                                value: stats_memory_profile.relay_queue_max_bytes as f64,
+                                kind: MetricKind::Gauge,
+                                engine: Some("otel".to_string()),
+                                environment: None,
+                                node_id: Some(CONTROL_PLANE_NODE_ID),
+                                labels: HashMap::new(),
+                            },
+                        ]);
+                        let point_count = points.len();
 
                         // Only advance the checkpoints once the write actually lands.
                         // Advancing them unconditionally would discard this cycle's
@@ -1028,7 +1110,7 @@ impl TempsPlugin for OtelPlugin {
                                 snap.ingest_errors.saturating_sub(prev.ingest_errors);
                             prev = snap;
                             debug!(
-                                points = deltas.len(),
+                                points = point_count,
                                 spans_dropped,
                                 ingest_errors,
                                 "OTel pipeline stats sampled and written"
@@ -1255,6 +1337,8 @@ mod tests {
             ingest_errors: 11,
             rate_limited_requests: 12,
             quota_exceeded_requests: 13,
+            relay_dropped_batches: 14,
+            relay_dropped_items: 15,
         };
 
         let deltas = pipeline_stat_deltas(&snap, &zero);
@@ -1275,6 +1359,8 @@ mod tests {
         assert_eq!(by_name["otel.ingest_errors"], 11);
         assert_eq!(by_name["otel.rate_limited_requests"], 12);
         assert_eq!(by_name["otel.quota_exceeded_requests"], 13);
+        assert_eq!(by_name["otel.relay_dropped_batches"], 14);
+        assert_eq!(by_name["otel.relay_dropped_items"], 15);
     }
 
     /// The writer's names and the reader's published list must be identical,

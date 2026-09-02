@@ -34,6 +34,7 @@ import { redisRestoreScenarioCommand } from './commands/redis-restore-scenario.t
 import { mongodbRestoreScenarioCommand } from './commands/mongodb-restore-scenario.ts'
 import { pgUpgradeScenarioCommand } from './commands/pg-upgrade-scenario.ts'
 import { mariadbRestoreScenarioCommand } from './commands/mariadb-restore-scenario.ts'
+import { mariadbPitrScenarioCommand } from './commands/mariadb-pitr-scenario.ts'
 import { envVarsScenarioCommand } from './commands/env-vars-scenario.ts'
 import { apiKeyScenarioCommand } from './commands/api-key-scenario.ts'
 import { multinodeJoinScenarioCommand } from './commands/multinode-join-scenario.ts'
@@ -473,6 +474,22 @@ program
   .option('--json', 'machine-readable output')
   .action(async (opts) => {
     await mariadbRestoreScenarioCommand({ ...opts, connection: connection() })
+  })
+
+program
+  .command('mariadb-pitr-scenario')
+  .description(
+    'Point-in-time recovery of a real MariaDB service via MinIO: real mariadb-backup physical base, real backup ' +
+      'schedule to unlock binlog archiving, write T1 rows, wait for their binlog segment to archive, capture a ' +
+      'recovery-target timestamp, write T2 rows, PITR-restore to T1, and prove via the read-only data-browser API ' +
+      'that exactly T1s rows survive',
+  )
+  .option('--minio-endpoint <url>', 'MinIO S3 API endpoint, reachable from the target instance', 'http://localhost:9092')
+  .option('--minio-bucket <name>', 'MinIO bucket to store backups in (must already exist)', 'temps-e2e-backups')
+  .option('--keep', 'do not tear down created resources')
+  .option('--json', 'machine-readable output')
+  .action(async (opts) => {
+    await mariadbPitrScenarioCommand({ ...opts, connection: connection() })
   })
 
 program
