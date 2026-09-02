@@ -19,6 +19,21 @@ pub struct Model {
     pub bucket_path: String,
     pub access_key_id: String,
     pub secret_key: String,
+    /// STS-style session token for a *temporary* credential, encrypted at rest
+    /// with the same [`temps_core::EncryptionService`] as `secret_key`.
+    ///
+    /// `None` for an ordinary long-lived credential — which is every source an
+    /// operator ever typed in. Only a credential vended by Temps Cloud (which
+    /// is prefix-scoped and short-lived, so it can only be minted through an
+    /// STS-style API) carries one. SigV4 rejects a temporary key pair unless
+    /// this token accompanies it as `X-Amz-Security-Token`, so it has to reach
+    /// both the in-process `aws-sdk-s3` clients and the `AWS_SESSION_TOKEN`
+    /// environment of every shelled-out engine (`wal-g`, `mc`, `mariabackup`).
+    pub session_token: Option<String>,
+    /// When the credential in this row stops working, for a temporary
+    /// credential. `None` means it does not expire. Not a secret: the console
+    /// shows it so an operator learns about a lapse before an upload fails.
+    pub credentials_expire_at: Option<DBDateTime>,
     pub force_path_style: Option<bool>,
     pub is_default: bool,
     /// True when this row was auto-provisioned by a Temps Cloud link rather
@@ -79,22 +94,50 @@ impl ActiveModelBehavior for ActiveModel {
 /// [`update_encrypted`] are the only ways this leaves the caller's stack, and
 /// both encrypt `access_key_id`/`secret_key` before anything touches the
 /// database.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3SourceCredentials {
     pub name: String,
     pub bucket_name: String,
     pub bucket_path: String,
     pub access_key_id: String,
     pub secret_key: String,
+    /// STS-style session token, when the credential is a temporary one.
+    /// `None` for every operator-configured long-lived credential.
+    pub session_token: Option<String>,
+    /// When a temporary credential lapses. `None` for a long-lived one.
+    pub credentials_expire_at: Option<DBDateTime>,
     pub region: String,
     pub endpoint: Option<String>,
     pub force_path_style: Option<bool>,
 }
 
-/// Failure encrypting or persisting an [`S3SourceCredentials`] value. Callers
-/// map this into their own domain error type (`temps-backup`'s `BackupError`,
-/// `temps-cloud`'s `CloudServiceError`) — this crate is a data-access layer
-/// and does not own an HTTP-facing error type.
+/// Hand-written so a stray `{:?}` — in a `tracing` field, an error string, a
+/// test failure message — can never print the secret key or the session token.
+/// The derived impl printed `secret_key` verbatim.
+impl std::fmt::Debug for S3SourceCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3SourceCredentials")
+            .field("name", &self.name)
+            .field("bucket_name", &self.bucket_name)
+            .field("bucket_path", &self.bucket_path)
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("credentials_expire_at", &self.credentials_expire_at)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
+}
+
+/// Failure encrypting, decrypting or persisting an [`S3SourceCredentials`]
+/// value. Callers map this into their own domain error type (`temps-backup`'s
+/// `BackupError`, `temps-cloud`'s `CloudServiceError`) — this crate is a data
+/// access layer and does not own an HTTP-facing error type.
 #[derive(Debug, thiserror::Error)]
 pub enum S3SourceCredentialError {
     #[error("Failed to encrypt {field} for S3 source '{name}': {reason}")]
@@ -103,14 +146,30 @@ pub enum S3SourceCredentialError {
         field: &'static str,
         reason: String,
     },
+    #[error("Failed to decrypt {field} for S3 source '{name}': {reason}")]
+    Decryption {
+        name: String,
+        field: &'static str,
+        reason: String,
+    },
     #[error("Database error while persisting S3 source '{name}': {source}")]
     Database { name: String, source: DbErr },
+}
+
+/// The three credential columns as they are stored: access key id, secret key,
+/// and the optional session token — each encrypted with the same service, so
+/// there is exactly one place where a credential field could be persisted in
+/// plaintext by mistake.
+struct EncryptedCredentialColumns {
+    access_key_id: String,
+    secret_key: String,
+    session_token: Option<String>,
 }
 
 fn encrypt_credentials(
     encryption: &temps_core::EncryptionService,
     credentials: &S3SourceCredentials,
-) -> Result<(String, String), S3SourceCredentialError> {
+) -> Result<EncryptedCredentialColumns, S3SourceCredentialError> {
     let access_key_id = encryption
         .encrypt_string(&credentials.access_key_id)
         .map_err(|error| S3SourceCredentialError::Encryption {
@@ -125,7 +184,54 @@ fn encrypt_credentials(
             field: "secret_key",
             reason: error.to_string(),
         })?;
-    Ok((access_key_id, secret_key))
+    // `None` stays `None`: an operator-configured long-lived credential must
+    // persist a NULL column, not an encrypted empty string, so that reading it
+    // back yields "no session token" rather than "a session token that is the
+    // empty string" (which would be signed and rejected by the provider).
+    let session_token = credentials
+        .session_token
+        .as_deref()
+        .map(|token| {
+            encryption
+                .encrypt_string(token)
+                .map_err(|error| S3SourceCredentialError::Encryption {
+                    name: credentials.name.clone(),
+                    field: "session_token",
+                    reason: error.to_string(),
+                })
+        })
+        .transpose()?;
+    Ok(EncryptedCredentialColumns {
+        access_key_id,
+        secret_key,
+        session_token,
+    })
+}
+
+/// Decrypt the optional session token stored on a row.
+///
+/// Returns `Ok(None)` for the overwhelmingly common case of a long-lived
+/// operator-configured credential, so every caller can pass the result straight
+/// into `aws_sdk_s3::config::Credentials::new`'s third argument (or omit
+/// `AWS_SESSION_TOKEN`) without branching on which kind of source it holds.
+pub fn decrypt_session_token(
+    encryption: &temps_core::EncryptionService,
+    model: &Model,
+) -> Result<Option<String>, S3SourceCredentialError> {
+    model
+        .session_token
+        .as_deref()
+        .filter(|token| !token.is_empty())
+        .map(|token| {
+            encryption
+                .decrypt_string(token)
+                .map_err(|error| S3SourceCredentialError::Decryption {
+                    name: model.name.clone(),
+                    field: "session_token",
+                    reason: error.to_string(),
+                })
+        })
+        .transpose()
 }
 
 /// Encrypt `credentials` and insert a new row.
@@ -141,15 +247,17 @@ pub async fn insert_encrypted<C: ConnectionTrait>(
     is_default: bool,
     managed_by_cloud: bool,
 ) -> Result<Model, S3SourceCredentialError> {
-    let (access_key_id, secret_key) = encrypt_credentials(encryption, &credentials)?;
+    let columns = encrypt_credentials(encryption, &credentials)?;
     let now = chrono::Utc::now();
     ActiveModel {
         id: sea_orm::ActiveValue::NotSet,
         name: Set(credentials.name.clone()),
         bucket_name: Set(credentials.bucket_name),
         bucket_path: Set(credentials.bucket_path),
-        access_key_id: Set(access_key_id),
-        secret_key: Set(secret_key),
+        access_key_id: Set(columns.access_key_id),
+        secret_key: Set(columns.secret_key),
+        session_token: Set(columns.session_token),
+        credentials_expire_at: Set(credentials.credentials_expire_at),
         region: Set(credentials.region),
         endpoint: Set(credentials.endpoint),
         force_path_style: Set(credentials.force_path_style),
@@ -170,20 +278,27 @@ pub async fn insert_encrypted<C: ConnectionTrait>(
 /// credential fields in place, leaving `is_default` and `managed_by_cloud`
 /// untouched. Used to rotate a Cloud-managed credential without losing the
 /// row's id (and therefore any backup schedule already pointing at it).
+///
+/// `session_token` and `credentials_expire_at` are written unconditionally,
+/// including when they are `None`. Rotation must be able to move a source from
+/// a temporary credential back to a long-lived one without leaving a stale
+/// token behind that would then be signed into every request.
 pub async fn update_encrypted<C: ConnectionTrait>(
     db: &C,
     encryption: &temps_core::EncryptionService,
     id: i32,
     credentials: S3SourceCredentials,
 ) -> Result<Model, S3SourceCredentialError> {
-    let (access_key_id, secret_key) = encrypt_credentials(encryption, &credentials)?;
+    let columns = encrypt_credentials(encryption, &credentials)?;
     let active = ActiveModel {
         id: Set(id),
         name: Set(credentials.name.clone()),
         bucket_name: Set(credentials.bucket_name),
         bucket_path: Set(credentials.bucket_path),
-        access_key_id: Set(access_key_id),
-        secret_key: Set(secret_key),
+        access_key_id: Set(columns.access_key_id),
+        secret_key: Set(columns.secret_key),
+        session_token: Set(columns.session_token),
+        credentials_expire_at: Set(credentials.credentials_expire_at),
         region: Set(credentials.region),
         endpoint: Set(credentials.endpoint),
         force_path_style: Set(credentials.force_path_style),
@@ -197,4 +312,114 @@ pub async fn update_encrypted<C: ConnectionTrait>(
             name: credentials.name,
             source,
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encryption() -> temps_core::EncryptionService {
+        temps_core::EncryptionService::new_from_password("s3-source-session-token-tests")
+    }
+
+    fn long_lived_credentials() -> S3SourceCredentials {
+        S3SourceCredentials {
+            name: "operator-source".to_string(),
+            bucket_name: "backups".to_string(),
+            bucket_path: "prod".to_string(),
+            access_key_id: "AKIAOPERATOR".to_string(),
+            secret_key: "operator-secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            force_path_style: Some(true),
+        }
+    }
+
+    fn model_with_session_token(session_token: Option<String>) -> Model {
+        let now = chrono::Utc::now();
+        Model {
+            id: 1,
+            name: "source".to_string(),
+            bucket_name: "backups".to_string(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            bucket_path: "prod".to_string(),
+            access_key_id: "ciphertext".to_string(),
+            secret_key: "ciphertext".to_string(),
+            session_token,
+            credentials_expire_at: None,
+            force_path_style: Some(true),
+            is_default: false,
+            managed_by_cloud: false,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The load-bearing guarantee for the ~286 installs already running their
+    /// own S3/R2/MinIO credentials: nothing about an operator-configured source
+    /// changes, and no session token is invented for it.
+    #[test]
+    fn a_long_lived_credential_persists_a_null_session_token() {
+        let columns =
+            encrypt_credentials(&encryption(), &long_lived_credentials()).expect("encrypt");
+
+        assert!(
+            columns.session_token.is_none(),
+            "an operator-configured source must store NULL, not an encrypted empty string"
+        );
+    }
+
+    #[test]
+    fn a_temporary_credential_round_trips_its_session_token_through_encryption() {
+        let encryption = encryption();
+        let credentials = S3SourceCredentials {
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived_credentials()
+        };
+
+        let columns = encrypt_credentials(&encryption, &credentials).expect("encrypt");
+        let stored = columns.session_token.expect("session token is stored");
+        assert_ne!(
+            stored, "sts-session-token",
+            "the session token must be encrypted at rest, never stored in plaintext"
+        );
+
+        let decrypted = decrypt_session_token(&encryption, &model_with_session_token(Some(stored)))
+            .expect("decrypt");
+        assert_eq!(decrypted.as_deref(), Some("sts-session-token"));
+    }
+
+    #[test]
+    fn decrypting_a_row_without_a_session_token_yields_none() {
+        assert!(
+            decrypt_session_token(&encryption(), &model_with_session_token(None))
+                .expect("decrypt")
+                .is_none()
+        );
+        // A legacy row could carry an empty string rather than NULL; that is
+        // still "no session token", never an empty one to sign with.
+        assert!(decrypt_session_token(
+            &encryption(),
+            &model_with_session_token(Some(String::new()))
+        )
+        .expect("decrypt")
+        .is_none());
+    }
+
+    #[test]
+    fn credentials_debug_output_redacts_both_secrets() {
+        let credentials = S3SourceCredentials {
+            secret_key: "operator-secret-value".to_string(),
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived_credentials()
+        };
+
+        let rendered = format!("{credentials:?}");
+        assert!(!rendered.contains("operator-secret-value"));
+        assert!(!rendered.contains("sts-session-token"));
+        assert!(rendered.contains("AKIAOPERATOR"));
+    }
 }

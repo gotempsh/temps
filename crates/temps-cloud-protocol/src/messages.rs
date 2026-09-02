@@ -574,6 +574,27 @@ pub struct ManagedBackupCapability {
     /// Never logged; the [`Debug`] impl below redacts it the same way
     /// [`EnrollResponse`] redacts `instance_token`.
     pub secret_key: Option<String>,
+    /// STS-style session token accompanying a *temporary* credential (e.g. one
+    /// minted by Cloudflare R2's Temporary Access Credentials API so it is
+    /// scoped to a single object prefix). SigV4 rejects such a credential
+    /// unless the token travels with it as `X-Amz-Security-Token`, so every
+    /// signer and shell-out on the instance side has to carry it through.
+    ///
+    /// `None` for a long-lived credential — the field is additive on the wire
+    /// (serde defaults a missing `Option` to `None`), so an older backend that
+    /// never sends it and an operator-configured source that never has one are
+    /// indistinguishable and both keep working unchanged.
+    ///
+    /// Never logged; redacted by the [`Debug`] impl below exactly like
+    /// `secret_key`.
+    #[serde(default)]
+    pub session_token: Option<String>,
+    /// When the vended credential stops working, so the console can say so
+    /// ahead of time instead of the operator discovering it through a failed
+    /// upload. `None` means "does not expire" (a long-lived credential) or "the
+    /// backend did not say".
+    #[serde(default)]
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
     /// e.g. "not available on Starter" — surfaced verbatim to the operator.
     pub reason: Option<String>,
 }
@@ -591,6 +612,11 @@ impl std::fmt::Debug for ManagedBackupCapability {
                 "secret_key",
                 &self.secret_key.as_ref().map(|_| "[REDACTED]"),
             )
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("expires_at", &self.expires_at)
             .field("reason", &self.reason)
             .finish()
     }
@@ -880,12 +906,41 @@ mod tests {
             bucket_path: Some("tenant-42".into()),
             access_key_id: Some("AKIA-VISIBLE".into()),
             secret_key: Some("super-secret-value".into()),
+            session_token: None,
+            expires_at: None,
             reason: None,
         };
 
         let debug_output = format!("{capability:?}");
         assert!(!debug_output.contains("super-secret-value"));
         assert!(debug_output.contains("AKIA-VISIBLE"));
+    }
+
+    #[test]
+    fn managed_backup_capability_debug_output_redacts_the_session_token() {
+        let capability = ManagedBackupCapability {
+            configured: true,
+            endpoint: Some("https://objects.example.com".into()),
+            region: Some("auto".into()),
+            bucket_name: Some("tenant-bucket".into()),
+            bucket_path: Some("tenant-42".into()),
+            access_key_id: Some("AKIA-VISIBLE".into()),
+            secret_key: Some("super-secret-value".into()),
+            session_token: Some("super-secret-session-token".into()),
+            expires_at: Some(
+                chrono::DateTime::parse_from_rfc3339("2026-09-03T00:00:00Z")
+                    .expect("valid timestamp")
+                    .with_timezone(&chrono::Utc),
+            ),
+            reason: None,
+        };
+
+        let debug_output = format!("{capability:?}");
+        assert!(!debug_output.contains("super-secret-session-token"));
+        assert!(!debug_output.contains("super-secret-value"));
+        assert!(debug_output.contains("session_token: Some(\"[REDACTED]\")"));
+        // The expiry itself is not a secret — the console needs to show it.
+        assert!(debug_output.contains("2026-09-03"));
     }
 
     #[test]
@@ -898,12 +953,62 @@ mod tests {
             bucket_path: None,
             access_key_id: None,
             secret_key: None,
+            session_token: None,
+            expires_at: None,
             reason: Some("not available on Starter".into()),
         };
         let json = serde_json::to_string(&capability).unwrap();
         let decoded: ManagedBackupCapability = serde_json::from_str(&json).unwrap();
         assert!(!decoded.configured);
         assert_eq!(decoded.reason.as_deref(), Some("not available on Starter"));
+    }
+
+    /// A backend that predates the temporary-credential work omits both new
+    /// fields entirely. That must decode to `None`/`None` rather than fail —
+    /// it is the wire half of the "an unconfigured source is untouched"
+    /// guarantee, and it is what lets Cloud ship the endpoint before every
+    /// instance has repinned.
+    #[test]
+    fn managed_backup_capability_defaults_the_temporary_credential_fields_when_absent() {
+        let decoded: ManagedBackupCapability = serde_json::from_value(serde_json::json!({
+            "configured": true,
+            "endpoint": "https://objects.example.com",
+            "region": "auto",
+            "bucket_name": "tenant-bucket",
+            "bucket_path": "tenant-42",
+            "access_key_id": "AKIA-VISIBLE",
+            "secret_key": "long-lived",
+            "reason": null,
+        }))
+        .expect("a payload without the temporary-credential fields must still decode");
+
+        assert!(decoded.session_token.is_none());
+        assert!(decoded.expires_at.is_none());
+    }
+
+    #[test]
+    fn managed_backup_capability_round_trips_a_temporary_credential() {
+        let expires_at = chrono::DateTime::parse_from_rfc3339("2026-09-03T12:34:56Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+        let capability = ManagedBackupCapability {
+            configured: true,
+            endpoint: Some("https://objects.example.com".into()),
+            region: Some("auto".into()),
+            bucket_name: Some("tenant-bucket".into()),
+            bucket_path: Some("tenants/42/instances/7/managed-backups/".into()),
+            access_key_id: Some("AKIA-VISIBLE".into()),
+            secret_key: Some("secret".into()),
+            session_token: Some("session-token".into()),
+            expires_at: Some(expires_at),
+            reason: None,
+        };
+
+        let json = serde_json::to_string(&capability).expect("serialize");
+        let decoded: ManagedBackupCapability = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(decoded.session_token.as_deref(), Some("session-token"));
+        assert_eq!(decoded.expires_at, Some(expires_at));
     }
 
     #[test]

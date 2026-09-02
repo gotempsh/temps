@@ -606,9 +606,14 @@ impl ExternalServiceHealthMonitor {
             .decrypt_string(&s3_source.secret_key)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 secret key: {}", e))?;
 
+        let session_token =
+            temps_entities::s3_sources::decrypt_session_token(&self.encryption_service, s3_source)
+                .map_err(|e| anyhow::anyhow!("Failed to decrypt S3 session token: {}", e))?;
+
         Ok(S3Credentials {
             access_key_id,
             secret_key,
+            session_token,
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),

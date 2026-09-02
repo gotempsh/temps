@@ -1627,9 +1627,16 @@ impl ExternalService for RustfsService {
             .encryption_service
             .decrypt_string(&s3_source.secret_key)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt secret key: {}", e))?;
+        // `None` for every operator-configured long-lived credential, which
+        // leaves the values below byte-for-byte what they were.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
 
         // Environment variables for mc - source is the RustFS service, dest is backup S3
-        let env_vars = [
+        let mut env_vars = vec![
             format!(
                 "MC_HOST_source=http://{}:{}@{}:{}",
                 rustfs_config.access_key,
@@ -1638,10 +1645,25 @@ impl ExternalService for RustfsService {
                 rustfs_config.port
             ),
             format!(
-                "MC_HOST_dest=http://{}:{}@{}",
-                decrypted_access_key, decrypted_secret_key, dest_endpoint
+                "MC_HOST_dest=http://{}@{}",
+                super::mc_host_credential(
+                    &decrypted_access_key,
+                    &decrypted_secret_key,
+                    decrypted_session_token.as_deref(),
+                ),
+                dest_endpoint
             ),
         ];
+        // The `mc alias set backup-dest ...` call below cannot carry a session
+        // token; this override can, and mc prefers it. Absent entirely for a
+        // long-lived credential.
+        env_vars.extend(super::mc_host_alias_override(
+            "backup-dest",
+            &dest_endpoint,
+            &decrypted_access_key,
+            &decrypted_secret_key,
+            decrypted_session_token.as_deref(),
+        ));
 
         // Create mc container with shell entrypoint and host networking
         let mc_config = bollard::models::ContainerCreateBody {
@@ -1825,19 +1847,36 @@ impl ExternalService for RustfsService {
         // s3_source credentials are expected to be plain-text (already decrypted by caller)
         let source_access_key = &s3_source.access_key_id;
         let source_secret_key = &s3_source.secret_key;
+        // Plaintext on the same contract; `None` for a long-lived credential.
+        let source_session_token = s3_source.session_token.as_deref();
         let source_endpoint = s3_source.endpoint.as_deref().unwrap_or("s3.amazonaws.com");
 
         // Environment variables for mc - source is backup S3, dest is the RustFS service
-        let env_vars = [
+        let mut env_vars = vec![
             format!(
-                "MC_HOST_source=http://{}:{}@{}",
-                source_access_key, source_secret_key, source_endpoint
+                "MC_HOST_source=http://{}@{}",
+                super::mc_host_credential(
+                    source_access_key,
+                    source_secret_key,
+                    source_session_token,
+                ),
+                source_endpoint
             ),
             format!(
                 "MC_HOST_dest=http://{}:{}@localhost:{}",
                 rustfs_config.access_key, rustfs_config.secret_key, rustfs_config.port
             ),
         ];
+        // The `mc alias set backup-source ...` call below cannot carry a
+        // session token; this override can, and mc prefers it. Absent entirely
+        // for a long-lived credential.
+        env_vars.extend(super::mc_host_alias_override(
+            "backup-source",
+            source_endpoint,
+            source_access_key,
+            source_secret_key,
+            source_session_token,
+        ));
 
         // Create mc container with shell entrypoint and host networking
         let mc_config = bollard::models::ContainerCreateBody {
@@ -2139,31 +2178,53 @@ impl ExternalService for RustfsService {
             // Re-decrypting would fail because these are no longer ciphertext.
             let source_access_key = ctx.s3_source.access_key_id.clone();
             let source_secret_key = ctx.s3_source.secret_key.clone();
+            // Plaintext on the same contract; `None` for a long-lived one.
+            let source_session_token = ctx.s3_source.session_token.clone();
             let source_endpoint = ctx
                 .s3_source
                 .endpoint
                 .as_deref()
                 .unwrap_or("s3.amazonaws.com");
-            let sensitive_values = [
+            let mut sensitive_values = vec![
                 source_access_key.as_str(),
                 source_secret_key.as_str(),
                 new_config.access_key.as_str(),
                 new_config.secret_key.as_str(),
             ];
+            // A session token is exactly as sensitive as the secret key, so mc
+            // output has to have it redacted too.
+            if let Some(token) = source_session_token.as_deref() {
+                sensitive_values.push(token);
+            }
 
             self.pull_mc_image(&self.docker).await?;
 
             let mc_container_name = format!("mc-restore-new-{}", uuid::Uuid::new_v4());
-            let env_vars = [
+            let mut env_vars = vec![
                 format!(
-                    "MC_HOST_source=http://{}:{}@{}",
-                    source_access_key, source_secret_key, source_endpoint
+                    "MC_HOST_source=http://{}@{}",
+                    super::mc_host_credential(
+                        &source_access_key,
+                        &source_secret_key,
+                        source_session_token.as_deref(),
+                    ),
+                    source_endpoint
                 ),
                 format!(
                     "MC_HOST_dest=http://{}:{}@localhost:{}",
                     new_config.access_key, new_config.secret_key, new_config.port
                 ),
             ];
+            // The `mc alias set backup-source ...` call below cannot carry a
+            // session token; this override can, and mc prefers it. Absent
+            // entirely for a long-lived credential.
+            env_vars.extend(super::mc_host_alias_override(
+                "backup-source",
+                source_endpoint,
+                &source_access_key,
+                &source_secret_key,
+                source_session_token.as_deref(),
+            ));
 
             let mc_config = bollard::models::ContainerCreateBody {
                 image: Some(Self::MC_IMAGE.to_string()),

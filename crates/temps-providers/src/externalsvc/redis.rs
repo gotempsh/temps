@@ -1097,6 +1097,10 @@ impl RedisService {
                 serde_json::json!({ "temps_backup_id": backup_id })
             ),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         if !redis_password.is_empty() {
             walg_env.push(format!("WALG_REDIS_PASSWORD={}", redis_password));
@@ -1155,6 +1159,10 @@ impl RedisService {
             "WALG_STREAM_CREATE_COMMAND=echo noop".to_string(),
             "WALG_STREAM_RESTORE_COMMAND=cat > /data/dump.rdb".to_string(),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         // Resolve S3 endpoint for use inside the Docker container.
         if let Some(resolved_endpoint) = s3_credentials

@@ -2372,6 +2372,10 @@ impl MariaDbService {
             "WALG_STREAM_RESTORE_COMMAND=mbstream -x -C /var/lib/mysql".to_string(),
             "WALG_MYSQL_BACKUP_PREPARE_COMMAND=mariadb-backup --prepare --target-dir=/var/lib/mysql".to_string(),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        env.extend(s3_credentials.session_token_env());
         if let Some(endpoint) = s3_credentials
             .resolve_endpoint_for_container(&self.docker, &container_name)
             .await

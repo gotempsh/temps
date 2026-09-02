@@ -371,6 +371,12 @@ impl CloudClient {
 
     /// Describe (or vend) a managed backup destination for this tenant, without
     /// uploading or reading any local backup bytes.
+    ///
+    /// The credential may be a *temporary* (STS-style) one, in which case
+    /// [`ManagedBackupCapability::session_token`] is populated and must travel
+    /// with the access key and secret through every signer and shell-out —
+    /// SigV4 rejects the pair on its own. It stays `None` for a long-lived
+    /// credential and for any backend that predates the field.
     pub async fn managed_backup_credentials(
         &self,
         token: &str,
@@ -1234,6 +1240,107 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(response.request_id, request_id);
         assert_eq!(response.settled_credits, 1);
+    }
+
+    /// Spin up a loopback stub that serves `body` from the managed-backup
+    /// capability route and return what `managed_backup_credentials` decoded,
+    /// or `None` when the sandbox forbids binding a listener.
+    async fn fetch_managed_backup_capability(
+        body: serde_json::Value,
+    ) -> Option<ManagedBackupCapability> {
+        let listener = match tokio::net::TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping managed-backup capability test: sandbox denied TCP bind");
+                return None;
+            }
+            Err(error) => panic!("bind loopback stub: {error}"),
+        };
+        let address = listener.local_addr().expect("stub address");
+        let app = Router::new().route(
+            "/v1/backups/managed/capability",
+            axum::routing::get(move || {
+                let body = body.clone();
+                async move { Json(body) }
+            }),
+        );
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve managed backup stub");
+        });
+
+        let client = CloudClient::new(
+            BackendUrl::loopback_development(&format!("http://{address}"))
+                .expect("loopback backend"),
+        )
+        .expect("cloud client");
+        Some(
+            client
+                .managed_backup_credentials("instance-token")
+                .await
+                .expect("capability decodes"),
+        )
+    }
+
+    /// The whole point of the protocol change: a prefix-scoped R2 credential is
+    /// STS-style, and SigV4 rejects it without the session token. If this ever
+    /// stops arriving at the caller, every managed backup upload 403s.
+    #[tokio::test]
+    async fn managed_backup_credentials_carry_the_session_token_and_expiry() {
+        let Some(capability) = fetch_managed_backup_capability(json!({
+            "configured": true,
+            "endpoint": "https://objects.example.com",
+            "region": "auto",
+            "bucket_name": "shared-bucket",
+            "bucket_path": "tenants/1/instances/2/managed-backups/",
+            "access_key_id": "temp-access-key",
+            "secret_key": "temp-secret-key",
+            "session_token": "temp-session-token",
+            "expires_at": "2026-09-03T12:34:56Z",
+            "reason": null,
+        }))
+        .await
+        else {
+            return;
+        };
+
+        assert!(capability.configured);
+        assert_eq!(
+            capability.session_token.as_deref(),
+            Some("temp-session-token")
+        );
+        assert_eq!(
+            capability.expires_at.map(|at| at.to_rfc3339()),
+            Some("2026-09-03T12:34:56+00:00".to_string())
+        );
+        // And the token must not leak through the value's own Debug rendering,
+        // which is what ends up in `tracing` output on the failure paths.
+        assert!(!format!("{capability:?}").contains("temp-session-token"));
+    }
+
+    /// A backend that predates the temporary-credential work sends neither
+    /// field. That must decode cleanly to `None`, so a long-lived credential
+    /// keeps behaving exactly as it did.
+    #[tokio::test]
+    async fn managed_backup_credentials_default_to_no_session_token() {
+        let Some(capability) = fetch_managed_backup_capability(json!({
+            "configured": true,
+            "endpoint": "https://objects.example.com",
+            "region": "auto",
+            "bucket_name": "shared-bucket",
+            "bucket_path": "tenant-1",
+            "access_key_id": "long-lived-access-key",
+            "secret_key": "long-lived-secret-key",
+            "reason": null,
+        }))
+        .await
+        else {
+            return;
+        };
+
+        assert!(capability.session_token.is_none());
+        assert!(capability.expires_at.is_none());
     }
 
     struct NotificationStub {

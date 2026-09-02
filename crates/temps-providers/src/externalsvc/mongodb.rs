@@ -1090,6 +1090,10 @@ impl MongodbService {
                 serde_json::json!({ "temps_backup_id": backup_id })
             ),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         if let Some(resolved_endpoint) = s3_credentials
             .resolve_endpoint_for_container(&self.docker, container_name)
@@ -1226,6 +1230,10 @@ impl MongodbService {
             format!("WALG_STREAM_RESTORE_COMMAND={}", stream_restore_cmd),
             format!("MONGODB_URI={}", mongodb_uri),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         // Resolve S3 endpoint for use inside the Docker container.
         if let Some(resolved_endpoint) = s3_credentials

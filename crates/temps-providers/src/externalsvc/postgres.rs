@@ -1947,6 +1947,10 @@ impl PostgresService {
             "PGHOST=localhost".to_string(),
             format!("PGPORT={}", POSTGRES_INTERNAL_PORT),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         // Resolve S3 endpoint for use inside the Docker container.
         if let Some(resolved_endpoint) = s3_credentials
@@ -2525,6 +2529,10 @@ impl PostgresService {
             "PGHOST=localhost".to_string(),
             format!("PGPORT={}", POSTGRES_INTERNAL_PORT),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
 
         if let Some(resolved_endpoint) = s3_credentials
             .resolve_endpoint_for_container(&self.docker, container_name)
@@ -3497,6 +3505,10 @@ impl ExternalService for PostgresService {
             format!("AWS_SECRET_ACCESS_KEY={}", s3_credentials.secret_key),
             format!("AWS_REGION={}", s3_credentials.region),
         ];
+        // Absent unless this source holds a temporary (STS-style)
+        // credential, so a long-lived one produces the exact environment
+        // it always did.
+        walg_env.extend(s3_credentials.session_token_env());
         if let Some(resolved_endpoint) = s3_credentials
             .resolve_endpoint_for_container(&self.docker, &container_name)
             .await
@@ -6343,6 +6355,7 @@ mod tests {
         let s3_creds = crate::externalsvc::S3Credentials {
             access_key_id: "k".into(),
             secret_key: "s".into(),
+            session_token: None,
             region: "us-east-1".into(),
             endpoint: None,
             bucket_name: "b".into(),
@@ -6356,6 +6369,8 @@ mod tests {
             bucket_path: "".into(),
             access_key_id: "enc".into(),
             secret_key: "enc".into(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".into(),
             endpoint: None,
             force_path_style: Some(true),

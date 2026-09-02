@@ -125,6 +125,8 @@ impl BackupEngine for S3MirrorEngine {
             .map_err(|e| BackupError::PermanentFailure {
                 reason: format!("decrypt dest secret key: {}", e),
             })?;
+        let dest_session_token =
+            v2_common::decrypt_session_token(&s3_dest, &deps.encryption_service)?;
 
         let dest_endpoint = s3_dest.endpoint.as_deref().unwrap_or("").to_string();
         let dest_endpoint = if dest_endpoint.is_empty() {
@@ -176,8 +178,14 @@ impl BackupEngine for S3MirrorEngine {
                 source_access_key, source_secret_key, source_host, source_port
             ),
             format!(
-                "MC_HOST_dest={}://{}:{}@{}",
-                dest_scheme, dest_access_key, dest_secret_key, dest_hostpath
+                "MC_HOST_dest={}://{}@{}",
+                dest_scheme,
+                temps_providers::externalsvc::mc_host_credential(
+                    &dest_access_key,
+                    &dest_secret_key,
+                    dest_session_token.as_deref(),
+                ),
+                dest_hostpath
             ),
         ];
 

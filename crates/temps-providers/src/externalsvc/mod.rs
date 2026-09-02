@@ -703,10 +703,19 @@ impl BackupOutcome {
 /// (e.g., WAL-G running inside a Docker container via `docker exec`).
 /// The `backup_to_s3` orchestrator decrypts the encrypted credentials from the
 /// `s3_sources` model and passes them through this struct.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct S3Credentials {
     pub access_key_id: String,
     pub secret_key: String,
+    /// STS-style session token for a *temporary* credential. `None` for the
+    /// long-lived credentials operators configure themselves, which is the
+    /// only kind that existed before managed backup sources.
+    ///
+    /// SigV4 rejects a temporary key pair unless this token is signed with it
+    /// as `X-Amz-Security-Token`, so it must reach both
+    /// [`S3Credentials::build_s3_client`] and the `AWS_SESSION_TOKEN`
+    /// environment of every engine that shells out to `wal-g`/`mc`.
+    pub session_token: Option<String>,
     pub region: String,
     pub endpoint: Option<String>,
     pub bucket_name: String,
@@ -714,7 +723,98 @@ pub struct S3Credentials {
     pub force_path_style: bool,
 }
 
+/// Hand-written so a `{:?}` anywhere — a `tracing` field, an error message, a
+/// panic in a test — cannot print the secret key or the session token. The
+/// derived impl printed `secret_key` verbatim.
+impl std::fmt::Debug for S3Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Credentials")
+            .field("access_key_id", &self.access_key_id)
+            .field("secret_key", &"[REDACTED]")
+            .field(
+                "session_token",
+                &self.session_token.as_ref().map(|_| "[REDACTED]"),
+            )
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("bucket_name", &self.bucket_name)
+            .field("bucket_path", &self.bucket_path)
+            .field("force_path_style", &self.force_path_style)
+            .finish()
+    }
+}
+
+/// The `AWS_SESSION_TOKEN=<token>` entry a shelled-out engine (`wal-g`,
+/// `mariabackup`, anything using the AWS SDK's default credential chain) needs
+/// alongside `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` when — and only when —
+/// the credential is a temporary one.
+///
+/// Returns `None` for a long-lived credential so callers can
+/// `env.extend(aws_session_token_env(...))` and have the variable be *absent*
+/// rather than empty. An empty `AWS_SESSION_TOKEN` is not the same as no
+/// session token: the SDKs sign it and the provider rejects the request.
+pub fn aws_session_token_env(session_token: Option<&str>) -> Option<String> {
+    session_token
+        .filter(|token| !token.is_empty())
+        .map(|token| format!("AWS_SESSION_TOKEN={token}"))
+}
+
+/// The credential segment of an `MC_HOST_<alias>` URL.
+///
+/// `mc` takes `<scheme>://<access key>:<secret key>[:<session token>]@<host>`.
+/// The session token is a third colon-separated field rather than an
+/// environment variable, because `mc` does not read `AWS_SESSION_TOKEN` at all.
+/// A long-lived credential produces the two-field form byte-for-byte as before.
+pub fn mc_host_credential(
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> String {
+    match session_token.filter(|token| !token.is_empty()) {
+        Some(token) => format!("{access_key}:{secret_key}:{token}"),
+        None => format!("{access_key}:{secret_key}"),
+    }
+}
+
+/// An `MC_HOST_<alias>` entry that gives an mc alias a session token.
+///
+/// `mc alias set <alias> <url> <access key> <secret key>` has no positional
+/// slot for a session token, so an alias configured that way cannot use a
+/// temporary credential at all. `MC_HOST_<alias>` can, and mc resolves it ahead
+/// of its config file — so emitting this alongside the existing `alias set`
+/// call upgrades the alias in place.
+///
+/// Returns `None` when there is no session token, which is every long-lived
+/// operator-configured credential: nothing is added to the container
+/// environment and the `mc alias set` path behaves exactly as it always has.
+pub fn mc_host_alias_override(
+    alias: &str,
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    session_token: Option<&str>,
+) -> Option<String> {
+    let token = session_token.filter(|token| !token.is_empty())?;
+    let (scheme, hostpath) = if let Some(rest) = endpoint.strip_prefix("https://") {
+        ("https", rest)
+    } else if let Some(rest) = endpoint.strip_prefix("http://") {
+        ("http", rest)
+    } else {
+        ("http", endpoint)
+    };
+    Some(format!(
+        "MC_HOST_{alias}={scheme}://{}@{hostpath}",
+        mc_host_credential(access_key, secret_key, Some(token))
+    ))
+}
+
 impl S3Credentials {
+    /// See [`aws_session_token_env`] — `None` unless these are temporary
+    /// credentials.
+    pub fn session_token_env(&self) -> Option<String> {
+        aws_session_token_env(self.session_token.as_deref())
+    }
+
     /// Build an `aws_sdk_s3::Client` from already-decrypted credentials.
     /// Used by post-backup steps (e.g. listing the WAL-G prefix to compute
     /// size) when we already hold a decrypted credential set and don't
@@ -723,7 +823,10 @@ impl S3Credentials {
         let creds = aws_sdk_s3::config::Credentials::new(
             self.access_key_id.clone(),
             self.secret_key.clone(),
-            None,
+            // Third argument is the session token: `None` for a long-lived
+            // credential (unchanged behaviour), `Some` for a temporary one,
+            // which SigV4 will not accept without it.
+            self.session_token.clone(),
             None,
             "temps-backup",
         );
@@ -1932,5 +2035,131 @@ mod resource_limits_tests {
         // None values must not overwrite — preserves whatever the engine set.
         assert_eq!(hc.cpu_shares, Some(1024));
         assert_eq!(hc.memory, None);
+    }
+}
+
+#[cfg(test)]
+mod temporary_credential_tests {
+    use super::*;
+
+    fn long_lived() -> S3Credentials {
+        S3Credentials {
+            access_key_id: "AKIAOPERATOR".to_string(),
+            secret_key: "operator-secret".to_string(),
+            session_token: None,
+            region: "us-east-1".to_string(),
+            endpoint: Some("https://s3.example.test".to_string()),
+            bucket_name: "backups".to_string(),
+            bucket_path: "tenant".to_string(),
+            force_path_style: true,
+        }
+    }
+
+    /// The guarantee for every source an operator configured themselves:
+    /// no `AWS_SESSION_TOKEN` is added to the container environment at all.
+    /// An *empty* one would be worse than none — the AWS SDKs sign it and the
+    /// provider rejects the request.
+    #[test]
+    fn a_long_lived_credential_contributes_no_session_token_env() {
+        assert_eq!(long_lived().session_token_env(), None);
+        assert_eq!(aws_session_token_env(None), None);
+        assert_eq!(aws_session_token_env(Some("")), None);
+    }
+
+    #[test]
+    fn a_temporary_credential_contributes_an_aws_session_token_env() {
+        let credentials = S3Credentials {
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived()
+        };
+
+        assert_eq!(
+            credentials.session_token_env().as_deref(),
+            Some("AWS_SESSION_TOKEN=sts-session-token")
+        );
+    }
+
+    /// Mirrors how every engine builds its environment: extend with the
+    /// helper, then assert the variable is present or absent accordingly.
+    #[test]
+    fn extending_an_env_vector_is_a_no_op_without_a_session_token() {
+        let mut env = vec![
+            "AWS_ACCESS_KEY_ID=AKIAOPERATOR".to_string(),
+            "AWS_SECRET_ACCESS_KEY=operator-secret".to_string(),
+        ];
+        let before = env.clone();
+        env.extend(long_lived().session_token_env());
+        assert_eq!(env, before);
+        assert!(!env
+            .iter()
+            .any(|entry| entry.starts_with("AWS_SESSION_TOKEN")));
+
+        let temporary = S3Credentials {
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived()
+        };
+        env.extend(temporary.session_token_env());
+        assert!(env
+            .iter()
+            .any(|entry| entry == "AWS_SESSION_TOKEN=sts-session-token"));
+    }
+
+    #[test]
+    fn mc_host_credential_omits_the_token_field_for_a_long_lived_credential() {
+        assert_eq!(mc_host_credential("key", "secret", None), "key:secret");
+        assert_eq!(mc_host_credential("key", "secret", Some("")), "key:secret");
+    }
+
+    #[test]
+    fn mc_host_credential_appends_the_token_as_a_third_field() {
+        assert_eq!(
+            mc_host_credential("key", "secret", Some("token")),
+            "key:secret:token"
+        );
+    }
+
+    #[test]
+    fn mc_host_alias_override_is_absent_without_a_session_token() {
+        assert_eq!(
+            mc_host_alias_override("backup-source", "https://s3.example.test", "k", "s", None),
+            None
+        );
+    }
+
+    #[test]
+    fn mc_host_alias_override_preserves_the_endpoint_scheme() {
+        assert_eq!(
+            mc_host_alias_override(
+                "backup-source",
+                "https://s3.example.test",
+                "k",
+                "s",
+                Some("token")
+            )
+            .as_deref(),
+            Some("MC_HOST_backup-source=https://k:s:token@s3.example.test")
+        );
+        assert_eq!(
+            mc_host_alias_override("bkp", "http://minio:9000", "k", "s", Some("token")).as_deref(),
+            Some("MC_HOST_bkp=http://k:s:token@minio:9000")
+        );
+        // A bare host:port keeps the historical plain-HTTP assumption.
+        assert_eq!(
+            mc_host_alias_override("bkp", "minio:9000", "k", "s", Some("token")).as_deref(),
+            Some("MC_HOST_bkp=http://k:s:token@minio:9000")
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_the_secret_key_and_the_session_token() {
+        let credentials = S3Credentials {
+            session_token: Some("sts-session-token".to_string()),
+            ..long_lived()
+        };
+
+        let rendered = format!("{credentials:?}");
+        assert!(!rendered.contains("operator-secret"));
+        assert!(!rendered.contains("sts-session-token"));
+        assert!(rendered.contains("AKIAOPERATOR"));
     }
 }

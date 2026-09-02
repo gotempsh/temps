@@ -815,6 +815,17 @@ fn managed_backup_credentials_from_capability(
         bucket_path,
         access_key_id,
         secret_key,
+        // Not required: a backend may vend a long-lived credential, and one
+        // that predates the temporary-credential protocol sends neither field
+        // at all. Both decode to `None`, which is the same shape as every
+        // operator-configured source, so the row behaves identically.
+        //
+        // When it *is* present the credential is STS-style and unusable
+        // without it — `update_encrypted`/`insert_encrypted` seal it with the
+        // same `EncryptionService` as `secret_key`, and every signer and
+        // shell-out reads it back from there.
+        session_token: capability.session_token,
+        credentials_expire_at: capability.expires_at,
         region,
         endpoint: capability.endpoint,
         // Cloud-issued endpoints are always virtual-hosted-style S3 APIs;
@@ -1015,6 +1026,72 @@ mod tests {
         .unwrap();
     }
 
+    fn capability(
+        session_token: Option<&str>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> ManagedBackupCapability {
+        ManagedBackupCapability {
+            configured: true,
+            endpoint: Some("https://example.r2.cloudflarestorage.com".to_string()),
+            region: Some("auto".to_string()),
+            bucket_name: Some("temps-cloud-shared".to_string()),
+            bucket_path: Some("tenants/1/instances/2/managed-backups/".to_string()),
+            access_key_id: Some("AKIA-vended".to_string()),
+            secret_key: Some("vended-secret".to_string()),
+            session_token: session_token.map(str::to_string),
+            expires_at,
+            reason: None,
+        }
+    }
+
+    /// The write-back half of the credential-vending contract: whatever the
+    /// rotation loop receives has to reach the `s3_sources` row, or the
+    /// instance stores a temporary credential it cannot sign with.
+    #[test]
+    fn a_vended_temporary_credential_carries_its_token_and_expiry_into_storage() {
+        let expires_at = chrono::DateTime::parse_from_rfc3339("2026-09-03T12:00:00Z")
+            .expect("valid timestamp")
+            .with_timezone(&chrono::Utc);
+
+        let credentials = managed_backup_credentials_from_capability(capability(
+            Some("vended-session-token"),
+            Some(expires_at),
+        ))
+        .expect("a complete capability translates");
+
+        assert_eq!(
+            credentials.session_token.as_deref(),
+            Some("vended-session-token")
+        );
+        assert_eq!(credentials.credentials_expire_at, Some(expires_at));
+    }
+
+    /// A backend that vends a long-lived credential — or one that predates the
+    /// temporary-credential protocol and sends neither field — produces a row
+    /// shaped exactly like an operator-configured source.
+    #[test]
+    fn a_vended_long_lived_credential_stores_no_session_token() {
+        let credentials = managed_backup_credentials_from_capability(capability(None, None))
+            .expect("a capability without the optional fields still translates");
+
+        assert!(credentials.session_token.is_none());
+        assert!(credentials.credentials_expire_at.is_none());
+    }
+
+    /// Neither secret may reach a log line or an error string through `{:?}`.
+    #[test]
+    fn translated_credentials_debug_output_redacts_both_secrets() {
+        let credentials = managed_backup_credentials_from_capability(capability(
+            Some("vended-session-token"),
+            None,
+        ))
+        .expect("a complete capability translates");
+
+        let rendered = format!("{credentials:?}");
+        assert!(!rendered.contains("vended-secret"));
+        assert!(!rendered.contains("vended-session-token"));
+    }
+
     fn test_credentials(bucket_name: &str) -> temps_entities::s3_sources::S3SourceCredentials {
         temps_entities::s3_sources::S3SourceCredentials {
             name: MANAGED_BACKUP_SOURCE_NAME.to_string(),
@@ -1022,6 +1099,8 @@ mod tests {
             bucket_path: "tenant".to_string(),
             access_key_id: "AKIA-rotated".to_string(),
             secret_key: "rotated-secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "auto".to_string(),
             endpoint: Some("https://example.r2.cloudflarestorage.com".to_string()),
             force_path_style: Some(false),
@@ -1060,6 +1139,8 @@ mod tests {
             bucket_path: "tenant".to_string(),
             access_key_id: "AKIA-old".to_string(),
             secret_key: "old-secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "auto".to_string(),
             endpoint: Some("https://example.r2.cloudflarestorage.com".to_string()),
             force_path_style: Some(false),

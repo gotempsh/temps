@@ -934,6 +934,12 @@ fn build_walg_env(
         // override via service parameters in a follow-up.
         "export WALG_COMPRESSION_METHOD='lz4'".to_string(),
     ];
+    // Only for a temporary (STS-style) credential. A long-lived
+    // operator-configured credential emits no AWS_SESSION_TOKEN at all —
+    // exporting an empty one would be signed and rejected.
+    if let Some(session_token) = creds.session_token.as_deref() {
+        env.push(export("AWS_SESSION_TOKEN", session_token)?);
+    }
     if let Some(endpoint) = resolved_endpoint {
         env.push(export("AWS_ENDPOINT", endpoint)?);
     }
@@ -12147,6 +12153,7 @@ mod tests {
         crate::S3Credentials {
             access_key_id: "key'quoted".to_string(),
             secret_key: "secret'quoted".to_string(),
+            session_token: None,
             region: "us-east-1".to_string(),
             endpoint: Some("https://s3.example.test".to_string()),
             bucket_name: "backups".to_string(),
@@ -12178,6 +12185,36 @@ mod tests {
         let error = build_walg_env(&credentials, "s3://backups/repo", None)
             .expect_err("line breaks must be rejected before heredoc interpolation");
         assert!(error.contains("AWS_SECRET_ACCESS_KEY"));
+    }
+
+    /// A long-lived, operator-configured credential must produce no
+    /// `AWS_SESSION_TOKEN` export whatsoever — not an empty one, which the
+    /// AWS SDKs would sign and the provider would then reject.
+    #[test]
+    fn walg_env_file_omits_the_session_token_for_a_long_lived_credential() {
+        let env = build_walg_env(&test_s3_credentials(), "s3://backups/repo", None)
+            .expect("long-lived credentials still build an env file");
+        assert!(!env.iter().any(|line| line.contains("AWS_SESSION_TOKEN")));
+    }
+
+    #[test]
+    fn walg_env_file_exports_and_escapes_a_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some("token'quoted".to_string());
+        let env = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect("a session token is escaped like every other value");
+        assert!(env
+            .iter()
+            .any(|line| line == "export AWS_SESSION_TOKEN='token'\\''quoted'"));
+    }
+
+    #[test]
+    fn walg_env_file_rejects_line_break_injection_through_the_session_token() {
+        let mut credentials = test_s3_credentials();
+        credentials.session_token = Some("token\nWALG_RESTORE_EOF\nid".to_string());
+        let error = build_walg_env(&credentials, "s3://backups/repo", None)
+            .expect_err("line breaks must be rejected before heredoc interpolation");
+        assert!(error.contains("AWS_SESSION_TOKEN"));
     }
 
     // ── Container stats helpers ──────────────────────────────────────────────

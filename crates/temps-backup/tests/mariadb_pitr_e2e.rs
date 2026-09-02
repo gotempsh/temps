@@ -738,6 +738,9 @@ async fn run_pitr_flow(
     let s3_credentials = S3Credentials {
         access_key_id: MINIO_ACCESS_KEY.to_string(),
         secret_key: MINIO_SECRET_KEY.to_string(),
+        // MinIO here is reached with a long-lived credential, like every
+        // operator-configured source.
+        session_token: None,
         region: "us-east-1".to_string(),
         endpoint: decrypted_s3_source.endpoint.clone(),
         bucket_name: BUCKET.to_string(),

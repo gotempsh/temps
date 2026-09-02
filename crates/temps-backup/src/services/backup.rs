@@ -1654,6 +1654,15 @@ impl BackupService {
                 message: format!("Failed to decrypt S3 secret key: {}", e),
             })?;
 
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to decrypt S3 session token: {}", e),
+        })?;
+
         // Build environment variables for WAL-G
         let mut env_vars: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
@@ -1662,12 +1671,17 @@ impl BackupService {
             format!("AWS_REGION={}", s3_source.region),
             format!("PGDATA={}", pgdata),
         ];
+        // Absent for a long-lived credential, so its environment is unchanged.
+        env_vars.extend(temps_providers::externalsvc::aws_session_token_env(
+            decrypted_session_token.as_deref(),
+        ));
 
         // Resolve S3 endpoint for use inside the Docker container.
         // localhost/127.0.0.1 endpoints are translated to Docker-resolvable addresses.
         let s3_creds = temps_providers::S3Credentials {
             access_key_id: decrypted_access_key.clone(),
             secret_key: decrypted_secret_key.clone(),
+            session_token: decrypted_session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -2317,10 +2331,19 @@ impl BackupService {
             .decrypt_string(&s3_source.secret_key)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt secret key: {}", e))?;
 
+        // `None` for a long-lived credential — the third argument stays exactly
+        // what it was for every operator-configured source. `Some` only for a
+        // temporary one, which SigV4 rejects without its session token.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
+
         let creds = aws_sdk_s3::config::Credentials::new(
             decrypted_access_key,
             decrypted_secret_key,
-            None,
+            decrypted_session_token,
             None,
             "backup-service",
         );
@@ -3448,6 +3471,15 @@ impl BackupService {
                 message: format!("Failed to decrypt S3 secret key: {}", e),
             })?;
 
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to decrypt S3 session token: {}", e),
+        })?;
+
         let walg_s3_prefix = &backup.s3_location;
         let mut walg_env: Vec<String> = vec![
             format!("WALG_S3_PREFIX={}", walg_s3_prefix),
@@ -3456,11 +3488,16 @@ impl BackupService {
             format!("AWS_REGION={}", s3_source.region),
             format!("PGDATA={}", pgdata),
         ];
+        // Absent for a long-lived credential, so its environment is unchanged.
+        walg_env.extend(temps_providers::externalsvc::aws_session_token_env(
+            decrypted_session_token.as_deref(),
+        ));
 
         // Resolve S3 endpoint for use inside the Docker container.
         let s3_creds = temps_providers::S3Credentials {
             access_key_id: decrypted_access_key.clone(),
             secret_key: decrypted_secret_key.clone(),
+            session_token: decrypted_session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -4293,12 +4330,24 @@ impl BackupService {
                     source.id, error
                 ))
             })?;
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            source,
+        )
+        .map_err(|error| {
+            BackupError::Configuration(format!(
+                "Failed to decrypt session token for S3 source {}: {}",
+                source.id, error
+            ))
+        })?;
         let docker = bollard::Docker::connect_with_local_defaults().map_err(|error| {
             BackupError::ExternalService(format!("Failed to connect to Docker: {}", error))
         })?;
         let endpoint = temps_providers::externalsvc::S3Credentials {
             access_key_id: access_key.clone(),
             secret_key: secret_key.clone(),
+            session_token: session_token.clone(),
             region: source.region.clone(),
             endpoint: source.endpoint.clone(),
             bucket_name: source.bucket_name.clone(),
@@ -4317,6 +4366,10 @@ impl BackupService {
             format!("AWS_SECRET_ACCESS_KEY={}", secret_key),
             format!("AWS_REGION={}", source.region),
         ];
+        // Absent for a long-lived credential, so its environment is unchanged.
+        env.extend(temps_providers::externalsvc::aws_session_token_env(
+            session_token.as_deref(),
+        ));
         if let Some(endpoint) = endpoint {
             env.push(format!(
                 "AWS_ENDPOINT={}",
@@ -4879,6 +4932,13 @@ impl BackupService {
                 bucket_path: request.bucket_path,
                 access_key_id: request.access_key_id,
                 secret_key: request.secret_key,
+                // An operator typing credentials into the S3 Sources form is
+                // always configuring a long-lived credential. Temporary,
+                // prefix-scoped credentials only ever arrive from Temps Cloud
+                // via `CloudService::provision_managed_backup_source`, so this
+                // path stores NULL for both and behaves exactly as before.
+                session_token: None,
+                credentials_expire_at: None,
                 region: request.region,
                 endpoint: request.endpoint,
                 force_path_style: request.force_path_style,
@@ -8101,9 +8161,18 @@ ORDER BY a.opened_at DESC
             .map_err(|e| BackupError::Internal {
                 message: format!("Failed to decrypt secret key for backup: {}", e),
             })?;
+        // `None` unless this source holds a temporary (STS-style) credential.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            &s3_source,
+        )
+        .map_err(|e| BackupError::Internal {
+            message: format!("Failed to decrypt session token for backup: {}", e),
+        })?;
         let s3_credentials = temps_providers::S3Credentials {
             access_key_id: decrypted_access_key,
             secret_key: decrypted_secret_key,
+            session_token: decrypted_session_token,
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -9400,6 +9469,8 @@ mod tests {
             bucket_path: "tenant".to_string(),
             access_key_id: "key".to_string(),
             secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: None,
             force_path_style: Some(true),
@@ -9464,6 +9535,8 @@ mod tests {
             bucket_path: "tenant".to_string(),
             access_key_id: "key".to_string(),
             secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: None,
             force_path_style: Some(true),
@@ -9515,6 +9588,8 @@ mod tests {
             bucket_path: "tenant".to_string(),
             access_key_id: "key".to_string(),
             secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: None,
             force_path_style: Some(false),
@@ -9559,6 +9634,8 @@ mod tests {
             bucket_path: "tenant".to_string(),
             access_key_id: "key".to_string(),
             secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: None,
             force_path_style: Some(false),
@@ -9698,6 +9775,8 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: encrypted_access_key,
             secret_key: encrypted_secret_key,
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
@@ -9921,6 +10000,8 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: encrypted_access_key,
             secret_key: encrypted_secret_key,
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
@@ -10051,6 +10132,8 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: "test-key".to_string(),
             secret_key: "test-secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             region: "us-east-1".to_string(),
             endpoint: Some("http://localhost:9000".to_string()),
             force_path_style: Some(true),
@@ -11104,6 +11187,8 @@ mod tests {
             bucket_path: "/backups".to_string(),
             access_key_id: "key".to_string(),
             secret_key: "secret".to_string(),
+            session_token: None,
+            credentials_expire_at: None,
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,
@@ -12141,6 +12226,8 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
@@ -12324,6 +12411,8 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
@@ -12486,6 +12575,8 @@ mod tests {
                     bucket_path: "/".to_string(),
                     access_key_id: "".to_string(),
                     secret_key: "".to_string(),
+                    session_token: None,
+                    credentials_expire_at: None,
                     region: "us-east-1".to_string(),
                     endpoint: None,
                     force_path_style: Some(true),
@@ -12620,6 +12711,8 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),
@@ -12763,6 +12856,8 @@ mod tests {
             bucket_path: Set("/".to_string()),
             access_key_id: Set("".to_string()),
             secret_key: Set("".to_string()),
+            session_token: Set(None),
+            credentials_expire_at: Set(None),
             region: Set("us-east-1".to_string()),
             endpoint: Set(None),
             force_path_style: Set(Some(true)),

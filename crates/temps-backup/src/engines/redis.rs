@@ -303,9 +303,11 @@ async fn run_walg_backup(
         .map_err(|error| BackupError::PermanentFailure {
             reason: format!("decrypt Redis WAL-G secret key: {error}"),
         })?;
+    let session_token = v2_common::decrypt_session_token(s3_source, &deps.encryption_service)?;
     let container_endpoint = temps_providers::externalsvc::S3Credentials {
         access_key_id: access_key.clone(),
         secret_key: secret_key.clone(),
+        session_token: session_token.clone(),
         region: s3_source.region.clone(),
         endpoint: s3_source.endpoint.clone(),
         bucket_name: s3_source.bucket_name.clone(),
@@ -323,6 +325,10 @@ async fn run_walg_backup(
         format!("WALG_STREAM_CREATE_COMMAND={WALG_STREAM_CREATE_COMMAND}"),
         format!("WALG_STREAM_RESTORE_COMMAND={WALG_STREAM_RESTORE_COMMAND}"),
     ];
+    // Absent unless this source holds a temporary credential.
+    env.extend(temps_providers::externalsvc::aws_session_token_env(
+        session_token.as_deref(),
+    ));
     env.extend(v2_common::walg_identity_env(backup_uuid));
     if let Some(endpoint) = container_endpoint {
         env.push(format!(

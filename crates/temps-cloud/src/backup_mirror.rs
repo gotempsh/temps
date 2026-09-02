@@ -2348,6 +2348,8 @@ mod tests {
             bucket_path: String::new(),
             access_key_id: "encrypted".to_owned(),
             secret_key: "encrypted".to_owned(),
+            session_token: None,
+            credentials_expire_at: None,
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,

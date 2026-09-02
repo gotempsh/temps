@@ -1315,8 +1315,15 @@ impl ExternalService for S3Service {
             .encryption_service
             .decrypt_string(&s3_source.secret_key)
             .map_err(|e| anyhow::anyhow!("Failed to decrypt secret key: {}", e))?;
+        // `None` for every operator-configured long-lived credential, which
+        // leaves the values below byte-for-byte what they were.
+        let decrypted_session_token = temps_entities::s3_sources::decrypt_session_token(
+            self.encryption_service.as_ref(),
+            s3_source,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to decrypt session token: {}", e))?;
 
-        let env_vars = [
+        let mut env_vars = vec![
             format!(
                 "MC_HOST_source=http://{}:{}@{}:{}",
                 s3_source_config.access_key,
@@ -1325,10 +1332,25 @@ impl ExternalService for S3Service {
                 s3_source_config.port
             ),
             format!(
-                "MC_HOST_dest=http://{}:{}@{}",
-                decrypted_access_key, decrypted_secret_key, dest_endpoint
+                "MC_HOST_dest=http://{}@{}",
+                super::mc_host_credential(
+                    &decrypted_access_key,
+                    &decrypted_secret_key,
+                    decrypted_session_token.as_deref(),
+                ),
+                dest_endpoint
             ),
         ];
+        // The `mc alias set backup-dest ...` call below cannot carry a session
+        // token; this override can, and mc prefers it. Absent entirely for a
+        // long-lived credential.
+        env_vars.extend(super::mc_host_alias_override(
+            "backup-dest",
+            &dest_endpoint,
+            &decrypted_access_key,
+            &decrypted_secret_key,
+            decrypted_session_token.as_deref(),
+        ));
 
         // Create mc container with a shell entrypoint
         let container_config = bollard::models::ContainerCreateBody {
@@ -1538,11 +1560,14 @@ impl ExternalService for S3Service {
         self.pull_mc_image(docker).await?;
 
         // Create environment variables for mc
-        let env_vars = [
+        let mut env_vars = vec![
             format!(
-                "MC_HOST_source=http://{}:{}@{}",
-                s3_source.access_key_id,
-                s3_source.secret_key,
+                "MC_HOST_source=http://{}@{}",
+                super::mc_host_credential(
+                    &s3_source.access_key_id,
+                    &s3_source.secret_key,
+                    s3_source.session_token.as_deref(),
+                ),
                 s3_source.endpoint.as_deref().unwrap_or("s3.amazonaws.com")
             ),
             format!(
@@ -1550,6 +1575,16 @@ impl ExternalService for S3Service {
                 s3_config.access_key, s3_config.secret_key, s3_config.port
             ),
         ];
+        // The `mc alias set backup-source ...` call below cannot carry a
+        // session token; this override can, and mc prefers it. Absent entirely
+        // for a long-lived credential.
+        env_vars.extend(super::mc_host_alias_override(
+            "backup-source",
+            s3_source.endpoint.as_deref().unwrap_or("s3.amazonaws.com"),
+            &s3_source.access_key_id,
+            &s3_source.secret_key,
+            s3_source.session_token.as_deref(),
+        ));
 
         // Create mc container with a shell entrypoint
         let container_config = bollard::models::ContainerCreateBody {
@@ -1960,8 +1995,14 @@ impl ExternalService for S3Service {
         // to these credentials for that window.
         let env_vars = vec![
             format!(
-                "MC_HOST_bkp={}://{}:{}@{}",
-                bkp_scheme, ctx.s3_source.access_key_id, ctx.s3_source.secret_key, bkp_hostpath,
+                "MC_HOST_bkp={}://{}@{}",
+                bkp_scheme,
+                super::mc_host_credential(
+                    &ctx.s3_source.access_key_id,
+                    &ctx.s3_source.secret_key,
+                    ctx.s3_source.session_token.as_deref(),
+                ),
+                bkp_hostpath,
             ),
             // Live service is always reached via localhost in host-network mode.
             format!(
@@ -2152,6 +2193,9 @@ impl ExternalService for S3Service {
         // ciphertext.
         let source_access_key = ctx.s3_source.access_key_id.clone();
         let source_secret_key = ctx.s3_source.secret_key.clone();
+        // Plaintext by the same RestoreContext contract. `None` for every
+        // long-lived operator-configured credential.
+        let source_session_token = ctx.s3_source.session_token.clone();
         let source_endpoint = ctx
             .s3_source
             .endpoint
@@ -2172,16 +2216,31 @@ impl ExternalService for S3Service {
         // (see the remove_container call at the end of this function), bounding
         // the exposure window to the restore execution time. Anyone with Docker
         // socket access has equivalent trust to these credentials for that window.
-        let env_vars = [
+        let mut env_vars = vec![
             format!(
-                "MC_HOST_source=http://{}:{}@{}",
-                source_access_key, source_secret_key, source_endpoint
+                "MC_HOST_source=http://{}@{}",
+                super::mc_host_credential(
+                    &source_access_key,
+                    &source_secret_key,
+                    source_session_token.as_deref(),
+                ),
+                source_endpoint
             ),
             format!(
                 "MC_HOST_dest=http://{}:{}@localhost:{}",
                 new_config.access_key, new_config.secret_key, new_config.port
             ),
         ];
+        // The `mc alias set backup-source ...` call below has no positional
+        // slot for a session token; this override does, and mc prefers it.
+        // Absent entirely for a long-lived credential.
+        env_vars.extend(super::mc_host_alias_override(
+            "backup-source",
+            source_endpoint,
+            &source_access_key,
+            &source_secret_key,
+            source_session_token.as_deref(),
+        ));
 
         let container_config = bollard::models::ContainerCreateBody {
             image: Some(Self::MC_IMAGE.to_string()),
@@ -3295,6 +3354,8 @@ mod tests {
             bucket_path: "".to_string(),
             access_key_id: encrypted_access_key,
             secret_key: encrypted_secret_key,
+            session_token: None,
+            credentials_expire_at: None,
             force_path_style: Some(true),
             is_default: false,
             managed_by_cloud: false,

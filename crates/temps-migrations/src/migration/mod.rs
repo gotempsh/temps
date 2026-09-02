@@ -221,6 +221,7 @@ mod m20260901_000004_create_cloud_span_outbox;
 mod m20260901_000005_add_cloud_telemetry_write_mode;
 mod m20260901_000006_create_telemetry_write_ledger;
 mod m20260901_000007_create_cloud_telemetry_bulk_jobs;
+mod m20260902_000001_add_session_token_to_s3_sources;
 
 pub struct Migrator;
 
@@ -476,6 +477,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260901_000005_add_cloud_telemetry_write_mode::Migration),
             Box::new(m20260901_000006_create_telemetry_write_ledger::Migration),
             Box::new(m20260901_000007_create_cloud_telemetry_bulk_jobs::Migration),
+            Box::new(m20260902_000001_add_session_token_to_s3_sources::Migration),
         ]
     }
 }

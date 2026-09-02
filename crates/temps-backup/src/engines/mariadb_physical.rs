@@ -136,9 +136,11 @@ impl BackupEngine for MariadbPhysicalEngine {
             .map_err(|error| BackupError::PermanentFailure {
                 reason: format!("decrypt MariaDB WAL-G secret key: {error}"),
             })?;
+        let session_token = v2_common::decrypt_session_token(&s3_source, &deps.encryption_service)?;
         let container_endpoint = temps_providers::externalsvc::S3Credentials {
             access_key_id: access_key.clone(),
             secret_key: secret_key.clone(),
+            session_token: session_token.clone(),
             region: s3_source.region.clone(),
             endpoint: s3_source.endpoint.clone(),
             bucket_name: s3_source.bucket_name.clone(),
@@ -152,6 +154,7 @@ impl BackupEngine for MariadbPhysicalEngine {
             &s3_source.region,
             &access_key,
             &secret_key,
+            session_token.as_deref(),
             &root_password,
             &backup_uuid,
         );
@@ -303,6 +306,7 @@ fn build_walg_env(
     region: &str,
     access_key: &str,
     secret_key: &str,
+    session_token: Option<&str>,
     root_password: &str,
     backup_uuid: &str,
 ) -> Vec<String> {
@@ -322,6 +326,12 @@ fn build_walg_env(
         "WALG_UPLOAD_QUEUE=2".into(),
         "WALG_TAR_SIZE_THRESHOLD=134217728".into(),
     ];
+    // Only a temporary (STS-style) credential contributes an
+    // `AWS_SESSION_TOKEN`; for a long-lived one the variable is absent, not
+    // empty, so the container environment is unchanged.
+    env.extend(temps_providers::externalsvc::aws_session_token_env(
+        session_token,
+    ));
     env.extend(v2_common::walg_identity_env(backup_uuid));
     env
 }
@@ -385,6 +395,7 @@ mod tests {
             "auto",
             "access",
             "secret",
+            None,
             password,
             "id",
         );
@@ -397,6 +408,45 @@ mod tests {
             .iter()
             .any(|value| value == &format!("MYSQL_PWD={password}")));
         assert!(env.iter().any(|value| value.contains("root:p4ss-word@tcp")));
+    }
+
+    /// The zero-change guarantee for an operator-configured S3 source: the
+    /// `mariabackup`/WAL-G container gets no `AWS_SESSION_TOKEN` at all.
+    #[test]
+    fn walg_env_omits_the_session_token_for_a_long_lived_credential() {
+        let env = build_walg_env(
+            "s3://bucket/path",
+            "auto",
+            "access",
+            "secret",
+            None,
+            "password",
+            "id",
+        );
+        assert!(!env
+            .iter()
+            .any(|value| value.starts_with("AWS_SESSION_TOKEN")));
+    }
+
+    #[test]
+    fn walg_env_carries_a_session_token_for_a_temporary_credential() {
+        let env = build_walg_env(
+            "s3://bucket/path",
+            "auto",
+            "access",
+            "secret",
+            Some("sts-session-token"),
+            "password",
+            "id",
+        );
+        assert!(env
+            .iter()
+            .any(|value| value == "AWS_SESSION_TOKEN=sts-session-token"));
+        // The other two must still be there, in the same form as before.
+        assert!(env.iter().any(|value| value == "AWS_ACCESS_KEY_ID=access"));
+        assert!(env
+            .iter()
+            .any(|value| value == "AWS_SECRET_ACCESS_KEY=secret"));
     }
 
     #[test]
