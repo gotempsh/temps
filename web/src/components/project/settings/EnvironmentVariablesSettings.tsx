@@ -114,9 +114,8 @@ function EnvironmentVariableRow({
   const [isRevealing, setIsRevealing] = useState(false)
   const revealScope = `${project.id}:${variable.id}:${variable.updated_at}`
   const revealGuard = useRef(createCredentialRevealGuard())
-  // Secret env vars are write-only: the value is never fetched, the reveal
-  // button is hidden, and the edit dialog defaults to "leave blank to keep
-  // the existing value". This mirrors the file-based Secrets UX.
+  // Secret env vars stay masked in list responses. Plaintext is fetched only
+  // after an explicit reveal through the permission-checked, audited endpoint.
   const isSecret = variable.is_secret ?? false
 
   useEffect(() => {
@@ -125,13 +124,11 @@ function EnvironmentVariableRow({
     // Drop plaintext whenever this row changes project, identity, or version.
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setRevealedValue(undefined)
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEditValue('')
     return () => guard.invalidate()
   }, [revealScope])
 
   const revealValue = async (): Promise<string | undefined> => {
-    if (isSecret) return undefined
     // Capture the guard instance once: revealGuard.current gets swapped to a
     // fresh guard (new, empty request map) whenever revealScope changes, which
     // happens as soon as this row's own edit is saved and the list refetches.
@@ -158,8 +155,20 @@ function EnvironmentVariableRow({
   }
 
   useEffect(() => {
-    if (isSecret) return
     revealGuard.current.cancel('value')
+    // Bulk reveal intentionally excludes secrets. A secret must be revealed
+    // through its own audited per-variable action, while "Hide all" still
+    // re-masks any secret that was revealed individually.
+    if (isSecret) {
+      if (!showAllValues) {
+        // eslint-disable-next-line react-hooks/set-state-in-effect
+        setIsVisible(false)
+        setRevealedValue(undefined)
+      }
+      return
+    }
+
+    // This synchronizes non-secret rows with the explicit bulk toggle.
     setIsVisible(showAllValues)
     if (showAllValues) {
       void revealValue()
@@ -172,7 +181,6 @@ function EnvironmentVariableRow({
   const dataValue = credentialValueForScope(revealedValue, revealScope) ?? ''
 
   const toggleVisibility = async () => {
-    if (isSecret) return
     if (isVisible) {
       revealGuard.current.cancel('value')
       setIsVisible(false)
@@ -228,20 +236,19 @@ function EnvironmentVariableRow({
     variable.include_in_preview ?? false
   )
   // Whether the edit box actually holds the variable's current value. False
-  // when the reveal was denied (it needs SecretsRead on top of EnvironmentsWrite)
-  // or failed, which is what distinguishes "cleared on purpose" from "never
-  // loaded" when the box is empty on save.
+  // when it has not been explicitly revealed, or when reveal was denied (it
+  // needs SecretsRead on top of EnvironmentsWrite) or failed. This
+  // distinguishes "cleared on purpose" from "never loaded" when saving.
   const [valueLoaded, setValueLoaded] = useState(false)
-  // Opt-in conversion of an existing plain variable into a write-only secret.
-  // One-way: once saved, the value can never be read back through the UI or the
-  // API, so it stays off unless the operator explicitly turns it on.
+  // Opt-in conversion of an existing plain variable into a masked secret.
+  // The classification stays one-way so a later list response cannot
+  // accidentally expose it as a regular value.
   const [convertToSecret, setConvertToSecret] = useState(false)
 
   // Update selected environments and preview flag when variable changes (after refetch)
   useEffect(() => {
     // eslint-disable-next-line react-hooks/set-state-in-effect
     setSelectedEditEnvironments(variable.environments.map((env) => env.id))
-    // eslint-disable-next-line react-hooks/set-state-in-effect
     setEditIncludeInPreview(variable.include_in_preview ?? false)
   }, [variable.environments, variable.include_in_preview])
 
@@ -336,7 +343,7 @@ function EnvironmentVariableRow({
               <p className="font-medium break-all">{variable.key}</p>
               {isSecret && (
                 <span
-                  title="Write-only secret — value is never returned by the API"
+                  title="Sensitive value — masked by default; reveals are audited"
                   className="inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide bg-amber-500/10 text-amber-700 dark:text-amber-400 border border-amber-500/20"
                 >
                   Secret
@@ -371,28 +378,28 @@ function EnvironmentVariableRow({
         <div className="flex flex-wrap items-center gap-2 pl-7 sm:pl-0">
           <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto">
             <span className="font-mono text-sm truncate max-w-[180px] sm:max-w-[220px]">
-              {isSecret
-                ? '••••••••••••'
-                : isVisible
-                  ? isRevealing && !dataValue
-                    ? 'Revealing…'
-                    : dataValue || '••••••••••••'
-                  : '••••••••••••'}
+              {isVisible
+                ? isRevealing && !dataValue
+                  ? 'Revealing…'
+                  : dataValue || '••••••••••••'
+                : '••••••••••••'}
             </span>
-            {!isSecret && (
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={toggleVisibility}
-                aria-label={`${isVisible ? 'Hide' : 'Reveal'} value for ${variable.key}`}
-              >
-                {isVisible ? (
-                  <EyeOff className="h-4 w-4" />
-                ) : (
-                  <Eye className="h-4 w-4" />
-                )}
-              </Button>
-            )}
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void toggleVisibility()}
+              disabled={isRevealing}
+              aria-label={
+                isVisible ? `Hide ${variable.key}` : `Reveal ${variable.key}`
+              }
+              title={isVisible ? 'Hide value' : 'Reveal value (audited)'}
+            >
+              {isVisible ? (
+                <EyeOff className="h-4 w-4" />
+              ) : (
+                <Eye className="h-4 w-4" />
+              )}
+            </Button>
           </div>
           <Button
             variant="outline"
@@ -495,8 +502,9 @@ function EnvironmentVariableRow({
                 )}
                 {isSecret && (
                   <p className="text-xs text-muted-foreground">
-                    This variable is a write-only secret. Leave the value blank
-                    to change only environments or preview settings.
+                    This secret stays masked unless explicitly revealed. Leave
+                    the value blank to change only environments or preview
+                    settings.
                   </p>
                 )}
               </div>
@@ -559,8 +567,8 @@ function EnvironmentVariableRow({
                     </Label>
                     <p className="text-sm text-muted-foreground">
                       {convertToSecret
-                        ? `On save, ${variable.key} becomes write-only: the value is masked in the UI and no longer returned by the API. You can still overwrite it, but never read it back — to make it a regular variable again you must delete it and create it anew.`
-                        : 'Make this variable write-only so its value can never be read from the UI or the API again. One-way: converting back means deleting and recreating the variable.'}
+                        ? `On save, ${variable.key} becomes a secret: it stays masked in lists and can only be viewed through an explicit, permission-checked, audited reveal. To make it a regular variable again you must delete it and create it anew.`
+                        : 'Mask this value by default and require explicit, audited access to reveal it. One-way: converting back means deleting and recreating the variable.'}
                     </p>
                   </div>
                   <Switch
@@ -653,6 +661,8 @@ function IntegrationEnvVarRow({
 
   useEffect(() => {
     revealGuard.current.cancel('value')
+    // This synchronizes the per-row reveal state with the explicit bulk toggle.
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     setIsVisible(showAllValues)
     if (showAllValues) {
       void revealValue()
@@ -775,6 +785,7 @@ function AddEnvironmentVariableDialog({
     if (isOpen && allEnvironments.length > 0) {
       if (!hasInitialized) {
         // Only auto-select on first open
+        // eslint-disable-next-line react-hooks/set-state-in-effect
         setSelectedEnvironments(allEnvironments.map((env) => env.id))
         setHasInitialized(true)
       }
@@ -921,12 +932,12 @@ function AddEnvironmentVariableDialog({
             <div className="flex items-center justify-between space-x-2 rounded-lg border p-4">
               <div className="flex-1 space-y-1">
                 <Label htmlFor="is-secret" className="text-sm font-medium">
-                  Secret (write-only)
+                  Secret
                 </Label>
                 <p className="text-sm text-muted-foreground">
-                  Mask the value in the UI and never return it from the API.
-                  Once enabled this cannot be reverted — only the value can be
-                  rotated.
+                  Mask the value by default. Viewing it requires an explicit,
+                  audited reveal. Once enabled this classification cannot be
+                  reverted — the value can still be rotated.
                 </p>
               </div>
               <Switch
@@ -1141,6 +1152,7 @@ export function EnvironmentVariablesSettings({
     const envs = projectEnvironments
     if (!envs || envs.length === 0) return
     const prod = envs.find((e: any) => e.name === 'production') ?? envs[0]
+    // eslint-disable-next-line react-hooks/set-state-in-effect
     if (prod) setSelectedEnvId(prod.id)
   }, [projectEnvironments, selectedEnvId])
 

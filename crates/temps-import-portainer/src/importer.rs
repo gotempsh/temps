@@ -1108,6 +1108,7 @@ async fn execute_plan(
         git_provider_connection_id: context.git_provider_connection_id,
         exposed_port: None,
         cpu_request: None,
+        cpu_limit: None,
         memory_request: None,
         memory_limit: None,
         // Portainer workloads are pure containers/stacks with no git repo —

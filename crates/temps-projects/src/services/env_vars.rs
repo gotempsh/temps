@@ -11,7 +11,7 @@ use thiserror::Error;
 
 use super::types::{EnvVarEnvironment, EnvVarWithEnvironments};
 
-/// Placeholder returned in place of a write-only secret's plaintext.
+/// Placeholder returned in place of a secret's plaintext in list responses.
 const SECRET_VALUE_MASK: &str = "***";
 
 #[derive(Error, Debug)]
@@ -38,10 +38,12 @@ pub enum EnvVarError {
         reason: String,
     },
 
-    #[error("Secret env var '{key}' (id={var_id}) is write-only and cannot be revealed")]
-    SecretValueCannotBeRevealed { var_id: i32, key: String },
+    #[error(
+        "Secret env var '{key}' (id={var_id}) must be read through the audited reveal endpoint"
+    )]
+    SecretValueRequiresAuditedReveal { var_id: i32, key: String },
 
-    #[error("Secret env var '{key}' requires a non-empty value: secrets are write-only and an empty one can never be read back or corrected")]
+    #[error("Secret env var '{key}' requires a non-empty value")]
     SecretValueRequired { key: String },
 
     #[error("Other error: {0}")]
@@ -152,7 +154,7 @@ impl EnvVarService {
         let mut result = Vec::new();
         for var in vars {
             let environments = env_map.get(&var.id).cloned().unwrap_or_default();
-            // Write-only secrets never yield plaintext through a listing path.
+            // Secrets never yield plaintext through a listing path.
             // Masking (rather than skipping the row) keeps the variable visible
             // so callers can still see that the key exists.
             let decrypted_value = if var.is_secret {
@@ -182,9 +184,8 @@ impl EnvVarService {
         value: String,
         is_secret: bool,
     ) -> Result<EnvVarWithEnvironments, EnvVarError> {
-        // A secret is write-only, so an empty one can never be filled in later
-        // through the UI — reject it at creation instead of storing a variable
-        // nobody can repair without deleting it.
+        // Empty secrets are almost always accidental and cannot authenticate
+        // anything, so reject them at creation.
         if is_secret && value.is_empty() {
             return Err(EnvVarError::SecretValueRequired { key });
         }
@@ -418,11 +419,11 @@ impl EnvVarService {
             .await?
             .ok_or_else(|| EnvVarError::Other("Environment variable not found".to_string()))?;
 
-        // Mirrors the guard in temps-environments' EnvVarService: a variable
-        // converted to a secret is write-only on every read path, so no caller
-        // can walk around the restriction by reaching this service instead.
+        // This legacy service has no authorization or audit context. Secret
+        // plaintext is available only through temps-environments' dedicated
+        // permission-checked, fail-closed audited reveal flow.
         if var.is_secret {
-            return Err(EnvVarError::SecretValueCannotBeRevealed {
+            return Err(EnvVarError::SecretValueRequiresAuditedReveal {
                 var_id: var.id,
                 key: var.key,
             });
@@ -451,8 +452,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_rejects_a_secret_with_an_empty_value() {
-        // A secret is write-only, so an empty one can never be inspected or
-        // corrected afterwards — it has to be refused up front.
+        // Empty secrets are unusable credentials and should be refused up front.
         let service = make_service(MockDatabase::new(DatabaseBackend::Postgres));
 
         let error = service
@@ -486,5 +486,49 @@ mod tests {
             !matches!(error, EnvVarError::SecretValueRequired { .. }),
             "a non-secret empty value must not trip the secret guard, got: {error}"
         );
+    }
+
+    #[tokio::test]
+    async fn legacy_read_rejects_secret_without_an_audit_context() {
+        let encryption_service = Arc::new(
+            EncryptionService::new(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            )
+            .expect("test key is valid"),
+        );
+        let encrypted = encryption_service
+            .encrypt_string("generated-admin-password")
+            .expect("test value encrypts");
+        let now = chrono::Utc::now();
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![env_vars::Model {
+                    id: 9,
+                    project_id: 3,
+                    environment_id: None,
+                    key: "KC_BOOTSTRAP_ADMIN_PASSWORD".to_string(),
+                    value: encrypted,
+                    created_at: now,
+                    updated_at: now,
+                    include_in_preview: false,
+                    is_encrypted: true,
+                    is_secret: true,
+                }]])
+                .into_connection(),
+        );
+        let service = EnvVarService::new(db, encryption_service);
+
+        let error = service
+            .get_environment_variable_value(3, "KC_BOOTSTRAP_ADMIN_PASSWORD", None)
+            .await
+            .expect_err("legacy reads must not bypass the audited reveal endpoint");
+
+        assert!(matches!(
+            error,
+            EnvVarError::SecretValueRequiresAuditedReveal {
+                var_id: 9,
+                ref key,
+            } if key == "KC_BOOTSTRAP_ADMIN_PASSWORD"
+        ));
     }
 }

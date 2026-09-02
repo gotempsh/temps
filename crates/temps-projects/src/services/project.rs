@@ -570,7 +570,7 @@ fn initial_deployment_config(
 ) -> temps_entities::deployment_config::DeploymentConfig {
     temps_entities::deployment_config::DeploymentConfig {
         cpu_request: request.cpu_request.or(Some(DEFAULT_CPU_REQUEST)),
-        cpu_limit: None,
+        cpu_limit: request.cpu_limit,
         memory_request: request.memory_request.or(Some(DEFAULT_MEMORY_REQUEST)),
         memory_limit: request.memory_limit.or(Some(DEFAULT_MEMORY_LIMIT)),
         exposed_port: request.exposed_port,
@@ -629,8 +629,7 @@ impl ProjectService {
                 if env_var.is_secret && env_var.value.is_empty() {
                     return Err(ProjectError::InvalidInput(format!(
                         "Environment variable '{}' is marked as a secret but has no value. \
-                         Secrets are write-only and cannot be filled in later — \
-                         provide a value or clear the secret flag.",
+                         Provide a value or clear the secret flag.",
                         env_var.key
                     )));
                 }
@@ -680,7 +679,16 @@ impl ProjectService {
         // OOM a small single-node host. Operators can still choose standard,
         // dedicated, or explicit uncapped limits later via deployment settings.
         let deployment_config = Some(initial_deployment_config(&request));
+        if let Some(config) = deployment_config.as_ref() {
+            config.validate().map_err(|reason| {
+                ProjectError::InvalidInput(format!(
+                    "Invalid initial deployment configuration for project '{}': {reason}",
+                    request.name
+                ))
+            })?;
+        }
         if request.cpu_request.is_some()
+            || request.cpu_limit.is_some()
             || request.memory_request.is_some()
             || request.memory_limit.is_some()
         {
@@ -4926,6 +4934,7 @@ mod tests {
             automatic_deploy: false,
             exposed_port: None,
             cpu_request: None,
+            cpu_limit: None,
             memory_request: None,
             memory_limit: None,
             is_public_repo: None,
@@ -5414,6 +5423,7 @@ mod tests {
             git_provider_connection_id: None,
             exposed_port: None,
             cpu_request: None,
+            cpu_limit: None,
             memory_request: None,
             memory_limit: None,
             source_type: temps_entities::source_type::SourceType::Git,
@@ -5532,6 +5542,7 @@ mod tests {
             automatic_deploy: false,
             exposed_port: None,
             cpu_request: None,
+            cpu_limit: None,
             memory_request: None,
             memory_limit: None,
             is_public_repo: None,
@@ -5548,6 +5559,7 @@ mod tests {
         let mut request = create_request("Keycloak");
         request.exposed_port = Some(8080);
         request.cpu_request = Some(500_000);
+        request.cpu_limit = Some(1_000_000);
         request.memory_request = Some(512);
         request.memory_limit = Some(1_536);
 
@@ -5555,6 +5567,7 @@ mod tests {
 
         assert_eq!(config.exposed_port, Some(8080));
         assert_eq!(config.cpu_request, Some(500_000));
+        assert_eq!(config.cpu_limit, Some(1_000_000));
         assert_eq!(config.memory_request, Some(512));
         assert_eq!(config.memory_limit, Some(1_536));
     }

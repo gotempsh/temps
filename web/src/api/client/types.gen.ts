@@ -4082,10 +4082,10 @@ export type CreateEnvironmentVariableRequest = {
      */
     include_in_preview?: boolean;
     /**
-     * When true the variable is treated as write-only: never returned in
-     * plaintext from the API, masked in the UI, and updates that omit the
-     * value preserve the existing ciphertext. The flag is one-way — secret
-     * vars cannot be demoted back to regular vars.
+     * When true the variable is masked in list responses and can only be
+     * viewed through the permission-checked, audited per-variable reveal
+     * endpoint. Updates that omit the value preserve the existing ciphertext.
+     * The flag is one-way — secret vars cannot be demoted to regular vars.
      */
     is_secret?: boolean;
     key: string;
@@ -4453,14 +4453,48 @@ export type CreateProjectFromTemplateRequest = {
      */
     automatic_deploy?: boolean;
     /**
+     * Optional image entrypoint arguments. An empty list explicitly uses the
+     * image's own default command instead of the template command.
+     */
+    command?: Array<string> | null;
+    /**
+     * CPU limit override in microcores. Zero means uncapped.
+     */
+    cpu_limit?: number | null;
+    /**
+     * CPU request override in microcores (1_000_000 = one CPU core).
+     */
+    cpu_request?: number | null;
+    /**
      * Environment variables to set (key-value pairs)
      */
     environment_variables?: Array<EnvVarInput>;
+    /**
+     * Public container port override.
+     */
+    exposed_port?: number | null;
     /**
      * Git provider connection ID. When omitted, the project deploys directly
      * from the template's public source repository instead of forking it.
      */
     git_provider_connection_id?: number | null;
+    /**
+     * Relative HTTP health-check path override.
+     */
+    health_check_path?: string | null;
+    /**
+     * Optional prebuilt-image override. Curated template values remain the
+     * default when this is omitted. Accepted only for image templates.
+     */
+    image?: string | null;
+    /**
+     * Memory limit override in MiB. Zero means uncapped.
+     */
+    memory_limit?: number | null;
+    /**
+     * Memory request override in MiB.
+     */
+    memory_request?: number | null;
     /**
      * Whether to make the repository private (defaults to true)
      */
@@ -7103,9 +7137,9 @@ export type EnvExampleVariableResponse = {
  */
 export type EnvVarInput = {
     /**
-     * Mark the variable as a write-only secret. Secret values are encrypted at
-     * rest and never returned in plaintext by the API — they can only be
-     * replaced, not read back. Defaults to `false`.
+     * Mark the variable as a secret. Secret values are encrypted at rest,
+     * masked in list responses, and revealable only through an audited,
+     * permission-checked endpoint. Defaults to `false`.
      */
     is_secret?: boolean;
     /**
@@ -7305,15 +7339,15 @@ export type EnvironmentVariableResponse = {
      */
     include_in_preview: boolean;
     /**
-     * Whether the variable is a write-only secret. Secrets always have
-     * `value: None` in responses.
+     * Whether the variable is a secret. Secrets always have `value: None` in
+     * list responses.
      */
     is_secret: boolean;
     key: string;
     updated_at: number;
     /**
      * Plaintext value for non-secret vars (or `"***"` mask for list responses).
-     * `None` for secret vars — secrets are write-only.
+     * `None` for secret vars; use the audited per-variable reveal endpoint.
      */
     value?: string | null;
 };
@@ -13855,9 +13889,9 @@ export type ProjectDashboardAnalytics = {
  */
 export type ProjectEnvVarInput = {
     /**
-     * Mark the variable as a write-only secret. Secret values are encrypted at
-     * rest and never returned in plaintext by the API — they can only be
-     * replaced, not read back. Defaults to `false`.
+     * Mark the variable as a secret. Secret values are encrypted at rest,
+     * masked in list responses, and revealable only through an audited,
+     * permission-checked endpoint. Defaults to `false`.
      */
     is_secret?: boolean;
     /**
@@ -19151,6 +19185,7 @@ export type TemplateKind = 'starter' | 'service';
  * microcore unit as project deployment configuration; memory values are MiB.
  */
 export type TemplateResources = {
+    cpu_limit?: number | null;
     cpu_request?: number | null;
     memory_limit?: number | null;
     memory_request?: number | null;

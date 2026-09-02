@@ -792,6 +792,7 @@ pub async fn create_project(
         git_provider_connection_id: project.git_provider_connection_id,
         exposed_port: project.exposed_port,
         cpu_request: None,
+        cpu_limit: None,
         memory_request: None,
         memory_limit: None,
         source_type: project.source_type,
@@ -1071,6 +1072,7 @@ pub async fn update_project(
         git_provider_connection_id: None,   // Keep existing setting
         exposed_port: project.exposed_port, // Keep existing or update if provided
         cpu_request: None,
+        cpu_limit: None,
         memory_request: None,
         memory_limit: None,
         source_type: project.source_type, // Preserve source type
@@ -2298,6 +2300,151 @@ enum TemplateServiceSelectionError {
     Ambiguous(Vec<String>),
 }
 
+#[derive(Debug, PartialEq, Eq)]
+struct EffectiveImageTemplateRuntime {
+    image_ref: String,
+    command: Option<Vec<String>>,
+    cpu_request: Option<i32>,
+    cpu_limit: Option<i32>,
+    memory_request: Option<i32>,
+    memory_limit: Option<i32>,
+    exposed_port: Option<i32>,
+    health_check_path: Option<String>,
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+enum TemplateRuntimeOverrideError {
+    #[error("Runtime overrides are available only for templates that deploy a prebuilt image")]
+    NotAnImageTemplate,
+    #[error("Invalid image reference: {reason}")]
+    InvalidImage { reason: String },
+    #[error("Invalid container command: {reason}")]
+    InvalidCommand { reason: String },
+    #[error("Invalid health-check path: {reason}")]
+    InvalidHealthCheckPath { reason: String },
+}
+
+fn has_template_runtime_overrides(
+    request: &super::templates::CreateProjectFromTemplateRequest,
+) -> bool {
+    request.image.is_some()
+        || request.command.is_some()
+        || request.cpu_request.is_some()
+        || request.cpu_limit.is_some()
+        || request.memory_request.is_some()
+        || request.memory_limit.is_some()
+        || request.exposed_port.is_some()
+        || request.health_check_path.is_some()
+}
+
+fn resolve_image_template_runtime(
+    template: &temps_core::templates::ProjectTemplate,
+    request: &super::templates::CreateProjectFromTemplateRequest,
+) -> Result<Option<EffectiveImageTemplateRuntime>, TemplateRuntimeOverrideError> {
+    let Some(template_image) = template.image.as_deref().filter(|image| !image.is_empty()) else {
+        if has_template_runtime_overrides(request) {
+            return Err(TemplateRuntimeOverrideError::NotAnImageTemplate);
+        }
+        return Ok(None);
+    };
+
+    let image_ref = request.image.as_deref().unwrap_or(template_image).trim();
+    if image_ref.is_empty() {
+        return Err(TemplateRuntimeOverrideError::InvalidImage {
+            reason: "the image reference cannot be empty".to_string(),
+        });
+    }
+    if image_ref.len() > 512 {
+        return Err(TemplateRuntimeOverrideError::InvalidImage {
+            reason: "the image reference cannot exceed 512 bytes".to_string(),
+        });
+    }
+    if image_ref
+        .chars()
+        .any(|character| character.is_control() || character.is_whitespace())
+    {
+        return Err(TemplateRuntimeOverrideError::InvalidImage {
+            reason: "the image reference cannot contain whitespace or control characters"
+                .to_string(),
+        });
+    }
+
+    let command = match request.command.as_ref() {
+        Some(parts) if parts.is_empty() => None,
+        Some(parts) => {
+            if parts.len() > 64 {
+                return Err(TemplateRuntimeOverrideError::InvalidCommand {
+                    reason: "at most 64 arguments are supported".to_string(),
+                });
+            }
+            let normalized = parts
+                .iter()
+                .map(|part| part.trim().to_string())
+                .collect::<Vec<_>>();
+            if normalized.iter().any(|part| {
+                part.is_empty() || part.len() > 1_024 || part.chars().any(char::is_control)
+            }) {
+                return Err(TemplateRuntimeOverrideError::InvalidCommand {
+                    reason: "arguments must be non-empty, at most 1024 bytes, and contain no control characters"
+                        .to_string(),
+                });
+            }
+            Some(normalized)
+        }
+        None => template.command.clone(),
+    };
+
+    let health_check_path = request
+        .health_check_path
+        .as_deref()
+        .or(template.health_check_path.as_deref())
+        .map(str::trim)
+        .map(str::to_string);
+    if let Some(path) = health_check_path.as_deref() {
+        if path.len() > 2_048
+            || !path.starts_with('/')
+            || path.contains('@')
+            || path.contains("://")
+            || path.chars().any(char::is_control)
+        {
+            return Err(TemplateRuntimeOverrideError::InvalidHealthCheckPath {
+                reason: "use a safe relative HTTP path starting with '/'".to_string(),
+            });
+        }
+    }
+
+    Ok(Some(EffectiveImageTemplateRuntime {
+        image_ref: image_ref.to_string(),
+        command,
+        cpu_request: request.cpu_request.or_else(|| {
+            template
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.cpu_request)
+        }),
+        cpu_limit: request.cpu_limit.or_else(|| {
+            template
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.cpu_limit)
+        }),
+        memory_request: request.memory_request.or_else(|| {
+            template
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.memory_request)
+        }),
+        memory_limit: request.memory_limit.or_else(|| {
+            template
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.memory_limit)
+        }),
+        exposed_port: request.exposed_port.or(template.exposed_port),
+        health_check_path,
+    }))
+}
+
 fn validate_template_service_selection(
     required_services: &[String],
     selected_service_types: &[String],
@@ -2378,6 +2525,12 @@ pub async fn create_project_from_template(
                 .with_detail(e.to_string())
         })?;
     let template_provenance = temps_core::templates::template_provenance(&template).to_string();
+    let image_runtime = resolve_image_template_runtime(&template, &request).map_err(|error| {
+        temps_core::error_builder::bad_request()
+            .title("Invalid Template Runtime Configuration")
+            .detail(error.to_string())
+            .build()
+    })?;
 
     // The browser normally enforces this selection, but the API must fail
     // before creating a project when a required managed dependency is absent
@@ -2464,11 +2617,11 @@ pub async fn create_project_from_template(
         crate::services::types::CreateProjectRequest,
         String,
         &'static str,
-        Option<String>,
-    ) = if let Some(image_ref) = template.image.clone().filter(|s| !s.is_empty()) {
+        Option<EffectiveImageTemplateRuntime>,
+    ) = if let Some(runtime) = image_runtime {
         info!(
             "Deploying template {} from prebuilt image {} (image mode)",
-            request.template_slug, image_ref
+            request.template_slug, runtime.image_ref
         );
         let req = crate::services::types::CreateProjectRequest {
             name: request.project_name.clone(),
@@ -2488,19 +2641,11 @@ pub async fn create_project_from_template(
             is_public_repo: None,
             git_url: None,
             git_provider_connection_id: None,
-            exposed_port: template.exposed_port,
-            cpu_request: template
-                .resources
-                .as_ref()
-                .and_then(|resources| resources.cpu_request),
-            memory_request: template
-                .resources
-                .as_ref()
-                .and_then(|resources| resources.memory_request),
-            memory_limit: template
-                .resources
-                .as_ref()
-                .and_then(|resources| resources.memory_limit),
+            exposed_port: runtime.exposed_port,
+            cpu_request: runtime.cpu_request,
+            cpu_limit: runtime.cpu_limit,
+            memory_request: runtime.memory_request,
+            memory_limit: runtime.memory_limit,
             // docker_image source skips the build pipeline entirely; the deploy
             // is triggered explicitly below via Job::DeployImageRequested.
             source_type: SourceType::DockerImage,
@@ -2508,7 +2653,7 @@ pub async fn create_project_from_template(
         };
         // Surface the template's source repo as the response URL (the image ref
         // isn't a browsable URL); the message clarifies it deployed from an image.
-        (req, template.git.url.clone(), "image", Some(image_ref))
+        (req, template.git.url.clone(), "image", Some(runtime))
     } else {
         let (create_request, repository_url, deploy_mode) = match request.git_provider_connection_id
         {
@@ -2577,6 +2722,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: Some(connection_id),
                     exposed_port: None,
                     cpu_request: None,
+                    cpu_limit: None,
                     memory_request: None,
                     memory_limit: None,
                     source_type: SourceType::Git,
@@ -2629,6 +2775,7 @@ pub async fn create_project_from_template(
                     git_provider_connection_id: None,
                     exposed_port: None,
                     cpu_request: None,
+                    cpu_limit: None,
                     memory_request: None,
                     memory_limit: None,
                     source_type: SourceType::Git,
@@ -2651,24 +2798,24 @@ pub async fn create_project_from_template(
     //    resolves the target environment, pulls the image, and runs it — no
     //    build. Failure to enqueue is logged but doesn't fail project creation
     //    (the user can redeploy from the UI).
-    if let Some(image_ref) = image_to_deploy {
+    if let Some(runtime) = image_to_deploy {
         let deploy_job =
             temps_core::Job::DeployImageRequested(temps_core::DeployImageRequestedJob {
                 project_id: project.id,
                 target_environment_id: None,
-                image_ref: image_ref.clone(),
-                health_check_path: template.health_check_path.clone(),
-                command: template.command.clone(),
+                image_ref: runtime.image_ref.clone(),
+                health_check_path: runtime.health_check_path,
+                command: runtime.command,
             });
         if let Err(e) = state.project_service.queue_service.send(deploy_job).await {
             error!(
                 "Failed to queue image deploy for project {} (image {}): {}",
-                project.id, image_ref, e
+                project.id, runtime.image_ref, e
             );
         } else {
             info!(
                 "Queued image deploy for project {} from image {}",
-                project.id, image_ref
+                project.id, runtime.image_ref
             );
         }
     }
@@ -2742,8 +2889,9 @@ mod tests {
     use super::{
         authorize_storage_service_scopes, compose_path_for_candidate, drop_preset_candidate_from,
         parse_owner_repo_from_git_url, project_created_from_template_telemetry_event,
-        require_git_settings_permissions, service_template_origin_attestation,
-        validate_template_service_selection, DropPresetCandidate, TemplateServiceSelectionError,
+        require_git_settings_permissions, resolve_image_template_runtime,
+        service_template_origin_attestation, validate_template_service_selection,
+        DropPresetCandidate, TemplateRuntimeOverrideError, TemplateServiceSelectionError,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -2794,6 +2942,88 @@ mod tests {
             ),
             Err(TemplateServiceSelectionError::Ambiguous(required))
         );
+    }
+
+    fn image_template_request() -> super::super::templates::CreateProjectFromTemplateRequest {
+        super::super::templates::CreateProjectFromTemplateRequest {
+            template_slug: "keycloak".to_string(),
+            project_name: "Identity".to_string(),
+            git_provider_connection_id: None,
+            repository_name: None,
+            repository_owner: None,
+            private: true,
+            environment_variables: Vec::new(),
+            storage_service_ids: Vec::new(),
+            automatic_deploy: false,
+            image: None,
+            command: None,
+            cpu_request: None,
+            cpu_limit: None,
+            memory_request: None,
+            memory_limit: None,
+            exposed_port: None,
+            health_check_path: None,
+        }
+    }
+
+    #[test]
+    fn image_template_runtime_uses_curated_defaults() {
+        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be bundled");
+
+        let runtime = resolve_image_template_runtime(&template, &image_template_request())
+            .expect("curated defaults should be valid")
+            .expect("Keycloak should resolve to image mode");
+
+        assert_eq!(runtime.image_ref, "quay.io/keycloak/keycloak:26.7.2");
+        assert_eq!(runtime.command, Some(vec!["start".to_string()]));
+        assert_eq!(runtime.cpu_request, Some(500_000));
+        assert_eq!(runtime.cpu_limit, Some(1_000_000));
+        assert_eq!(runtime.memory_request, Some(512));
+        assert_eq!(runtime.memory_limit, Some(1_536));
+        assert_eq!(runtime.exposed_port, Some(8080));
+        assert_eq!(runtime.health_check_path.as_deref(), Some("/realms/master"));
+    }
+
+    #[test]
+    fn image_template_runtime_applies_user_overrides_and_can_clear_command() {
+        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be bundled");
+        let mut request = image_template_request();
+        request.image = Some("quay.io/keycloak/keycloak:27.0.0".to_string());
+        request.command = Some(Vec::new());
+        request.cpu_request = Some(750_000);
+        request.cpu_limit = Some(1_500_000);
+        request.memory_request = Some(768);
+        request.memory_limit = Some(2_048);
+        request.exposed_port = Some(9090);
+        request.health_check_path = Some("/health/ready".to_string());
+
+        let runtime = resolve_image_template_runtime(&template, &request)
+            .expect("valid overrides should resolve")
+            .expect("Keycloak should resolve to image mode");
+
+        assert_eq!(runtime.image_ref, "quay.io/keycloak/keycloak:27.0.0");
+        assert_eq!(runtime.command, None);
+        assert_eq!(runtime.cpu_request, Some(750_000));
+        assert_eq!(runtime.cpu_limit, Some(1_500_000));
+        assert_eq!(runtime.memory_request, Some(768));
+        assert_eq!(runtime.memory_limit, Some(2_048));
+        assert_eq!(runtime.exposed_port, Some(9090));
+        assert_eq!(runtime.health_check_path.as_deref(), Some("/health/ready"));
+    }
+
+    #[test]
+    fn image_template_runtime_rejects_unsafe_health_paths() {
+        let template = temps_core::templates::bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be bundled");
+        let mut request = image_template_request();
+        request.health_check_path = Some("https://example.test/ready".to_string());
+
+        assert!(matches!(
+            resolve_image_template_runtime(&template, &request),
+            Err(TemplateRuntimeOverrideError::InvalidHealthCheckPath { .. })
+        ));
     }
 
     #[test]

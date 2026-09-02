@@ -3966,7 +3966,7 @@ networks:
                 default_value: None,
                 route_service: None,
             };
-            assert!(variable.is_secret(), "{name} should be write-only");
+            assert!(variable.is_secret(), "{name} should be secret");
         }
 
         for name in [

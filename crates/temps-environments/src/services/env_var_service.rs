@@ -55,9 +55,6 @@ pub enum EnvVarError {
     )]
     SecretValueRequired { key: String },
 
-    #[error("Secret env var '{key}' (id={var_id}) is write-only and cannot be revealed")]
-    SecretValueCannotBeRevealed { var_id: i32, key: String },
-
     #[error(
         "Environment variable '{key}' is ambiguous in project {project_id}; specify an environment"
     )]
@@ -192,9 +189,8 @@ impl EnvVarService {
                 continue;
             }
 
-            // Secret values are write-only — never returned in plaintext from
-            // the API surface. The deployer path goes through
-            // `get_for_deploy` instead.
+            // Secret values are never returned in plaintext from this bulk
+            // API surface. Deployment and explicit reveal use scoped methods.
             let value = if var.is_secret {
                 None
             } else {
@@ -410,10 +406,9 @@ impl EnvVarService {
                         // Refuse to seal an empty value over a real one. Without
                         // this a client that failed to load the current value
                         // (a denied or transient reveal) silently overwrites the
-                        // credential with "" and marks it write-only, which is
-                        // unrecoverable: it cannot be read back to notice the
-                        // loss, and cannot be demoted to inspect it. Mirrors the
-                        // create-time `SecretValueRequired` guard.
+                        // credential with "" and marks it secret. The empty
+                        // credential is unusable and the classification cannot
+                        // be demoted. Mirrors the create-time guard.
                         if final_is_secret && value_is_explicitly_empty {
                             return Err(EnvVarError::SecretValueRequired { key: key.clone() });
                         }
@@ -543,7 +538,12 @@ impl EnvVarService {
         Ok(())
     }
 
-    pub async fn get_environment_variable_value(
+    /// Decrypt one value for an HTTP reveal flow.
+    ///
+    /// This stays crate-private and is deliberately named after its security
+    /// invariant: callers must authorize and durably audit the reveal before
+    /// returning the plaintext outside the process.
+    pub(crate) async fn get_environment_variable_value_for_audited_reveal(
         &self,
         project_id: i32,
         key: &str,
@@ -585,13 +585,6 @@ impl EnvVarService {
                 key, project_id
             ))
         })?;
-
-        if var.is_secret {
-            return Err(EnvVarError::SecretValueCannotBeRevealed {
-                var_id: var.id,
-                key: var.key,
-            });
-        }
 
         self.decrypt_value(var.id, &var.key, &var.value, var.is_encrypted)
     }
@@ -875,7 +868,7 @@ mod tests {
 
         let service = EnvVarService::new(db, svc);
         let value = service
-            .get_environment_variable_value(10, "API_KEY", None, None)
+            .get_environment_variable_value_for_audited_reveal(10, "API_KEY", None, None)
             .await
             .unwrap();
 
@@ -904,7 +897,7 @@ mod tests {
         let service = EnvVarService::new(db, encryption_service);
 
         let value = service
-            .get_environment_variable_value(10, "SHARED_KEY", Some(22), None)
+            .get_environment_variable_value_for_audited_reveal(10, "SHARED_KEY", Some(22), None)
             .await
             .expect("environment-scoped reveal should select the linked row");
 
@@ -927,7 +920,7 @@ mod tests {
         let service = EnvVarService::new(db, encryption_service);
 
         let error = service
-            .get_environment_variable_value(10, "SHARED_KEY", None, None)
+            .get_environment_variable_value_for_audited_reveal(10, "SHARED_KEY", None, None)
             .await
             .expect_err("unscoped duplicate-key reveal must fail closed");
 
@@ -960,7 +953,7 @@ mod tests {
         let service = EnvVarService::new(db, encryption_service);
 
         let value = service
-            .get_environment_variable_value(10, "SHARED_KEY", None, Some(4))
+            .get_environment_variable_value_for_audited_reveal(10, "SHARED_KEY", None, Some(4))
             .await
             .expect("row-scoped reveal should return the requested env-var row");
 
@@ -968,9 +961,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_get_environment_variable_value_rejects_write_only_secret() {
+    async fn test_get_environment_variable_value_reveals_secret_through_scoped_endpoint() {
         let encryption_service = make_encryption_service();
-        let encrypted = encryption_service.encrypt_string("never-reveal").unwrap();
+        let encrypted = encryption_service
+            .encrypt_string("reveal-on-demand")
+            .unwrap();
         let db = Arc::new(
             MockDatabase::new(DatabaseBackend::Postgres)
                 .append_query_results(vec![vec![make_env_var_model_full(
@@ -985,18 +980,12 @@ mod tests {
         );
         let service = EnvVarService::new(db, encryption_service);
 
-        let error = service
-            .get_environment_variable_value(10, "WRITE_ONLY_TOKEN", None, None)
+        let value = service
+            .get_environment_variable_value_for_audited_reveal(10, "WRITE_ONLY_TOKEN", None, None)
             .await
-            .expect_err("write-only secret must not be revealable");
+            .expect("an authorized audited endpoint must be able to reveal a secret");
 
-        assert!(matches!(
-            error,
-            EnvVarError::SecretValueCannotBeRevealed {
-                var_id: 4,
-                ref key,
-            } if key == "WRITE_ONLY_TOKEN"
-        ));
+        assert_eq!(value, "reveal-on-demand");
     }
 
     /// Building a mock that walks the update transaction: SELECT the row,
@@ -1144,8 +1133,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_update_rejects_empty_value_for_an_existing_secret() {
-        // Same hazard without a promotion: blanking a secret that is already
-        // write-only is equally unrecoverable.
+        // Same hazard without a promotion: blanking an existing secret leaves
+        // an unusable credential.
         let encryption_service = make_encryption_service();
         let encrypted = encryption_service.encrypt_string("still_needed").unwrap();
         let before = make_env_var_model_full(7, 10, "TOKEN", &encrypted, true, true);

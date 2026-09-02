@@ -4079,10 +4079,10 @@ export type CreateEnvironmentVariableRequest = {
      */
     include_in_preview?: boolean;
     /**
-     * When true the variable is treated as write-only: never returned in
-     * plaintext from the API, masked in the UI, and updates that omit the
-     * value preserve the existing ciphertext. The flag is one-way — secret
-     * vars cannot be demoted back to regular vars.
+     * When true the variable is masked in list responses and can only be
+     * viewed through the permission-checked, audited per-variable reveal
+     * endpoint. Updates that omit the value preserve the existing ciphertext.
+     * The flag is one-way — secret vars cannot be demoted to regular vars.
      */
     is_secret?: boolean;
     key: string;
@@ -4450,14 +4450,48 @@ export type CreateProjectFromTemplateRequest = {
      */
     automatic_deploy?: boolean;
     /**
+     * Optional image entrypoint arguments. An empty list explicitly uses the
+     * image's own default command instead of the template command.
+     */
+    command?: Array<string> | null;
+    /**
+     * CPU limit override in microcores. Zero means uncapped.
+     */
+    cpu_limit?: number | null;
+    /**
+     * CPU request override in microcores (1_000_000 = one CPU core).
+     */
+    cpu_request?: number | null;
+    /**
      * Environment variables to set (key-value pairs)
      */
     environment_variables?: Array<EnvVarInput>;
+    /**
+     * Public container port override.
+     */
+    exposed_port?: number | null;
     /**
      * Git provider connection ID. When omitted, the project deploys directly
      * from the template's public source repository instead of forking it.
      */
     git_provider_connection_id?: number | null;
+    /**
+     * Relative HTTP health-check path override.
+     */
+    health_check_path?: string | null;
+    /**
+     * Optional prebuilt-image override. Curated template values remain the
+     * default when this is omitted. Accepted only for image templates.
+     */
+    image?: string | null;
+    /**
+     * Memory limit override in MiB. Zero means uncapped.
+     */
+    memory_limit?: number | null;
+    /**
+     * Memory request override in MiB.
+     */
+    memory_request?: number | null;
     /**
      * Whether to make the repository private (defaults to true)
      */
@@ -4533,15 +4567,16 @@ export type CreateProjectRequest = {
      */
     expected_slug?: string | null;
     /**
-     * Port exposed by the container (fallback when image has no EXPOSE directive)
+     * Explicit port exposed by the container.
      *
      * Priority order for port resolution:
-     * 1. Image EXPOSE directive (auto-detected from built image)
-     * 2. Environment-level exposed_port (overrides this value per environment)
-     * 3. This project-level exposed_port (fallback)
+     * 1. Environment-level exposed_port (explicit override)
+     * 2. This project-level exposed_port (explicit override)
+     * 3. Image EXPOSE directive (auto-detected from built image)
      * 4. Default: 3000
      *
-     * Only set this if your image doesn't use EXPOSE directive.
+     * Set this when the desired application port differs from the image's
+     * first EXPOSE directive (for example, an image exposing HTTP and HTTPS).
      */
     exposed_port?: number | null;
     git_provider_connection_id?: number | null;
@@ -5605,6 +5640,12 @@ export type DeploymentMetadata = {
      * Docker builder used (e.g., "nixpacks", "dockerfile")
      */
     builder?: string | null;
+    /**
+     * Command passed to a prebuilt image entrypoint. Stored in deployment
+     * metadata so redeploy, rollback, and node failover reproduce the exact
+     * workload rather than falling back to the image default.
+     */
+    command?: Array<string> | null;
     /**
      * Deployment duration in milliseconds
      */
@@ -7093,9 +7134,9 @@ export type EnvExampleVariableResponse = {
  */
 export type EnvVarInput = {
     /**
-     * Mark the variable as a write-only secret. Secret values are encrypted at
-     * rest and never returned in plaintext by the API — they can only be
-     * replaced, not read back. Defaults to `false`.
+     * Mark the variable as a secret. Secret values are encrypted at rest,
+     * masked in list responses, and revealable only through an audited,
+     * permission-checked endpoint. Defaults to `false`.
      */
     is_secret?: boolean;
     /**
@@ -7295,15 +7336,15 @@ export type EnvironmentVariableResponse = {
      */
     include_in_preview: boolean;
     /**
-     * Whether the variable is a write-only secret. Secrets always have
-     * `value: None` in responses.
+     * Whether the variable is a secret. Secrets always have `value: None` in
+     * list responses.
      */
     is_secret: boolean;
     key: string;
     updated_at: number;
     /**
      * Plaintext value for non-secret vars (or `"***"` mask for list responses).
-     * `None` for secret vars — secrets are write-only.
+     * `None` for secret vars; use the audited per-variable reveal endpoint.
      */
     value?: string | null;
 };
@@ -10635,6 +10676,7 @@ export type ListTemplatesQuery = {
      * Only return featured templates
      */
     featured?: boolean | null;
+    kind?: null | TemplateKind;
     /**
      * Filter templates by tag
      */
@@ -13844,9 +13886,9 @@ export type ProjectDashboardAnalytics = {
  */
 export type ProjectEnvVarInput = {
     /**
-     * Mark the variable as a write-only secret. Secret values are encrypted at
-     * rest and never returned in plaintext by the API — they can only be
-     * replaced, not read back. Defaults to `false`.
+     * Mark the variable as a secret. Secret values are encrypted at rest,
+     * masked in list responses, and revealable only through an audited,
+     * permission-checked endpoint. Defaults to `false`.
      */
     is_secret?: boolean;
     /**
@@ -19131,9 +19173,29 @@ export type TeamResponse = {
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
 
 /**
+ * Where a template is presented in the project creation flow.
+ */
+export type TemplateKind = 'starter' | 'service';
+
+/**
+ * Resource profile required by a curated template. CPU values use the same
+ * microcore unit as project deployment configuration; memory values are MiB.
+ */
+export type TemplateResources = {
+    cpu_limit?: number | null;
+    cpu_request?: number | null;
+    memory_limit?: number | null;
+    memory_request?: number | null;
+};
+
+/**
  * Response type for a single template
  */
 export type TemplateResponse = {
+    /**
+     * Optional command passed to the image entrypoint.
+     */
+    command?: Array<string> | null;
     /**
      * Short description
      */
@@ -19172,6 +19234,18 @@ export type TemplateResponse = {
      */
     is_featured: boolean;
     /**
+     * Gallery this template belongs to.
+     */
+    kind: TemplateKind;
+    /**
+     * Managed-service environment aliases used at deployment time.
+     */
+    managed_service_bindings: {
+        [key: string]: {
+            [key: string]: string;
+        };
+    };
+    /**
      * Display name
      */
     name: string;
@@ -19179,6 +19253,7 @@ export type TemplateResponse = {
      * Framework/preset to use
      */
     preset: string;
+    resources?: null | TemplateResources;
     /**
      * URL to a wide screenshot/banner preview of the deployed template.
      * Absent for templates that don't have one captured yet.
@@ -54745,6 +54820,10 @@ export type ListProjectTemplatesData = {
          * Only return featured templates
          */
         featured?: boolean;
+        /**
+         * Filter by gallery: starter or service
+         */
+        kind?: TemplateKind;
     };
     url: '/templates';
 };

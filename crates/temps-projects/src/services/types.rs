@@ -192,8 +192,8 @@ pub struct ProjectSettingsUpdate {
 pub struct CreateProjectEnvVar {
     pub key: String,
     pub value: String,
-    /// When true the value is write-only: it is encrypted at rest and the API
-    /// never returns the plaintext again.
+    /// When true the value is encrypted at rest and masked in list responses.
+    /// Plaintext access requires the audited reveal endpoint.
     pub is_secret: bool,
 }
 
@@ -271,6 +271,7 @@ pub struct CreateProjectRequest {
     /// Optional curated-template resource profile. Generic callers leave
     /// these unset and receive the platform defaults.
     pub cpu_request: Option<i32>,
+    pub cpu_limit: Option<i32>,
     pub memory_request: Option<i32>,
     pub memory_limit: Option<i32>,
     /// Source type for deployments (git, docker_image, or static_files)

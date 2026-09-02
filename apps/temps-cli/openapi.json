@@ -8354,7 +8354,7 @@
             "type": "boolean"
           },
           "is_secret": {
-            "description": "When true the variable is treated as write-only: never returned in\nplaintext from the API, masked in the UI, and updates that omit the\nvalue preserve the existing ciphertext. The flag is one-way — secret\nvars cannot be demoted back to regular vars.",
+            "description": "When true the variable is masked in list responses and can only be\nviewed through the permission-checked, audited per-variable reveal\nendpoint. Updates that omit the value preserve the existing ciphertext.\nThe flag is one-way — secret vars cannot be demoted to regular vars.",
             "type": "boolean"
           },
           "key": {
@@ -9098,6 +9098,32 @@
             "description": "Enable automatic deployment on push (defaults to true). Only honoured in\nfork mode; public-repo deploys cannot receive push webhooks.",
             "type": "boolean"
           },
+          "command": {
+            "description": "Optional image entrypoint arguments. An empty list explicitly uses the\nimage's own default command instead of the template command.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "cpu_limit": {
+            "description": "CPU limit override in microcores. Zero means uncapped.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpu_request": {
+            "description": "CPU request override in microcores (1_000_000 = one CPU core).",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "environment_variables": {
             "description": "Environment variables to set (key-value pairs)",
             "items": {
@@ -9105,8 +9131,46 @@
             },
             "type": "array"
           },
+          "exposed_port": {
+            "description": "Public container port override.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
           "git_provider_connection_id": {
             "description": "Git provider connection ID. When omitted, the project deploys directly\nfrom the template's public source repository instead of forking it.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "health_check_path": {
+            "description": "Relative HTTP health-check path override.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "image": {
+            "description": "Optional prebuilt-image override. Curated template values remain the\ndefault when this is omitted. Accepted only for image templates.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "description": "Memory limit override in MiB. Zero means uncapped.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_request": {
+            "description": "Memory request override in MiB.",
             "format": "int32",
             "type": [
               "integer",
@@ -9234,7 +9298,7 @@
             ]
           },
           "exposed_port": {
-            "description": "Port exposed by the container (fallback when image has no EXPOSE directive)\n\nPriority order for port resolution:\n1. Image EXPOSE directive (auto-detected from built image)\n2. Environment-level exposed_port (overrides this value per environment)\n3. This project-level exposed_port (fallback)\n4. Default: 3000\n\nOnly set this if your image doesn't use EXPOSE directive.",
+            "description": "Explicit port exposed by the container.\n\nPriority order for port resolution:\n1. Environment-level exposed_port (explicit override)\n2. This project-level exposed_port (explicit override)\n3. Image EXPOSE directive (auto-detected from built image)\n4. Default: 3000\n\nSet this when the desired application port differs from the image's\nfirst EXPOSE directive (for example, an image exposing HTTP and HTTPS).",
             "example": 8080,
             "format": "int32",
             "type": [
@@ -11288,6 +11352,16 @@
               "null"
             ]
           },
+          "command": {
+            "description": "Command passed to a prebuilt image entrypoint. Stored in deployment\nmetadata so redeploy, rollback, and node failover reproduce the exact\nworkload rather than falling back to the image default.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "deploymentDurationMs": {
             "description": "Deployment duration in milliseconds",
             "format": "int64",
@@ -13211,7 +13285,7 @@
               },
               {
                 "$ref": "#/components/schemas/ComposeTemplateOrigin",
-                "description": "Informational catalog origin captured when a service template creates the project.\nThis is not a server-attested audit record."
+                "description": "Catalog origin captured when a service template creates the project.\nIts digest and the first saved Compose source are revalidated for\nanonymous telemetry provenance, but this is not a general-purpose audit\nattestation."
               }
             ]
           }
@@ -14847,7 +14921,7 @@
         "description": "Input for environment variable",
         "properties": {
           "is_secret": {
-            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "description": "Mark the variable as a secret. Secret values are encrypted at rest,\nmasked in list responses, and revealable only through an audited,\npermission-checked endpoint. Defaults to `false`.",
             "type": "boolean"
           },
           "name": {
@@ -15229,7 +15303,7 @@
             "type": "boolean"
           },
           "is_secret": {
-            "description": "Whether the variable is a write-only secret. Secrets always have\n`value: None` in responses.",
+            "description": "Whether the variable is a secret. Secrets always have `value: None` in\nlist responses.",
             "type": "boolean"
           },
           "key": {
@@ -15240,7 +15314,7 @@
             "type": "integer"
           },
           "value": {
-            "description": "Plaintext value for non-secret vars (or `\"***\"` mask for list responses).\n`None` for secret vars — secrets are write-only.",
+            "description": "Plaintext value for non-secret vars (or `\"***\"` mask for list responses).\n`None` for secret vars; use the audited per-variable reveal endpoint.",
             "type": [
               "string",
               "null"
@@ -22799,6 +22873,17 @@
               "null"
             ]
           },
+          "kind": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateKind",
+                "description": "Filter by gallery (`starter` or `service`)."
+              }
+            ]
+          },
           "tag": {
             "description": "Filter templates by tag",
             "type": [
@@ -29907,7 +29992,7 @@
         "description": "Documentation-only schema for a project-creation environment variable.\n\nThe wire format is deserialized by [`CreateProjectEnvVar`], which also\naccepts the legacy `[\"KEY\", \"value\"]` tuple form. This struct exists so the\nOpenAPI spec (and the generated clients) describe the preferred object form\nwith its `is_secret` flag.",
         "properties": {
           "is_secret": {
-            "description": "Mark the variable as a write-only secret. Secret values are encrypted at\nrest and never returned in plaintext by the API — they can only be\nreplaced, not read back. Defaults to `false`.",
+            "description": "Mark the variable as a secret. Secret values are encrypted at rest,\nmasked in list responses, and revealable only through an audited,\npermission-checked endpoint. Defaults to `false`.",
             "type": "boolean"
           },
           "key": {
@@ -41687,9 +41772,61 @@
         ],
         "type": "string"
       },
+      "TemplateKind": {
+        "description": "Where a template is presented in the project creation flow.",
+        "enum": [
+          "starter",
+          "service"
+        ],
+        "type": "string"
+      },
+      "TemplateResources": {
+        "description": "Resource profile required by a curated template. CPU values use the same\nmicrocore unit as project deployment configuration; memory values are MiB.",
+        "properties": {
+          "cpu_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cpu_request": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "memory_request": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "TemplateResponse": {
         "description": "Response type for a single template",
         "properties": {
+          "command": {
+            "description": "Optional command passed to the image entrypoint.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "description": {
             "description": "Short description",
             "type": [
@@ -41748,6 +41885,26 @@
             "description": "Whether the template is featured/promoted",
             "type": "boolean"
           },
+          "kind": {
+            "$ref": "#/components/schemas/TemplateKind",
+            "description": "Gallery this template belongs to."
+          },
+          "managed_service_bindings": {
+            "additionalProperties": {
+              "additionalProperties": {
+                "type": "string"
+              },
+              "propertyNames": {
+                "type": "string"
+              },
+              "type": "object"
+            },
+            "description": "Managed-service environment aliases used at deployment time.",
+            "propertyNames": {
+              "type": "string"
+            },
+            "type": "object"
+          },
           "name": {
             "description": "Display name",
             "type": "string"
@@ -41755,6 +41912,17 @@
           "preset": {
             "description": "Framework/preset to use",
             "type": "string"
+          },
+          "resources": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TemplateResources",
+                "description": "Curated CPU/memory profile applied when the project is created."
+              }
+            ]
           },
           "screenshot_url": {
             "description": "URL to a wide screenshot/banner preview of the deployed template.\nAbsent for templates that don't have one captured yet.",
@@ -41785,13 +41953,15 @@
         "required": [
           "slug",
           "name",
+          "kind",
           "git",
           "preset",
           "tags",
           "features",
           "services",
           "env_vars",
-          "is_featured"
+          "is_featured",
+          "managed_service_bindings"
         ],
         "type": "object"
       },
@@ -100597,6 +100767,15 @@
             "required": false,
             "schema": {
               "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter by gallery: starter or service",
+            "in": "query",
+            "name": "kind",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/TemplateKind"
             }
           }
         ],

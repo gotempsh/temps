@@ -145,11 +145,13 @@ templates:
       url: https://github.com/keycloak/keycloak.git
       ref: 26.7.2
     preset: dockerfile
+    image_url: /templates/keycloak.svg
     image: quay.io/keycloak/keycloak:26.7.2
     command:
       - start
     resources:
       cpu_request: 500000
+      cpu_limit: 1000000
       memory_request: 512
       memory_limit: 1536
     exposed_port: 8080
@@ -201,3 +203,52 @@ templates:
     is_public: true
     is_featured: true
     sort_order: 0
+
+  # Browserless runs Chromium as an authenticated remote browser service. It is
+  # intentionally modeled as one native container: consumers connect over its
+  # public HTTP/WebSocket endpoint and it has no hidden Compose dependencies.
+  - slug: browserless
+    name: Browserless
+    kind: service
+    description: Remote Chromium for Playwright, Puppeteer, screenshots, PDFs, and browser automation. Review Browserless licensing for commercial or proprietary workloads.
+    git:
+      url: https://github.com/browserless/browserless.git
+      ref: v2.56.0
+    preset: dockerfile
+    image_url: /templates/browserless.svg
+    image: ghcr.io/browserless/chromium:v2.56.0
+    resources:
+      cpu_request: 1000000
+      cpu_limit: 2000000
+      memory_request: 1024
+      memory_limit: 2048
+    exposed_port: 3000
+    health_check_path: /docs
+    tags:
+      - browser-automation
+      - chromium
+      - playwright
+      - puppeteer
+      - scraping
+    features:
+      - Remote Chromium over Playwright and Puppeteer protocols
+      - REST APIs for screenshots, PDFs, content, and scraping
+      - Generated access token and proxy-aware external URLs
+      - Version-pinned, multi-architecture Chromium image
+    services: []
+    env_vars:
+      - name: TOKEN
+        description: Access token required by every Browserless API and WebSocket connection
+        required: true
+        default_generator: random_secret
+      - name: EXTERNAL
+        description: Public Temps URL used when Browserless generates HTTP and WebSocket endpoints
+        required: true
+        default_generator: app_url
+      - name: CONCURRENT
+        description: Maximum simultaneous browser sessions; raise this together with CPU and memory
+        default: "2"
+        required: true
+    is_public: true
+    is_featured: true
+    sort_order: 1

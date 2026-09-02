@@ -29,6 +29,7 @@ import {
 } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Textarea } from '@/components/ui/textarea'
 import { Checkbox } from '@/components/ui/checkbox'
 import { Badge } from '@/components/ui/badge'
 import { Alert, AlertDescription } from '@/components/ui/alert'
@@ -50,6 +51,11 @@ import {
 } from '@/components/ui/select'
 import { RadioGroup, RadioGroupItem } from '@/components/ui/radio-group'
 import { Label } from '@/components/ui/label'
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from '@/components/ui/collapsible'
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -77,9 +83,15 @@ import { getErrorMessage } from '@/utils/errorHandling'
 import { cn } from '@/lib/utils'
 import { ADD_SERVICE_TYPES } from '@/lib/addServiceTypes'
 import {
-  isLikelySecretProjectEnvironmentVariable,
   projectEnvironmentVariablesSchema,
+  templateEnvironmentVariableDefaultsToSecret,
 } from '@/lib/project-environment-variables'
+import {
+  templateRuntimeDefaults,
+  templateRuntimeDefaultsSchema,
+  templateRuntimeOverrides,
+  type TemplateRuntimeDefaults,
+} from '@/lib/template-runtime-defaults'
 import {
   getTemplateServiceRequirements,
   normalizeTemplateServiceType,
@@ -100,6 +112,7 @@ import {
   Lock,
   Plus,
   Rocket,
+  RotateCcw,
   Settings,
   Sparkles,
   Star,
@@ -144,6 +157,10 @@ const formSchema = z.object({
   automaticDeploy: z.boolean(),
   storageServices: z.array(z.number()),
   environmentVariables: projectEnvironmentVariablesSchema,
+  // Source-based templates do not render runtime controls, so they must not be
+  // blocked by image-only validation. Image templates always seed this value
+  // from their curated defaults and validate it before submission.
+  runtime: templateRuntimeDefaultsSchema.optional(),
 })
 
 type FormValues = z.infer<typeof formSchema>
@@ -198,10 +215,6 @@ interface TemplateConfiguratorProps {
   className?: string
 }
 
-function formatTemplateCpu(microcores: number): string {
-  return `${microcores / 1_000_000} CPU`
-}
-
 function formatTemplateMemory(mebibytes: number): string {
   if (mebibytes >= 1024 && mebibytes % 1024 === 0) {
     return `${mebibytes / 1024} GB`
@@ -210,6 +223,29 @@ function formatTemplateMemory(mebibytes: number): string {
     return `${(mebibytes / 1024).toFixed(1)} GB`
   }
   return `${mebibytes} MB`
+}
+
+function runtimeProfileSummary(runtime: TemplateRuntimeDefaults): string {
+  const values = [
+    runtime.cpuRequest
+      ? `${runtime.cpuRequest} CPU requested`
+      : 'CPU request inherited',
+    runtime.cpuLimit
+      ? runtime.cpuLimit === '0'
+        ? 'CPU uncapped'
+        : `${runtime.cpuLimit} CPU limit`
+      : 'CPU limit inherited',
+    runtime.memoryRequest
+      ? `${formatTemplateMemory(Number(runtime.memoryRequest))} memory requested`
+      : 'Memory request inherited',
+    runtime.memoryLimit
+      ? runtime.memoryLimit === '0'
+        ? 'Memory uncapped'
+        : `${formatTemplateMemory(Number(runtime.memoryLimit))} memory limit`
+      : 'Memory limit inherited',
+  ]
+
+  return values.join(' · ')
 }
 
 export function TemplateConfigurator({
@@ -314,6 +350,7 @@ export function TemplateConfigurator({
       private: true,
       automaticDeploy: true,
       storageServices: [],
+      runtime: template.image ? templateRuntimeDefaults(template) : undefined,
       environmentVariables: configurableTemplateEnvVars.map((env) => {
         const generated =
           runGenerator(env.default_generator, {
@@ -323,9 +360,11 @@ export function TemplateConfigurator({
         return {
           key: env.name,
           value: env.default || generated,
-          isSecret:
-            isLikelySecretProjectEnvironmentVariable(env.name) ||
-            env.default_generator?.includes('secret') === true,
+          isSecret: templateEnvironmentVariableDefaultsToSecret({
+            templateKind: template.kind,
+            key: env.name,
+            defaultGenerator: env.default_generator,
+          }),
         }
       }),
     },
@@ -577,6 +616,10 @@ export function TemplateConfigurator({
     // template's public source repo when it isn't. Repository name/owner only
     // matter in fork mode, so they're omitted otherwise.
     const usePublicRepo = data.gitProviderConnectionId == null
+    const runtimeOverrides =
+      template.image && data.runtime
+        ? templateRuntimeOverrides(data.runtime)
+        : undefined
 
     await createFromTemplateMutation.mutateAsync({
       body: {
@@ -591,6 +634,7 @@ export function TemplateConfigurator({
         // Auto-deploy on push is only possible against a fork we own.
         automatic_deploy: usePublicRepo ? false : data.automaticDeploy,
         storage_service_ids: allServiceIds,
+        ...runtimeOverrides,
         environment_variables: data.environmentVariables
           .filter((env) => env.key && env.value)
           .map((env) => ({
@@ -628,6 +672,10 @@ export function TemplateConfigurator({
     control: form.control,
     name: 'environmentVariables',
   })
+  const watchedRuntime = useWatch({
+    control: form.control,
+    name: 'runtime',
+  })
   const watchedConnectionId = useWatch({
     control: form.control,
     name: 'gitProviderConnectionId',
@@ -653,6 +701,7 @@ export function TemplateConfigurator({
   // The backend decides image-vs-build from `template.image`; when it's set we
   // hide the entire Git/source section and show an "instant deploy" note.
   const isImageTemplate = Boolean(template.image)
+  const effectiveRuntime = watchedRuntime ?? templateRuntimeDefaults(template)
 
   // Check if required env vars are filled
   const missingRequiredVars = useMemo(() => {
@@ -756,41 +805,271 @@ export function TemplateConfigurator({
 
               {/* Image-based template: deploys a prebuilt image directly. No
                   Git source/connection needed, so the whole source picker is
-                  replaced by an "instant deploy" note. */}
+                  replaced by an expandable runtime-defaults card. */}
               {isImageTemplate && (
-                <div className="flex items-start gap-3 rounded-md border border-primary/30 bg-primary/5 px-3 py-3">
-                  <Rocket className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
-                  <div className="space-y-1">
-                    <p className="text-sm font-medium">
-                      Deploys instantly from a prebuilt image
-                    </p>
-                    <p className="text-xs text-muted-foreground">
-                      No build step and no Git account — Temps pulls{' '}
-                      <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-                        {template.image}
-                      </code>{' '}
-                      and runs it in seconds.
-                    </p>
-                    {template.resources && (
-                      <p className="text-xs text-muted-foreground">
-                        Runtime profile:{' '}
-                        {[
-                          template.resources.cpu_request != null
-                            ? formatTemplateCpu(template.resources.cpu_request)
-                            : null,
-                          template.resources.memory_request != null
-                            ? `${formatTemplateMemory(template.resources.memory_request)} memory requested`
-                            : null,
-                          template.resources.memory_limit != null
-                            ? `${formatTemplateMemory(template.resources.memory_limit)} memory limit`
-                            : null,
-                        ]
-                          .filter(Boolean)
-                          .join(' · ')}
-                      </p>
-                    )}
-                  </div>
-                </div>
+                <Collapsible className="overflow-hidden rounded-lg border border-primary/25 bg-primary/[0.035]">
+                  <CollapsibleTrigger asChild>
+                    <button
+                      type="button"
+                      className="group flex w-full items-start gap-3 px-4 py-3.5 text-left transition-colors hover:bg-primary/[0.055] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
+                    >
+                      <span className="mt-0.5 flex size-8 shrink-0 items-center justify-center rounded-md border border-primary/20 bg-background/70 text-primary shadow-sm">
+                        <Rocket className="size-4" />
+                      </span>
+                      <span className="min-w-0 flex-1 space-y-1">
+                        <span className="block text-sm font-medium">
+                          Deploys instantly from a prebuilt image
+                        </span>
+                        <span className="block text-xs text-muted-foreground">
+                          Temps pulls{' '}
+                          <code className="rounded bg-muted px-1 py-0.5 text-[11px] text-foreground">
+                            {effectiveRuntime.image}
+                          </code>{' '}
+                          with no build step or Git account.
+                        </span>
+                        <span className="block text-xs text-muted-foreground">
+                          {runtimeProfileSummary(effectiveRuntime)}
+                        </span>
+                      </span>
+                      <span className="flex shrink-0 items-center gap-2 pt-1 text-xs font-medium text-muted-foreground">
+                        Configure
+                        <ChevronDown className="size-4 transition-transform duration-200 group-data-[state=open]:rotate-180" />
+                      </span>
+                    </button>
+                  </CollapsibleTrigger>
+                  <CollapsibleContent>
+                    <div className="border-t border-primary/15 bg-background/45 px-4 py-4">
+                      <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
+                        <div>
+                          <p className="text-sm font-medium">
+                            Runtime defaults
+                          </p>
+                          <p className="mt-0.5 text-xs text-muted-foreground">
+                            Applied before the first deployment. Operator
+                            resource ceilings still apply.
+                          </p>
+                        </div>
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 self-start text-xs text-muted-foreground"
+                          onClick={() =>
+                            form.setValue(
+                              'runtime',
+                              templateRuntimeDefaults(template),
+                              {
+                                shouldDirty: true,
+                                shouldValidate: true,
+                              }
+                            )
+                          }
+                        >
+                          <RotateCcw className="mr-1.5 size-3.5" />
+                          Reset defaults
+                        </Button>
+                      </div>
+
+                      <div className="grid gap-4 md:grid-cols-2">
+                        <FormField
+                          control={form.control}
+                          name="runtime.image"
+                          render={({ field }) => (
+                            <FormItem className="md:col-span-2">
+                              <FormLabel>Container image</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  className="font-mono text-sm"
+                                  autoCapitalize="none"
+                                  autoCorrect="off"
+                                  spellCheck={false}
+                                  placeholder="registry.example.com/org/app:v1.0.0"
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                Pin a version or digest for repeatable
+                                deployments.
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="runtime.command"
+                          render={({ field }) => (
+                            <FormItem className="md:col-span-2">
+                              <FormLabel>Container command</FormLabel>
+                              <FormControl>
+                                <Textarea
+                                  {...field}
+                                  rows={2}
+                                  className="resize-y font-mono text-sm"
+                                  placeholder={'start\n--optimized'}
+                                  autoCapitalize="none"
+                                  autoCorrect="off"
+                                  spellCheck={false}
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                One argument per line. Leave empty to use the
+                                image&apos;s default command.
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="runtime.cpuRequest"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>CPU request</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  type="number"
+                                  min="0.01"
+                                  step="0.01"
+                                  inputMode="decimal"
+                                  placeholder="0.5"
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                Guaranteed CPU cores
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="runtime.cpuLimit"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>CPU limit</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  type="number"
+                                  min="0"
+                                  step="0.01"
+                                  inputMode="decimal"
+                                  placeholder="1"
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                Maximum cores; 0 is uncapped
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="runtime.memoryRequest"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Memory request</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  type="number"
+                                  min="1"
+                                  step="1"
+                                  inputMode="numeric"
+                                  placeholder="512"
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                Guaranteed memory in MiB
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="runtime.memoryLimit"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Memory limit</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  type="number"
+                                  min="0"
+                                  step="1"
+                                  inputMode="numeric"
+                                  placeholder="1536"
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                Maximum MiB; 0 is uncapped
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="runtime.exposedPort"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Container port</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  type="number"
+                                  min="1"
+                                  max="65535"
+                                  step="1"
+                                  inputMode="numeric"
+                                  placeholder="8080"
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                Receives public traffic
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+
+                        <FormField
+                          control={form.control}
+                          name="runtime.healthCheckPath"
+                          render={({ field }) => (
+                            <FormItem>
+                              <FormLabel>Health-check path</FormLabel>
+                              <FormControl>
+                                <Input
+                                  {...field}
+                                  className="font-mono text-sm"
+                                  autoCapitalize="none"
+                                  autoCorrect="off"
+                                  spellCheck={false}
+                                  placeholder="/health"
+                                />
+                              </FormControl>
+                              <FormDescription>
+                                Relative HTTP path used for readiness
+                              </FormDescription>
+                              <FormMessage />
+                            </FormItem>
+                          )}
+                        />
+                      </div>
+                    </div>
+                  </CollapsibleContent>
+                </Collapsible>
               )}
 
               {!isImageTemplate && (
@@ -1389,8 +1668,9 @@ export function TemplateConfigurator({
                 <div className="space-y-1.5">
                   <CardTitle>Environment Variables</CardTitle>
                   <CardDescription>
-                    Review the template configuration and protect credentials as
-                    write-only secrets.
+                    All values are encrypted at rest. Mark a variable as secret
+                    only when it needs stricter masking, permission checks, and
+                    audited reveals.
                   </CardDescription>
                 </div>
                 <Button
@@ -1399,7 +1679,7 @@ export function TemplateConfigurator({
                   size="sm"
                   onClick={addEnvironmentVariable}
                 >
-                  <Plus className="h-4 w-4 mr-2" />
+                  <Plus className="size-4 shrink-0" />
                   Add Variable
                 </Button>
               </div>
@@ -1435,225 +1715,226 @@ export function TemplateConfigurator({
               )}
 
               {watchedEnvVars.length > 0 ? (
-                <div className="space-y-3">
-                  {watchedEnvVars.map((envVar, index) => {
-                    const templateVar = configurableTemplateEnvVars.find(
-                      (e) => e.name === envVar.key
-                    )
-                    return (
-                      <Card
-                        key={index}
-                        className="border-border/70 bg-muted/15"
-                      >
-                        <CardContent className="p-4">
-                          <div className="flex items-start gap-3">
-                            <div className="flex-1 grid grid-cols-1 md:grid-cols-2 gap-3">
-                              <FormField
-                                control={form.control}
-                                name={`environmentVariables.${index}.key`}
-                                render={({ field }) => (
-                                  <FormItem>
-                                    <FormLabel className="text-sm flex items-center gap-2">
-                                      Key
-                                      {templateVar?.required && (
-                                        <Badge
-                                          variant="destructive"
-                                          className="text-xs"
-                                        >
-                                          Required
-                                        </Badge>
+                <div className="overflow-hidden rounded-lg border border-border/60">
+                  <div className="hidden grid-cols-[minmax(0,5fr)_minmax(0,7fr)_auto] gap-4 border-b border-border/60 bg-muted/30 px-4 py-2 text-sm font-medium text-muted-foreground lg:grid">
+                    <div>Variable</div>
+                    <div>Value</div>
+                    <div className="w-28">Access</div>
+                  </div>
+                  <div className="divide-y divide-border/60">
+                    {watchedEnvVars.map((envVar, index) => {
+                      const templateVar = configurableTemplateEnvVars.find(
+                        (e) => e.name === envVar.key
+                      )
+                      return (
+                        <div
+                          key={index}
+                          className="grid gap-3 px-4 py-3 lg:grid-cols-[minmax(0,5fr)_minmax(0,7fr)_auto] lg:items-start lg:gap-4"
+                        >
+                          <FormField
+                            control={form.control}
+                            name={`environmentVariables.${index}.key`}
+                            render={({ field }) => (
+                              <FormItem className="min-w-0 space-y-1.5">
+                                <FormLabel className="text-base sm:text-sm lg:sr-only">
+                                  Variable
+                                </FormLabel>
+                                <div className="flex min-w-0 items-center gap-1.5">
+                                  <FormControl>
+                                    <Input
+                                      {...field}
+                                      placeholder="VARIABLE_NAME"
+                                      readOnly={!!templateVar}
+                                      className={cn(
+                                        'min-w-0 font-mono',
+                                        templateVar && 'bg-muted'
                                       )}
-                                    </FormLabel>
+                                      autoCapitalize="none"
+                                      autoCorrect="off"
+                                      spellCheck={false}
+                                    />
+                                  </FormControl>
+                                  {templateVar?.required && (
+                                    <div
+                                      className="shrink-0 text-sm text-muted-foreground"
+                                      title="Required"
+                                    >
+                                      <span aria-hidden="true">*</span>
+                                      <span className="sr-only">Required</span>
+                                    </div>
+                                  )}
+                                </div>
+                                {templateVar?.description && (
+                                  <p className="text-pretty text-base text-muted-foreground sm:text-sm">
+                                    {templateVar.description}
+                                  </p>
+                                )}
+                                <FormMessage />
+                                <ProvidedEnvironmentVariableWarning
+                                  variableName={envVar.key}
+                                  providedVariables={
+                                    providedEnvironmentVariables ?? []
+                                  }
+                                />
+                              </FormItem>
+                            )}
+                          />
+                          <FormField
+                            control={form.control}
+                            name={`environmentVariables.${index}.value`}
+                            render={({ field }) => {
+                              const generator = templateVar?.default_generator
+                              const handleGenerate = () => {
+                                const value = runGenerator(generator, {
+                                  repositoryName:
+                                    form.getValues('repositoryName'),
+                                  base: deploymentUrlBase,
+                                })
+                                if (!value) {
+                                  toast.error(
+                                    generator === 'app_url'
+                                      ? 'Enter a repository name first'
+                                      : 'Could not generate value'
+                                  )
+                                  return
+                                }
+                                form.setValue(
+                                  `environmentVariables.${index}.value`,
+                                  value,
+                                  {
+                                    shouldValidate: true,
+                                  }
+                                )
+                                autoGeneratedRef.current = {
+                                  ...autoGeneratedRef.current,
+                                  [templateVar!.name]: value,
+                                }
+                              }
+                              return (
+                                <FormItem className="min-w-0 space-y-1.5">
+                                  <FormLabel className="text-base sm:text-sm lg:sr-only">
+                                    Value
+                                  </FormLabel>
+                                  <div className="relative">
                                     <FormControl>
                                       <Input
                                         {...field}
-                                        placeholder="VARIABLE_NAME"
-                                        readOnly={!!templateVar}
+                                        type={
+                                          envVar.isSecret && !showSecrets[index]
+                                            ? 'password'
+                                            : 'text'
+                                        }
+                                        placeholder={
+                                          templateVar?.example || 'Enter value'
+                                        }
                                         className={cn(
                                           'font-mono',
-                                          templateVar && 'bg-muted'
+                                          generator &&
+                                            envVar.isSecret &&
+                                            'pr-20',
+                                          generator &&
+                                            !envVar.isSecret &&
+                                            'pr-10',
+                                          !generator &&
+                                            envVar.isSecret &&
+                                            'pr-10'
                                         )}
-                                        autoCapitalize="none"
-                                        autoCorrect="off"
-                                        spellCheck={false}
                                       />
                                     </FormControl>
-                                    {templateVar?.description && (
-                                      <p className="text-xs text-muted-foreground">
-                                        {templateVar.description}
-                                      </p>
+                                    {generator && (
+                                      <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="sm"
+                                        className={cn(
+                                          'absolute top-0 h-full px-2',
+                                          envVar.isSecret
+                                            ? 'right-9'
+                                            : 'right-0'
+                                        )}
+                                        onClick={handleGenerate}
+                                        title={
+                                          generator === 'app_url'
+                                            ? 'Generate from repository name'
+                                            : 'Generate random value'
+                                        }
+                                      >
+                                        <Sparkles className="h-4 w-4" />
+                                      </Button>
                                     )}
-                                    <FormMessage />
-                                    <ProvidedEnvironmentVariableWarning
-                                      variableName={envVar.key}
-                                      providedVariables={
-                                        providedEnvironmentVariables ?? []
-                                      }
+                                    {envVar.isSecret && (
+                                      <Button
+                                        type="button"
+                                        variant="ghost"
+                                        size="sm"
+                                        className="absolute right-0 top-0 h-full px-3"
+                                        onClick={() =>
+                                          setShowSecrets((prev) => ({
+                                            ...prev,
+                                            [index]: !prev[index],
+                                          }))
+                                        }
+                                        aria-label={
+                                          showSecrets[index]
+                                            ? 'Hide secret value'
+                                            : 'Show secret value'
+                                        }
+                                      >
+                                        {showSecrets[index] ? (
+                                          <EyeOff className="h-4 w-4" />
+                                        ) : (
+                                          <Eye className="h-4 w-4" />
+                                        )}
+                                      </Button>
+                                    )}
+                                  </div>
+                                  <FormMessage />
+                                </FormItem>
+                              )
+                            }}
+                          />
+                          <FormField
+                            control={form.control}
+                            name={`environmentVariables.${index}.isSecret`}
+                            render={({ field }) => (
+                              <div className="flex min-h-10 items-center gap-1 lg:w-28">
+                                <FormItem className="flex min-w-0 flex-1 items-center gap-2 space-y-0">
+                                  <FormControl>
+                                    <Checkbox
+                                      checked={field.value}
+                                      onCheckedChange={field.onChange}
                                     />
-                                  </FormItem>
-                                )}
-                              />
-                              <FormField
-                                control={form.control}
-                                name={`environmentVariables.${index}.value`}
-                                render={({ field }) => {
-                                  const generator =
-                                    templateVar?.default_generator
-                                  const handleGenerate = () => {
-                                    const value = runGenerator(generator, {
-                                      repositoryName:
-                                        form.getValues('repositoryName'),
-                                      base: deploymentUrlBase,
-                                    })
-                                    if (!value) {
-                                      toast.error(
-                                        generator === 'app_url'
-                                          ? 'Enter a repository name first'
-                                          : 'Could not generate value'
-                                      )
-                                      return
+                                  </FormControl>
+                                  <FormLabel className="text-base font-normal sm:text-sm">
+                                    Secret
+                                  </FormLabel>
+                                </FormItem>
+                                {!templateVar && (
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="sm"
+                                    onClick={() =>
+                                      removeEnvironmentVariable(index)
                                     }
-                                    form.setValue(
-                                      `environmentVariables.${index}.value`,
-                                      value,
-                                      {
-                                        shouldValidate: true,
-                                      }
-                                    )
-                                    autoGeneratedRef.current = {
-                                      ...autoGeneratedRef.current,
-                                      [templateVar!.name]: value,
-                                    }
-                                  }
-                                  return (
-                                    <FormItem>
-                                      <FormLabel className="text-sm">
-                                        Value
-                                      </FormLabel>
-                                      <div className="relative">
-                                        <FormControl>
-                                          <Input
-                                            {...field}
-                                            type={
-                                              envVar.isSecret &&
-                                              !showSecrets[index]
-                                                ? 'password'
-                                                : 'text'
-                                            }
-                                            placeholder={
-                                              templateVar?.example ||
-                                              'Enter value'
-                                            }
-                                            className={cn(
-                                              'font-mono',
-                                              generator &&
-                                                envVar.isSecret &&
-                                                'pr-20',
-                                              generator &&
-                                                !envVar.isSecret &&
-                                                'pr-10',
-                                              !generator &&
-                                                envVar.isSecret &&
-                                                'pr-10'
-                                            )}
-                                          />
-                                        </FormControl>
-                                        {generator && (
-                                          <Button
-                                            type="button"
-                                            variant="ghost"
-                                            size="sm"
-                                            className={cn(
-                                              'absolute top-0 h-full px-2',
-                                              envVar.isSecret
-                                                ? 'right-9'
-                                                : 'right-0'
-                                            )}
-                                            onClick={handleGenerate}
-                                            title={
-                                              generator === 'app_url'
-                                                ? 'Generate from repository name'
-                                                : 'Generate random value'
-                                            }
-                                          >
-                                            <Sparkles className="h-4 w-4" />
-                                          </Button>
-                                        )}
-                                        {envVar.isSecret && (
-                                          <Button
-                                            type="button"
-                                            variant="ghost"
-                                            size="sm"
-                                            className="absolute right-0 top-0 h-full px-3"
-                                            onClick={() =>
-                                              setShowSecrets((prev) => ({
-                                                ...prev,
-                                                [index]: !prev[index],
-                                              }))
-                                            }
-                                            aria-label={
-                                              showSecrets[index]
-                                                ? 'Hide secret value'
-                                                : 'Show secret value'
-                                            }
-                                          >
-                                            {showSecrets[index] ? (
-                                              <EyeOff className="h-4 w-4" />
-                                            ) : (
-                                              <Eye className="h-4 w-4" />
-                                            )}
-                                          </Button>
-                                        )}
-                                      </div>
-                                      <FormMessage />
-                                    </FormItem>
-                                  )
-                                }}
-                              />
-                              <FormField
-                                control={form.control}
-                                name={`environmentVariables.${index}.isSecret`}
-                                render={({ field }) => (
-                                  <FormItem className="flex items-start gap-3 space-y-0 rounded-md border bg-background/70 p-3 md:col-span-2">
-                                    <FormControl>
-                                      <Checkbox
-                                        checked={field.value}
-                                        onCheckedChange={field.onChange}
-                                        className="mt-0.5"
-                                      />
-                                    </FormControl>
-                                    <div className="space-y-1">
-                                      <FormLabel className="text-sm">
-                                        Encrypt as secret
-                                      </FormLabel>
-                                      <p className="text-xs text-muted-foreground">
-                                        Secret values are write-only after
-                                        creation. Use this for passwords,
-                                        tokens, and private connection strings.
-                                      </p>
-                                    </div>
-                                  </FormItem>
+                                    className="relative size-8 shrink-0 p-0 text-muted-foreground hover:text-destructive"
+                                    aria-label={`Remove environment variable ${index + 1}`}
+                                    title="Remove variable"
+                                  >
+                                    <span
+                                      className="pointer-fine:hidden absolute top-1/2 left-1/2 size-[max(100%,3rem)] -translate-1/2"
+                                      aria-hidden="true"
+                                    />
+                                    <X className="size-4 shrink-0" />
+                                  </Button>
                                 )}
-                              />
-                            </div>
-                            {!templateVar && (
-                              <Button
-                                type="button"
-                                variant="ghost"
-                                size="sm"
-                                onClick={() => removeEnvironmentVariable(index)}
-                                className="text-destructive hover:text-destructive h-8 w-8 p-0 mt-6"
-                                aria-label={`Remove environment variable ${index + 1}`}
-                                title="Remove variable"
-                              >
-                                <X className="h-4 w-4" />
-                              </Button>
+                              </div>
                             )}
-                          </div>
-                        </CardContent>
-                      </Card>
-                    )
-                  })}
+                          />
+                        </div>
+                      )
+                    })}
+                  </div>
                 </div>
               ) : (
                 <div className="text-center py-8">
@@ -1724,6 +2005,9 @@ export function TemplateConfigurator({
           if (!open) setSelectedServiceType(null)
         }}
         serviceType={selectedServiceType || 'postgres'}
+        successMessage={(service) =>
+          `Database "${service.name}" created successfully!`
+        }
         onSuccess={(service: ExternalServiceInfo) => {
           setIsCreateServiceDialogOpen(false)
           setSelectedServiceType(null)
@@ -1743,7 +2027,6 @@ export function TemplateConfigurator({
             Array.from(new Set([...currentServices, service.id]))
           )
           void refetchServices()
-          toast.success(`Database "${service.name}" created successfully!`)
         }}
       />
     </div>

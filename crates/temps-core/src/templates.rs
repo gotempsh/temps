@@ -79,6 +79,8 @@ pub struct TemplateResources {
     #[serde(default)]
     pub cpu_request: Option<i32>,
     #[serde(default)]
+    pub cpu_limit: Option<i32>,
+    #[serde(default)]
     pub memory_request: Option<i32>,
     #[serde(default)]
     pub memory_limit: Option<i32>,
@@ -362,6 +364,7 @@ const BUNDLED_TELEMETRY_TEMPLATE_SLUGS: &[&str] = &[
     "nextjs-saas-starter",
     "nextjs-docs-template",
     "keycloak",
+    "browserless",
 ];
 
 /// Return a bundled template only when the slug is part of the embedded,
@@ -604,12 +607,20 @@ impl TemplateService {
         if let Some(resources) = &template.resources {
             for (name, value) in [
                 ("cpu_request", resources.cpu_request),
+                ("cpu_limit", resources.cpu_limit),
                 ("memory_request", resources.memory_request),
                 ("memory_limit", resources.memory_limit),
             ] {
                 if value.is_some_and(|value| value <= 0) {
                     errors.push(format!("Template resource {name} must be positive"));
                 }
+            }
+            if resources
+                .cpu_request
+                .zip(resources.cpu_limit)
+                .is_some_and(|(request, limit)| request > limit)
+            {
+                errors.push("Template cpu_request cannot exceed cpu_limit".to_string());
             }
             if resources
                 .memory_request
@@ -965,10 +976,21 @@ templates:
 
         assert_eq!(template.kind, TemplateKind::Service);
         assert_eq!(
+            template.image_url.as_deref(),
+            Some("/templates/keycloak.svg")
+        );
+        assert_eq!(
             template.image.as_deref(),
             Some("quay.io/keycloak/keycloak:26.7.2")
         );
         assert_eq!(template.command, Some(vec!["start".to_string()]));
+        assert_eq!(
+            template
+                .resources
+                .as_ref()
+                .and_then(|resources| resources.cpu_limit),
+            Some(1_000_000)
+        );
         assert_eq!(
             template
                 .resources
@@ -986,6 +1008,63 @@ templates:
             Some("POSTGRES_USER")
         );
         assert!(TemplateService::validate_template(&template).is_empty());
+    }
+
+    #[test]
+    fn bundled_browserless_is_a_pinned_authenticated_service() {
+        let template = bundled_template_by_slug("browserless")
+            .expect("Browserless should be part of the reviewed catalog");
+
+        assert_eq!(template.kind, TemplateKind::Service);
+        assert_eq!(
+            template.image_url.as_deref(),
+            Some("/templates/browserless.svg")
+        );
+        assert_eq!(
+            template.image.as_deref(),
+            Some("ghcr.io/browserless/chromium:v2.56.0")
+        );
+        assert_eq!(template.exposed_port, Some(3000));
+        assert_eq!(template.health_check_path.as_deref(), Some("/docs"));
+        assert!(template.services.is_empty());
+
+        let token = template
+            .env_vars
+            .iter()
+            .find(|variable| variable.name == "TOKEN")
+            .expect("Browserless must require an access token");
+        assert!(token.required);
+        assert_eq!(token.default_generator.as_deref(), Some("random_secret"));
+
+        let external = template
+            .env_vars
+            .iter()
+            .find(|variable| variable.name == "EXTERNAL")
+            .expect("Browserless must know its proxy-facing URL");
+        assert!(external.required);
+        assert_eq!(external.default_generator.as_deref(), Some("app_url"));
+        assert!(TemplateService::validate_template(&template).is_empty());
+    }
+
+    #[test]
+    fn template_resources_reject_requests_above_limits() {
+        let mut template = bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be part of the reviewed catalog");
+        let resources = template
+            .resources
+            .as_mut()
+            .expect("Keycloak should define a runtime profile");
+        resources.cpu_request = Some(2_000_000);
+        resources.cpu_limit = Some(1_000_000);
+
+        let errors = TemplateService::validate_template(&template);
+
+        assert!(
+            errors
+                .iter()
+                .any(|error| error == "Template cpu_request cannot exceed cpu_limit"),
+            "unexpected validation errors: {errors:?}"
+        );
     }
 
     #[test]

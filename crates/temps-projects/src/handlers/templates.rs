@@ -220,6 +220,32 @@ pub struct CreateProjectFromTemplateRequest {
     /// fork mode; public-repo deploys cannot receive push webhooks.
     #[serde(default = "default_true")]
     pub automatic_deploy: bool,
+    /// Optional prebuilt-image override. Curated template values remain the
+    /// default when this is omitted. Accepted only for image templates.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Optional image entrypoint arguments. An empty list explicitly uses the
+    /// image's own default command instead of the template command.
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
+    /// CPU request override in microcores (1_000_000 = one CPU core).
+    #[serde(default)]
+    pub cpu_request: Option<i32>,
+    /// CPU limit override in microcores. Zero means uncapped.
+    #[serde(default)]
+    pub cpu_limit: Option<i32>,
+    /// Memory request override in MiB.
+    #[serde(default)]
+    pub memory_request: Option<i32>,
+    /// Memory limit override in MiB. Zero means uncapped.
+    #[serde(default)]
+    pub memory_limit: Option<i32>,
+    /// Public container port override.
+    #[serde(default)]
+    pub exposed_port: Option<i32>,
+    /// Relative HTTP health-check path override.
+    #[serde(default)]
+    pub health_check_path: Option<String>,
 }
 
 fn default_private() -> bool {
@@ -237,9 +263,9 @@ pub struct EnvVarInput {
     pub name: String,
     /// Variable value
     pub value: String,
-    /// Mark the variable as a write-only secret. Secret values are encrypted at
-    /// rest and never returned in plaintext by the API — they can only be
-    /// replaced, not read back. Defaults to `false`.
+    /// Mark the variable as a secret. Secret values are encrypted at rest,
+    /// masked in list responses, and revealable only through an audited,
+    /// permission-checked endpoint. Defaults to `false`.
     #[serde(default)]
     pub is_secret: bool,
 }

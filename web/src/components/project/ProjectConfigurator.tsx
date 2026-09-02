@@ -772,10 +772,7 @@ export function ProjectConfigurator({
       query: { branch: selectedBranch },
     }),
     enabled:
-      !providedPresetData &&
-      !publicRepo &&
-      !!repository.id &&
-      !!selectedBranch,
+      !providedPresetData && !publicRepo && !!repository.id && !!selectedBranch,
     // Key includes branch, so React Query will refetch when branch changes
   })
 
@@ -2402,12 +2399,12 @@ export function ProjectConfigurator({
                               htmlFor={`env-var-secret-${index}`}
                               className="text-sm font-medium"
                             >
-                              Encrypt as secret
+                              Treat as secret
                             </FormLabel>
                             <p className="text-muted-foreground text-xs">
-                              Secret values are write-only after creation. Use
-                              this for passwords, tokens, and private connection
-                              strings.
+                              All values are encrypted at rest. Enable this for
+                              stricter masking, permission checks, and audited
+                              reveals.
                             </p>
                           </div>
                         </FormItem>
@@ -2551,6 +2548,9 @@ export function ProjectConfigurator({
             }
           }}
           serviceType={selectedServiceType}
+          successMessage={(service) =>
+            `Database "${service.name}" created successfully!`
+          }
           onSuccess={(service: ExternalServiceInfo) => {
             setIsCreateServiceDialogOpen(false)
             setSelectedServiceType(null)
@@ -2566,7 +2566,6 @@ export function ProjectConfigurator({
               Array.from(new Set([...currentServices, service.id]))
             )
             void refetchServices()
-            toast.success(`Database "${service.name}" created successfully!`)
           }}
         />
       )}

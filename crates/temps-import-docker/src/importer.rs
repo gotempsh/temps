@@ -679,6 +679,7 @@ impl WorkloadImporter for DockerImporter {
             git_provider_connection_id: context.git_provider_connection_id,
             exposed_port: None,
             cpu_request: None,
+            cpu_limit: None,
             memory_request: None,
             memory_limit: None,
             source_type: temps_entities::source_type::SourceType::Git,
