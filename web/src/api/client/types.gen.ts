@@ -5609,6 +5609,12 @@ export type DeploymentMetadata = {
      */
     builder?: string | null;
     /**
+     * Command passed to a prebuilt image entrypoint. Stored in deployment
+     * metadata so redeploy, rollback, and node failover reproduce the exact
+     * workload rather than falling back to the image default.
+     */
+    command?: Array<string> | null;
+    /**
      * Deployment duration in milliseconds
      */
     deploymentDurationMs?: number | null;
@@ -10638,6 +10644,7 @@ export type ListTemplatesQuery = {
      * Only return featured templates
      */
     featured?: boolean | null;
+    kind?: null | TemplateKind;
     /**
      * Filter templates by tag
      */
@@ -19134,9 +19141,18 @@ export type TeamResponse = {
 export type TeamRole = 'owner' | 'admin' | 'deployer' | 'viewer';
 
 /**
+ * Where a template is presented in the project creation flow.
+ */
+export type TemplateKind = 'starter' | 'service';
+
+/**
  * Response type for a single template
  */
 export type TemplateResponse = {
+    /**
+     * Optional command passed to the image entrypoint.
+     */
+    command?: Array<string> | null;
     /**
      * Short description
      */
@@ -19174,6 +19190,18 @@ export type TemplateResponse = {
      * Whether the template is featured/promoted
      */
     is_featured: boolean;
+    /**
+     * Gallery this template belongs to.
+     */
+    kind: TemplateKind;
+    /**
+     * Managed-service environment aliases used at deployment time.
+     */
+    managed_service_bindings: {
+        [key: string]: {
+            [key: string]: string;
+        };
+    };
     /**
      * Display name
      */
@@ -54662,6 +54690,10 @@ export type ListProjectTemplatesData = {
          * Only return featured templates
          */
         featured?: boolean;
+        /**
+         * Filter by gallery: starter or service
+         */
+        kind?: TemplateKind;
     };
     url: '/templates';
 };

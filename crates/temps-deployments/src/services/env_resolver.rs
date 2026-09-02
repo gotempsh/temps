@@ -80,6 +80,18 @@ pub enum DeploymentEnvResolutionError {
     },
 
     #[error(
+        "Managed service binding '{target}' for template '{template_slug}' could not read '{source_variable}' from the linked {service} service in project {project_id}, environment {environment_id}"
+    )]
+    ManagedServiceBindingMissing {
+        project_id: i32,
+        environment_id: i32,
+        template_slug: String,
+        service: String,
+        target: String,
+        source_variable: String,
+    },
+
+    #[error(
         "Secrets-manager resolution failed for project {project_id}, environment {environment_id}: {reason}. Verify provider connectivity and credentials"
     )]
     SecretsManager {
@@ -176,6 +188,41 @@ pub(super) fn merge_environment_variable_layers(
 ) {
     resolved.extend(linked_service_vars);
     resolved.extend(explicit_project_vars);
+}
+
+/// Apply declarative aliases from a reviewed bundled template to the variables
+/// supplied by linked Temps-managed services. Explicit project variables are
+/// merged afterwards and can override these defaults.
+fn apply_managed_service_bindings(
+    linked_service_vars: &mut HashMap<String, String>,
+    template_slug: Option<&str>,
+    project_id: i32,
+    environment_id: i32,
+) -> Result<(), DeploymentEnvResolutionError> {
+    let Some(template_slug) = template_slug else {
+        return Ok(());
+    };
+    let Some(template) = temps_core::templates::bundled_template_by_slug(template_slug) else {
+        return Ok(());
+    };
+
+    for (service, bindings) in template.managed_service_bindings {
+        for (target, source) in bindings {
+            let value = linked_service_vars.get(&source).cloned().ok_or_else(|| {
+                DeploymentEnvResolutionError::ManagedServiceBindingMissing {
+                    project_id,
+                    environment_id,
+                    template_slug: template_slug.to_string(),
+                    service: service.clone(),
+                    target: target.clone(),
+                    source_variable: source.clone(),
+                }
+            })?;
+            linked_service_vars.entry(target).or_insert(value);
+        }
+    }
+
+    Ok(())
 }
 
 /// Apply values owned by the deployment runtime after every tenant-controlled
@@ -370,6 +417,13 @@ impl DeploymentEnvResolver {
                 failures: format!("{} service(s):\n{failure_details}", failed_services.len()),
             });
         }
+
+        apply_managed_service_bindings(
+            &mut linked_service_vars,
+            project.template_slug.as_deref(),
+            project.id,
+            environment.id,
+        )?;
 
         // Linked-service variables are defaults. Explicit project variables
         // express user intent and therefore take precedence on collisions.
@@ -600,8 +654,9 @@ mod tests {
     use temps_entities::preset::Preset;
 
     use super::{
-        apply_deployment_owned_variables, apply_secrets_manager_layer,
-        merge_environment_variable_layers, otel_exporter_headers, DeploymentEnvResolutionError,
+        apply_deployment_owned_variables, apply_managed_service_bindings,
+        apply_secrets_manager_layer, merge_environment_variable_layers, otel_exporter_headers,
+        DeploymentEnvResolutionError,
     };
 
     struct TestSecretsResolver {
@@ -651,6 +706,48 @@ mod tests {
             Some("linked-database")
         );
         assert_eq!(resolved.get("HOST").map(String::as_str), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn keycloak_aliases_are_derived_from_managed_postgres() {
+        let mut linked = HashMap::from([
+            ("POSTGRES_HOST".to_string(), "postgres-12".to_string()),
+            ("POSTGRES_PORT".to_string(), "5432".to_string()),
+            ("POSTGRES_DB".to_string(), "keycloak".to_string()),
+            ("POSTGRES_USER".to_string(), "temps".to_string()),
+            ("POSTGRES_PASSWORD".to_string(), "secret".to_string()),
+        ]);
+
+        apply_managed_service_bindings(&mut linked, Some("keycloak"), 4, 8)
+            .expect("the reviewed Keycloak bindings should resolve");
+
+        assert_eq!(
+            linked.get("KC_DB_URL_HOST"),
+            Some(&"postgres-12".to_string())
+        );
+        assert_eq!(linked.get("KC_DB_URL_PORT"), Some(&"5432".to_string()));
+        assert_eq!(
+            linked.get("KC_DB_URL_DATABASE"),
+            Some(&"keycloak".to_string())
+        );
+        assert_eq!(linked.get("KC_DB_USERNAME"), Some(&"temps".to_string()));
+        assert_eq!(linked.get("KC_DB_PASSWORD"), Some(&"secret".to_string()));
+    }
+
+    #[test]
+    fn missing_required_managed_binding_fails_with_context() {
+        let mut linked = HashMap::new();
+        let error = apply_managed_service_bindings(&mut linked, Some("keycloak"), 4, 8)
+            .expect_err("missing managed PostgreSQL values must fail closed");
+
+        assert!(matches!(
+            error,
+            DeploymentEnvResolutionError::ManagedServiceBindingMissing {
+                project_id: 4,
+                environment_id: 8,
+                ..
+            }
+        ));
     }
 
     #[test]

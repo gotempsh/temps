@@ -1884,6 +1884,7 @@ impl DeploymentService {
         target_environment_id: Option<i32>,
         image_ref: String,
         health_check_path: Option<String>,
+        command: Option<Vec<String>>,
     ) -> Result<(), DeploymentError> {
         if image_ref.is_empty() {
             return Err(DeploymentError::InvalidInput(
@@ -1903,6 +1904,7 @@ impl DeploymentService {
                     target_environment_id,
                     image_ref,
                     health_check_path,
+                    command,
                 },
             ))
             .await
@@ -1950,7 +1952,19 @@ impl DeploymentService {
             .and_then(|m| m.external_image_ref.clone())
         {
             return self
-                .trigger_image_deployment(project_id, Some(environment_id), image_ref, None)
+                .trigger_image_deployment(
+                    project_id,
+                    Some(environment_id),
+                    image_ref,
+                    deploy
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.health_check_path.clone()),
+                    deploy
+                        .metadata
+                        .as_ref()
+                        .and_then(|metadata| metadata.command.clone()),
+                )
                 .await;
         }
 
@@ -8518,7 +8532,7 @@ mod tests {
         let deployment_service = create_deployment_service_for_test(db);
 
         let result = deployment_service
-            .trigger_image_deployment(1, None, String::new(), None)
+            .trigger_image_deployment(1, None, String::new(), None, None)
             .await;
 
         assert!(matches!(result, Err(DeploymentError::InvalidInput(_))));
@@ -8540,6 +8554,7 @@ mod tests {
                 Some(7),
                 "ghcr.io/org/app:latest".to_string(),
                 Some("/healthz".to_string()),
+                Some(vec!["serve".to_string()]),
             )
             .await?;
 
@@ -8558,6 +8573,7 @@ mod tests {
         assert_eq!(job.target_environment_id, Some(7));
         assert_eq!(job.image_ref, "ghcr.io/org/app:latest");
         assert_eq!(job.health_check_path.as_deref(), Some("/healthz"));
+        assert_eq!(job.command, Some(vec!["serve".to_string()]));
         Ok(())
     }
 

@@ -9,6 +9,7 @@ import type { PresetResponse } from '../../api/types.gen.js'
 import { withSpinner } from '../../ui/spinner.js'
 import { printTable, type TableColumn } from '../../ui/table.js'
 import { newline, header, icons, json, colors, info } from '../../ui/output.js'
+import { readAndValidateTemplateFile } from './validate.js'
 
 export function registerTemplatesCommands(program: Command): void {
   const cmd = program
@@ -23,6 +24,22 @@ export function registerTemplatesCommands(program: Command): void {
     .option('--json', 'Output in JSON format')
     .option('--type <type>', 'Filter by project type (server, static)')
     .action(listTemplatesAction)
+
+  cmd
+    .command('validate <file>')
+    .description('Validate a Temps-native template YAML file offline')
+    .option('--json', 'Output in JSON format')
+    .action(async (file: string, options: { json?: boolean }) => {
+      const result = await readAndValidateTemplateFile(file)
+      if (options.json) {
+        json(result)
+      } else if (result.valid) {
+        info(`Valid native template catalog (${result.templateCount} template(s))`)
+      } else {
+        result.errors.forEach((error) => info(`- ${error}`))
+      }
+      if (!result.valid) process.exitCode = 1
+    })
 }
 
 async function listTemplatesAction(options: { json?: boolean; type?: string }): Promise<void> {

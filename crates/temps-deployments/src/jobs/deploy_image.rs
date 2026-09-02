@@ -312,6 +312,8 @@ pub struct DeploymentJobConfig {
     /// scope configured a port, so auto-detection is allowed to run.
     pub configured_port: Option<u16>,
     pub environment_variables: HashMap<String, String>,
+    /// Optional command passed to the container image entrypoint.
+    pub command: Option<Vec<String>>,
     /// Secret values (decrypted plaintext) mounted into the container as
     /// files under `/run/secrets/<KEY>` by the deployer. Never injected as
     /// environment variables; never visible via `docker inspect`.
@@ -380,6 +382,7 @@ impl Default for DeploymentJobConfig {
             port: 8080,
             configured_port: None,
             environment_variables: HashMap::new(),
+            command: None,
             secrets: HashMap::new(),
             resources: ResourceUsage::default(),
             health_check_path: Some("/".to_string()),
@@ -1882,7 +1885,7 @@ impl DeployImageJob {
             resource_limits,
             restart_policy: RestartPolicy::Always,
             log_path,
-            command: None,
+            command: self.config.command.clone(),
             log_config: self.log_config.clone(),
             labels,
         };
@@ -2708,6 +2711,11 @@ impl DeployImageJobBuilder {
 
     pub fn environment_variables(mut self, env_vars: HashMap<String, String>) -> Self {
         self.config.environment_variables = env_vars;
+        self
+    }
+
+    pub fn command(mut self, command: Option<Vec<String>>) -> Self {
+        self.config.command = command;
         self
     }
 

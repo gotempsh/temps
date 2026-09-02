@@ -382,6 +382,7 @@ impl JobProcessorService {
                 external_image_ref: Some(job.image_ref.clone()),
                 deployment_source_type: Some(temps_entities::source_type::SourceType::DockerImage),
                 health_check_path: job.health_check_path.clone(),
+                command: job.command.clone(),
                 ..Default::default()
             };
 

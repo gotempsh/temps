@@ -2126,7 +2126,8 @@ pub async fn generate_preset_dockerfile(
     operation_id = "list_project_templates",
     params(
         ("tag" = Option<String>, Query, description = "Filter templates by tag"),
-        ("featured" = Option<bool>, Query, description = "Only return featured templates")
+        ("featured" = Option<bool>, Query, description = "Only return featured templates"),
+        ("kind" = Option<temps_core::templates::TemplateKind>, Query, description = "Filter by gallery: starter or service")
     ),
     responses(
         (status = 200, description = "List of templates", body = super::templates::ListTemplatesResponse),
@@ -2140,13 +2141,21 @@ pub async fn list_project_templates(
     RequireAuth(_auth): RequireAuth,
     Query(query): Query<super::templates::ListTemplatesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    let templates = if let Some(true) = query.featured {
-        state.template_service.list_featured_templates().await
-    } else if let Some(tag) = query.tag {
-        state.template_service.list_templates_by_tag(&tag).await
-    } else {
-        state.template_service.list_templates().await
-    };
+    let mut templates = state.template_service.list_templates().await;
+    if let Some(kind) = query.kind {
+        templates.retain(|template| template.kind == kind);
+    }
+    if query.featured == Some(true) {
+        templates.retain(|template| template.is_featured);
+    }
+    if let Some(tag) = query.tag {
+        templates.retain(|template| {
+            template
+                .tags
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&tag))
+        });
+    }
 
     let total = templates.len();
     let response = super::templates::ListTemplatesResponse {
@@ -2277,6 +2286,47 @@ fn project_created_from_template_telemetry_event(
     .with("service_count", service_count as i64)
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum TemplateServiceSelectionError {
+    Missing(Vec<String>),
+    Ambiguous(Vec<String>),
+}
+
+fn validate_template_service_selection(
+    required_services: &[String],
+    selected_service_types: &[String],
+) -> Result<(), TemplateServiceSelectionError> {
+    let missing = required_services
+        .iter()
+        .filter(|required| {
+            !selected_service_types
+                .iter()
+                .any(|selected| selected.eq_ignore_ascii_case(required))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(TemplateServiceSelectionError::Missing(missing));
+    }
+
+    let ambiguous = required_services
+        .iter()
+        .filter(|required| {
+            selected_service_types
+                .iter()
+                .filter(|selected| selected.eq_ignore_ascii_case(required))
+                .count()
+                > 1
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if !ambiguous.is_empty() {
+        return Err(TemplateServiceSelectionError::Ambiguous(ambiguous));
+    }
+
+    Ok(())
+}
+
 /// Create a new project from a template
 ///
 /// Creates a new repository from a template and sets up the project with the
@@ -2322,6 +2372,58 @@ pub async fn create_project_from_template(
                 .with_detail(e.to_string())
         })?;
     let template_provenance = temps_core::templates::template_provenance(&template).to_string();
+
+    // The browser normally enforces this selection, but the API must fail
+    // before creating a project when a required managed dependency is absent
+    // or the caller supplied a service of the wrong type.
+    let mut selected_service_types = Vec::with_capacity(request.storage_service_ids.len());
+    for service_id in &request.storage_service_ids {
+        let service = state
+            .external_service_manager
+            .get_service(*service_id)
+            .await
+            .map_err(|error| {
+                error!(
+                    service_id = *service_id,
+                    template = %template.slug,
+                    "Failed to resolve selected managed service: {error}"
+                );
+                temps_core::error_builder::internal_server_error()
+                    .title("Managed Service Lookup Failed")
+                    .detail(format!(
+                        "Could not verify managed service {service_id} for template '{}': {error}",
+                        template.name
+                    ))
+                    .build()
+            })?;
+        selected_service_types.push(service.service_type.to_ascii_lowercase());
+    }
+    if let Err(error) =
+        validate_template_service_selection(&template.services, &selected_service_types)
+    {
+        let (title, detail) = match error {
+            TemplateServiceSelectionError::Missing(services) => (
+                "Managed Service Required",
+                format!(
+                    "Template '{}' requires a linked {} service before it can be deployed",
+                    template.name,
+                    services.join(", ")
+                ),
+            ),
+            TemplateServiceSelectionError::Ambiguous(services) => (
+                "Ambiguous Managed Service Selection",
+                format!(
+                    "Template '{}' accepts exactly one linked {} service",
+                    template.name,
+                    services.join(", ")
+                ),
+            ),
+        };
+        return Err(temps_core::error_builder::bad_request()
+            .title(title)
+            .detail(detail)
+            .build());
+    }
 
     // 2. Build the environment variables from the request (shared by both modes).
     let env_vars: Option<Vec<CreateProjectEnvVar>> = if request.environment_variables.is_empty() {
@@ -2532,6 +2634,7 @@ pub async fn create_project_from_template(
                 target_environment_id: None,
                 image_ref: image_ref.clone(),
                 health_check_path: template.health_check_path.clone(),
+                command: template.command.clone(),
             });
         if let Err(e) = state.project_service.queue_service.send(deploy_job).await {
             error!(
@@ -2615,7 +2718,8 @@ mod tests {
     use super::{
         authorize_storage_service_scopes, compose_path_for_candidate, drop_preset_candidate_from,
         parse_owner_repo_from_git_url, project_created_from_template_telemetry_event,
-        require_git_settings_permissions, service_template_origin_attestation, DropPresetCandidate,
+        require_git_settings_permissions, service_template_origin_attestation,
+        validate_template_service_selection, DropPresetCandidate, TemplateServiceSelectionError,
     };
     use axum::http::StatusCode;
     use chrono::Utc;
@@ -2648,6 +2752,24 @@ mod tests {
         };
 
         AuthContext::new_api_key(user, None, Some(permissions), "test-key".to_string(), 1)
+    }
+
+    #[test]
+    fn template_service_selection_requires_exactly_one_matching_dependency() {
+        let required = vec!["postgres".to_string()];
+
+        assert_eq!(
+            validate_template_service_selection(&required, &[]),
+            Err(TemplateServiceSelectionError::Missing(required.clone()))
+        );
+        assert!(validate_template_service_selection(&required, &["POSTGRES".to_string()]).is_ok());
+        assert_eq!(
+            validate_template_service_selection(
+                &required,
+                &["postgres".to_string(), "postgres".to_string()]
+            ),
+            Err(TemplateServiceSelectionError::Ambiguous(required))
+        );
     }
 
     #[test]

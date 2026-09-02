@@ -1514,6 +1514,14 @@ impl WorkflowExecutionService {
                     .log_service(self.log_service.clone())
                     .failed_container_retention(self.db.clone(), deployment.id);
 
+                if let Some(command) = deployment
+                    .metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.command.clone())
+                {
+                    builder = builder.command(Some(command));
+                }
+
                 // Apply explicit deploy-time health-check path override (image/static
                 // deploys can't read .temps.yaml, so the deploy request carries it on
                 // the deployment metadata). When set, it wins over .temps.yaml.

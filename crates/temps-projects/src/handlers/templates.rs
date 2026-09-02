@@ -16,7 +16,7 @@ use std::sync::Arc;
 use temps_auth::RequireAuth;
 use temps_core::{
     problemdetails::{self, Problem},
-    templates::{EnvVarTemplate, ProjectTemplate, TemplateService},
+    templates::{EnvVarTemplate, ProjectTemplate, TemplateKind, TemplateService},
 };
 use utoipa::{OpenApi, ToSchema};
 
@@ -32,6 +32,8 @@ pub struct ListTemplatesQuery {
     pub tag: Option<String>,
     /// Only return featured templates
     pub featured: Option<bool>,
+    /// Filter by gallery (`starter` or `service`).
+    pub kind: Option<TemplateKind>,
 }
 
 /// Response type for a single template
@@ -41,6 +43,8 @@ pub struct TemplateResponse {
     pub slug: String,
     /// Display name
     pub name: String,
+    /// Gallery this template belongs to.
+    pub kind: TemplateKind,
     /// Short description
     pub description: Option<String>,
     /// URL to template image/icon
@@ -65,10 +69,15 @@ pub struct TemplateResponse {
     /// Prebuilt Docker image reference. When set, the one-click deploy pulls and
     /// runs this image directly (no build); when absent it builds from `git`.
     pub image: Option<String>,
+    /// Optional command passed to the image entrypoint.
+    pub command: Option<Vec<String>>,
     /// Container port the prebuilt image listens on (image deploys only).
     pub exposed_port: Option<i32>,
     /// HTTP health-check path probed after the container starts (image deploys).
     pub health_check_path: Option<String>,
+    /// Managed-service environment aliases used at deployment time.
+    pub managed_service_bindings:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
 }
 
 /// Git repository reference response
@@ -105,6 +114,7 @@ impl From<ProjectTemplate> for TemplateResponse {
         Self {
             slug: template.slug,
             name: template.name,
+            kind: template.kind,
             description: template.description,
             image_url: template.image_url,
             screenshot_url: template.screenshot_url,
@@ -124,8 +134,10 @@ impl From<ProjectTemplate> for TemplateResponse {
                 .collect(),
             is_featured: template.is_featured,
             image: template.image,
+            command: template.command,
             exposed_port: template.exposed_port,
             health_check_path: template.health_check_path,
+            managed_service_bindings: template.managed_service_bindings,
         }
     }
 }
@@ -288,7 +300,8 @@ pub struct TemplatesApiDoc;
     operation_id = "list_templates",
     params(
         ("tag" = Option<String>, Query, description = "Filter templates by tag"),
-        ("featured" = Option<bool>, Query, description = "Only return featured templates")
+        ("featured" = Option<bool>, Query, description = "Only return featured templates"),
+        ("kind" = Option<TemplateKind>, Query, description = "Filter by gallery: starter or service")
     ),
     responses(
         (status = 200, description = "List of templates", body = ListTemplatesResponse),
@@ -302,13 +315,21 @@ pub async fn list_templates(
     RequireAuth(_auth): RequireAuth,
     Query(query): Query<ListTemplatesQuery>,
 ) -> Result<impl IntoResponse, Problem> {
-    let templates = if let Some(true) = query.featured {
-        state.template_service.list_featured_templates().await
-    } else if let Some(tag) = query.tag {
-        state.template_service.list_templates_by_tag(&tag).await
-    } else {
-        state.template_service.list_templates().await
-    };
+    let mut templates = state.template_service.list_templates().await;
+    if let Some(kind) = query.kind {
+        templates.retain(|template| template.kind == kind);
+    }
+    if query.featured == Some(true) {
+        templates.retain(|template| template.is_featured);
+    }
+    if let Some(tag) = query.tag {
+        templates.retain(|template| {
+            template
+                .tags
+                .iter()
+                .any(|candidate| candidate.eq_ignore_ascii_case(&tag))
+        });
+    }
 
     let total = templates.len();
     let response = ListTemplatesResponse {
@@ -390,6 +411,7 @@ mod tests {
         ProjectTemplate {
             slug: "test-template".to_string(),
             name: "Test Template".to_string(),
+            kind: TemplateKind::Starter,
             description: Some("A test template".to_string()),
             image_url: Some("/templates/test.png".to_string()),
             screenshot_url: Some("/templates/test-screenshot.png".to_string()),
@@ -401,11 +423,13 @@ mod tests {
             preset: "nextjs".to_string(),
             preset_config: None,
             image: None,
+            command: None,
             exposed_port: None,
             health_check_path: None,
             tags: vec!["test".to_string(), "example".to_string()],
             features: vec!["Feature 1".to_string(), "Feature 2".to_string()],
             services: vec!["postgres".to_string()],
+            managed_service_bindings: Default::default(),
             env_vars: vec![EnvVarTemplate {
                 name: "TEST_VAR".to_string(),
                 example: Some("test_value".to_string()),

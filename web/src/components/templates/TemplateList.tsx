@@ -20,12 +20,16 @@ interface TemplateListProps {
   onTemplateSelect: (template: TemplateResponse) => void
   selectedTemplate?: TemplateResponse | null
   showFeaturedFirst?: boolean
+  kind?: 'starter' | 'service'
+  showTagFilter?: boolean
 }
 
 export function TemplateList({
   onTemplateSelect,
   selectedTemplate,
   showFeaturedFirst = true,
+  kind = 'starter',
+  showTagFilter = true,
 }: TemplateListProps) {
   const [searchQuery, setSearchQuery] = useState('')
   const [selectedTag, setSelectedTag] = useState<string | null>(null)
@@ -38,6 +42,7 @@ export function TemplateList({
       query: {
         featured: showFeaturedOnly ? true : undefined,
         tag: selectedTag || undefined,
+        kind,
       },
     }),
   })
@@ -104,7 +109,9 @@ export function TemplateList({
             size="sm"
             onClick={() => setShowFeaturedOnly(!showFeaturedOnly)}
           >
-            <Star className={cn('h-4 w-4 mr-1', showFeaturedOnly && 'fill-current')} />
+            <Star
+              className={cn('h-4 w-4 mr-1', showFeaturedOnly && 'fill-current')}
+            />
             Featured
           </Button>
           <div className="flex items-center border rounded-md">
@@ -129,7 +136,7 @@ export function TemplateList({
       </div>
 
       {/* Tags */}
-      {tagsData?.tags && tagsData.tags.length > 0 && (
+      {showTagFilter && tagsData?.tags && tagsData.tags.length > 0 && (
         <ScrollArea className="w-full whitespace-nowrap">
           <div className="flex gap-2 pb-2">
             <Badge
@@ -158,9 +165,7 @@ export function TemplateList({
         <div className="text-center py-12 text-muted-foreground">
           <p>No templates found</p>
           {searchQuery && (
-            <p className="text-sm mt-1">
-              Try adjusting your search or filters
-            </p>
+            <p className="text-sm mt-1">Try adjusting your search or filters</p>
           )}
         </div>
       ) : (
@@ -185,7 +190,8 @@ export function TemplateList({
 
       {/* Template count */}
       <div className="text-xs text-muted-foreground text-center pt-2">
-        {filteredTemplates.length} of {templatesData?.total ?? 0} templates
+        {filteredTemplates.length} of {templatesData?.total ?? 0}{' '}
+        {kind === 'service' ? 'services' : 'templates'}
       </div>
     </div>
   )

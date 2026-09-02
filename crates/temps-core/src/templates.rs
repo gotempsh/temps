@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -60,6 +61,17 @@ fn default_true() -> bool {
     true
 }
 
+/// Where a template is presented in the project creation flow.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum TemplateKind {
+    /// Source-code starter shown in the regular template gallery.
+    #[default]
+    Starter,
+    /// Curated application service shown in the service gallery.
+    Service,
+}
+
 /// A curated project template
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, ToSchema)]
 pub struct ProjectTemplate {
@@ -67,6 +79,10 @@ pub struct ProjectTemplate {
     pub slug: String,
     /// Display name
     pub name: String,
+    /// Gallery this template belongs to. Older configurations default to a
+    /// source-code starter, preserving their existing behaviour.
+    #[serde(default)]
+    pub kind: TemplateKind,
     /// Short description
     #[serde(default)]
     pub description: Option<String>,
@@ -92,6 +108,11 @@ pub struct ProjectTemplate {
     /// absent, the template builds from source.
     #[serde(default)]
     pub image: Option<String>,
+    /// Optional command passed to the container image. This is needed for
+    /// production images whose default command is intentionally a development
+    /// mode (for example Keycloak).
+    #[serde(default)]
+    pub command: Option<Vec<String>>,
     /// Container port the prebuilt image listens on (used for routing when
     /// deploying from `image`). Falls back to the image's EXPOSE / 3000 default.
     #[serde(default)]
@@ -109,6 +130,13 @@ pub struct ProjectTemplate {
     /// Required external services (e.g., ["postgres", "redis"])
     #[serde(default)]
     pub services: Vec<String>,
+    /// Environment aliases populated from a linked managed service. The outer
+    /// key is the Temps service type and each inner entry maps an application
+    /// variable to a variable supplied by that service.
+    ///
+    /// Example: `postgres.KC_DB_USERNAME: POSTGRES_USER`.
+    #[serde(default)]
+    pub managed_service_bindings: BTreeMap<String, BTreeMap<String, String>>,
     /// Environment variables template
     #[serde(default)]
     pub env_vars: Vec<EnvVarTemplate>,
@@ -184,6 +212,14 @@ impl TemplatesConfig {
         self.templates.iter().find(|t| t.slug == slug)
     }
 
+    /// Get public templates for one gallery.
+    pub fn templates_by_kind(&self, kind: TemplateKind) -> Vec<&ProjectTemplate> {
+        self.templates
+            .iter()
+            .filter(|template| template.is_public && template.kind == kind)
+            .collect()
+    }
+
     /// Get all unique tags
     pub fn all_tags(&self) -> Vec<String> {
         let mut tags: Vec<String> = self
@@ -214,6 +250,38 @@ pub const VALID_SERVICES: &[&str] = &[
     "neo4j",
     "opensearch",
     "valkey",
+];
+
+/// Presets accepted by project creation. Kept here so invalid bundled YAML is
+/// rejected before a user reaches the install form.
+pub const VALID_PRESETS: &[&str] = &[
+    "nextjs",
+    "vite",
+    "astro",
+    "nuxt",
+    "remix",
+    "sveltekit",
+    "solidstart",
+    "angular",
+    "vue",
+    "react",
+    "docusaurus",
+    "rsbuild",
+    "python",
+    "fastapi",
+    "flask",
+    "django",
+    "rails",
+    "go",
+    "rust",
+    "java",
+    "laravel",
+    "dockerfile",
+    "nixpacks",
+    "autopack",
+    "static",
+    "docker-compose",
+    "nodejs",
 ];
 
 /// Validation error for a single template
@@ -277,7 +345,18 @@ const BUNDLED_TELEMETRY_TEMPLATE_SLUGS: &[&str] = &[
     "observability-starter",
     "nextjs-saas-starter",
     "nextjs-docs-template",
+    "keycloak",
 ];
+
+/// Return a bundled template only when the slug is part of the embedded,
+/// reviewed catalog. Runtime configuration files cannot influence this lookup.
+pub fn bundled_template_by_slug(slug: &str) -> Option<ProjectTemplate> {
+    TemplatesConfig::from_yaml(BUNDLED_TEMPLATES)
+        .ok()?
+        .templates
+        .into_iter()
+        .find(|template| template.slug == slug)
+}
 
 /// Stored provenance marker for projects created from an operator-defined
 /// template. The operator's actual slug stays local to the template catalog.
@@ -479,9 +558,42 @@ impl TemplateService {
             }
         }
 
+        for (service, bindings) in &template.managed_service_bindings {
+            if !template
+                .services
+                .iter()
+                .any(|required| required.eq_ignore_ascii_case(service))
+            {
+                errors.push(format!(
+                    "Managed service bindings for '{service}' require it to be listed in services"
+                ));
+            }
+            for (target, source) in bindings {
+                if target.trim().is_empty() || source.trim().is_empty() {
+                    errors.push(format!(
+                        "Managed service binding names for '{service}' cannot be empty"
+                    ));
+                }
+            }
+        }
+
+        if template
+            .command
+            .as_ref()
+            .is_some_and(|command| command.is_empty() || command.iter().any(|part| part.is_empty()))
+        {
+            errors.push("Command must contain only non-empty arguments".to_string());
+        }
+
         // Check for empty preset
         if template.preset.is_empty() {
             errors.push("Preset cannot be empty".to_string());
+        } else if !VALID_PRESETS.contains(&template.preset.as_str()) {
+            errors.push(format!(
+                "Unknown preset '{}'. Valid presets are: {}",
+                template.preset,
+                VALID_PRESETS.join(", ")
+            ));
         }
 
         errors
@@ -569,6 +681,18 @@ impl TemplateService {
         let config = self.config.read().await;
         let mut templates: Vec<_> = config.templates_by_tag(tag).into_iter().cloned().collect();
         templates.sort_by_key(|a| a.sort_order);
+        templates
+    }
+
+    /// Get public templates for one gallery.
+    pub async fn list_templates_by_kind(&self, kind: TemplateKind) -> Vec<ProjectTemplate> {
+        let config = self.config.read().await;
+        let mut templates: Vec<_> = config
+            .templates_by_kind(kind)
+            .into_iter()
+            .cloned()
+            .collect();
+        templates.sort_by_key(|template| template.sort_order);
         templates
     }
 
@@ -789,6 +913,7 @@ templates:
 
         let t = &config.templates[0];
         assert_eq!(t.slug, "minimal");
+        assert_eq!(t.kind, TemplateKind::Starter);
         assert!(t.is_public); // default
         assert!(!t.is_featured); // default
         assert_eq!(t.sort_order, 0); // default
@@ -799,12 +924,36 @@ templates:
     }
 
     #[test]
+    fn bundled_keycloak_is_a_pinned_postgres_backed_service() {
+        let template = bundled_template_by_slug("keycloak")
+            .expect("Keycloak should be part of the reviewed catalog");
+
+        assert_eq!(template.kind, TemplateKind::Service);
+        assert_eq!(
+            template.image.as_deref(),
+            Some("quay.io/keycloak/keycloak:26.7.2")
+        );
+        assert_eq!(template.command, Some(vec!["start".to_string()]));
+        assert_eq!(template.services, vec!["postgres".to_string()]);
+        assert_eq!(
+            template
+                .managed_service_bindings
+                .get("postgres")
+                .and_then(|bindings| bindings.get("KC_DB_USERNAME"))
+                .map(String::as_str),
+            Some("POSTGRES_USER")
+        );
+        assert!(TemplateService::validate_template(&template).is_empty());
+    }
+
+    #[test]
     fn test_serialize_config() {
         let config = TemplatesConfig {
             version: "1".to_string(),
             templates: vec![ProjectTemplate {
                 slug: "test".to_string(),
                 name: "Test Template".to_string(),
+                kind: TemplateKind::Starter,
                 description: Some("A test template".to_string()),
                 image_url: None,
                 screenshot_url: None,
@@ -816,11 +965,13 @@ templates:
                 preset: "nextjs".to_string(),
                 preset_config: None,
                 image: None,
+                command: None,
                 exposed_port: None,
                 health_check_path: None,
                 tags: vec!["test".to_string()],
                 features: vec!["Feature 1".to_string()],
                 services: vec!["postgres".to_string()],
+                managed_service_bindings: BTreeMap::new(),
                 env_vars: vec![],
                 is_public: true,
                 is_featured: false,
