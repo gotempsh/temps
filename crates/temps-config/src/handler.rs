@@ -1781,13 +1781,96 @@ fn preserve_omitted_security_fields(incoming: &mut AppSettings, current: &AppSet
     }
 }
 
-/// Cloud exports require resource-specific permissions and are writable only
-/// through `PATCH /cloud/features`. A generic settings write must not bypass
-/// those guards, even when it submits a complete AppSettings document.
-fn preserve_cloud_export_consent(incoming: &mut AppSettings, current: &AppSettings) {
+/// Which of the operator-tuned `cloud.*` keys a `PUT /settings` body actually
+/// carried.
+///
+/// `AppSettings` deserializes with `#[serde(default)]` at every level, so a body
+/// that never mentions `cloud` produces a `CloudSettings::default()` that is —
+/// once deserialization is done — indistinguishable from one where the client
+/// spelled every default out. That is the whole bug this type exists to fix: the
+/// console's own save has never sent a `cloud` block, so any unrelated settings
+/// save silently reset the ADR-041 outbox ceiling and both ADR-042 spend guards
+/// to their build-time defaults. Worse than the reset, an operator who had
+/// *narrowed* the anomaly factor also had their next unrelated save refused with
+/// a 403, because the guard authorization compares the incoming factor against
+/// the stored one and an absent field reads as "widen it back to 5x".
+///
+/// Absence is therefore read off the wire, once, *before* the body becomes an
+/// `AppSettings`. The obvious cheaper alternative — "if the value equals the
+/// default, treat it as absent" — cannot work here: three of these four fields
+/// have a non-sentinel default, so that rule makes the default unwritable. An
+/// operator who narrowed the factor to 2x could never put it back to 5x, and one
+/// who pointed `backend_url` at a staging Cloud could never point it home again.
+///
+/// An explicit `null` counts as **sent**: a client writing
+/// `"telemetry_bulk_rate_limit_spans_per_sec": null` is asking to clear the
+/// throttle, and honouring that is precisely why presence is tracked rather than
+/// inferred from the value.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CloudFieldsSent {
+    backend_url: bool,
+    telemetry_outbox_max_bytes: bool,
+    telemetry_bulk_rate_limit_spans_per_sec: bool,
+    telemetry_bulk_anomaly_factor: bool,
+}
+
+impl CloudFieldsSent {
+    /// Read key presence from a raw settings document. A `cloud` member that is
+    /// missing, or present but not an object, means the client sent none of
+    /// these fields — a non-object is rejected moments later by deserialization
+    /// anyway, so "sent nothing" is both true and the safe answer.
+    fn from_settings_body(body: &serde_json::Value) -> Self {
+        let Some(cloud) = body.get("cloud").and_then(serde_json::Value::as_object) else {
+            return Self::default();
+        };
+        Self {
+            backend_url: cloud.contains_key("backend_url"),
+            telemetry_outbox_max_bytes: cloud.contains_key("telemetry_outbox_max_bytes"),
+            telemetry_bulk_rate_limit_spans_per_sec: cloud
+                .contains_key("telemetry_bulk_rate_limit_spans_per_sec"),
+            telemetry_bulk_anomaly_factor: cloud.contains_key("telemetry_bulk_anomaly_factor"),
+        }
+    }
+}
+
+/// Keep the parts of the `cloud` block a generic settings write must not change:
+/// the export consent flags always, and every operator-tuned field the client
+/// did not send.
+///
+/// Two rules, both consequences of `PUT /settings` replacing the whole document:
+///
+/// - **Consent is never writable through this endpoint.** Enabling a Cloud
+///   export requires resource-specific permissions and goes through
+///   `PATCH /cloud/features`; a generic settings write must not bypass those
+///   guards even when it submits a complete `AppSettings`. Restored from the DB
+///   unconditionally, whether the client sent it or not.
+/// - **A field the client did not send keeps its stored value.** Applies to
+///   `backend_url` and `telemetry_outbox_max_bytes` (ADR-041) and to both
+///   bulk-activation guards (ADR-042 §3, §6.3). See [`CloudFieldsSent`] for why
+///   "did not send" is read from the request body rather than inferred from the
+///   deserialized value.
+fn preserve_cloud_settings_not_sent_by_every_client(
+    incoming: &mut AppSettings,
+    current: &AppSettings,
+    sent: CloudFieldsSent,
+) {
     incoming.cloud.telemetry_enabled = current.cloud.telemetry_enabled;
     incoming.cloud.backups_enabled = current.cloud.backups_enabled;
     incoming.cloud.notifications_enabled = current.cloud.notifications_enabled;
+
+    if !sent.backend_url {
+        incoming.cloud.backend_url = current.cloud.backend_url.clone();
+    }
+    if !sent.telemetry_outbox_max_bytes {
+        incoming.cloud.telemetry_outbox_max_bytes = current.cloud.telemetry_outbox_max_bytes;
+    }
+    if !sent.telemetry_bulk_rate_limit_spans_per_sec {
+        incoming.cloud.telemetry_bulk_rate_limit_spans_per_sec =
+            current.cloud.telemetry_bulk_rate_limit_spans_per_sec;
+    }
+    if !sent.telemetry_bulk_anomaly_factor {
+        incoming.cloud.telemetry_bulk_anomaly_factor = current.cloud.telemetry_bulk_anomaly_factor;
+    }
 }
 
 /// Trim and validate an optional URL setting (`external_url`/`internal_url`).
@@ -2111,9 +2194,27 @@ async fn update_settings(
     RequireAuth(auth): RequireAuth,
     State(app_state): State<Arc<SettingsState>>,
     Extension(metadata): Extension<RequestMetadata>,
-    Json(mut settings): Json<AppSettings>,
+    Json(body): Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // Taken as raw JSON first, and only then turned into an `AppSettings`,
+    // because which `cloud.*` keys the client sent is information
+    // `#[serde(default)]` destroys: it cannot be recovered from the
+    // deserialized document. See `CloudFieldsSent`.
+    let cloud_fields_sent = CloudFieldsSent::from_settings_body(&body);
+    let mut settings: AppSettings = serde_path_to_error::deserialize(body).map_err(|e| {
+        let field = e.path().to_string();
+        ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Invalid Settings Payload")
+            .detail(format!(
+                "The settings document could not be read at `{}`: {}. Nothing was saved.",
+                field,
+                e.into_inner()
+            ))
+            .value("field", field)
+            .build()
+    })?;
 
     // ADR-042 §6.3: the money guard on bulk Temps Cloud activation. Validated,
     // authorized and captured here — before any other field is touched — for
@@ -2123,12 +2224,18 @@ async fn update_settings(
     // activation endpoints use, and the change is recorded as its own audit
     // event with both sides.
     //
+    // Validated against what the client actually sent, before anything is
+    // merged in from the DB: a stored value that predates a range change, or
+    // was hand-edited, must not make every unrelated save fail with a message
+    // about a field the client never mentioned. `effective_*` clamps such a row
+    // on read.
+    //
     // A read failure aborts the save. Proceeding would mean applying a
     // possibly-widened spend ceiling with neither the check nor the record that
     // are supposed to accompany it.
     validate_bulk_activation_guards(&settings.cloud)?;
-    let previous_bulk_guards = match app_state.config_service.get_settings().await {
-        Ok(current) => BulkActivationGuards::from(&current.cloud),
+    let stored_settings = match app_state.config_service.get_settings().await {
+        Ok(current) => current,
         Err(e) => {
             error!(
                 "Could not read the current Temps Cloud bulk activation guard settings; \
@@ -2138,15 +2245,28 @@ async fn update_settings(
             return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
                 .title("Settings Save Aborted")
                 .detail(format!(
-                    "Could not read the current Temps Cloud bulk activation guard settings, so \
-                     a change to them could be neither authorized nor recorded; the save was \
-                     aborted rather than applied unchecked. Retry the save; if this persists, \
-                     check database connectivity: {}",
+                    "Could not read the current Temps Cloud settings, so a change to the bulk \
+                     activation guards could be neither authorized nor recorded, and the fields \
+                     this client did not send could not be preserved; the save was aborted \
+                     rather than applied unchecked. Retry the save; if this persists, check \
+                     database connectivity: {}",
                     e
                 ))
                 .build());
         }
     };
+
+    // Merge the `cloud` block *before* the guard comparison below, not after:
+    // a save that never mentioned `cloud` is not a request to widen the spend
+    // guard back to its default, and must be neither refused as one (403) nor
+    // recorded as one in the audit log.
+    preserve_cloud_settings_not_sent_by_every_client(
+        &mut settings,
+        &stored_settings,
+        cloud_fields_sent,
+    );
+
+    let previous_bulk_guards = BulkActivationGuards::from(&stored_settings.cloud);
     let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
     authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
@@ -2203,7 +2323,9 @@ async fn update_settings(
             // out of `current_settings` below.
             preserve_self_recorded_fields(&mut settings, &current_settings);
             preserve_omitted_security_fields(&mut settings, &current_settings);
-            preserve_cloud_export_consent(&mut settings, &current_settings);
+            // The `cloud` block was already merged, further up: the ADR-042
+            // guard authorization depends on the merged value, so it cannot
+            // wait until here.
 
             // Per-provider credentials: keep existing unless caller supplied a new one
             for (id, current_cfg) in current_settings.agent_sandbox.providers.iter() {
@@ -3063,7 +3185,11 @@ mod tests {
         incoming.cloud.backups_enabled = true;
         incoming.cloud.notifications_enabled = true;
 
-        preserve_cloud_export_consent(&mut incoming, &current);
+        preserve_cloud_settings_not_sent_by_every_client(
+            &mut incoming,
+            &current,
+            CloudFieldsSent::default(),
+        );
 
         assert!(!incoming.cloud.telemetry_enabled);
         assert!(!incoming.cloud.backups_enabled);
@@ -3078,11 +3204,172 @@ mod tests {
         current.cloud.notifications_enabled = true;
         let mut incoming = AppSettings::default();
 
-        preserve_cloud_export_consent(&mut incoming, &current);
+        preserve_cloud_settings_not_sent_by_every_client(
+            &mut incoming,
+            &current,
+            CloudFieldsSent::default(),
+        );
 
         assert!(incoming.cloud.telemetry_enabled);
         assert!(incoming.cloud.backups_enabled);
         assert!(incoming.cloud.notifications_enabled);
+    }
+
+    /// A settings row whose operator-tuned Cloud fields have all been moved off
+    /// their defaults, so that "reset to default" is visible as a failure.
+    fn stored_settings_with_tuned_cloud_fields() -> AppSettings {
+        let mut current = AppSettings::default();
+        // ADR-041: a bigger outbox than the 512 MiB default, and a Cloud that
+        // is not the production one.
+        current.cloud.backend_url = "https://cloud.staging.example".to_string();
+        current.cloud.telemetry_outbox_max_bytes = 1024 * 1024 * 1024;
+        // ADR-042: a narrowed spend guard and a throttled backfill.
+        current.cloud.telemetry_bulk_anomaly_factor = Some(2.0);
+        current.cloud.telemetry_bulk_rate_limit_spans_per_sec = Some(5_000);
+        current
+    }
+
+    /// Mirror exactly what `update_settings` does with a request body: read key
+    /// presence off the raw JSON, deserialize, then merge the stored `cloud`
+    /// block in. Testing from the wire format is the point — the bug being
+    /// guarded against lives in the gap between "key absent" and "value equals
+    /// the default", which no test built from an `AppSettings` value could see.
+    fn merge_settings_body(body: serde_json::Value, current: &AppSettings) -> AppSettings {
+        let sent = CloudFieldsSent::from_settings_body(&body);
+        let mut incoming: AppSettings =
+            serde_json::from_value(body).expect("settings body should deserialize");
+        preserve_cloud_settings_not_sent_by_every_client(&mut incoming, current, sent);
+        incoming
+    }
+
+    /// The console's own save has never carried a `cloud` block, and no client
+    /// built before ADR-041/ADR-042 does either. Such a save must leave every
+    /// operator-tuned Cloud field exactly as stored, not reset it to the
+    /// build-time default.
+    #[test]
+    fn a_settings_save_that_omits_the_cloud_block_keeps_the_stored_spend_guards() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        // A realistic unrelated save: some other settings page, no `cloud` key.
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "preview_domain": "apps.example.test",
+                "insecure_tls": false,
+            }),
+            &current,
+        );
+
+        // ADR-042 §6.3 — the narrowed money guard survives.
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, Some(2.0));
+        assert_eq!(merged.cloud.effective_bulk_anomaly_factor(), 2.0);
+        assert_ne!(
+            merged.cloud.effective_bulk_anomaly_factor(),
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // ADR-042 §3 — the throttle survives.
+        assert_eq!(
+            merged.cloud.telemetry_bulk_rate_limit_spans_per_sec,
+            Some(5_000)
+        );
+        // ADR-041 — the outbox ceiling and the Cloud destination survive.
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(merged.cloud.backend_url, "https://cloud.staging.example");
+    }
+
+    /// The same save must also not *look* like a guard change, or an operator
+    /// holding only `settings:write` would be refused with a 403 (widening 2x
+    /// back to the 5x default is instance-admin only) and the audit log would
+    /// record a spend-guard change that nobody made.
+    #[test]
+    fn a_settings_save_that_omits_the_cloud_block_is_not_a_guard_change() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({ "preview_domain": "apps.example.test" }),
+            &current,
+        );
+
+        assert_eq!(
+            BulkActivationGuards::from(&merged.cloud),
+            BulkActivationGuards::from(&current.cloud)
+        );
+    }
+
+    /// Preserving is not freezing: a client that names a field still writes it,
+    /// including writing it *back to its default value* — the case a
+    /// "value equals the default means absent" heuristic would silently drop.
+    #[test]
+    fn an_explicitly_sent_cloud_field_still_overrides_the_stored_one() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "cloud": {
+                    "telemetry_bulk_anomaly_factor": 7.5,
+                    "backend_url": "https://app.temps.sh",
+                }
+            }),
+            &current,
+        );
+
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, Some(7.5));
+        // Explicitly restoring the default destination is a real write.
+        assert_eq!(merged.cloud.backend_url, "https://app.temps.sh");
+        // The two keys this body did not name are still preserved.
+        assert_eq!(
+            merged.cloud.telemetry_bulk_rate_limit_spans_per_sec,
+            Some(5_000)
+        );
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+    }
+
+    /// An explicit `null` is a value, not an omission: it is how a client
+    /// removes the backfill throttle and returns the anomaly factor to the
+    /// documented default.
+    #[test]
+    fn an_explicit_null_clears_a_cloud_field_instead_of_preserving_it() {
+        let current = stored_settings_with_tuned_cloud_fields();
+
+        let merged = merge_settings_body(
+            serde_json::json!({
+                "cloud": {
+                    "telemetry_bulk_rate_limit_spans_per_sec": null,
+                    "telemetry_bulk_anomaly_factor": null,
+                }
+            }),
+            &current,
+        );
+
+        assert_eq!(merged.cloud.telemetry_bulk_rate_limit_spans_per_sec, None);
+        assert_eq!(merged.cloud.telemetry_bulk_anomaly_factor, None);
+        assert_eq!(
+            merged.cloud.effective_bulk_anomaly_factor(),
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // Still scoped: the unnamed ADR-041 fields are untouched.
+        assert_eq!(merged.cloud.telemetry_outbox_max_bytes, 1024 * 1024 * 1024);
+        assert_eq!(merged.cloud.backend_url, "https://cloud.staging.example");
+    }
+
+    #[test]
+    fn cloud_field_presence_is_read_per_key_from_the_request_body() {
+        let nothing = CloudFieldsSent::from_settings_body(&serde_json::json!({}));
+        assert_eq!(nothing, CloudFieldsSent::default());
+
+        // A `cloud` block that exists but names no operator-tuned field (what a
+        // client that only knows about the consent flags would send).
+        let consent_only = CloudFieldsSent::from_settings_body(&serde_json::json!({
+            "cloud": { "telemetry_enabled": true }
+        }));
+        assert_eq!(consent_only, CloudFieldsSent::default());
+
+        let outbox_only = CloudFieldsSent::from_settings_body(&serde_json::json!({
+            "cloud": { "telemetry_outbox_max_bytes": 1024 }
+        }));
+        assert!(outbox_only.telemetry_outbox_max_bytes);
+        assert!(!outbox_only.backend_url);
+        assert!(!outbox_only.telemetry_bulk_anomaly_factor);
+        assert!(!outbox_only.telemetry_bulk_rate_limit_spans_per_sec);
     }
 
     /// The stored value and the effective value must be the same number.

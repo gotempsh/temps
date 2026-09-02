@@ -275,6 +275,16 @@ export function buildPlatformSettingsUpdateBody(
     // Same reasoning: omitting this would silently reset cluster DNS back to
     // disabled on every unrelated settings save.
     cluster_dns: updated.cluster_dns,
+    // Same reasoning, and the one block with real money attached: omitting
+    // this would reset the Cloud destination and outbox ceiling (ADR-041) and
+    // both bulk-activation spend guards (ADR-042) to their build-time defaults
+    // on every unrelated settings save. `updated` is the server's own GET
+    // response merged with the caller's patch, so this is the stored `cloud`
+    // block round-tripped, not form state — there is no UI control for these
+    // fields yet, and this send path must not depend on one appearing.
+    // The server also preserves unsent `cloud` fields, but a client that knows
+    // the values should not rely on that.
+    cloud: updated.cloud,
     // Same reasoning: omitting this would silently disable the MCP server on
     // every unrelated settings save.
     mcp_server: updated.mcp_server,
