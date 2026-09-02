@@ -11,9 +11,14 @@
 //! The Cloud-side schema is not in this repository. What *is* in this
 //! repository — and is therefore the only contract this side owns — is exactly
 //! what leaves the machine: `temps_cloud_protocol::SpanRecord`, built by
-//! `cloud_span()` at the owning project's consented fidelity. The column names
-//! below are that struct's field names, one for one, because the only shape
-//! Cloud can be storing is the shape it was sent.
+//! `cloud_span()` at the owning project's consented fidelity. Most column
+//! names below are that struct's field names, one for one — **except the
+//! timestamp**: the wire carries `ts_millis` (an epoch-millisecond integer),
+//! but Cloud's ingest path (`temps-app-ingest`) converts it into a
+//! `DateTime64(3)` column named `ts` before storing it, so it can partition
+//! and TTL on it. A query against this table has to use the storage name and
+//! type (`ts`, `DateTime64`), not the wire name and type — this file learned
+//! that the hard way once already; see `git blame` on [`CloudSpanRow`].
 //!
 //! If the two ever diverge, every query fails upstream and nothing on this side
 //! can explain why — the same failure mode
@@ -40,7 +45,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{TimeZone, Utc};
+use chrono::{DateTime, Utc};
 use temps_cloud_client::CloudLink;
 
 use crate::error::{OtelError, StorageErrorKind};
@@ -123,13 +128,19 @@ impl CloudTelemetrySpanSource {
     }
 }
 
-/// One row as Cloud stores it — the wire projection, field for field.
+/// One row as Cloud stores it.
+///
+/// Field for field with the wire `SpanRecord`, except `ts`: Cloud stores the
+/// wire's `ts_millis` integer as an actual `DateTime64(3)` column named `ts`
+/// (see the module docs), so this decodes it the same way
+/// `temps-app-ingest`'s `SpanRow` encodes it.
 #[derive(Debug, clickhouse::Row, serde::Deserialize)]
 struct CloudSpanRow {
     trace_id: String,
     span_id: String,
     name: String,
-    ts_millis: i64,
+    #[serde(with = "clickhouse::serde::chrono::datetime64::millis")]
+    ts: DateTime<Utc>,
     duration_ms: f64,
     service_name: String,
     span_kind: String,
@@ -145,10 +156,7 @@ impl CloudSpanRow {
     /// invented. `project_id` is supplied by the caller, which is the only side
     /// that knows it — Cloud only ever saw a pseudonym.
     fn into_span(self, project_id: i32) -> SpanRecord {
-        let start_time = Utc
-            .timestamp_millis_opt(self.ts_millis)
-            .single()
-            .unwrap_or_else(Utc::now);
+        let start_time = self.ts;
         SpanRecord {
             project_id,
             trace_id: self.trace_id,
@@ -214,11 +222,15 @@ fn trace_filters(query: &TraceQuery) -> String {
     if query.min_duration_ms.is_some() {
         clauses.push("duration_ms >= ?".into());
     }
+    // `ts` is `DateTime64(3)`, and `bind_trace_filters` binds these as raw
+    // millisecond integers (matching every other bound value in this query,
+    // no special-casing) — so the column, not the parameter, is what's cast
+    // for the comparison.
     if query.start_time.is_some() {
-        clauses.push("ts_millis >= ?".into());
+        clauses.push("toUnixTimestamp64Milli(ts) >= ?".into());
     }
     if query.end_time.is_some() {
-        clauses.push("ts_millis <= ?".into());
+        clauses.push("toUnixTimestamp64Milli(ts) <= ?".into());
     }
     if query.root_only {
         clauses.push("parent_span_id = ''".into());
@@ -264,9 +276,9 @@ impl CloudSpanSource for CloudTelemetrySpanSource {
         let project_ref = self.project_ref(query.project_id)?;
         let client = self.client()?;
         let sql = format!(
-            "SELECT trace_id, span_id, name, ts_millis, duration_ms, service_name, span_kind, \
+            "SELECT trace_id, span_id, name, ts, duration_ms, service_name, span_kind, \
                     status_code, parent_span_id, environment \
-             FROM {CLOUD_SPANS_TABLE} WHERE {} ORDER BY ts_millis DESC LIMIT {} OFFSET {}",
+             FROM {CLOUD_SPANS_TABLE} WHERE {} ORDER BY ts DESC LIMIT {} OFFSET {}",
             trace_filters(&query),
             bounded_limit(query.limit),
             query.offset.unwrap_or(0),
@@ -546,7 +558,7 @@ mod tests {
             trace_id: "t".into(),
             span_id: "s".into(),
             name: "GET /".into(),
-            ts_millis: 1_700_000_000_000,
+            ts: DateTime::from_timestamp_millis(1_700_000_000_000).expect("valid millis"),
             duration_ms: 12.5,
             service_name: "api".into(),
             span_kind: "server".into(),
