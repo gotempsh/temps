@@ -71,6 +71,11 @@ interface JsonSchemaFormProps {
   cancelText?: string
   showCancel?: boolean
   isSubmitting?: boolean
+  /** Disables the submit button without showing the submitting spinner —
+   *  for parent-owned validation (e.g. a required field tracked outside
+   *  this form's own schema) that must block submission before the
+   *  request is ever attempted. */
+  submitDisabled?: boolean
   initialValues?: Record<string, string | null>
   pairedFields?: [string, string][]
   hiddenFields?: string[]
@@ -228,6 +233,7 @@ export function JsonSchemaForm({
   cancelText = 'Cancel',
   showCancel = true,
   isSubmitting = false,
+  submitDisabled = false,
   initialValues = {},
   pairedFields = [
     ['host', 'port'],
@@ -665,7 +671,7 @@ export function JsonSchemaForm({
               {cancelText}
             </Button>
           )}
-          <Button type="submit" disabled={isSubmitting}>
+          <Button type="submit" disabled={isSubmitting || submitDisabled}>
             {isSubmitting ? (
               <>
                 <Loader2 className="h-4 w-4 mr-2 animate-spin" />

@@ -568,7 +568,7 @@ export function RedeploymentModal({
                   onValueChange={handleEnvironmentChange}
                   disabled={environmentsQuery.isLoading}
                 >
-                  <SelectTrigger>
+                  <SelectTrigger id="image-environment">
                     <SelectValue
                       placeholder={
                         environmentsQuery.isLoading
@@ -999,7 +999,7 @@ export function RedeploymentModal({
                   onValueChange={handleEnvironmentChange}
                   disabled={environmentsQuery.isLoading}
                 >
-                  <SelectTrigger>
+                  <SelectTrigger id="environment">
                     <SelectValue
                       placeholder={
                         environmentsQuery.isLoading

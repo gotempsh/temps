@@ -576,10 +576,24 @@ export function CreateService() {
             value={serviceName}
             onChange={(e) => setServiceName(e.target.value)}
             placeholder={`my-${serviceType}`}
+            aria-invalid={!serviceName.trim()}
+            aria-describedby="serviceName-description"
           />
-          <p className="text-sm text-muted-foreground">
-            A unique name to identify this service
-          </p>
+          {serviceName.trim() ? (
+            <p
+              id="serviceName-description"
+              className="text-sm text-muted-foreground"
+            >
+              A unique name to identify this service
+            </p>
+          ) : (
+            <p
+              id="serviceName-description"
+              className="text-sm text-destructive"
+            >
+              Service name is required
+            </p>
+          )}
         </div>
 
         {/* Topology Selector (only for service types that support clustering AND when worker nodes exist) */}
@@ -703,6 +717,7 @@ export function CreateService() {
               ? `Create ${serviceName.trim()}`
               : 'Create Service'
           }
+          submitDisabled={!serviceName.trim()}
           isSubmitting={createServiceMut.isPending}
           serviceType={serviceType}
           managedByTemps
