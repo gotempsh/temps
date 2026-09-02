@@ -304,6 +304,23 @@ impl ServeCommand {
             runtime_context.clone(),
         ));
 
+        // Resolve Traefik label discovery config here — BEFORE the route table
+        // listener's initial load is kicked off below — and tell the route
+        // table which Docker network (if any) this process may serve adopted
+        // containers from. The watcher itself is started much later (it needs
+        // the Docker handle), but the *reader* side has to know from the very
+        // first load: without this, previously adopted `traefik_discovered_routes`
+        // rows would keep routing after an operator turned discovery off or
+        // repointed it at a different network, since nothing would ever delete
+        // rows the (now stopped) reconciler owns.
+        let traefik_discovery_config =
+            temps_deployer::traefik_discovery::TraefikDiscoveryConfig::from_env("temps");
+        route_table.set_traefik_discovery_network(
+            traefik_discovery_config
+                .enabled
+                .then(|| traefik_discovery_config.network.clone()),
+        );
+
         // ADR-012-lite: every successful route_table reload also
         // reconciles internal `<env>.<project>.temps.local` A records,
         // so the L7 routes and the internal DNS zone share one trigger
@@ -569,6 +586,71 @@ impl ServeCommand {
             temps_agents::preview_gateway::spawn_reconcile(&rt, docker, db.clone(), data_dir);
         }
 
+        // Traefik-label discovery: adopt containers the operator already runs
+        // (an existing docker-compose / Coolify / Dokploy stack) into the route
+        // table by reading their `traefik.*` labels. Opt-in and OFF by default
+        // — it changes routing for workloads that were never deployed through
+        // Temps, so it must be an explicit operator decision.
+        //
+        // It writes `traefik_discovered_routes` rows rather than touching an
+        // in-memory table, so the existing route_table_changes NOTIFY path
+        // carries every change to the split-mode `temps proxy` process and to
+        // every other control plane node. That is also why this only runs here
+        // and not in `temps proxy`: one writer per Docker daemon, many readers.
+        //
+        // The handle built here is handed to the console so
+        // `GET /traefik-discovery/status` answers with this process's real
+        // state. It is built in EVERY case — including "off" and "Docker
+        // unavailable" — because an unconfigured feature must onboard rather
+        // than disappear (CLAUDE.md, Feature Discoverability): the endpoint
+        // returns `configured: false` plus the reason and the env vars that
+        // would enable it.
+        let traefik_discovery_handle = {
+            use temps_deployer::traefik_discovery::{
+                TraefikDiscoveryHandle, TraefikDiscoveryService, ENABLED_ENV,
+            };
+
+            // Resolved once, up where the route table is created, so the reader
+            // (route table) and the writer (this watcher) can never disagree
+            // about which network is in play. Same network `DockerRuntime` is
+            // constructed with above, so an operator who only flips the enable
+            // flag watches a network the proxy can actually reach.
+            let discovery_config = traefik_discovery_config.clone();
+            Arc::new(if !discovery_config.enabled {
+                TraefikDiscoveryHandle::not_running(
+                    discovery_config,
+                    format!("{ENABLED_ENV} is not set to 'true' on this server"),
+                )
+            } else {
+                match docker_handle.clone() {
+                    Some(docker) => {
+                        let discovery = Arc::new(TraefikDiscoveryService::new(
+                            docker,
+                            db.clone(),
+                            discovery_config,
+                            Some(route_table.clone()
+                                as Arc<dyn temps_core::route_table::RouteTableRefresher>),
+                        ));
+                        discovery.clone().start(rt.handle());
+                        TraefikDiscoveryHandle::running(discovery)
+                    }
+                    None => {
+                        warn!(
+                            "{} is set, but Docker is not reachable from this server — no \
+                             containers can be inspected, so Traefik label discovery is not \
+                             running",
+                            ENABLED_ENV
+                        );
+                        TraefikDiscoveryHandle::not_running(
+                            discovery_config,
+                            "Docker is not reachable from this server, so no containers can be \
+                             inspected for Traefik labels",
+                        )
+                    }
+                }
+            })
+        };
+
         // Build the admin-gate handle up-front so both the console listener
         // and the Pingora proxy see the same source of truth. Env precedence
         // is resolved here; the DB is consulted on first read inside the
@@ -655,6 +737,7 @@ impl ServeCommand {
             project_ip_gate_slot: project_ip_gate_slot.clone(),
             update_status,
             self_updater,
+            traefik_discovery: traefik_discovery_handle,
         };
 
         if self.role == ServeRole::Console {

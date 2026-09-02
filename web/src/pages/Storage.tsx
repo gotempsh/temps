@@ -296,6 +296,7 @@ function ServiceActions({
         size="icon"
         onClick={() => onEdit(service)}
         className="size-8"
+        aria-label={`Edit ${service.name}`}
       >
         <Pencil className="size-3.5" />
       </Button>

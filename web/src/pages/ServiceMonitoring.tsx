@@ -80,6 +80,10 @@ import {
   CartesianGrid,
 } from 'recharts'
 import { formatBytes } from '@/lib/utils'
+import {
+  SERVICE_ALERT_COMPARATOR_OPTIONS,
+  type ServiceAlertComparator,
+} from '@/lib/service-alert-comparator'
 
 // ---------------------------------------------------------------------------
 // View-model types (derived from the generated SDK responses)
@@ -89,10 +93,10 @@ import { formatBytes } from '@/lib/utils'
  *  `metrics/latest` endpoint returns. */
 type MetricLatest = { name: string; value: number }
 
-/** Alert-rule form-state unions. The API accepts `comparator`/`severity` as
- *  plain strings; these constrain the UI selects to the supported values. */
-type Comparator = 'gt' | 'lt' | 'gte' | 'lte'
-type Severity = 'info' | 'warning' | 'critical'
+/** Alert-rule form-state union for `severity`. The API accepts it as a plain
+ *  string; this constrains the UI select to the supported values.
+ *  `comparator` has its own type — see `@/lib/service-alert-comparator`. */
+type Severity = 'warning' | 'critical'
 
 /** Extract a comparable message from whatever the SDK throws on a failed
  *  request. `@hey-api/client-fetch` throws the parsed RFC 7807 Problem body
@@ -774,7 +778,7 @@ function AddAlertRuleDialog({
   const [name, setName] = useState('')
   const [metricName, setMetricName] = useState(ALL_METRICS[engine][0] ?? '')
   const [threshold, setThreshold] = useState('0')
-  const [comparator, setComparator] = useState<Comparator>('gt')
+  const [comparator, setComparator] = useState<ServiceAlertComparator>('>')
   const [severity, setSeverity] = useState<Severity>('warning')
 
   const create = useMutation({
@@ -787,7 +791,9 @@ function AddAlertRuleDialog({
       setThreshold('0')
     },
     onError: (err: Error) =>
-      toast.error('Failed to create alert rule', { description: err.message }),
+      toast.error('Failed to create alert rule', {
+        description: metricsErrorText(err),
+      }),
   })
 
   return (
@@ -801,21 +807,28 @@ function AddAlertRuleDialog({
         </DialogHeader>
         <div className="space-y-4 py-2">
           <div className="space-y-1.5">
-            <label className="text-sm font-medium text-foreground">
+            <label
+              htmlFor="alert-rule-name"
+              className="text-sm font-medium text-foreground"
+            >
               Rule name
             </label>
             <Input
+              id="alert-rule-name"
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="e.g. High connection count"
             />
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium text-foreground">
+            <label
+              htmlFor="alert-rule-metric"
+              className="text-sm font-medium text-foreground"
+            >
               Metric
             </label>
             <Select value={metricName} onValueChange={setMetricName}>
-              <SelectTrigger>
+              <SelectTrigger id="alert-rule-metric" aria-label="Metric">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -829,29 +842,42 @@ function AddAlertRuleDialog({
           </div>
           <div className="flex gap-3">
             <div className="w-32 space-y-1.5">
-              <label className="text-sm font-medium text-foreground">
+              <label
+                htmlFor="alert-rule-comparator"
+                className="text-sm font-medium text-foreground"
+              >
                 Comparator
               </label>
               <Select
                 value={comparator}
-                onValueChange={(v) => setComparator(v as Comparator)}
+                onValueChange={(v) =>
+                  setComparator(v as ServiceAlertComparator)
+                }
               >
-                <SelectTrigger>
+                <SelectTrigger
+                  id="alert-rule-comparator"
+                  aria-label="Comparator"
+                >
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="gt">&gt; greater than</SelectItem>
-                  <SelectItem value="gte">&ge; greater or equal</SelectItem>
-                  <SelectItem value="lt">&lt; less than</SelectItem>
-                  <SelectItem value="lte">&le; less or equal</SelectItem>
+                  {SERVICE_ALERT_COMPARATOR_OPTIONS.map((opt) => (
+                    <SelectItem key={opt.value} value={opt.value}>
+                      {opt.label}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
             <div className="flex-1 space-y-1.5">
-              <label className="text-sm font-medium text-foreground">
+              <label
+                htmlFor="alert-rule-threshold"
+                className="text-sm font-medium text-foreground"
+              >
                 Threshold
               </label>
               <Input
+                id="alert-rule-threshold"
                 type="number"
                 value={threshold}
                 onChange={(e) => setThreshold(e.target.value)}
@@ -859,18 +885,20 @@ function AddAlertRuleDialog({
             </div>
           </div>
           <div className="space-y-1.5">
-            <label className="text-sm font-medium text-foreground">
+            <label
+              htmlFor="alert-rule-severity"
+              className="text-sm font-medium text-foreground"
+            >
               Severity
             </label>
             <Select
               value={severity}
               onValueChange={(v) => setSeverity(v as Severity)}
             >
-              <SelectTrigger>
+              <SelectTrigger id="alert-rule-severity" aria-label="Severity">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="info">Info</SelectItem>
                 <SelectItem value="warning">Warning</SelectItem>
                 <SelectItem value="critical">Critical</SelectItem>
               </SelectContent>

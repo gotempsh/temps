@@ -28,8 +28,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use temps_core::EncryptionService;
 use temps_entities::{
-    backup_schedule_services, backup_schedules, external_service_health_checks, external_services,
-    project_services, s3_sources,
+    backup_schedule_services, backup_schedules, external_service_backups,
+    external_service_health_checks, external_services, project_services, s3_sources,
 };
 use temps_metrics::{MetricKind, MetricPoint, MetricsStore, SourceKind};
 use temps_monitoring::alarm_service::{AlarmService, AlarmSeverity, AlarmType, FireAlarmRequest};
@@ -74,6 +74,19 @@ pub enum HealthMonitorError {
 
     #[error("External service {id} not found")]
     ServiceNotFound { id: i32 },
+
+    /// The MariaDB binlog-retention anchor could not be established, so no
+    /// archived segment may be deleted this run. Carries the service and the
+    /// concrete reason because the only signal an operator gets is the log
+    /// line — an unexplained "not pruning" is indistinguishable from a bug.
+    #[error(
+        "MariaDB binlog retention anchor for service {service_id} ('{service_name}') is undetermined: {reason}"
+    )]
+    BinlogRetentionAnchor {
+        service_id: i32,
+        service_name: String,
+        reason: String,
+    },
 }
 
 /// Background loop that keeps `external_services.health_status` in sync with
@@ -519,6 +532,11 @@ impl ExternalServiceHealthMonitor {
                         shipped,
                         "Archived MariaDB binlog segment(s) to S3"
                     );
+                    // Retention counterpart to the ship. Only after something
+                    // new landed — a no-op tick cannot have made an older
+                    // segment newly unreachable, so there is nothing to prune.
+                    self.prune_mariadb_binlogs(service, &mariadb, &s3_client, &s3_source)
+                        .await;
                 }
             }
             Err(e) => {
@@ -529,6 +547,148 @@ impl ExternalServiceHealthMonitor {
                 );
             }
         }
+    }
+
+    /// Delete archived binlog segments that no retained base backup can reach.
+    ///
+    /// `archive_binlogs` only ever uploads, so without this the `binlog/`
+    /// prefix grows for the life of the service. The anchor is the recorded
+    /// `binlog_file` of the OLDEST retained physical base backup: PITR replay
+    /// always starts at its base's own coordinate, so nothing older than the
+    /// oldest base is reachable from any retained backup.
+    ///
+    /// Failures are logged and swallowed, like the archive itself — losing a
+    /// prune run costs storage, never data.
+    async fn prune_mariadb_binlogs(
+        &self,
+        service: &external_services::Model,
+        mariadb: &MariaDbService,
+        s3_client: &aws_sdk_s3::Client,
+        s3_source: &s3_sources::Model,
+    ) {
+        let anchor = match self
+            .oldest_retained_mariadb_base_anchor(service, mariadb, s3_client, s3_source)
+            .await
+        {
+            Ok(Some(anchor)) => anchor,
+            Ok(None) => {
+                debug!(
+                    service_id = service.id,
+                    service = %service.name,
+                    "No retained MariaDB physical base with a binlog anchor; keeping all archived \
+                     binlog segments"
+                );
+                return;
+            }
+            Err(e) => {
+                warn!(
+                    service_id = service.id,
+                    service = %service.name,
+                    "Could not determine MariaDB binlog retention anchor; keeping all archived \
+                     segments: {}", e
+                );
+                return;
+            }
+        };
+
+        match mariadb
+            .prune_stale_binlogs(s3_client, s3_source, &anchor)
+            .await
+        {
+            Ok(0) => {}
+            Ok(pruned) => {
+                info!(
+                    service_id = service.id,
+                    service = %service.name,
+                    pruned,
+                    anchor = %anchor,
+                    "Pruned stale MariaDB binlog segments from S3"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    service_id = service.id,
+                    service = %service.name,
+                    anchor = %anchor,
+                    "MariaDB binlog prune run failed: {}", e
+                );
+            }
+        }
+    }
+
+    /// Resolve the retention anchor: the `binlog_file` recorded by the OLDEST
+    /// still-retained physical base backup of this service.
+    ///
+    /// Backups are hard-deleted (`delete_backup_model` removes the rows), so
+    /// "retained" is simply "the row still exists in a completed state".
+    ///
+    /// Every ambiguous case returns `Ok(None)` / `Err` — i.e. "do not prune":
+    /// - no completed physical base at all (nothing anchors retention yet, and
+    ///   a base backup may be about to run);
+    /// - a completed physical-engine row whose `s3_location` we cannot read as
+    ///   a base object, which would mean the true oldest base is invisible to
+    ///   us and any anchor we picked would be too new;
+    /// - the oldest base has no binlog coordinate (`pitr: false`), so we
+    ///   cannot say which segments it would have needed.
+    async fn oldest_retained_mariadb_base_anchor(
+        &self,
+        service: &external_services::Model,
+        mariadb: &MariaDbService,
+        s3_client: &aws_sdk_s3::Client,
+        s3_source: &s3_sources::Model,
+    ) -> Result<Option<String>, HealthMonitorError> {
+        use sea_orm::QueryOrder;
+
+        let rows = external_service_backups::Entity::find()
+            .filter(external_service_backups::Column::ServiceId.eq(service.id))
+            .filter(external_service_backups::Column::State.eq("completed"))
+            .order_by_asc(external_service_backups::Column::StartedAt)
+            .all(self.db.as_ref())
+            .await?;
+
+        let mut oldest_base: Option<&temps_entities::external_service_backups::Model> = None;
+        for row in &rows {
+            let is_physical_engine = row
+                .metadata
+                .get("engine")
+                .and_then(|v| v.as_str())
+                .is_some_and(|engine| engine == "mariadb_physical");
+            let is_base_object = MariaDbService::is_physical_base_location(&row.s3_location);
+
+            if is_physical_engine && !is_base_object {
+                // A physical backup we can't locate. Its base could be older
+                // than anything else we found, so we have no trustworthy
+                // anchor — decline rather than prune against a newer one.
+                return Err(HealthMonitorError::BinlogRetentionAnchor {
+                    service_id: service.id,
+                    service_name: service.name.clone(),
+                    reason: format!(
+                        "completed mariadb_physical backup row {} has no usable base location ('{}')",
+                        row.id, row.s3_location
+                    ),
+                });
+            }
+            if is_base_object {
+                oldest_base = Some(row);
+                break;
+            }
+        }
+
+        let Some(base) = oldest_base else {
+            return Ok(None);
+        };
+
+        mariadb
+            .base_binlog_anchor(s3_client, &s3_source.bucket_name, &base.s3_location)
+            .await
+            .map_err(|e| HealthMonitorError::BinlogRetentionAnchor {
+                service_id: service.id,
+                service_name: service.name.clone(),
+                reason: format!(
+                    "failed to read binlog anchor from base backup row {}: {}",
+                    base.id, e
+                ),
+            })
     }
 
     /// Check the per-service interval gate and, if elapsed, record `now` as the

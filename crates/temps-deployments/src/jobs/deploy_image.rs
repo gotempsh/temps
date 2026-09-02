@@ -260,7 +260,20 @@ pub struct DeploymentJobConfig {
     pub namespace: String,
     pub service_name: String,
     pub replicas: u32,
+    /// Fallback container port, used when `configured_port` is `None` and
+    /// image `EXPOSE` auto-detection finds nothing either. Every caller that
+    /// builds a real deployment job resolves and sets this explicitly (3000
+    /// when neither environment nor project configures a port); the `8080`
+    /// in [`Default::default`] below is only a placeholder for tests and is
+    /// never meant to reach `resolve_container_port()` unmodified.
     pub port: u32,
+    /// Explicit port override from the environment or project scope (in that
+    /// priority order), as resolved by the job planner. When `Some`, this
+    /// wins over image `EXPOSE` auto-detection in `resolve_container_port()`
+    /// — an operator's explicit configuration must never be overridden by a
+    /// heuristic guess at the image's listening port. `None` means neither
+    /// scope configured a port, so auto-detection is allowed to run.
+    pub configured_port: Option<u16>,
     pub environment_variables: HashMap<String, String>,
     /// Secret values (decrypted plaintext) mounted into the container as
     /// files under `/run/secrets/<KEY>` by the deployer. Never injected as
@@ -328,6 +341,7 @@ impl Default for DeploymentJobConfig {
             service_name: "app".to_string(),
             replicas: 1,
             port: 8080,
+            configured_port: None,
             environment_variables: HashMap::new(),
             secrets: HashMap::new(),
             resources: ResourceUsage::default(),
@@ -879,12 +893,29 @@ impl DeployImageJob {
     /// Resolve the actual container port to expose
     ///
     /// Priority order:
-    /// 1. Auto-detected from Docker image EXPOSE directive (source of truth)
-    /// 2. Configured port from environment/project/default (fallback)
+    /// 1. Explicit environment-level or project-level port override
+    ///    (`self.config.configured_port`) — an operator's explicit
+    ///    configuration always wins over a heuristic guess.
+    /// 2. Auto-detected from the Docker image's EXPOSE directive
+    /// 3. Configured/default port (`self.config.port`, e.g. 3000)
     ///
-    /// This method inspects the built image and extracts exposed ports.
+    /// This method inspects the built image and extracts exposed ports, but
+    /// only when neither scope explicitly configures a port.
     async fn resolve_container_port(&self, image_tag: &str, context: &WorkflowContext) -> u16 {
-        // Try to inspect the image and get exposed ports
+        if let Some(configured) = self.config.configured_port {
+            let _ = self
+                .log(
+                    context,
+                    format!(
+                        "Using explicitly configured port: {} (environment/project override)",
+                        configured
+                    ),
+                )
+                .await;
+            return configured;
+        }
+
+        // No explicit override — try to inspect the image and get exposed ports
         match bollard::Docker::connect_with_local_defaults() {
             Ok(docker) => {
                 match crate::utils::docker_inspect::get_primary_port(&docker, image_tag).await {
@@ -934,7 +965,7 @@ impl DeployImageJob {
             }
         }
 
-        // Fallback to configured port (from environment/project/default)
+        // Fallback to configured/default port
         self.config.port as u16
     }
 
@@ -1514,7 +1545,7 @@ impl DeployImageJob {
         let log_path = std::env::temp_dir().join(format!("deploy_{}.log", self.job_id));
 
         // Determine the actual container port to expose
-        // Priority: Image EXPOSE directive > configured port (from environment/project/default)
+        // Priority: explicit environment/project override > Image EXPOSE directive > default
         let container_port = self.resolve_container_port(image_tag, context).await;
 
         // For local deployments, allocate a port on this host.
@@ -2410,6 +2441,14 @@ impl DeployImageJobBuilder {
 
     pub fn port(mut self, port: u32) -> Self {
         self.config.port = port;
+        self
+    }
+
+    /// Explicit port override from the environment/project scope. When
+    /// `Some`, `resolve_container_port()` uses it directly and skips image
+    /// `EXPOSE` auto-detection entirely.
+    pub fn configured_port(mut self, configured_port: Option<u16>) -> Self {
+        self.config.configured_port = configured_port;
         self
     }
 
@@ -3328,6 +3367,64 @@ mod tests {
         // The default standard path is left untouched; precedence is resolved at
         // execution time (override > .temps.yaml > default).
         assert_eq!(job.config.health_check_path, Some("/".to_string()));
+    }
+
+    /// Regression test for https://github.com/gotempsh/temps/issues/879:
+    /// an explicit environment/project port override must win over image
+    /// EXPOSE auto-detection, not the other way around. The image tag here
+    /// doesn't exist, so any attempt to consult it would fail; the override
+    /// must be returned without ever needing a successful inspection.
+    #[tokio::test]
+    async fn test_resolve_container_port_prefers_explicit_override_over_image_detection() {
+        let job = DeployImageJobBuilder::new()
+            .job_id("deploy".to_string())
+            .build_job_id("build_image".to_string())
+            .target(DeploymentTarget::Docker {
+                registry_url: "local".to_string(),
+                network: None,
+            })
+            .service_name("app".to_string())
+            .port(3000)
+            .configured_port(Some(9090))
+            .build(Arc::new(TrackingMockContainerDeployer::new()))
+            .unwrap();
+
+        let context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
+
+        let port = job
+            .resolve_container_port("temps-test-nonexistent-image:latest", &context)
+            .await;
+
+        assert_eq!(port, 9090);
+    }
+
+    /// When neither environment nor project configures a port, image
+    /// inspection is attempted; if it fails (as it always will here, since
+    /// the image tag doesn't exist), resolution falls back to the
+    /// configured/default port.
+    #[tokio::test]
+    async fn test_resolve_container_port_falls_back_to_default_without_override() {
+        let job = DeployImageJobBuilder::new()
+            .job_id("deploy".to_string())
+            .build_job_id("build_image".to_string())
+            .target(DeploymentTarget::Docker {
+                registry_url: "local".to_string(),
+                network: None,
+            })
+            .service_name("app".to_string())
+            .port(4000)
+            .build(Arc::new(TrackingMockContainerDeployer::new()))
+            .unwrap();
+
+        assert_eq!(job.config.configured_port, None);
+
+        let context = crate::test_utils::create_test_context("run-1".to_string(), 1, 1, 1);
+
+        let port = job
+            .resolve_container_port("temps-test-nonexistent-image:latest", &context)
+            .await;
+
+        assert_eq!(port, 4000);
     }
 
     #[tokio::test]

@@ -6,6 +6,7 @@ import type { GettingStartedItem } from '@/hooks/useGettingStarted'
 import {
   firstIncompleteGettingStartedIndex,
   nextIncompleteGettingStartedItem,
+  onboardingStepPosition,
 } from './onboarding-next-step'
 
 function step(key: string, done: boolean): GettingStartedItem {
@@ -50,5 +51,9 @@ describe('dashboard onboarding next step', () => {
     expect(
       firstIncompleteGettingStartedIndex([step('ai', true), step('git', true)])
     ).toBe(-1)
+  })
+
+  test('labels carousel position as a step rather than completion progress', () => {
+    expect(onboardingStepPosition(0, 8)).toBe('Step 1 of 8')
   })
 })

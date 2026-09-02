@@ -74,6 +74,13 @@ interface RestoreRunShowOptions {
   json?: boolean
 }
 
+// Backup formats that support point-in-time recovery. "walg" is Postgres's
+// continuous-archive format; "mariadb_physical" is the MariaDB analog (a
+// mariadb-backup physical base backup with archived binlogs for replay).
+// Anything else (pg_dump, mariadb_dump, unknown/empty) is a logical/one-shot
+// backup and cannot be replayed to an arbitrary point in time.
+const PITR_CAPABLE_FORMATS = new Set(['walg', 'mariadb_physical'])
+
 // ---- Actions -------------------------------------------------------------
 
 async function showCapsAction(options: ShowCapsOptions): Promise<void> {
@@ -157,12 +164,12 @@ async function listBackupsAction(options: ListBackupsOptions): Promise<void> {
       color: (value, r) => typeof r.size_bytes === 'number' && r.size_bytes != null ? value : colors.muted(value),
     },
     {
-      header: 'Location',
-      accessor: (r) =>
-        (r.location ?? '').startsWith('s3://')
-          ? 'WAL-G'
-          : 'legacy',
-      color: (value, r) => (r.location ?? '').startsWith('s3://') ? colors.success(value) : colors.muted(value),
+      header: 'Format',
+      accessor: (r) => r.format || 'unknown',
+      color: (value, r) =>
+        r.format && PITR_CAPABLE_FORMATS.has(r.format)
+          ? colors.success(value)
+          : colors.muted(value),
     },
     {
       header: 'Created',
@@ -548,7 +555,7 @@ export function registerRestoreCommands(services: Command): void {
     )
     .option(
       '--pitr <iso>',
-      'Point-in-time recovery target, ISO 8601 timestamp (requires WAL-G backup). Combine with --new-service to route PITR into a new service.',
+      'Point-in-time recovery target, ISO 8601 timestamp (requires a PITR-capable backup). Combine with --new-service to route PITR into a new service.',
     )
     .option('-y, --yes', 'Skip confirmation')
     .option('--no-wait', 'Return immediately without polling run status')

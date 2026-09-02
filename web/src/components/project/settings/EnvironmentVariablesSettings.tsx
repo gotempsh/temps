@@ -326,6 +326,7 @@ function EnvironmentVariableRow({
             checked={isSelected}
             onCheckedChange={() => onSelect(variable.id)}
             className="mt-1 sm:mt-0"
+            aria-label={`Select ${variable.key}`}
           />
           <div className="space-y-1 flex-1 min-w-0">
             <div className="flex flex-wrap items-center gap-2">
@@ -379,7 +380,12 @@ function EnvironmentVariableRow({
                   : '••••••••••••'}
             </span>
             {!isSecret && (
-              <Button variant="ghost" size="sm" onClick={toggleVisibility}>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={toggleVisibility}
+                aria-label={`${isVisible ? 'Hide' : 'Reveal'} value for ${variable.key}`}
+              >
                 {isVisible ? (
                   <EyeOff className="h-4 w-4" />
                 ) : (
@@ -1614,6 +1620,11 @@ export function EnvironmentVariablesSettings({
                   <Checkbox
                     checked={allSelected}
                     onCheckedChange={handleSelectAll}
+                    aria-label={
+                      allSelected
+                        ? 'Deselect all environment variables'
+                        : 'Select all environment variables'
+                    }
                   />
                   <span className="text-sm font-medium">
                     {selectedCount > 0

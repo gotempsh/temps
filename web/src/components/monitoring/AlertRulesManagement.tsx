@@ -203,7 +203,7 @@ export function AlertRulesManagement({
               value={String(projectId)}
               onValueChange={(v) => setSelectedProjectId(Number(v))}
             >
-              <SelectTrigger className="w-[200px]">
+              <SelectTrigger className="w-[200px]" aria-label="Project">
                 <SelectValue placeholder="Select project" />
               </SelectTrigger>
               <SelectContent>
@@ -264,10 +264,16 @@ export function AlertRulesManagement({
                     checked={rule.enabled}
                     onCheckedChange={() => handleToggleEnabled(rule)}
                     disabled={updateMutation.isPending}
+                    aria-label={`${rule.enabled ? 'Disable' : 'Enable'} ${rule.name}`}
                   />
                   <DropdownMenu>
                     <DropdownMenuTrigger asChild>
-                      <Button variant="ghost" size="icon" className="h-8 w-8">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        className="h-8 w-8"
+                        aria-label={`Actions for ${rule.name}`}
+                      >
                         <EllipsisVertical className="h-4 w-4" />
                       </Button>
                     </DropdownMenuTrigger>

@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use axum::body::Bytes;
 use axum::extract::{FromRequestParts, Path, State};
@@ -30,6 +31,18 @@ use temps_core::ProblemDetails;
 use temps_metrics::{
     validate_metric_name, MetricKind, MetricPoint as StoreMetricPoint, SourceKind,
 };
+
+const RELAY_DROP_LOG_EVERY: u64 = 1024;
+static RELAY_DROPPED_BATCHES: AtomicU64 = AtomicU64::new(0);
+
+fn relay_drop_log_sample() -> Option<u64> {
+    let dropped_total = RELAY_DROPPED_BATCHES.fetch_add(1, Ordering::Relaxed) + 1;
+    if dropped_total == 1 || dropped_total.is_multiple_of(RELAY_DROP_LOG_EVERY) {
+        Some(dropped_total)
+    } else {
+        None
+    }
+}
 
 impl From<OtelError> for Problem {
     fn from(error: OtelError) -> Self {
@@ -598,20 +611,28 @@ async fn do_ingest_metrics(
 
     // Fire decoded batch at the relay extension point (non-blocking).
     // `data.clone()` is O(1) — bytes::Bytes is ref-counted. The relay channel
-    // is bounded; try_send drops silently on full rather than blocking.
+    // is bounded; try_send drops on full rather than blocking.
     if let Some(tx) = &state.otel_relay_tx {
         let msg = crate::relay::OtelRelayMessage {
             project_id: ctx.project_id,
             environment_id: ctx.environment_id,
             deployment_id: ctx.deployment_id,
             signal: crate::relay::OtelSignal::Metrics,
+            item_count: count,
             payload: data.clone(),
         };
-        if tx.try_send(msg).is_err() {
-            tracing::warn!(
-                project_id = ctx.project_id,
-                "otel relay channel full; metrics batch dropped (backpressure)"
-            );
+        if let Err(reason) = tx.try_send(msg) {
+            state.otel_service.record_relay_drop(count);
+            if let Some(dropped_total) = relay_drop_log_sample() {
+                tracing::warn!(
+                    project_id = ctx.project_id,
+                    item_count = count,
+                    payload_bytes = data.len(),
+                    reason = reason.as_str(),
+                    dropped_batches_total = dropped_total,
+                    "otel relay channel full; metrics batch dropped (backpressure)"
+                );
+            }
         }
     }
 
@@ -705,13 +726,21 @@ async fn do_ingest_traces(
             environment_id: ctx.environment_id,
             deployment_id: ctx.deployment_id,
             signal: crate::relay::OtelSignal::Traces,
+            item_count: count,
             payload: data.clone(),
         };
-        if tx.try_send(msg).is_err() {
-            tracing::warn!(
-                project_id = ctx.project_id,
-                "otel relay channel full; traces batch dropped (backpressure)"
-            );
+        if let Err(reason) = tx.try_send(msg) {
+            state.otel_service.record_relay_drop(count);
+            if let Some(dropped_total) = relay_drop_log_sample() {
+                tracing::warn!(
+                    project_id = ctx.project_id,
+                    item_count = count,
+                    payload_bytes = data.len(),
+                    reason = reason.as_str(),
+                    dropped_batches_total = dropped_total,
+                    "otel relay channel full; traces batch dropped (backpressure)"
+                );
+            }
         }
     }
 
@@ -813,13 +842,21 @@ async fn do_ingest_logs(
             environment_id: ctx.environment_id,
             deployment_id: ctx.deployment_id,
             signal: crate::relay::OtelSignal::Logs,
+            item_count: count,
             payload: data.clone(),
         };
-        if tx.try_send(msg).is_err() {
-            tracing::warn!(
-                project_id = ctx.project_id,
-                "otel relay channel full; logs batch dropped (backpressure)"
-            );
+        if let Err(reason) = tx.try_send(msg) {
+            state.otel_service.record_relay_drop(count);
+            if let Some(dropped_total) = relay_drop_log_sample() {
+                tracing::warn!(
+                    project_id = ctx.project_id,
+                    item_count = count,
+                    payload_bytes = data.len(),
+                    reason = reason.as_str(),
+                    dropped_batches_total = dropped_total,
+                    "otel relay channel full; logs batch dropped (backpressure)"
+                );
+            }
         }
     }
 
@@ -1724,16 +1761,17 @@ mod tests {
 
     #[test]
     fn relay_channel_full_try_send_returns_err_not_panic() {
-        use crate::relay::{OtelRelayMessage, OtelSignal};
+        use crate::relay::{bounded_relay_queue, OtelRelayMessage, OtelSignal};
 
         // Capacity-1 channel: fill it with the first send.
-        let (tx, _rx) = tokio::sync::mpsc::channel::<OtelRelayMessage>(1);
+        let (tx, _rx) = bounded_relay_queue(1, 1024);
 
         let make_msg = |project_id: i32| OtelRelayMessage {
             project_id,
             environment_id: None,
             deployment_id: None,
             signal: OtelSignal::Metrics,
+            item_count: 0,
             payload: bytes::Bytes::new(),
         };
 
@@ -1751,10 +1789,10 @@ mod tests {
 
     #[test]
     fn relay_channel_closed_try_send_returns_err_not_panic() {
-        use crate::relay::{OtelRelayMessage, OtelSignal};
+        use crate::relay::{bounded_relay_queue, OtelRelayMessage, OtelSignal};
 
         // Drop the receiver immediately — channel is closed.
-        let (tx, rx) = tokio::sync::mpsc::channel::<OtelRelayMessage>(10);
+        let (tx, rx) = bounded_relay_queue(10, 1024);
         drop(rx);
 
         let msg = OtelRelayMessage {
@@ -1762,6 +1800,7 @@ mod tests {
             environment_id: None,
             deployment_id: None,
             signal: OtelSignal::Traces,
+            item_count: 0,
             payload: bytes::Bytes::new(),
         };
 

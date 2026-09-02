@@ -23,6 +23,9 @@ pub use managed_environment_variables::*;
 pub mod env_resolver;
 pub use env_resolver::*;
 
+pub mod port_resolver;
+pub use port_resolver::*;
+
 pub mod workflow_execution_service;
 pub use workflow_execution_service::*;
 
@@ -67,3 +70,9 @@ pub use log_redaction::*;
 
 pub mod failure_report_service;
 pub use failure_report_service::*;
+
+pub mod traefik_discovery_service;
+pub use traefik_discovery_service::*;
+
+pub mod cert_validator;
+pub use cert_validator::*;

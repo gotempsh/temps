@@ -3,6 +3,7 @@
 
 use crate::externalsvc::{
     mariadb::{validate_immutable_mariadb_image, MariaDbSizeProfile},
+    rustfs::DEFAULT_RUSTFS_IMAGE,
     ServiceResourceLimits,
 };
 use serde_json::{json, Value as JsonValue};
@@ -770,7 +771,7 @@ impl ParameterStrategy for S3ParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("rustfs/rustfs:1.0.0-alpha.98".to_string()),
+                JsonValue::String(DEFAULT_RUSTFS_IMAGE.to_string()),
             );
         }
 
@@ -888,7 +889,7 @@ impl ParameterStrategy for S3ParameterStrategy {
                 "docker_image": {
                     "type": "string",
                     "description": "Docker image (updateable)",
-                    "default": "rustfs/rustfs:1.0.0-alpha.98"
+                    "default": DEFAULT_RUSTFS_IMAGE
                 }
             },
             "readonly": ["backend", "access_key", "secret_key", "host", "region"]
@@ -1061,7 +1062,7 @@ impl ParameterStrategy for RustfsParameterStrategy {
         if is_empty_value(params.get("docker_image")) {
             params.insert(
                 "docker_image".to_string(),
-                JsonValue::String("rustfs/rustfs:1.0.0-alpha.98".to_string()),
+                JsonValue::String(DEFAULT_RUSTFS_IMAGE.to_string()),
             );
         }
 
@@ -1173,7 +1174,7 @@ impl ParameterStrategy for RustfsParameterStrategy {
                 "docker_image": {
                     "type": "string",
                     "description": "Docker image (updateable)",
-                    "default": "rustfs/rustfs:1.0.0-alpha.98"
+                    "default": DEFAULT_RUSTFS_IMAGE
                 }
             },
             "readonly": ["access_key", "secret_key", "host", "region"]
@@ -1832,6 +1833,31 @@ mod tests {
             err.contains("container_name"),
             "error should mention 'container_name', got: {err}"
         );
+    }
+
+    #[test]
+    fn managed_s3_and_rustfs_defaults_use_the_provider_image() {
+        for strategy in [
+            &S3ParameterStrategy as &dyn ParameterStrategy,
+            &RustfsParameterStrategy as &dyn ParameterStrategy,
+        ] {
+            let mut params = HashMap::new();
+            strategy
+                .auto_generate_missing(&mut params)
+                .expect("managed defaults must be generated");
+            assert_eq!(
+                params.get("docker_image").and_then(JsonValue::as_str),
+                Some(DEFAULT_RUSTFS_IMAGE)
+            );
+            assert_eq!(
+                strategy.get_schema().and_then(|schema| {
+                    schema["properties"]["docker_image"]["default"]
+                        .as_str()
+                        .map(str::to_owned)
+                }),
+                Some(DEFAULT_RUSTFS_IMAGE.to_string())
+            );
+        }
     }
 
     #[test]

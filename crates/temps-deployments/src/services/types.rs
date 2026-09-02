@@ -44,6 +44,9 @@ pub struct DeploymentListResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LatestDeploymentMedia {
     pub project_id: i32,
+    /// State of the newest deployment attempt, which may differ from the
+    /// older deployment that is still serving traffic and supplying media.
+    pub latest_attempt_status: String,
     /// Public deployment URL when this is a currently served deployment.
     /// Historical screenshot fallbacks deliberately omit the URL.
     pub url: Option<String>,

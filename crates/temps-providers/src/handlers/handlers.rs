@@ -96,7 +96,7 @@ async fn get_providers_metadata(
         (status = 500, description = "Internal server error")
     ),
     params(
-        ("service_type" = String, Path, description = "Service type (mongodb, postgres, redis, s3)")
+        ("service_type" = String, Path, description = "Service type (mariadb, mongodb, postgres, redis, s3, kv, blob, rustfs, or legacy minio)")
     )
 )]
 async fn get_provider_metadata(

@@ -372,6 +372,23 @@ impl ProxyCommand {
             runtime_context.clone(),
         ));
 
+        // Split topology (ADR-017): this process never runs the Traefik label
+        // discovery watcher — `temps serve` owns the single writer per Docker
+        // daemon — but it IS the reader that serves the adopted routes, so it
+        // needs the same network scoping. Reading the same environment as the
+        // console process is what keeps "discovery is off" meaning the same
+        // thing on both sides; a proxy that ignored this would keep serving
+        // rows the console had already stopped maintaining.
+        {
+            let discovery_config =
+                temps_deployer::traefik_discovery::TraefikDiscoveryConfig::from_env("temps");
+            route_table.set_traefik_discovery_network(
+                discovery_config
+                    .enabled
+                    .then(|| discovery_config.network.clone()),
+            );
+        }
+
         // ADR-018 on-demand TLS: build the certificate manager when enabled in
         // settings. Constructed after the route table exists (the gate's
         // cert-eligible route check reads it). `None` (the default, or when the

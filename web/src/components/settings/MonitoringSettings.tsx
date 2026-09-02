@@ -92,6 +92,7 @@ export function MonitoringSettings({
                 <div className="flex items-center gap-4">
                   <Slider
                     id="threshold-slider"
+                    aria-label="Disk space alert threshold percentage"
                     value={[diskSpaceAlert?.threshold_percent || 80]}
                     min={50}
                     max={99}

@@ -83,6 +83,10 @@ impl TempsPlugin for DomainsPlugin {
                 repository.clone(),
                 encryption_service.clone(),
             ));
+            // Register DomainService so the serve wiring layer can construct the
+            // DiscoveredHostTlsProvisioner adapter (ADR-041 §8) without
+            // introducing a direct temps-domains dependency in temps-deployments.
+            context.register_service(domain_service.clone());
 
             // Create TLS service
             let tls_service = TlsServiceBuilder::new()

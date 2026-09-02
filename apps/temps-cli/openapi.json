@@ -2847,6 +2847,8 @@
               "backend_url": "https://app.temps.sh",
               "backups_enabled": false,
               "notifications_enabled": false,
+              "telemetry_bulk_anomaly_factor": null,
+              "telemetry_bulk_rate_limit_spans_per_sec": null,
               "telemetry_enabled": false,
               "telemetry_outbox_max_bytes": 536870912
             },
@@ -4507,7 +4509,7 @@
         "properties": {
           "docker_image": {
             "description": "Docker image being used",
-            "example": "ghcr.io/rustfs/rustfs:0.5.0",
+            "example": "rustfs/rustfs:1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -4525,7 +4527,7 @@
           },
           "version": {
             "description": "Current version (if running)",
-            "example": "0.5.0",
+            "example": "1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -4695,6 +4697,484 @@
           }
         },
         "type": "object"
+      },
+      "BulkActivationEstimateResponse": {
+        "description": "The quote.",
+        "properties": {
+          "active_batch_id": {
+            "description": "A job already running. Submitting would be refused with `409`, so the\nclient can offer \"watch the running job\" instead of a button that fails.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "configured": {
+            "description": "Whether a bulk activation could run at all right now.\n\n`false` is the normal state on an unlinked instance and must render as\nonboarding, not as an error.",
+            "type": "boolean"
+          },
+          "eligible_projects": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "estimated_bytes": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "estimated_spans": {
+            "description": "Totals over the **eligible** projects only — what confirming this quote\nwould actually send.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "plan_expires_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_hash": {
+            "description": "Stable identity of the project set and windows, recorded on the job.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "plan_token": {
+            "description": "The handle to send back to `POST /bulk-jobs`.\n\n`None` when nothing is eligible: there is no bill to confirm, and\nhanding back a token that would be refused on submit would be a dead\nend with no explanation attached.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "projects": {
+            "description": "Every project considered, eligible or not, ascending by id.",
+            "items": {
+              "$ref": "#/components/schemas/BulkActivationProjectEstimateResponse"
+            },
+            "type": "array"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skipped_projects": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_projects": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "window_from": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "window_to": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "configured",
+          "window_from",
+          "window_to",
+          "projects",
+          "total_projects",
+          "eligible_projects",
+          "skipped_projects",
+          "estimated_spans",
+          "estimated_bytes"
+        ],
+        "type": "object"
+      },
+      "BulkActivationEtaState": {
+        "description": "How much of the ETA this instance can honestly claim to know.",
+        "enum": [
+          "estimating",
+          "known",
+          "finished"
+        ],
+        "type": "string"
+      },
+      "BulkActivationJobProjectResponse": {
+        "description": "One project's row inside a job.",
+        "properties": {
+          "bytes_shipped": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "estimated_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "estimated_spans": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "last_error": {
+            "description": "Why this project stopped, when `status` is `failed`. The switch is never\nrolled back, so this project is Cloud-primary with a recorded hole in\nits history — which is retryable, and must be visible to be retried.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "percent_complete": {
+            "description": "`spans_shipped / estimated_spans`, clamped to 0–100. `None` when the\nestimate is zero or unknown — an empty window is not \"0% done\".",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skip_detail": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skip_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spans_shipped": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/BulkJobProjectStatus"
+          },
+          "window_from": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "window_to": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "status",
+          "window_from",
+          "window_to",
+          "estimated_spans",
+          "estimated_bytes",
+          "spans_shipped",
+          "bytes_shipped"
+        ],
+        "type": "object"
+      },
+      "BulkActivationJobResponse": {
+        "description": "A job, its projects, its progress and its ETA.",
+        "properties": {
+          "abort_detail": {
+            "description": "The same reason as a sentence naming the fix and the page that applies\nit.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "abort_reason": {
+            "description": "Machine-readable instance-wide abort reason, e.g. `not_linked`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "batch_id": {
+            "type": "string"
+          },
+          "bytes_shipped": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "cancel_requested": {
+            "description": "Set as soon as a cancel is requested, before the worker honours it at\nthe next chunk boundary — so the UI can stop offering Cancel twice.",
+            "type": "boolean"
+          },
+          "cancel_requested_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "current_project_id": {
+            "description": "The project being switched or backfilled right now.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "estimated_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "estimated_spans": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "eta_seconds": {
+            "description": "Seconds remaining, or `null` when `eta_state` is not `known`.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "eta_state": {
+            "$ref": "#/components/schemas/BulkActivationEtaState"
+          },
+          "observed_spans_per_sec": {
+            "description": "The average this job has actually achieved since it started. Sent so the\nclient can render a coarse rate instead of implying a precision the\naverage does not have.",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "percent_complete": {
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "plan_hash": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/BulkActivationJobProjectResponse"
+            },
+            "type": "array"
+          },
+          "projects_done": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projects_failed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projects_pending": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projects_skipped": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "projects_total": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "requested_by_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "spans_shipped": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/BulkJobStatus"
+          },
+          "trigger": {
+            "$ref": "#/components/schemas/BulkJobTrigger"
+          }
+        },
+        "required": [
+          "batch_id",
+          "trigger",
+          "status",
+          "estimated_spans",
+          "estimated_bytes",
+          "spans_shipped",
+          "bytes_shipped",
+          "eta_state",
+          "projects_total",
+          "projects_pending",
+          "projects_done",
+          "projects_failed",
+          "projects_skipped",
+          "cancel_requested",
+          "created_at",
+          "projects"
+        ],
+        "type": "object"
+      },
+      "BulkActivationProjectEstimateResponse": {
+        "description": "One project's line on the quote.",
+        "properties": {
+          "average_span_bytes": {
+            "format": "double",
+            "type": "number"
+          },
+          "eligible": {
+            "description": "Whether this project is part of the plan the token covers.",
+            "type": "boolean"
+          },
+          "estimated_bytes": {
+            "description": "`average_span_bytes * estimated_spans`, rounded up. Temps Cloud's own\nacknowledgement is authoritative; this is what this instance can know\nbefore sending.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "estimated_spans": {
+            "description": "Exact count of local spans in the window. Zero for a skipped project —\nnothing was counted, because nothing would be sent.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "fidelity": {
+            "$ref": "#/components/schemas/CloudTelemetryFidelity"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "sampled_spans": {
+            "description": "How many spans were actually projected to derive the average.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "setup_path": {
+            "description": "Where the operator goes to unblock it, when anywhere.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skip_detail": {
+            "description": "The same reason as a sentence, so no client has to map an enum to prose.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skip_reason": {
+            "description": "Machine-readable reason it is not, e.g. `fidelity_not_queryable`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_from": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "window_to": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "eligible",
+          "fidelity",
+          "window_from",
+          "window_to",
+          "estimated_spans",
+          "estimated_bytes",
+          "sampled_spans",
+          "average_span_bytes"
+        ],
+        "type": "object"
+      },
+      "BulkJobProjectStatus": {
+        "description": "Where one project has got to inside a bulk job.\n\n`switching` and `backfilling` are separate on purpose: the switch is cheap,\natomic and egresses nothing, while the backfill can run for hours and costs\nmoney. An operator watching a stuck job needs to know which of the two it is\nstuck in, and a project that failed after switching is *not* rolled back\n(ADR-042 §7) — so the two must be distinguishable after the fact too.",
+        "enum": [
+          "pending",
+          "switching",
+          "backfilling",
+          "done",
+          "failed",
+          "skipped"
+        ],
+        "type": "string"
+      },
+      "BulkJobStatus": {
+        "description": "Lifecycle of a bulk job.\n\nThe three terminal-with-a-problem states are deliberately distinct.\n`completed_with_failures` means the job ran to the end and some projects\ndid not; `aborted` means an instance-wide condition stopped it and the\nuntouched projects are still `pending`, ready to resume; `cancelled` means\nan operator asked it to stop. Collapsing any two of those would leave the\nConsole unable to say what to do next.",
+        "enum": [
+          "pending",
+          "running",
+          "completed",
+          "completed_with_failures",
+          "aborted",
+          "cancelled"
+        ],
+        "type": "string"
+      },
+      "BulkJobTrigger": {
+        "description": "Which entry point created the job (ADR-042 §1).\n\nThe engine does not branch on this. It exists so an operator disputing an\ninvoice, or reading an audit trail, can tell \"this instance spent money\nbecause someone clicked a button\" apart from \"…because a purchase completed\nand the payment was the authorization\".",
+        "enum": [
+          "purchase",
+          "operator"
+        ],
+        "type": "string"
       },
       "CancelBackupResponse": {
         "description": "Response body for cancel endpoints.",
@@ -5661,7 +6141,7 @@
         "type": "string"
       },
       "CloudSettings": {
-        "description": "Non-secret managed control-plane settings stored with application settings.",
+        "description": "Non-secret managed control-plane settings stored with application settings.\n\n`PartialEq` but deliberately **not** `Eq`: `telemetry_bulk_anomaly_factor` is\na float, and the total-equality contract `Eq` promises is one `f32` cannot\nkeep. Nothing compares two `CloudSettings` for equality outside this module's\nown tests, so the weaker bound costs nothing.",
         "properties": {
           "backend_url": {
             "default": "https://app.temps.sh",
@@ -5677,6 +6157,29 @@
             "default": false,
             "description": "Explicit consent to send notifications through managed providers.",
             "type": "boolean"
+          },
+          "telemetry_bulk_anomaly_factor": {
+            "default": null,
+            "description": "ADR-042 §6.3: how far a project's shipped bytes may exceed its pre-send\nestimate before the bulk activation stops that project.\n\n`None` — the default — resolves to\n[`DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`]. The guard exists because\nan estimate that is wrong by an order of magnitude means a bug, and *a\nbug that costs money should stop* rather than run away with a customer's\negress spend on a path that has no human confirm behind it.\n\nAn operator setting on the singleton `settings` row rather than an\nenvironment variable, per CLAUDE.md: the right multiple depends on how\nheterogeneous that instance's spans actually are, which only the operator\nrunning it can know, and they must be able to widen it — or narrow it —\nwithout restarting the binary mid-activation.\n\nBelow `1.0` every project would pause on its first chunk, and above\n[`MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`] the guard stops being a\ntuning knob and becomes an off switch. The settings write path rejects\nvalues outside that range, and the effective value is clamped on read\nbesides; see [`CloudSettings::effective_bulk_anomaly_factor`].\n\nThe schema bounds below are documentation for a client; they are not\nwhat enforces this. The server validates the range on write.",
+            "example": 5,
+            "format": "float",
+            "maximum": 50,
+            "minimum": 1,
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "telemetry_bulk_rate_limit_spans_per_sec": {
+            "default": null,
+            "description": "ADR-042 §3: optional throttle, in spans per second, on a **bulk Cloud\ntelemetry activation** backfill.\n\n`None` — the default — is unthrottled, which is what \"activate now\"\nmeans and is right for an instance that is idle or being cut over\ndeliberately. An operator running an activation against a live instance\ncan set a ceiling so the backfill stops competing with their own read IO\nand with the Cloud ingest allowance.\n\nAn operator setting on the singleton `settings` row rather than an\nenvironment variable, per CLAUDE.md, so it can be changed **while a job\nis running** — which is exactly when an operator discovers they need it,\nand exactly when restarting the binary would mean stopping an activation\nthey have already paid for. The worker re-reads it each time it picks up\na project, so a change takes effect at the next project boundary rather\nthan at the next restart.\n\nOnly the bulk worker reads this. The live Cloud-primary write path is a\nprimary path and is never throttled; the offline\n`temps backfill cloud-telemetry` tool keeps its own\n`--rate-limit-spans-per-sec` flag, because it runs in a different\nprocess with the server stopped.",
+            "example": 5000,
+            "format": "int32",
+            "minimum": 1,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "telemetry_enabled": {
             "default": false,
@@ -8256,6 +8759,19 @@
         "required": [
           "name",
           "auth"
+        ],
+        "type": "object"
+      },
+      "CreateBulkActivationJobRequest": {
+        "description": "Body for `POST /bulk-jobs`.\n\nDeliberately one field. The plan is inside the token, so there is no project\nlist here to disagree with the one that was quoted.",
+        "properties": {
+          "plan_token": {
+            "description": "The `plan_token` from a `POST /bulk-jobs/estimate` response.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "plan_token"
         ],
         "type": "object"
       },
@@ -14660,7 +15176,7 @@
         "properties": {
           "docker_image": {
             "description": "Docker image to use (optional, defaults to RustFS)",
-            "example": "ghcr.io/rustfs/rustfs:0.5.0",
+            "example": "rustfs/rustfs:1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -15945,6 +16461,43 @@
           "start_time",
           "end_time"
         ],
+        "type": "object"
+      },
+      "EstimateBulkActivationRequest": {
+        "description": "What to quote.\n\nExactly one of `all_eligible_projects` and a non-empty `project_ids` must be\ngiven. Defaulting an omitted scope to \"everything\" would make a typo cost\nmoney; defaulting it to \"nothing\" would make the endpoint silently useless.",
+        "properties": {
+          "all_eligible_projects": {
+            "description": "Quote every project that still writes its spans to this instance.",
+            "type": "boolean"
+          },
+          "project_ids": {
+            "description": "Quote exactly these projects. Projects that are already Cloud-primary\nare accepted here — re-shipping a window is the retry path — but are\nnever picked up by `all_eligible_projects`.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "window_from": {
+            "description": "Start of the window to ship. Defaults to the oldest span local retention\ncan still be holding.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_to": {
+            "description": "End of the window to ship. Defaults to now.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "EventActivityBucket": {
@@ -21202,6 +21755,113 @@
         ],
         "type": "object"
       },
+      "ImportTraefikAcmeJsonRequest": {
+        "description": "Request body for Path B: import from Traefik's `acme.json`.\n\n`Debug` is hand-written: `acme_json` contains Traefik's private keys and\nmust never appear in logs. Only the host list, renewal method, dry-run flag,\nand byte length are logged.",
+        "properties": {
+          "acknowledge_manual_dns_renewal": {
+            "description": "Required when `renewal_method` is `\"dns-01\"` and no auto-manage zone\ncovers the host.",
+            "type": "boolean"
+          },
+          "acme_json": {
+            "description": "Raw contents of the Traefik `acme.json` file (uploaded by the CLI or\npasted in the console). **Never** a server-side file path.\nRedacted in `Debug` output — the field holds private key material.",
+            "type": "string"
+          },
+          "dry_run": {
+            "description": "`true` → full parse and validation, no writes. The identical per-host\nverdicts are returned, giving the operator a preview before committing.",
+            "type": "boolean"
+          },
+          "hosts": {
+            "description": "Hosts to import. Only hosts that appear in the document's certificates\n(by X.509 SAN, not JSON `domain.main`) are accepted.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "renewal_method": {
+            "description": "`\"http-01\"` or `\"dns-01\"`. Stored as `verification_method` so the\nrenewal scheduler knows how to renew.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "acme_json",
+          "hosts",
+          "renewal_method"
+        ],
+        "type": "object"
+      },
+      "ImportTraefikAcmeJsonResponse": {
+        "description": "Response body for the Path B import endpoint.",
+        "properties": {
+          "dry_run": {
+            "type": "boolean"
+          },
+          "failed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "succeeded": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_requested": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "verdicts": {
+            "items": {
+              "$ref": "#/components/schemas/ImportedHostVerdict"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "dry_run",
+          "total_requested",
+          "succeeded",
+          "failed",
+          "verdicts"
+        ],
+        "type": "object"
+      },
+      "ImportedHostVerdict": {
+        "description": "Per-host result from a Path B import.",
+        "properties": {
+          "error": {
+            "description": "Human-readable failure reason when `success` is `false`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "type": "string"
+          },
+          "not_after": {
+            "description": "ISO 8601 expiry of the imported certificate.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sans": {
+            "description": "DNS SANs carried in the imported certificate.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "success": {
+            "description": "Whether the cert was written (or would be written on `dry_run: false`).",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "host",
+          "success",
+          "sans"
+        ],
+        "type": "object"
+      },
       "IncidentBucket": {
         "properties": {
           "active_incidents": {
@@ -22160,6 +22820,9 @@
       },
       "LatestDeploymentMediaResponseItem": {
         "properties": {
+          "latest_attempt_status": {
+            "type": "string"
+          },
           "project_id": {
             "format": "int32",
             "type": "integer"
@@ -22178,7 +22841,8 @@
           }
         },
         "required": [
-          "project_id"
+          "project_id",
+          "latest_attempt_status"
         ],
         "type": "object"
       },
@@ -22432,6 +23096,29 @@
         "type": "object"
       },
       "ListDeploymentTokensQuery": {
+        "properties": {
+          "page": {
+            "example": 1,
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "page_size": {
+            "example": 20,
+            "format": "int64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "ListDiscoveredRoutesQuery": {
         "properties": {
           "page": {
             "example": 1,
@@ -29071,6 +29758,18 @@
             "minimum": 0,
             "type": "integer"
           },
+          "relay_dropped_batches": {
+            "description": "Cumulative count of best-effort relay batches rejected because the\nbounded relay handoff was saturated or closed.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "relay_dropped_items": {
+            "description": "Cumulative signal-item count contained in rejected relay batches.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
           "spans_dropped": {
             "format": "int64",
             "minimum": 0,
@@ -29100,7 +29799,9 @@
           "logs_dropped",
           "ingest_errors",
           "rate_limited_requests",
-          "quota_exceeded_requests"
+          "quota_exceeded_requests",
+          "relay_dropped_batches",
+          "relay_dropped_items"
         ],
         "type": "object"
       },
@@ -29165,7 +29866,7 @@
             ]
           },
           "format": {
-            "description": "\"walg\", \"pg_dump\", \"unknown\".",
+            "description": "\"walg\", \"pg_dump\", \"mariadb_physical\", \"mariadb_dump\", \"unknown\".",
             "type": "string"
           },
           "id": {
@@ -33528,6 +34229,23 @@
         ],
         "type": "object"
       },
+      "RequestDiscoveredRouteCertRequest": {
+        "description": "Request body for Path A: operator-triggered ACME issuance.",
+        "properties": {
+          "acknowledge_manual_dns_renewal": {
+            "description": "Must be `true` when `challenge_type` is `\"dns-01\"` and no verified\n`auto_manage` zone covers this host. Lets the operator confirm they\nknow renewal will require manual DNS updates.",
+            "type": "boolean"
+          },
+          "challenge_type": {
+            "description": "`\"http-01\"` or `\"dns-01\"`. Required — no silent default.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "challenge_type"
+        ],
+        "type": "object"
+      },
       "RequestRow": {
         "properties": {
           "client_ip": {
@@ -34196,7 +34914,7 @@
             "type": "array"
           },
           "strategy": {
-            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\nor \"unsupported\".",
+            "description": "How the restore will be performed: \"walg_restore\", \"pg_dump_restore\",\n\"mariadb_physical_restore\", \"mariadb_dump_restore\", or \"unsupported\".",
             "type": "string"
           },
           "target_service": {
@@ -34266,7 +34984,7 @@
             "type": "object"
           },
           {
-            "description": "Point-in-time recovery. Only valid on WAL-G backups (Postgres).",
+            "description": "Point-in-time recovery. Only valid on a backup that anchors a\ncontinuous change stream: a WAL-G base (Postgres) or a physical\n`mariadb-backup` base with archived binary logs (MariaDB).",
             "properties": {
               "mode": {
                 "enum": [
@@ -42459,6 +43177,442 @@
         ],
         "type": "object"
       },
+      "TraefikDiscoveredRouteListResponse": {
+        "description": "Paginated discovered routes, plus the hosts that were found and rejected.",
+        "properties": {
+          "conflicts": {
+            "description": "Labelled containers found by the last reconciliation that were NOT\nadopted (host owned by a Temps route, or claimed by another container).\nThese have no row of their own — without surfacing them here the\noperator sees nothing at all for a container they labelled.",
+            "items": {
+              "$ref": "#/components/schemas/TraefikDiscoveryConflictResponse"
+            },
+            "type": "array"
+          },
+          "discovery_running": {
+            "description": "`false` when the watcher isn't running, so a client can explain an\nempty list as \"discovery is off\" rather than \"nothing was found\".",
+            "type": "boolean"
+          },
+          "page": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "page_size": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes": {
+            "items": {
+              "$ref": "#/components/schemas/TraefikDiscoveredRouteResponse"
+            },
+            "type": "array"
+          },
+          "total": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "routes",
+          "total",
+          "page",
+          "page_size",
+          "conflicts",
+          "discovery_running"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveredRouteResponse": {
+        "description": "One row of `traefik_discovered_routes`, annotated for an operator.",
+        "properties": {
+          "active": {
+            "description": "Whether this route is currently served by the proxy.",
+            "type": "boolean"
+          },
+          "contested_by": {
+            "description": "Other labelled containers that claim this host and lost the collision.\nNon-empty means someone's container is silently not being routed.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "created_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "host": {
+            "type": "string"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "inactive_reason": {
+            "description": "Why it isn't, when `active` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_seen_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "network": {
+            "type": "string"
+          },
+          "router_name": {
+            "type": "string"
+          },
+          "target_container_id": {
+            "type": "string"
+          },
+          "target_container_name": {
+            "type": "string"
+          },
+          "target_host_port": {
+            "description": "Host-published port, used on baremetal installs where the proxy cannot\nresolve container names.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "target_port": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "tls": {
+            "type": "boolean"
+          },
+          "tls_certificate": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TraefikRouteTlsBlock",
+                "description": "TLS authorization state for this host (ADR-041). Present only when a\n`traefik_route_certificates` row exists. `null` means no operator has\never authorized TLS for this host — the container label's `tls` field\n(above) records what the label says, but this is what has been acted on."
+              }
+            ]
+          },
+          "updated_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "host",
+          "router_name",
+          "target_container_id",
+          "target_container_name",
+          "target_port",
+          "network",
+          "tls",
+          "enabled",
+          "active",
+          "contested_by",
+          "last_seen_at",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveryConflictResponse": {
+        "description": "A labelled container that was found but deliberately **not** adopted.",
+        "properties": {
+          "container_id": {
+            "type": "string"
+          },
+          "container_name": {
+            "type": "string"
+          },
+          "detail": {
+            "description": "Human-readable explanation of the conflict.",
+            "type": "string"
+          },
+          "host": {
+            "type": "string"
+          },
+          "reason": {
+            "description": "Machine-readable discriminator: `owned_by_temps_route` or\n`claimed_by_another_container`.",
+            "type": "string"
+          },
+          "router_name": {
+            "description": "Traefik router name the host came from.",
+            "type": "string"
+          },
+          "winner_container_name": {
+            "description": "Container that holds the host instead, when the conflict is between two\ndiscovered containers.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "host",
+          "container_id",
+          "container_name",
+          "router_name",
+          "reason",
+          "detail"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoverySetupResponse": {
+        "description": "How an operator turns discovery on. Always returned, including when\ndiscovery is already running, so the console/CLI can render the exact\ninvocation instead of sending the reader to the docs.",
+        "properties": {
+          "enable_env_var": {
+            "description": "Environment variable that opts this installation in.",
+            "example": "TEMPS_TRAEFIK_DISCOVERY_ENABLED",
+            "type": "string"
+          },
+          "example": {
+            "description": "A concrete, copy-pasteable example of enabling it.",
+            "type": "string"
+          },
+          "network_env_var": {
+            "description": "Environment variable overriding the watched Docker network.",
+            "example": "TEMPS_TRAEFIK_DISCOVERY_NETWORK",
+            "type": "string"
+          },
+          "requires_restart": {
+            "description": "These are read once at process start: changing them needs a restart.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enable_env_var",
+          "network_env_var",
+          "example",
+          "requires_restart"
+        ],
+        "type": "object"
+      },
+      "TraefikDiscoveryStatusResponse": {
+        "description": "Capability + status of Traefik label discovery on this instance.",
+        "properties": {
+          "configured": {
+            "description": "`true` only when the watcher is actually running in this process.\n`false` means \"not turned on here\", never \"not supported\" — the setup\nblock below always says how to turn it on.",
+            "type": "boolean"
+          },
+          "discovered_route_count": {
+            "description": "Rows currently in `traefik_discovered_routes` (all networks).",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "enabled": {
+            "description": "Whether `TEMPS_TRAEFIK_DISCOVERY_ENABLED` resolved to true. Can be\n`true` while `configured` is `false` (e.g. Docker unreachable).",
+            "type": "boolean"
+          },
+          "enabled_route_count": {
+            "description": "Of those, how many are enabled and therefore in the live route table.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_reconciliation": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TraefikReconciliationResponse",
+                "description": "Last reconciliation pass, absent until the first one completes."
+              }
+            ]
+          },
+          "network": {
+            "description": "Docker network being watched, or the one that *would* be watched.",
+            "type": "string"
+          },
+          "poll_interval_seconds": {
+            "description": "Interval of the full reconciliation safety net.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "description": "Why discovery isn't active, when `configured` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup": {
+            "$ref": "#/components/schemas/TraefikDiscoverySetupResponse"
+          }
+        },
+        "required": [
+          "configured",
+          "enabled",
+          "network",
+          "poll_interval_seconds",
+          "setup",
+          "discovered_route_count",
+          "enabled_route_count"
+        ],
+        "type": "object"
+      },
+      "TraefikReconciliationResponse": {
+        "description": "Summary of the most recent reconciliation pass.",
+        "properties": {
+          "completed_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "conflicts": {
+            "items": {
+              "$ref": "#/components/schemas/TraefikDiscoveryConflictResponse"
+            },
+            "type": "array"
+          },
+          "containers_scanned": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "network": {
+            "type": "string"
+          },
+          "routes_removed": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes_unchanged": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "routes_upserted": {
+            "minimum": 0,
+            "type": "integer"
+          },
+          "skipped_temps_managed": {
+            "description": "Containers skipped because Temps deployed them (they already have a\nroute and must never re-derive one from labels they control).",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "network",
+          "containers_scanned",
+          "skipped_temps_managed",
+          "routes_upserted",
+          "routes_unchanged",
+          "routes_removed",
+          "conflicts",
+          "completed_at"
+        ],
+        "type": "object"
+      },
+      "TraefikRouteTlsBlock": {
+        "description": "TLS state for a single discovered route (ADR-041 §3/§4).\n\nAbsent when no `traefik_route_certificates` row exists for this host.\nNever `null` on a host where `cert_authorized = true`.",
+        "properties": {
+          "authorized_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "authorized_container_id": {
+            "description": "Container ID that was authorized. Used for drift comparison.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "authorized_container_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "cert_authorized": {
+            "description": "The operator has explicitly authorized TLS for this host.",
+            "type": "boolean"
+          },
+          "container_drift": {
+            "description": "`true` when the currently-serving container differs from the one\nthat was authorized. Requires operator acknowledgment.",
+            "type": "boolean"
+          },
+          "container_drift_detected_at": {
+            "description": "When drift was first detected.",
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "current_container_name": {
+            "description": "Name of the container that currently holds the host (for the drift UI).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "days_remaining": {
+            "description": "Days until expiry.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "imported_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "not_after": {
+            "description": "ISO 8601 expiry time of the current certificate, if one exists.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "renewal_method": {
+            "description": "`\"http-01\"` or `\"dns-01\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "serving": {
+            "description": "`true` when the proxy is currently loading a cert for this host.",
+            "type": "boolean"
+          },
+          "source": {
+            "description": "`\"acme\"` or `\"imported\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "description": "Certificate status as reported by the `domains` row, e.g. `\"active\"`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "cert_authorized",
+          "serving",
+          "container_drift",
+          "container_drift_detected_at",
+          "authorized_at",
+          "imported_at"
+        ],
+        "type": "object"
+      },
       "TrafficAggregationRequest": {
         "properties": {
           "dimensions": {
@@ -43603,8 +44757,8 @@
         "description": "Request to update Blob service configuration",
         "properties": {
           "docker_image": {
-            "description": "Docker image to use (e.g., \"rustfs/rustfs:1.0.0-alpha.98\")",
-            "example": "rustfs/rustfs:1.0.0-alpha.98",
+            "description": "Docker image to use (e.g., \"rustfs/rustfs:1.0.0-rc.5\")",
+            "example": "rustfs/rustfs:1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -45610,6 +46764,19 @@
           "connection_id",
           "message",
           "is_active"
+        ],
+        "type": "object"
+      },
+      "UpdateTraefikRouteEnabledRequest": {
+        "description": "Body of `PATCH /traefik-discovery/routes/{host}/enabled`.",
+        "properties": {
+          "enabled": {
+            "description": "`false` suppresses the route without touching the container's labels;\nthe row stays visible so the operator can see what was found.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "enabled"
         ],
         "type": "object"
       },
@@ -62782,7 +63949,7 @@
         "operationId": "get_provider_metadata",
         "parameters": [
           {
-            "description": "Service type (mongodb, postgres, redis, s3)",
+            "description": "Service type (mariadb, mongodb, postgres, redis, s3, kv, blob, rustfs, or legacy minio)",
             "in": "path",
             "name": "service_type",
             "required": true,
@@ -73662,6 +74829,400 @@
           }
         ],
         "summary": "Status of the most recent Temps Cloud telemetry backfill for a project.",
+        "tags": [
+          "OTel"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/cloud-telemetry/bulk-jobs": {
+      "post": {
+        "operationId": "create_bulk_activation_job",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateBulkActivationJobRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkActivationJobResponse"
+                }
+              }
+            },
+            "description": "The activation was queued"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "The plan token is invalid, altered or expired"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "An activation is already running; the response carries its batch_id"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Queue the activation that was quoted.",
+        "tags": [
+          "OTel"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/cloud-telemetry/bulk-jobs/current": {
+      "get": {
+        "operationId": "get_current_bulk_activation_job",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "$ref": "#/components/schemas/BulkActivationJobResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "The active activation job, or null when none is running"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "The activation currently pending or running, or `null`.",
+        "tags": [
+          "OTel"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/cloud-telemetry/bulk-jobs/estimate": {
+      "post": {
+        "operationId": "estimate_bulk_activation",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EstimateBulkActivationRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkActivationEstimateResponse"
+                }
+              }
+            },
+            "description": "Per-project and total estimate, plus a plan token"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Neither or both scopes given, or an invalid window"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Temps Cloud is not ready for telemetry"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Quote a bulk Cloud-telemetry activation. Sends nothing.",
+        "tags": [
+          "OTel"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/cloud-telemetry/bulk-jobs/{batch_id}": {
+      "get": {
+        "operationId": "get_bulk_activation_job",
+        "parameters": [
+          {
+            "description": "Activation job id (UUID)",
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkActivationJobResponse"
+                }
+              }
+            },
+            "description": "The activation job"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No such activation job"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "One activation job, with per-project rows and an ETA.",
+        "tags": [
+          "OTel"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel": {
+      "post": {
+        "operationId": "cancel_bulk_activation_job",
+        "parameters": [
+          {
+            "description": "Activation job id (UUID)",
+            "in": "path",
+            "name": "batch_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BulkActivationJobResponse"
+                }
+              }
+            },
+            "description": "The cancellation was recorded, or the job had already stopped"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No such activation job"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Ask an activation to stop at the next chunk boundary.",
         "tags": [
           "OTel"
         ],
@@ -100442,6 +102003,517 @@
         "summary": "Get a specific template by slug",
         "tags": [
           "Templates"
+        ]
+      }
+    },
+    "/traefik-discovery/routes": {
+      "get": {
+        "operationId": "list_traefik_discovered_routes",
+        "parameters": [
+          {
+            "description": "Page number (default: 1)",
+            "in": "query",
+            "name": "page",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Page size (default: 20, max: 100)",
+            "in": "query",
+            "name": "page_size",
+            "required": false,
+            "schema": {
+              "format": "int64",
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraefikDiscoveredRouteListResponse"
+                }
+              }
+            },
+            "description": "Discovered routes and unresolved host conflicts"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List every container adopted from Traefik labels, plus the labelled\ncontainers that were found and rejected.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/routes/{host}/certificate": {
+      "delete": {
+        "description": "Clears `cert_authorized` so Temps stops attempting renewal. Does **not**\ndelete the `domains` row or the certificate — deleting live key material as\na side effect of deauthorization is the kind of surprise this codebase\navoids. Use `DELETE /domains/{host}` to remove the certificate itself.",
+        "operationId": "deauthorize_discovered_route_cert",
+        "parameters": [
+          {
+            "description": "Hostname of the discovered route",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "TLS authorization cleared"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No authorization record for that host"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Remove TLS authorization for a discovered route.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      },
+      "post": {
+        "description": "The operator explicitly authorizes issuance; `cert_eligible` stays `false`\nso the container's own labels can never trigger this. Both `SettingsWrite`\nand `DomainsCreate` are required: `SettingsWrite` is Admin/PlatformAdmin\nonly, so any caller reaching this endpoint is already an administrator.\n\nThe authorization is recorded against the container identity currently\nserving the host (§2a). Container drift after authorization fires a Critical\nalarm but does not auto-clear `cert_authorized` — auto-clearing would not\nremove the certificate and would be a DoS primitive (ADR-041 §2a).",
+        "operationId": "request_discovered_route_cert",
+        "parameters": [
+          {
+            "description": "Hostname of the discovered route",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestDiscoveredRouteCertRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "TLS authorization created and ACME challenge initiated"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error (e.g. unsupported challenge_type)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No discovered route for that host"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Host owned by another resource, or verification_method conflict"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Certificate validation failed"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          },
+          "502": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "TLS provisioner error (ACME upstream failure)"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Request Temps to issue an ACME certificate for a discovered route (Path A).",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/routes/{host}/enabled": {
+      "patch": {
+        "description": "This is a plain column update: the `traefik_discovered_routes` row-level\ntrigger fires `notify_route_table_change()` on an `enabled` change, so the\nexisting `route_table_changes` LISTEN/NOTIFY path reloads this node's route\ntable *and* every other control plane node's. No manual reload here.",
+        "operationId": "set_traefik_discovered_route_enabled",
+        "parameters": [
+          {
+            "description": "Hostname of the discovered route",
+            "in": "path",
+            "name": "host",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateTraefikRouteEnabledRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraefikDiscoveredRouteResponse"
+                }
+              }
+            },
+            "description": "Updated discovered route"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "No discovered route for that host"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Suppress or restore a single discovered route.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/status": {
+      "get": {
+        "operationId": "get_traefik_discovery_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TraefikDiscoveryStatusResponse"
+                }
+              }
+            },
+            "description": "Discovery status. `configured: false` means it is not turned on here — the `setup` block says exactly how to turn it on"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Whether Traefik label discovery is active on this instance, and how to turn\nit on when it is not.",
+        "tags": [
+          "Traefik Discovery"
+        ]
+      }
+    },
+    "/traefik-discovery/tls/import": {
+      "post": {
+        "description": "Upload the raw contents of Traefik's `acme.json` and a list of hosts to\nimport. Each host is independently validated (8-step chain from ADR-041 §5)\nand a per-host verdict is returned. `dry_run: true` runs all validation\nwithout writing anything, so the operator can preview before committing.\n\nThe request body is capped at 1 MiB. Do **not** add a decompression layer\nto this route — the 1 MiB cap's security properties depend on the absence\nof decompression here (ADR-041 §4).",
+        "operationId": "import_traefik_acme_json",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ImportTraefikAcmeJsonRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ImportTraefikAcmeJsonResponse"
+                }
+              }
+            },
+            "description": "Import results (per-host verdicts)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Validation error (malformed JSON, unsupported renewal_method)"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Request body exceeds the 1 MiB limit"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Import certificates from a Traefik `acme.json` document (Path B).",
+        "tags": [
+          "Traefik Discovery"
         ]
       }
     },

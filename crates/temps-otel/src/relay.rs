@@ -17,6 +17,19 @@
 
 use std::sync::Arc;
 
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+
+/// Maximum number of batches waiting in the process-wide relay handoff.
+///
+/// The consumer only dispatches into a plugin-owned queue, so a large message
+/// backlog here adds memory without improving destination outage tolerance.
+pub const RELAY_QUEUE_MAX_BATCHES: usize = 128;
+
+/// Maximum decompressed OTLP payload bytes retained by the process-wide relay
+/// handoff. This is independent of the queue's batch-count bound so a stream of
+/// maximum-size requests cannot consume the count limit times request limit.
+pub const RELAY_QUEUE_MAX_BYTES: usize = crate::memory::MAX_RELAY_QUEUE_BYTES;
+
 /// Which OTLP signal type a relay batch belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OtelSignal {
@@ -45,8 +58,94 @@ pub struct OtelRelayMessage {
     pub deployment_id: Option<i32>,
     /// OTLP signal type (Metrics / Traces / Logs).
     pub signal: OtelSignal,
+    /// Number of signal items in the batch (spans, log records, or metric
+    /// points). Relays use this for drop and throughput accounting without
+    /// decoding the protobuf a second time.
+    pub item_count: usize,
     /// Decompressed OTLP protobuf bytes (see module-level note).
     pub payload: bytes::Bytes,
+}
+
+/// Why a non-blocking enqueue into the process-wide relay handoff failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OtelRelayEnqueueError {
+    /// The batch-count limit was reached.
+    BatchCapacity,
+    /// Retaining this payload would exceed the byte budget.
+    ByteCapacity,
+    /// The background relay consumer has exited.
+    Closed,
+}
+
+impl OtelRelayEnqueueError {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BatchCapacity => "batch_capacity",
+            Self::ByteCapacity => "byte_capacity",
+            Self::Closed => "closed",
+        }
+    }
+}
+
+struct QueuedOtelRelayMessage {
+    message: OtelRelayMessage,
+    _byte_permit: OwnedSemaphorePermit,
+}
+
+/// Non-blocking, byte-aware sender used by OTLP ingest handlers.
+///
+/// A byte permit lives with each queued message and is released when the relay
+/// consumer dequeues that message. Both limits are therefore strict,
+/// and enqueue never waits for capacity on the latency-sensitive ingest path.
+#[derive(Clone)]
+pub struct OtelRelayQueueSender {
+    tx: mpsc::Sender<QueuedOtelRelayMessage>,
+    byte_budget: Arc<Semaphore>,
+}
+
+pub struct OtelRelayQueueReceiver {
+    rx: mpsc::Receiver<QueuedOtelRelayMessage>,
+}
+
+pub fn bounded_relay_queue(
+    max_batches: usize,
+    max_bytes: usize,
+) -> (OtelRelayQueueSender, OtelRelayQueueReceiver) {
+    let (tx, rx) = mpsc::channel(max_batches.max(1));
+    let byte_budget = Arc::new(Semaphore::new(max_bytes.max(1)));
+    (
+        OtelRelayQueueSender { tx, byte_budget },
+        OtelRelayQueueReceiver { rx },
+    )
+}
+
+impl OtelRelayQueueSender {
+    pub fn try_send(&self, message: OtelRelayMessage) -> Result<(), OtelRelayEnqueueError> {
+        let payload_bytes = message.payload.len().max(1);
+        let permits =
+            u32::try_from(payload_bytes).map_err(|_| OtelRelayEnqueueError::ByteCapacity)?;
+        let byte_permit = self
+            .byte_budget
+            .clone()
+            .try_acquire_many_owned(permits)
+            .map_err(|_| OtelRelayEnqueueError::ByteCapacity)?;
+
+        self.tx
+            .try_send(QueuedOtelRelayMessage {
+                message,
+                _byte_permit: byte_permit,
+            })
+            .map_err(|error| match error {
+                mpsc::error::TrySendError::Full(_) => OtelRelayEnqueueError::BatchCapacity,
+                mpsc::error::TrySendError::Closed(_) => OtelRelayEnqueueError::Closed,
+            })
+    }
+}
+
+impl OtelRelayQueueReceiver {
+    pub async fn recv(&mut self) -> Option<OtelRelayMessage> {
+        self.rx.recv().await.map(|queued| queued.message)
+    }
 }
 
 /// Extension point for observing or relaying decoded OTLP batches.
@@ -164,8 +263,55 @@ mod tests {
             environment_id: None,
             deployment_id: None,
             signal,
+            item_count: 1,
             payload: bytes::Bytes::from_static(b"test-payload"),
         }
+    }
+
+    fn sized_msg(payload_bytes: usize) -> OtelRelayMessage {
+        OtelRelayMessage {
+            project_id: 1,
+            environment_id: None,
+            deployment_id: None,
+            signal: OtelSignal::Traces,
+            item_count: 10,
+            payload: bytes::Bytes::from(vec![0; payload_bytes]),
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_queue_enforces_and_releases_byte_budget() {
+        let (tx, mut rx) = bounded_relay_queue(4, 8);
+
+        assert!(tx.try_send(sized_msg(8)).is_ok());
+        assert_eq!(
+            tx.try_send(sized_msg(1)),
+            Err(OtelRelayEnqueueError::ByteCapacity)
+        );
+
+        let received = rx.recv().await.expect("queued message");
+        assert_eq!(received.payload.len(), 8);
+        assert!(tx.try_send(sized_msg(8)).is_ok());
+    }
+
+    #[test]
+    fn bounded_queue_rejects_batch_larger_than_byte_budget() {
+        let (tx, _rx) = bounded_relay_queue(4, 8);
+        assert_eq!(
+            tx.try_send(sized_msg(9)),
+            Err(OtelRelayEnqueueError::ByteCapacity)
+        );
+    }
+
+    #[test]
+    fn bounded_queue_enforces_batch_capacity_independently() {
+        let (tx, _rx) = bounded_relay_queue(1, 1024);
+
+        assert!(tx.try_send(sized_msg(8)).is_ok());
+        assert_eq!(
+            tx.try_send(sized_msg(8)),
+            Err(OtelRelayEnqueueError::BatchCapacity)
+        );
     }
 
     // ── Test double ──────────────────────────────────────────────────────

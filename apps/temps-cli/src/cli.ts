@@ -71,6 +71,7 @@ import { registerSandboxCommands } from './commands/sandbox/index.js'
 import { registerWorkflowCommands } from './commands/workflow/index.js'
 import { registerRevenueCommands } from './commands/revenue/index.js'
 import { registerSessionReplayCommands } from './commands/session-replay/index.js'
+import { registerTraefikDiscoveryCommands } from './commands/traefik-discovery/index.js'
 
 // Developer workflow commands
 import { registerInitCommand } from './commands/init/index.js'
@@ -223,6 +224,7 @@ export function createProgram(): Command {
   registerWorkflowCommands(program)
   registerRevenueCommands(program)
   registerSessionReplayCommands(program)
+  registerTraefikDiscoveryCommands(program)
 
   // Developer workflow commands
   registerInitCommand(program)

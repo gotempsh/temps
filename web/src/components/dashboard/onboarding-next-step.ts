@@ -14,3 +14,7 @@ export function firstIncompleteGettingStartedIndex(
 ): number {
   return items.findIndex((item) => !item.done)
 }
+
+export function onboardingStepPosition(index: number, total: number): string {
+  return `Step ${index + 1} of ${total}`
+}

@@ -487,21 +487,59 @@ impl TlsService {
         };
 
         for cert in expiring {
-            match cert.verification_method.as_str() {
+            // ADR-041 §7a step (a): map known aliases to correct dispatch paths.
+            //
+            // `generate_certificate_from_order` hardcoded `"acme"` on every cert it
+            // produced, and `save_certificate`'s upsert included VerificationMethod,
+            // so every provision/renewal could overwrite a correctly-set `"http-01"`
+            // row with `"acme"`. Those rows were silently never renewed.
+            //
+            // "acme" and "http" → HTTP-01 renewal (the challenge type for every
+            //   non-DNS issuance before step (b) of §7a landed).
+            // "manual" → manual-renewal notification (an actionable "renew this
+            //   yourself" prompt, NOT TlsRenewalFailed — the cert was deliberately
+            //   not ACME-issued and the operator knows it).
+            //
+            // After step (b)'s backfill migration these aliases will no longer appear
+            // in the database; step (c) (shipped after that migration) makes a truly
+            // unknown value produce a RenewalFailure + Critical alarm. For now, an
+            // unrecognized value continues to warn so it is visible in logs without
+            // triggering false alarms on instances that have not yet run the backfill.
+            let effective_method = match cert.verification_method.as_str() {
+                "http-01" | "acme" | "http" => "http-01",
+                "dns-01" => "dns-01",
+                "manual" => "manual",
+                other => {
+                    warn!(
+                        domain = %cert.domain,
+                        verification_method = %other,
+                        "Unknown verification method — certificate will not be renewed until \
+                         the method is corrected. Run the ADR-041 backfill migration to map \
+                         known aliases to http-01."
+                    );
+                    continue;
+                }
+            };
+
+            match effective_method {
                 "http-01" => {
-                    // HTTP-01: Attempt automatic renewal
                     self.handle_http01_renewal(&cert, &mut report).await;
                 }
                 "dns-01" => {
-                    // DNS-01: Notify user for manual renewal
                     self.handle_dns01_notification(&cert, &mut report).await;
                 }
-                _ => {
-                    warn!(
-                        "Unknown verification method '{}' for domain {}",
-                        cert.verification_method, cert.domain
-                    );
+                "manual" => {
+                    // Manual-renewal notification: TlsCertExpiring (escalating to
+                    // Critical inside 7 days), not TlsRenewalFailed. The certificate
+                    // was not ACME-issued; the operator must renew it themselves.
+                    self.send_manual_renewal_notification(&cert).await;
+                    report.manual_action_needed.push(ManualRenewalNeeded {
+                        domain: cert.domain.clone(),
+                        expires_at: cert.expiration_time,
+                        days_remaining: cert.days_until_expiry(),
+                    });
                 }
+                _ => unreachable!("matched from a fixed set above"),
             }
         }
 
@@ -3147,5 +3185,150 @@ mod tests {
         let service = TlsService::new(repo, provider);
 
         assert_eq!(service.get_acme_email().await, "");
+    }
+
+    // ── ADR-041 §7a: Renewal dispatch alias tests ─────────────────────────────
+    //
+    // These tests verify that the alias mapping in `check_and_renew_certificates`
+    // routes each `verification_method` value to the correct renewal path. They
+    // use only `MockCertificateRepository` and `MockCertificateProvider` — no
+    // real ACME server, real database, or network I/O.
+    //
+    // The setup intentionally wires no `config_service` so `get_acme_email()`
+    // returns "". With an empty email, `provision_certificate` returns
+    // `Err(TlsError::Configuration(...))`, causing the HTTP-01 path to push the
+    // cert to `renewal_failed`. This is exactly what distinguishes it from the
+    // `manual` path (→ `manual_action_needed`) and the unknown-method path
+    // (→ silently skipped, nothing in any report field).
+
+    fn expiring_cert(domain: &str, verification_method: &str) -> Certificate {
+        Certificate {
+            id: 1,
+            domain: domain.to_string(),
+            certificate_pem: "test-cert-pem".to_string(),
+            private_key_pem: "test-key-pem".to_string(),
+            // 10 days → within the 30-day renewal threshold
+            expiration_time: chrono::Utc::now() + chrono::Duration::days(10),
+            last_renewed: None,
+            is_wildcard: false,
+            verification_method: verification_method.to_string(),
+            status: CertificateStatus::Active,
+        }
+    }
+
+    /// A `verification_method` of `"acme"` is a legacy alias produced by the old
+    /// code path. ADR-041 §7a maps it to HTTP-01. The test confirms it dispatches
+    /// to the HTTP-01 renewal branch (evidenced by the cert appearing in
+    /// `renewal_failed`, not in `manual_action_needed`) and never in a
+    /// "no match, silently ignored" state.
+    #[tokio::test]
+    async fn renewal_dispatch_acme_alias_routes_to_http01_path() {
+        let repo = Arc::new(MockCertificateRepository::new());
+        let provider = Arc::new(MockCertificateProvider::new());
+
+        // Seed with a cert using the legacy "acme" verification_method.
+        repo.save_certificate(expiring_cert("acme-alias.example.com", "acme"))
+            .await
+            .unwrap();
+
+        // No config_service → empty ACME email → provision_certificate returns
+        // Err(TlsError::Configuration), so the HTTP-01 handler pushes the domain
+        // into renewal_failed (proves it took the HTTP-01 path, not manual).
+        let service = TlsService::new(repo, provider);
+        let report = service
+            .check_and_renew_certificates(30)
+            .await
+            .expect("renewal check must not return a hard error");
+
+        assert_eq!(report.total_checked, 1);
+        // Went to the HTTP-01 path → landed in renewal_failed (no ACME email).
+        assert_eq!(
+            report.renewal_failed.len(),
+            1,
+            "\"acme\" alias must dispatch to the HTTP-01 path, not be silently skipped"
+        );
+        assert_eq!(report.renewal_failed[0].domain, "acme-alias.example.com");
+        // Critically: did NOT go to the manual path.
+        assert!(
+            report.manual_action_needed.is_empty(),
+            "\"acme\" alias must NOT dispatch to the manual-renewal path"
+        );
+    }
+
+    /// A `verification_method` of `"manual"` must dispatch to
+    /// `send_manual_renewal_notification` and produce a `ManualRenewalNeeded`
+    /// entry, never `RenewalFailure`. Without an alarm_service wired, the
+    /// notification is a no-op, but the report entry is always written.
+    #[tokio::test]
+    async fn renewal_dispatch_manual_method_routes_to_manual_notification_path() {
+        let repo = Arc::new(MockCertificateRepository::new());
+        let provider = Arc::new(MockCertificateProvider::new());
+
+        repo.save_certificate(expiring_cert("manual.example.com", "manual"))
+            .await
+            .unwrap();
+
+        let service = TlsService::new(repo, provider);
+        let report = service
+            .check_and_renew_certificates(30)
+            .await
+            .expect("renewal check must not return a hard error");
+
+        assert_eq!(report.total_checked, 1);
+        // Went to the manual path.
+        assert_eq!(
+            report.manual_action_needed.len(),
+            1,
+            "\"manual\" method must dispatch to the manual-renewal notification path"
+        );
+        assert_eq!(report.manual_action_needed[0].domain, "manual.example.com");
+        // Did NOT go to the HTTP-01 or DNS-01 renewal paths.
+        assert!(
+            report.renewal_failed.is_empty(),
+            "\"manual\" method must NOT produce a RenewalFailure"
+        );
+        assert!(
+            report.auto_renewed.is_empty(),
+            "\"manual\" method must NOT auto-renew"
+        );
+    }
+
+    /// A genuinely unrecognized `verification_method` (not any alias) must be
+    /// logged and skipped — it must NOT end up in `renewal_failed` (which would
+    /// fire a false alarm) and must NOT end up in `manual_action_needed`.
+    /// Confirms that step (c) of the §7a sequencing (warn + continue) survived
+    /// the alias-fix refactor.
+    #[tokio::test]
+    async fn renewal_dispatch_unknown_method_is_skipped_not_alarmed() {
+        let repo = Arc::new(MockCertificateRepository::new());
+        let provider = Arc::new(MockCertificateProvider::new());
+
+        repo.save_certificate(expiring_cert(
+            "unknown.example.com",
+            "completely-unknown-method",
+        ))
+        .await
+        .unwrap();
+
+        let service = TlsService::new(repo, provider);
+        let report = service
+            .check_and_renew_certificates(30)
+            .await
+            .expect("renewal check must not return a hard error");
+
+        assert_eq!(report.total_checked, 1);
+        // The cert was skipped (warn + continue) — nothing in any report bucket.
+        assert!(
+            report.renewal_failed.is_empty(),
+            "an unknown method must not produce a RenewalFailure (false alarm)"
+        );
+        assert!(
+            report.manual_action_needed.is_empty(),
+            "an unknown method must not dispatch to the manual-renewal path"
+        );
+        assert!(
+            report.auto_renewed.is_empty(),
+            "an unknown method must not be auto-renewed"
+        );
     }
 }

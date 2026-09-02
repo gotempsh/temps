@@ -1313,6 +1313,14 @@ impl WorkflowExecutionService {
 
                 let port = config.get("port").and_then(|v| v.as_i64()).unwrap_or(3000) as u16;
 
+                // Explicit environment/project port override, as resolved by the
+                // planner. `Some` here means `resolve_container_port()` must use
+                // it directly instead of falling back to image EXPOSE detection.
+                let configured_port = config
+                    .get("configured_port")
+                    .and_then(|v| v.as_i64())
+                    .map(|p| p as u16);
+
                 // Get replicas with priority: environment > project > job config > default (1)
                 let replicas = environment
                     .deployment_config
@@ -1480,6 +1488,7 @@ impl WorkflowExecutionService {
                     .service_name(deployment.slug.clone())
                     .namespace("default".to_string())
                     .port(port as u32)
+                    .configured_port(configured_port)
                     .replicas(replicas)
                     .environment_variables(env_variables)
                     .remote_environment_variables(remote_env_variables)

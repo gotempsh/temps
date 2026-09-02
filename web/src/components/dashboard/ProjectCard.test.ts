@@ -13,6 +13,7 @@ import {
 describe('deploymentLabel', () => {
   test('calls only completed runs deployed', () => {
     expect(deploymentLabel('completed')).toBe('Deployed')
+    expect(deploymentLabel('deployed')).toBe('Deployed')
     expect(deploymentLabel('failed')).toBe('Last attempt')
     expect(deploymentLabel('cancelled')).toBe('Last attempt')
     expect(deploymentLabel(undefined)).toBe('Last attempt')

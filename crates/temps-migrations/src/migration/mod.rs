@@ -213,7 +213,12 @@ mod m20260828_000002_add_alarms_silenced_until;
 mod m20260829_000001_allow_duplicate_ready_snapshot_digests;
 mod m20260830_000001_add_external_service_creator;
 mod m20260830_000001_add_managed_by_cloud_to_s3_sources;
+mod m20260830_000001_create_traefik_discovered_routes;
+// Main shipped this migration first with the same date and sequence stamp as
+// the certificates migration below. Preserve that upgrade history.
 mod m20260831_000001_create_analytics_ingest_keys;
+mod m20260831_000001_create_traefik_route_certificates;
+mod m20260831_000002_backfill_acme_verification_method;
 mod m20260901_000001_add_cloud_telemetry_fidelity;
 mod m20260901_000002_create_cloud_telemetry_backfills;
 mod m20260901_000003_constrain_cloud_telemetry_fidelity;
@@ -467,9 +472,21 @@ impl MigratorTrait for Migrator {
             Box::new(m20260828_000001_alarms_nullable_project::Migration),
             Box::new(m20260828_000002_add_alarms_silenced_until::Migration),
             Box::new(m20260829_000001_allow_duplicate_ready_snapshot_digests::Migration),
+            // Main shipped this migration first with the same date and sequence
+            // stamp as the discovered-routes migration below. Preserve that
+            // upgrade history.
             Box::new(m20260830_000001_add_external_service_creator::Migration),
             Box::new(m20260830_000001_add_managed_by_cloud_to_s3_sources::Migration),
+            Box::new(m20260830_000001_create_traefik_discovered_routes::Migration),
+            // Main shipped this migration first with the same date and sequence
+            // stamp as the certificates migration below. Preserve that upgrade
+            // history.
             Box::new(m20260831_000001_create_analytics_ingest_keys::Migration),
+            // ADR-041: durable per-host TLS authorization records for discovered routes.
+            Box::new(m20260831_000001_create_traefik_route_certificates::Migration),
+            // ADR-041 §7a step (b): backfill "acme"/"http" → "http-01" so the renewal
+            // scheduler can dispatch them; "manual" is intentionally left untouched.
+            Box::new(m20260831_000002_backfill_acme_verification_method::Migration),
             Box::new(m20260901_000001_add_cloud_telemetry_fidelity::Migration),
             Box::new(m20260901_000002_create_cloud_telemetry_backfills::Migration),
             Box::new(m20260901_000003_constrain_cloud_telemetry_fidelity::Migration),

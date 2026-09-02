@@ -3,6 +3,7 @@
 
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { DEFAULT_RUSTFS_IMAGE } from '@/lib/service-images'
 import { AlertTriangle } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { useState } from 'react'
@@ -391,7 +392,7 @@ const S3_OPTIONS: PresetOption[] = [
     id: 'rustfs',
     title: 'RustFS',
     subtitle: 'Rust-native',
-    value: 'rustfs/rustfs:1.0.0-alpha.98',
+    value: DEFAULT_RUSTFS_IMAGE,
     hint: 'Default',
   },
   {

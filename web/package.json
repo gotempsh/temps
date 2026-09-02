@@ -131,6 +131,7 @@
   },
   "overrides": {
     "brace-expansion": "^5.0.9",
+    "browserslist": "^4.28.8",
     "d3-color": "^3.1.0",
     "defu": "^6.1.5",
     "flatted": "^3.4.2",

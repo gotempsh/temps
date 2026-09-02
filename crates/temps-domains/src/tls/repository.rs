@@ -133,6 +133,25 @@ impl CertificateRepository for DefaultCertificateRepository {
     async fn save_certificate(&self, cert: Certificate) -> Result<Certificate, RepositoryError> {
         use temps_entities::domains;
 
+        // ADR-041 §7a step (b): guard against downgrading a correct verification_method.
+        //
+        // Before this fix, `generate_certificate_from_order` hardcoded "acme" and
+        // `save_certificate`'s upsert unconditionally overwrote `verification_method`,
+        // so a provisioning run could turn a correctly-set `"http-01"` row into `"acme"`.
+        // Reject the alias values here so any code path that still produces them is caught
+        // immediately rather than silently producing an unrenewable certificate.
+        //
+        // The backfill migration (m20260831_000002) corrects existing rows; this guard
+        // prevents regression after the backfill.
+        if matches!(cert.verification_method.as_str(), "acme" | "http") {
+            return Err(RepositoryError::Internal(format!(
+                "save_certificate: verification_method '{}' is a legacy alias — \
+                 use 'http-01' or 'dns-01'. Check generate_certificate_from_order \
+                 for the code path that produced this value.",
+                cert.verification_method
+            )));
+        }
+
         // Encrypt the private key before saving
         let encrypted_private_key = if !cert.private_key_pem.is_empty() {
             self.encryption_service
@@ -160,6 +179,10 @@ impl CertificateRepository for DefaultCertificateRepository {
                         domains::Column::LastRenewed,
                         domains::Column::Status,
                         domains::Column::UpdatedAt,
+                        // ADR-041 §7a step (b): VerificationMethod is still updated on
+                        // conflict so that import (Path B) can set it to the declared
+                        // renewal_method. The alias guard above ensures only valid values
+                        // ("http-01", "dns-01", "manual") reach this point.
                         domains::Column::VerificationMethod,
                         domains::Column::IsWildcard,
                         domains::Column::LastError,

@@ -596,6 +596,43 @@ impl TempsPlugin for DeploymentsPlugin {
             sensitive_action_authorizer,
         });
 
+        // Traefik label discovery is an operator-level, host-scoped feature
+        // whose watcher (when enabled) is started by `temps serve`, which
+        // registers the resulting handle here. When nothing registered one —
+        // an embedded bootstrap, or a process that doesn't run the watcher —
+        // fall back to a handle that reports the environment's intent and
+        // says the watcher is not running, so the endpoints still answer
+        // `configured: false` with a reason instead of 404'ing. A feature that
+        // disappears when unconfigured is indistinguishable from one that was
+        // never built (CLAUDE.md, Feature Discoverability).
+        let traefik_discovery_handle = context
+            .get_service::<temps_deployer::traefik_discovery::TraefikDiscoveryHandle>()
+            .unwrap_or_else(|| {
+                Arc::new(
+                    temps_deployer::traefik_discovery::TraefikDiscoveryHandle::disabled_from_env(
+                        &temps_core::NETWORK_NAME,
+                    ),
+                )
+            });
+        // ADR-041 §8: the TLS provisioner bridges temps-deployments to
+        // temps-domains without introducing a direct crate dependency.
+        // It is registered by the serve wiring layer (console.rs) after all
+        // plugins have initialized, following the same pattern as
+        // AlarmServiceDriftSink. `require_service` fails loudly at startup if
+        // the provisioner was not registered, per CLAUDE.md's dependency rule.
+        let provisioner = context.require_service::<dyn crate::services::traefik_discovery_service::DiscoveredHostTlsProvisioner>();
+        let traefik_discovery_state =
+            Arc::new(handlers::traefik_discovery::TraefikDiscoveryAppState {
+                traefik_discovery_service: Arc::new(
+                    crate::services::TraefikDiscoveryAdminService::new(
+                        context.require_service::<sea_orm::DatabaseConnection>(),
+                        traefik_discovery_handle,
+                        provisioner,
+                    ),
+                ),
+                audit_service: context.require_service::<dyn temps_core::AuditLogger>(),
+            });
+
         let deployments_routes = handlers::deployments::configure_routes();
         let cron_routes = handlers::crons::configure_routes();
         let external_images_routes = handlers::external_images::configure_routes();
@@ -607,13 +644,17 @@ impl TempsPlugin for DeploymentsPlugin {
         let deployment_token_routes =
             handlers::deployment_tokens::configure_routes().with_state(deployment_token_state);
 
+        let traefik_discovery_routes =
+            handlers::traefik_discovery::configure_routes().with_state(traefik_discovery_state);
+
         let routes = deployments_routes
             .merge(cron_routes)
             .merge(external_images_routes)
             .merge(remote_deployments_routes)
             .merge(admin_node_routes)
             .with_state(app_state)
-            .merge(deployment_token_routes);
+            .merge(deployment_token_routes)
+            .merge(traefik_discovery_routes);
 
         Some(PluginRoutes::new(routes))
     }
@@ -629,6 +670,8 @@ impl TempsPlugin for DeploymentsPlugin {
         let nodes_schema = <handlers::nodes::NodesApiDoc as UtoimaOpenApi>::openapi();
         let deployment_tokens_schema =
             <handlers::deployment_tokens::DeploymentTokensApiDoc as UtoimaOpenApi>::openapi();
+        let traefik_discovery_schema =
+            <handlers::traefik_discovery::TraefikDiscoveryApiDoc as UtoimaOpenApi>::openapi();
 
         Some(temps_core::openapi::merge_openapi_schemas(
             deployments_schema,
@@ -638,6 +681,7 @@ impl TempsPlugin for DeploymentsPlugin {
                 remote_deployments_schema,
                 nodes_schema,
                 deployment_tokens_schema,
+                traefik_discovery_schema,
             ],
         ))
     }
@@ -694,5 +738,30 @@ mod tests {
             paths.contains_key("/projects/{project_id}/deployment-tokens/{token_id}"),
             "deployment-token item route must be in the merged OpenAPI schema"
         );
+    }
+
+    // Same guard for the Traefik discovery surface: it is merged into the
+    // plugin's router and schema, and a drop from either would leave the
+    // feature invisible to the console and the CLI.
+    #[test]
+    fn openapi_schema_exposes_traefik_discovery_routes() {
+        let schema = DeploymentsPlugin::new()
+            .openapi_schema()
+            .expect("deployments plugin must expose an OpenAPI schema");
+        let paths = schema.paths.paths;
+
+        for expected in [
+            "/traefik-discovery/status",
+            "/traefik-discovery/routes",
+            "/traefik-discovery/routes/{host}/enabled",
+            "/traefik-discovery/routes/{host}/certificate",
+            "/traefik-discovery/tls/import",
+        ] {
+            assert!(
+                paths.contains_key(expected),
+                "{expected} must be in the merged OpenAPI schema; got paths: {:?}",
+                paths.keys().collect::<Vec<_>>()
+            );
+        }
     }
 }
