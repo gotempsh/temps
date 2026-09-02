@@ -162,6 +162,10 @@ export function Projects() {
         latestDeploymentMedia={
           latestDeploymentMedia.data?.projects?.[String(project.id)]
         }
+        latestDeploymentMediaLoading={latestDeploymentMedia.isLoading}
+        latestDeploymentMediaError={
+          latestDeploymentMedia.isError && !latestDeploymentMedia.data
+        }
       />
     ))
 

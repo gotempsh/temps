@@ -4487,7 +4487,7 @@
         "properties": {
           "docker_image": {
             "description": "Docker image being used",
-            "example": "ghcr.io/rustfs/rustfs:0.5.0",
+            "example": "rustfs/rustfs:1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -4505,7 +4505,7 @@
           },
           "version": {
             "description": "Current version (if running)",
-            "example": "0.5.0",
+            "example": "1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -14219,7 +14219,7 @@
         "properties": {
           "docker_image": {
             "description": "Docker image to use (optional, defaults to RustFS)",
-            "example": "ghcr.io/rustfs/rustfs:0.5.0",
+            "example": "rustfs/rustfs:1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -21622,6 +21622,9 @@
       },
       "LatestDeploymentMediaResponseItem": {
         "properties": {
+          "latest_attempt_status": {
+            "type": "string"
+          },
           "project_id": {
             "format": "int32",
             "type": "integer"
@@ -21640,7 +21643,8 @@
           }
         },
         "required": [
-          "project_id"
+          "project_id",
+          "latest_attempt_status"
         ],
         "type": "object"
       },
@@ -42742,8 +42746,8 @@
         "description": "Request to update Blob service configuration",
         "properties": {
           "docker_image": {
-            "description": "Docker image to use (e.g., \"rustfs/rustfs:1.0.0-alpha.98\")",
-            "example": "rustfs/rustfs:1.0.0-alpha.98",
+            "description": "Docker image to use (e.g., \"rustfs/rustfs:1.0.0-rc.5\")",
+            "example": "rustfs/rustfs:1.0.0-rc.5",
             "type": [
               "string",
               "null"
@@ -61609,7 +61613,7 @@
         "operationId": "get_provider_metadata",
         "parameters": [
           {
-            "description": "Service type (mongodb, postgres, redis, s3)",
+            "description": "Service type (mariadb, mongodb, postgres, redis, s3, kv, blob, rustfs, or legacy minio)",
             "in": "path",
             "name": "service_type",
             "required": true,

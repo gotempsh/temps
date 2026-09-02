@@ -10156,6 +10156,7 @@ export type LatestDeploymentMediaResponse = {
 };
 
 export type LatestDeploymentMediaResponseItem = {
+    latest_attempt_status: string;
     project_id: number;
     screenshot_location?: string | null;
     url?: string | null;
@@ -19672,7 +19673,7 @@ export type UpdateBackupScheduleRequest = {
  */
 export type UpdateBlobRequest = {
     /**
-     * Docker image to use (e.g., "rustfs/rustfs:1.0.0-alpha.98")
+     * Docker image to use (e.g., "rustfs/rustfs:1.0.0-rc.5")
      */
     docker_image?: string | null;
 };
@@ -30438,7 +30439,7 @@ export type GetProviderMetadataData = {
     body?: never;
     path: {
         /**
-         * Service type (mongodb, postgres, redis, s3)
+         * Service type (mariadb, mongodb, postgres, redis, s3, kv, blob, rustfs, or legacy minio)
          */
         service_type: string;
     };

@@ -136,6 +136,7 @@ export function projectBuildSource(
 export function deploymentLabel(status?: string | null): string {
   switch (status) {
     case 'completed':
+    case 'deployed':
       return 'Deployed'
     case 'running':
     case 'pending':

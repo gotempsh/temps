@@ -21,7 +21,10 @@ import {
 } from 'lucide-react'
 import { useState } from 'react'
 import { Link } from 'react-router'
-import { firstIncompleteGettingStartedIndex } from './onboarding-next-step'
+import {
+  firstIncompleteGettingStartedIndex,
+  onboardingStepPosition,
+} from './onboarding-next-step'
 
 const STEP_ICONS: Record<string, LucideIcon> = {
   ai: Bot,
@@ -107,8 +110,8 @@ export function OnboardingNextStepCard() {
             >
               <ChevronLeft className="size-4" />
             </Button>
-            <span className="min-w-10 text-center text-xs tabular-nums text-muted-foreground">
-              {safeSelectedIndex + 1} / {totalCount}
+            <span className="min-w-16 text-center text-xs tabular-nums text-muted-foreground">
+              {onboardingStepPosition(safeSelectedIndex, totalCount)}
             </span>
             <Button
               variant="ghost"

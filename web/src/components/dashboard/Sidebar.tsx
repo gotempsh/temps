@@ -623,7 +623,7 @@ function GettingStartedNavItem() {
           <SidebarMenuItem>
             <SidebarMenuButton
               asChild
-              tooltip={`Finish setup — ${completedCount}/${totalCount}`}
+              tooltip={`Platform setup — ${completedCount}/${totalCount}`}
               className="justify-center"
             >
               <Link to="/setup">
@@ -644,7 +644,7 @@ function GettingStartedNavItem() {
       >
         <div className="flex items-center gap-2">
           <BadgeCheck className="size-4 shrink-0 text-primary" />
-          <span className="flex-1 text-sm font-medium">Finish setup</span>
+          <span className="flex-1 text-sm font-medium">Platform setup</span>
           <span className="text-xs tabular-nums text-muted-foreground">
             {completedCount}/{totalCount}
           </span>
@@ -1111,7 +1111,7 @@ function ProjectSetupNavItem({ project }: { project: ProjectResponse }) {
       >
         <div className="flex items-center gap-2">
           <BadgeCheck className="size-4 shrink-0 text-primary" />
-          <span className="flex-1 text-sm font-medium">Finish setup</span>
+          <span className="flex-1 text-sm font-medium">Project setup</span>
           <span className="text-xs tabular-nums text-muted-foreground">
             {setup.completedCount}/{setup.totalCount}
           </span>

@@ -3,6 +3,7 @@
 
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { DEFAULT_RUSTFS_IMAGE } from '@/lib/service-images'
 import { AlertTriangle } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { useState } from 'react'
@@ -115,16 +116,14 @@ function PresetGroup({
         <div className="flex items-start gap-2 rounded-md border border-amber-500/20 bg-amber-500/10 p-3 text-sm text-amber-800 dark:text-amber-200">
           <AlertTriangle className="h-4 w-4 flex-shrink-0 mt-0.5" />
           <div className="space-y-1">
-            <p className="font-medium">
-              Point-in-time recovery not available
-            </p>
+            <p className="font-medium">Point-in-time recovery not available</p>
             <p className="text-xs">
-              This image does not include WAL-G. Backups will be basic
-              snapshots — you won't be able to restore to a specific
-              timestamp.
+              This image does not include WAL-G. Backups will be basic snapshots
+              — you won’t be able to restore to a specific timestamp.
               {pitrManagedImage && (
                 <>
-                  {' '}For full PITR support, use{' '}
+                  {' '}
+                  For full PITR support, use{' '}
                   <code className="font-mono bg-amber-500/10 px-1 rounded">
                     {pitrManagedImage}
                   </code>
@@ -158,9 +157,7 @@ export interface PresetState {
  *
  * Returns null ui + empty overrides for service types that don't have a preset.
  */
-export function useServiceTypePreset(
-  serviceType: string | null
-): PresetState {
+export function useServiceTypePreset(serviceType: string | null): PresetState {
   // One hook call per possible preset keeps hook order stable.
   const postgres = usePostgresPreset()
   const mariadb = useMariDbPreset()
@@ -395,7 +392,7 @@ const S3_OPTIONS: PresetOption[] = [
     id: 'rustfs',
     title: 'RustFS',
     subtitle: 'Rust-native',
-    value: 'rustfs/rustfs:1.0.0-alpha.98',
+    value: DEFAULT_RUSTFS_IMAGE,
     hint: 'Default',
   },
   {

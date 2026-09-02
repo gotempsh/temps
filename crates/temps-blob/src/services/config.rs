@@ -6,8 +6,9 @@
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
 
-/// Default RustFS Docker image
-pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-alpha.98";
+/// Default RustFS Docker image. Re-export the provider default so managed S3
+/// and the blob subsystem cannot silently provision different releases.
+pub use temps_providers::externalsvc::rustfs::DEFAULT_RUSTFS_IMAGE;
 /// Default container name
 pub const DEFAULT_CONTAINER_NAME: &str = "temps-blob-rustfs";
 /// Default volume name
@@ -18,7 +19,7 @@ pub const DEFAULT_BUCKET_NAME: &str = "temps-blobs";
 /// User-provided configuration for Blob service (with defaults)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BlobInputConfig {
-    /// Docker image to use (e.g., "rustfs/rustfs:1.0.0-alpha.98")
+    /// Docker image to use (e.g., "rustfs/rustfs:1.0.0-rc.5")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub docker_image: Option<String>,
 

@@ -219,6 +219,7 @@ pub struct DeploymentListResponse {
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
 pub struct LatestDeploymentMediaResponseItem {
     pub project_id: i32,
+    pub latest_attempt_status: String,
     pub url: Option<String>,
     pub screenshot_location: Option<String>,
 }
@@ -227,6 +228,7 @@ impl From<crate::services::types::LatestDeploymentMedia> for LatestDeploymentMed
     fn from(media: crate::services::types::LatestDeploymentMedia) -> Self {
         Self {
             project_id: media.project_id,
+            latest_attempt_status: media.latest_attempt_status,
             url: media.url,
             screenshot_location: media.screenshot_location,
         }

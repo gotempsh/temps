@@ -36,11 +36,13 @@ use super::{
 
 /// Default RustFS Docker image (from Docker Hub).
 ///
-/// `1.0.0-beta.6` is the first stable line with reliable OTLP custom-header
-/// support (`RUSTFS_OBS_ENDPOINT_METRICS_HEADERS`), fixed in alpha.99. This
-/// lets us authenticate metrics push with an `Authorization` header instead of
-/// embedding the ingest token in the URL path (which leaks into logs).
-pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-beta.6";
+/// `1.0.0-rc.5` is the current named RustFS release and includes reliable
+/// OTLP custom-header support (`RUSTFS_OBS_ENDPOINT_METRICS_HEADERS`). Pinning
+/// the version avoids the moving `latest` channel. Container registries can
+/// still replace a tag, so callers that require immutable artifacts should
+/// additionally verify the image digest.
+pub const DEFAULT_RUSTFS_IMAGE: &str = "rustfs/rustfs:1.0.0-rc.5";
+const DEFAULT_RUSTFS_VERSION: &str = "1.0.0-rc.5";
 /// Default RustFS API port
 pub const DEFAULT_RUSTFS_API_PORT: u16 = 9000;
 /// Default RustFS console port
@@ -1532,7 +1534,10 @@ impl ExternalService for RustfsService {
     }
 
     fn get_default_docker_image(&self) -> (String, String) {
-        ("rustfs/rustfs".to_string(), "latest".to_string())
+        (
+            "rustfs/rustfs".to_string(),
+            DEFAULT_RUSTFS_VERSION.to_string(),
+        )
     }
 
     async fn get_current_docker_image(&self) -> Result<(String, String)> {
@@ -1555,7 +1560,7 @@ impl ExternalService for RustfsService {
     }
 
     fn get_default_version(&self) -> String {
-        "latest".to_string()
+        DEFAULT_RUSTFS_VERSION.to_string()
     }
 
     async fn get_current_version(&self) -> Result<String> {
@@ -2606,6 +2611,16 @@ mod tests {
         assert_eq!(config.docker_image, DEFAULT_RUSTFS_IMAGE);
         assert!(!config.access_key.is_empty());
         assert!(!config.secret_key.is_empty());
+    }
+
+    #[test]
+    fn rustfs_lifecycle_defaults_match_the_provisioning_image() {
+        let (repository, version) = DEFAULT_RUSTFS_IMAGE
+            .rsplit_once(':')
+            .expect("the tested RustFS image must include an explicit version");
+
+        assert_eq!(repository, "rustfs/rustfs");
+        assert_eq!(version, DEFAULT_RUSTFS_VERSION);
     }
 
     #[test]

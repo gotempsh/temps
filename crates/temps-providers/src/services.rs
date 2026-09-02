@@ -8,7 +8,7 @@ use crate::externalsvc::{
     postgres::PostgresService,
     postgres_cluster::PostgresClusterService,
     redis::RedisService,
-    rustfs::RustfsService,
+    rustfs::{RustfsService, DEFAULT_RUSTFS_IMAGE},
     s3::S3Service,
     AvailableContainer, ClusterMemberResult, ClusterMemberSpec, ExternalService, HealthProbeStatus,
     ManagedS3BackendKind, ManagedS3BackendSelection, PgAutoFailoverState, ServiceConfig,
@@ -1569,7 +1569,7 @@ impl ExternalServiceManager {
                 let image = parameters
                     .get("docker_image")
                     .cloned()
-                    .unwrap_or_else(|| "ghcr.io/rustfs/rustfs:latest".to_string());
+                    .unwrap_or_else(|| DEFAULT_RUSTFS_IMAGE.to_string());
                 let access_key = parameters
                     .get("access_key")
                     .cloned()
@@ -11563,17 +11563,30 @@ mod tests {
     fn remote_create_uses_provider_canonical_container_names() {
         let manager = mock_service_manager(vec![]);
 
-        for (service_type, expected) in [
-            (ServiceType::Postgres, "postgres-orders"),
-            (ServiceType::Mariadb, "mariadb-orders"),
-            (ServiceType::Mongodb, "temps-mongodb-orders"),
-            (ServiceType::Redis, "redis-orders"),
-            (ServiceType::Rustfs, "rustfs-orders"),
+        for (service_type, expected_name, expected_image) in [
+            (ServiceType::Postgres, "postgres-orders", None),
+            (ServiceType::Mariadb, "mariadb-orders", None),
+            (ServiceType::Mongodb, "temps-mongodb-orders", None),
+            (ServiceType::Redis, "redis-orders", None),
+            (
+                ServiceType::Rustfs,
+                "rustfs-orders",
+                Some(DEFAULT_RUSTFS_IMAGE),
+            ),
+            (ServiceType::S3, "rustfs-orders", Some(DEFAULT_RUSTFS_IMAGE)),
+            (
+                ServiceType::Blob,
+                "rustfs-orders",
+                Some(DEFAULT_RUSTFS_IMAGE),
+            ),
         ] {
             let params = manager
                 .build_remote_create_params("orders", &service_type, &HashMap::new())
                 .expect("default remote service parameters should be valid");
-            assert_eq!(params.name, expected, "wrong name for {service_type}");
+            assert_eq!(params.name, expected_name, "wrong name for {service_type}");
+            if let Some(expected_image) = expected_image {
+                assert_eq!(params.image, expected_image);
+            }
         }
     }
 

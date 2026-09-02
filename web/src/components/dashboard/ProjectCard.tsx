@@ -50,9 +50,12 @@ interface ProjectCardProps {
   /** Latest production uptime-monitor status; outranks traffic health. */
   monitorHealth?: ProjectMonitorHealth
   latestDeploymentMedia?: {
+    latest_attempt_status: string
     url?: string | null
     screenshot_location?: string | null
   }
+  latestDeploymentMediaLoading?: boolean
+  latestDeploymentMediaError?: boolean
 }
 
 const HEALTH_TONE_STYLES: Record<
@@ -135,6 +138,8 @@ export function ProjectCard({
   health,
   monitorHealth,
   latestDeploymentMedia,
+  latestDeploymentMediaLoading = false,
+  latestDeploymentMediaError = false,
 }: ProjectCardProps) {
   const repository = projectRepository(project)
   const buildSource = projectBuildSource(project)
@@ -155,6 +160,18 @@ export function ProjectCard({
     traffic.kind === 'visitors'
       ? 'Visitor traffic over the last 24 hours'
       : 'API request traffic over the last 24 hours'
+
+  const deploymentBadge = latestDeploymentMediaLoading ? (
+    <Skeleton className="h-5 w-20" />
+  ) : latestDeploymentMediaError ? (
+    <Badge variant="outline" className="h-5 shrink-0 px-1.5">
+      Unavailable
+    </Badge>
+  ) : (
+    <Badge variant="secondary" className="h-5 shrink-0 px-1.5">
+      {deploymentLabel(latestDeploymentMedia?.latest_attempt_status)}
+    </Badge>
+  )
 
   const activityContent =
     analyticsLoading && healthLoading ? (
@@ -265,11 +282,7 @@ export function ProjectCard({
               <p className="mt-1 text-xs text-muted-foreground">Not deployed</p>
             )}
           </div>
-          {project.last_deployment && (
-            <Badge variant="secondary" className="h-5 shrink-0 px-1.5">
-              {deploymentLabel()}
-            </Badge>
-          )}
+          {project.last_deployment && deploymentBadge}
         </div>
       </Link>
     )
@@ -314,9 +327,7 @@ export function ProjectCard({
         <div className="min-w-0 text-sm">
           {project.last_deployment ? (
             <div className="flex min-w-0 items-center gap-2">
-              <Badge variant="secondary" className="h-5 shrink-0 px-1.5">
-                Deployed
-              </Badge>
+              {deploymentBadge}
               <span className="truncate text-xs text-muted-foreground">
                 <TimeAgo date={project.last_deployment} />
               </span>
@@ -406,9 +417,7 @@ export function ProjectCard({
       <MetadataCell label="Latest deployment">
         {project.last_deployment ? (
           <div className="min-w-0">
-            <Badge variant="secondary" className="h-5 px-1.5">
-              Deployed
-            </Badge>
+            {deploymentBadge}
             <p className="mt-1 truncate text-xs text-muted-foreground">
               <TimeAgo date={project.last_deployment} />
             </p>
