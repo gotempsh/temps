@@ -31,8 +31,12 @@ impl From<sea_orm::DbErr> for PerformanceError {
 #[derive(Debug, Clone)]
 pub struct RecordPerformanceMetricsConfig {
     pub project_id: i32,
-    pub environment_id: i32,
-    pub deployment_id: i32,
+    /// `None` when the host has no Temps environment (e.g. an app Temps does
+    /// not deploy). The metric is still recorded — dropping it was the old
+    /// behaviour and it lost web vitals silently.
+    pub environment_id: Option<i32>,
+    /// `None` when the environment has no live Temps deployment.
+    pub deployment_id: Option<i32>,
     pub session_id: Option<String>,
     pub visitor_id: Option<String>,
     pub ip_address_id: Option<i32>,
@@ -57,8 +61,11 @@ pub struct RecordPerformanceMetricsConfig {
 #[derive(Debug, Clone)]
 pub struct UpdatePerformanceMetricsConfig {
     pub project_id: i32,
-    pub environment_id: i32,
-    pub deployment_id: i32,
+    /// `None` when the host has no Temps environment; matched with `IS NULL`
+    /// so it finds the row `record_performance_metrics` actually wrote.
+    pub environment_id: Option<i32>,
+    /// `None` when the environment has no live Temps deployment.
+    pub deployment_id: Option<i32>,
     pub session_id: Option<String>,
     pub visitor_id: Option<String>,
     pub cls: Option<f32>,
@@ -916,10 +923,16 @@ impl PerformanceService {
             None
         };
 
-        // Look up visitor_id in visitor table
+        // Look up visitor_id in visitor table, scoped to this project.
+        // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
+        // visitor_id string can legitimately belong to different projects —
+        // so an unscoped lookup would match (and, on the record path,
+        // update the `last_seen`/attribution of) another project's visitor
+        // row for any client-supplied visitor_id on the keyed ingest path.
         let visitor_id_i32 = if let Some(vis_id) = config.visitor_id {
             visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(&vis_id))
+                .filter(visitor::Column::ProjectId.eq(config.project_id))
                 .one(self.db.as_ref())
                 .await?
                 .map(|v| v.id)
@@ -984,10 +997,16 @@ impl PerformanceService {
             None
         };
 
-        // Look up visitor_id in visitor table
+        // Look up visitor_id in visitor table, scoped to this project.
+        // `visitor` is uniquely keyed on (visitor_id, project_id) — the same
+        // visitor_id string can legitimately belong to different projects —
+        // so an unscoped lookup would match (and, on the record path,
+        // update the `last_seen`/attribution of) another project's visitor
+        // row for any client-supplied visitor_id on the keyed ingest path.
         let visitor_id_i32 = if let Some(vis_id) = config.visitor_id {
             visitor::Entity::find()
                 .filter(visitor::Column::VisitorId.eq(&vis_id))
+                .filter(visitor::Column::ProjectId.eq(config.project_id))
                 .one(self.db.as_ref())
                 .await?
                 .map(|v| v.id)
@@ -998,8 +1017,17 @@ impl PerformanceService {
         // Find the most recent metric for this session/visitor
         let mut query = performance_metrics::Entity::find()
             .filter(performance_metrics::Column::ProjectId.eq(config.project_id))
-            .filter(performance_metrics::Column::EnvironmentId.eq(config.environment_id))
-            .filter(performance_metrics::Column::DeploymentId.eq(config.deployment_id))
+            // `= NULL` matches nothing in SQL, so an unscoped metric has to be
+            // located with `IS NULL` or the late CLS/INP update silently finds
+            // no row and errors out.
+            .filter(match config.environment_id {
+                Some(env_id) => performance_metrics::Column::EnvironmentId.eq(env_id),
+                None => performance_metrics::Column::EnvironmentId.is_null(),
+            })
+            .filter(match config.deployment_id {
+                Some(dep_id) => performance_metrics::Column::DeploymentId.eq(dep_id),
+                None => performance_metrics::Column::DeploymentId.is_null(),
+            })
             .order_by_desc(performance_metrics::Column::RecordedAt);
 
         if let Some(sess_id) = session_id_i32 {
@@ -1084,6 +1112,198 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(!result.unwrap());
+    }
+
+    fn metric_model(
+        environment_id: Option<i32>,
+        deployment_id: Option<i32>,
+    ) -> performance_metrics::Model {
+        performance_metrics::Model {
+            id: 1,
+            project_id: 7,
+            environment_id,
+            deployment_id,
+            ttfb: Some(120.0),
+            lcp: None,
+            fid: None,
+            fcp: None,
+            cls: None,
+            inp: None,
+            recorded_at: chrono::Utc::now(),
+            ip_address_id: None,
+            session_id: None,
+            visitor_id: None,
+            is_crawler: false,
+            pathname: Some("/".to_string()),
+            query: None,
+            host: Some("app.example.com".to_string()),
+            browser: None,
+            browser_version: None,
+            operating_system: None,
+            operating_system_version: None,
+            device_type: None,
+            screen_width: None,
+            screen_height: None,
+            viewport_width: None,
+            viewport_height: None,
+            language: None,
+        }
+    }
+
+    fn record_config(
+        environment_id: Option<i32>,
+        deployment_id: Option<i32>,
+    ) -> RecordPerformanceMetricsConfig {
+        RecordPerformanceMetricsConfig {
+            project_id: 7,
+            environment_id,
+            deployment_id,
+            session_id: None,
+            visitor_id: None,
+            ip_address_id: None,
+            ttfb: Some(120.0),
+            lcp: None,
+            fid: None,
+            fcp: None,
+            cls: None,
+            inp: None,
+            pathname: Some("/".to_string()),
+            query: None,
+            host: Some("app.example.com".to_string()),
+            user_agent: None,
+            screen_width: None,
+            screen_height: None,
+            viewport_width: None,
+            viewport_height: None,
+            language: None,
+        }
+    }
+
+    /// Take the transaction log back off a connection the service still holds
+    /// a handle to.
+    fn transaction_log(
+        service: PerformanceService,
+        db: Arc<DatabaseConnection>,
+    ) -> Vec<sea_orm::Transaction> {
+        drop(service);
+        match Arc::try_unwrap(db) {
+            Ok(conn) => conn.into_transaction_log(),
+            Err(_) => panic!("service still holds a connection handle"),
+        }
+    }
+
+    /// The metric must be written with a NULL scope rather than dropped. Before
+    /// ADR-040 both `/speed` handlers early-returned 204 in this case, which
+    /// looks like success to the browser SDK while losing every web vital for
+    /// a project that has nothing deployed.
+    #[tokio::test]
+    async fn record_performance_metrics_persists_metric_without_environment_or_deployment() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![metric_model(None, None)]])
+                .into_connection(),
+        );
+        let service = PerformanceService::new(db.clone());
+
+        let result = service
+            .record_performance_metrics(record_config(None, None))
+            .await;
+
+        assert!(result.is_ok(), "unscoped metric must still be recorded");
+
+        let log = transaction_log(service, db);
+        let insert = format!(
+            "{:?}",
+            log.first().expect("an INSERT must have been issued")
+        );
+        assert!(
+            insert.contains("INSERT INTO") && insert.contains("performance_metrics"),
+            "expected an insert into performance_metrics, got: {insert}"
+        );
+        // Explicit NULLs, never the `0` sentinel that would FK-violate.
+        assert!(
+            insert.contains("Int(None)"),
+            "environment_id/deployment_id must be bound as NULL: {insert}"
+        );
+        assert!(
+            !insert.contains("Int(Some(0))"),
+            "a `0` sentinel must never be written to an FK column: {insert}"
+        );
+    }
+
+    /// `= NULL` matches nothing in SQL, so the late CLS/INP update has to look
+    /// the row up with `IS NULL` or it can never find the row the insert above
+    /// just wrote.
+    #[tokio::test]
+    async fn update_performance_metrics_matches_null_scope_with_is_null() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![metric_model(None, None)]])
+                .append_query_results([vec![metric_model(None, None)]])
+                .into_connection(),
+        );
+        let service = PerformanceService::new(db.clone());
+
+        let result = service
+            .update_performance_metrics(UpdatePerformanceMetricsConfig {
+                project_id: 7,
+                environment_id: None,
+                deployment_id: None,
+                session_id: None,
+                visitor_id: None,
+                cls: Some(0.05),
+                inp: None,
+            })
+            .await;
+
+        assert!(result.is_ok(), "unscoped metric must be updatable");
+
+        let log = transaction_log(service, db);
+        let sql = format!("{:?}", log.first().expect("a SELECT must have been issued"));
+        assert_eq!(
+            sql.matches("IS NULL").count(),
+            2,
+            "both environment_id and deployment_id must be matched with IS NULL, got: {sql}"
+        );
+    }
+
+    /// The concrete-scope path must keep filtering by equality — the `IS NULL`
+    /// branch above must not leak into it and widen the match across
+    /// environments.
+    #[tokio::test]
+    async fn update_performance_metrics_matches_concrete_scope_with_equality() {
+        let db = Arc::new(
+            MockDatabase::new(DatabaseBackend::Postgres)
+                .append_query_results([vec![metric_model(Some(3), Some(11))]])
+                .append_query_results([vec![metric_model(Some(3), Some(11))]])
+                .into_connection(),
+        );
+        let service = PerformanceService::new(db.clone());
+
+        let result = service
+            .update_performance_metrics(UpdatePerformanceMetricsConfig {
+                project_id: 7,
+                environment_id: Some(3),
+                deployment_id: Some(11),
+                session_id: None,
+                visitor_id: None,
+                cls: Some(0.05),
+                inp: None,
+            })
+            .await;
+
+        assert!(result.is_ok());
+
+        let log = transaction_log(service, db);
+        let sql = format!("{:?}", log.first().expect("a SELECT must have been issued"));
+        assert!(
+            !sql.contains("IS NULL"),
+            "a fully scoped lookup must not fall into the IS NULL branch: {sql}"
+        );
+        assert!(
+            sql.contains("Int(Some(3))") && sql.contains("Int(Some(11))"),
+            "the concrete environment/deployment ids must still be bound: {sql}"
+        );
     }
 
     #[test]

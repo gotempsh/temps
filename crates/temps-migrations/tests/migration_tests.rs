@@ -388,6 +388,244 @@ async fn test_snapshot_digest_index_migration_up_and_down() -> anyhow::Result<()
     Ok(())
 }
 
+async fn column_is_nullable(
+    db: &DatabaseConnection,
+    table: &str,
+    column: &str,
+) -> anyhow::Result<bool> {
+    let row = db
+        .query_one(sea_orm::Statement::from_sql_and_values(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT is_nullable FROM information_schema.columns \
+             WHERE table_schema = 'public' AND table_name = $1 AND column_name = $2",
+            [table.into(), column.into()],
+        ))
+        .await?
+        .unwrap_or_else(|| panic!("{table}.{column} must exist"));
+    Ok(row.try_get::<String>("", "is_nullable")? == "YES")
+}
+
+/// ADR-040 phase 1. Three things must hold after `up()`:
+/// the new key table exists with a UNIQUE `public_key` index; the four
+/// analytics scope columns are nullable (the entity models already decode them
+/// as `Option<i32>`); and any pre-existing `0` sentinel in
+/// `session_replay_sessions` has been normalized to NULL.
+///
+/// `down()` is deliberately **not** a full inverse — it drops the table and
+/// leaves the columns nullable, because restoring `NOT NULL` would fail against
+/// rows that legitimately hold NULL once the feature has been used. That
+/// asymmetry is asserted here so nobody "fixes" it later.
+#[tokio::test]
+async fn test_analytics_ingest_keys_migration_up_and_down() -> anyhow::Result<()> {
+    if external_db_configured() {
+        println!(
+            "Skipping test_analytics_ingest_keys_migration_up_and_down: external database configured"
+        );
+        return Ok(());
+    }
+
+    let container = match GenericImage::new("timescale/timescaledb-ha", "pg18")
+        .with_wait_for(postgres_ready_wait_for())
+        .with_env_var("POSTGRES_DB", "postgres")
+        .with_env_var("POSTGRES_USER", "postgres")
+        .with_env_var("POSTGRES_PASSWORD", "postgres")
+        .with_env_var("POSTGRES_HOST_AUTH_METHOD", "trust")
+        .with_cmd(vec![
+            "postgres",
+            "-c",
+            "timescaledb.max_background_workers=0",
+        ])
+        .with_startup_timeout(CONTAINER_STARTUP_TIMEOUT)
+        .start()
+        .await
+    {
+        Ok(container) => container,
+        Err(error) => {
+            eprintln!(
+                "Skipping test_analytics_ingest_keys_migration_up_and_down: Docker unavailable: {error}"
+            );
+            return Ok(());
+        }
+    };
+    let port = container.get_host_port_ipv4(5432).await?;
+    let db_url = format!("postgresql://postgres:postgres@localhost:{port}/postgres");
+    let db = connect_with_retries(&db_url).await?;
+
+    let target = "m20260831_000001_create_analytics_ingest_keys";
+    let pre_target_count = Migrator::migrations()
+        .iter()
+        .position(|migration| migration.name() == target)
+        .unwrap_or_else(|| panic!("migration {target} not found in Migrator"));
+    Migrator::up(&db, Some(pre_target_count as u32)).await?;
+
+    // Before: the columns are NOT NULL, which is what makes the `unwrap_or(0)`
+    // sentinel and the 204 drops load-bearing.
+    assert!(!column_is_nullable(&db, "performance_metrics", "environment_id").await?);
+    assert!(!column_is_nullable(&db, "session_replay_sessions", "deployment_id").await?);
+    assert!(!column_is_nullable(&db, "events", "environment_id").await?);
+
+    // Real parent rows — the FKs on session_replay_sessions are `NOT NULL`
+    // and enforced at this point.
+    db.execute_unprepared(
+        "INSERT INTO projects (name, repo_name, repo_owner, directory, main_branch, preset, \
+         created_at, updated_at, slug) \
+         VALUES ('ingest-key-proj', 'repo', 'owner', '.', 'main', 'nodejs', now(), now(), \
+                 'ingest-key-proj-slug')",
+    )
+    .await?;
+    let proj_id: i32 = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM projects WHERE slug = 'ingest-key-proj-slug'".to_string(),
+        ))
+        .await?
+        .expect("project row")
+        .try_get("", "id")?;
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO environments (name, slug, subdomain, host, upstreams, \
+         created_at, updated_at, project_id) \
+         VALUES ('production', 'prod', 'prod', 'ingest-key.example.test', '[]', \
+                 now(), now(), {proj_id})"
+    ))
+    .await?;
+    let env_id: i32 = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            format!("SELECT id FROM environments WHERE project_id = {proj_id}"),
+        ))
+        .await?
+        .expect("environment row")
+        .try_get("", "id")?;
+
+    db.execute_unprepared(&format!(
+        "INSERT INTO visitor (visitor_id, first_seen, last_seen, project_id, environment_id) \
+         VALUES ('visitor-ingest-key-fixture', now(), now(), {proj_id}, {env_id})"
+    ))
+    .await?;
+    let visitor_id: i32 = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT id FROM visitor WHERE visitor_id = 'visitor-ingest-key-fixture'".to_string(),
+        ))
+        .await?
+        .expect("visitor row")
+        .try_get("", "id")?;
+
+    // Plant a `0`-sentinel row the way an instance that once ran without the
+    // scope FKs would hold it — that is precisely the case the migration's
+    // normalization step exists for, so the triggers are disabled to reproduce
+    // it and restored immediately afterwards.
+    db.execute_unprepared("ALTER TABLE session_replay_sessions DISABLE TRIGGER ALL")
+        .await?;
+    db.execute_unprepared(&format!(
+        "INSERT INTO session_replay_sessions \
+             (session_replay_id, visitor_id, project_id, environment_id, deployment_id, is_active) \
+         VALUES ('session-ingest-key-fixture', {visitor_id}, {proj_id}, 0, 0, true)"
+    ))
+    .await?;
+    db.execute_unprepared("ALTER TABLE session_replay_sessions ENABLE TRIGGER ALL")
+        .await?;
+
+    Migrator::up(&db, Some(1)).await?;
+
+    for (table, column) in [
+        ("performance_metrics", "environment_id"),
+        ("performance_metrics", "deployment_id"),
+        ("session_replay_sessions", "environment_id"),
+        ("session_replay_sessions", "deployment_id"),
+        ("events", "environment_id"),
+        ("events", "deployment_id"),
+    ] {
+        assert!(
+            column_is_nullable(&db, table, column).await?,
+            "{table}.{column} must be nullable after the migration"
+        );
+    }
+
+    let sentinel_rows = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT COUNT(*) AS remaining FROM session_replay_sessions \
+             WHERE environment_id = 0 OR deployment_id = 0"
+                .to_string(),
+        ))
+        .await?
+        .expect("count query returns a row");
+    assert_eq!(
+        sentinel_rows.try_get::<i64>("", "remaining")?,
+        0,
+        "the `0` sentinel must be normalized to NULL"
+    );
+
+    let public_key_index = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT i.indisunique AS is_unique \
+             FROM pg_index i \
+             JOIN pg_class c ON c.oid = i.indexrelid \
+             WHERE c.relname = 'idx_analytics_ingest_keys_public_key'"
+                .to_string(),
+        ))
+        .await?
+        .expect("public_key index exists after migration up");
+    assert!(
+        public_key_index.try_get::<bool>("", "is_unique")?,
+        "public_key must be UNIQUE — a duplicate would make key->project ambiguous"
+    );
+
+    // A project-scoped key (NULL environment_id) must be insertable.
+    db.execute_unprepared(&format!(
+        "INSERT INTO analytics_ingest_keys (project_id, public_key) \
+         VALUES ({proj_id}, 'pa_migration_fixture')"
+    ))
+    .await?;
+
+    let duplicate_key = db
+        .execute_unprepared(&format!(
+            "INSERT INTO analytics_ingest_keys (project_id, public_key) \
+             VALUES ({proj_id}, 'pa_migration_fixture')"
+        ))
+        .await;
+    assert!(
+        duplicate_key.is_err(),
+        "a duplicate public_key must be rejected"
+    );
+
+    Migrator::down(&db, Some(1)).await?;
+
+    let table_exists = db
+        .query_one(sea_orm::Statement::from_string(
+            sea_orm::DatabaseBackend::Postgres,
+            "SELECT to_regclass('public.analytics_ingest_keys') IS NOT NULL AS present".to_string(),
+        ))
+        .await?
+        .expect("regclass query returns a row");
+    assert!(
+        !table_exists.try_get::<bool>("", "present")?,
+        "down() must drop analytics_ingest_keys"
+    );
+
+    // Deliberate asymmetry: the columns stay nullable. Restoring NOT NULL would
+    // fail against legitimately-NULL rows, and deleting them would destroy
+    // analytics history.
+    for (table, column) in [
+        ("performance_metrics", "environment_id"),
+        ("performance_metrics", "deployment_id"),
+        ("session_replay_sessions", "environment_id"),
+        ("session_replay_sessions", "deployment_id"),
+        ("events", "environment_id"),
+        ("events", "deployment_id"),
+    ] {
+        assert!(
+            column_is_nullable(&db, table, column).await?,
+            "{table}.{column} must stay nullable after down() — see ADR-040 §6"
+        );
+    }
+
+    Ok(())
+}
+
 /// Test that migrations can be applied successfully
 #[tokio::test]
 async fn test_migration_up() -> anyhow::Result<()> {

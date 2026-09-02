@@ -83,6 +83,19 @@ export function DetectedPresetGrid({
                 {directory}
               </span>
             </div>
+            {/* The Dockerfile can live in a subdirectory even when the
+                build context (shown above) is the upload root — call that
+                out so the user doesn't assume the Dockerfile sits directly
+                in `directory`. */}
+            {candidate.dockerfilePath && (
+              <p
+                className="mt-1.5 truncate text-xs text-muted-foreground"
+                title={candidate.dockerfilePath}
+              >
+                Dockerfile detected in{' '}
+                <span className="font-mono">{candidate.dockerfilePath}</span>
+              </p>
+            )}
           </button>
         )
       })}

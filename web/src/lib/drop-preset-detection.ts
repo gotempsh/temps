@@ -11,11 +11,22 @@ export interface PreparedDropInspection {
 
 export function presetConfigForDropCandidate(
   candidate: DropPresetCandidate
-): { composePath: string } | undefined {
-  if (candidate.preset !== 'docker-compose' || !candidate.composePath) {
-    return undefined
+): { composePath: string } | { dockerfilePath: string } | undefined {
+  if (candidate.preset === 'docker-compose') {
+    return candidate.composePath
+      ? { composePath: candidate.composePath }
+      : undefined
   }
-  return { composePath: candidate.composePath }
+  // A Dockerfile detected in a subdirectory but rolled up to the repository
+  // root (e.g. `docker/Dockerfile` with COPY instructions that reach back to
+  // the repo root) needs its actual location threaded through so the build
+  // still finds it, while the build context stays at the root — leaving
+  // `buildContext` unset makes the backend default it to the project's
+  // directory, which is already the root here.
+  if (candidate.preset === 'dockerfile' && candidate.dockerfilePath) {
+    return { dockerfilePath: candidate.dockerfilePath }
+  }
+  return undefined
 }
 
 interface PrepareAndInspectOptions {

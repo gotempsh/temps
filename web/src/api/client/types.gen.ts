@@ -1008,6 +1008,51 @@ export type AllocEntry = {
     underlay_address: string;
 };
 
+/**
+ * An analytics ingest key as returned by the admin API.
+ *
+ * `public_key` is present in full on every response — see the module docs.
+ */
+export type AnalyticsIngestKey = {
+    /**
+     * Exact origins (`scheme://host[:port]`) permitted to use this key from a
+     * browser. `None` or `[]` means any origin. This is a browser-enforced
+     * convenience control, not authentication — a non-browser client ignores
+     * `Origin` entirely.
+     */
+    allowed_origins?: Array<string> | null;
+    created_at: string;
+    created_by_user_id?: number | null;
+    /**
+     * `None` means the key is scoped to the whole project. An
+     * environment-scoped key additionally attributes ingested data to that
+     * environment's current deployment, when it has one.
+     */
+    environment_id?: number | null;
+    event_count: number;
+    id: number;
+    is_active: boolean;
+    last_used_at?: string | null;
+    /**
+     * Operator-facing label.
+     */
+    name: string;
+    project_id: number;
+    /**
+     * The ingest key itself, `pa_` + 64 hex characters.
+     *
+     * **Not a secret.** It is designed to ship in client-side JavaScript and
+     * is returned unmasked so operators can copy it. See the module docs.
+     */
+    public_key: string;
+    /**
+     * `None` or `<= 0` means unlimited.
+     */
+    rate_limit_per_minute?: number | null;
+    revoked_at?: string | null;
+    updated_at: string;
+};
+
 export type AnalyticsSessionEventsResponse = {
     events: Array<SessionEvent>;
     session_id: string;
@@ -2263,219 +2308,6 @@ export type BuildLimitsSettings = {
 };
 
 /**
- * The quote.
- */
-export type BulkActivationEstimateResponse = {
-    /**
-     * A job already running. Submitting would be refused with `409`, so the
-     * client can offer "watch the running job" instead of a button that fails.
-     */
-    active_batch_id?: string | null;
-    /**
-     * Whether a bulk activation could run at all right now.
-     *
-     * `false` is the normal state on an unlinked instance and must render as
-     * onboarding, not as an error.
-     */
-    configured: boolean;
-    eligible_projects: number;
-    estimated_bytes: number;
-    /**
-     * Totals over the **eligible** projects only — what confirming this quote
-     * would actually send.
-     */
-    estimated_spans: number;
-    plan_expires_at?: string | null;
-    /**
-     * Stable identity of the project set and windows, recorded on the job.
-     */
-    plan_hash?: string | null;
-    /**
-     * The handle to send back to `POST /bulk-jobs`.
-     *
-     * `None` when nothing is eligible: there is no bill to confirm, and
-     * handing back a token that would be refused on submit would be a dead
-     * end with no explanation attached.
-     */
-    plan_token?: string | null;
-    /**
-     * Every project considered, eligible or not, ascending by id.
-     */
-    projects: Array<BulkActivationProjectEstimateResponse>;
-    reason?: string | null;
-    setup_path?: string | null;
-    skipped_projects: number;
-    total_projects: number;
-    window_from: string;
-    window_to: string;
-};
-
-/**
- * How much of the ETA this instance can honestly claim to know.
- */
-export type BulkActivationEtaState = 'estimating' | 'known' | 'finished';
-
-/**
- * One project's row inside a job.
- */
-export type BulkActivationJobProjectResponse = {
-    bytes_shipped: number;
-    completed_at?: string | null;
-    estimated_bytes: number;
-    estimated_spans: number;
-    /**
-     * Why this project stopped, when `status` is `failed`. The switch is never
-     * rolled back, so this project is Cloud-primary with a recorded hole in
-     * its history — which is retryable, and must be visible to be retried.
-     */
-    last_error?: string | null;
-    /**
-     * `spans_shipped / estimated_spans`, clamped to 0–100. `None` when the
-     * estimate is zero or unknown — an empty window is not "0% done".
-     */
-    percent_complete?: number | null;
-    project_id: number;
-    setup_path?: string | null;
-    skip_detail?: string | null;
-    skip_reason?: string | null;
-    spans_shipped: number;
-    started_at?: string | null;
-    status: BulkJobProjectStatus;
-    window_from: string;
-    window_to: string;
-};
-
-/**
- * A job, its projects, its progress and its ETA.
- */
-export type BulkActivationJobResponse = {
-    /**
-     * The same reason as a sentence naming the fix and the page that applies
-     * it.
-     */
-    abort_detail?: string | null;
-    /**
-     * Machine-readable instance-wide abort reason, e.g. `not_linked`.
-     */
-    abort_reason?: string | null;
-    batch_id: string;
-    bytes_shipped: number;
-    /**
-     * Set as soon as a cancel is requested, before the worker honours it at
-     * the next chunk boundary — so the UI can stop offering Cancel twice.
-     */
-    cancel_requested: boolean;
-    cancel_requested_at?: string | null;
-    completed_at?: string | null;
-    created_at: string;
-    /**
-     * The project being switched or backfilled right now.
-     */
-    current_project_id?: number | null;
-    estimated_bytes: number;
-    estimated_spans: number;
-    /**
-     * Seconds remaining, or `null` when `eta_state` is not `known`.
-     */
-    eta_seconds?: number | null;
-    eta_state: BulkActivationEtaState;
-    /**
-     * The average this job has actually achieved since it started. Sent so the
-     * client can render a coarse rate instead of implying a precision the
-     * average does not have.
-     */
-    observed_spans_per_sec?: number | null;
-    percent_complete?: number | null;
-    plan_hash?: string | null;
-    projects: Array<BulkActivationJobProjectResponse>;
-    projects_done: number;
-    projects_failed: number;
-    projects_pending: number;
-    projects_skipped: number;
-    projects_total: number;
-    requested_by_user_id?: number | null;
-    spans_shipped: number;
-    started_at?: string | null;
-    status: BulkJobStatus;
-    trigger: BulkJobTrigger;
-};
-
-/**
- * One project's line on the quote.
- */
-export type BulkActivationProjectEstimateResponse = {
-    average_span_bytes: number;
-    /**
-     * Whether this project is part of the plan the token covers.
-     */
-    eligible: boolean;
-    /**
-     * `average_span_bytes * estimated_spans`, rounded up. Temps Cloud's own
-     * acknowledgement is authoritative; this is what this instance can know
-     * before sending.
-     */
-    estimated_bytes: number;
-    /**
-     * Exact count of local spans in the window. Zero for a skipped project —
-     * nothing was counted, because nothing would be sent.
-     */
-    estimated_spans: number;
-    fidelity: CloudTelemetryFidelity;
-    project_id: number;
-    /**
-     * How many spans were actually projected to derive the average.
-     */
-    sampled_spans: number;
-    /**
-     * Where the operator goes to unblock it, when anywhere.
-     */
-    setup_path?: string | null;
-    /**
-     * The same reason as a sentence, so no client has to map an enum to prose.
-     */
-    skip_detail?: string | null;
-    /**
-     * Machine-readable reason it is not, e.g. `fidelity_not_queryable`.
-     */
-    skip_reason?: string | null;
-    window_from: string;
-    window_to: string;
-};
-
-/**
- * Where one project has got to inside a bulk job.
- *
- * `switching` and `backfilling` are separate on purpose: the switch is cheap,
- * atomic and egresses nothing, while the backfill can run for hours and costs
- * money. An operator watching a stuck job needs to know which of the two it is
- * stuck in, and a project that failed after switching is *not* rolled back
- * (ADR-042 §7) — so the two must be distinguishable after the fact too.
- */
-export type BulkJobProjectStatus = 'pending' | 'switching' | 'backfilling' | 'done' | 'failed' | 'skipped';
-
-/**
- * Lifecycle of a bulk job.
- *
- * The three terminal-with-a-problem states are deliberately distinct.
- * `completed_with_failures` means the job ran to the end and some projects
- * did not; `aborted` means an instance-wide condition stopped it and the
- * untouched projects are still `pending`, ready to resume; `cancelled` means
- * an operator asked it to stop. Collapsing any two of those would leave the
- * Console unable to say what to do next.
- */
-export type BulkJobStatus = 'pending' | 'running' | 'completed' | 'completed_with_failures' | 'aborted' | 'cancelled';
-
-/**
- * Which entry point created the job (ADR-042 §1).
- *
- * The engine does not branch on this. It exists so an operator disputing an
- * invoice, or reading an audit trail, can tell "this instance spent money
- * because someone clicked a button" apart from "…because a purchase completed
- * and the payment was the authorization".
- */
-export type BulkJobTrigger = 'purchase' | 'operator';
-
-/**
  * Response body for cancel endpoints.
  */
 export type CancelBackupResponse = {
@@ -2918,31 +2750,6 @@ export type CloudSettings = {
      */
     notifications_enabled?: boolean;
     /**
-     * ADR-042 §3: optional throttle, in spans per second, on a **bulk Cloud
-     * telemetry activation** backfill.
-     *
-     * `None` — the default — is unthrottled, which is what "activate now"
-     * means and is right for an instance that is idle or being cut over
-     * deliberately. An operator running an activation against a live instance
-     * can set a ceiling so the backfill stops competing with their own read IO
-     * and with the Cloud ingest allowance.
-     *
-     * An operator setting on the singleton `settings` row rather than an
-     * environment variable, per CLAUDE.md, so it can be changed **while a job
-     * is running** — which is exactly when an operator discovers they need it,
-     * and exactly when restarting the binary would mean stopping an activation
-     * they have already paid for. The worker re-reads it each time it picks up
-     * a project, so a change takes effect at the next project boundary rather
-     * than at the next restart.
-     *
-     * Only the bulk worker reads this. The live Cloud-primary write path is a
-     * primary path and is never throttled; the offline
-     * `temps backfill cloud-telemetry` tool keeps its own
-     * `--rate-limit-spans-per-sec` flag, because it runs in a different
-     * process with the server stopped.
-     */
-    telemetry_bulk_rate_limit_spans_per_sec?: number | null;
-    /**
      * Explicit consent to mirror locally stored telemetry.
      */
     telemetry_enabled?: boolean;
@@ -2974,7 +2781,6 @@ export type CloudStatus = {
     health: string;
     health_message: string;
     instance_id?: string | null;
-    managed_backup_setup: ManagedBackupSetup;
     notifications_enabled: boolean;
     spooled_spans: number;
     status: string;
@@ -4191,6 +3997,32 @@ export type CreateAlertRuleRequest = {
     trigger_type: string;
 };
 
+/**
+ * Request body for minting a new ingest key.
+ */
+export type CreateAnalyticsIngestKeyRequest = {
+    /**
+     * Exact origins permitted to use this key from a browser. Omit or send an
+     * empty array to allow any origin.
+     */
+    allowed_origins?: Array<string> | null;
+    /**
+     * Scope the key to a single environment. Recommended: it lets Temps
+     * attribute ingested data to that environment's current deployment.
+     * Omit for a project-wide key.
+     */
+    environment_id?: number | null;
+    /**
+     * Operator-facing label. Defaults to "Default ingest key".
+     */
+    name?: string | null;
+    /**
+     * Requests per minute for this key. Omit for the 600/min default; send a
+     * non-positive value for unlimited.
+     */
+    rate_limit_per_minute?: number | null;
+};
+
 export type CreateApiKeyRequest = {
     expires_at?: string | null;
     name: string;
@@ -4253,19 +4085,6 @@ export type CreateBitbucketRequest = {
      * Display name for this provider.
      */
     name: string;
-};
-
-/**
- * Body for `POST /bulk-jobs`.
- *
- * Deliberately one field. The plan is inside the token, so there is no project
- * list here to disagree with the one that was quoted.
- */
-export type CreateBulkActivationJobRequest = {
-    /**
-     * The `plan_token` from a `POST /bulk-jobs/estimate` response.
-     */
-    plan_token: string;
 };
 
 export type CreateCloudflareProviderRequest = {
@@ -6936,6 +6755,14 @@ export type DropPresetCandidate = {
     composePath?: string | null;
     confidence: string;
     directory: string;
+    /**
+     * Repository-root-relative path to the Dockerfile, when it does not
+     * live directly under `{directory}/Dockerfile` (e.g. `docker/Dockerfile`
+     * rolled up to a `directory` of `"."`). `None` for a Dockerfile located
+     * directly at `{directory}/Dockerfile` and for every non-Dockerfile
+     * preset.
+     */
+    dockerfilePath?: string | null;
     isStatic: boolean;
     label: string;
     preset: string;
@@ -7743,35 +7570,6 @@ export type ErrorTimeSeriesQuery = {
 };
 
 /**
- * What to quote.
- *
- * Exactly one of `all_eligible_projects` and a non-empty `project_ids` must be
- * given. Defaulting an omitted scope to "everything" would make a typo cost
- * money; defaulting it to "nothing" would make the endpoint silently useless.
- */
-export type EstimateBulkActivationRequest = {
-    /**
-     * Quote every project that still writes its spans to this instance.
-     */
-    all_eligible_projects?: boolean;
-    /**
-     * Quote exactly these projects. Projects that are already Cloud-primary
-     * are accepted here — re-shipping a window is the retry path — but are
-     * never picked up by `all_eligible_projects`.
-     */
-    project_ids?: Array<number> | null;
-    /**
-     * Start of the window to ship. Defaults to the oldest span local retention
-     * can still be holding.
-     */
-    window_from?: string | null;
-    /**
-     * End of the window to ship. Defaults to now.
-     */
-    window_to?: string | null;
-};
-
-/**
  * Time bucket data point for event activity graph
  */
 export type EventActivityBucket = {
@@ -8016,6 +7814,14 @@ export type EventMetricsPayload = {
      * Cumulative Layout Shift (score)
      */
     cls?: number | null;
+    /**
+     * The tracked site's own domain, computed client-side by the SDK's
+     * `resolveDomain()` and sent as a sibling of `event_data` (not nested
+     * inside it). Used on the keyed ingest path (ADR-040 §3) to attribute
+     * self-referrals/channels correctly: there, `Host` names the Temps
+     * server rather than the customer's site, so it can't be used for that.
+     */
+    domain?: string | null;
     event_data: unknown;
     event_name: string;
     /**
@@ -8045,11 +7851,23 @@ export type EventMetricsPayload = {
     screen_height?: number | null;
     screen_width?: number | null;
     /**
+     * Client-generated session id fallback (see `visitor_id`).
+     */
+    session_id?: string | null;
+    /**
      * Time to First Byte (milliseconds)
      */
     ttfb?: number | null;
     viewport_height?: number | null;
     viewport_width?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     * Accepts the SDK's `visitorId` key too, since the shared SDK helper that
+     * generates this value sends camelCase for every ingest endpoint.
+     */
+    visitor_id?: string | null;
 };
 
 /**
@@ -11057,17 +10875,6 @@ export type LogsResponse = {
     data: Array<LogRecord>;
 };
 
-export type ManagedBackupSetup = {
-    action: ManagedBackupSetupAction;
-    message: string;
-    ready: boolean;
-    status: ManagedBackupSetupStatus;
-};
-
-export type ManagedBackupSetupAction = 'none' | 'retry' | 'renew_subscription';
-
-export type ManagedBackupSetupStatus = 'disabled' | 'ready' | 'needs_setup' | 'subscription_required' | 'unavailable';
-
 /**
  * Managed domain response
  */
@@ -13780,6 +13587,13 @@ export type PresetInfo = {
      */
     compose_files?: Array<string> | null;
     /**
+     * Repository-root-relative path to the Dockerfile, when it does not
+     * live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+     * rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+     * directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+     */
+    dockerfile_path?: string | null;
+    /**
      * Default exposed port for this preset
      */
     exposed_port?: number | null;
@@ -14199,6 +14013,13 @@ export type ProjectPresetResponse = {
      * Compose file paths found in the repository (only for docker-compose preset)
      */
     composeFiles?: Array<string> | null;
+    /**
+     * Repository-root-relative path to the Dockerfile, when it does not
+     * live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+     * rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+     * directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+     */
+    dockerfilePath?: string | null;
     /**
      * Default exposed port for this preset (e.g., 3000 for Next.js, 8000 for FastAPI)
      */
@@ -17746,6 +17567,13 @@ export type SessionReplayInitRequest = {
     userAgent?: string | null;
     viewportHeight?: number | null;
     viewportWidth?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     * The SDK already sends this today via `getSessionMetadata()`.
+     */
+    visitorId?: string | null;
 };
 
 export type SessionReplayInitResponse = {
@@ -18650,6 +18478,10 @@ export type SpeedMetricsPayload = {
      */
     screenWidth?: number | null;
     /**
+     * Client-generated session id fallback (see `visitor_id`).
+     */
+    sessionId?: string | null;
+    /**
      * Time to First Byte (milliseconds)
      */
     ttfb?: number | null;
@@ -18661,6 +18493,12 @@ export type SpeedMetricsPayload = {
      * Viewport width in pixels
      */
     viewportWidth?: number | null;
+    /**
+     * Client-generated visitor id, used only when the request carries no
+     * Temps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as
+     * an analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).
+     */
+    visitorId?: string | null;
 };
 
 /**
@@ -20151,6 +19989,30 @@ export type UpdateAlertRuleRequest = {
     trigger_type?: string | null;
 };
 
+/**
+ * Request body for a partial update.
+ *
+ * `allowed_origins` and `rate_limit_per_minute` use the three-state
+ * double-`Option` encoding: field absent = leave unchanged, explicit `null` =
+ * clear, value = set. Plain `Option<Option<T>>` alone cannot express this
+ * because serde collapses an explicit JSON `null` into the outer `None`.
+ */
+export type UpdateAnalyticsIngestKeyRequest = {
+    /**
+     * Absent = unchanged, `null` = clear (any origin allowed), array = replace.
+     */
+    allowed_origins?: Array<string> | null;
+    /**
+     * New operator-facing label. Absent leaves it unchanged. The column is
+     * `NOT NULL`, so there is no "clear" state — send a new label instead.
+     */
+    name?: string | null;
+    /**
+     * Absent = unchanged, `null` = clear (unlimited), value = replace.
+     */
+    rate_limit_per_minute?: number | null;
+};
+
 export type UpdateApiKeyRequest = {
     expires_at?: string | null;
     is_active?: boolean | null;
@@ -21132,6 +20994,16 @@ export type UpdateSpeedMetricsPayload = {
      * Interaction to Next Paint (milliseconds)
      */
     inp?: number | null;
+    /**
+     * Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+     */
+    sessionId?: string | null;
+    /**
+     * Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).
+     * Required to identify the right row on the keyed path, where there is
+     * no Temps-issued cookie to fall back on.
+     */
+    visitorId?: string | null;
 };
 
 /**
@@ -22455,8 +22327,19 @@ export type UploadReleaseFileResponse = UploadReleaseFileResponses[keyof UploadR
 
 export type RecordEventMetricsData = {
     body: EventMetricsPayload;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/event';
 };
 
@@ -22528,8 +22411,19 @@ export type IngestTunneledEnvelopeResponse = IngestTunneledEnvelopeResponses[key
 
 export type AddSessionReplayEventsData = {
     body: SessionReplayEventsRequest;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used to flush the final replay batch on page unload). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/session-replay/events';
 };
 
@@ -22561,8 +22455,19 @@ export type AddSessionReplayEventsResponse = AddSessionReplayEventsResponses[key
 
 export type InitSessionReplayData = {
     body: SessionReplayInitRequest;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/session-replay/init';
 };
 
@@ -22590,8 +22495,19 @@ export type InitSessionReplayResponse = InitSessionReplayResponses[keyof InitSes
 
 export type RecordSpeedMetricsData = {
     body: SpeedMetricsPayload;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/speed';
 };
 
@@ -22623,8 +22539,19 @@ export type RecordSpeedMetricsResponse = RecordSpeedMetricsResponses[keyof Recor
 
 export type UpdateSpeedMetricsData = {
     body: UpdateSpeedMetricsPayload;
+    headers?: {
+        /**
+         * Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.
+         */
+        'x-temps-analytics-key'?: string | null;
+    };
     path?: never;
-    query?: never;
+    query?: {
+        /**
+         * Query-string fallback for the analytics ingest key, for clients that cannot set custom headers. This endpoint is called via `navigator.sendBeacon` on page unload, so the query form is the only one available there. Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.
+         */
+        temps_key?: string;
+    };
     url: '/_temps/speed/update';
 };
 
@@ -27958,19 +27885,6 @@ export type GetCloudAiCapabilityResponses = {
 };
 
 export type GetCloudAiCapabilityResponse = GetCloudAiCapabilityResponses[keyof GetCloudAiCapabilityResponses];
-
-export type ReconcileCloudBackupSourceData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/cloud/backups/source/reconcile';
-};
-
-export type ReconcileCloudBackupSourceResponses = {
-    200: ManagedBackupSetup;
-};
-
-export type ReconcileCloudBackupSourceResponse = ReconcileCloudBackupSourceResponses[keyof ReconcileCloudBackupSourceResponses];
 
 export type GetCloudCapabilityData = {
     body?: never;
@@ -38416,205 +38330,6 @@ export type GetCloudBackfillStatusResponses = {
 
 export type GetCloudBackfillStatusResponse = GetCloudBackfillStatusResponses[keyof GetCloudBackfillStatusResponses];
 
-export type CreateBulkActivationJobData = {
-    body: CreateBulkActivationJobRequest;
-    path?: never;
-    query?: never;
-    url: '/otel/cloud-telemetry/bulk-jobs';
-};
-
-export type CreateBulkActivationJobErrors = {
-    /**
-     * The plan token is invalid, altered or expired
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * An activation is already running; the response carries its batch_id
-     */
-    409: ProblemDetails;
-    /**
-     * Internal server error
-     */
-    500: ProblemDetails;
-};
-
-export type CreateBulkActivationJobError = CreateBulkActivationJobErrors[keyof CreateBulkActivationJobErrors];
-
-export type CreateBulkActivationJobResponses = {
-    /**
-     * The activation was queued
-     */
-    202: BulkActivationJobResponse;
-};
-
-export type CreateBulkActivationJobResponse = CreateBulkActivationJobResponses[keyof CreateBulkActivationJobResponses];
-
-export type GetCurrentBulkActivationJobData = {
-    body?: never;
-    path?: never;
-    query?: never;
-    url: '/otel/cloud-telemetry/bulk-jobs/current';
-};
-
-export type GetCurrentBulkActivationJobErrors = {
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Internal server error
-     */
-    500: ProblemDetails;
-};
-
-export type GetCurrentBulkActivationJobError = GetCurrentBulkActivationJobErrors[keyof GetCurrentBulkActivationJobErrors];
-
-export type GetCurrentBulkActivationJobResponses = {
-    /**
-     * The active activation job, or null when none is running
-     */
-    200: null | BulkActivationJobResponse;
-};
-
-export type GetCurrentBulkActivationJobResponse = GetCurrentBulkActivationJobResponses[keyof GetCurrentBulkActivationJobResponses];
-
-export type EstimateBulkActivationData = {
-    body: EstimateBulkActivationRequest;
-    path?: never;
-    query?: never;
-    url: '/otel/cloud-telemetry/bulk-jobs/estimate';
-};
-
-export type EstimateBulkActivationErrors = {
-    /**
-     * Neither or both scopes given, or an invalid window
-     */
-    400: ProblemDetails;
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * Temps Cloud is not ready for telemetry
-     */
-    409: ProblemDetails;
-    /**
-     * Internal server error
-     */
-    500: ProblemDetails;
-};
-
-export type EstimateBulkActivationError = EstimateBulkActivationErrors[keyof EstimateBulkActivationErrors];
-
-export type EstimateBulkActivationResponses = {
-    /**
-     * Per-project and total estimate, plus a plan token
-     */
-    200: BulkActivationEstimateResponse;
-};
-
-export type EstimateBulkActivationResponse = EstimateBulkActivationResponses[keyof EstimateBulkActivationResponses];
-
-export type GetBulkActivationJobData = {
-    body?: never;
-    path: {
-        /**
-         * Activation job id (UUID)
-         */
-        batch_id: string;
-    };
-    query?: never;
-    url: '/otel/cloud-telemetry/bulk-jobs/{batch_id}';
-};
-
-export type GetBulkActivationJobErrors = {
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * No such activation job
-     */
-    404: ProblemDetails;
-    /**
-     * Internal server error
-     */
-    500: ProblemDetails;
-};
-
-export type GetBulkActivationJobError = GetBulkActivationJobErrors[keyof GetBulkActivationJobErrors];
-
-export type GetBulkActivationJobResponses = {
-    /**
-     * The activation job
-     */
-    200: BulkActivationJobResponse;
-};
-
-export type GetBulkActivationJobResponse = GetBulkActivationJobResponses[keyof GetBulkActivationJobResponses];
-
-export type CancelBulkActivationJobData = {
-    body?: never;
-    path: {
-        /**
-         * Activation job id (UUID)
-         */
-        batch_id: string;
-    };
-    query?: never;
-    url: '/otel/cloud-telemetry/bulk-jobs/{batch_id}/cancel';
-};
-
-export type CancelBulkActivationJobErrors = {
-    /**
-     * Unauthorized
-     */
-    401: ProblemDetails;
-    /**
-     * Insufficient permissions
-     */
-    403: ProblemDetails;
-    /**
-     * No such activation job
-     */
-    404: ProblemDetails;
-    /**
-     * Internal server error
-     */
-    500: ProblemDetails;
-};
-
-export type CancelBulkActivationJobError = CancelBulkActivationJobErrors[keyof CancelBulkActivationJobErrors];
-
-export type CancelBulkActivationJobResponses = {
-    /**
-     * The cancellation was recorded, or the job had already stopped
-     */
-    200: BulkActivationJobResponse;
-};
-
-export type CancelBulkActivationJobResponse = CancelBulkActivationJobResponses[keyof CancelBulkActivationJobResponses];
-
 export type GetProjectCloudTelemetryData = {
     body?: never;
     path: {
@@ -43010,6 +42725,226 @@ export type SilenceAlarmResponses = {
      */
     200: unknown;
 };
+
+export type ListAnalyticsIngestKeysData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys';
+};
+
+export type ListAnalyticsIngestKeysErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type ListAnalyticsIngestKeysResponses = {
+    /**
+     * Ingest keys, active and revoked, newest first
+     */
+    200: Array<AnalyticsIngestKey>;
+};
+
+export type ListAnalyticsIngestKeysResponse = ListAnalyticsIngestKeysResponses[keyof ListAnalyticsIngestKeysResponses];
+
+export type CreateAnalyticsIngestKeyData = {
+    body: CreateAnalyticsIngestKeyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys';
+};
+
+export type CreateAnalyticsIngestKeyErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Project or environment not found
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type CreateAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key created
+     */
+    201: AnalyticsIngestKey;
+};
+
+export type CreateAnalyticsIngestKeyResponse = CreateAnalyticsIngestKeyResponses[keyof CreateAnalyticsIngestKeyResponses];
+
+export type UpdateAnalyticsIngestKeyData = {
+    body: UpdateAnalyticsIngestKeyRequest;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}';
+};
+
+export type UpdateAnalyticsIngestKeyErrors = {
+    /**
+     * Validation error
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type UpdateAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key updated
+     */
+    200: AnalyticsIngestKey;
+};
+
+export type UpdateAnalyticsIngestKeyResponse = UpdateAnalyticsIngestKeyResponses[keyof UpdateAnalyticsIngestKeyResponses];
+
+export type RevokeAnalyticsIngestKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}/revoke';
+};
+
+export type RevokeAnalyticsIngestKeyErrors = {
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RevokeAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key revoked
+     */
+    204: void;
+};
+
+export type RevokeAnalyticsIngestKeyResponse = RevokeAnalyticsIngestKeyResponses[keyof RevokeAnalyticsIngestKeyResponses];
+
+export type RotateAnalyticsIngestKeyData = {
+    body?: never;
+    path: {
+        /**
+         * Project ID
+         */
+        project_id: number;
+        /**
+         * Analytics ingest key ID
+         */
+        key_id: number;
+    };
+    query?: never;
+    url: '/projects/{project_id}/analytics/ingest-keys/{key_id}/rotate';
+};
+
+export type RotateAnalyticsIngestKeyErrors = {
+    /**
+     * The key is revoked and cannot be rotated
+     */
+    400: unknown;
+    /**
+     * Unauthorized
+     */
+    401: unknown;
+    /**
+     * Insufficient permissions
+     */
+    403: unknown;
+    /**
+     * Ingest key not found in this project
+     */
+    404: unknown;
+    /**
+     * Internal server error
+     */
+    500: unknown;
+};
+
+export type RotateAnalyticsIngestKeyResponses = {
+    /**
+     * Ingest key rotated
+     */
+    200: AnalyticsIngestKey;
+};
+
+export type RotateAnalyticsIngestKeyResponse = RotateAnalyticsIngestKeyResponses[keyof RotateAnalyticsIngestKeyResponses];
 
 export type GetApiCallersData = {
     body?: never;

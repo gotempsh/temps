@@ -157,12 +157,6 @@ mod runtime_provisioning_tests {
 #[cfg(test)]
 mod cluster_integration_tests;
 
-/// Shared mutex for tests that mutate the DEPLOYMENT_MODE environment variable.
-/// This must be shared across all test modules (postgres, redis, etc.) because
-/// env vars are process-global — a module-local mutex doesn't prevent cross-module races.
-#[cfg(test)]
-pub(crate) static DEPLOYMENT_MODE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
 // Re-export services for easier access
 pub use cluster_role::{ClusterRole, PgAutoFailoverState};
 pub use managed_s3::{ManagedS3Backend, ManagedS3BackendKind, ManagedS3BackendSelection};

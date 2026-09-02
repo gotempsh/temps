@@ -392,6 +392,7 @@ fn convert_preset_json(cache: Option<sea_orm::JsonValue>) -> Option<Vec<ProjectP
                             icon_url: p.icon_url,
                             project_type: p.project_type,
                             compose_files: p.compose_files,
+                            dockerfile_path: p.dockerfile_path,
                         })
                 })
                 .collect(),
@@ -535,6 +536,12 @@ pub struct ProjectPresetResponse {
     /// Compose file paths found in the repository (only for docker-compose preset)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_files: Option<Vec<String>>,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`
+    /// rolled up to a `path` of `"./"`). `None` for a Dockerfile located
+    /// directly at `{path}/Dockerfile` and for every non-Dockerfile preset.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub dockerfile_path: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
@@ -1335,6 +1342,7 @@ pub async fn get_repository_preset_by_name(
                     icon_url: p.icon_url,
                     project_type: p.project_type,
                     compose_files: p.compose_files,
+                    dockerfile_path: p.dockerfile_path,
                 })
                 .collect(),
             calculated_at: preset_result.calculated_at,
@@ -2527,6 +2535,7 @@ pub async fn get_repository_preset_live(
                     icon_url: p.icon_url,
                     project_type: p.project_type,
                     compose_files: p.compose_files,
+                    dockerfile_path: p.dockerfile_path,
                 })
                 .collect(),
             calculated_at: preset_result.calculated_at,
@@ -3252,5 +3261,74 @@ mod permission_error_tests {
             .get("detail")
             .and_then(|value| value.as_str())
             .is_some_and(|detail| detail.contains("Resource not accessible by integration")));
+    }
+}
+
+#[cfg(test)]
+mod convert_preset_json_tests {
+    use super::*;
+    use temps_entities::repositories::{BranchPresetData, PresetInfo, RepositoryPresetCache};
+
+    /// `convert_preset_json` is the last hop between the cached
+    /// `repositories.preset` JSON and the authenticated "connect a repo,
+    /// list its detected presets" HTTP response (`RepositoryResponse.preset`
+    /// / `RepositoryPresetResponse.presets`). Dropping `dockerfile_path`
+    /// here would silently defeat the fix for a `docker/Dockerfile`-shaped
+    /// repository for every user going through the connected-provider flow,
+    /// even though the cache itself carries the field correctly.
+    #[test]
+    fn dockerfile_path_survives_the_cache_to_response_conversion() {
+        let mut branches = std::collections::HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            BranchPresetData {
+                presets: vec![PresetInfo {
+                    path: "./".to_string(),
+                    preset: "dockerfile".to_string(),
+                    preset_label: "Dockerfile".to_string(),
+                    exposed_port: None,
+                    icon_url: None,
+                    project_type: "backend".to_string(),
+                    compose_files: None,
+                    dockerfile_path: Some("docker/Dockerfile".to_string()),
+                }],
+                calculated_at: chrono::Utc::now(),
+            },
+        );
+        let cache = RepositoryPresetCache { branches };
+        let json = serde_json::to_value(&cache).unwrap();
+
+        let converted = convert_preset_json(Some(json)).expect("cache should convert");
+        assert_eq!(converted.len(), 1);
+        assert_eq!(
+            converted[0].dockerfile_path.as_deref(),
+            Some("docker/Dockerfile")
+        );
+    }
+
+    #[test]
+    fn missing_dockerfile_path_stays_none() {
+        let mut branches = std::collections::HashMap::new();
+        branches.insert(
+            "main".to_string(),
+            BranchPresetData {
+                presets: vec![PresetInfo {
+                    path: "apps/api".to_string(),
+                    preset: "dockerfile".to_string(),
+                    preset_label: "Dockerfile".to_string(),
+                    exposed_port: None,
+                    icon_url: None,
+                    project_type: "backend".to_string(),
+                    compose_files: None,
+                    dockerfile_path: None,
+                }],
+                calculated_at: chrono::Utc::now(),
+            },
+        );
+        let cache = RepositoryPresetCache { branches };
+        let json = serde_json::to_value(&cache).unwrap();
+
+        let converted = convert_preset_json(Some(json)).expect("cache should convert");
+        assert_eq!(converted[0].dockerfile_path, None);
     }
 }

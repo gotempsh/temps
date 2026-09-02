@@ -2115,6 +2115,104 @@
         ],
         "type": "object"
       },
+      "AnalyticsIngestKey": {
+        "description": "An analytics ingest key as returned by the admin API.\n\n`public_key` is present in full on every response — see the module docs.",
+        "properties": {
+          "allowed_origins": {
+            "description": "Exact origins (`scheme://host[:port]`) permitted to use this key from a\nbrowser. `None` or `[]` means any origin. This is a browser-enforced\nconvenience control, not authentication — a non-browser client ignores\n`Origin` entirely.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "created_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          },
+          "created_by_user_id": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "`None` means the key is scoped to the whole project. An\nenvironment-scoped key additionally attributes ingested data to that\nenvironment's current deployment, when it has one.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "event_count": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "is_active": {
+            "type": "boolean"
+          },
+          "last_used_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Operator-facing label.",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "public_key": {
+            "description": "The ingest key itself, `pa_` + 64 hex characters.\n\n**Not a secret.** It is designed to ship in client-side JavaScript and\nis returned unmasked so operators can copy it. See the module docs.",
+            "type": "string"
+          },
+          "rate_limit_per_minute": {
+            "description": "`None` or `<= 0` means unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "revoked_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "example": "2026-01-01T00:00:00Z",
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "project_id",
+          "name",
+          "public_key",
+          "is_active",
+          "event_count",
+          "created_at",
+          "updated_at"
+        ],
+        "type": "object"
+      },
       "AnalyticsSessionEventsResponse": {
         "properties": {
           "events": {
@@ -2749,7 +2847,8 @@
               "backend_url": "https://app.temps.sh",
               "backups_enabled": false,
               "notifications_enabled": false,
-              "telemetry_enabled": false
+              "telemetry_enabled": false,
+              "telemetry_outbox_max_bytes": 536870912
             },
             "oneOf": [
               {
@@ -5409,6 +5508,106 @@
         ],
         "type": "object"
       },
+      "CloudBackfillStatusResponse": {
+        "properties": {
+          "backfill_available": {
+            "description": "Whether a backfill would be accepted right now. False means the project\nis still at `metered` fidelity.",
+            "type": "boolean"
+          },
+          "command": {
+            "description": "The exact command an operator should run. Always present, in every\nstate, so the capability is discoverable from the Console even though\nthe Console deliberately cannot trigger it.",
+            "type": "string"
+          },
+          "completed_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "fidelity": {
+            "$ref": "#/components/schemas/CloudTelemetryFidelity",
+            "description": "Current per-project egress fidelity. A `metered` project cannot be\nbackfilled at all — the CLI refuses — so the client must be able to\nrender \"not set up\" rather than \"not started\"."
+          },
+          "last_error": {
+            "description": "Reason the last run stopped, when `status` is `failed`. Verbatim, but\nlength-bounded: it originates as raw driver/server text and is readable\nby every project member with `OtelRead`, not only whoever ran the\ncommand.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "percent_complete": {
+            "description": "`spans_processed / spans_total`, clamped to 0–100. `None` when the total\nis unknown or zero — an empty window is not \"0% done\".",
+            "format": "double",
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "setup_path": {
+            "description": "Where to go to raise fidelity, when `backfill_available` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "spans_processed": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "spans_total": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/CloudTelemetryBackfillStatus",
+            "description": "`not_started` when no backfill has ever run for this project."
+          },
+          "updated_at": {
+            "description": "Bumped on every progress write. A `running` status whose `updated_at` is\nfar in the past is a stalled run, and the client should say so instead\nof showing a spinner forever.",
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_from": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "window_to": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "status",
+          "fidelity",
+          "backfill_available",
+          "spans_processed",
+          "spans_total",
+          "command"
+        ],
+        "type": "object"
+      },
       "CloudCapability": {
         "properties": {
           "configured": {
@@ -5483,6 +5682,14 @@
             "default": false,
             "description": "Explicit consent to mirror locally stored telemetry.",
             "type": "boolean"
+          },
+          "telemetry_outbox_max_bytes": {
+            "default": 536870912,
+            "description": "ADR-041 §3d: hard ceiling, in bytes, on the durable span outbox that\nbacks Cloud-primary telemetry writes.\n\nAn operator setting on the singleton `settings` row rather than an\nenvironment variable, per CLAUDE.md, so it can be raised at runtime by\nthe operator watching a queue fill up — which is exactly when they need\nto change it and exactly when restarting the binary is the worst\navailable option.\n\nExpressed in **bytes and not rows**: the reference deployment is\n3 vCPU / 4 GB, and a row count says nothing about disk on a table whose\nrows are serialized spans of wildly varying size. When the queue reaches\nthis size the instance stops accepting new spans for Cloud-primary\nprojects and records a gap window with a start, an end and a count —\nsee [`DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES`] for how the default is\nsized and what it buys.",
+            "example": 536870912,
+            "format": "int64",
+            "minimum": 1048576,
+            "type": "integer"
           }
         },
         "type": "object"
@@ -5544,6 +5751,138 @@
           "backups_enabled",
           "notifications_enabled",
           "managed_backup_setup"
+        ],
+        "type": "object"
+      },
+      "CloudTelemetryBackfillStatus": {
+        "description": "Lifecycle of the most recent backfill run for a project.",
+        "enum": [
+          "not_started",
+          "running",
+          "completed",
+          "failed"
+        ],
+        "type": "string"
+      },
+      "CloudTelemetryFidelity": {
+        "description": "Per-project fidelity tier for the optional Temps Cloud telemetry mirror.",
+        "enum": [
+          "metered",
+          "queryable"
+        ],
+        "type": "string"
+      },
+      "CloudTelemetryWriteMode": {
+        "description": "Per-project destination for span writes.",
+        "enum": [
+          "local",
+          "cloud"
+        ],
+        "type": "string"
+      },
+      "CloudTelemetryWriteStatusResponse": {
+        "description": "Instance-wide aggregate for the Cloud settings page.",
+        "properties": {
+          "can_decommission_local_span_store": {
+            "description": "Whether the console should offer decommission guidance. True only when\n`local_span_store_required` is false — the ADR is explicit that the\nadvice must not appear before then.",
+            "type": "boolean"
+          },
+          "cloud_primary_projects": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "configured": {
+            "description": "Whether Cloud-primary writes can be used at all on this instance.",
+            "type": "boolean"
+          },
+          "dead_lettered_rows": {
+            "description": "Rows that exhausted their retries. Never swept automatically; an\noperator has to see them.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "gap_windows": {
+            "items": {
+              "$ref": "#/components/schemas/TelemetryGapWindowResponse"
+            },
+            "type": "array"
+          },
+          "local_history_until": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "local_mode_projects": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "local_span_store_reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "local_span_store_required": {
+            "description": "The derived decommission signal. `true` means the operator gets **zero**\nresource win from removing their local span store, whatever the write\nmodes say.",
+            "type": "boolean"
+          },
+          "oldest_unshipped_age_secs": {
+            "description": "Age of the oldest unshipped span, in seconds. `None` when the queue is\nempty — different from zero, and it must not render as zero.",
+            "format": "int64",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "queue_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "queue_depth": {
+            "description": "Spans queued for Cloud across all projects.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "queue_max_bytes": {
+            "description": "The operator-set ceiling, so the depth above is readable against\nsomething rather than being a number with no scale.",
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "write_suspension": {
+            "description": "Set while Cloud-primary writes are falling back to local storage.",
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "configured",
+          "cloud_primary_projects",
+          "local_mode_projects",
+          "local_span_store_required",
+          "queue_depth",
+          "queue_bytes",
+          "queue_max_bytes",
+          "dead_lettered_rows",
+          "gap_windows",
+          "can_decommission_local_span_store"
         ],
         "type": "object"
       },
@@ -7703,6 +8042,45 @@
           "name",
           "trigger_type"
         ],
+        "type": "object"
+      },
+      "CreateAnalyticsIngestKeyRequest": {
+        "description": "Request body for minting a new ingest key.",
+        "properties": {
+          "allowed_origins": {
+            "description": "Exact origins permitted to use this key from a browser. Omit or send an\nempty array to allow any origin.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "environment_id": {
+            "description": "Scope the key to a single environment. Recommended: it lets Temps\nattribute ingested data to that environment's current deployment.\nOmit for a project-wide key.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "Operator-facing label. Defaults to \"Default ingest key\".",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rate_limit_per_minute": {
+            "description": "Requests per minute for this key. Omit for the 600/min default; send a\nnon-positive value for unlimited.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
         "type": "object"
       },
       "CreateApiKeyRequest": {
@@ -13572,6 +13950,13 @@
           "directory": {
             "type": "string"
           },
+          "dockerfilePath": {
+            "description": "Repository-root-relative path to the Dockerfile, when it does not\nlive directly under `{directory}/Dockerfile` (e.g. `docker/Dockerfile`\nrolled up to a `directory` of `\".\"`). `None` for a Dockerfile located\ndirectly at `{directory}/Dockerfile` and for every non-Dockerfile\npreset.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "isStatic": {
             "type": "boolean"
           },
@@ -15991,6 +16376,13 @@
               "null"
             ]
           },
+          "domain": {
+            "description": "The tracked site's own domain, computed client-side by the SDK's\n`resolveDomain()` and sent as a sibling of `event_data` (not nested\ninside it). Used on the keyed ingest path (ADR-040 §3) to attribute\nself-referrals/channels correctly: there, `Host` names the Temps\nserver rather than the customer's site, so it can't be used for that.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "event_data": {},
           "event_name": {
             "type": "string"
@@ -16068,6 +16460,13 @@
               "null"
             ]
           },
+          "session_id": {
+            "description": "Client-generated session id fallback (see `visitor_id`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ttfb": {
             "description": "Time to First Byte (milliseconds)",
             "format": "float",
@@ -16089,6 +16488,13 @@
             "minimum": 0,
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "visitor_id": {
+            "description": "Client-generated visitor id, used only when the request carries no\nTemps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as\nan analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).\nAccepts the SDK's `visitorId` key too, since the shared SDK helper that\ngenerates this value sends camelCase for every ingest endpoint.",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -17151,6 +17557,42 @@
           "timescaledb"
         ],
         "type": "string"
+      },
+      "FacetCapability": {
+        "description": "Whether a facet registered now would actually cover anything\n(Feature Discoverability: \"not built\" and \"not set up\" need different UI).",
+        "properties": {
+          "configured": {
+            "description": "False when the facet would populate for no project at all.",
+            "type": "boolean"
+          },
+          "reason": {
+            "description": "Why, when `configured` is false. Always populated in that case.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "description": "Where the operator goes to change it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "uncovered_project_ids": {
+            "description": "Projects whose spans this facet will **not** cover, because they are\nCloud-primary and store no spans on this instance. Non-empty alongside\n`configured: true` is a real and useful state: the facet works for the\nother projects, and the operator must be told which ones it misses\nrather than discovering it from an empty filter.",
+            "items": {
+              "format": "int32",
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "configured",
+          "uncovered_project_ids"
+        ],
+        "type": "object"
       },
       "FacetInfo": {
         "description": "Public representation of a registered span attribute facet.",
@@ -29051,6 +29493,13 @@
               "null"
             ]
           },
+          "dockerfile_path": {
+            "description": "Repository-root-relative path to the Dockerfile, when it does not\nlive directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`\nrolled up to a `path` of `\"./\"`). `None` for a Dockerfile located\ndirectly at `{path}/Dockerfile` and for every non-Dockerfile preset.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "exposed_port": {
             "description": "Default exposed port for this preset",
             "format": "int32",
@@ -29388,6 +29837,117 @@
         ],
         "type": "object"
       },
+      "ProjectCloudTelemetryResponse": {
+        "description": "A project's Cloud telemetry configuration, in every state.",
+        "properties": {
+          "attribute_allowlist": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "cloud_write_mode_available": {
+            "description": "Whether `write_mode = cloud` could be set right now.\n\n`false` is the normal state on an unlinked instance and must render as\nonboarding, not as an error.",
+            "type": "boolean"
+          },
+          "dead_lettered_spans": {
+            "description": "Spans this instance accepted for this project and gave up on delivering.\n\nThe instance-wide card only shows a count; this route is already scoped\nto one project, so it can say *why* without exposing another tenant's\nfailures.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "effective_reason": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/TelemetryWriteIntervalReason",
+                "description": "Why they differ. Absent when intent and reality agree."
+              }
+            ]
+          },
+          "effective_reason_message": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "effective_write_mode": {
+            "$ref": "#/components/schemas/CloudTelemetryWriteMode",
+            "description": "Where this project's spans are going right now, which differs from\n`write_mode` during a quota or credential fallback."
+          },
+          "fidelity": {
+            "$ref": "#/components/schemas/CloudTelemetryFidelity"
+          },
+          "gap_windows": {
+            "description": "Gap windows in the last 30 days.",
+            "items": {
+              "$ref": "#/components/schemas/TelemetryGapWindowResponse"
+            },
+            "type": "array"
+          },
+          "intervals": {
+            "description": "The write-mode ledger, newest first.",
+            "items": {
+              "$ref": "#/components/schemas/TelemetryWriteIntervalResponse"
+            },
+            "type": "array"
+          },
+          "last_dead_letter_at": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_dead_letter_error": {
+            "description": "The reason the most recent give-up gave, if there is one.\n\nDelivery metadata only — this instance's own bounded error string. It is\nnever the span payload, and this field must not become a place one\nappears.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "queued_spans": {
+            "description": "Spans queued for Cloud for this project and not yet acknowledged.",
+            "format": "int64",
+            "type": "integer"
+          },
+          "reason": {
+            "description": "The single most relevant missing prerequisite, when\n`cloud_write_mode_available` is false.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "setup_path": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "write_mode": {
+            "$ref": "#/components/schemas/CloudTelemetryWriteMode",
+            "description": "The operator's declared intent."
+          }
+        },
+        "required": [
+          "project_id",
+          "fidelity",
+          "attribute_allowlist",
+          "write_mode",
+          "effective_write_mode",
+          "cloud_write_mode_available",
+          "queued_spans",
+          "dead_lettered_spans",
+          "gap_windows",
+          "intervals"
+        ],
+        "type": "object"
+      },
       "ProjectConfiguration": {
         "description": "Project-level configuration",
         "properties": {
@@ -29652,6 +30212,13 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "dockerfilePath": {
+            "description": "Repository-root-relative path to the Dockerfile, when it does not\nlive directly under `{path}/Dockerfile` (e.g. `docker/Dockerfile`\nrolled up to a `path` of `\"./\"`). `None` for a Dockerfile located\ndirectly at `{path}/Dockerfile` and for every non-Dockerfile preset.",
+            "type": [
+              "string",
               "null"
             ]
           },
@@ -37530,6 +38097,13 @@
               "integer",
               "null"
             ]
+          },
+          "visitorId": {
+            "description": "Client-generated visitor id, used only when the request carries no\nTemps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as\nan analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).\nThe SDK already sends this today via `getSessionMetadata()`.",
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -39549,6 +40123,13 @@
               "null"
             ]
           },
+          "sessionId": {
+            "description": "Client-generated session id fallback (see `visitor_id`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "ttfb": {
             "description": "Time to First Byte (milliseconds)",
             "format": "float",
@@ -39570,6 +40151,13 @@
             "format": "int32",
             "type": [
               "integer",
+              "null"
+            ]
+          },
+          "visitorId": {
+            "description": "Client-generated visitor id, used only when the request carries no\nTemps-issued `_temps_visitor_id` cookie — i.e. Temps is used purely as\nan analytics backend for an app it doesn't deploy/proxy (gotempsh/temps#848).",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -40930,6 +41518,92 @@
           "viewer"
         ],
         "type": "string"
+      },
+      "TelemetryGapWindowResponse": {
+        "description": "A gap window as the client renders it.",
+        "properties": {
+          "dropped_bytes": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "dropped_spans": {
+            "format": "int64",
+            "type": "integer"
+          },
+          "ended_at": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "message": {
+            "description": "The sentence shown to the operator. Sent by the server so the client\nnever has to map an enum to prose and never renders a bare enum name.",
+            "type": "string"
+          },
+          "project_id": {
+            "format": "int32",
+            "type": "integer"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/TelemetryWriteIntervalReason"
+          },
+          "started_at": {
+            "format": "date-time",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "started_at",
+          "ended_at",
+          "dropped_spans",
+          "dropped_bytes",
+          "reason",
+          "message"
+        ],
+        "type": "object"
+      },
+      "TelemetryWriteIntervalReason": {
+        "description": "Why an interval opened.",
+        "enum": [
+          "operator",
+          "cloud_disconnected",
+          "quota_exhausted",
+          "credential_rejected",
+          "queue_overflow_spill",
+          "cloud_recovered"
+        ],
+        "type": "string"
+      },
+      "TelemetryWriteIntervalResponse": {
+        "description": "One entry of the write-mode ledger.",
+        "properties": {
+          "effective_from": {
+            "format": "date-time",
+            "type": "string"
+          },
+          "effective_to": {
+            "format": "date-time",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "type": "string"
+          },
+          "mode": {
+            "$ref": "#/components/schemas/CloudTelemetryWriteMode"
+          },
+          "reason": {
+            "$ref": "#/components/schemas/TelemetryWriteIntervalReason"
+          }
+        },
+        "required": [
+          "mode",
+          "effective_from",
+          "reason",
+          "message"
+        ],
+        "type": "object"
       },
       "TemplateResponse": {
         "description": "Response type for a single template",
@@ -42771,6 +43445,37 @@
         },
         "type": "object"
       },
+      "UpdateAnalyticsIngestKeyRequest": {
+        "description": "Request body for a partial update.\n\n`allowed_origins` and `rate_limit_per_minute` use the three-state\ndouble-`Option` encoding: field absent = leave unchanged, explicit `null` =\nclear, value = set. Plain `Option<Option<T>>` alone cannot express this\nbecause serde collapses an explicit JSON `null` into the outer `None`.",
+        "properties": {
+          "allowed_origins": {
+            "description": "Absent = unchanged, `null` = clear (any origin allowed), array = replace.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "New operator-facing label. Absent leaves it unchanged. The column is\n`NOT NULL`, so there is no \"clear\" state — send a new label instead.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rate_limit_per_minute": {
+            "description": "Absent = unchanged, `null` = clear (unlimited), value = replace.",
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateApiKeyRequest": {
         "properties": {
           "expires_at": {
@@ -44194,6 +44899,41 @@
         ],
         "type": "object"
       },
+      "UpdateProjectCloudTelemetryRequest": {
+        "description": "Body for changing a project's Cloud telemetry settings.\n\nBoth fields are optional and independent: an operator raising fidelity and\none flipping the write mode are two different acts, and forcing a client to\nsend both would make each one able to clobber the other.",
+        "properties": {
+          "attribute_allowlist": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "fidelity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CloudTelemetryFidelity"
+              }
+            ]
+          },
+          "write_mode": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/CloudTelemetryWriteMode"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
       "UpdateProjectSecretRequest": {
         "description": "Request to update a project secret. The `value` field is optional — omit it\nto rotate only the environment scoping / preview flag without touching the\nciphertext.",
         "properties": {
@@ -44746,6 +45486,20 @@
             "format": "float",
             "type": [
               "number",
+              "null"
+            ]
+          },
+          "sessionId": {
+            "description": "Client-generated session id fallback (see [`SpeedMetricsPayload::visitor_id`]).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "visitorId": {
+            "description": "Client-generated visitor id fallback (see [`SpeedMetricsPayload::visitor_id`]).\nRequired to identify the right row on the keyed path, where there is\nno Temps-issued cookie to fall back on.",
+            "type": [
+              "string",
               "null"
             ]
           }
@@ -47863,6 +48617,29 @@
     "/_temps/event": {
       "post": {
         "operationId": "record_event_metrics",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -47937,6 +48714,29 @@
     "/_temps/session-replay/events": {
       "post": {
         "operationId": "add_session_replay_events",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used to flush the final replay batch on page unload). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -47999,6 +48799,29 @@
     "/_temps/session-replay/init": {
       "post": {
         "operationId": "init_session_replay",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -48051,6 +48874,29 @@
     "/_temps/speed": {
       "post": {
         "operationId": "record_speed_metrics",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers (`navigator.sendBeacon`, used for page-unload events). Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -48105,6 +48951,29 @@
     "/_temps/speed/update": {
       "post": {
         "operationId": "update_speed_metrics",
+        "parameters": [
+          {
+            "description": "Analytics ingest key (ADR-040), `pa_` followed by 64 hex characters. An alternative to Host-based project resolution, for apps Temps does not deploy and which therefore have no route-table entry. When present it takes precedence and the Host header is not consulted for resolution; a key that does not resolve to an active row is a 401, never a fallback to Host. The value is public by design — it ships in client JS — and is write-only: it grants analytics ingest for one project (optionally one environment) and nothing else.",
+            "in": "header",
+            "name": "x-temps-analytics-key",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "description": "Query-string fallback for the analytics ingest key, for clients that cannot set custom headers. This endpoint is called via `navigator.sendBeacon` on page unload, so the query form is the only one available there. Consulted only when the `x-temps-analytics-key` header is absent; identical precedence and error semantics.",
+            "in": "query",
+            "name": "temps_key",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -72730,6 +73599,308 @@
         "x-maturity": "beta"
       }
     },
+    "/otel/cloud-telemetry/backfill/{project_id}": {
+      "get": {
+        "operationId": "get_cloud_backfill_status",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudBackfillStatusResponse"
+                }
+              }
+            },
+            "description": "Backfill status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Status of the most recent Temps Cloud telemetry backfill for a project.",
+        "tags": [
+          "OTel"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/cloud-telemetry/projects/{project_id}": {
+      "get": {
+        "operationId": "get_project_cloud_telemetry",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectCloudTelemetryResponse"
+                }
+              }
+            },
+            "description": "Project Cloud telemetry settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "A project's Cloud telemetry write mode and fidelity.",
+        "tags": [
+          "OTel"
+        ],
+        "x-maturity": "beta"
+      },
+      "patch": {
+        "operationId": "update_project_cloud_telemetry",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateProjectCloudTelemetryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectCloudTelemetryResponse"
+                }
+              }
+            },
+            "description": "Updated settings"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Project not found"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "A prerequisite is missing"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Change a project's Cloud telemetry write mode and/or fidelity.",
+        "tags": [
+          "OTel"
+        ],
+        "x-maturity": "beta"
+      }
+    },
+    "/otel/cloud-telemetry/status": {
+      "get": {
+        "operationId": "get_cloud_telemetry_status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CloudTelemetryWriteStatusResponse"
+                }
+              }
+            },
+            "description": "Instance Cloud telemetry write status"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Instance-wide Cloud telemetry write status.",
+        "tags": [
+          "OTel"
+        ],
+        "x-maturity": "beta"
+      }
+    },
     "/otel/dashboards": {
       "get": {
         "operationId": "list_dashboards",
@@ -80420,6 +81591,311 @@
         "summary": "Silence an alarm (and future re-fires of the same type/scope) for a\nchosen duration, without permanently resolving it.",
         "tags": [
           "Alarms"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys": {
+      "get": {
+        "description": "Includes revoked keys: revocation is soft, and an operator investigating\n\"which key sent this?\" needs to see the rows that no longer work. Every\n`public_key` is returned unmasked — see [`create_analytics_ingest_key`].",
+        "operationId": "list_analytics_ingest_keys",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/AnalyticsIngestKey"
+                  },
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Ingest keys, active and revoked, newest first"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "List a project's analytics ingest keys, newest first.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      },
+      "post": {
+        "description": "The returned `public_key` is **not a secret**: it is designed to be embedded\nin client-side JavaScript and sent as `X-Temps-Analytics-Key` or\n`?temps_key=`. It is returned in full here and on every subsequent read, so\nan operator can copy it at any time; there is no \"reveal\" step because there\nis nothing to conceal.",
+        "operationId": "create_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateAnalyticsIngestKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "Ingest key created"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Project or environment not found"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Mint a new analytics ingest key.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys/{key_id}": {
+      "patch": {
+        "description": "`allowed_origins` and `rate_limit_per_minute` are three-state: omit to leave\nunchanged, send `null` to clear, send a value to replace. Clearing\n`allowed_origins` allows any origin; clearing `rate_limit_per_minute`\nremoves the limit.",
+        "operationId": "update_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateAnalyticsIngestKeyRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "Ingest key updated"
+          },
+          "400": {
+            "description": "Validation error"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Update an ingest key's label, origin allowlist, or rate limit.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys/{key_id}/revoke": {
+      "post": {
+        "description": "Soft by design: the row is kept with `is_active = false` and `revoked_at`\nset, so the record of which key ingested what survives. The key stops\nresolving immediately.",
+        "operationId": "revoke_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Ingest key revoked"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Revoke an ingest key.",
+        "tags": [
+          "Analytics Ingest Keys"
+        ]
+      }
+    },
+    "/projects/{project_id}/analytics/ingest-keys/{key_id}/rotate": {
+      "post": {
+        "description": "The previous value stops working immediately — the resolution cache entry\nfor it is evicted synchronously rather than left to expire. Any client still\nsending the old value will start receiving 401s, so roll out the new value\nbefore rotating.",
+        "operationId": "rotate_analytics_ingest_key",
+        "parameters": [
+          {
+            "description": "Project ID",
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Analytics ingest key ID",
+            "in": "path",
+            "name": "key_id",
+            "required": true,
+            "schema": {
+              "format": "int32",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AnalyticsIngestKey"
+                }
+              }
+            },
+            "description": "Ingest key rotated"
+          },
+          "400": {
+            "description": "The key is revoked and cannot be rotated"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "404": {
+            "description": "Ingest key not found in this project"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace an ingest key's value, keeping the same row and scope.",
+        "tags": [
+          "Analytics Ingest Keys"
         ]
       }
     },
@@ -102666,6 +104142,10 @@
     {
       "description": "Provider preference and availability endpoints",
       "name": "AI Provider Status"
+    },
+    {
+      "description": "Manage non-secret analytics ingest keys for apps Temps does not deploy",
+      "name": "Analytics Ingest Keys"
     },
     {
       "description": "Git provider management endpoints",

@@ -9,6 +9,7 @@ nightly_workflow="$repository_root/.github/workflows/nightly-release.yml"
 release_workflow="$repository_root/.github/workflows/release.yml"
 sandbox_workflow="$repository_root/.github/workflows/sandbox-images-beta.yml"
 e2e_workflow="$repository_root/.github/workflows/e2e-tests.yml"
+rust_tests_workflow="$repository_root/.github/workflows/rust-tests.yml"
 decision_script="$repository_root/.github/scripts/nightly-release-decision.sh"
 validation_script="$repository_root/.github/scripts/validate-release-ref.sh"
 
@@ -47,7 +48,7 @@ if [[ "$tag_aware_dispatch_count" -ne 5 ]]; then
   fail "expected release channel and version logic to distinguish dry-runs from tag dispatches"
 fi
 
-ruby - "$repository_root" "$nightly_workflow" "$release_workflow" "$sandbox_workflow" "$e2e_workflow" <<'RUBY'
+ruby - "$repository_root" "$nightly_workflow" "$release_workflow" "$sandbox_workflow" "$e2e_workflow" "$rust_tests_workflow" <<'RUBY'
 require "yaml"
 
 repository_root = ARGV[0]
@@ -55,6 +56,7 @@ nightly = YAML.safe_load(File.read(ARGV[1]), aliases: true)
 release = YAML.safe_load(File.read(ARGV[2]), aliases: true)
 sandbox = YAML.safe_load(File.read(ARGV[3]), aliases: true)
 e2e = YAML.safe_load(File.read(ARGV[4]), aliases: true)
+rust_tests = YAML.safe_load(File.read(ARGV[5]), aliases: true)
 
 e2e_sandbox_channel = e2e.dig("jobs", "e2e-test", "env", "TEMPS_SANDBOX_CHANNEL")
 abort "E2E must pull the beta sandbox images published for main and PR builds" unless
@@ -133,6 +135,17 @@ unless actual_release_permissions == expected_release_permissions
   abort "release job permissions differ from the least-privilege allowlist:\n" \
     "expected #{expected_release_permissions.inspect}\nactual #{actual_release_permissions.inspect}"
 end
+
+otel_protobuf_compat = rust_tests.fetch("jobs").fetch("otel-protobuf-compat")
+abort "OTEL protobuf compatibility must use the release runner image" unless
+  otel_protobuf_compat["runs-on"] == "ubuntu-22.04"
+otel_protobuf_steps = otel_protobuf_compat.fetch("steps")
+protobuf_install = otel_protobuf_steps.find { |step| step["name"] == "Install protobuf compiler" }
+abort "OTEL protobuf compatibility must install protobuf-compiler" unless
+  protobuf_install&.fetch("run", "")&.include?("protobuf-compiler")
+protobuf_compile = otel_protobuf_steps.find { |step| step["name"] == "Compile OTEL protobuf bindings" }
+abort "OTEL protobuf compatibility must compile temps-otel" unless
+  protobuf_compile&.fetch("run", "") == "cargo check --lib -p temps-otel"
 
 release_steps = release.fetch("jobs").values.flat_map { |job| job.fetch("steps", []) }
 bun_versions = release_steps.map { |step| step.dig("with", "bun-version") }.compact

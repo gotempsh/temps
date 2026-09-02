@@ -18,6 +18,7 @@ import {
   apiSummary,
 } from './api-traffic.js'
 import { performanceInsights } from './performance.js'
+import { registerAnalyticsKeysCommands } from './keys.js'
 
 function collect(value: string, previous: string[]): string[] {
   return [...previous, value]
@@ -28,6 +29,8 @@ export function registerAnalyticsCommands(program: Command): void {
     .command('analytics')
     .alias('stats')
     .description('View project analytics')
+
+  registerAnalyticsKeysCommands(analytics)
 
   analytics
     .command('overview')
@@ -343,6 +346,11 @@ Examples:
   $ temps analytics api-ip 203.0.113.10 -p my-app --period 7d
   $ temps analytics api-path /api/health -p my-app --sort-by error_rate
   $ temps analytics api-query -p my-app --group-by client_ip,path --metrics requests,error_rate,latency_p95 --filter method:eq:GET --json
-  $ temps analytics api-summary  -p my-app --period 24h`,
+  $ temps analytics api-summary  -p my-app --period 24h
+
+  Ingest keys (for apps Temps does not deploy):
+  $ temps analytics keys list   --project-id 7
+  $ temps analytics keys create --project-id 7 --name "marketing site" -y
+  $ temps analytics keys rotate --project-id 7 --key-id 3 --force`,
   )
 }

@@ -151,6 +151,16 @@ impl ServeCommand {
         self,
         extra_plugins: Vec<Box<dyn temps_core::plugin::TempsPlugin>>,
     ) -> anyhow::Result<()> {
+        let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
+        if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
+            warn!(
+                legacy_variable = temps_core::LEGACY_DEPLOYMENT_MODE_VARIABLE,
+                canonical_variable = temps_core::EXECUTION_ENVIRONMENT_VARIABLE,
+                execution_environment = %runtime_context.execution_environment(),
+                "Using deprecated execution-environment configuration; migrate to TEMPS_EXECUTION_ENV"
+            );
+        }
+
         // Install the rustls crypto provider once at startup, before any
         // dependency (e.g. temps-domains) constructs a rustls client.
         crate::install_crypto_provider();
@@ -289,7 +299,10 @@ impl ServeCommand {
             temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(1000);
 
         // Create shared route table instance (used by both console API and proxy)
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_proxy::CachedPeerTable::new_with_runtime_context(
+            db.clone(),
+            runtime_context.clone(),
+        ));
 
         // ADR-012-lite: every successful route_table reload also
         // reconciles internal `<env>.<project>.temps.local` A records,
@@ -433,25 +446,19 @@ impl ServeCommand {
         // The proxy server (80/443) MUST come up regardless.
         let docker_handle: Option<Arc<bollard::Docker>> = {
             let docker_rt = tokio::runtime::Runtime::new()?;
-            match docker_rt.block_on(async {
-                let docker = bollard::Docker::connect_with_defaults()
-                    .map_err(|e| anyhow::anyhow!("Docker connect failed: {}", e))?;
-                docker
-                    .ping()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Docker ping failed: {}", e))?;
-                Ok::<_, anyhow::Error>(docker)
-            }) {
-                Ok(docker) => Some(Arc::new(docker)),
-                Err(e) => {
-                    warn!(
-                        "Docker not available — on-demand scale-to-zero and workspace \
-                         preview gateway will be disabled: {}",
-                        e
-                    );
-                    None
-                }
-            }
+            proxy::optional_docker_feature(
+                docker_rt.block_on(async {
+                    let docker = bollard::Docker::connect_with_defaults()
+                        .map_err(|e| anyhow::anyhow!("Docker connect failed: {}", e))?;
+                    docker
+                        .ping()
+                        .await
+                        .map_err(|e| anyhow::anyhow!("Docker ping failed: {}", e))?;
+                    Ok::<_, anyhow::Error>(docker)
+                }),
+                "on-demand scale-to-zero and workspace preview gateway",
+            )
+            .map(Arc::new)
         };
 
         // The on-demand wake manager is a PROXY-side concern: it watches request
@@ -473,7 +480,8 @@ impl ServeCommand {
                         "temps".to_string(),
                     );
                     let adapter = proxy::ContainerLifecycleAdapter::new(
-                        Arc::new(docker_runtime) as Arc<dyn temps_deployer::ContainerDeployer>
+                        Arc::new(docker_runtime) as Arc<dyn temps_deployer::ContainerDeployer>,
+                        runtime_context.clone(),
                     );
                     Arc::new(temps_proxy::on_demand::OnDemandManager::new(
                         db.clone(),

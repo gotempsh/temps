@@ -38,7 +38,7 @@ pub mod plugin;
 pub mod readiness;
 pub mod remote;
 pub mod static_deployer;
-pub(crate) mod static_ingestion;
+pub mod static_ingestion;
 
 pub use platform::{
     canonicalize_platform, is_buildable_platform, native_platform, normalize_arch,

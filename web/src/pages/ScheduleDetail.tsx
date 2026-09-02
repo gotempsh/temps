@@ -50,6 +50,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { EmptyState } from '@/components/ui/empty-state'
 import { Skeleton } from '@/components/ui/skeleton'
 import {
   Table,
@@ -795,10 +796,16 @@ export function ScheduleDetail() {
                 <Skeleton className="h-10 w-full" />
               </div>
             ) : !attachedServices || attachedServices.length === 0 ? (
-              <div className="rounded-md border border-dashed p-6 text-center text-sm text-muted-foreground">
-                No services attached yet. Click <strong>Attach service</strong>{' '}
-                to add Postgres, Redis, MongoDB, or RustFS targets.
-              </div>
+              <EmptyState
+                icon={Database}
+                title="No services attached yet"
+                description={
+                  <>
+                    Click <strong>Attach service</strong> to add Postgres,
+                    Redis, MongoDB, or RustFS targets.
+                  </>
+                }
+              />
             ) : (
               <ul className="divide-y rounded-md border">
                 {attachedServices.map((svc) => {

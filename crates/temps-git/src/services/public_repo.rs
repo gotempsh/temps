@@ -86,6 +86,11 @@ pub struct DetectedPreset {
     pub icon_url: Option<String>,
     pub project_type: String,
     pub compose_files: Option<Vec<String>>,
+    /// Repository-root-relative path to the Dockerfile, when it does not
+    /// live directly under `{path}/Dockerfile`. See
+    /// [`temps_presets::DetectedPreset::dockerfile_path`] for the full
+    /// explanation.
+    pub dockerfile_path: Option<String>,
 }
 
 /// Trait for public repository providers
@@ -1110,6 +1115,7 @@ pub fn detect_presets_from_files(files: &[String]) -> Vec<DetectedPreset> {
                 icon_url,
                 project_type,
                 compose_files: preset.compose_files,
+                dockerfile_path: preset.dockerfile_path,
             }
         })
         .collect()
@@ -1377,11 +1383,75 @@ mod tests {
             icon_url: Some("https://example.com/icon.svg".to_string()),
             project_type: "frontend".to_string(),
             compose_files: None,
+            dockerfile_path: None,
         };
 
         let json = serde_json::to_string(&preset).unwrap();
         assert!(json.contains("\"preset\":\"nextjs\""));
         assert!(json.contains("\"exposed_port\":3000"));
+    }
+
+    #[test]
+    fn test_detected_preset_serialization_with_dockerfile_path() {
+        let preset = DetectedPreset {
+            path: "".to_string(),
+            preset: "dockerfile".to_string(),
+            preset_label: "Dockerfile".to_string(),
+            exposed_port: None,
+            icon_url: None,
+            project_type: "backend".to_string(),
+            compose_files: None,
+            dockerfile_path: Some("docker/Dockerfile".to_string()),
+        };
+
+        let json = serde_json::to_string(&preset).unwrap();
+        assert!(json.contains("\"dockerfile_path\":\"docker/Dockerfile\""));
+
+        let round_tripped: DetectedPreset = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            round_tripped.dockerfile_path,
+            Some("docker/Dockerfile".to_string())
+        );
+    }
+
+    /// A bare Dockerfile in a `docker/`-named subdirectory, with something
+    /// else at the repository root, must be rolled up into a repo-root
+    /// candidate that records where the Dockerfile actually lives.
+    #[test]
+    fn test_detect_presets_from_files_bare_dockerfile_in_docker_dir_roots_at_repo_root() {
+        let files = vec!["package.json".to_string(), "docker/Dockerfile".to_string()];
+
+        let detected = detect_presets_from_files(&files);
+        let dockerfile_preset = detected
+            .iter()
+            .find(|p| p.preset == "dockerfile")
+            .expect("dockerfile preset should be detected");
+
+        assert_eq!(dockerfile_preset.path, "./");
+        assert_eq!(
+            dockerfile_preset.dockerfile_path,
+            Some("docker/Dockerfile".to_string())
+        );
+    }
+
+    /// A genuine monorepo service directory (its own Dockerfile plus its own
+    /// manifest, in a directory name that isn't a conventional Docker-tooling
+    /// name) keeps today's behavior: its own root, `dockerfile_path: None`.
+    #[test]
+    fn test_detect_presets_from_files_service_dockerfile_keeps_own_root() {
+        let files = vec![
+            "apps/api/Dockerfile".to_string(),
+            "apps/api/package.json".to_string(),
+        ];
+
+        let detected = detect_presets_from_files(&files);
+        let dockerfile_preset = detected
+            .iter()
+            .find(|p| p.preset == "dockerfile")
+            .expect("dockerfile preset should be detected");
+
+        assert_eq!(dockerfile_preset.path, "apps/api");
+        assert_eq!(dockerfile_preset.dockerfile_path, None);
     }
 
     // =============================================================================

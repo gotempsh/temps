@@ -209,6 +209,16 @@ impl ProxyCommand {
         self,
         ip_gate_builder: Option<ProjectIpGateBuilder>,
     ) -> anyhow::Result<()> {
+        let runtime_context = Arc::new(temps_core::initialize_process_runtime_context()?.clone());
+        if runtime_context.source() == temps_core::ExecutionEnvironmentSource::Legacy {
+            warn!(
+                legacy_variable = temps_core::LEGACY_DEPLOYMENT_MODE_VARIABLE,
+                canonical_variable = temps_core::EXECUTION_ENVIRONMENT_VARIABLE,
+                execution_environment = %runtime_context.execution_environment(),
+                "Using deprecated execution-environment configuration; migrate to TEMPS_EXECUTION_ENV"
+            );
+        }
+
         let serve_config = Arc::new(temps_config::ServerConfig::new(
             self.address.clone(),
             self.database_url.clone(),
@@ -258,6 +268,7 @@ impl ProxyCommand {
             cookie_crypto,
             encryption_service,
             serve_config.clone(),
+            runtime_context,
         )
     }
 
@@ -272,6 +283,7 @@ impl ProxyCommand {
         cookie_crypto: Arc<CookieCrypto>,
         encryption_service: Arc<temps_core::EncryptionService>,
         config: Arc<ServerConfig>,
+        runtime_context: Arc<temps_core::RuntimeContext>,
     ) -> anyhow::Result<()> {
         let data_dir = config.data_dir.clone();
         let console_address = console_address
@@ -355,7 +367,10 @@ impl ProxyCommand {
             temps_queue::BroadcastQueueService::create_job_queue_arc_with_receiver(1000);
 
         // Initialize route table with listener (preview_domain loaded from settings)
-        let route_table = Arc::new(temps_proxy::CachedPeerTable::new(db.clone()));
+        let route_table = Arc::new(temps_proxy::CachedPeerTable::new_with_runtime_context(
+            db.clone(),
+            runtime_context.clone(),
+        ));
 
         // ADR-018 on-demand TLS: build the certificate manager when enabled in
         // settings. Constructed after the route table exists (the gate's
@@ -418,8 +433,11 @@ impl ProxyCommand {
                     .map_err(|e| anyhow::anyhow!("Docker ping failed: {}", e))?;
                 Ok::<_, anyhow::Error>(docker)
             });
-            match docker {
-                Ok(docker) => {
+            match crate::commands::serve::proxy::optional_docker_feature(
+                docker,
+                "on-demand scale-to-zero wake for this proxy",
+            ) {
+                Some(docker) => {
                     let docker_runtime = temps_deployer::docker::DockerRuntime::new(
                         Arc::new(docker),
                         true,
@@ -427,6 +445,7 @@ impl ProxyCommand {
                     );
                     let adapter = crate::commands::serve::proxy::ContainerLifecycleAdapter::new(
                         Arc::new(docker_runtime) as Arc<dyn temps_deployer::ContainerDeployer>,
+                        runtime_context.clone(),
                     );
                     Some(Arc::new(OnDemandManager::new(
                         db.clone(),
@@ -439,14 +458,7 @@ impl ProxyCommand {
                         None,
                     )))
                 }
-                Err(e) => {
-                    warn!(
-                        "Docker not available — on-demand scale-to-zero wake is disabled \
-                         for this proxy: {}",
-                        e
-                    );
-                    None
-                }
+                None => None,
             }
         };
 

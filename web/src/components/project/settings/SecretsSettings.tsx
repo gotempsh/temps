@@ -9,6 +9,7 @@ import {
   listProjectSecretsOptions,
 } from '@/api/client/@tanstack/react-query.gen'
 import { Button } from '@/components/ui/button'
+import { EmptyState } from '@/components/ui/empty-state'
 import {
   AlertDialog,
   AlertDialogAction,
@@ -38,6 +39,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { FileLock2, Plus, Trash2 } from 'lucide-react'
 import { useEffect, useState } from 'react'
 import { toast } from 'sonner'
+import { useKeyboardShortcut } from '@/hooks/useKeyboardShortcut'
 
 interface SecretsSettingsProps {
   project: ProjectResponse
@@ -66,32 +68,10 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
 
   const [isCreateOpen, setIsCreateOpen] = useState(false)
 
-  // `n` opens the Create Secret dialog. Mirrors the env-vars page shortcut.
-  // Skips when the user is typing in an input/textarea/contentEditable so
-  // typing the literal "n" inside a form field doesn't hijack focus.
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (
-        e.key === 'n' &&
-        !e.metaKey &&
-        !e.ctrlKey &&
-        !e.shiftKey &&
-        !e.altKey
-      ) {
-        const target = e.target as HTMLElement
-        if (
-          target.tagName !== 'INPUT' &&
-          target.tagName !== 'TEXTAREA' &&
-          !target.isContentEditable
-        ) {
-          e.preventDefault()
-          setIsCreateOpen(true)
-        }
-      }
-    }
-    document.addEventListener('keydown', handleKeyDown)
-    return () => document.removeEventListener('keydown', handleKeyDown)
-  }, [])
+  useKeyboardShortcut({
+    key: 'n',
+    callback: () => setIsCreateOpen(true),
+  })
 
   const refetchSecrets = () => {
     queryClient.invalidateQueries({
@@ -145,9 +125,18 @@ export function SecretsSettings({ project }: SecretsSettingsProps) {
           <Skeleton className="h-12 w-full" />
         </div>
       ) : secrets.length === 0 ? (
-        <div className="border border-dashed rounded-md p-8 text-center text-sm text-muted-foreground">
-          No secrets yet. Click <strong>New secret</strong> to add one.
-        </div>
+        <EmptyState
+          icon={FileLock2}
+          title="No secrets yet"
+          description="Secrets are mounted into your containers as read-only files. Add one to get started."
+          action={
+            <Button onClick={() => setIsCreateOpen(true)}>
+              <Plus className="h-4 w-4 mr-1" />
+              New secret
+              <KbdBadge keys={['N']} className="ml-2 hidden sm:inline-flex" />
+            </Button>
+          }
+        />
       ) : (
         <div className="border rounded-md divide-y">
           {secrets.map((s) => (

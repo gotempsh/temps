@@ -15,8 +15,7 @@
 //!
 //! Persistence lives in `SandboxService`. This module is pure crypto.
 
-use argon2::password_hash::{rand_core::OsRng, PasswordHash, SaltString};
-use argon2::{Argon2, PasswordHasher, PasswordVerifier};
+use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier};
 
 /// Minimum plaintext length we'll accept. Short enough to not annoy users
 /// who just want a shared team password, long enough that online brute force
@@ -60,9 +59,8 @@ pub fn validate(plaintext: &str) -> Result<(), String> {
 /// Hash a validated plaintext. Caller is responsible for calling
 /// [`validate`] first — this function trusts its input.
 pub fn hash_password(plaintext: &str) -> Result<HashedPassword, String> {
-    let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
-        .hash_password(plaintext.as_bytes(), &salt)
+        .hash_password(plaintext.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| format!("argon2 hash failed: {}", e))?;
     Ok(HashedPassword {

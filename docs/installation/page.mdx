@@ -44,6 +44,7 @@ This guide covers all installation methods and production configuration options 
 | **443**  | HTTPS                    | Yes                     |
 | **8080** | Temps API (configurable) | Yes                     |
 | **5432** | PostgreSQL               | Internal only           |
+| **8123** | ClickHouse HTTP API      | Internal only           |
 
 ---
 
@@ -220,20 +221,24 @@ temps --version
 
 ### Docker Compose from Source
 
-The repository Compose stack requires independent URL-safe database and Redis
-passwords. Copy the template and generate 256-bit hexadecimal values (do not
-use URI punctuation, because the values are also used in connection URLs):
+The repository Compose stack requires independent URL-safe PostgreSQL and
+ClickHouse passwords. Copy the template and generate 256-bit hexadecimal
+values (do not use URI punctuation, because some values are also used in
+connection URLs):
 
 ```bash
 install -m 600 .env.example .env
 openssl rand -hex 32  # set as POSTGRES_PASSWORD
-openssl rand -hex 32  # set as REDIS_PASSWORD
+openssl rand -hex 32  # set as CLICKHOUSE_PASSWORD
 # Set TEMPS_ADMIN_EMAIL to the initial administrator's email address.
 # Create its password as a permission-restricted Compose secret:
 mkdir -p secrets
 chmod 700 secrets
 { printf 'tT3!'; openssl rand -hex 32; } > secrets/admin_password
-chmod 444 secrets/admin_password
+# Create a separate password for the loopback-only admin ingress. Its Basic
+# auth username is `temps`; never reuse the Temps account password.
+{ printf 'iI4!'; openssl rand -hex 32; } > secrets/admin_ingress_password
+chmod 444 secrets/admin_password secrets/admin_ingress_password
 # Set DOCKER_GID to the container-visible socket group on Linux or macOS:
 # docker run --rm -v /var/run/docker.sock:/var/run/docker.sock alpine:3.22 stat -c '%g' /var/run/docker.sock
 docker compose up --build --detach
@@ -247,16 +252,61 @@ Keep `.env` owned by the account that operates Temps and mode `0600`; it
 contains credentials that can access the loopback-published data services.
 
 Compose validates the password alphabet before starting data services. It
-publishes PostgreSQL, Redis, and the console API on loopback only; HTTP and
-HTTPS remain publicly bound. Temps receives Docker-socket access through the
-socket owner's group while the application process remains non-root. Treat
-membership in that group as root-equivalent host access.
+starts TimescaleDB, ClickHouse, and Temps, with persistent volumes for
+each stateful service. Every published port, including Temps HTTP, HTTPS, and
+the console API, is bound to `127.0.0.1`. The public console/ingest listener is
+on port `9000`; the UI and management API are on port `9001`, protected by the
+independent Basic-auth password in `secrets/admin_ingress_password` and then by
+Temps' own authentication. Use username `temps` at the Basic-auth prompt. Use a
+TLS-terminating reverse proxy, mTLS, or a secure tunnel before making any port
+reachable from another host. The ingress password file must contain one
+non-blank line of 16–72 printable ASCII bytes; ingress startup fails closed for
+invalid content. Temps connects to ClickHouse automatically for
+analytics, request logs, metrics, and OpenTelemetry storage.
+Temps joins the private dependency network and the separately named
+`TEMPS_NETWORK_NAME` workload network. PostgreSQL, ClickHouse, and the Temps
+listeners use static addresses on the private network so workload-controlled
+Docker DNS aliases cannot redirect control-plane credentials or listener binds.
+Managed workloads can reach the intentionally public HTTP/TLS/ingest surface,
+but cannot resolve the private admin service name or reach the control-plane
+data services.
+Compose enforces that separation with two ingress containers: the public proxy
+joins the workload network, while the loopback admin proxy joins a dedicated
+bridge that workloads cannot resolve by service name. Docker engines differ in
+cross-bridge routing, so the independent Basic-auth barrier remains mandatory
+even when a client knows the admin proxy's private IP. Both proxies bind to
+explicit private addresses inside their containers; no listener binds to
+`0.0.0.0`.
+
+<Note>
+  Basic auth uses the HTTP `Authorization` header. Browser sessions work because
+  Temps uses cookies, but bearer-token admin clients need a separate trusted
+  path or mTLS design rather than this browser-oriented ingress.
+</Note>
+The control network is also marked internal to block direct routing from the
+workload bridge to those private addresses.
+The Temps process binds its listeners only to the private network interface,
+while Docker publishes them to host loopback. Managed applications therefore
+cannot connect directly to the control-plane HTTP, TLS, or console/admin ports.
+Temps receives Docker-socket access through the socket owner's group while the
+application process remains non-root. Treat membership in that group as
+root-equivalent host access.
+Redis is not a control-plane dependency. Enabling Temps KV storage provisions
+and manages its own Redis service separately.
+
+If a default subnet overlaps a Docker, LAN, or VPN route, change the associated
+values together before the first `docker compose up`: `TEMPS_CONTROL_SUBNET`
+and all three `*_INTERNAL_IP` values for the private control plane;
+`TEMPS_WORKLOAD_SUBNET` and `TEMPS_PUBLIC_INGRESS_IP` for managed workloads;
+or `TEMPS_INGRESS_SUBNET`, `TEMPS_ADMIN_INGRESS_IP`, and
+`TEMPS_INGRESS_GATEWAY_IP` for the loopback admin proxy.
+
 On the first unattended startup, Temps creates `TEMPS_ADMIN_EMAIL` as the
 administrator using the mounted `TEMPS_ADMIN_PASSWORD_FILE`. The password is
 not placed in the container environment, command line, or logs. The source file
-must be `0444` so the image's non-root UID can read—but not modify—the bind-mounted secret on
-Linux; its `0700` parent directory prevents other host users from traversing to
-it. Rotate the password after first login.
+must be `0444` so the image's non-root UID can read—but not modify—the
+bind-mounted secret on Linux; its `0700` parent directory prevents other host
+users from traversing to it. Rotate the password after first login.
 
 ---
 
@@ -289,6 +339,7 @@ temps serve
 | `TEMPS_DATA_DIR`        | `--data-dir`        | `~/.temps`       | Data directory for keys/config              |
 | `TEMPS_LOG_LEVEL`       | `--log-level`       | `info`           | Log level (trace, debug, info, warn, error) |
 | `TEMPS_CONSOLE_ADDRESS` | `--console-address` | (optional)       | Admin console address                       |
+| `TEMPS_EXECUTION_ENV`   | (none)              | `host`           | Endpoint context: `host` or `docker`        |
 
 ---
 

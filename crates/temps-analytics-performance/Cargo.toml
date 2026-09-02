@@ -16,6 +16,9 @@ temps-entities = { path = "../temps-entities" }
 temps-routes = { path = "../temps-routes" }
 temps-geo = { path = "../temps-geo" }
 temps-auth = { path = "../temps-auth" }
+# ADR-040 analytics ingest keys. Downward-only: temps-analytics depends on
+# neither temps-routes nor this crate, so there is no cycle.
+temps-analytics = { path = "../temps-analytics" }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }
@@ -25,6 +28,9 @@ sea-orm = { version = "1.1.2", features = ["sqlx-postgres", "runtime-tokio-rustl
 
 # Web framework
 axum = "0.8.1"
+# CORS on the public ingest routes (ADR-040): the browser blocks a
+# cross-origin POST before it leaves the page without it.
+tower-http = { workspace = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -51,3 +57,6 @@ woothee = "0.13"
 maplit = "1.0"
 sea-orm = { version = "1.1.2", features = ["sqlx-postgres", "runtime-tokio-rustls", "macros", "mock"] }
 async-trait = { workspace = true }
+# Schema-backed ingest tests (ADR-040 keyed ingest + no-key regression).
+temps-database = { path = "../temps-database" }
+tower = { version = "0.5", features = ["util"] }

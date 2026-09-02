@@ -11,6 +11,7 @@ pub mod ai_provider_keys;
 pub mod ai_provider_models;
 pub mod ai_usage_logs;
 pub mod alarms;
+pub mod analytics_ingest_keys;
 pub mod cross_project_trace_refs;
 // Agent entities (renamed from autopilot)
 pub mod agent_run_logs;

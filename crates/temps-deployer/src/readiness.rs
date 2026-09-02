@@ -28,12 +28,12 @@
 //!
 //! ## URL resolution
 //!
-//! The probe URL is built with [`temps_core::DeploymentMode::build_container_url`]
-//! — the same helper the deploy path uses — so it is correct in both modes:
+//! The probe URL is resolved from an injected [`temps_core::RuntimeContext`],
+//! so it is correct in both environments without reading process-global state:
 //! * **Docker mode** (control plane runs as a container on the shared app
 //!   network): `http://{container_name}:{container_port}` — straight to the app
 //!   over the Docker network, bypassing `docker-proxy` entirely.
-//! * **Baremetal mode** (control plane on the host): `http://127.0.0.1:{host_port}`
+//! * **Host mode** (control plane on the host): `http://127.0.0.1:{host_port}`
 //!   — through `docker-proxy`, where requiring a real HTTP response is exactly
 //!   what avoids the false-positive above.
 //!
@@ -168,9 +168,10 @@ pub async fn check_accepting_requests(
     deployer: &Arc<dyn ContainerDeployer>,
     container_id: &str,
     request_timeout: Duration,
+    runtime_context: &temps_core::RuntimeContext,
 ) -> Result<ReadinessCheck, ReadinessError> {
     let client = build_client(request_timeout)?;
-    check_accepting_requests_with_client(deployer, container_id, &client).await
+    check_accepting_requests_with_client(deployer, container_id, &client, runtime_context).await
 }
 
 /// Like [`check_accepting_requests`] but reuses a caller-provided client, so a
@@ -179,6 +180,7 @@ async fn check_accepting_requests_with_client(
     deployer: &Arc<dyn ContainerDeployer>,
     container_id: &str,
     client: &reqwest::Client,
+    runtime_context: &temps_core::RuntimeContext,
 ) -> Result<ReadinessCheck, ReadinessError> {
     let info = deployer
         .get_container_info(container_id)
@@ -205,12 +207,14 @@ async fn check_accepting_requests_with_client(
                         .find(|p| p.host_port == host_port)
                         .map(|p| p.container_port)
                         .unwrap_or(host_port);
-                    let url = temps_core::DeploymentMode::build_container_url(
-                        &info.container_name,
-                        container_port,
-                        host_port,
-                        Some(PROBE_PATH),
-                    );
+                    let url = runtime_context
+                        .resolve_service_endpoint(
+                            &info.container_name,
+                            temps_core::ServiceEndpointScheme::Http,
+                            container_port,
+                            host_port,
+                        )
+                        .url(Some(PROBE_PATH));
                     if probe_http(client, &url).await {
                         ReadinessCheck::Ready
                     } else {
@@ -245,6 +249,7 @@ pub async fn wait_until_accepting_requests(
     deployer: &Arc<dyn ContainerDeployer>,
     container_id: &str,
     probe: ReadinessProbe,
+    runtime_context: &temps_core::RuntimeContext,
 ) -> Result<(), ReadinessError> {
     let client = build_client(probe.request_timeout)?;
     let start = Instant::now();
@@ -253,17 +258,23 @@ pub async fn wait_until_accepting_requests(
         // The status observed this iteration — surfaced in the timeout error so
         // a stuck wake reports *why* (e.g. still `Created`, or `Running` but
         // not yet answering HTTP).
-        let last_status =
-            match check_accepting_requests_with_client(deployer, container_id, &client).await? {
-                ReadinessCheck::Ready => return Ok(()),
-                ReadinessCheck::Terminal(status) => {
-                    return Err(ReadinessError::Terminal {
-                        container_id: container_id.to_string(),
-                        status,
-                    });
-                }
-                ReadinessCheck::NotYet(status) => status,
-            };
+        let last_status = match check_accepting_requests_with_client(
+            deployer,
+            container_id,
+            &client,
+            runtime_context,
+        )
+        .await?
+        {
+            ReadinessCheck::Ready => return Ok(()),
+            ReadinessCheck::Terminal(status) => {
+                return Err(ReadinessError::Terminal {
+                    container_id: container_id.to_string(),
+                    status,
+                });
+            }
+            ReadinessCheck::NotYet(status) => status,
+        };
 
         if start.elapsed() >= probe.timeout {
             return Err(ReadinessError::Timeout {
@@ -385,6 +396,20 @@ mod tests {
         }
     }
 
+    fn info_with_port_mapping(
+        status: ContainerStatus,
+        host_port: u16,
+        container_port: u16,
+    ) -> ContainerInfo {
+        let mut container = info(status, vec![]);
+        container.ports.push(PortMapping {
+            host_port,
+            container_port,
+            protocol: Protocol::Tcp,
+        });
+        container
+    }
+
     #[async_trait]
     impl ContainerDeployer for ScriptedDeployer {
         async fn deploy_container(
@@ -496,18 +521,101 @@ mod tests {
     #[tokio::test]
     async fn running_no_ports_is_ready() {
         let deployer = ScriptedDeployer::arc(vec![info(ContainerStatus::Running, vec![])]);
-        assert!(wait_until_accepting_requests(&deployer, "c1", fast_probe())
-            .await
-            .is_ok());
+        assert!(wait_until_accepting_requests(
+            &deployer,
+            "c1",
+            fast_probe(),
+            &temps_core::RuntimeContext::host(),
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
     async fn running_http_200_is_ready() {
         let port = spawn_http_server("HTTP/1.1 200 OK").await;
         let deployer = ScriptedDeployer::arc(vec![info(ContainerStatus::Running, vec![port])]);
-        assert!(wait_until_accepting_requests(&deployer, "c1", fast_probe())
-            .await
-            .is_ok());
+        assert!(wait_until_accepting_requests(
+            &deployer,
+            "c1",
+            fast_probe(),
+            &temps_core::RuntimeContext::host(),
+        )
+        .await
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_check_accepting_requests_host_context_uses_published_host_port() {
+        let live_host_port = spawn_http_server("HTTP/1.1 200 OK").await;
+        let closed_container_port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let deployer = ScriptedDeployer::arc(vec![info_with_port_mapping(
+            ContainerStatus::Running,
+            live_host_port,
+            closed_container_port,
+        )]);
+
+        let result = check_accepting_requests(
+            &deployer,
+            "c1",
+            Duration::from_millis(300),
+            &temps_core::RuntimeContext::host(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, ReadinessCheck::Ready));
+    }
+
+    #[tokio::test]
+    async fn test_check_accepting_requests_docker_context_uses_internal_container_port() {
+        let live_container_port = spawn_http_server("HTTP/1.1 200 OK").await;
+        let closed_host_port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let deployer = ScriptedDeployer::arc(vec![info_with_port_mapping(
+            ContainerStatus::Running,
+            closed_host_port,
+            live_container_port,
+        )]);
+
+        let result = check_accepting_requests(
+            &deployer,
+            "c1",
+            Duration::from_millis(300),
+            &temps_core::RuntimeContext::docker(),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(result, ReadinessCheck::Ready));
+    }
+
+    #[tokio::test]
+    async fn polling_probe_uses_injected_docker_context() {
+        let live_container_port = spawn_http_server("HTTP/1.1 200 OK").await;
+        let closed_host_port = {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            listener.local_addr().unwrap().port()
+        };
+        let deployer = ScriptedDeployer::arc(vec![info_with_port_mapping(
+            ContainerStatus::Running,
+            closed_host_port,
+            live_container_port,
+        )]);
+
+        assert!(wait_until_accepting_requests(
+            &deployer,
+            "c1",
+            fast_probe(),
+            &temps_core::RuntimeContext::docker(),
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
@@ -515,9 +623,14 @@ mod tests {
         // 404 means the path doesn't exist but the server IS up → ready.
         let port = spawn_http_server("HTTP/1.1 404 Not Found").await;
         let deployer = ScriptedDeployer::arc(vec![info(ContainerStatus::Running, vec![port])]);
-        assert!(wait_until_accepting_requests(&deployer, "c1", fast_probe())
-            .await
-            .is_ok());
+        assert!(wait_until_accepting_requests(
+            &deployer,
+            "c1",
+            fast_probe(),
+            &temps_core::RuntimeContext::host(),
+        )
+        .await
+        .is_ok());
     }
 
     #[tokio::test]
@@ -527,9 +640,14 @@ mod tests {
         // time out instead.
         let port = spawn_silent_tcp().await;
         let deployer = ScriptedDeployer::arc(vec![info(ContainerStatus::Running, vec![port])]);
-        let err = wait_until_accepting_requests(&deployer, "c1", fast_probe())
-            .await
-            .unwrap_err();
+        let err = wait_until_accepting_requests(
+            &deployer,
+            "c1",
+            fast_probe(),
+            &temps_core::RuntimeContext::host(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ReadinessError::Timeout { .. }), "got {err:?}");
     }
 
@@ -541,9 +659,14 @@ mod tests {
             l.local_addr().unwrap().port()
         };
         let deployer = ScriptedDeployer::arc(vec![info(ContainerStatus::Running, vec![port])]);
-        let err = wait_until_accepting_requests(&deployer, "c1", fast_probe())
-            .await
-            .unwrap_err();
+        let err = wait_until_accepting_requests(
+            &deployer,
+            "c1",
+            fast_probe(),
+            &temps_core::RuntimeContext::host(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ReadinessError::Timeout { .. }), "got {err:?}");
     }
 
@@ -552,18 +675,28 @@ mod tests {
         // Server up but erroring → not ready; bounded by the overall timeout.
         let port = spawn_http_server("HTTP/1.1 500 Internal Server Error").await;
         let deployer = ScriptedDeployer::arc(vec![info(ContainerStatus::Running, vec![port])]);
-        let err = wait_until_accepting_requests(&deployer, "c1", fast_probe())
-            .await
-            .unwrap_err();
+        let err = wait_until_accepting_requests(
+            &deployer,
+            "c1",
+            fast_probe(),
+            &temps_core::RuntimeContext::host(),
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(err, ReadinessError::Timeout { .. }), "got {err:?}");
     }
 
     #[tokio::test]
     async fn exited_fails_fast() {
         let deployer = ScriptedDeployer::arc(vec![info(ContainerStatus::Exited, vec![])]);
-        let err = wait_until_accepting_requests(&deployer, "c1", fast_probe())
-            .await
-            .unwrap_err();
+        let err = wait_until_accepting_requests(
+            &deployer,
+            "c1",
+            fast_probe(),
+            &temps_core::RuntimeContext::host(),
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -585,8 +718,13 @@ mod tests {
             info(ContainerStatus::Created, vec![]),
             info(ContainerStatus::Running, vec![port]),
         ]);
-        assert!(wait_until_accepting_requests(&deployer, "c1", fast_probe())
-            .await
-            .is_ok());
+        assert!(wait_until_accepting_requests(
+            &deployer,
+            "c1",
+            fast_probe(),
+            &temps_core::RuntimeContext::host(),
+        )
+        .await
+        .is_ok());
     }
 }

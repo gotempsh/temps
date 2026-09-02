@@ -35,6 +35,7 @@ import {
   TableRow,
 } from '@/components/ui/table'
 import { Skeleton } from '@/components/ui/skeleton'
+import { EmptyState } from '@/components/ui/empty-state'
 import { CopyButton } from '@/components/ui/copy-button'
 import { Badge } from '@/components/ui/badge'
 import { useSensitiveActionVerification } from '@/hooks/useSensitiveActionVerification'
@@ -163,10 +164,16 @@ export function DeploymentTokensSettings({ project }: DeploymentTokensSettingsPr
           ) : tokensQuery.isError ? (
             <p className="text-sm text-destructive">Failed to load deployment tokens.</p>
           ) : tokens.length === 0 ? (
-            <p className="text-sm text-muted-foreground">
-              No deployment tokens yet. Create one via the API using{' '}
-              <code>POST /projects/{'{project_id}'}/deployment-tokens</code>.
-            </p>
+            <EmptyState
+              icon={Key}
+              title="No deployment tokens yet"
+              description={
+                <p className="text-sm text-muted-foreground">
+                  Create one via the API using{' '}
+                  <code>POST /projects/{'{project_id}'}/deployment-tokens</code>.
+                </p>
+              }
+            />
           ) : (
             <div className="overflow-x-auto">
               <Table>

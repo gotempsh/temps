@@ -279,6 +279,21 @@ echo '[restore] complete'"#;
             .unwrap_or_else(|| self.get_container_name())
     }
 
+    fn get_effective_address_for_environment(
+        &self,
+        service_config: ServiceConfig,
+        execution_environment: temps_core::ExecutionEnvironment,
+    ) -> Result<(String, String)> {
+        let config = self.get_s3_config(service_config)?;
+        Ok(match execution_environment {
+            temps_core::ExecutionEnvironment::Host => ("localhost".to_string(), config.port),
+            temps_core::ExecutionEnvironment::Docker => (
+                self.get_live_container_name(&config),
+                S3_INTERNAL_PORT.to_string(),
+            ),
+        })
+    }
+
     /// Creates and starts the MinIO container, retrying with a fresh host
     /// port if the chosen one lost the race described in `port_util` docs
     /// (bindable when we checked, but taken by the time Docker actually binds
@@ -741,18 +756,10 @@ impl ExternalService for S3Service {
     }
 
     fn get_effective_address(&self, service_config: ServiceConfig) -> Result<(String, String)> {
-        let config = self.get_s3_config(service_config)?;
-
-        if temps_core::DeploymentMode::is_docker() {
-            // Docker mode: use container name and internal port
-            Ok((
-                self.get_live_container_name(&config),
-                S3_INTERNAL_PORT.to_string(),
-            ))
-        } else {
-            // Baremetal mode: use localhost and exposed port
-            Ok(("localhost".to_string(), config.port))
-        }
+        self.get_effective_address_for_environment(
+            service_config,
+            temps_core::runtime::execution_environment_compatibility(),
+        )
     }
 
     fn get_docker_container_name(&self) -> String {
@@ -2876,11 +2883,6 @@ mod tests {
 
     #[test]
     fn test_get_effective_address_docker_mode_uses_imported_container_name() {
-        let _lock = crate::externalsvc::DEPLOYMENT_MODE_MUTEX
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        unsafe { std::env::set_var("DEPLOYMENT_MODE", "docker") };
-
         let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
         let encryption_service =
             Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
@@ -2900,12 +2902,51 @@ mod tests {
             }),
         };
 
-        let (host, port) = service.get_effective_address(config).unwrap();
+        let (host, port) = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
         // The imported container name wins over the derived `minio-{name}`.
         assert_eq!(host, "legacy-minio");
         assert_eq!(port, S3_INTERNAL_PORT);
+    }
 
-        unsafe { std::env::remove_var("DEPLOYMENT_MODE") };
+    #[test]
+    fn test_get_effective_address_host_and_docker_use_environment_specific_addresses() {
+        let docker = Arc::new(Docker::connect_with_local_defaults().unwrap());
+        let encryption_service =
+            Arc::new(EncryptionService::new("test_encryption_key_1234567890ab").unwrap());
+        let service = S3Service::new("address-mapping".to_string(), docker, encryption_service);
+        let config = ServiceConfig {
+            name: "address-mapping".to_string(),
+            service_type: ServiceType::S3,
+            version: None,
+            parameters: serde_json::json!({
+                "host": "localhost",
+                "port": "19000",
+                "access_key": "minioadmin",
+                "secret_key": "minioadmin",
+                "region": "us-east-1",
+            }),
+        };
+
+        let host = service
+            .get_effective_address_for_environment(
+                config.clone(),
+                temps_core::ExecutionEnvironment::Host,
+            )
+            .unwrap();
+        let docker = service
+            .get_effective_address_for_environment(config, temps_core::ExecutionEnvironment::Docker)
+            .unwrap();
+
+        assert_eq!(host, ("localhost".to_string(), "19000".to_string()));
+        assert_eq!(
+            docker,
+            (
+                "minio-address-mapping".to_string(),
+                S3_INTERNAL_PORT.to_string()
+            )
+        );
     }
 
     #[test]

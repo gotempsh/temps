@@ -13,8 +13,11 @@ pub struct Model {
     pub session_replay_id: String,
     pub visitor_id: i32,
     pub project_id: i32,
-    pub environment_id: i32,
-    pub deployment_id: i32,
+    /// `None` when the session belongs to a project that has no Temps
+    /// environment for this host (e.g. an app Temps does not deploy).
+    pub environment_id: Option<i32>,
+    /// `None` when the environment has no live Temps deployment.
+    pub deployment_id: Option<i32>,
     pub created_at: Option<DBDateTime>,
     pub user_agent: Option<String>,
     pub browser: Option<String>,
