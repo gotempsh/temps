@@ -774,6 +774,33 @@ impl TelemetryWriteModeService {
     }
 
     /// Project ids whose *declared* mode is `cloud`.
+    /// Every live project still writing its spans to this instance, ascending.
+    ///
+    /// The candidate set for a bulk Cloud activation (ADR-042 §4). Projects
+    /// already Cloud-primary are deliberately absent: there is nothing to
+    /// switch, and including them would quote the operator for history that
+    /// is already on the other side. Soft-deleted projects are excluded for the
+    /// same reason every other lookup in this service excludes them — a
+    /// deleted project is gone to the operator, and shipping its history would
+    /// spend money on data nobody asked to keep.
+    pub async fn local_mode_project_ids(&self) -> Result<Vec<i32>, TelemetryWriteModeError> {
+        #[derive(FromQueryResult)]
+        struct Id {
+            id: i32,
+        }
+        let rows = Id::find_by_statement(Statement::from_sql_and_values(
+            DatabaseBackend::Postgres,
+            "SELECT id FROM projects \
+             WHERE cloud_telemetry_write_mode = 'local' AND deleted_at IS NULL \
+             ORDER BY id",
+            vec![],
+        ))
+        .all(self.db.as_ref())
+        .await
+        .map_err(|source| TelemetryWriteModeError::Ledger { source })?;
+        Ok(rows.into_iter().map(|row| row.id).collect())
+    }
+
     pub async fn cloud_primary_project_ids(&self) -> Result<Vec<i32>, TelemetryWriteModeError> {
         #[derive(FromQueryResult)]
         struct Id {

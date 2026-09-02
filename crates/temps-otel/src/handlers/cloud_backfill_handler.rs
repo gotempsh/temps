@@ -248,6 +248,9 @@ mod tests {
                 None
             },
             last_error: last_error.map(str::to_string),
+            // A run driven by `temps backfill cloud-telemetry` — the case this
+            // response shape was built for — has no bulk activation job.
+            bulk_job_id: None,
         }
     }
 

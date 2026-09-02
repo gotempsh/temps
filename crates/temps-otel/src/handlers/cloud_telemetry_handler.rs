@@ -575,7 +575,7 @@ fn visible_recent_gap_windows(
         .collect()
 }
 
-fn link_snapshot(state: &OtelAppState) -> CloudLinkSnapshot {
+pub(crate) fn link_snapshot(state: &OtelAppState) -> CloudLinkSnapshot {
     match &state.cloud_link {
         Some(link) => CloudLinkSnapshot {
             linked: link.is_linked(),
@@ -600,12 +600,14 @@ fn link_snapshot(state: &OtelAppState) -> CloudLinkSnapshot {
 /// carry one; the number only affects a advisory message, and being wrong in
 /// the conservative direction (claiming history is still readable) keeps the
 /// decommission guidance from appearing too early.
-fn local_retention_days() -> u32 {
+pub(crate) fn local_retention_days() -> u32 {
     temps_core::ObservabilityRetentionSettings::default().otel_spans_days
 }
 
 /// The instance-level answer to "can any project be Cloud-primary right now".
-fn instance_capability(link: &CloudLinkSnapshot) -> (bool, Option<String>, Option<String>) {
+pub(crate) fn instance_capability(
+    link: &CloudLinkSnapshot,
+) -> (bool, Option<String>, Option<String>) {
     if !link.linked {
         return (
             false,

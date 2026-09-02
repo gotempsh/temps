@@ -255,6 +255,26 @@ impl AuthContext {
         self.has_role(&Role::Admin)
     }
 
+    /// Whether this principal runs the *instance*, not merely some resource in
+    /// it.
+    ///
+    /// A permission answers "may you do this kind of thing"; this answers "is
+    /// this whole installation yours". They are different questions, and a
+    /// handful of operations need the second one: anything whose blast radius is
+    /// instance-wide by construction — every project at once, or the safety
+    /// margin on a guard that spends the instance's money — has no path
+    /// parameter for a project-scoped guard to narrow, so a project-scoped token
+    /// or a per-project role must not reach it at all.
+    ///
+    /// Defined once, here, rather than re-derived at each call site: three
+    /// separate copies of `is_admin() || has_role(PlatformAdmin)` is three
+    /// chances for one of them to drift into a weaker bar than the operation it
+    /// is standing in front of, which is precisely the class of bug this
+    /// predicate exists to prevent.
+    pub fn is_instance_admin(&self) -> bool {
+        self.is_admin() || self.has_role(&Role::PlatformAdmin)
+    }
+
     /// Get the user ID if available
     /// Returns None for deployment tokens
     pub fn user_id(&self) -> i32 {

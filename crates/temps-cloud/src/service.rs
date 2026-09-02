@@ -8,14 +8,14 @@ use std::{
 
 use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, PaginatorTrait, QueryFilter};
 use serde::Serialize;
-use temps_cloud_client::{BackendUrl, CloudError, CloudFeatureSwitches, CloudLink};
+use temps_cloud_client::{BackendUrl, CloudError, CloudFeatureSwitches, CloudLink, EnrollmentKind};
 use temps_cloud_protocol::{
     ManagedBackupCapability, ManagedNotificationAccepted, ManagedNotificationRequest,
 };
 use temps_config::{ConfigService, ConfigServiceError};
 use temps_core::EncryptionService;
 use thiserror::Error;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex as AsyncMutex};
 use utoipa::ToSchema;
 use uuid::Uuid;
 
@@ -49,7 +49,7 @@ pub enum CloudServiceError {
 pub enum ManagedBackupOutcome {
     /// Cloud reported `configured: false` (tier does not include managed
     /// backups, or the backend has not provisioned one yet).
-    NotConfigured,
+    NotConfigured { reason: Option<String> },
     /// A Cloud-managed `s3_sources` row now exists (inserted, or rotated
     /// in place against the same bucket it already pointed at).
     Provisioned,
@@ -100,6 +100,32 @@ pub struct CloudAiCapability {
     pub model: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedBackupSetupStatus {
+    Disabled,
+    Ready,
+    NeedsSetup,
+    SubscriptionRequired,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, ToSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedBackupSetupAction {
+    None,
+    Retry,
+    RenewSubscription,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema, PartialEq, Eq)]
+pub struct ManagedBackupSetup {
+    pub status: ManagedBackupSetupStatus,
+    pub ready: bool,
+    pub message: String,
+    pub action: ManagedBackupSetupAction,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct CloudStatus {
     pub status: String,
@@ -114,6 +140,7 @@ pub struct CloudStatus {
     pub telemetry_enabled: bool,
     pub backups_enabled: bool,
     pub notifications_enabled: bool,
+    pub managed_backup_setup: ManagedBackupSetup,
 }
 
 pub struct CloudService {
@@ -127,6 +154,8 @@ pub struct CloudService {
     backup_credential_rotation_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     allow_loopback_development: bool,
     configuration_issue: RwLock<Option<String>>,
+    managed_backup_setup: RwLock<Option<ManagedBackupSetup>>,
+    managed_backup_reconcile_lock: AsyncMutex<()>,
 }
 
 impl CloudService {
@@ -149,6 +178,8 @@ impl CloudService {
             backup_credential_rotation_task: Mutex::new(None),
             allow_loopback_development,
             configuration_issue: RwLock::new(None),
+            managed_backup_setup: RwLock::new(None),
+            managed_backup_reconcile_lock: AsyncMutex::new(()),
         }
     }
 
@@ -161,6 +192,20 @@ impl CloudService {
 
     fn configuration_issue(&self) -> Option<String> {
         self.configuration_issue
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    fn set_managed_backup_setup(&self, setup: ManagedBackupSetup) {
+        *self
+            .managed_backup_setup
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(setup);
+    }
+
+    fn managed_backup_setup(&self) -> Option<ManagedBackupSetup> {
+        self.managed_backup_setup
             .read()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone()
@@ -386,6 +431,13 @@ impl CloudService {
         };
         let health = self.link.health();
         let switches = self.link.feature_switches();
+        let managed_backup_setup = if let Some(setup) = self.managed_backup_setup() {
+            setup
+        } else if self.has_managed_backup_source().await? {
+            ready_managed_backup_setup()
+        } else {
+            default_managed_backup_setup(switches.backups)
+        };
         Ok(CloudStatus {
             status,
             status_message,
@@ -398,6 +450,7 @@ impl CloudService {
             telemetry_enabled: switches.telemetry,
             backups_enabled: switches.backups,
             notifications_enabled: switches.notifications,
+            managed_backup_setup,
         })
     }
 
@@ -432,16 +485,28 @@ impl CloudService {
             );
             return Err(CloudServiceError::State(error));
         }
+        if switches.backups {
+            self.reconcile_managed_backup_source().await?;
+        } else {
+            self.set_managed_backup_setup(default_managed_backup_setup(false));
+        }
         self.status().await
     }
 
     /// Enroll this instance and, if the tenant's plan includes it, provision
     /// a Cloud-managed offsite backup destination. Backup provisioning never
     /// fails enrollment itself — see [`ManagedBackupOutcome`].
+    ///
+    /// The returned [`EnrollmentKind`] says whether this call *established* the
+    /// link or merely re-authenticated an existing one. It is passed straight
+    /// through from [`CloudLink::enroll`], which is the only place that can
+    /// still see the prior credential, and it exists so a caller with a side
+    /// effect that belongs to linking — ADR-042's purchase-triggered telemetry
+    /// activation — does not fire it on an ordinary credential recovery.
     pub async fn enroll(
         &self,
         code: &str,
-    ) -> Result<(CloudStatus, ManagedBackupOutcome), CloudServiceError> {
+    ) -> Result<(CloudStatus, ManagedBackupOutcome, EnrollmentKind), CloudServiceError> {
         let settings = self.config.get_settings().await?;
         let backend = parse_backend(
             &settings.cloud.backend_url,
@@ -461,13 +526,15 @@ impl CloudService {
                 notifications: settings.cloud.notifications_enabled,
             })
             .map_err(CloudServiceError::State)?;
-        self.link
+        let enrollment = self
+            .link
             .enroll(code)
             .await
             .map_err(CloudServiceError::Client)?;
         let backup_outcome = self.provision_managed_backup_source().await;
+        self.set_managed_backup_setup(managed_backup_setup_from_outcome(&backup_outcome));
         let status = self.status().await?;
-        Ok((status, backup_outcome))
+        Ok((status, backup_outcome, enrollment))
     }
 
     /// Fetch (or refresh) the tenant's managed backup credential and upsert
@@ -486,11 +553,12 @@ impl CloudService {
             }
         };
         if !capability.configured {
+            let reason = capability.reason;
             tracing::info!(
-                reason = capability.reason.as_deref().unwrap_or("no reason given"),
+                reason = reason.as_deref().unwrap_or("no reason given"),
                 "Temps Cloud did not provision a managed backup destination for this tenant"
             );
-            return ManagedBackupOutcome::NotConfigured;
+            return ManagedBackupOutcome::NotConfigured { reason };
         }
         let credentials = match managed_backup_credentials_from_capability(capability) {
             Ok(credentials) => credentials,
@@ -584,8 +652,33 @@ impl CloudService {
         }
         self.link.disconnect().map_err(CloudServiceError::State)?;
         let removed = self.remove_managed_backup_source().await?;
+        self.set_managed_backup_setup(default_managed_backup_setup(false));
         let status = self.status().await?;
         Ok((status, removed))
+    }
+
+    async fn has_managed_backup_source(&self) -> Result<bool, CloudServiceError> {
+        Ok(temps_entities::s3_sources::Entity::find()
+            .filter(temps_entities::s3_sources::Column::ManagedByCloud.eq(true))
+            .count(self.db.as_ref())
+            .await?
+            > 0)
+    }
+
+    pub async fn reconcile_managed_backup_source(
+        &self,
+    ) -> Result<ManagedBackupSetup, CloudServiceError> {
+        let _guard = self.managed_backup_reconcile_lock.lock().await;
+        if !self.link.feature_switches().backups {
+            let setup = default_managed_backup_setup(false);
+            self.set_managed_backup_setup(setup.clone());
+            return Ok(setup);
+        }
+
+        let outcome = self.provision_managed_backup_source().await;
+        let setup = managed_backup_setup_from_outcome(&outcome);
+        self.set_managed_backup_setup(setup.clone());
+        Ok(setup)
     }
 
     /// Remove the Cloud-managed `s3_sources` row created by
@@ -738,6 +831,90 @@ fn parse_backend(value: &str, allow_loopback_development: bool) -> Result<Backen
     }
 }
 
+fn ready_managed_backup_setup() -> ManagedBackupSetup {
+    ManagedBackupSetup {
+        status: ManagedBackupSetupStatus::Ready,
+        ready: true,
+        message: "Managed backup destination is ready.".to_string(),
+        action: ManagedBackupSetupAction::None,
+    }
+}
+
+fn default_managed_backup_setup(backups_enabled: bool) -> ManagedBackupSetup {
+    if backups_enabled {
+        ManagedBackupSetup {
+            status: ManagedBackupSetupStatus::NeedsSetup,
+            ready: false,
+            message: "Temps Cloud has not created the managed backup destination yet.".to_string(),
+            action: ManagedBackupSetupAction::Retry,
+        }
+    } else {
+        ManagedBackupSetup {
+            status: ManagedBackupSetupStatus::Disabled,
+            ready: false,
+            message: "Enable Cloud backup export to provision the managed destination.".to_string(),
+            action: ManagedBackupSetupAction::None,
+        }
+    }
+}
+
+fn managed_backup_setup_from_outcome(outcome: &ManagedBackupOutcome) -> ManagedBackupSetup {
+    match outcome {
+        ManagedBackupOutcome::Provisioned
+        | ManagedBackupOutcome::ProvisionedBucketChanged { .. } => ready_managed_backup_setup(),
+        ManagedBackupOutcome::NotConfigured { reason }
+            if reason.as_deref().is_some_and(requires_subscription_renewal) =>
+        {
+            subscription_required_managed_backup_setup()
+        }
+        ManagedBackupOutcome::NotConfigured { .. } => ManagedBackupSetup {
+            status: ManagedBackupSetupStatus::NeedsSetup,
+            ready: false,
+            message: "Temps Cloud has not created the managed backup destination yet."
+                .to_string(),
+            action: ManagedBackupSetupAction::Retry,
+        },
+        ManagedBackupOutcome::Unavailable(reason) if requires_subscription_renewal(reason) => {
+            subscription_required_managed_backup_setup()
+        }
+        ManagedBackupOutcome::Unavailable(_) => ManagedBackupSetup {
+            status: ManagedBackupSetupStatus::Unavailable,
+            ready: false,
+            message: "Temps Cloud could not create the managed backup destination. Retry when the service is available."
+                .to_string(),
+            action: ManagedBackupSetupAction::Retry,
+        },
+    }
+}
+
+fn subscription_required_managed_backup_setup() -> ManagedBackupSetup {
+    ManagedBackupSetup {
+        status: ManagedBackupSetupStatus::SubscriptionRequired,
+        ready: false,
+        message: "Your Temps Cloud subscription is inactive. Renew it before managed backups can be provisioned."
+            .to_string(),
+        action: ManagedBackupSetupAction::RenewSubscription,
+    }
+}
+
+fn requires_subscription_renewal(reason: &str) -> bool {
+    let normalized = reason.to_ascii_lowercase();
+    [
+        "subscription",
+        "billing",
+        "payment",
+        "trial",
+        "past_due",
+        "past due",
+        "expired",
+        "canceled",
+        "cancelled",
+        "inactive",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
 fn status_name(status: &temps_cloud_client::LinkStatus) -> &'static str {
     match status {
         temps_cloud_client::LinkStatus::StateUnreadable { .. } => "state_unreadable",
@@ -760,6 +937,37 @@ fn health_name(health: &temps_cloud_client::MirrorHealth) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_subscription_requires_renewal_instead_of_retry() {
+        let setup = managed_backup_setup_from_outcome(&ManagedBackupOutcome::NotConfigured {
+            reason: Some("subscription expired".to_string()),
+        });
+
+        assert_eq!(setup.status, ManagedBackupSetupStatus::SubscriptionRequired);
+        assert_eq!(setup.action, ManagedBackupSetupAction::RenewSubscription);
+        assert!(!setup.ready);
+    }
+
+    #[test]
+    fn transient_managed_backup_failure_can_be_retried() {
+        let setup = managed_backup_setup_from_outcome(&ManagedBackupOutcome::Unavailable(
+            "503 Service Unavailable".to_string(),
+        ));
+
+        assert_eq!(setup.status, ManagedBackupSetupStatus::Unavailable);
+        assert_eq!(setup.action, ManagedBackupSetupAction::Retry);
+        assert!(!setup.ready);
+    }
+
+    #[test]
+    fn disabled_backup_export_has_no_setup_action() {
+        let setup = default_managed_backup_setup(false);
+
+        assert_eq!(setup.status, ManagedBackupSetupStatus::Disabled);
+        assert_eq!(setup.action, ManagedBackupSetupAction::None);
+        assert!(!setup.ready);
+    }
 
     #[test]
     fn production_cloud_configuration_rejects_plain_http() {

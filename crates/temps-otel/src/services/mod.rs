@@ -10,10 +10,21 @@ pub mod cloud_backfill;
 pub mod cloud_backfill_audit;
 /// Shared progress record for the out-of-process Cloud telemetry backfill.
 pub mod cloud_backfill_progress;
+/// Durable state of a bulk Cloud-telemetry activation job (ADR-042 §7, §8).
+pub mod cloud_bulk_activation;
+/// The signed `plan_token` that binds a confirmed estimate to the job it
+/// creates (ADR-042 §9).
+pub mod cloud_bulk_activation_plan;
+/// The background task that runs a bulk Cloud-telemetry activation job
+/// (ADR-042 §2, §3, §5, §7).
+pub mod cloud_bulk_activation_worker;
 /// Per-project Temps Cloud telemetry egress policy (ADR-040 §1).
 pub mod cloud_fidelity;
 /// Handing Cloud-primary projects back to local span storage (ADR-041 §7c).
 pub mod cloud_primary_fallback;
+/// The purchase-triggered entry point onto the bulk activation engine
+/// (ADR-042 §1a, P3).
+pub mod cloud_purchase_activation;
 /// Cross-project trace discovery service (ADR-027 Phases 0 and 2).
 pub mod cross_project;
 pub mod dashboard_service;
@@ -42,12 +53,27 @@ pub use cloud_backfill_progress::{
     percent_complete, truncate_failure_reason, CloudBackfillProgressError,
     CloudBackfillProgressService, MAX_LAST_ERROR_CHARS,
 };
+pub use cloud_bulk_activation::{
+    cursor_of, BulkAbortReason, BulkJobDetail, BulkJobProjectPlan, BulkSkipReason,
+    CloudBulkActivationError, CloudBulkActivationService, EnqueueBulkJobRequest,
+};
+pub use cloud_bulk_activation_plan::{
+    mint_plan_token, plan_hash, verify_plan_token, MintedPlan, PlanTokenError, VerifiedPlan,
+    PLAN_TOKEN_KEY_DOMAIN, PLAN_TOKEN_TTL_SECONDS,
+};
+pub use cloud_bulk_activation_worker::{
+    anomaly_byte_budget, anomaly_pause_reason, exceeds_anomaly_budget, rate_limit_pause,
+    unestimated_pause_reason, BulkActivationCycle, BulkActivationTuning, BulkAnomalyFactorSource,
+    BulkRateLimitSource, CloudBulkActivationWorker, ANOMALY_PAUSE_CODE, MIN_ANOMALY_BUDGET_BYTES,
+    UNESTIMATED_ANOMALY_BUDGET_BASE_BYTES, UNESTIMATED_PAUSE_CODE,
+};
 pub use cloud_fidelity::{
     CloudPolicyCache, CloudPolicyError, CloudTelemetryPolicy, CLOUD_POLICY_CACHE_TTL,
 };
 pub use cloud_primary_fallback::{
     CloudPrimaryFallback, CloudWriteSuspensionObserver, OutboxSpiller,
 };
+pub use cloud_purchase_activation::{PurchaseActivationTrigger, MAX_PURCHASE_ACTIVATION_PROJECTS};
 pub use cross_project::{
     AnnotatedSpan, CrossProjectTraceError, CrossProjectTraceService, ProjectRef, SiblingRef,
     TraceHintMsg, TraceProjectRef, UnifiedTrace,

@@ -2937,7 +2937,7 @@
               "node_disk_alert_percent": 90,
               "node_memory_alert_percent": 90,
               "private_address": null,
-              "require_mtls": false
+              "require_mtls": true
             },
             "oneOf": [
               {
@@ -3255,6 +3255,7 @@
         "required": [
           "preview_domain",
           "proxy_port",
+          "cloud",
           "screenshots",
           "letsencrypt",
           "dns_provider",
@@ -5512,6 +5513,9 @@
               "null"
             ]
           },
+          "managed_backup_setup": {
+            "$ref": "#/components/schemas/ManagedBackupSetup"
+          },
           "notifications_enabled": {
             "type": "boolean"
           },
@@ -5538,7 +5542,8 @@
           "backend_url",
           "telemetry_enabled",
           "backups_enabled",
-          "notifications_enabled"
+          "notifications_enabled",
+          "managed_backup_setup"
         ],
         "type": "object"
       },
@@ -22964,6 +22969,47 @@
         ],
         "type": "object"
       },
+      "ManagedBackupSetup": {
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/ManagedBackupSetupAction"
+          },
+          "message": {
+            "type": "string"
+          },
+          "ready": {
+            "type": "boolean"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ManagedBackupSetupStatus"
+          }
+        },
+        "required": [
+          "status",
+          "ready",
+          "message",
+          "action"
+        ],
+        "type": "object"
+      },
+      "ManagedBackupSetupAction": {
+        "enum": [
+          "none",
+          "retry",
+          "renew_subscription"
+        ],
+        "type": "string"
+      },
+      "ManagedBackupSetupStatus": {
+        "enum": [
+          "disabled",
+          "ready",
+          "needs_setup",
+          "subscription_required",
+          "unavailable"
+        ],
+        "type": "string"
+      },
       "ManagedDomainResponse": {
         "description": "Managed domain response",
         "properties": {
@@ -24045,7 +24091,7 @@
       "MintEnrollmentTokenResponse": {
         "properties": {
           "ca_fingerprint": {
-            "description": "SHA-256 fingerprint of the cluster CA (if mTLS is set up). Pass it to the\nworker as `temps join --ca-fingerprint <fp>` to verify the CA on join.",
+            "description": "SHA-256 fingerprint of the cluster CA. Token issuance initializes the\nCA when needed, so every newly minted token carries a trust pin.",
             "type": [
               "string",
               "null"
@@ -24571,8 +24617,8 @@
             ]
           },
           "require_mtls": {
-            "default": false,
-            "description": "Whether to enforce multi-node mTLS (ADR-020 WS-2.1). When `false`\n(default), the control plane ignores join-time CSRs and nodes keep\nserving plaintext HTTP — zero behavior change. When `true`, the CP signs\nnode CSRs, nodes serve mutual TLS, and every CP→agent call uses the\ncluster client cert. Observe-then-enforce: flip this on only once all\nworkers have re-enrolled with certs.",
+            "default": true,
+            "description": "Whether to enforce multi-node mTLS (ADR-020 WS-2.1). New installations\ndefault to `true`. Existing serialized settings that predate this field\ndeserialize it as `false`, providing an explicit migration window rather\nthan unexpectedly disconnecting legacy workers. When `true`, the CP signs\nnode CSRs, nodes serve mutual TLS, and every CP→agent call uses the\ncluster client cert. Observe-then-enforce: flip this on only once all\nworkers have re-enrolled with certs.",
             "type": "boolean"
           }
         },
@@ -24589,13 +24635,13 @@
             ]
           },
           "cluster_network": {
-            "description": "Effective cluster-wide container address pool. `None` only when the\nsingleton network configuration could not be read.",
             "oneOf": [
               {
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ClusterNetworkSettings"
+                "$ref": "#/components/schemas/ClusterNetworkSettings",
+                "description": "Effective cluster-wide container address pool. `None` only when the\nsingleton network configuration could not be read."
               }
             ]
           },
@@ -24783,6 +24829,24 @@
             "type": "object"
           }
         ]
+      },
+      "NetworkPoolEntry": {
+        "description": "Cluster-wide pool which every node must use. This is intentionally sent\nalongside the local allocation so operators and agents can detect stale or\nindependently configured nodes before routes are changed.",
+        "properties": {
+          "compute_pool_cidr": {
+            "type": "string"
+          },
+          "subnet_prefix_len": {
+            "format": "int32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "compute_pool_cidr",
+          "subnet_prefix_len"
+        ],
+        "type": "object"
       },
       "NixpacksPresetConfig": {
         "description": "Configuration for Nixpacks preset\nNixpacks provider and inline build-plan configuration.",
@@ -27787,6 +27851,9 @@
             "description": "Whether the cluster-DNS resolver is enabled on this control plane\n(`AppSettings.cluster_dns.enabled`). Workers should start their\nper-node resolver and write `overlay_bridge_address` only when this\nis `true`. Always serialized (never `skip_serializing_if`) so older\nand newer version skew degrades to the safe default of `false`.",
             "type": "boolean"
           },
+          "network": {
+            "$ref": "#/components/schemas/NetworkPoolEntry"
+          },
           "peers": {
             "description": "All other nodes with a `compute_cidr` set, excluding the caller.",
             "items": {
@@ -27796,6 +27863,7 @@
           }
         },
         "required": [
+          "network",
           "peers",
           "cluster_dns_enabled"
         ],
@@ -32376,6 +32444,10 @@
           "message": {
             "type": "string"
           },
+          "mtls_required": {
+            "description": "Whether this node must serve mTLS and reject plaintext agent traffic.",
+            "type": "boolean"
+          },
           "name": {
             "type": "string"
           },
@@ -32387,7 +32459,8 @@
           "id",
           "name",
           "status",
-          "message"
+          "message",
+          "mtls_required"
         ],
         "type": "object"
       },
@@ -34055,6 +34128,48 @@
         ],
         "type": "object"
       },
+      "RotateClusterCaRequest": {
+        "properties": {
+          "confirmation": {
+            "description": "Destructive-action guard. Must be exactly `ROTATE CLUSTER CA`.",
+            "type": "string"
+          },
+          "expected_fingerprint": {
+            "description": "Fingerprint observed through a trusted operator channel immediately\nbefore rotation. The request fails if the active root changed.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "expected_fingerprint",
+          "confirmation"
+        ],
+        "type": "object"
+      },
+      "RotateClusterCaResponse": {
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "new_fingerprint": {
+            "type": "string"
+          },
+          "previous_fingerprint": {
+            "type": "string"
+          },
+          "revoked_enrollment_tokens": {
+            "format": "int64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "previous_fingerprint",
+          "new_fingerprint",
+          "revoked_enrollment_tokens",
+          "message"
+        ],
+        "type": "object"
+      },
       "RouteRefreshResponse": {
         "properties": {
           "message": {
@@ -34366,7 +34481,7 @@
             "type": "boolean"
           },
           "managed_by_cloud": {
-            "description": "True when this source was auto-provisioned by a Temps Cloud link rather than entered by an operator. Managed sources cannot be edited or deleted from this API; disconnect Temps Cloud to remove one.",
+            "description": "True when this source was auto-provisioned by a Temps Cloud link\nrather than entered by an operator. Managed sources cannot be edited\nor deleted from this API; disconnect Temps Cloud to remove one.",
             "type": "boolean"
           },
           "name": {
@@ -57260,6 +57375,31 @@
         ]
       }
     },
+    "/cloud/backups/source/reconcile": {
+      "post": {
+        "operationId": "reconcile_cloud_backup_source",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ManagedBackupSetup"
+                }
+              }
+            },
+            "description": ""
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "tags": [
+          "Cloud"
+        ]
+      }
+    },
     "/cloud/capability": {
       "get": {
         "operationId": "get_cloud_capability",
@@ -63162,6 +63302,12 @@
             },
             "description": "List of linked projects"
           },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to view this service"
+          },
           "404": {
             "description": "Service not found"
           },
@@ -63209,8 +63355,17 @@
             },
             "description": "Service linked to project successfully"
           },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to link this service"
+          },
           "404": {
             "description": "Service or project not found"
+          },
+          "409": {
+            "description": "Project already has a database of this type"
           },
           "500": {
             "description": "Internal server error"
@@ -63250,6 +63405,12 @@
         "responses": {
           "204": {
             "description": "Service unlinked from project successfully"
+          },
+          "401": {
+            "description": "Authentication required"
+          },
+          "403": {
+            "description": "Insufficient permission to unlink this service"
           },
           "404": {
             "description": "Service link not found"
@@ -96654,6 +96815,60 @@
         "summary": "Save (or replace) a provider's credential. The credential is encrypted\nwith `EncryptionService` and stored inside\n`agent_sandbox.providers[provider_id].credentials_encrypted`.",
         "tags": [
           "Agents"
+        ]
+      }
+    },
+    "/settings/cluster-ca/rotate": {
+      "post": {
+        "operationId": "rotate_cluster_ca",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RotateClusterCaRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RotateClusterCaResponse"
+                }
+              }
+            },
+            "description": "Cluster CA rotated"
+          },
+          "400": {
+            "description": "Invalid confirmation or CA state"
+          },
+          "401": {
+            "description": "Unauthorized"
+          },
+          "403": {
+            "description": "Insufficient permissions"
+          },
+          "409": {
+            "description": "Expected fingerprint is stale"
+          },
+          "428": {
+            "description": "Fresh MFA verification required"
+          },
+          "500": {
+            "description": "Internal server error"
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ],
+        "summary": "Replace a compromised cluster CA and invalidate outstanding enrollment\ntokens. Existing workers fail closed until they are re-enrolled.",
+        "tags": [
+          "Settings"
         ]
       }
     },

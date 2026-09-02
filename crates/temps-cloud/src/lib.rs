@@ -15,5 +15,5 @@ pub use handler::{cloud_routes, CloudApiDoc};
 pub use plugin::CloudPlugin;
 pub use service::{
     CloudAiCapability, CloudCapability, CloudService, CloudServiceError, CloudStatus,
-    ManagedBackupOutcome,
+    ManagedBackupOutcome, ManagedBackupSetup, ManagedBackupSetupAction, ManagedBackupSetupStatus,
 };

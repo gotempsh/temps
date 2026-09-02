@@ -49,7 +49,7 @@ pub async fn run(service: Arc<CloudService>, mut cancel: watch::Receiver<bool>) 
                     // to keep ticking.
                     ManagedBackupOutcome::Provisioned
                     | ManagedBackupOutcome::ProvisionedBucketChanged { .. }
-                    | ManagedBackupOutcome::NotConfigured
+                    | ManagedBackupOutcome::NotConfigured { .. }
                     | ManagedBackupOutcome::Unavailable(_) => {}
                 }
             }

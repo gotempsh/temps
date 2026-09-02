@@ -41,6 +41,12 @@ const BATCH_SIZE: usize = 500;
 /// Number of producer batches accepted before the mirror starts shedding load.
 /// The local telemetry store remains authoritative and is never affected.
 const INCOMING_BATCH_CAPACITY: usize = 8;
+/// Spans an open [`SubmissionScope`] may hold before it starts shedding.
+///
+/// Two shipments' worth. A scoped caller offers one batch and drains it before
+/// offering the next, so this is headroom rather than a working set, and it
+/// bounds what such a caller can cost a 4 GB instance.
+const SCOPE_SPOOL_CAPACITY: usize = BATCH_SIZE * 2;
 
 /// What a flush attempt did. Returned so a caller can log or schedule backoff.
 #[derive(Debug, Clone, PartialEq)]
@@ -137,6 +143,132 @@ struct IncomingBatch {
     spans: Vec<SpanRecord>,
 }
 
+/// Refused because a submission scope is already open on this link.
+///
+/// Scoped submissions are deliberately serialized: two of them would
+/// reintroduce exactly the counter conflation a scope exists to remove, and
+/// ADR-041 §3b forbids concurrent in-flight submissions from one instance until
+/// Cloud confirms `/v1/telemetry`'s idempotency and metering tolerate them.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "a Temps Cloud submission scope is already open on this link; only one \
+     scoped submission may be in flight at a time, so wait for the running one \
+     to finish and retry"
+)]
+pub struct SubmissionScopeBusy;
+
+/// What a successful [`CloudLink::enroll`] actually did to this instance's link.
+///
+/// # Why this exists
+///
+/// `enroll` is not first-time-only, and must not become so: overwriting the
+/// token on an instance that is already linked is the *only* way an operator
+/// recovers from `CredentialRejected` after a credential is revoked or rotated
+/// at the backend. So "enrollment succeeded" and "this instance just became
+/// linked" are different facts, and until this type existed there was no way to
+/// tell them apart from the outside.
+///
+/// That mattered because enrollment carries automatic side effects, and one of
+/// them spends money: ADR-042's purchase-triggered activation switches every
+/// local-mode project to Cloud-primary and ships its history. Firing that on
+/// every successful enroll means an operator re-authenticating a link they have
+/// had for months silently re-activates projects they deliberately kept local
+/// after the first activation — a decision they made once and cannot see being
+/// undone.
+///
+/// The distinction is drawn on the **tenant**, not on the token, because that is
+/// what "a link that did not exist before" actually means. A fresh token for the
+/// same tenant is the same customer proving themselves again. A different tenant
+/// is a different customer, and binding to one is a new link no matter what
+/// stale credential happened to be on disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentKind {
+    /// No credential was held before this call: the link is new.
+    First,
+    /// A credential was already held, and it was for a *different* tenant than
+    /// the one just enrolled — or for no recorded tenant at all, which a
+    /// half-written legacy state can produce and which cannot be shown to be
+    /// the same customer.
+    ReboundToNewTenant {
+        /// The tenant this instance was bound to before, when it recorded one.
+        previous_tenant_id: Option<Uuid>,
+    },
+    /// A credential was already held for this same tenant: credential recovery,
+    /// not a new link.
+    ReEnrolled { tenant_id: Uuid },
+}
+
+impl EnrollmentKind {
+    fn classify(was_linked: bool, previous_tenant_id: Option<Uuid>, new_tenant_id: Uuid) -> Self {
+        if !was_linked {
+            return Self::First;
+        }
+        match previous_tenant_id {
+            Some(previous) if previous == new_tenant_id => Self::ReEnrolled {
+                tenant_id: new_tenant_id,
+            },
+            previous => Self::ReboundToNewTenant {
+                previous_tenant_id: previous,
+            },
+        }
+    }
+
+    /// Whether this enrollment established a link that did not exist before.
+    ///
+    /// The single question every side effect that belongs to *linking* should
+    /// ask, so no caller has to re-derive it and get the `ReboundToNewTenant`
+    /// case — a new customer on an instance carrying a stale credential —
+    /// wrong.
+    pub fn establishes_new_link(&self) -> bool {
+        matches!(self, Self::First | Self::ReboundToNewTenant { .. })
+    }
+
+    /// A stable, greppable name for logs and audit records.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::First => "first",
+            Self::ReboundToNewTenant { .. } => "rebound_to_new_tenant",
+            Self::ReEnrolled { .. } => "re_enrolled",
+        }
+    }
+}
+
+/// The queue behind an open [`SubmissionScope`].
+///
+/// Owned by [`CloudLink`] rather than by the handle so every path that must
+/// forget exportable data — a telemetry-export revocation, a disconnect, an
+/// origin change — can clear it exactly as it clears the mirror spool. A
+/// scope's spans are customer data under the same consent rules as any other.
+struct ScopedSubmission {
+    spool: Spool,
+    /// Kept across retries so a resubmission reuses its `submission_id` and
+    /// Cloud's idempotency still covers it.
+    pending: Option<PendingSubmission>,
+}
+
+impl ScopedSubmission {
+    fn new() -> Self {
+        Self {
+            spool: Spool::with_limits(SCOPE_SPOOL_CAPACITY, crate::spool::DEFAULT_CAPACITY_BYTES),
+            pending: None,
+        }
+    }
+
+    /// Spans offered to this scope that Cloud has not acknowledged yet.
+    fn queued(&self) -> usize {
+        self.spool.len()
+            + self
+                .pending
+                .as_ref()
+                .map_or(0, |pending| pending.spans.len())
+    }
+
+    fn clear(&mut self) {
+        self.spool.clear();
+        self.pending = None;
+    }
+}
+
 pub struct CloudLink {
     state: RwLock<Option<EnrollmentState>>,
     /// Present when a state file existed but could not be decoded. Mutations
@@ -152,6 +284,11 @@ pub struct CloudLink {
     /// The active submission stays here until a matching full acknowledgement
     /// arrives, preserving its id across retries.
     pending: Mutex<Option<PendingSubmission>>,
+    /// The queue of the one open [`SubmissionScope`], if any (ADR-042 §2).
+    ///
+    /// `Some` is also the claim: [`CloudLink::submission_scope`] refuses while
+    /// it is set, and dropping the handle clears it.
+    scoped_submission: Mutex<Option<ScopedSubmission>>,
     health: RwLock<MirrorHealth>,
     state_path: PathBuf,
     agent_version: String,
@@ -259,6 +396,7 @@ impl CloudLink {
             linked: AtomicBool::new(linked),
             spool: Mutex::new(Spool::with_default_capacity()),
             pending: Mutex::new(pending_submission),
+            scoped_submission: Mutex::new(None),
             health: RwLock::new(MirrorHealth::Healthy),
             state_path,
             agent_version: agent_version.into(),
@@ -451,6 +589,9 @@ impl CloudLink {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
+        // Consent revocation must not leave exportable customer data resident
+        // anywhere in the process, including in an open submission scope.
+        self.clear_scoped_submission();
         *self.health.write().unwrap_or_else(|p| p.into_inner()) = MirrorHealth::Healthy;
         persistence
     }
@@ -680,6 +821,9 @@ impl CloudLink {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .take();
+            // Buffered telemetry is origin-bound, and a scope's queue is no
+            // exception.
+            self.clear_scoped_submission();
             self.credential_rejected.store(false, Ordering::SeqCst);
             *self.health.write().unwrap_or_else(|p| p.into_inner()) = MirrorHealth::Healthy;
         }
@@ -694,7 +838,14 @@ impl CloudLink {
     }
 
     /// Redeem an operator-pasted code and persist the resulting credential.
-    pub async fn enroll(&self, code: &str) -> Result<(), CloudError> {
+    ///
+    /// Returns [`EnrollmentKind`], which is not decoration: this method is
+    /// deliberately **not** first-time-only — overwriting `token`/`tenant_id` on
+    /// an instance that is already linked is how credential recovery works after
+    /// a `CredentialRejected` — so a caller with a side effect that belongs to
+    /// *establishing* a link has no other way to tell the two apart. See
+    /// [`EnrollmentKind`] for why guessing is not acceptable.
+    pub async fn enroll(&self, code: &str) -> Result<EnrollmentKind, CloudError> {
         if let Some(error) = self.unreadable_cloud_error() {
             return Err(error);
         }
@@ -730,6 +881,11 @@ impl CloudLink {
                 detail: "link state changed while enrollment was in progress; try again".into(),
             });
         }
+        // Read *before* the overwrite below: after it, there is no record on
+        // this instance that a different credential was ever held, and a caller
+        // asking "did this call establish the link?" would have to guess.
+        let kind = EnrollmentKind::classify(current.is_linked(), current.tenant_id, res.tenant_id);
+
         let mut next = current.clone();
         next.token = Some(res.instance_token);
         next.tenant_id = Some(res.tenant_id);
@@ -745,7 +901,7 @@ impl CloudLink {
         self.linked.store(true, Ordering::Release);
         self.credential_rejected.store(false, Ordering::SeqCst);
         *self.health.write().unwrap_or_else(|p| p.into_inner()) = MirrorHealth::Healthy;
-        Ok(())
+        Ok(kind)
     }
 
     /// Revoke the active credential at its issuing backend.
@@ -1057,10 +1213,58 @@ impl CloudLink {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .take();
+        self.clear_scoped_submission();
         self.credential_rejected.store(false, Ordering::SeqCst);
         self.generation.fetch_add(1, Ordering::SeqCst);
         *self.health.write().unwrap_or_else(|p| p.into_inner()) = MirrorHealth::Healthy;
         Ok(())
+    }
+
+    /// Open an isolated submission scope (ADR-042 §2).
+    ///
+    /// [`Self::record`] and [`Self::flush`] share one spool with the live
+    /// mirror, which is correct for the mirror and wrong for anyone who needs to
+    /// know whether *its own* batch drained. On a running instance the mirror
+    /// records continuously, so a caller looping `flush` until
+    /// [`Self::spooled`] reaches zero would count the mirror's spans as its own
+    /// and, on a busy instance, might never see zero at all. The Cloud telemetry
+    /// backfill is that caller.
+    ///
+    /// A scope gives it its own queue, its own pending submission and its own
+    /// drain-complete test, while still sharing the link's credential, its
+    /// `flush_lock` — so submission concurrency stays 1 globally, per
+    /// ADR-041 §3b — and its revocation signal.
+    ///
+    /// At most one scope may be open at a time; a second call returns
+    /// [`SubmissionScopeBusy`] rather than silently sharing one. Closing it is
+    /// `drop`.
+    pub fn submission_scope(&self) -> Result<SubmissionScope<'_>, SubmissionScopeBusy> {
+        let mut guard = self
+            .scoped_submission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if guard.is_some() {
+            return Err(SubmissionScopeBusy);
+        }
+        *guard = Some(ScopedSubmission::new());
+        Ok(SubmissionScope { link: self })
+    }
+
+    /// Forget whatever an open scope still holds, leaving the scope itself open.
+    ///
+    /// Called from the same places that clear the mirror spool. The handle stays
+    /// valid on purpose: its next `flush` then reports `NotLinked`, so the
+    /// caller learns the link went away instead of seeing an empty queue and
+    /// concluding it shipped everything.
+    fn clear_scoped_submission(&self) {
+        if let Some(scope) = self
+            .scoped_submission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            scope.clear();
+        }
     }
 
     /// Offer spans to the mirror. Never blocks on IO, never fails.
@@ -1417,6 +1621,320 @@ impl CloudLink {
     }
 }
 
+/// One caller's private view of the link's submission path (ADR-042 §2).
+///
+/// Obtained from [`CloudLink::submission_scope`] and released by dropping it.
+/// Everything it reports — [`Self::spooled`], [`Self::dropped`], the spans in
+/// each [`FlushOutcome`] — is about spans offered through *this* handle. The
+/// live mirror can be recording and flushing throughout and none of it appears
+/// here, which is what lets a caller loop `flush` until its own queue is empty
+/// and treat "still queued" as a real failure.
+pub struct SubmissionScope<'link> {
+    link: &'link CloudLink,
+}
+
+impl SubmissionScope<'_> {
+    /// Offer spans to this scope. Never blocks on IO, never fails.
+    ///
+    /// Unlike [`CloudLink::record`] there is no bounded producer channel in
+    /// front of the queue. A scoped caller is a control-plane loop that offers
+    /// one bounded batch and waits for it, not a telemetry producer on the
+    /// ingest path, so the channel's load-shedding would buy nothing and would
+    /// make the caller's own accounting lossy.
+    pub fn record(&self, spans: Vec<SpanRecord>) {
+        if spans.is_empty() {
+            return;
+        }
+        // A cleared scope — revocation, disconnect, origin change — drops what
+        // is offered. The next `flush` reports `NotLinked`, which is what the
+        // caller has to act on; buffering for a link that is gone would only
+        // delay it.
+        if let Some(scope) = self
+            .link
+            .scoped_submission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+        {
+            scope.spool.push(spans);
+        }
+    }
+
+    /// Spans this scope has offered that Cloud has not acknowledged yet.
+    ///
+    /// Counts only this scope's spans. Live mirror traffic recorded through
+    /// [`CloudLink::record`] is invisible here, which is the entire point:
+    /// `spooled() == 0` means *this caller's* batch drained.
+    pub fn spooled(&self) -> usize {
+        self.link
+            .scoped_submission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(0, ScopedSubmission::queued)
+    }
+
+    /// Spans this scope discarded because its queue was full.
+    ///
+    /// A scoped caller ships history the operator is paying for, so it must be
+    /// able to tell "everything drained" from "everything that survived
+    /// drained". Zero in normal operation, since a caller offers one batch at a
+    /// time and drains it.
+    pub fn dropped(&self) -> u64 {
+        self.link
+            .scoped_submission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .map_or(0, |scope| scope.spool.dropped())
+    }
+
+    /// Ship one of this scope's batches.
+    ///
+    /// Takes the same `flush_lock` as [`CloudLink::flush`] and
+    /// [`CloudLink::ship_outbox_batch`], so the mirror, the Cloud-primary outbox
+    /// and a scoped caller never have two submissions in flight at once
+    /// (ADR-041 §3b). Subscribes to telemetry revocations before starting I/O,
+    /// exactly as those two do, so switching export off drops the in-flight
+    /// request rather than letting it complete after consent was withdrawn.
+    ///
+    /// Deliberately does **not** touch [`MirrorHealth`] or the state file's
+    /// `pending_submission`. The first is the mirror's operator-visible status
+    /// and a backfill must not rewrite it — an operator reading "buffering,
+    /// 4000 spooled" needs that to be about their live telemetry. The second is
+    /// a per-batch whole-file rewrite of a credential store, which a scoped
+    /// caller carrying its own durable cursor does not need, for the same
+    /// reason [`CloudLink::ship_outbox_batch`] avoids it.
+    pub async fn flush(&self) -> FlushOutcome {
+        let _flush = self.link.flush_lock.lock().await;
+        let mut telemetry_revocations = self.link.telemetry_revocations.subscribe();
+        if !self.link.telemetry_enabled.load(Ordering::Acquire) {
+            return FlushOutcome::NotLinked;
+        }
+        let (base_url, token, generation) = {
+            let guard = self.link.state.read().unwrap_or_else(|p| p.into_inner());
+            match guard.as_ref() {
+                Some(state) if state.is_linked() => (
+                    state.base_url.clone(),
+                    state.token.clone().unwrap_or_default(),
+                    self.link.generation.load(Ordering::SeqCst),
+                ),
+                _ => return FlushOutcome::NotLinked,
+            }
+        };
+
+        let submission = {
+            let mut guard = self
+                .link
+                .scoped_submission
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let Some(scope) = guard.as_mut() else {
+                // The scope was cleared under us by a revocation or a
+                // disconnect. Reporting `Idle` here would tell the caller its
+                // batch shipped.
+                return FlushOutcome::NotLinked;
+            };
+            match scope.pending.clone() {
+                Some(pending) => pending,
+                None => {
+                    let spans = scope.spool.take(BATCH_SIZE);
+                    if spans.is_empty() {
+                        return FlushOutcome::Idle;
+                    }
+                    let next = PendingSubmission {
+                        submission_id: Uuid::new_v4(),
+                        spans,
+                    };
+                    scope.pending = Some(next.clone());
+                    next
+                }
+            }
+        };
+        let count = submission.spans.len();
+
+        let backend = match self.link.parse_backend(&base_url) {
+            Ok(backend) => backend,
+            Err(error) => {
+                return FlushOutcome::Blocked {
+                    spans: count,
+                    reason: error.to_string(),
+                }
+            }
+        };
+        let client = match CloudClient::new(backend) {
+            Ok(client) => client,
+            Err(error) => {
+                return FlushOutcome::Blocked {
+                    spans: count,
+                    reason: error.to_string(),
+                }
+            }
+        };
+
+        let result = tokio::select! {
+            biased;
+            changed = telemetry_revocations.changed() => {
+                let _ = changed;
+                return FlushOutcome::NotLinked;
+            }
+            result = client.ship(&token, submission.submission_id, submission.spans.clone()) => result,
+        };
+
+        if !self.link.telemetry_enabled.load(Ordering::Acquire)
+            || self.link.generation.load(Ordering::SeqCst) != generation
+        {
+            // Consent was withdrawn, or the link changed origin, while the
+            // request was in flight. The batch must not be counted as shipped
+            // against a link that no longer exists.
+            return FlushOutcome::NotLinked;
+        }
+
+        match result {
+            Ok(ack) => {
+                self.link.credential_rejected.store(false, Ordering::SeqCst);
+                if let Some(scope) = self
+                    .link
+                    .scoped_submission
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .as_mut()
+                {
+                    if scope
+                        .pending
+                        .as_ref()
+                        .is_some_and(|value| value.submission_id == submission.submission_id)
+                    {
+                        scope.pending = None;
+                    }
+                }
+                if let Some(warning) = ack.warning {
+                    // The mirror path records this as `MirrorHealth::Degraded`;
+                    // a scope must not overwrite that surface, but the operator
+                    // still has to be able to find out that Cloud accepted this
+                    // submission while degraded.
+                    tracing::warn!(
+                        spans = count,
+                        warning = ?warning,
+                        "Temps Cloud accepted a scoped submission but the tenant is degraded"
+                    );
+                }
+                FlushOutcome::Shipped { spans: count }
+            }
+            Err(error) => {
+                if matches!(error, CloudError::CredentialRejected) {
+                    self.link.credential_rejected.store(true, Ordering::SeqCst);
+                }
+                let reason = error.to_string();
+                // The batch stays in the scope's pending slot with its
+                // submission id, so a retry is idempotent. Never infer from a
+                // refusal that the caller's spans are disposable.
+                if error.is_retryable() {
+                    FlushOutcome::Retained {
+                        spans: count,
+                        reason,
+                    }
+                } else {
+                    FlushOutcome::Blocked {
+                        spans: count,
+                        reason,
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Names the type without reading its queue. Formatting deliberately takes no
+/// lock: a `Debug` impl that did could deadlock whoever is holding one, and the
+/// interesting numbers are already available through [`SubmissionScope::spooled`]
+/// and [`SubmissionScope::dropped`].
+impl std::fmt::Debug for SubmissionScope<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SubmissionScope").finish_non_exhaustive()
+    }
+}
+
+impl Drop for SubmissionScope<'_> {
+    /// Release the claim. Anything still queued is discarded: a scoped caller
+    /// resumes from its own durable cursor, so holding a half-shipped batch
+    /// after the caller has gone would be a leak, not a recovery.
+    fn drop(&mut self) {
+        *self
+            .link
+            .scoped_submission
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = None;
+    }
+}
+
+#[cfg(test)]
+mod enrollment_kind_tests {
+    use super::*;
+
+    #[test]
+    fn an_instance_with_no_credential_is_a_first_enrollment() {
+        let tenant = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(false, None, tenant);
+
+        assert_eq!(kind, EnrollmentKind::First);
+        assert!(kind.establishes_new_link());
+        assert_eq!(kind.as_str(), "first");
+    }
+
+    #[test]
+    fn re_authenticating_the_same_tenant_does_not_establish_a_new_link() {
+        // The credential-recovery path: a token was revoked or rotated at the
+        // backend and the operator pasted a fresh code for the *same* account.
+        // Nothing about the link is new, so nothing that belongs to linking —
+        // least of all a spend — may fire again.
+        let tenant = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(true, Some(tenant), tenant);
+
+        assert_eq!(kind, EnrollmentKind::ReEnrolled { tenant_id: tenant });
+        assert!(!kind.establishes_new_link());
+        assert_eq!(kind.as_str(), "re_enrolled");
+    }
+
+    #[test]
+    fn binding_to_a_different_tenant_is_a_new_link_even_with_a_credential_on_disk() {
+        // Functionally a new customer. The stale credential on disk says
+        // nothing about them, so treating this as "already linked" would deny
+        // a genuinely new link the side effects it is entitled to.
+        let previous = Uuid::new_v4();
+        let next = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(true, Some(previous), next);
+
+        assert_eq!(
+            kind,
+            EnrollmentKind::ReboundToNewTenant {
+                previous_tenant_id: Some(previous)
+            }
+        );
+        assert!(kind.establishes_new_link());
+        assert_eq!(kind.as_str(), "rebound_to_new_tenant");
+    }
+
+    #[test]
+    fn a_token_with_no_recorded_tenant_cannot_be_shown_to_be_the_same_customer() {
+        // A half-written legacy state can carry a token and no tenant. There is
+        // no evidence it is the same tenant, and the failure directions are not
+        // symmetric: treating it as new costs one extra activation the operator
+        // can cancel, treating it as the same silently withholds one from a
+        // customer who just paid.
+        let tenant = Uuid::new_v4();
+        let kind = EnrollmentKind::classify(true, None, tenant);
+
+        assert_eq!(
+            kind,
+            EnrollmentKind::ReboundToNewTenant {
+                previous_tenant_id: None
+            }
+        );
+        assert!(kind.establishes_new_link());
+    }
+}
+
 #[cfg(test)]
 mod unreadable_state_tests {
     use super::*;
@@ -1504,5 +2022,295 @@ mod unreadable_state_tests {
             Err(StateError::UnreadableStateBlocksMutation { .. })
         ));
         assert_eq!(std::fs::read(&state_path).unwrap(), ciphertext);
+    }
+}
+
+#[cfg(test)]
+mod submission_scope_tests {
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::Duration;
+
+    use axum::{extract::State, routing::post, Json, Router};
+    use temps_cloud_protocol::TelemetryBatch;
+
+    use super::*;
+
+    /// Counts accepted spans per producer, keyed by the prefix each test gives
+    /// its span names. The whole question a scope answers is "whose spans were
+    /// those", so the stub has to be able to answer it too.
+    #[derive(Clone, Default)]
+    struct Stub {
+        mirror_spans: Arc<AtomicUsize>,
+        scoped_spans: Arc<AtomicUsize>,
+    }
+
+    async fn serve(stub: Stub) -> Option<String> {
+        let app = Router::new()
+            .route(
+                "/v1/enroll",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "tenant_id": Uuid::new_v4(),
+                        "instance_token": "inst_submission_scope_test"
+                    }))
+                }),
+            )
+            .route(
+                "/v1/telemetry",
+                post(
+                    |State(stub): State<Stub>, Json(batch): Json<TelemetryBatch>| async move {
+                        let spans = batch.spans.len();
+                        for span in &batch.spans {
+                            if span.name.starts_with("scoped") {
+                                stub.scoped_spans.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                stub.mirror_spans.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        Json(serde_json::json!({
+                            "submission_id": batch.submission_id,
+                            "processed_spans": spans,
+                            "stored_spans": spans,
+                            "metered_bytes": 1
+                        }))
+                    },
+                ),
+            )
+            .with_state(stub);
+        let listener = match tokio::net::TcpListener::bind::<SocketAddr>(
+            "127.0.0.1:0".parse().expect("loopback address must parse"),
+        )
+        .await
+        {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping submission scope network test: sandbox denied TCP bind");
+                return None;
+            }
+            Err(error) => panic!("test server must bind: {error}"),
+        };
+        let address = listener.local_addr().expect("test server has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Some(format!("http://{address}"))
+    }
+
+    fn span(name: String) -> SpanRecord {
+        SpanRecord {
+            trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+            span_id: format!("span-{name}"),
+            name,
+            ts_millis: 1,
+            duration_ms: 1.0,
+            attributes: Default::default(),
+            ..Default::default()
+        }
+    }
+
+    fn spans(prefix: &str, count: usize) -> Vec<SpanRecord> {
+        (0..count).map(|i| span(format!("{prefix}-{i}"))).collect()
+    }
+
+    async fn linked_test_link(stub: Stub) -> Option<(Arc<CloudLink>, tempfile::TempDir)> {
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let backend = serve(stub).await?;
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "submission-scope-test",
+        ));
+        link.configure(
+            crate::BackendUrl::loopback_development(&backend)
+                .expect("stub backend URL must be accepted"),
+        )
+        .expect("test link must be configured");
+        link.enroll("scope-code")
+            .await
+            .expect("test link must enroll");
+        link.set_feature_switches(crate::CloudFeatureSwitches {
+            telemetry: true,
+            ..Default::default()
+        })
+        .expect("enable telemetry export");
+        Some((link, directory))
+    }
+
+    /// Poll until `condition` holds, so the test never depends on a sleep being
+    /// long enough on a loaded machine.
+    async fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..2_000 {
+            if condition() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        false
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scope_drains_its_own_batch_while_the_mirror_is_recording() {
+        // ADR-042 P0. This is the whole reason a scope exists: the shared spool
+        // is being written to and drained by the live mirror throughout, and the
+        // scoped caller must still be able to say "my batch shipped".
+        let stub = Stub::default();
+        let Some((link, _directory)) = linked_test_link(stub.clone()).await else {
+            return;
+        };
+
+        let mirror_running = Arc::new(AtomicBool::new(true));
+        let mirror = tokio::spawn({
+            let link = Arc::clone(&link);
+            let mirror_running = Arc::clone(&mirror_running);
+            async move {
+                while mirror_running.load(Ordering::SeqCst) {
+                    link.record(spans("mirror", 5));
+                    let _ = link.flush().await;
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        // Do not start measuring until the mirror is demonstrably shipping, or
+        // a green test would prove nothing about concurrency.
+        assert!(
+            wait_until(|| stub.mirror_spans.load(Ordering::SeqCst) > 0).await,
+            "the mirror must be shipping before the scoped submission starts"
+        );
+        let mirror_baseline = stub.mirror_spans.load(Ordering::SeqCst);
+
+        let scope = link
+            .submission_scope()
+            .expect("a fresh link has no open scope");
+        // More than one `BATCH_SIZE`, so the drain loop runs several times with
+        // the mirror interleaving between iterations.
+        let offered = BATCH_SIZE + 137;
+        scope.record(spans("scoped", offered));
+
+        let mut shipped = 0usize;
+        for _ in 0..8 {
+            match scope.flush().await {
+                FlushOutcome::Shipped { spans } => shipped += spans,
+                FlushOutcome::Idle => break,
+                other => panic!("scoped flush must not fail: {other:?}"),
+            }
+            if scope.spooled() == 0 {
+                break;
+            }
+        }
+
+        assert_eq!(
+            scope.spooled(),
+            0,
+            "the scope's drain-complete test must settle even while the mirror records"
+        );
+        assert_eq!(
+            shipped, offered,
+            "the scope must count exactly the spans it offered, not the mirror's"
+        );
+        assert_eq!(scope.dropped(), 0, "nothing may be shed at this size");
+        assert_eq!(
+            stub.scoped_spans.load(Ordering::SeqCst),
+            offered,
+            "Cloud must have received exactly the scoped batch"
+        );
+        assert!(
+            stub.mirror_spans.load(Ordering::SeqCst) > mirror_baseline,
+            "the mirror must have kept shipping during the scoped submission"
+        );
+
+        mirror_running.store(false, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_secs(5), mirror).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn mirror_traffic_is_invisible_to_a_scope_and_the_scope_to_the_mirror() {
+        // The two counters must not see each other in either direction: a
+        // backfill that counted mirror spans would over-report progress, and a
+        // mirror whose `spooled()` included a backfill would tell the operator
+        // their live telemetry is backlogged when it is not.
+        let stub = Stub::default();
+        let Some((link, _directory)) = linked_test_link(stub.clone()).await else {
+            return;
+        };
+
+        let scope = link
+            .submission_scope()
+            .expect("a fresh link has no open scope");
+        scope.record(spans("scoped", 40));
+        link.record(spans("mirror", 25));
+
+        assert_eq!(scope.spooled(), 40, "the scope sees only its own spans");
+        assert_eq!(link.spooled(), 25, "the mirror sees only its own spans");
+
+        assert_eq!(scope.flush().await, FlushOutcome::Shipped { spans: 40 });
+        assert_eq!(
+            scope.spooled(),
+            0,
+            "the scope drained without touching the mirror's queue"
+        );
+        assert_eq!(
+            link.spooled(),
+            25,
+            "a scoped flush must never ship the mirror's spans"
+        );
+        assert_eq!(stub.scoped_spans.load(Ordering::SeqCst), 40);
+        assert_eq!(stub.mirror_spans.load(Ordering::SeqCst), 0);
+
+        assert_eq!(link.flush().await, FlushOutcome::Shipped { spans: 25 });
+        assert_eq!(stub.mirror_spans.load(Ordering::SeqCst), 25);
+    }
+
+    #[tokio::test]
+    async fn only_one_scope_may_be_open_at_a_time() {
+        // Two scoped callers would reintroduce exactly the conflation a scope
+        // removes, so the second one is refused rather than quietly sharing.
+        let directory = tempfile::tempdir().expect("temporary directory must be created");
+        let link = CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "submission-scope-test",
+        );
+
+        let first = link.submission_scope().expect("the first scope opens");
+        let busy = link
+            .submission_scope()
+            .expect_err("a second concurrent scope must be refused");
+        assert!(
+            busy.to_string().contains("already open"),
+            "the refusal must say what is in the way: {busy}"
+        );
+
+        drop(first);
+        assert!(
+            link.submission_scope().is_ok(),
+            "dropping a scope must release the claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn revoking_telemetry_export_empties_an_open_scope() {
+        // Consent withdrawal must not leave exportable customer data resident in
+        // a scope any more than in the mirror spool, and the caller must learn
+        // why rather than seeing an empty queue and assuming success.
+        let stub = Stub::default();
+        let Some((link, _directory)) = linked_test_link(stub.clone()).await else {
+            return;
+        };
+        let scope = link
+            .submission_scope()
+            .expect("a fresh link has no open scope");
+        scope.record(spans("scoped", 12));
+        assert_eq!(scope.spooled(), 12);
+
+        link.set_feature_switches(crate::CloudFeatureSwitches::default())
+            .expect("disable telemetry export");
+
+        assert_eq!(scope.spooled(), 0, "revocation must drop the queued spans");
+        assert_eq!(
+            scope.flush().await,
+            FlushOutcome::NotLinked,
+            "the caller must be told the link went away, not that it drained"
+        );
+        assert_eq!(stub.scoped_spans.load(Ordering::SeqCst), 0);
     }
 }

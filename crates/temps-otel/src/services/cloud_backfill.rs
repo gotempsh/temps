@@ -39,7 +39,7 @@ use std::time::Duration;
 use sea_orm::{
     ConnectionTrait, DatabaseBackend, DatabaseConnection, FromQueryResult, Statement, Value,
 };
-use temps_cloud_client::{CloudLink, FlushOutcome};
+use temps_cloud_client::{CloudLink, FlushOutcome, SubmissionScope};
 use temps_core::DBDateTime;
 use temps_entities::cloud_telemetry_fidelity::CloudTelemetryFidelity;
 use tracing::debug;
@@ -125,6 +125,12 @@ pub enum CloudBackfillError {
          Cloud. The link credential is unavailable; re-enroll this instance."
     )]
     ProjectionFailed { project_id: i32, span_id: String },
+
+    #[error(
+        "Another Temps Cloud submission is already in flight on this instance, \
+         so project {project_id} cannot be backfilled right now: {reason}"
+    )]
+    SubmissionScopeBusy { project_id: i32, reason: String },
 
     #[error(
         "Temps Cloud did not accept a batch of {spans} span(s) for project \
@@ -400,6 +406,20 @@ pub async fn backfill_cloud_telemetry_window(
 ) -> Result<CloudBackfillReport, CloudBackfillError> {
     guard_ready(link, policy, project_id)?;
 
+    // ADR-042 §2 (Finding 2): submit through a scope of our own rather than the
+    // link's shared spool. On a running instance the live mirror records into
+    // that spool continuously, so `link.spooled()` after our flushes would also
+    // count the mirror's spans — this run's shipped counter would include
+    // traffic it never read, and its drain-complete test could never settle on
+    // a busy instance. The scope is held for the whole window and released when
+    // this function returns, however it returns.
+    let scope =
+        link.submission_scope()
+            .map_err(|error| CloudBackfillError::SubmissionScopeBusy {
+                project_id,
+                reason: error.to_string(),
+            })?;
+
     let batch_size = batch_size.clamp(1, MAX_BATCH_SIZE);
 
     // Kept below INFO: this runs once per window while the CLI's progress bar
@@ -452,7 +472,7 @@ pub async fn backfill_cloud_telemetry_window(
         }
 
         let offered = projected.len() as u64;
-        let shipped = ship_batch(link, project_id, projected, &next_cursor).await?;
+        let shipped = ship_batch(&scope, project_id, projected, &next_cursor).await?;
 
         report.spans_read += read;
         report.spans_offered += offered;
@@ -542,12 +562,21 @@ fn cursor_after(batch: &[SourcedSpan]) -> CloudBackfillCursor {
 /// Offer one batch to the link and drain it, so a batch is fully acknowledged
 /// before its cursor advances.
 ///
-/// Uses [`CloudLink::record`] + [`CloudLink::flush`] rather than a second HTTP
-/// path on purpose: that reuses the live mirror's `submission_id` idempotency,
-/// its durable pending-submission state, and its metering — the properties
-/// ADR-040 relies on to make a re-run safe.
+/// Goes through the link's own submission path rather than a second HTTP client
+/// on purpose: that reuses the live mirror's `submission_id` idempotency and its
+/// metering — the properties ADR-040 relies on to make a re-run safe.
+///
+/// It does so through a [`SubmissionScope`] (ADR-042 §2), not
+/// [`CloudLink::record`]/[`CloudLink::flush`], so that everything counted here
+/// is this batch and only this batch. Those two share one spool with the live
+/// mirror, which is invisible today only because the CLI runs with the server
+/// stopped; the moment this code runs inside `temps serve` the mirror is
+/// recording into that spool continuously, and it would both inflate `shipped`
+/// and keep the drain-complete test below from ever settling on a busy
+/// instance. With a scope, no amount of concurrent mirror traffic can do
+/// either.
 async fn ship_batch(
-    link: &CloudLink,
+    scope: &SubmissionScope<'_>,
     project_id: i32,
     projected: Vec<temps_cloud_protocol::SpanRecord>,
     cursor: &CloudBackfillCursor,
@@ -562,14 +591,15 @@ async fn ship_batch(
         .map(|ts| ts.to_rfc3339())
         .unwrap_or_else(|| "the start of the window".to_string());
 
-    link.record(projected);
+    let dropped_before = scope.dropped();
+    scope.record(projected);
 
     let mut shipped = 0u64;
     for _ in 0..MAX_FLUSHES_PER_BATCH {
-        match link.flush().await {
+        match scope.flush().await {
             FlushOutcome::Shipped { spans } => {
                 shipped += spans as u64;
-                if link.spooled() == 0 {
+                if scope.spooled() == 0 {
                     break;
                 }
             }
@@ -595,7 +625,7 @@ async fn ship_batch(
         }
     }
 
-    let still_queued = link.spooled();
+    let still_queued = scope.spooled();
     if still_queued > 0 {
         return Err(CloudBackfillError::ShipmentRefused {
             project_id,
@@ -604,6 +634,23 @@ async fn ship_batch(
             reason: format!(
                 "{still_queued} span(s) were still queued after {MAX_FLUSHES_PER_BATCH} \
                  delivery attempts"
+            ),
+        });
+    }
+
+    // An empty queue is only proof of delivery if nothing was discarded on the
+    // way. The operator is paying for this history, so a shed span must stop
+    // the run at a cursor it can resume from rather than leave a hole nobody
+    // ever hears about.
+    let dropped = scope.dropped().saturating_sub(dropped_before);
+    if dropped > 0 {
+        return Err(CloudBackfillError::ShipmentRefused {
+            project_id,
+            spans: offered,
+            resume_from,
+            reason: format!(
+                "{dropped} span(s) were discarded before delivery because the submission \
+                 buffer was full"
             ),
         });
     }
@@ -1158,5 +1205,264 @@ mod tests {
             0,
             "a refused backfill must not have queued a single span"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // ADR-042 P0: shipping while the live mirror is recording
+    // -----------------------------------------------------------------------
+
+    /// Accepts telemetry and counts spans per producer, so a test can assert
+    /// whose spans Cloud actually received.
+    #[derive(Clone, Default)]
+    struct TelemetryStub {
+        mirror_spans: Arc<std::sync::atomic::AtomicUsize>,
+        backfill_spans: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    async fn serve_stub(stub: TelemetryStub) -> Option<String> {
+        use axum::{extract::State, routing::post, Json, Router};
+        use std::sync::atomic::Ordering;
+
+        let app = Router::new()
+            .route(
+                "/v1/enroll",
+                post(|| async {
+                    Json(serde_json::json!({
+                        "tenant_id": uuid::Uuid::new_v4(),
+                        "instance_token": "inst_backfill_scope_test"
+                    }))
+                }),
+            )
+            .route(
+                "/v1/telemetry",
+                post(
+                    |State(stub): State<TelemetryStub>,
+                     Json(batch): Json<temps_cloud_protocol::TelemetryBatch>| async move {
+                        let spans = batch.spans.len();
+                        for span in &batch.spans {
+                            if span.name.starts_with("mirror") {
+                                stub.mirror_spans.fetch_add(1, Ordering::SeqCst);
+                            } else {
+                                stub.backfill_spans.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        Json(serde_json::json!({
+                            "submission_id": batch.submission_id,
+                            "processed_spans": spans,
+                            "stored_spans": spans,
+                            "metered_bytes": 1
+                        }))
+                    },
+                ),
+            )
+            .with_state(stub);
+
+        let listener = match tokio::net::TcpListener::bind::<std::net::SocketAddr>(
+            "127.0.0.1:0".parse().expect("loopback address must parse"),
+        )
+        .await
+        {
+            Ok(listener) => listener,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!("skipping cloud backfill network test: sandbox denied TCP bind");
+                return None;
+            }
+            Err(error) => panic!("test server must bind: {error}"),
+        };
+        let address = listener.local_addr().expect("test server has an address");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Some(format!("http://{address}"))
+    }
+
+    /// A link enrolled against the stub, with telemetry export on.
+    async fn linked_to_stub(stub: TelemetryStub) -> Option<(tempfile::TempDir, Arc<CloudLink>)> {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let backend = serve_stub(stub).await?;
+        let link = Arc::new(CloudLink::load_for_loopback_development(
+            directory.path().to_path_buf(),
+            "backfill-scope-test",
+        ));
+        link.configure(
+            temps_cloud_client::BackendUrl::loopback_development(&backend)
+                .expect("stub backend URL must be accepted"),
+        )
+        .expect("test link must be configured");
+        link.enroll("backfill-code")
+            .await
+            .expect("test link must enroll");
+        link.set_feature_switches(temps_cloud_client::CloudFeatureSwitches {
+            telemetry: true,
+            backups: false,
+            notifications: false,
+        })
+        .expect("enable telemetry export");
+        Some((directory, link))
+    }
+
+    fn wire_spans(prefix: &str, count: usize) -> Vec<temps_cloud_protocol::SpanRecord> {
+        (0..count)
+            .map(|i| temps_cloud_protocol::SpanRecord {
+                trace_id: "4bf92f3577b34da6a3ce929d0e0e4736".into(),
+                span_id: format!("{prefix}-{i}"),
+                name: format!("{prefix}-{i}"),
+                ts_millis: 1_700_000_000_000 + i as i64,
+                duration_ms: 1.0,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_batch_ships_completely_while_the_mirror_flusher_is_recording() {
+        // ADR-042 P0's acceptance criterion. Before the submission scope, this
+        // batch's own drain-complete test read the shared spool, so live mirror
+        // traffic recorded a millisecond earlier both inflated `shipped` and
+        // could keep `spooled()` above zero for all eight attempts — a spurious
+        // `ShipmentRefused` on a busy instance.
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let stub = TelemetryStub::default();
+        let Some((_directory, link)) = linked_to_stub(stub.clone()).await else {
+            return;
+        };
+
+        // The live mirror: recording and flushing continuously, exactly as it
+        // does inside `temps serve`.
+        let mirror_running = Arc::new(AtomicBool::new(true));
+        let mirror = tokio::spawn({
+            let link = Arc::clone(&link);
+            let mirror_running = Arc::clone(&mirror_running);
+            async move {
+                while mirror_running.load(Ordering::SeqCst) {
+                    link.record(wire_spans("mirror", 5));
+                    let _ = link.flush().await;
+                    tokio::task::yield_now().await;
+                }
+            }
+        });
+
+        // Do not start until the mirror is demonstrably shipping, or a green
+        // test would prove nothing about concurrency.
+        let mut mirrored = 0;
+        for _ in 0..2_000 {
+            mirrored = stub.mirror_spans.load(Ordering::SeqCst);
+            if mirrored > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            mirrored > 0,
+            "the mirror must be shipping before the backfill batch starts"
+        );
+
+        let scope = link
+            .submission_scope()
+            .expect("no other submission scope is open");
+        // Larger than one submission, so the drain loop runs more than once and
+        // the mirror interleaves between iterations.
+        let offered = 637;
+        let cursor = CloudBackfillCursor {
+            last_start_time: chrono::DateTime::from_timestamp_millis(1_700_000_000_000),
+            last_row_id: Some(42),
+            last_span_id: Some("backfill-0".into()),
+        };
+
+        let shipped = ship_batch(&scope, 7, wire_spans("backfill", offered), &cursor)
+            .await
+            .expect("the batch must drain despite concurrent mirror traffic");
+
+        assert_eq!(
+            shipped, offered as u64,
+            "the batch must report exactly its own spans"
+        );
+        assert_eq!(
+            scope.spooled(),
+            0,
+            "the batch's own queue must be empty when it reports success"
+        );
+        assert_eq!(
+            stub.backfill_spans.load(Ordering::SeqCst),
+            offered,
+            "Cloud must have received exactly the backfilled spans"
+        );
+        assert!(
+            stub.mirror_spans.load(Ordering::SeqCst) > mirrored,
+            "the mirror must have kept shipping during the backfill batch"
+        );
+
+        mirror_running.store(false, Ordering::SeqCst);
+        let _ = tokio::time::timeout(Duration::from_secs(5), mirror).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_that_ships_nothing_reports_the_link_rather_than_success() {
+        // The failure direction of the same isolation: with export switched off
+        // mid-run the scope is emptied, and the caller must get a refusal naming
+        // the link — not a silent "0 spans, all done" that advances the cursor
+        // over history nobody sent.
+        let stub = TelemetryStub::default();
+        let Some((_directory, link)) = linked_to_stub(stub.clone()).await else {
+            return;
+        };
+        let scope = link
+            .submission_scope()
+            .expect("no other submission scope is open");
+        link.set_feature_switches(temps_cloud_client::CloudFeatureSwitches::default())
+            .expect("disable telemetry export");
+
+        let error = ship_batch(
+            &scope,
+            7,
+            wire_spans("backfill", 10),
+            &CloudBackfillCursor::default(),
+        )
+        .await
+        .expect_err("shipping with export switched off must fail");
+
+        assert!(matches!(
+            error,
+            CloudBackfillError::ShipmentRefused { project_id: 7, .. }
+        ));
+        assert_eq!(
+            stub.backfill_spans
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_second_backfill_is_refused_while_one_holds_the_submission_scope() {
+        // Submission concurrency is 1 globally (ADR-041 §3b), so the second
+        // caller is told what is in the way rather than silently sharing a
+        // queue and mis-reporting both runs' progress.
+        let (_directory, link) = linked_cloud();
+        let held = link.submission_scope().expect("the first scope must open");
+
+        let source =
+            CloudBackfillSource::Timescale(Arc::new(sea_orm::DatabaseConnection::Disconnected));
+        let now = chrono::Utc::now();
+        let error = backfill_cloud_telemetry_window(
+            &source,
+            &link,
+            &CloudTelemetryPolicy::queryable(std::iter::empty()),
+            7,
+            now - chrono::Duration::days(1),
+            now,
+            DEFAULT_BATCH_SIZE,
+            CloudBackfillCursor::default(),
+            None,
+            |_| {},
+        )
+        .await
+        .expect_err("a second concurrent backfill must be refused");
+
+        assert!(matches!(
+            error,
+            CloudBackfillError::SubmissionScopeBusy { project_id: 7, .. }
+        ));
+        drop(held);
     }
 }

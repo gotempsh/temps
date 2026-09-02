@@ -7,6 +7,9 @@ pub mod admin_gate;
 pub mod ai_tool_call;
 pub mod audit;
 pub mod client_ip;
+/// The seam the purchase-triggered Cloud telemetry activation crosses
+/// (ADR-042 P3).
+pub mod cloud_telemetry_activation;
 pub mod config;
 pub mod deployment;
 pub mod dns_automation;
@@ -66,6 +69,10 @@ pub mod workflow_memory;
 // Re-export commonly used types
 pub use audit::*;
 pub use client_ip::resolve_client_ip;
+pub use cloud_telemetry_activation::{
+    CloudTelemetryActivationTrigger, StartedTelemetryActivation, TelemetryActivationOutcome,
+    TelemetryActivationSkipped,
+};
 pub use config::*;
 pub use constants::*;
 pub use deployment::*;
@@ -112,8 +119,9 @@ pub use app_settings::{
     MonitoringSettings, MultiNodeSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PreviewGatewaySettings, ProviderConfig, RateLimitSettings,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings, SelfUpdateSettings,
-    TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
-    MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+    TenantResourceCeilings, DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES, MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+    MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
 };
 pub use async_trait;
 pub use chrono;

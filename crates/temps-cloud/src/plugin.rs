@@ -101,6 +101,11 @@ impl TempsPlugin for CloudPlugin {
         Some(PluginRoutes::new(cloud_routes(
             context.require_service::<CloudService>(),
             context.require_service::<dyn temps_core::AuditLogger>(),
+            // ADR-042 P3, and deliberately `get_service`: a build with no OTel
+            // plugin, or an instance with no local span source, has nothing to
+            // activate and must still be able to enroll. `require_service` here
+            // would turn "no telemetry history to ship" into a startup failure.
+            context.get_service::<dyn temps_core::CloudTelemetryActivationTrigger>(),
         )))
     }
 

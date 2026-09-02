@@ -219,6 +219,7 @@ mod m20260901_000003_constrain_cloud_telemetry_fidelity;
 mod m20260901_000004_create_cloud_span_outbox;
 mod m20260901_000005_add_cloud_telemetry_write_mode;
 mod m20260901_000006_create_telemetry_write_ledger;
+mod m20260901_000007_create_cloud_telemetry_bulk_jobs;
 
 pub struct Migrator;
 
@@ -472,6 +473,7 @@ impl MigratorTrait for Migrator {
             Box::new(m20260901_000004_create_cloud_span_outbox::Migration),
             Box::new(m20260901_000005_add_cloud_telemetry_write_mode::Migration),
             Box::new(m20260901_000006_create_telemetry_write_ledger::Migration),
+            Box::new(m20260901_000007_create_cloud_telemetry_bulk_jobs::Migration),
         ]
     }
 }

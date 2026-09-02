@@ -2008,6 +2008,7 @@ Manage external services (databases, caches, storage)
 - `logs` - View persisted logs for an external service
 - `slow-queries` - Show slowest PostgreSQL queries from pg_stat_statements
 - `enable-pg-stat-statements` - Enable pg_stat_statements on a standalone Postgres service by restarting its container (drops active connections briefly)
+- `metrics` - Resource and engine metrics for a database/cache/storage service
 - `restore-capabilities` - Show what restore modes a service supports (in-place / new service / PITR)
 - `list-backups` - List backups stored on an S3 source
 - `restore` - Restore a service from a backup (in-place, new service, or PITR)
@@ -2254,6 +2255,159 @@ Enable pg_stat_statements on a standalone Postgres service by restarting its con
 |------|-------------|---------|----------|
 | `--id <id>` | Service ID | - | Yes |
 | `-y, --yes` | Skip the restart confirmation prompt (for automation) | - | No |
+
+### `services metrics`
+
+Resource and engine metrics for a database/cache/storage service
+
+**Subcommands:**
+
+- `latest` - Show the most recent value of every tracked metric
+- `range` - Show a time-series range for a single metric
+- `status` - Show when metrics were last received for a service
+- `by-database` - Per-database metric breakdown (PostgreSQL services only)
+- `enable` - Enable metric collection for a service (seeds default alert rules)
+- `disable` - Disable metric collection for a service
+- `alert-rules` - Manage monitoring alert rules for a service
+
+#### `services metrics latest`
+
+Show the most recent value of every tracked metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics range`
+
+Show a time-series range for a single metric
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-r, --range <window>` | Time window: 1h, 6h, 24h, 7d (default: 24h) | - | No |
+| `-p, --percentile <n>` | Histogram percentile (0-100) instead of a plain average | - | No |
+| `--json` | Output raw JSON instead of a formatted table | - | No |
+
+#### `services metrics status`
+
+Show when metrics were last received for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics by-database`
+
+Per-database metric breakdown (PostgreSQL services only)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+#### `services metrics enable`
+
+Enable metric collection for a service (seeds default alert rules)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics disable`
+
+Disable metric collection for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+
+#### `services metrics alert-rules`
+
+Manage monitoring alert rules for a service
+
+**Subcommands:**
+
+- `list` (`ls`) - List alert rules for a service
+- `create` (`add`) - Create an alert rule for a service
+- `update` - Update an existing alert rule
+- `remove` (`rm`) - Delete an alert rule
+
+##### `services metrics alert-rules list` (alias: `ls`)
+
+List alert rules for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules create` (alias: `add`)
+
+Create an alert rule for a service
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | Yes |
+| `-m, --metric <name>` | Metric name, e.g. "pg.connections_active" | - | Yes |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | Yes |
+| `-t, --threshold <n>` | Threshold value that triggers the alert | - | Yes |
+| `-s, --severity <level>` | warning or critical (default: warning) | - | No |
+| `--for-duration <secs>` | Seconds the breach must persist before firing (default: 0) | - | No |
+| `--disabled` | Create the rule disabled | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules update`
+
+Update an existing alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-n, --name <name>` | Alert rule name | - | No |
+| `-m, --metric <name>` | Metric name | - | No |
+| `-c, --comparator <op>` | Comparator: >, <, >=, <= | - | No |
+| `-t, --threshold <n>` | Threshold value | - | No |
+| `-s, --severity <level>` | warning or critical | - | No |
+| `--for-duration <secs>` | Seconds the breach must persist before firing | - | No |
+| `--enable` | Enable the rule | - | No |
+| `--disable` | Disable the rule | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `services metrics alert-rules remove` (alias: `rm`)
+
+Delete an alert rule
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--id <id>` | Service ID | - | Yes |
+| `--rule-id <id>` | Alert rule ID | - | Yes |
+| `-y, --yes` | Skip confirmation prompt | - | No |
 
 ### `services restore-capabilities`
 
@@ -2981,7 +3135,7 @@ Manage project containers in environments
 - `start` - Start a stopped container
 - `stop` - Stop a running container
 - `restart` - Restart a container
-- `history` - List every container that has ever run in an environment, including ones replaced by a later redeploy
+- `history` - List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included
 - `metrics` - Get container resource metrics (all containers if no container ID specified)
 
 ### `containers list` (alias: `ls`)
@@ -3048,7 +3202,7 @@ Restart a container
 
 ### `containers history`
 
-List every container that has ever run in an environment, including ones replaced by a later redeploy
+List containers that have run in an environment, including ones replaced by a later redeploy; every currently-running container is always included
 
 **Options:**
 
@@ -3056,6 +3210,8 @@ List every container that has ever run in an environment, including ones replace
 |------|-------------|---------|----------|
 | `-p, --project-id <id>` | Project ID | - | Yes |
 | `-e, --environment-id <id>` | Environment ID | - | Yes |
+| `-d, --deployment-id <id>` | Only list containers belonging to this deployment | - | No |
+| `-l, --limit <count>` | Max REPLACED container rows to return on top of the running ones, newest first (default 20, max 100) | - | No |
 | `--json` | Output in JSON format | - | No |
 
 ### `containers metrics`
@@ -6980,8 +7136,12 @@ Temps Cloud
 - `login` - Login to Temps Cloud
 - `logout` - Logout from Temps Cloud
 - `whoami` - Show current Temps Cloud account
+- `status` - Show this self-hosted instance's Temps Cloud link
+- `connect` - Connect this self-hosted instance using an enrollment code
+- `disconnect` - Disconnect this self-hosted instance from Temps Cloud
 - `vps` - Manage cloud VPS instances
 - `billing` - Manage Temps Cloud billing and subscription
+- `telemetry` - Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
 
 ### `cloud login`
 
@@ -6994,6 +7154,37 @@ Logout from Temps Cloud
 ### `cloud whoami`
 
 Show current Temps Cloud account
+
+### `cloud status`
+
+Show this self-hosted instance's Temps Cloud link
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output JSON | - | No |
+
+### `cloud connect`
+
+Connect this self-hosted instance using an enrollment code
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--code <code>` | Single-use enrollment code from Temps Cloud | - | Yes |
+
+### `cloud disconnect`
+
+Disconnect this self-hosted instance from Temps Cloud
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
 
 ### `cloud vps`
 
@@ -7133,6 +7324,100 @@ Upgrade your plan
 |------|-------------|---------|----------|
 | `--yearly` | Use yearly billing cycle (default: monthly) | - | No |
 | `--no-browser` | Don't open browser, just show the URL | - | No |
+
+### `cloud telemetry`
+
+Where a project’s spans are written — this instance, or Temps Cloud (ADR-041)
+
+**Subcommands:**
+
+- `write-mode` - Read or change a project’s telemetry write mode
+- `status` - Instance-wide Cloud telemetry write status: queue depth, gaps, and whether the local span store is still required
+- `bulk-switch` - Switch many projects to Temps Cloud and ship their history in one job — estimates first, then asks
+- `bulk-status` - Show the Temps Cloud activation running on this instance — progress, ETA, skips and failures
+- `bulk-cancel` - Stop a Temps Cloud activation at its next chunk boundary
+
+#### `cloud telemetry write-mode`
+
+Read or change a project’s telemetry write mode
+
+**Subcommands:**
+
+- `get` - Show where a project’s spans are written, what is queued, and any gaps
+- `set` - Set the write mode to "local" (stored on this instance) or "cloud" (written to Temps Cloud, not stored here)
+
+##### `cloud telemetry write-mode get`
+
+Show where a project’s spans are written, what is queued, and any gaps
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug>` | Project slug | - | No |
+| `--json` | Output in JSON format | - | No |
+
+##### `cloud telemetry write-mode set`
+
+Set the write mode to "local" (stored on this instance) or "cloud" (written to Temps Cloud, not stored here)
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-p, --project <slug>` | Project slug | - | No |
+| `--fidelity <tier>` | Also set Cloud telemetry fidelity: metered or queryable. "cloud" requires "queryable". | - | No |
+| `-f, --force` | Skip confirmation | - | No |
+| `-y, --yes` | Skip confirmation prompts (alias for --force) | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cloud telemetry status`
+
+Instance-wide Cloud telemetry write status: queue depth, gaps, and whether the local span store is still required
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--json` | Output in JSON format | - | No |
+
+#### `cloud telemetry bulk-switch`
+
+Switch many projects to Temps Cloud and ship their history in one job — estimates first, then asks
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--all` | Every project still storing its spans on this instance. Projects already on Temps Cloud are not included. | - | No |
+| `-p, --project <id>` | A project id to switch. Repeatable. Cannot be combined with --all. | `` | No |
+| `--from <timestamp>` | Start of the history window to ship (RFC 3339). Defaults to the oldest span local retention can still be holding. | - | No |
+| `--to <timestamp>` | End of the history window to ship (RFC 3339). Defaults to now. | - | No |
+| `-y, --yes` | Skip the confirmation. The estimate is still computed and printed. | - | No |
+| `--watch` | Follow the job until it finishes | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cloud telemetry bulk-status`
+
+Show the Temps Cloud activation running on this instance — progress, ETA, skips and failures
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `--watch` | Follow the job until it finishes | - | No |
+| `--json` | Output in JSON format | - | No |
+
+#### `cloud telemetry bulk-cancel`
+
+Stop a Temps Cloud activation at its next chunk boundary
+
+**Options:**
+
+| Flag | Description | Default | Required |
+|------|-------------|---------|----------|
+| `-y, --yes` | Skip confirmation | - | No |
+| `--json` | Output in JSON format | - | No |
 
 
 ---

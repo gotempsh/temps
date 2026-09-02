@@ -210,7 +210,12 @@ pub struct AppSettings {
 }
 
 /// Non-secret managed control-plane settings stored with application settings.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+///
+/// `PartialEq` but deliberately **not** `Eq`: `telemetry_bulk_anomaly_factor` is
+/// a float, and the total-equality contract `Eq` promises is one `f32` cannot
+/// keep. Nothing compares two `CloudSettings` for equality outside this module's
+/// own tests, so the weaker bound costs nothing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(default)]
 pub struct CloudSettings {
     /// HTTPS origin used for enrollment and telemetry mirroring.
@@ -241,6 +246,59 @@ pub struct CloudSettings {
     #[serde(default = "default_cloud_telemetry_outbox_max_bytes")]
     #[schema(minimum = 1048576, example = 536870912)]
     pub telemetry_outbox_max_bytes: u64,
+
+    /// ADR-042 §3: optional throttle, in spans per second, on a **bulk Cloud
+    /// telemetry activation** backfill.
+    ///
+    /// `None` — the default — is unthrottled, which is what "activate now"
+    /// means and is right for an instance that is idle or being cut over
+    /// deliberately. An operator running an activation against a live instance
+    /// can set a ceiling so the backfill stops competing with their own read IO
+    /// and with the Cloud ingest allowance.
+    ///
+    /// An operator setting on the singleton `settings` row rather than an
+    /// environment variable, per CLAUDE.md, so it can be changed **while a job
+    /// is running** — which is exactly when an operator discovers they need it,
+    /// and exactly when restarting the binary would mean stopping an activation
+    /// they have already paid for. The worker re-reads it each time it picks up
+    /// a project, so a change takes effect at the next project boundary rather
+    /// than at the next restart.
+    ///
+    /// Only the bulk worker reads this. The live Cloud-primary write path is a
+    /// primary path and is never throttled; the offline
+    /// `temps backfill cloud-telemetry` tool keeps its own
+    /// `--rate-limit-spans-per-sec` flag, because it runs in a different
+    /// process with the server stopped.
+    #[serde(default)]
+    #[schema(minimum = 1, example = 5000)]
+    pub telemetry_bulk_rate_limit_spans_per_sec: Option<u32>,
+
+    /// ADR-042 §6.3: how far a project's shipped bytes may exceed its pre-send
+    /// estimate before the bulk activation stops that project.
+    ///
+    /// `None` — the default — resolves to
+    /// [`DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`]. The guard exists because
+    /// an estimate that is wrong by an order of magnitude means a bug, and *a
+    /// bug that costs money should stop* rather than run away with a customer's
+    /// egress spend on a path that has no human confirm behind it.
+    ///
+    /// An operator setting on the singleton `settings` row rather than an
+    /// environment variable, per CLAUDE.md: the right multiple depends on how
+    /// heterogeneous that instance's spans actually are, which only the operator
+    /// running it can know, and they must be able to widen it — or narrow it —
+    /// without restarting the binary mid-activation.
+    ///
+    /// Below `1.0` every project would pause on its first chunk, and above
+    /// [`MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`] the guard stops being a
+    /// tuning knob and becomes an off switch. The settings write path rejects
+    /// values outside that range, and the effective value is clamped on read
+    /// besides; see [`CloudSettings::effective_bulk_anomaly_factor`].
+    ///
+    /// The schema bounds below are documentation for a client; they are not
+    /// what enforces this. The server validates the range on write.
+    #[serde(default)]
+    #[schema(minimum = 1.0, maximum = 50.0, example = 5.0)]
+    pub telemetry_bulk_anomaly_factor: Option<f32>,
 }
 
 /// Default durable-outbox ceiling: 512 MiB.
@@ -267,6 +325,65 @@ fn default_cloud_telemetry_outbox_max_bytes() -> u64 {
     DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES
 }
 
+/// Default byte-budget anomaly factor for a bulk Cloud activation: **5×**.
+///
+/// # This number is a placeholder, and says so
+///
+/// ADR-042 Open Question 1 asks what multiple of the estimate should pause a
+/// project and answers: *"Needs a number from real backfill data, not a guess."*
+/// No such data exists yet, so rather than hard-code a constant that pretends to
+/// be authoritative this is the *default* of a setting an operator can change —
+/// and the number itself is chosen to be defensible from what is known about how
+/// the estimate is produced:
+///
+/// - `estimate_backfill` extrapolates the whole window from the **first**
+///   `ESTIMATE_SAMPLE_SIZE` (1,000) spans of it, at that project's projection
+///   fidelity. Spans in one project are not uniform — an error span carrying a
+///   stack trace, or a request with many allowlisted attributes, serializes
+///   several times larger than a bare health-check span — so the mean over the
+///   head of a window can legitimately understate the mean over all of it by a
+///   small multiple. A 2× budget would pause a large amount of perfectly valid
+///   work.
+/// - ADR-042 §6.3 says the condition worth stopping for is an estimate *"wrong
+///   by an order of magnitude"*. 5× sits below one order of magnitude, so a
+///   genuine 10×+ over-run still trips it, while ordinary sampling skew does
+///   not.
+/// - The failure modes are asymmetric. Too tight costs an operator a retry
+///   click on a project that stopped early with its cursor intact; too loose
+///   costs a customer money that cannot be given back. When in doubt, stop.
+pub const DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR: f32 = 5.0;
+
+/// Smallest accepted anomaly factor: `1.0`.
+///
+/// A factor below 1 means "pause before the estimate is even reached", which
+/// would stop every project on its first chunk and make a paid-for activation
+/// impossible to complete. Clamped rather than rejected so a hand-written `0`
+/// degrades to "budget equals the estimate" instead of bricking activation.
+pub const MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR: f32 = 1.0;
+
+/// Largest accepted anomaly factor: `50.0`.
+///
+/// The setting exists so an operator can **tune** the guard to how heterogeneous
+/// their spans actually are. It does not exist so the guard can be switched off,
+/// and without a ceiling that is exactly what it becomes: one field on the
+/// settings document, set to `1e12`, silently converts the purchase path — the
+/// path that spends a customer's money with no human confirm — back into an
+/// unbounded one, and nothing on any screen says so.
+///
+/// `50.0` is ten times the default and an order of magnitude past the ADR's own
+/// threshold for "this is a bug, stop" (§6.3: an estimate *"wrong by an order of
+/// magnitude"*). An instance whose real span-size skew exceeds 50× is not one
+/// this guard can usefully bound — the honest answer there is the operator path,
+/// where the estimate is shown and confirmed before anything ships, not a wider
+/// blind budget.
+///
+/// Enforced in two places on purpose, and they are not redundant: the settings
+/// write path **rejects** an out-of-range value with a 400 so the operator finds
+/// out immediately, and [`CloudSettings::effective_bulk_anomaly_factor`] clamps
+/// on read so a row written by an older build, by hand, or by a restore cannot
+/// reach the worker with a value the current build would refuse.
+pub const MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR: f32 = 50.0;
+
 impl Default for CloudSettings {
     fn default() -> Self {
         Self {
@@ -275,6 +392,16 @@ impl Default for CloudSettings {
             backups_enabled: false,
             notifications_enabled: false,
             telemetry_outbox_max_bytes: DEFAULT_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES,
+            // ADR-042 §3: unthrottled by default. "Activate now" is what the
+            // customer paid for, and a throttle nobody asked for makes a long
+            // activation longer for no stated reason.
+            telemetry_bulk_rate_limit_spans_per_sec: None,
+            // ADR-042 §6.3 / Open Question 1: `None` resolves to the documented
+            // default rather than to "no guard at all". The purchase path spends
+            // money with no human confirm, so the guard must be on by default —
+            // an operator opting *into* a safety net they do not know exists is
+            // not a safety net.
+            telemetry_bulk_anomaly_factor: None,
         }
     }
 }
@@ -291,6 +418,46 @@ impl CloudSettings {
     pub fn effective_outbox_max_bytes(&self) -> u64 {
         self.telemetry_outbox_max_bytes
             .max(MIN_CLOUD_TELEMETRY_OUTBOX_MAX_BYTES)
+    }
+
+    /// The effective bulk-activation throttle, with `Some(0)` resolved.
+    ///
+    /// A row written by hand could carry `0`, which read literally means "ship
+    /// zero spans per second" — a job that never finishes while reporting
+    /// itself as running. Treated as "no throttle" here rather than at the call
+    /// site, so the unusable value cannot reach the worker.
+    pub fn effective_bulk_rate_limit_spans_per_sec(&self) -> Option<u32> {
+        self.telemetry_bulk_rate_limit_spans_per_sec
+            .filter(|per_second| *per_second > 0)
+    }
+
+    /// The effective byte-budget anomaly factor, always a usable number.
+    ///
+    /// Unlike the throttle, `None` here does **not** mean "off": an unset value
+    /// is a settings row written by a build that predates the guard, and
+    /// resolving that to "no budget" would silently disable a money guard on
+    /// every existing instance the moment they upgrade. A hand-written `0`,
+    /// negative or non-finite value is clamped to
+    /// [`MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`] for the same reason the
+    /// outbox cap has a floor: an unusable value must never reach the worker.
+    ///
+    /// Clamped at the **top** as well, to
+    /// [`MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR`]. A factor with no ceiling is
+    /// not a tuning knob, it is a way to switch the money guard off from a
+    /// single settings field — and unlike the floor, a value above the ceiling
+    /// fails in the direction that costs a customer money rather than a retry
+    /// click. The write path rejects such a value outright so the operator hears
+    /// about their mistake; this clamp is what protects a row that was written
+    /// before the ceiling existed, edited by hand, or restored from a backup.
+    pub fn effective_bulk_anomaly_factor(&self) -> f32 {
+        match self.telemetry_bulk_anomaly_factor {
+            Some(factor) if factor.is_finite() => factor.clamp(
+                MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+                MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+            ),
+            // Unset, or NaN/infinity from a hand-edited row.
+            _ => DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+        }
     }
 }
 
@@ -1680,6 +1847,157 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── ADR-042 §3: the bulk-activation throttle ──────────────────────
+
+    #[test]
+    fn a_new_instance_runs_bulk_activation_unthrottled() {
+        // "Activate now" is what the customer paid for. A throttle that appears
+        // by default would make every activation slower with nothing on screen
+        // explaining why.
+        assert_eq!(
+            CloudSettings::default().effective_bulk_rate_limit_spans_per_sec(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_settings_row_written_by_an_older_build_has_no_throttle() {
+        // The field is additive, so a row serialized before it existed must
+        // deserialize to "unthrottled" rather than failing the whole settings
+        // read — which would take the settings page down on upgrade.
+        let legacy = r#"{"backend_url":"https://app.temps.sh","telemetry_enabled":true,
+             "backups_enabled":false,"notifications_enabled":false,
+             "telemetry_outbox_max_bytes":536870912}"#;
+        let parsed: CloudSettings =
+            serde_json::from_str(legacy).expect("a legacy row must still parse");
+
+        assert_eq!(parsed.effective_bulk_rate_limit_spans_per_sec(), None);
+        assert!(parsed.telemetry_enabled);
+    }
+
+    #[test]
+    fn a_zero_throttle_reads_as_unthrottled_rather_than_as_a_stalled_job() {
+        // Taken literally, zero spans per second is a job that runs forever
+        // while reporting itself as running — the single worst state for an
+        // operator with nobody to ask.
+        let stalled = CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(stalled.effective_bulk_rate_limit_spans_per_sec(), None);
+    }
+
+    #[test]
+    fn an_operator_set_throttle_is_used_verbatim() {
+        let throttled = CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: Some(5_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            throttled.effective_bulk_rate_limit_spans_per_sec(),
+            Some(5_000)
+        );
+    }
+
+    // ── ADR-042 §6.3: the byte-budget anomaly factor ──────────────────
+
+    #[test]
+    fn a_new_instance_gets_the_documented_anomaly_factor_not_an_unguarded_job() {
+        // The purchase path spends money with no human confirm. The guard must
+        // therefore be on out of the box: an operator opting *into* a safety net
+        // they do not know exists is not a safety net.
+        assert_eq!(
+            CloudSettings::default().effective_bulk_anomaly_factor(),
+            DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+    }
+
+    #[test]
+    fn a_settings_row_written_before_the_guard_existed_still_gets_the_guard() {
+        // The important half of "additive": upgrading must not silently remove
+        // a money guard from every instance that has a settings row already.
+        let legacy = r#"{"backend_url":"https://app.temps.sh","telemetry_enabled":true,
+             "backups_enabled":false,"notifications_enabled":false,
+             "telemetry_outbox_max_bytes":536870912}"#;
+        let parsed: CloudSettings =
+            serde_json::from_str(legacy).expect("a legacy row must still parse");
+
+        assert_eq!(parsed.telemetry_bulk_anomaly_factor, None);
+        assert_eq!(
+            parsed.effective_bulk_anomaly_factor(),
+            DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+    }
+
+    #[test]
+    fn an_operator_set_anomaly_factor_is_used_verbatim() {
+        let tight = CloudSettings {
+            telemetry_bulk_anomaly_factor: Some(2.5),
+            ..Default::default()
+        };
+        assert_eq!(tight.effective_bulk_anomaly_factor(), 2.5);
+    }
+
+    #[test]
+    fn an_unusable_anomaly_factor_is_clamped_rather_than_bricking_activation() {
+        // A factor below 1 pauses every project before it reaches its own
+        // estimate, which would make an activation the customer has already paid
+        // for impossible to finish. NaN/infinity come from a hand-edited row and
+        // must not propagate into a comparison that is false for everything.
+        for unusable in [Some(0.0), Some(-3.0), Some(f32::NAN), Some(f32::INFINITY)] {
+            let settings = CloudSettings {
+                telemetry_bulk_anomaly_factor: unusable,
+                ..Default::default()
+            };
+            let effective = settings.effective_bulk_anomaly_factor();
+            assert!(
+                effective.is_finite() && effective >= MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+                "{unusable:?} resolved to an unusable {effective}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_enormous_anomaly_factor_is_clamped_rather_than_disabling_the_money_guard() {
+        // Without a ceiling, one field on the settings document turns the
+        // purchase path — which spends with no human confirm — back into an
+        // unbounded one, and nothing on any screen says so. The write path
+        // rejects such a value; this clamp is what protects a row that predates
+        // the ceiling, was hand-edited, or came back from a restore.
+        for absurd in [
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR + 1.0,
+            1_000.0,
+            1e12,
+            f32::MAX,
+        ] {
+            let settings = CloudSettings {
+                telemetry_bulk_anomaly_factor: Some(absurd),
+                ..Default::default()
+            };
+            assert_eq!(
+                settings.effective_bulk_anomaly_factor(),
+                MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+                "{absurd} must clamp to the ceiling, not become an off switch"
+            );
+        }
+
+        // The ceiling itself is still usable verbatim — clamping must not make
+        // the widest legitimate setting unreachable.
+        let widest = CloudSettings {
+            telemetry_bulk_anomaly_factor: Some(MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            ..Default::default()
+        };
+        assert_eq!(
+            widest.effective_bulk_anomaly_factor(),
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+        // The ceiling has to leave real headroom above the default, or the
+        // setting stops being a tuning knob at all.
+        const _: () = assert!(
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR > DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR
+        );
+    }
 
     // Issue #478: a project domain must never be allowed to claim the
     // console hostname — doing so locks the operator out of the console and

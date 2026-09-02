@@ -713,6 +713,14 @@ async fn test_delete_alert_rejects_cross_project_rule_id_before_touching_evaluat
             ctx.db.clone(),
         )),
         cloud_link: None,
+        // ADR-042: the activation service is always present so the endpoints
+        // can answer "no job is running" on an instance that never linked
+        // Cloud; the span source and worker are the parts that need a link.
+        bulk_activation: Arc::new(temps_otel::services::CloudBulkActivationService::new(
+            ctx.db.clone(),
+        )),
+        cloud_backfill_source: None,
+        plan_signing_key: Arc::new([0u8; 32]),
     };
 
     let attacker_auth = AuthContext::new_session(attacker_user, Role::Admin);

@@ -23,6 +23,7 @@ use temps_core::{
     MetricsStoreKind, MonitoringSettings, ObservabilityCompressionSettings,
     ObservabilityRetentionSettings, PublicHostnameStrategy, RateLimitSettings, RequestMetadata,
     RequestTimeoutSettings, ScreenshotSettings, SecurityHeadersSettings,
+    MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR, MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
 };
 use tracing::{error, info};
 use utoipa::{OpenApi, ToSchema};
@@ -82,6 +83,74 @@ impl AuditOperation for ClusterCaRotatedAudit {
 impl AuditOperation for SettingsUpdatedAudit {
     fn operation_type(&self) -> String {
         "SETTINGS_UPDATED".to_string()
+    }
+    fn user_id(&self) -> Option<i32> {
+        Some(self.context.user_id)
+    }
+    fn ip_address(&self) -> Option<String> {
+        self.context.ip_address.clone()
+    }
+    fn user_agent(&self) -> &str {
+        &self.context.user_agent
+    }
+    fn serialize(&self) -> anyhow::Result<String> {
+        serde_json::to_string(self)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize audit operation {}", e))
+    }
+}
+
+/// The two ADR-042 §6.3 bulk-activation guard settings, resolved to the values
+/// that would actually be **in effect**.
+///
+/// Effective rather than raw, for both of the jobs this type has. The
+/// permission bar must compare like with like — `None` and `Some(5.0)` are the
+/// same guard, and treating a client that omits the field as "widening from
+/// nothing" would refuse ordinary saves. And the audit record has to name the
+/// number that was really in force, because the point of writing it down is that
+/// somebody months later can say what this instance's spend guard was on a given
+/// day without also having to know which build's defaults applied.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct BulkActivationGuards {
+    anomaly_factor: f32,
+    rate_limit_spans_per_sec: Option<u32>,
+}
+
+impl From<&CloudSettings> for BulkActivationGuards {
+    fn from(cloud: &CloudSettings) -> Self {
+        Self {
+            anomaly_factor: cloud.effective_bulk_anomaly_factor(),
+            rate_limit_spans_per_sec: cloud.effective_bulk_rate_limit_spans_per_sec(),
+        }
+    }
+}
+
+/// `CLOUD_TELEMETRY_BULK_GUARD_UPDATED` — a change to one of ADR-042 §6.3's two
+/// bulk-activation guard settings, carrying the values on both sides.
+///
+/// A separate event from `SETTINGS_UPDATED`, which records only who saved and
+/// from where. That is enough for a presentation setting and not nearly enough
+/// for these two: widening the anomaly factor from 5× to 50× raises the ceiling
+/// on what a purchase-triggered activation may spend without any human
+/// confirming it, and under one undifferentiated `SETTINGS_UPDATED` row it is
+/// indistinguishable from somebody changing the instance's display name. An
+/// audit trail that cannot answer "when did this instance's spend guard change,
+/// and to what" is not an audit trail for a money guard.
+#[derive(Debug, Clone, serde::Serialize)]
+struct CloudTelemetryBulkGuardUpdatedAudit {
+    context: AuditContext,
+    previous_anomaly_factor: f32,
+    new_anomaly_factor: f32,
+    previous_rate_limit_spans_per_sec: Option<u32>,
+    new_rate_limit_spans_per_sec: Option<u32>,
+    /// Whether this change *loosened* the money guard — i.e. raised the anomaly
+    /// factor. Recorded as its own field so the one direction that matters is
+    /// greppable without a reader having to compare two floats themselves.
+    widened_anomaly_factor: bool,
+}
+
+impl AuditOperation for CloudTelemetryBulkGuardUpdatedAudit {
+    fn operation_type(&self) -> String {
+        "CLOUD_TELEMETRY_BULK_GUARD_UPDATED".to_string()
     }
     fn user_id(&self) -> Option<i32> {
         Some(self.context.user_id)
@@ -1898,6 +1967,98 @@ fn validate_monitoring_settings(monitoring: &MonitoringSettings) -> Result<(), P
     Ok(())
 }
 
+/// Reject a bulk-activation anomaly factor outside the supported range.
+///
+/// `effective_bulk_anomaly_factor` clamps on read, so an out-of-range value
+/// could never reach the worker — but silently clamping a write hides the
+/// operator's mistake behind a settings page that echoes back `1000` while the
+/// instance is really running at 50. Worse, it hides it in the one direction
+/// that costs money: an operator who believes they widened the guard to 1000×
+/// and did not is being lied to about their own spend ceiling. Rejecting keeps
+/// the stored value and the effective value the same thing, which is the only
+/// way the page can be trusted.
+fn validate_bulk_activation_guards(cloud: &CloudSettings) -> Result<(), Problem> {
+    let Some(factor) = cloud.telemetry_bulk_anomaly_factor else {
+        // Unset is the documented default, not an out-of-range value.
+        return Ok(());
+    };
+    if !factor.is_finite()
+        || !(MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR..=MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR)
+            .contains(&factor)
+    {
+        return Err(ErrorBuilder::new(StatusCode::BAD_REQUEST)
+            .title("Validation Error")
+            .detail(format!(
+                "cloud.telemetry_bulk_anomaly_factor must be between \
+                 {MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR} and \
+                 {MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR} (got {factor}). This is the multiple \
+                 of its own estimate a project may ship before a bulk Temps Cloud activation \
+                 stops it, so it is a tuning range and not an off switch. A project that needs a \
+                 wider margin than {MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR}x should be activated \
+                 from the Cloud telemetry status card, which estimates it and shows the number \
+                 before anything is sent."
+            ))
+            .value(
+                "minimum",
+                MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR.to_string(),
+            )
+            .value(
+                "maximum",
+                MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR.to_string(),
+            )
+            .build());
+    }
+    Ok(())
+}
+
+/// Confine *widening* the bulk-activation money guard to an instance operator.
+///
+/// Asymmetric on purpose, and the asymmetry is the whole point:
+///
+/// - **Narrowing** it (a smaller factor, a stricter guard) makes an activation
+///   more likely to stop early with its cursor intact. The worst outcome is a
+///   retry click, so ordinary `SettingsWrite` is the right bar — and requiring
+///   more would mean an operator who spots a runaway bill cannot tighten the
+///   guard without finding an administrator first.
+/// - **Widening** it raises the ceiling on what a purchase-triggered activation
+///   may spend with nobody confirming it. That is the same authority the
+///   operator bulk-activation endpoints already reserve to an instance
+///   administrator (`OtelWrite` + instance admin), and it would be incoherent
+///   for `POST /bulk-jobs` to demand it while a `SettingsWrite` holder could
+///   raise the ceiling on the very same spend through the settings document.
+///
+/// Scoped to this one field rather than to the endpoint: tightening the whole
+/// settings PUT to instance-admin would break every unrelated caller that
+/// legitimately holds `SettingsWrite`.
+fn authorize_bulk_activation_guard_change(
+    auth: &temps_auth::AuthContext,
+    previous: BulkActivationGuards,
+    next: BulkActivationGuards,
+) -> Result<(), Problem> {
+    if next.anomaly_factor <= previous.anomaly_factor || auth.is_instance_admin() {
+        return Ok(());
+    }
+    Err(ErrorBuilder::new(StatusCode::FORBIDDEN)
+        .type_("https://temps.sh/probs/insufficient-permissions")
+        .title("Instance Administrator Required")
+        .detail(format!(
+            "Raising cloud.telemetry_bulk_anomaly_factor from {} to {} widens the byte budget a \
+             bulk Temps Cloud telemetry activation may spend on a project before it stops, on a \
+             path that spends without a human confirming it. Loosening that guard is restricted \
+             to an instance administrator, the same bar the bulk activation endpoints \
+             themselves use. Lowering it, or leaving it alone, needs only settings:write.",
+            previous.anomaly_factor, next.anomaly_factor
+        ))
+        .value("required_role", temps_auth::Role::PlatformAdmin.to_string())
+        .value("user_role", auth.effective_role.to_string())
+        .value(
+            "current_anomaly_factor",
+            previous.anomaly_factor.to_string(),
+        )
+        .value("requested_anomaly_factor", next.anomaly_factor.to_string())
+        .build())
+}
+
 fn validate_observability_retention(
     retention: &ObservabilityRetentionSettings,
 ) -> Result<(), Problem> {
@@ -1953,6 +2114,41 @@ async fn update_settings(
     Json(mut settings): Json<AppSettings>,
 ) -> Result<impl IntoResponse, Problem> {
     permission_guard!(auth, SettingsWrite);
+
+    // ADR-042 §6.3: the money guard on bulk Temps Cloud activation. Validated,
+    // authorized and captured here — before any other field is touched — for
+    // three reasons that all need the *previous* value, which a completed save
+    // can no longer produce: an out-of-range factor is refused rather than
+    // silently clamped, widening it needs the same instance-admin bar the bulk
+    // activation endpoints use, and the change is recorded as its own audit
+    // event with both sides.
+    //
+    // A read failure aborts the save. Proceeding would mean applying a
+    // possibly-widened spend ceiling with neither the check nor the record that
+    // are supposed to accompany it.
+    validate_bulk_activation_guards(&settings.cloud)?;
+    let previous_bulk_guards = match app_state.config_service.get_settings().await {
+        Ok(current) => BulkActivationGuards::from(&current.cloud),
+        Err(e) => {
+            error!(
+                "Could not read the current Temps Cloud bulk activation guard settings; \
+                 aborting settings save: {}",
+                e
+            );
+            return Err(ErrorBuilder::new(StatusCode::INTERNAL_SERVER_ERROR)
+                .title("Settings Save Aborted")
+                .detail(format!(
+                    "Could not read the current Temps Cloud bulk activation guard settings, so \
+                     a change to them could be neither authorized nor recorded; the save was \
+                     aborted rather than applied unchecked. Retry the save; if this persists, \
+                     check database connectivity: {}",
+                    e
+                ))
+                .build());
+        }
+    };
+    let next_bulk_guards = BulkActivationGuards::from(&settings.cloud);
+    authorize_bulk_activation_guard_change(&auth, previous_bulk_guards, next_bulk_guards)?;
 
     // If sensitive fields are masked, preserve the existing values
     if let Some(ref key) = settings.dns_provider.cloudflare_api_key {
@@ -2172,6 +2368,42 @@ async fn update_settings(
             };
             if let Err(e) = app_state.audit_service.create_audit_log(&audit).await {
                 error!("Failed to create audit log: {}", e);
+            }
+
+            // ADR-042 §6.3: a change to either bulk-activation guard gets its
+            // own record with both sides, because `SETTINGS_UPDATED` carries no
+            // field-level values and a widened spend ceiling must not be
+            // indistinguishable from an unrelated save.
+            if next_bulk_guards != previous_bulk_guards {
+                let widened = next_bulk_guards.anomaly_factor > previous_bulk_guards.anomaly_factor;
+                info!(
+                    previous_anomaly_factor = previous_bulk_guards.anomaly_factor,
+                    new_anomaly_factor = next_bulk_guards.anomaly_factor,
+                    previous_rate_limit_spans_per_sec =
+                        previous_bulk_guards.rate_limit_spans_per_sec,
+                    new_rate_limit_spans_per_sec = next_bulk_guards.rate_limit_spans_per_sec,
+                    widened,
+                    "Temps Cloud bulk activation guard settings changed"
+                );
+                let guard_audit = CloudTelemetryBulkGuardUpdatedAudit {
+                    context: AuditContext {
+                        user_id: auth.user_id(),
+                        ip_address: Some(metadata.ip_address.clone()),
+                        user_agent: metadata.user_agent.clone(),
+                    },
+                    previous_anomaly_factor: previous_bulk_guards.anomaly_factor,
+                    new_anomaly_factor: next_bulk_guards.anomaly_factor,
+                    previous_rate_limit_spans_per_sec: previous_bulk_guards
+                        .rate_limit_spans_per_sec,
+                    new_rate_limit_spans_per_sec: next_bulk_guards.rate_limit_spans_per_sec,
+                    widened_anomaly_factor: widened,
+                };
+                if let Err(e) = app_state.audit_service.create_audit_log(&guard_audit).await {
+                    error!(
+                        "Failed to create the Temps Cloud bulk activation guard audit log: {}",
+                        e
+                    );
+                }
             }
 
             Ok((
@@ -2502,6 +2734,192 @@ mod tests {
             created_at: now,
             updated_at: now,
         }
+    }
+
+    // ── ADR-042 §6.3 review, Finding 2: the bulk-activation money guard ──
+
+    fn guard_principal(role: temps_auth::Role) -> temps_auth::AuthContext {
+        temps_auth::AuthContext::new_session(rotation_test_user(false), role)
+    }
+
+    fn cloud_with_factor(factor: Option<f32>) -> CloudSettings {
+        CloudSettings {
+            telemetry_bulk_anomaly_factor: factor,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_anomaly_factor_above_the_ceiling_is_rejected_rather_than_silently_clamped() {
+        // Clamping on read alone would leave the settings page echoing back a
+        // number that is not in force — and lying in the one direction that
+        // costs money, because the operator would believe they had widened the
+        // spend guard when they had not.
+        for absurd in [
+            MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR + 0.5,
+            1_000.0,
+            f32::INFINITY,
+            f32::NAN,
+        ] {
+            let problem = validate_bulk_activation_guards(&cloud_with_factor(Some(absurd)))
+                .expect_err("an out-of-range factor must be refused");
+            assert_eq!(
+                problem.status_code,
+                StatusCode::BAD_REQUEST,
+                "{absurd} must be a 400"
+            );
+            let body = format!("{problem:?}");
+            assert!(body.contains("telemetry_bulk_anomaly_factor"), "{body}");
+            // The operator must learn the range *and* what to do when their
+            // project genuinely needs a wider margin than the ceiling allows.
+            assert!(body.contains("maximum"), "{body}");
+            assert!(body.contains("Cloud telemetry status card"), "{body}");
+        }
+    }
+
+    #[test]
+    fn a_factor_below_the_floor_is_rejected_too_and_the_whole_range_is_accepted() {
+        assert_eq!(
+            validate_bulk_activation_guards(&cloud_with_factor(Some(0.5)))
+                .expect_err("below the floor every project pauses on its first chunk")
+                .status_code,
+            StatusCode::BAD_REQUEST
+        );
+
+        for usable in [
+            None,
+            Some(MIN_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            Some(temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+            Some(MAX_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR),
+        ] {
+            assert!(
+                validate_bulk_activation_guards(&cloud_with_factor(usable)).is_ok(),
+                "{usable:?} is inside the tuning range and must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn widening_the_money_guard_needs_an_instance_admin_but_narrowing_does_not() {
+        let previous = BulkActivationGuards::from(&cloud_with_factor(Some(5.0)));
+        let wider = BulkActivationGuards::from(&cloud_with_factor(Some(40.0)));
+        let narrower = BulkActivationGuards::from(&cloud_with_factor(Some(2.0)));
+
+        // A settings:write holder who is not an instance admin may tighten the
+        // guard — an operator watching a bill run away must never have to find
+        // an administrator before they can stop it — but not loosen it.
+        let ordinary = guard_principal(temps_auth::Role::User);
+        assert!(authorize_bulk_activation_guard_change(&ordinary, previous, narrower).is_ok());
+        assert!(authorize_bulk_activation_guard_change(&ordinary, previous, previous).is_ok());
+
+        let refused = authorize_bulk_activation_guard_change(&ordinary, previous, wider)
+            .expect_err("loosening the money guard is an instance-admin action");
+        assert_eq!(refused.status_code, StatusCode::FORBIDDEN);
+        let body = format!("{refused:?}");
+        assert!(body.contains("required_role"), "{body}");
+        assert!(body.contains("requested_anomaly_factor"), "{body}");
+
+        // The bar the operator bulk-activation endpoints already use.
+        for role in [temps_auth::Role::Admin, temps_auth::Role::PlatformAdmin] {
+            assert!(
+                authorize_bulk_activation_guard_change(
+                    &guard_principal(role.clone()),
+                    previous,
+                    wider
+                )
+                .is_ok(),
+                "{role} runs the instance and may widen its own spend guard"
+            );
+        }
+    }
+
+    #[test]
+    fn omitting_the_factor_is_not_treated_as_a_change_let_alone_a_widening() {
+        // The settings PUT replaces the whole document, so a client built before
+        // this field existed sends `None`. `None` and `Some(5.0)` are the same
+        // guard, and refusing every such save with a 403 would break every
+        // unrelated settings write on the instance.
+        let unset = BulkActivationGuards::from(&cloud_with_factor(None));
+        let explicit_default = BulkActivationGuards::from(&cloud_with_factor(Some(
+            temps_core::DEFAULT_CLOUD_TELEMETRY_BULK_ANOMALY_FACTOR,
+        )));
+
+        assert_eq!(unset, explicit_default);
+        assert!(authorize_bulk_activation_guard_change(
+            &guard_principal(temps_auth::Role::User),
+            unset,
+            explicit_default
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn a_guard_change_is_audited_with_both_sides_and_the_direction() {
+        // `SETTINGS_UPDATED` carries no field-level values, so under it alone a
+        // widened spend ceiling is indistinguishable from a display-name change.
+        let event = CloudTelemetryBulkGuardUpdatedAudit {
+            context: AuditContext {
+                user_id: 71,
+                ip_address: Some("127.0.0.1".to_string()),
+                user_agent: "test".to_string(),
+            },
+            previous_anomaly_factor: 5.0,
+            new_anomaly_factor: 40.0,
+            previous_rate_limit_spans_per_sec: Some(5_000),
+            new_rate_limit_spans_per_sec: None,
+            widened_anomaly_factor: true,
+        };
+
+        assert_eq!(
+            AuditOperation::operation_type(&event),
+            "CLOUD_TELEMETRY_BULK_GUARD_UPDATED"
+        );
+        let serialized = AuditOperation::serialize(&event).expect("must serialize");
+        assert!(
+            serialized.contains("\"previous_anomaly_factor\":5.0"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"new_anomaly_factor\":40.0"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"previous_rate_limit_spans_per_sec\":5000"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"new_rate_limit_spans_per_sec\":null"),
+            "{serialized}"
+        );
+        assert!(
+            serialized.contains("\"widened_anomaly_factor\":true"),
+            "{serialized}"
+        );
+    }
+
+    #[test]
+    fn a_throttle_change_alone_is_still_a_recordable_guard_change() {
+        // The rate limit is the other half of what governs how fast a paid-for
+        // activation spends. A change to it with the factor untouched must not
+        // fall through the "did anything change" check.
+        let previous = BulkActivationGuards::from(&CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: Some(1_000),
+            ..Default::default()
+        });
+        let next = BulkActivationGuards::from(&CloudSettings {
+            telemetry_bulk_rate_limit_spans_per_sec: None,
+            ..Default::default()
+        });
+
+        assert_ne!(previous, next);
+        // …and removing a throttle is not a widening of the money guard, so it
+        // stays under ordinary settings:write.
+        assert!(authorize_bulk_activation_guard_change(
+            &guard_principal(temps_auth::Role::User),
+            previous,
+            next
+        )
+        .is_ok());
     }
 
     fn disconnected_authorizer() -> temps_auth::DefaultSensitiveActionAuthorizer {

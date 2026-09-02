@@ -6,8 +6,10 @@ import {
   enrollCloudMutation,
   getCloudCapabilityOptions,
   getCloudStatusOptions,
+  reconcileCloudBackupSourceMutation,
   updateCloudFeaturesMutation,
 } from '@/api/client/@tanstack/react-query.gen'
+import type { ManagedBackupSetup } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent } from '@/components/ui/card'
@@ -24,10 +26,13 @@ import {
   AlertCircle,
   Bell,
   Check,
+  CheckCircle2,
   Cloud,
   DatabaseBackup,
+  ExternalLink,
   Loader2,
   Radio,
+  RefreshCw,
   ShieldCheck,
   Unplug,
 } from 'lucide-react'
@@ -61,6 +66,9 @@ export function CloudSettingsPage() {
   const enroll = useMutation(enrollCloudMutation())
   const disconnect = useMutation(disconnectCloudMutation())
   const updateFeatures = useMutation(updateCloudFeaturesMutation())
+  const reconcileBackupSource = useMutation(
+    reconcileCloudBackupSourceMutation()
+  )
   const form = useForm<EnrollmentForm>({
     resolver: zodResolver(enrollmentSchema),
     defaultValues: { enrollmentCode: '' },
@@ -78,6 +86,7 @@ export function CloudSettingsPage() {
   const stateUnreadable = status.data?.status === 'state_unreadable'
   const degraded = connected && status.data?.health !== 'healthy'
   const cloudConsoleUrl = status.data?.backend_url ?? 'https://app.temps.sh'
+  const cloudBillingUrl = `${cloudConsoleUrl.replace(/\/+$/, '')}/billing`
   const refresh = () =>
     Promise.all([
       queryClient.invalidateQueries({
@@ -129,6 +138,30 @@ export function CloudSettingsPage() {
     } catch (error) {
       toast.error(
         getErrorMessage(error, `Could not update ${label.toLowerCase()}`)
+      )
+    }
+  }
+
+  const retryBackupSource = async () => {
+    try {
+      const managedBackupSetup = await reconcileBackupSource.mutateAsync({})
+      if (status.data) {
+        queryClient.setQueryData(getCloudStatusOptions().queryKey, {
+          ...status.data,
+          managed_backup_setup: managedBackupSetup,
+        })
+      }
+
+      if (managedBackupSetup.ready) {
+        toast.success('Managed backup source is ready')
+      } else if (managedBackupSetup.action === 'renew_subscription') {
+        toast.error('Renew the Cloud subscription to resume backup uploads')
+      } else {
+        toast.error(managedBackupSetup.message)
+      }
+    } catch (error) {
+      toast.error(
+        getErrorMessage(error, 'Could not retry managed backup setup')
       )
     }
   }
@@ -337,6 +370,14 @@ export function CloudSettingsPage() {
                     )
                   }
                 />
+                {status.data?.managed_backup_setup ? (
+                  <BackupSourceStatus
+                    setup={status.data.managed_backup_setup}
+                    cloudBillingUrl={cloudBillingUrl}
+                    isRetrying={reconcileBackupSource.isPending}
+                    onRetry={() => void retryBackupSource()}
+                  />
+                ) : null}
                 <FeatureToggle
                   icon={<Bell />}
                   label="Send notifications through Cloud"
@@ -461,6 +502,83 @@ export function CloudSettingsPage() {
           </aside>
         </div>
       )}
+    </div>
+  )
+}
+
+function BackupSourceStatus({
+  setup,
+  cloudBillingUrl,
+  isRetrying,
+  onRetry,
+}: {
+  setup: ManagedBackupSetup
+  cloudBillingUrl: string
+  isRetrying: boolean
+  onRetry: () => void
+}) {
+  const subscriptionRequired = setup.status === 'subscription_required'
+  const ready = setup.status === 'ready'
+  const retryable =
+    setup.status === 'needs_setup' || setup.status === 'unavailable'
+  const alertVariant = subscriptionRequired
+    ? 'warning'
+    : retryable
+      ? 'destructive'
+      : 'default'
+
+  let title = 'Managed backup source disabled'
+  if (ready) title = 'Managed backup source ready'
+  if (retryable) title = 'Managed backup source needs attention'
+  if (subscriptionRequired) title = 'Cloud subscription required'
+
+  return (
+    <div className="py-4 pl-10" aria-live="polite">
+      <Alert
+        variant={alertVariant}
+        className={
+          ready
+            ? 'border-emerald-500/30 bg-emerald-500/5 [&>svg]:text-emerald-500'
+            : undefined
+        }
+      >
+        {ready ? (
+          <CheckCircle2 className="size-4" />
+        ) : setup.status === 'disabled' ? (
+          <DatabaseBackup className="size-4" />
+        ) : (
+          <AlertCircle className="size-4" />
+        )}
+        <AlertTitle>{title}</AlertTitle>
+        <AlertDescription className="space-y-3">
+          <p>{setup.message}</p>
+          {subscriptionRequired ? (
+            <div className="space-y-3">
+              <p>
+                Local backups remain available. Managed uploads resume after the
+                Temps Cloud subscription is renewed.
+              </p>
+              <Button asChild size="sm">
+                <a href={cloudBillingUrl} target="_blank" rel="noreferrer">
+                  Renew subscription <ExternalLink className="size-3.5" />
+                </a>
+              </Button>
+            </div>
+          ) : null}
+          {retryable || ready ? (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              onClick={onRetry}
+              disabled={isRetrying}
+            >
+              <RefreshCw className={isRetrying ? 'animate-spin' : undefined} />
+              {ready ? 'Check again' : 'Retry setup'}
+            </Button>
+          ) : null}
+        </AlertDescription>
+      </Alert>
     </div>
   )
 }

@@ -145,4 +145,26 @@ pub struct OtelAppState {
     /// to "not linked" — the safe answer, and the one that produces an
     /// onboarding state rather than an error.
     pub cloud_link: Option<std::sync::Arc<temps_cloud_client::CloudLink>>,
+    /// Durable state of bulk Cloud-telemetry activation jobs (ADR-042 §8).
+    ///
+    /// Required rather than optional, for the same reason
+    /// `telemetry_write_modes` is: the activation card renders on every
+    /// instance, including one that has never linked Cloud, and an endpoint
+    /// that sometimes cannot answer "is an activation running" would make that
+    /// impossible.
+    pub bulk_activation: std::sync::Arc<crate::services::CloudBulkActivationService>,
+    /// Where an activation estimate reads local span history from.
+    ///
+    /// The same source the worker ships from — chosen once, so the quote and
+    /// the shipment can never disagree about which table holds the history.
+    /// `None` on a build with no Cloud link, where the estimate answers
+    /// `configured: false` rather than erroring.
+    pub cloud_backfill_source: Option<std::sync::Arc<crate::services::CloudBackfillSource>>,
+    /// HMAC key for the ADR-042 `plan_token`, derived from the instance's
+    /// master encryption key under its own domain.
+    ///
+    /// Derived rather than generated per process so an operator who reads an
+    /// estimate, gets interrupted and comes back inside the token's TTL is not
+    /// forced to re-estimate by an unrelated restart.
+    pub plan_signing_key: std::sync::Arc<[u8; 32]>,
 }

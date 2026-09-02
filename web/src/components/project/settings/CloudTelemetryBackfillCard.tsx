@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
 import { ProjectResponse } from '@/api/client'
+import { getCurrentBulkActivationJobOptions } from '@/api/client/@tanstack/react-query.gen'
+import type { BulkActivationJobProjectResponse } from '@/api/client/types.gen'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
@@ -20,9 +22,14 @@ import {
   getCloudBackfillStatusOptions,
   isBackfillStalled,
 } from '@/lib/cloud-telemetry-backfill'
+import { PROJECT_STATUS_HINTS } from '@/lib/cloud-telemetry-activation'
 import { useQuery } from '@tanstack/react-query'
-import { AlertCircle, Cloud } from 'lucide-react'
+import { AlertCircle, ArrowRight, Cloud, Layers } from 'lucide-react'
 import { Link } from 'react-router'
+
+/** Where the instance-wide activation section lives (ADR-042 §11). */
+const ACTIVATION_SECTION_PATH =
+  '/settings/otel-pipeline#cloud-telemetry-activation'
 
 /**
  * Progress of the Temps Cloud telemetry backfill for this project (ADR-040 §1).
@@ -53,6 +60,22 @@ export function CloudTelemetryBackfillCard({
     getCloudBackfillStatusOptions(project?.id ?? undefined)
   )
 
+  // A running backfill this project's own settings page never started is the
+  // confusing case, so that is the only case worth asking about. The per-project
+  // status carries no `bulk_job_id`, so membership is derived from the
+  // instance-wide job's project list. The endpoint is instance-admin only: a
+  // `403` simply leaves the note off, which is the same view as before.
+  const { data: bulkJob } = useQuery({
+    ...getCurrentBulkActivationJobOptions(),
+    enabled: data?.status === 'running',
+    retry: false,
+    refetchInterval: 30_000,
+  })
+
+  const bulkJobProject = bulkJob?.projects.find(
+    (row) => row.project_id === project?.id
+  )
+
   return (
     <Card className="bg-background text-foreground">
       <CardHeader>
@@ -73,6 +96,8 @@ export function CloudTelemetryBackfillCard({
           error={error}
           data={data}
           onRetry={() => void refetch()}
+          bulkJobId={bulkJobProject ? (bulkJob?.batch_id ?? null) : null}
+          bulkJobProject={bulkJobProject}
         />
       </CardContent>
     </Card>
@@ -85,12 +110,17 @@ function BackfillBody({
   error,
   data,
   onRetry,
+  bulkJobId,
+  bulkJobProject,
 }: {
   isPending: boolean
   isError: boolean
   error: unknown
   data: CloudBackfillStatusResponse | undefined
   onRetry: () => void
+  /** The bulk activation that owns this backfill, when one does. */
+  bulkJobId: string | null
+  bulkJobProject: BulkActivationJobProjectResponse | undefined
 }) {
   if (isPending) {
     // Skeletons that match the real layout, so the card does not collapse and
@@ -130,13 +160,55 @@ function BackfillBody({
         </span>
       </div>
 
+      {bulkJobId && bulkJobProject && (
+        <PartOfBulkActivation batchId={bulkJobId} row={bulkJobProject} />
+      )}
+
       {!data.backfill_available && <NotOptedIn status={data} />}
       {data.status === 'running' && <RunningProgress status={data} />}
       {data.status === 'completed' && <Completed status={data} />}
       {data.status === 'failed' && <Failed status={data} />}
 
-      <CommandBlock status={data} />
+      <CommandBlock status={data} ownedByBulkJob={!!bulkJobProject} />
     </div>
+  )
+}
+
+/**
+ * Says out loud that this run belongs to an instance-wide activation.
+ *
+ * Without it, a project whose backfill someone else queued reads as
+ * "already running" with no explanation, and the obvious next move — running
+ * the CLI command below — would contend with the job that is already doing it.
+ */
+function PartOfBulkActivation({
+  batchId,
+  row,
+}: {
+  batchId: string
+  row: BulkActivationJobProjectResponse
+}) {
+  return (
+    <Alert>
+      <Layers className="h-4 w-4" aria-hidden="true" />
+      <AlertTitle>Part of a bulk Cloud activation</AlertTitle>
+      <AlertDescription className="space-y-3">
+        <p>
+          This backfill was not started for this project on its own — it is one
+          step of an instance-wide activation ({row.status}).{' '}
+          {PROJECT_STATUS_HINTS[row.status]}
+        </p>
+        <p className="font-mono text-xs break-all text-muted-foreground">
+          Activation {batchId}
+        </p>
+        <Button asChild variant="outline" size="sm" className="gap-1.5">
+          <Link to={ACTIVATION_SECTION_PATH}>
+            See the whole activation
+            <ArrowRight className="size-3.5" />
+          </Link>
+        </Button>
+      </AlertDescription>
+    </Alert>
   )
 }
 
@@ -264,13 +336,21 @@ function Failed({ status }: { status: CloudBackfillStatusResponse }) {
  * The command, in every state. This is the only place an operator can discover
  * that the capability exists at all, so it is never hidden behind a state.
  */
-function CommandBlock({ status }: { status: CloudBackfillStatusResponse }) {
+function CommandBlock({
+  status,
+  ownedByBulkJob,
+}: {
+  status: CloudBackfillStatusResponse
+  ownedByBulkJob: boolean
+}) {
   return (
     <div className="space-y-2">
       <p className="text-sm font-medium">
-        {status.status === 'not_started'
-          ? 'Run this on the instance to start a backfill'
-          : 'Run this on the instance to start another backfill'}
+        {ownedByBulkJob
+          ? 'Running this while the activation is in flight would duplicate work'
+          : status.status === 'not_started'
+            ? 'Run this on the instance to start a backfill'
+            : 'Run this on the instance to start another backfill'}
       </p>
       <div className="flex items-start gap-2 rounded-lg border bg-muted/40 p-3">
         <code className="min-w-0 flex-1 font-mono text-xs break-all">

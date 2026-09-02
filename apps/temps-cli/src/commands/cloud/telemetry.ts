@@ -35,6 +35,7 @@ import {
   success,
   warning,
 } from '../../ui/output.js'
+import { registerCloudTelemetryBulkCommands } from './bulk-activation.js'
 
 // ── Shapes ─────────────────────────────────────────────────────────────────
 
@@ -508,6 +509,11 @@ export function registerCloudTelemetryCommands(cloud: Command): void {
     )
     .option('--json', 'Output in JSON format')
     .action(telemetryStatus)
+
+  // ADR-042 §10: the many-projects-at-once path. Registered on the same
+  // `telemetry` command as the single-project controls above, so an operator
+  // who found one has found the other.
+  registerCloudTelemetryBulkCommands(telemetry)
 
   telemetry.addHelpText(
     'after',

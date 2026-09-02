@@ -102,6 +102,13 @@ pub struct Model {
     /// Why the last run stopped, when `status` is `failed`. Verbatim, because
     /// a self-hosted operator has nobody to ask what a generic failure meant.
     pub last_error: Option<String>,
+    /// The bulk activation job driving this run, when one is (ADR-042 §6/§8).
+    ///
+    /// `None` for a run started by `temps backfill cloud-telemetry`, which is
+    /// still the offline/recovery tool and is unchanged. The per-project
+    /// backfill card reads this so a project's progress is never mysteriously
+    /// "already running" with no explanation of who started it.
+    pub bulk_job_id: Option<Uuid>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

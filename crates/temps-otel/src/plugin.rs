@@ -18,6 +18,7 @@ use utoipa::OpenApi as OpenApiTrait;
 use crate::anomaly::detector::{AnomalyDetector, AnomalyDetectorConfig};
 use crate::handlers;
 use crate::handlers::cloud_backfill_handler;
+use crate::handlers::cloud_bulk_activation_handler;
 use crate::handlers::cloud_telemetry_handler;
 use crate::handlers::dashboard_handler;
 use crate::handlers::facet_handler;
@@ -337,6 +338,11 @@ fn pipeline_stat_deltas(
         cloud_telemetry_handler::get_cloud_telemetry_status,
         cloud_telemetry_handler::get_project_cloud_telemetry,
         cloud_telemetry_handler::update_project_cloud_telemetry,
+        cloud_bulk_activation_handler::estimate_bulk_activation,
+        cloud_bulk_activation_handler::create_bulk_activation_job,
+        cloud_bulk_activation_handler::get_bulk_activation_job,
+        cloud_bulk_activation_handler::get_current_bulk_activation_job,
+        cloud_bulk_activation_handler::cancel_bulk_activation_job,
         query_handler::get_pipeline_stats,
         query_handler::get_ingest_errors,
         query_handler::get_pipeline_history,
@@ -423,6 +429,16 @@ fn pipeline_stat_deltas(
             cloud_telemetry_handler::TelemetryWriteIntervalResponse,
             temps_entities::cloud_telemetry_write_mode::CloudTelemetryWriteMode,
             temps_entities::project_telemetry_write_intervals::TelemetryWriteIntervalReason,
+            cloud_bulk_activation_handler::EstimateBulkActivationRequest,
+            cloud_bulk_activation_handler::BulkActivationEstimateResponse,
+            cloud_bulk_activation_handler::BulkActivationProjectEstimateResponse,
+            cloud_bulk_activation_handler::CreateBulkActivationJobRequest,
+            cloud_bulk_activation_handler::BulkActivationJobResponse,
+            cloud_bulk_activation_handler::BulkActivationJobProjectResponse,
+            cloud_bulk_activation_handler::BulkActivationEtaState,
+            temps_entities::cloud_telemetry_bulk_jobs::BulkJobStatus,
+            temps_entities::cloud_telemetry_bulk_jobs::BulkJobTrigger,
+            temps_entities::cloud_telemetry_bulk_job_projects::BulkJobProjectStatus,
             facet_handler::CreateFacetRequest,
             facet_handler::FacetsResponse,
             crate::services::facet_service::FacetCapability,
@@ -778,7 +794,7 @@ impl TempsPlugin for OtelPlugin {
                     config.max_concurrent_ingest_requests,
                 )
                 .with_cloud_link(context.require_service::<temps_cloud_client::CloudLink>())
-                .with_cloud_policy_cache(cloud_policy_cache)
+                .with_cloud_policy_cache(cloud_policy_cache.clone())
                 .with_write_mode_service(telemetry_write_modes.clone());
                 if let Some(outbox) = span_outbox.clone() {
                     service = service.with_span_outbox(outbox);
@@ -929,6 +945,77 @@ impl TempsPlugin for OtelPlugin {
                 ))
             };
 
+            // ── ADR-042 §8/§9: bulk Cloud activation state ────────────────
+            //
+            // Registered unconditionally so P2's endpoints and P3's enroll hook
+            // have a service to call, and so an instance can *read* a job's
+            // history whether or not a link exists today. The worker below is
+            // the part that needs a link.
+            let bulk_activation =
+                Arc::new(crate::services::CloudBulkActivationService::new(db.clone()));
+            context.register_service(bulk_activation.clone());
+
+            // The span source an activation estimate reads history from, and
+            // the one its worker ships from — built once and shared, so a quote
+            // and the shipment it authorizes can never disagree about which
+            // table holds the history. Reading an empty `otel_spans` on a
+            // ClickHouse instance would quote "0 spans" and look like success.
+            //
+            // Only with a Cloud link: without one there is nowhere to activate
+            // to, and the estimate endpoint answers `configured: false`.
+            let cloud_backfill_source = cloud_link.as_ref().map(|_| {
+                Arc::new(match read_clickhouse_otel_config_from_env() {
+                    Some(cfg) => crate::services::CloudBackfillSource::ClickHouse(Arc::new(
+                        ::clickhouse::Client::default()
+                            .with_url(&cfg.url)
+                            .with_database(&cfg.database)
+                            .with_user(&cfg.user)
+                            .with_password(&cfg.password),
+                    )),
+                    None => crate::services::CloudBackfillSource::Timescale(db.clone()),
+                })
+            });
+
+            // ── ADR-042 P3: the purchase-triggered activation seam ────────
+            //
+            // Registered as `Arc<dyn CloudTelemetryActivationTrigger>` so
+            // `POST /cloud/enroll` can start the activation the customer just
+            // paid for without `temps-cloud` depending on this crate. Registered
+            // only alongside a link and a span source, which is exactly when
+            // there is somewhere to activate to and something to ship — with
+            // neither, enroll behaves precisely as it did before, which is what
+            // ADR-042's enroll-path coupling risk requires.
+            //
+            // This is the **only** registration of the purchase path. There is
+            // no HTTP route for it: the sole caller is enrollment itself
+            // (ADR-042 §9), and the operator path keeps its `plan_token` gate.
+            if let (Some(link), Some(source)) = (cloud_link.clone(), cloud_backfill_source.clone())
+            {
+                let trigger = Arc::new(crate::services::PurchaseActivationTrigger::new(
+                    bulk_activation.clone(),
+                    telemetry_write_modes.clone(),
+                    cloud_policy_cache.clone(),
+                    link,
+                    source,
+                    // The same "everything local storage holds" the operator
+                    // path defaults to, from one place, so the two cannot
+                    // disagree about how far back an activation reaches.
+                    crate::handlers::cloud_telemetry_handler::local_retention_days(),
+                ));
+                context.register_service(
+                    trigger as Arc<dyn temps_core::CloudTelemetryActivationTrigger>,
+                );
+            }
+
+            // The `plan_token` signing key (ADR-042 §9). Its own `derive_subkey`
+            // domain, so a signature minted for an activation plan can never be
+            // confused with any other HMAC on this instance.
+            let plan_signing_key = Arc::new(
+                context
+                    .require_service::<temps_core::EncryptionService>()
+                    .derive_subkey(crate::services::PLAN_TOKEN_KEY_DOMAIN),
+            );
+
             // Create app state for handlers. The `project_access_checker` is
             // injected in `configure_routes` (after all services register).
             let app_state = OtelAppState {
@@ -947,6 +1034,9 @@ impl TempsPlugin for OtelPlugin {
                 cloud_backfill_progress: cloud_backfill_progress.clone(),
                 telemetry_write_modes: telemetry_write_modes.clone(),
                 cloud_link: cloud_link.clone(),
+                bulk_activation: bulk_activation.clone(),
+                cloud_backfill_source: cloud_backfill_source.clone(),
+                plan_signing_key,
             };
             context.register_service(Arc::new(app_state.clone()));
 
@@ -1012,6 +1102,60 @@ impl TempsPlugin for OtelPlugin {
                         cancel_rx,
                     )
                     .await;
+                });
+            }
+
+            // ── ADR-042 §2: the bulk Cloud activation worker ───────────────
+            //
+            // Spawned alongside — never instead of — the outbox worker above.
+            // The two never overlap on the wire: the link hands out one
+            // submission scope at a time, globally (ADR-042 P0), so a bulk
+            // backfill and the live Cloud-primary drain interleave between
+            // chunks rather than competing (ADR-042 §3, "the live outbox always
+            // wins").
+            //
+            // Only with a Cloud link: without one there is nowhere to activate
+            // to, and a poll loop that can never find eligible work is pure
+            // cost on a 4 GB box.
+            if let (Some(link), Some(backfill_source)) =
+                (cloud_link.clone(), cloud_backfill_source.clone())
+            {
+                let mut worker = crate::services::CloudBulkActivationWorker::new(
+                    bulk_activation.clone(),
+                    link,
+                    telemetry_write_modes.clone(),
+                    cloud_policy_cache.clone(),
+                    cloud_backfill_progress.clone(),
+                    backfill_source,
+                );
+
+                // ADR-042 §3: `rate_limit_spans_per_sec` lives on the singleton
+                // `settings` row, and the worker re-reads it per project. That
+                // is the whole point of it not being an environment variable —
+                // an operator who finds an activation competing with their own
+                // read IO can throttle it without stopping a job they have
+                // already paid for.
+                if let Some(config) = context.get_service::<temps_config::ConfigService>() {
+                    worker = worker
+                        .with_rate_limits(Arc::new(SettingsBulkRateLimit {
+                            config: config.clone(),
+                        }))
+                        // ADR-042 §6.3: the byte-budget guard, on the same
+                        // runtime-settable footing. Its *absence* is never a
+                        // state the worker can be in — a missing settings
+                        // service leaves the compiled default in place, not "no
+                        // budget" — but wiring it is what lets an operator widen
+                        // a budget that is wrong for their spans without
+                        // stopping an activation they have already paid for.
+                        .with_anomaly_factors(Arc::new(SettingsBulkAnomalyFactor { config }));
+                }
+
+                let (cancel, cancel_rx) = tokio::sync::watch::channel(false);
+                tokio::spawn(async move {
+                    // Same ownership shape as the outbox worker: the sender
+                    // lives exactly as long as the loop that reads it.
+                    let _cancel = cancel;
+                    crate::services::cloud_bulk_activation_worker::run(worker, cancel_rx).await;
                 });
             }
 
@@ -1499,6 +1643,48 @@ impl temps_cloud_client::OutboxCapSource for SettingsOutboxCap {
             .await
             .ok()
             .map(|settings| settings.cloud.effective_outbox_max_bytes())
+    }
+}
+
+/// ADR-042 §3's bulk-activation throttle, read from the singleton `settings`
+/// row each time the worker picks up a project.
+struct SettingsBulkRateLimit {
+    config: Arc<temps_config::ConfigService>,
+}
+
+#[async_trait::async_trait]
+impl crate::services::BulkRateLimitSource for SettingsBulkRateLimit {
+    async fn bulk_rate_limit_spans_per_sec(&self) -> Option<u32> {
+        // A failed read yields `None`, which the worker treats as "unthrottled"
+        // — the same answer a fresh instance gives. Inventing a throttle
+        // because a database read blipped would silently change how fast the
+        // customer's money is being spent.
+        self.config
+            .get_settings()
+            .await
+            .ok()
+            .and_then(|settings| settings.cloud.effective_bulk_rate_limit_spans_per_sec())
+    }
+}
+
+/// ADR-042 §6.3's byte-budget anomaly factor, read from the singleton `settings`
+/// row each time the worker picks up a project.
+struct SettingsBulkAnomalyFactor {
+    config: Arc<temps_config::ConfigService>,
+}
+
+#[async_trait::async_trait]
+impl crate::services::BulkAnomalyFactorSource for SettingsBulkAnomalyFactor {
+    async fn bulk_anomaly_factor(&self) -> Option<f32> {
+        // `None` means "could not read", and the worker answers that by keeping
+        // its configured factor. It must never mean "no guard": a database blip
+        // is not consent to spend without a budget on a path that has no human
+        // confirm behind it.
+        self.config
+            .get_settings()
+            .await
+            .ok()
+            .map(|settings| settings.cloud.effective_bulk_anomaly_factor())
     }
 }
 

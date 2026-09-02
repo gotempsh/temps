@@ -36,6 +36,8 @@ pub mod cloud_backup_mirror_cursors;
 pub mod cloud_backup_mirror_states;
 pub mod cloud_span_outbox;
 pub mod cloud_telemetry_backfills;
+pub mod cloud_telemetry_bulk_job_projects;
+pub mod cloud_telemetry_bulk_jobs;
 pub mod cloud_telemetry_fidelity;
 pub mod cloud_telemetry_write_mode;
 pub mod cron_executions;

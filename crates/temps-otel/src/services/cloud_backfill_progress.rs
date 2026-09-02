@@ -123,6 +123,44 @@ impl CloudBackfillProgressService {
         window_from: DBDateTime,
         window_to: DBDateTime,
     ) -> Result<BackfillProgress, CloudBackfillProgressError> {
+        self.start_inner(project_id, spans_total, window_from, window_to, None)
+            .await
+    }
+
+    /// Mark a run as started on behalf of a bulk activation job (ADR-042 §6).
+    ///
+    /// Same row, same semantics — the bulk engine reuses this surface rather
+    /// than duplicating it — with the job id attached so the per-project card
+    /// can explain *who* started the run it is displaying.
+    pub async fn start_for_bulk_job(
+        &self,
+        project_id: i32,
+        spans_total: u64,
+        window_from: DBDateTime,
+        window_to: DBDateTime,
+        bulk_job_id: uuid::Uuid,
+    ) -> Result<BackfillProgress, CloudBackfillProgressError> {
+        self.start_inner(
+            project_id,
+            spans_total,
+            window_from,
+            window_to,
+            Some(bulk_job_id),
+        )
+        .await
+    }
+
+    /// `bulk_job_id` is always written, never left alone: a CLI run that
+    /// follows a bulk run must clear the stale job id rather than inherit it
+    /// and claim a job it has nothing to do with.
+    async fn start_inner(
+        &self,
+        project_id: i32,
+        spans_total: u64,
+        window_from: DBDateTime,
+        window_to: DBDateTime,
+        bulk_job_id: Option<uuid::Uuid>,
+    ) -> Result<BackfillProgress, CloudBackfillProgressError> {
         let now = chrono::Utc::now();
         let spans_total = clamp_to_i64(spans_total);
         self.upsert(
@@ -135,6 +173,7 @@ impl CloudBackfillProgressService {
             Some(now),
             None,
             None,
+            Some(bulk_job_id),
         )
         .await
     }
@@ -152,6 +191,7 @@ impl CloudBackfillProgressService {
             clamp_to_i64(spans_total),
             CloudTelemetryBackfillStatus::Running,
             clamp_to_i64(spans_processed),
+            None,
             None,
             None,
             None,
@@ -178,6 +218,7 @@ impl CloudBackfillProgressService {
             None,
             Some(chrono::Utc::now()),
             None,
+            None,
         )
         .await
     }
@@ -201,6 +242,7 @@ impl CloudBackfillProgressService {
             None,
             None,
             Some(reason.as_ref().to_string()),
+            None,
         )
         .await
     }
@@ -210,6 +252,11 @@ impl CloudBackfillProgressService {
     /// `None` for the optional window/timestamp arguments means "leave whatever
     /// the running row already has", so a per-chunk progress write does not
     /// have to restate the window it is filling.
+    ///
+    /// `bulk_job_id` is doubly optional on purpose: the outer `None` means
+    /// "leave the existing value alone" (a per-chunk progress write), and
+    /// `Some(None)` means "this run has no bulk job", which is how a CLI run
+    /// clears the job id a previous bulk run left behind.
     #[allow(clippy::too_many_arguments)]
     async fn upsert(
         &self,
@@ -222,6 +269,7 @@ impl CloudBackfillProgressService {
         started_at: Option<DBDateTime>,
         completed_at: Option<DBDateTime>,
         last_error: Option<String>,
+        bulk_job_id: Option<Option<uuid::Uuid>>,
     ) -> Result<BackfillProgress, CloudBackfillProgressError> {
         let write_error = |source: sea_orm::DbErr| CloudBackfillProgressError::Write {
             project_id,
@@ -255,6 +303,9 @@ impl CloudBackfillProgressService {
                     last_error: Set(last_error),
                     ..Default::default()
                 };
+                if let Some(bulk_job_id) = bulk_job_id {
+                    active.bulk_job_id = Set(bulk_job_id);
+                }
                 active.window_from = Set(window_from.or(row.window_from));
                 active.window_to = Set(window_to.or(row.window_to));
                 active.started_at = Set(started_at.or(row.started_at));
@@ -281,6 +332,7 @@ impl CloudBackfillProgressService {
                 updated_at: Set(now),
                 completed_at: Set(completed_at),
                 last_error: Set(last_error),
+                bulk_job_id: Set(bulk_job_id.flatten()),
                 ..Default::default()
             }
             .insert(self.db.as_ref())
