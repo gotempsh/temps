@@ -49,16 +49,17 @@ pub struct OtelService {
     stats: PipelineStatsAtomic,
 }
 
-/// Default process-wide limit for OTLP requests that may authenticate,
-/// decompress, decode, and write concurrently. The permit is acquired before
-/// Axum buffers the request body, bounding both task and payload memory
-/// during exporter retry storms.
+/// Conservative fallback process-wide limit for OTLP requests that may
+/// authenticate, decompress, decode, and write concurrently. Normal startup
+/// replaces this with a value derived from effective memory. The permit is
+/// acquired before Axum buffers the request body, bounding both task and
+/// payload memory during exporter retry storms.
 ///
 /// This is a process-wide operational tuning knob, not per-tenant config, so
 /// deployments that need a higher ceiling (larger hardware, many
 /// projects/services sharing one instance) can override it via
 /// `TEMPS_OTEL_MAX_CONCURRENT_INGEST_REQUESTS` — see `OtelConfig::from_env`.
-pub const DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS: usize = 64;
+pub const DEFAULT_MAX_CONCURRENT_INGEST_REQUESTS: usize = 8;
 
 /// Max `si_` ingest requests per service per window. ~10 req/s — far above a
 /// healthy exporter's cadence, low enough to stop a tight-loop flood from

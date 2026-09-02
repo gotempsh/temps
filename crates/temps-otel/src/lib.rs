@@ -36,6 +36,7 @@ pub mod detectors;
 pub mod error;
 pub mod handlers;
 pub mod ingest;
+pub mod memory;
 pub mod plugin;
 pub mod proto;
 pub mod relay;

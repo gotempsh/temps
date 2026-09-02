@@ -28,7 +28,7 @@ pub const RELAY_QUEUE_MAX_BATCHES: usize = 128;
 /// Maximum decompressed OTLP payload bytes retained by the process-wide relay
 /// handoff. This is independent of the queue's batch-count bound so a stream of
 /// maximum-size requests cannot consume the count limit times request limit.
-pub const RELAY_QUEUE_MAX_BYTES: usize = 16 * 1024 * 1024;
+pub const RELAY_QUEUE_MAX_BYTES: usize = crate::memory::MAX_RELAY_QUEUE_BYTES;
 
 /// Which OTLP signal type a relay batch belongs to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
