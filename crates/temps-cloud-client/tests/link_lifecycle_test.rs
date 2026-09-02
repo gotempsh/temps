@@ -364,6 +364,22 @@ async fn changing_backend_origin_requires_remote_disconnect_first() {
         2,
         "a refused origin change must retain the active link's telemetry"
     );
+
+    // The caller (temps-cloud's service, which owns startup reconciliation)
+    // reports a rejected origin change through `block_outbound`, exactly as
+    // it does here. The operator-visible health must carry that specific
+    // reason immediately, not the generic "could not report why" placeholder
+    // that `health()` only falls back to when it genuinely has no reason —
+    // this instance already has the best possible one.
+    l.block_outbound(error.clone());
+    assert_eq!(
+        l.health(),
+        MirrorHealth::Buffering {
+            spooled: 2,
+            reason: error,
+        },
+        "a known block reason must reach the operator-visible health, not a generic fallback"
+    );
 }
 
 #[tokio::test]

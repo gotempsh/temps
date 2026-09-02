@@ -510,11 +510,45 @@ impl CloudLink {
             })
     }
 
+    /// Block outbound submissions and attribute the block as the reason for
+    /// any span that's already been, or is about to be, dropped.
+    ///
+    /// Without this, a block that fires before the flusher's next tick (e.g.
+    /// startup reconciliation failing before any flush ever runs) leaves
+    /// `self.health` at its default value while producer-side drops still
+    /// accumulate. [`Self::health`]'s fallback then has no real reason to
+    /// report and falls back to a placeholder that tells the operator nothing
+    /// — exactly the failure mode `Dropping.reason` exists to prevent.
     pub fn block_outbound(&self, reason: impl Into<String>) {
+        let reason = reason.into();
         *self
             .outbound_blocked_reason
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason.into());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(reason.clone());
+        let (spooled, dropped) = {
+            let spool = self
+                .spool
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (
+                spool.len(),
+                spool
+                    .dropped()
+                    .saturating_add(self.incoming_dropped.load(Ordering::Relaxed)),
+            )
+        };
+        *self
+            .health
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = if dropped > 0 {
+            MirrorHealth::Dropping {
+                spooled,
+                dropped,
+                reason,
+            }
+        } else {
+            MirrorHealth::Buffering { spooled, reason }
+        };
     }
 
     fn clear_outbound_block(&self) {
